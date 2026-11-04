@@ -17,8 +17,10 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import native_identity  # noqa: E402
 import transcript_backup_manifest  # noqa: E402
 import transcript_roots  # noqa: E402
 
@@ -77,8 +79,9 @@ def settled_threads(state_db):
     if not state_db or not os.path.isfile(state_db):
         return out
     try:
-        c = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(f"{Path(os.path.abspath(state_db)).as_uri()}?mode=ro", uri=True, timeout=30)
         try:
+            c.execute("BEGIN")
             for (tid,) in c.execute(
                     "SELECT DISTINCT json_extract(json, '$.workThreadId') FROM ardud_kanban_cards "
                     "WHERE json_extract(json, '$.settledAt') IS NOT NULL"):
@@ -160,7 +163,10 @@ def plan(roots, ledger, manifest, settled, now=None, min_age_days=MIN_AGE_DAYS):
                         continue
                     if not captured_to_end(ledger, full, st):
                         continue
-                    thread = ledger.get(full, {}).get("thread_id")
+                    record = ledger.get(full, {})
+                    if record.get("instance") != instance:
+                        continue
+                    thread = record.get("thread_id")
                     if not thread or thread not in settled:
                         continue
                     key = os.path.join(prefix, os.path.relpath(full, root))
@@ -172,41 +178,44 @@ def plan(roots, ledger, manifest, settled, now=None, min_age_days=MIN_AGE_DAYS):
 
 
 def load_ledger(path):
-    """Only use a ledger that explicitly binds each captured path to a thread.
-
-    D1's current schema has no thread_id; until its identity mapping is wired in,
-    it is unknown whether a file's thread is settled, so nothing is eligible.
-    """
+    """Bind unambiguous live capture rows to aliases from the same database."""
     if not path or not os.path.isfile(path):
         return {}
     try:
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(f"{Path(os.path.abspath(path)).as_uri()}?mode=ro", uri=True, timeout=30)
         try:
+            # All file and alias evidence comes from one database snapshot.
+            c.execute("BEGIN")
             cols = [d[1] for d in c.execute("PRAGMA table_info(native_capture_files)")]
-            if not {"path", "offset", "error_count", "thread_id"} <= set(cols):
+            required = {"path", "instance", "session_key", "offset", "error_count", "retired", "inode",
+                        "phys_size", "head_len", "head_sha1", "tail_sha1"}
+            if not required <= set(cols):
                 return {}
-            # Only a current, successful checkpoint with an unchanged inode and
-            # physical size can attest to this specific representation.
-            if not {"retired", "inode", "phys_size", "head_len", "head_sha1", "tail_sha1"} <= set(cols):
-                return {}
-            where = " WHERE retired=0"
-            rows = c.execute("SELECT * FROM native_capture_files" + where).fetchall()
+            rows = c.execute("SELECT * FROM native_capture_files WHERE retired=0").fetchall()
+            resolver = native_identity.ThreadResolver(c)
+            unique, ambiguous = {}, set()
+            for row in rows:
+                record = dict(zip(cols, row))
+                key = record["path"]
+                if not isinstance(key, str) or not key:
+                    continue
+                if key in unique or key in ambiguous:
+                    unique.pop(key, None)
+                    ambiguous.add(key)
+                else:
+                    unique[key] = record
+            result = {}
+            for key, record in unique.items():
+                instance = record["instance"]
+                source = native_identity.source_for_instance(instance)
+                thread = resolver.resolve_thread(instance, source, record["session_key"])
+                if thread is not None:
+                    result[key] = {**record, "thread_id": thread}
+            return result
         finally:
             c.close()
     except sqlite3.Error:
         return {}
-    result, ambiguous = {}, set()
-    for row in rows:
-        record = dict(zip(cols, row))
-        key = record["path"]
-        if not isinstance(key, str):
-            continue
-        if key in result or key in ambiguous:
-            result.pop(key, None)
-            ambiguous.add(key)
-        else:
-            result[key] = record
-    return result
 
 
 def main(argv=None):

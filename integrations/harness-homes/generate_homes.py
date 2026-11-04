@@ -24,7 +24,8 @@ PERSONAL_HOMES = ("~/.claude", "~/.codex", "/Volumes/ExternalSSD/codex")
 INLINE_KEYS = {"http_headers", "env", "set"}
 CLAUDE_PLUGIN_KEY = "cc-plugin-agents-md@builtin"
 RESERVED_IDS = {"t3-code"}  # Robob injects this per thread
-HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SessionStart")
+HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart",
+               "SubagentStop", "Stop", "SessionStart", "SessionEnd")
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 HARNESSES = ("claude", "codex", "codex-cu")
 NODE_REPL = "node_repl"
@@ -152,9 +153,15 @@ def skill_name(skill_md: Path) -> str:
     return skill_md.parent.name
 
 
-def discover_skills(skill_roots: list[str]) -> list[tuple[str, str]]:
-    """Return (name, skill_dir) for every directory holding SKILL.md, collision-checked."""
+def discover_skills(skill_roots: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return discovered skills and paths that could not be inspected."""
     found: list[tuple[str, str]] = []
+    unreadable: list[str] = []
+
+    def cannot_inspect(path: str, exc: OSError) -> None:
+        unreadable.append(path)
+        print(f"warning: cannot inspect skill path {path}: {exc}", file=sys.stderr)
+
     seen_real: set[str] = set()
     for root in skill_roots:
         if not os.path.isdir(root):
@@ -169,21 +176,36 @@ def discover_skills(skill_roots: list[str]) -> list[tuple[str, str]]:
             visited.add(real)
             try:
                 entries = sorted(os.scandir(current), key=lambda e: e.name)
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                cannot_inspect(current, exc)
                 continue
             is_skill = False
             subdirs = []
             for entry in entries:
-                if entry.name == "SKILL.md" and entry.is_file(follow_symlinks=True):
-                    is_skill = True
-                elif entry.is_dir(follow_symlinks=True):
-                    subdirs.append(entry.path)
+                try:
+                    if entry.name == "SKILL.md" and entry.is_file(follow_symlinks=True):
+                        is_skill = True
+                    elif entry.is_dir(follow_symlinks=True):
+                        subdirs.append(entry.path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    cannot_inspect(current if entry.name == "SKILL.md" else entry.path, exc)
             if is_skill and real not in seen_real:
-                seen_real.add(real)
-                name = skill_name(Path(current) / "SKILL.md")
-                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-                    raise HomeError(f"skill name {name!r} at {current} is not a safe link name")
-                found.append((name, current))
+                try:
+                    name = skill_name(Path(current) / "SKILL.md")
+                except FileNotFoundError:
+                    name = None
+                except OSError as exc:
+                    cannot_inspect(current, exc)
+                    name = None
+                if name is not None:
+                    seen_real.add(real)
+                    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                        raise HomeError(f"skill name {name!r} at {current} is not a safe link name")
+                    found.append((name, current))
             stack.extend(reversed(subdirs))
     by_name: dict[str, list[str]] = {}
     for name, path in found:
@@ -192,10 +214,11 @@ def discover_skills(skill_roots: list[str]) -> list[tuple[str, str]]:
     if clashes:
         lines = [f"  {name}: " + " and ".join(paths) for name, paths in sorted(clashes.items())]
         raise HomeError("skill name collision, nothing written:\n" + "\n".join(lines))
-    return sorted(found)
+    return sorted(found), unreadable
 
 
-def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) -> list[tuple]:
+def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str],
+              unreadable: list[str]) -> list[tuple]:
     """Plan the skills/ farm: ("unlink", path) or ("link", path, target). Writes nothing.
 
     Real directories and symlinks that point outside the skill roots are never touched.
@@ -206,9 +229,20 @@ def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) 
     def into_root(target: str) -> bool:
         return any(target.startswith(r + os.sep) for r in root_forms)
 
+    def cannot_inspect(target: str) -> bool:
+        # Discovery follows symlinks once; a second root may alias an unreadable subtree.
+        real_target = os.path.realpath(target)
+        for path in unreadable:
+            real_path = os.path.realpath(path)
+            if (target == path or target.startswith(path + os.sep) or
+                    real_target == real_path or real_target.startswith(real_path + os.sep)):
+                return True
+        return False
+
     if os.path.lexists(skills_dir) and not os.path.isdir(skills_dir):
         raise HomeError(f"{skills_dir} exists and is not a directory")
     ops: list[tuple] = []
+    protected: set[str] = set()
     if os.path.isdir(skills_dir):
         for entry in sorted(os.listdir(skills_dir)):
             link = os.path.join(skills_dir, entry)
@@ -217,11 +251,16 @@ def skill_ops(skills_dir: str, skills: list[tuple[str, str]], roots: list[str]) 
             target = os.path.normpath(os.path.join(skills_dir, os.readlink(link)))
             if not into_root(target):
                 continue
+            if cannot_inspect(target):
+                protected.add(link)
+                continue
             if desired.get(entry) == target:
                 continue
             ops.append(("unlink", link))  # gone or no longer discovered
     for name in sorted(desired):
         link = os.path.join(skills_dir, name)
+        if link in protected:
+            continue
         if os.path.islink(link):
             if os.path.normpath(os.path.join(skills_dir, os.readlink(link))) == desired[name]:
                 continue
@@ -399,7 +438,9 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
                 "requires_openai_auth": False,
                 "supports_websockets": False,
                 "stream_idle_timeout_ms": 900000,
-                "http_headers": {"x-9router-token-saver": "off"},
+                # For this provider, Codex 0.166 needs a non-empty actor header for image_gen; the fixed placeholder is not a credential and 9router never forwards it upstream.
+                "http_headers": {"x-9router-token-saver": "off",
+                                 "x-openai-actor-authorization": "robob-9router-local"},
             }
         },
         "skills": {"max_context_tokens": 10000},
@@ -410,6 +451,7 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
             "computer_use": False,
             "goals": False,
             "hooks": True,
+            "image_generation": True,
             "output_token_replay": True,
             "concurrent_reasoning_summaries": True,
             "subagent_default_context_limits": False,
@@ -571,16 +613,16 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
     return files
 
 
-def plan_all(home_root: str | None) -> tuple[dict, dict, list, dict]:
+def plan_all(home_root: str | None) -> tuple[dict, dict, list, list, dict]:
     manifest = load_manifest()
     validate_manifest(manifest)
     homes = resolve_homes(manifest, home_root)
-    skills = discover_skills([expand(r) for r in manifest["skillRoots"]])
+    skills, unreadable = discover_skills([expand(r) for r in manifest["skillRoots"]])
     files = build(manifest, homes)
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
             raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
-    return manifest, homes, skills, files
+    return manifest, homes, skills, unreadable, files
 
 
 # ---------- writing ----------
@@ -640,11 +682,11 @@ class Writer:
 
 
 def generate(home_root: str | None, dry_run: bool) -> int:
-    manifest, homes, skills, files = plan_all(home_root)
+    manifest, homes, skills, unreadable, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
     guard_outputs([*homes.values(), *farms, *files])
     roots = [expand(r) for r in manifest["skillRoots"]]
-    plans = {home: skill_ops(os.path.join(home, "skills"), skills, roots) for home in homes.values()}
+    plans = {home: skill_ops(os.path.join(home, "skills"), skills, roots, unreadable) for home in homes.values()}
     guard_outputs([op[1] for plan in plans.values() for op in plan])
     writer = Writer(dry_run)
     for home in homes.values():
@@ -665,9 +707,11 @@ def generate(home_root: str | None, dry_run: bool) -> int:
 # ---------- check ----------
 
 def check(home_root: str | None) -> int:
-    manifest, homes, skills, files = plan_all(home_root)
+    manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
+    if unreadable:
+        failures.append("skills: could not inspect " + ", ".join(unreadable))
 
     # Compare complete owned structures, not just MCP IDs or the extended slugs.
     # build() incorporates the Claude foreign keys and each Codex trust state.

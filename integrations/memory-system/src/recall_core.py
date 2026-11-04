@@ -19,6 +19,8 @@ import sqlite3
 import threading
 import time
 import unicodedata
+from collections import deque
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +31,7 @@ CATALOG_DB = Path(os.environ.get("RECALL_CATALOG_DB", str(DATA / "recall_catalog
 OPENCODE_DB = Path(
     os.environ.get("OPENCODE_DB", str(Path.home() / ".local/share/opencode/opencode.db"))
 )
+STATE_DB = Path(os.environ.get("RECALL_STATE_DB", str(Path.home() / ".robob/userdata/statev2.sqlite")))
 
 STOP = set(
     """a an and are as at be by can do does for from has have how i in is it its me my of on or our
@@ -420,9 +423,10 @@ class Filters:
             where.append(f"{col['ts']} <= ?")
             params.append(int(self.until))
         if self.exclude:
-            ids = sorted(self.exclude)[:2000]
-            where.append(f"{col['session_id']} NOT IN ({','.join('?' * len(ids))})")
-            params += ids
+            # One JSON parameter avoids SQLite's bind-variable limit without
+            # truncating a large caller tree or consuming the FTS hit window.
+            where.append(f"{col['session_id']} NOT IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(sorted(self.exclude)))
         return "".join(" AND " + w for w in where), params
 
     def __bool__(self) -> bool:
@@ -885,6 +889,7 @@ def list_sessions(
     until: int | None = None,
     include_children: bool = False,
     limit: int = 20,
+    exclude_sessions: set[str] | frozenset = frozenset(),
 ) -> list[dict]:
     con = catalog()
     where, params = [], []
@@ -902,6 +907,9 @@ def list_sessions(
         params.append(until)
     if not include_children:
         where.append("parent_id IS NULL")
+    if exclude_sessions:
+        where.append("session_id NOT IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(sorted(exclude_sessions)))
     if text:
         for w in text.split():
             where.append("(title LIKE ? OR first_prompt LIKE ? OR cwd LIKE ? OR session_id LIKE ?)")
@@ -920,6 +928,272 @@ RESUME_SUFFIX_RE = re.compile(r"\s*\((?:resume|cont|continued|continuation)\b[^)
 _lineage_cache: dict[str, tuple[float, frozenset]] = {}
 
 
+class UnknownCaller(Exception):
+    """A supplied caller could not be excluded safely."""
+
+
+def _members(values: set[str]) -> str:
+    return json.dumps(sorted(values))
+
+
+def _alias_table_tree(ids: set[str]) -> set[str]:
+    """Read D1's materialized aliases when available; never cache a changing map."""
+    con = mem()
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_aliases'").fetchone():
+        return set()
+    natives = {value.split(":agent:", 1)[0] for value in ids}
+    rows = con.execute(
+        "SELECT root_thread_id FROM thread_aliases WHERE canonical_thread_id IN (SELECT value FROM json_each(?)) "
+        "UNION SELECT root_thread_id FROM thread_aliases WHERE native_id IN (SELECT value FROM json_each(?)) "
+        "UNION SELECT root_thread_id FROM thread_aliases WHERE root_thread_id IN (SELECT value FROM json_each(?))",
+        (_members(ids), _members(natives), _members(ids)),
+    ).fetchall()
+    roots = {row[0] for row in rows if row[0]}
+    if not roots:
+        return set()
+    out = set(roots)
+    for canonical, native, agent in con.execute(
+        "SELECT canonical_thread_id,native_id,agent_id FROM thread_aliases "
+        "WHERE root_thread_id IN (SELECT value FROM json_each(?))", (_members(roots),)
+    ):
+        out.update(x for x in (canonical, native, agent) if x)
+        if native and agent:
+            out.add(f"{native}:agent:{agent}")
+    return out
+
+
+def _state_tree(ids: set[str]) -> set[str]:
+    """Interim D1 reader. State is read-only; it is not a second identity writer."""
+    with closing(connect_ro(STATE_DB)) as con:
+        con.execute("BEGIN")
+        thread_table = "orchestration_v2_projection_threads"
+        provider_table = "orchestration_v2_projection_provider_threads"
+        subagent_table = "orchestration_v2_projection_subagents"
+        natives = {ident.split(":agent:", 1)[0] for ident in ids}
+        seeds = {r[0] for r in con.execute(
+            f"SELECT thread_id FROM {thread_table} WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
+        )}
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT DISTINCT thread_id FROM {provider_table} "
+            "WHERE json_extract(payload_json,'$.nativeThreadRef.nativeId') IN (SELECT value FROM json_each(?)) "
+            "AND thread_id IS NOT NULL", (_members(natives),)
+        ))
+        seeds.update(r[0] for r in con.execute(
+            "SELECT thread_id FROM ardud_opencode_import WHERE native_session_id IN (SELECT value FROM json_each(?))", (_members(natives),)
+        ))
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT child_thread_id FROM {subagent_table} "
+            "WHERE child_thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
+        ) if r[0])
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT thread_id FROM {subagent_table} "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
+        ) if r[0])
+        if not seeds:
+            return set()
+        # Root hints and explicit edges all establish possible membership, even
+        # when projections disagree. Only direct parent edges prove ownership.
+        neighbors: dict[str, set[str]] = {}
+        ownership_children: dict[str, set[str]] = {}
+
+        def link(parent: str, child: str, *, owns: bool) -> None:
+            if not parent or not child or parent == child:
+                return
+            neighbors.setdefault(parent, set()).add(child)
+            neighbors.setdefault(child, set()).add(parent)
+            if owns:
+                ownership_children.setdefault(parent, set()).add(child)
+
+        # The JSON lineage fields have no index, so read them once.
+        for child, parent, root in con.execute(
+            f"SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
+            f"json_extract(payload_json,'$.lineage.rootThreadId') FROM {thread_table}"
+        ):
+            if parent:
+                link(parent, child, owns=True)
+            if root:
+                link(root, child, owns=False)
+        threads = set(seeds)
+        frontier = set(seeds)
+        subagents = set()
+        while frontier:
+            rows = con.execute(
+                f"SELECT thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId') "
+                f"FROM {subagent_table} WHERE thread_id IN (SELECT value FROM json_each(?)) "
+                "OR child_thread_id IN (SELECT value FROM json_each(?))", (_members(frontier), _members(frontier))
+            ).fetchall()
+            subagents.update(rows)
+            for parent, child, _agent in rows:
+                if child:
+                    link(parent, child, owns=True)
+            found = set().union(*(neighbors.get(thread, set()) for thread in frontier))
+            frontier = found - threads
+            threads.update(frontier)
+        out = set(threads)
+        natives_by_thread: dict[str, set[str]] = {}
+        for thread, native_id in con.execute(
+            f"SELECT thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId') FROM {provider_table} "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(threads),)
+        ):
+            if native_id:
+                out.add(native_id)
+                natives_by_thread.setdefault(thread, set()).add(native_id)
+        for thread, native_id in con.execute(
+            "SELECT thread_id,native_session_id FROM ardud_opencode_import "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(threads),)
+        ):
+            if native_id:
+                out.add(native_id)
+                natives_by_thread.setdefault(thread, set()).add(native_id)
+        # Native subagents may have no provider row. Carry every possible
+        # ancestor incarnation through the ownership graph; a nearer provider
+        # does not prove that older/root incarnations did not capture the task.
+        owners = {thread: set(natives) for thread, natives in natives_by_thread.items()}
+        pending = deque((thread, native) for thread, natives in owners.items() for native in natives)
+        while pending:
+            parent, native = pending.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and native not in owners.get(child, ()):
+                    owners.setdefault(child, set()).add(native)
+                    pending.append((child, native))
+        # A second possible ownership path can have no provider even when
+        # another path has one. Propagate that uncertainty rather than using
+        # a root hint to guess the missing incarnation.
+        dangling = threads - owners.keys()
+        pending_dangling = deque(dangling)
+        while pending_dangling:
+            parent = pending_dangling.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and child not in dangling:
+                    dangling.add(child)
+                    pending_dangling.append(child)
+        if dangling:
+            raise UnknownCaller("subagent provider ownership could not be resolved")
+        for parent, _child, agent in subagents:
+            if agent:
+                out.add(agent)
+                out.update(f"{n}:agent:{agent}" for n in owners[parent])
+        return out
+
+
+def _opencode_edges(con: sqlite3.Connection) -> dict[str, set[str]]:
+    edges: dict[str, set[str]] = {}
+    for sid, parent, old in con.execute(
+        "SELECT id,parent_id,json_extract(metadata,'$.migration.sourceSessionID') FROM session_v2"
+    ):
+        for other in (parent, old):
+            if other:
+                edges.setdefault(sid, set()).add(other)
+                edges.setdefault(other, set()).add(sid)
+    return edges
+
+
+def _opencode_tree(ids: set[str], edges: dict[str, set[str]] | None = None) -> set[str]:
+    """Add OpenCode ancestors, descendants and explicit migration aliases."""
+    con = opencode_ro()
+    if con is None:
+        if any(s.startswith("ses_") for s in ids):
+            raise UnknownCaller("OpenCode lineage store unavailable")
+        return set()
+    out = set(ids)
+    if edges is None:
+        edges = _opencode_edges(con)
+    frontier = set(ids)
+    while frontier:
+        found = set().union(*(edges.get(sid, set()) for sid in frontier))
+        frontier = found - out
+        out.update(frontier)
+    return out - ids
+
+
+def _catalog_tree(ids: set[str]) -> set[str]:
+    """Explicit catalog parent edges are evidence; titles are not."""
+    con = catalog()
+    out = set(ids)
+    frontier = set(ids)
+    while frontier:
+        found = {r[0] for r in con.execute(
+            "SELECT parent_id FROM sessions WHERE session_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
+        ) if r[0]}
+        found.update(r[0] for r in con.execute(
+            "SELECT session_id FROM sessions WHERE parent_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
+        ))
+        frontier = found - out
+        out.update(frontier)
+    return out - ids
+
+
+def validate_driver(ident: str, driver: str) -> None:
+    """Qualifiers must agree with a persisted provider binding."""
+    with closing(connect_ro(STATE_DB)) as con:
+        native = ident.split(":agent:", 1)[0]
+        row = con.execute(
+            "SELECT 1 FROM orchestration_v2_projection_provider_threads "
+            "WHERE (thread_id=? OR json_extract(payload_json,'$.nativeThreadRef.nativeId')=?) "
+            "AND COALESCE(driver,json_extract(payload_json,'$.driver'))=? LIMIT 1", (ident, native, driver)
+        ).fetchone()
+        if not row and driver == "opencode":
+            row = con.execute("SELECT 1 FROM ardud_opencode_import WHERE thread_id=? OR native_session_id=?", (ident, native)).fetchone()
+        if not row:
+            raise UnknownCaller("caller driver does not match")
+
+
+def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
+    """All known aliases in the caller's complete root tree, or fail closed."""
+    # Robob commits identity rows before creating a transcript; capture reads
+    # that transcript later. Recheck after retrieval before exposing candidates.
+    # Legacy results are only an additional exclusion, never proof of identity.
+    if not canonical_or_native_id:
+        raise UnknownCaller("caller identity is missing")
+    ident = canonical_or_native_id.strip()
+    if not ident:
+        raise UnknownCaller("caller identity is missing")
+    try:
+        oc = opencode_ro()
+        edges = _opencode_edges(oc) if oc is not None else None
+        aliases = _alias_table_tree({ident})
+        try:
+            aliases.update(_state_tree({ident}))
+            # An alias row can predate its state's descendants. Expand from
+            # every historical binding, but require a current state anchor.
+            state_anchor = bool(_state_tree(set(aliases) | {ident}))
+            state_available = True
+        except sqlite3.Error:
+            raise UnknownCaller("caller identity store unavailable") from None
+        if not aliases:
+            # A known OpenCode id can bridge into the authoritative map through
+            # migration links. Only use title matching if no mapped id exists.
+            if not state_available or oc is None or not oc.execute(
+                "SELECT 1 FROM session_v2 WHERE id=?", (ident,)
+            ).fetchone():
+                raise UnknownCaller("caller identity is unknown")
+            explicit = {ident} | _opencode_tree({ident}, edges) | _catalog_tree({ident})
+            aliases.update(_alias_table_tree(explicit) | _state_tree(explicit))
+            aliases.update(explicit if aliases else _legacy_lineage(ident, fresh=fresh_legacy))
+            state_anchor = bool(_state_tree(aliases))
+        if not state_anchor and not (ident.startswith("ses_") and oc is not None and oc.execute(
+                "SELECT 1 FROM session_v2 WHERE id=?", (ident,)).fetchone()):
+            raise UnknownCaller("caller has no current identity anchor")
+        aliases.add(ident)
+        # A migration edge can reveal a later Robob binding, and that binding
+        # can reveal more OpenCode aliases. Close both maps until stable.
+        frontier = set(aliases)
+        legacy_checked: set[str] = set()
+        while frontier:
+            found = _opencode_tree(frontier, edges) | _alias_table_tree(frontier) | _catalog_tree(frontier)
+            if state_available:
+                found.update(_state_tree(frontier))
+            for sid in frontier:
+                if sid.startswith("ses_") and sid not in legacy_checked:
+                    legacy_checked.add(sid)
+                    found.update(_legacy_lineage(sid, fresh=fresh_legacy))
+            frontier = found - aliases
+            aliases.update(frontier)
+        return frozenset(aliases)
+    except sqlite3.Error as e:
+        raise UnknownCaller("caller lineage could not be read") from e
+
+
 def base_title(title: str) -> str:
     t = (title or "").strip()
     while True:
@@ -929,7 +1203,7 @@ def base_title(title: str) -> str:
         t = s
 
 
-def lineage(session_id: str | None, days: int = 14, max_ids: int = 1500) -> frozenset:
+def _legacy_lineage(session_id: str | None, days: int = 14, *, fresh: bool = False) -> frozenset:
     """The session, its subagents, and recent earlier incarnations of the same thread.
 
     A resumed thread starts a new session with the same title and directory; its
@@ -939,7 +1213,7 @@ def lineage(session_id: str | None, days: int = 14, max_ids: int = 1500) -> froz
     if not session_id:
         return frozenset()
     hit = _lineage_cache.get(session_id)
-    if hit and time.monotonic() - hit[0] < 300:
+    if not fresh and hit and time.monotonic() - hit[0] < 300:
         return hit[1]
     roots = {session_id}
     oc = opencode_ro()
@@ -969,9 +1243,7 @@ def lineage(session_id: str | None, days: int = 14, max_ids: int = 1500) -> froz
     # also knows other harnesses' children (e.g. Muse threads a session delegated).
     sources = [catalog()] + ([oc] if oc is not None else [])
     frontier = list(roots)
-    for _ in range(4):
-        if not frontier or len(out) >= max_ids:
-            break
+    while frontier:
         nxt = []
         for i in range(0, len(frontier), 400):
             chunk = frontier[i : i + 400]
@@ -986,11 +1258,21 @@ def lineage(session_id: str | None, days: int = 14, max_ids: int = 1500) -> froz
         nxt = [s for s in dict.fromkeys(nxt) if s not in out]
         out.update(nxt)
         frontier = nxt
-    res = frozenset(list(out)[:max_ids])
+    res = frozenset(out)
     if len(_lineage_cache) > 500:
         _lineage_cache.clear()
     _lineage_cache[session_id] = (time.monotonic(), res)
     return res
+
+
+def lineage(session_id: str | None) -> frozenset:
+    """Compatibility wrapper for callers which can tolerate unknown identity."""
+    if not session_id:
+        return frozenset()
+    try:
+        return lineage_exclusions(session_id)
+    except UnknownCaller:
+        return frozenset()
 
 
 def resolve_session(ident: str) -> str | None:

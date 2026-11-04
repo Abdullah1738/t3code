@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recall_ask as ra  # noqa: E402
 import recall_cli as cli  # noqa: E402
 import recall_core as rc  # noqa: E402
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 from starlette.responses import JSONResponse, Response  # noqa: E402
@@ -43,14 +43,37 @@ def _err(e: Exception) -> str:
     return f"error: {e}"
 
 
+def _caller_exclusions(ctx: Context | None, caller_thread: str = "", caller_native: str = "",
+                       caller_driver: str = "", caller_agent: str = "") -> set[str]:
+    # The request context is scoped to this call; never cache headers on the
+    # shared server. A malformed supplied identity fails closed, not anonymous.
+    headers = ctx.headers if ctx else None
+    headers = {k.lower(): v for k, v in (headers or {}).items()}
+    if any(k in headers and not str(headers[k]).strip() for k in
+           ("x-robob-thread", "x-robob-native", "x-robob-driver", "x-robob-agent")):
+        raise rc.UnknownCaller("empty caller identity header")
+    caller_thread = headers.get("x-robob-thread") or caller_thread
+    caller_native = headers.get("x-robob-native") or caller_native
+    caller_driver = headers.get("x-robob-driver") or caller_driver
+    caller_agent = headers.get("x-robob-agent") or caller_agent
+    if not any((caller_thread, caller_native, caller_driver, caller_agent)):
+        return set()
+    return ra.lineage_of(None, None, caller_thread=caller_thread, caller_native=caller_native,
+                         caller_driver=caller_driver, caller_agent=caller_agent)
+
+
 @server.tool()
-def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", source: str = "", timeout: int = 30) -> str:
+def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", source: str = "", timeout: int = 30,
+               caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
+               ctx: Context = None) -> str:
     """Answer a question from past agent sessions, with [n] citations and the sessions listed underneath.
 
     Ask in plain words ("what did we decide about kafka for crpko?", "how did we fix the talabat voucher bug?").
-    cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode|muse.
+    cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode|muse|claude.
     """
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         res = ra.ask(
             question,
             cwd=cwd or None,
@@ -58,6 +81,8 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
             since=since or None,
             until=until or None,
             source=source or None,
+            exclude=list(exclude),
+            recheck_exclusions=recheck if exclude else None,
             timeout=max(8, min(int(timeout or 30), 90)),
         )
     except Exception as e:  # noqa: BLE001
@@ -78,6 +103,11 @@ def recall_search(
     until: str = "",
     source: str = "",
     limit: int = 10,
+    caller_thread: str = "",
+    caller_native: str = "",
+    caller_driver: str = "",
+    caller_agent: str = "",
+    ctx: Context = None,
 ) -> str:
     """Keyword search over past session messages; returns the best sessions with matching snippets, newest-relevant first.
 
@@ -85,41 +115,66 @@ def recall_search(
     include_tools=true also searches commands, tool output and errors. Read a hit with recall_read("<session>#e<event>").
     """
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         res = rc.search(
             [query],
             source=source or None,
             since=rc.parse_when(since or None),
             until=rc.parse_when(until or None),
             include_tools=include_tools,
+            exclude_sessions=exclude,
             cwd=cwd or None,
             cwd_only=bool(cwd),
             exact=exact,
             limit_sessions=max(1, min(int(limit or 10), 30)),
             deadline=rc.Deadline(20),
         )
+        if exclude:
+            excluded = exclude | recheck()
+            sessions = [s for s in res["sessions"] if s["session_id"] not in excluded and s.get("parent_id") not in excluded]
+            res["total_sessions"] = max(0, res["total_sessions"] - (len(res["sessions"]) - len(sessions)))
+            res["sessions"] = sessions
     except Exception as e:  # noqa: BLE001
         return _err(e)
     return cli.format_search(res)
 
 
 @server.tool()
-def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool = False, max_chars: int = 40000) -> str:
+def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool = False, max_chars: int = 40000,
+                caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
+                ctx: Context = None) -> str:
     """Read a past session. ref: "<session-id>" (start), "<id>#e<event>" (around an event from search), "<id>#40-60" (message range).
 
     Session ids accept unique prefixes. include_tools adds tool calls/output; include_reasoning adds model reasoning.
     """
     try:
-        return cli.format_view(
-            ref, include_tools=include_tools, include_reasoning=include_reasoning, total_chars=max(2000, min(int(max_chars or 40000), 120000))
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        excluded = recheck()
+        if excluded:
+            sid = rc.resolve_session(ref)
+            if not sid or sid in excluded:
+                raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
+        result = cli.format_view(
+            ref, include_tools=include_tools, include_reasoning=include_reasoning,
+            total_chars=max(2000, min(int(max_chars or 40000), 120000)),
+            resolved_session=sid if excluded else None,
         )
+        if excluded and sid in (excluded | recheck()):
+            raise rc.UnknownCaller("session is in the caller's tree or cannot be resolved")
+        return result
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
 
 @server.tool()
-def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = "", until: str = "", include_subagents: bool = False, limit: int = 20) -> str:
+def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = "", until: str = "", include_subagents: bool = False, limit: int = 20,
+                caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
+                ctx: Context = None) -> str:
     """List past sessions, newest first. text filters titles/first prompts; cwd filters by project directory."""
     try:
+        recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
+        exclude = recheck()
         rows = rc.list_sessions(
             text=text or None,
             source=source or None,
@@ -127,8 +182,12 @@ def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = ""
             since=rc.parse_when(since or None),
             until=rc.parse_when(until or None),
             include_children=include_subagents,
+            exclude_sessions=exclude,
             limit=max(1, min(int(limit or 20), 200)),
         )
+        if exclude:
+            excluded = exclude | recheck()
+            rows = [row for row in rows if row["session_id"] not in excluded and row.get("parent_id") not in excluded]
     except Exception as e:  # noqa: BLE001
         return _err(e)
     return cli.format_list(rows)
@@ -168,7 +227,7 @@ def _log_inject(entry: dict) -> None:
             except FileNotFoundError:
                 pass
             with INJECT_LOG.open("a") as f:
-                f.write(json.dumps({k: _redact(v) for k, v in entry.items()}, ensure_ascii=False) + "\n")
+                f.write(json.dumps({k: _redact(v) for k, v in entry.items()}) + "\n")
     except OSError:
         pass
 
@@ -190,6 +249,10 @@ async def api_inject(request: Request) -> Response:
         cwd=body.get("cwd") or None,
         already=[str(x) for x in body.get("already") or []],
         timeout=float(body.get("timeout") or 12),
+        caller_thread=request.headers.get("x-robob-thread") or body.get("caller_thread") or None,
+        caller_native=request.headers.get("x-robob-native") or body.get("caller_native") or None,
+        caller_driver=request.headers.get("x-robob-driver") or body.get("caller_driver") or None,
+        caller_agent=request.headers.get("x-robob-agent") or body.get("caller_agent") or None,
     )
 
     known = [str(x) for x in body.get("known") or []]
@@ -239,6 +302,12 @@ async def api_ask(request: Request) -> Response:
         return JSONResponse({"error": "bad json"}, status_code=400)
 
     def work() -> dict:
+        headers = request.headers
+        recheck = lambda: _caller_exclusions(None, headers.get("x-robob-thread") or body.get("caller_thread") or "",
+                                             headers.get("x-robob-native") or body.get("caller_native") or "",
+                                             headers.get("x-robob-driver") or body.get("caller_driver") or "",
+                                             headers.get("x-robob-agent") or body.get("caller_agent") or "")
+        exclude = recheck()
         return ra.ask(
             str(body.get("question") or ""),
             cwd=body.get("cwd") or None,
@@ -246,6 +315,8 @@ async def api_ask(request: Request) -> Response:
             since=body.get("since") or None,
             until=body.get("until") or None,
             source=body.get("source") or None,
+            exclude=list(exclude),
+            recheck_exclusions=recheck if exclude else None,
             timeout=float(body.get("timeout") or 30),
         )
 

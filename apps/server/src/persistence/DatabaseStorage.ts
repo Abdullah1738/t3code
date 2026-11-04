@@ -19,7 +19,8 @@ import { forkParked } from "../serverActivation.ts";
 
 /** Pages returned per reclaim pass; one minute of churn, not a backlog. */
 const RECLAIM_PAGES_PER_PASS = 1024;
-const COMPACTION_INTERVAL = Duration.hours(6);
+const COMPACTION_INTERVAL = Duration.hours(24);
+const COMPACTION_MIN_PAGE_INTERVAL_MS = 25;
 
 export class DatabaseStorage extends Context.Service<
   DatabaseStorage,
@@ -32,7 +33,7 @@ export class DatabaseStorage extends Context.Service<
 >()("t3/persistence/DatabaseStorage") {}
 
 /**
- * Deletes superseded history every few hours and hands freed pages back to
+ * Deletes superseded history daily and hands freed pages back to
  * the filesystem every minute. Deleted events are always superseded by a
  * retained event with a higher sequence, so a client replaying from an older
  * cursor still reaches the same state; no replay boundary is published.
@@ -95,13 +96,19 @@ const make = Effect.gen(function* () {
   );
 
   // Even a pass that deletes nothing scans the event store. Persist completion
-  // so restarting does not trigger another scan before the six-hour interval.
+  // so restarting does not trigger another scan before the daily interval.
   const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at");
   const compact = Effect.gen(function* () {
-    const result = yield* maintenance.compactEventStore;
+    const result = yield* maintenance.compactEventStoreWith({
+      minPageIntervalMs: COMPACTION_MIN_PAGE_INTERVAL_MS,
+    });
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
-    if (result.deletedEventCount > 0 || result.deletedReceiptCount > 0) {
+    if (
+      result.deletedEventCount > 0 ||
+      result.deletedReceiptCount > 0 ||
+      result.consideredTextEventCount > 0
+    ) {
       yield* Effect.logInfo("Compacted orchestration history", result);
     }
   }).pipe(

@@ -79,6 +79,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ProjectStore from "./ProjectStore.ts";
 import {
@@ -161,6 +162,12 @@ import {
   parseThreadSegmentFromAttachmentId,
   toSafeThreadAttachmentSegment,
 } from "../attachmentStore.ts";
+
+// ardud: lets tests land a provider event between planning and committing.
+export const AdoptNativeHistoryBeforeCommit = Context.Reference<Effect.Effect<void>>(
+  "t3/ardud/AdoptNativeHistoryBeforeCommit",
+  { defaultValue: () => Effect.void },
+);
 
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
   "OrchestratorDispatchError",
@@ -515,6 +522,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
       return command.parentThreadId;
     case "secret_request.record":
     case "html_render.record":
+    case "thread.adopt-native-history":
       return command.threadId;
     case "thread.fork":
     case "thread.merge_back":
@@ -862,6 +870,7 @@ function lastDeliveredRunForProviderThread(
 }
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
   const contextHandoffService = yield* ContextHandoffServiceV2;
@@ -7739,6 +7748,156 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // ardud: bind staged history without rewriting the source provider thread.
+  const dispatchAdoptNativeHistory = Effect.fn("orchestrationV2.dispatch.adoptNativeHistory")(
+    function* (
+      command: Extract<
+        OrchestrationV2InternalCommand,
+        { readonly type: "thread.adopt-native-history" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, [
+          "runs",
+          "providerThreads",
+          "providerSessions",
+          "runtimeRequests",
+        ])
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      const { thread } = projection;
+      if (thread.deletedAt !== null || thread.archivedAt !== null) {
+        return yield* reject(`Thread ${command.threadId} is not active.`);
+      }
+      if (projection.runs.some((run) => run.status === "queued" || isBlockingRun(run))) {
+        return yield* reject(`Thread ${command.threadId} has queued or active runs.`);
+      }
+      if (projection.runtimeRequests.some((request) => request.status === "pending")) {
+        return yield* reject(`Thread ${command.threadId} has a pending runtime request.`);
+      }
+      if (thread.activeProviderThreadId !== command.expectedActiveProviderThreadId) {
+        return yield* reject(`Thread ${command.threadId} has a different active provider thread.`);
+      }
+
+      const now = yield* DateTime.now;
+      let target: OrchestrationV2ProviderThread;
+      if (command.target.kind === "new") {
+        const { driver, nativeId, headId, seededHistory } = command.target;
+        const id = idAllocator.derive.providerThread({
+          driver,
+          providerInstanceId: command.modelSelection.instanceId,
+          nativeThreadId: nativeId ?? `adopt:${command.commandId}`,
+        });
+        if (projection.providerThreads.some((row) => row.id === id)) {
+          return yield* reject(`Provider thread ${id} was already adopted.`);
+        }
+        target = {
+          id,
+          driver,
+          providerInstanceId: command.modelSelection.instanceId,
+          providerSessionId: null,
+          appThreadId: command.threadId,
+          ownerNodeId: null,
+          nativeThreadRef: nativeId === null ? null : { driver, nativeId, strength: "strong" },
+          nativeConversationHeadRef:
+            headId === null ? null : { driver, nativeId: headId, strength: "strong" },
+          status: "not_loaded",
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          contextUsage: null,
+          nativeMetadata: { seededHistory },
+          createdAt: now,
+          updatedAt: now,
+        };
+      } else {
+        const existingId = command.target.providerThreadId;
+        const row = projection.providerThreads.find(
+          (candidate) => candidate.id === existingId && candidate.appThreadId === command.threadId,
+        );
+        if (row === undefined) {
+          return yield* reject(`Provider thread ${existingId} does not belong to this thread.`);
+        }
+        if (row.providerInstanceId !== command.modelSelection.instanceId) {
+          return yield* reject(`Provider thread ${existingId} belongs to a different instance.`);
+        }
+        target = { ...row, updatedAt: now };
+      }
+
+      const emitEvent = emit(events, command);
+      const activeRow = projection.providerThreads.find(
+        (row) => row.id === thread.activeProviderThreadId,
+      );
+      const session = projection.providerSessions.find(
+        (candidate) => candidate.id === activeRow?.providerSessionId,
+      );
+      if (session !== undefined && session.status !== "stopped" && session.status !== "error") {
+        yield* emitEvent({
+          type: "provider-session.detached",
+          threadId: command.threadId,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            providerSessionId: session.id,
+            detachedAt: now,
+            reason: "Thread moved to another harness.",
+          },
+        });
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:provider-session.detach:${session.id}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-session.detach" as const,
+              providerSessionId: session.id,
+              detail: "Thread moved to another harness.",
+            },
+          },
+        ]);
+      }
+      yield* emitEvent({
+        type:
+          thread.providerInstanceId === command.modelSelection.instanceId
+            ? "thread.model-selection-updated"
+            : "thread.provider-switched",
+        threadId: command.threadId,
+        providerInstanceId: command.modelSelection.instanceId,
+        occurredAt: now,
+        payload: {
+          ...thread,
+          providerInstanceId: command.modelSelection.instanceId,
+          modelSelection: command.modelSelection,
+          activeProviderThreadId: target.id,
+          harnessMigrationFence: true,
+          updatedAt: now,
+        },
+      });
+      yield* emitEvent({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        driver: target.driver,
+        providerInstanceId: target.providerInstanceId,
+        occurredAt: now,
+        payload: target,
+      });
+    },
+  );
+
   const dispatchRuntimeRequestRespond = Effect.fn("Orchestrator.dispatchRuntimeRequestRespond")(
     function* (
       command: Extract<OrchestrationV2Command, { readonly type: "runtime-request.respond" }>,
@@ -11644,6 +11803,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "html_render.record":
         yield* dispatchHtmlRenderRecord(command, events);
         break;
+      case "thread.adopt-native-history":
+        yield* dispatchAdoptNativeHistory(command, events, effects);
+        break;
       default:
         return yield* dispatchUnsupported(command);
     }
@@ -11742,6 +11904,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
         : undefined;
 
+    // Provider events bypass the command lock, so reject a plan if the source
+    // changed before its transaction. Destination identity is checked there too.
+    const adoptionSequence =
+      command.type === "thread.adopt-native-history"
+        ? yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(
+            Effect.mapError(
+              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+            ),
+          )
+        : undefined;
+
     const plan = yield* dispatchOnce(command).pipe(
       Effect.flatMap((planned) =>
         planned.events.length > 0 ||
@@ -11824,14 +11997,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
     if (archiveIfIdle !== undefined) yield* yield* ArchiveIfIdleBeforeCommit;
+    if (command.type === "thread.adopt-native-history") {
+      yield* yield* AdoptNativeHistoryBeforeCommit;
+    }
+    const adoptionTarget = plan.events.find((event) => event.type === "provider-thread.updated");
     const recheck =
-      archiveIfIdle === undefined
-        ? undefined
-        : refuseUnlessIdle(
+      archiveIfIdle !== undefined
+        ? refuseUnlessIdle(
             archiveIfIdle.command,
             archiveIfIdle.expectedNativeSessionId,
             archiveIfIdle.plannedAtSequence,
-          );
+          )
+        : command.type === "thread.adopt-native-history" && adoptionSequence !== undefined
+          ? Effect.gen(function* () {
+              const reject = (detail: string) =>
+                new OrchestratorThreadNotIdleError({
+                  commandId: command.commandId,
+                  threadId: command.threadId,
+                  reason: "changed",
+                  detail,
+                });
+              const sequence = yield* eventSink.latestSequence({ threadId: command.threadId });
+              if (sequence !== adoptionSequence) {
+                return yield* reject(
+                  `Thread ${command.threadId} changed while adopting native history.`,
+                );
+              }
+              if (
+                command.target.kind !== "new" ||
+                adoptionTarget?.type !== "provider-thread.updated"
+              )
+                return;
+              const row = adoptionTarget.payload;
+              const rows = yield* sql<{ readonly provider_thread_id: string }>`
+                SELECT provider_thread_id FROM orchestration_v2_projection_provider_threads
+                WHERE provider_thread_id = ${row.id}
+                   OR (${command.target.nativeId} IS NOT NULL
+                       AND driver = ${row.driver}
+                       AND provider_instance_id = ${row.providerInstanceId}
+                       AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${command.target.nativeId})
+                LIMIT 1
+              `;
+              if (rows.length > 0) {
+                return yield* reject(`Provider thread ${row.id} was already adopted.`);
+              }
+            })
+          : undefined;
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
@@ -12306,6 +12517,7 @@ export const layer: Layer.Layer<
   | ProjectionStoreV2
   | RuntimePolicyV2
   | ServerSettings.ServerSettingsService
+  | SqlClient.SqlClient
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),

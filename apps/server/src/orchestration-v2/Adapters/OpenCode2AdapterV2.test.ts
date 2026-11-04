@@ -665,6 +665,191 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "marks a text whose step finished with stop as the answer, and a tool-call step as narration",
+    () =>
+      Effect.gen(function* () {
+        const answer = "msg_answer0000000000000000000";
+        const narration = "msg_narration000000000000000000";
+        const { runtime, thread } = yield* resumed([
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.text.started", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            ordinal: 0,
+          }),
+          event("session.text.ended", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            ordinal: 0,
+            text: "Checking.",
+          }),
+          event("session.step.ended", {
+            sessionID: SESSION,
+            assistantMessageID: narration,
+            finish: "tool-calls",
+            cost: 0,
+            tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+          }),
+          event("session.text.started", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            ordinal: 0,
+          }),
+          event("session.text.ended", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            ordinal: 0,
+            text: "DONE",
+          }),
+          event("session.step.ended", {
+            sessionID: SESSION,
+            assistantMessageID: answer,
+            finish: "stop",
+            cost: 0,
+            tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+          }),
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ]);
+        const collected = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.startTurn(turnInput(thread));
+        const seen = yield* Fiber.join(collected);
+        const phases = new Map(
+          seen.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? [[event.turnItem.text, event.turnItem.phase] as const]
+              : [],
+          ),
+        );
+        assert.strictEqual(phases.get("Checking."), "narration");
+        assert.strictEqual(phases.get("DONE"), "answer");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a reconnect backfill gives a listed text the phase of its message's finish", () =>
+    Effect.gen(function* () {
+      const narration = "msg_backfill_narration0000000";
+      const answer = "msg_backfill_answer00000000000";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        // The stream drops while the run goes on, and the run finishes unseen: the reconnect finds the
+        // session no longer active, so it reads back what the run wrote.
+        { type: "runtime_exit", status: "success" } as const,
+        out("event.subscribe"),
+        out("session.active"),
+        replyData("session.active", {}),
+        out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+        reply("message.list", {
+          data: [
+            {
+              id: answer,
+              time: { created: 4 },
+              type: "assistant",
+              agent: "build",
+              model: { id: "space-bunny-free", providerID: "opencode", variant: "high" },
+              content: [{ type: "text", text: "DONE" }],
+              finish: "stop",
+              cost: 0,
+              tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+            },
+            {
+              id: narration,
+              time: { created: 3 },
+              type: "assistant",
+              agent: "build",
+              model: { id: "space-bunny-free", providerID: "opencode", variant: "high" },
+              content: [{ type: "text", text: "Checking." }],
+              finish: "tool-calls",
+              cost: 0,
+              tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+            },
+            // The turn's own prompt is the history's start. The adapter sends it under its derived
+            // `msg_t3_turn_<session>:<attempt>` id, which is what the backfill matches against.
+            {
+              id: `msg_t3_turn_${SESSION}:attempt:opencode2-adapter`,
+              time: { created: 1 },
+              type: "user",
+              text: "hi",
+            },
+            // A finished run ends its history with the idle record that carries its outcome.
+            {
+              id: "msg_backfill_idle0000000000000",
+              time: { created: 5 },
+              type: "idle",
+              outcome: "succeeded",
+            },
+          ],
+          cursor: {},
+        }),
+      ]);
+      const collected = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      const seen = yield* Fiber.join(collected);
+      const phases = new Map(
+        seen.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+            ? [[event.turnItem.text, event.turnItem.phase] as const]
+            : [],
+        ),
+      );
+      // Narration written before a tool call is never the answer; the answer is the text its stop finished.
+      assert.strictEqual(phases.get("Checking."), "narration");
+      assert.strictEqual(phases.get("DONE"), "answer");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("records the native finish of the last step on the provider turn", () =>
+    Effect.gen(function* () {
+      const message = "msg_0eb735d5b001oAFVeY5jz3WD4Z";
+      const { runtime, thread } = yield* resumed([
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.text.started", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          ordinal: 0,
+        }),
+        event("session.text.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          ordinal: 0,
+          text: "DONE",
+        }),
+        event("session.step.ended", {
+          sessionID: SESSION,
+          assistantMessageID: message,
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 1200, output: 40, reasoning: 0, cache: { read: 300, write: 2500 } },
+        }),
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      ]);
+      const collected = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(turnInput(thread));
+      const seen = yield* Fiber.join(collected);
+      const finishes = seen.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status === "completed"
+          ? [event.providerTurn.finish]
+          : [],
+      );
+      assert.deepEqual(finishes, ["stop"]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("emits a streaming block's node only when it changes, and every text update", () =>
     Effect.gen(function* () {
       const block = {
@@ -4121,6 +4306,23 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         "assistant_message:completed",
         "command_execution:completed",
       ]);
+      const phases = collected.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+          ? [event.turnItem.phase]
+          : [],
+      );
+      const finished = collected.findLast(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "completed",
+      );
+      assert.deepEqual(
+        {
+          phase: phases.at(-1),
+          finish:
+            finished?.type === "provider_turn.updated" ? finished.providerTurn.finish : undefined,
+        },
+        { phase: "narration", finish: "stop" },
+      );
       assert.deepInclude(collected.at(-1), { type: "turn.terminal", status: "completed" });
     }).pipe(Effect.scoped),
   );

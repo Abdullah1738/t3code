@@ -28,6 +28,7 @@ import {
   StaleOpenCodeSessions,
   type StaleOpenCodeSession,
 } from "../ardud/opencode-import/StaleRuns.ts";
+import { withStartupPhase } from "../ardud/observability/StartupPhaseLog.ts";
 // ardud: startup logs one bounded summary of continuation decisions.
 import {
   restartContinuationDecision,
@@ -766,7 +767,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const reconcile = Effect.fn("ProviderRuntimeRecoveryService.reconcile")(function* (
+  const reconcileWithCounts = Effect.fn("ProviderRuntimeRecoveryService.reconcile")(function* (
     trigger: "startup" | "shutdown",
   ) {
     // ardud: malformed settings silently fall back to an opt-out, but should not be logged as one.
@@ -865,8 +866,21 @@ export const make = Effect.gen(function* () {
       requeuedEffects: outboxReconciliation.requeued,
       staleOpenCodeAborted,
       staleOpenCodeAbortFailed,
-    } satisfies ProviderRuntimeReconciliationSummary;
+      recoveryIds: threadIds.length,
+    } satisfies ProviderRuntimeReconciliationSummary & { readonly recoveryIds: number };
   });
+
+  const reconcile = (trigger: "startup" | "shutdown") => {
+    const work = reconcileWithCounts(trigger);
+    return (
+      trigger === "startup"
+        ? withStartupPhase("orchestration-v2.recovery.reconcile", work, (result) => ({
+            recoveryIds: result.recoveryIds,
+            terminalizedRuns: result.terminalizedRuns,
+          }))
+        : work
+    ).pipe(Effect.map(({ recoveryIds: _recoveryIds, ...summary }) => summary));
+  };
 
   const prepareForShutdown = Effect.gen(function* () {
     const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));

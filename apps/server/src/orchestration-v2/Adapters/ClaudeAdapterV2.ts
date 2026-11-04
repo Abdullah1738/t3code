@@ -75,6 +75,7 @@ import {
   type OrchestrationV2ProviderRetry,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2AssistantPhase,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2UserInputQuestion,
@@ -155,6 +156,10 @@ import {
 import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  t3ToolInstructions,
+  type T3CodeToolAvailability,
+} from "../../provider/T3ToolInstructions.ts";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import {
   mcpToolPresentation,
@@ -921,6 +926,12 @@ export const layerQueryRunner: Layer.Layer<
                           ),
                       }),
                     );
+                    if (failed.includes("recall")) {
+                      return yield* queryRunnerError(
+                        "Caller-aware recall could not be registered.",
+                        "setMcpServers",
+                      );
+                    }
                     if (failed.length > 0) {
                       yield* Effect.logWarning("orchestration-v2.claude-mcp-servers-unavailable", {
                         threadId: input.threadId,
@@ -1197,6 +1208,8 @@ export function makeClaudeQueryOptions(input: {
   readonly sdkSettings?: string | ClaudeSdkSettings;
   readonly environment?: NodeJS.ProcessEnv;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
+  /** Which preview/device tools the MCP credential grants; gates the guidance text. */
+  readonly t3ToolAvailability?: T3CodeToolAvailability;
   readonly tools?: ClaudeAgentSdkQueryTools;
   readonly allowedTools?: ReadonlyArray<string>;
   readonly disallowedTools?: ReadonlyArray<string>;
@@ -1289,7 +1302,12 @@ export function makeClaudeQueryOptions(input: {
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
+        (input.mcpServers?.["t3-code"] === undefined
+          ? ""
+          : T3_CODE_ORCHESTRATION_INSTRUCTIONS +
+            t3ToolInstructionsSuffix(
+              input.t3ToolAvailability ?? { browser: false, device: false },
+            )),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
@@ -1300,6 +1318,24 @@ export function makeClaudeQueryOptions(input: {
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
   return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+}
+
+/**
+ * Mirrors Codex's `toolInstructions`: the same capability-gated text for the same
+ * MCP credential, so Claude sessions learn about preview/device tools on the same terms.
+ */
+export function claudeT3ToolAvailability(
+  session: McpProviderSession.McpProviderSessionConfig | undefined,
+): T3CodeToolAvailability {
+  return {
+    browser: session?.browserToolsAvailable ?? true,
+    device: session?.capabilities?.has("device") ?? false,
+  };
+}
+
+function t3ToolInstructionsSuffix(availability: T3CodeToolAvailability): string {
+  const text = t3ToolInstructions(availability);
+  return text === "" ? "" : `\n\n${text}`;
 }
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
@@ -1345,29 +1381,46 @@ export function claudeMcpQueryOverrides(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly readOnlySandbox: boolean;
   readonly allowedTools?: ReadonlyArray<string>;
+  readonly recall?: { readonly url: string; readonly threadId: ThreadId };
 }): {
   readonly allowedTools?: ReadonlyArray<string>;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
 } {
   const session = input.mcpSession;
-  if (session === undefined) {
-    return input.allowedTools === undefined ? {} : { allowedTools: input.allowedTools };
-  }
   const mcpAllowedTools = input.readOnlySandbox
     ? CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS
     : [CLAUDE_T3_MCP_TOOL_WILDCARD];
+  const mcpServers: NonNullable<ClaudeQueryOptions["mcpServers"]> = {
+    ...(session === undefined
+      ? {}
+      : {
+          "t3-code": {
+            type: "http" as const,
+            url: session.endpoint,
+            headers: { Authorization: session.authorizationHeader },
+            timeout: CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
+          },
+        }),
+    ...(input.recall === undefined
+      ? {}
+      : {
+          recall: {
+            type: "http" as const,
+            url: input.recall.url,
+            headers: {
+              "X-Robob-Thread": input.recall.threadId,
+              "X-Robob-Driver": CLAUDE_PROVIDER,
+            },
+          },
+        }),
+  };
   return {
-    allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
-    mcpServers: {
-      "t3-code": {
-        type: "http",
-        url: session.endpoint,
-        headers: {
-          Authorization: session.authorizationHeader,
-        },
-        timeout: CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
-      },
-    },
+    ...(session === undefined
+      ? input.allowedTools === undefined
+        ? {}
+        : { allowedTools: input.allowedTools }
+      : { allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])) }),
+    ...(Object.keys(mcpServers).length === 0 ? {} : { mcpServers }),
   };
 }
 
@@ -3117,6 +3170,7 @@ function buildAssistantArtifacts(input: {
   readonly ordinal: number;
   readonly startedAt: DateTime.Utc;
   readonly completedAt: DateTime.Utc;
+  readonly phase?: OrchestrationV2AssistantPhase;
 }): {
   readonly node: OrchestrationV2ExecutionNode;
   readonly message: OrchestrationV2ConversationMessage;
@@ -3167,6 +3221,7 @@ function buildAssistantArtifacts(input: {
       nodeId,
       role: "assistant",
       text: input.text,
+      phase: input.phase ?? "unknown",
       attachments: [],
       streaming: false,
       createdAt: input.completedAt,
@@ -3190,9 +3245,22 @@ function buildAssistantArtifacts(input: {
       type: "assistant_message",
       messageId,
       text: input.text,
+      phase: input.phase ?? "unknown",
       streaming: false,
     },
   };
+}
+
+/**
+ * Claude writes text before a tool call as its own assistant line, so the stop
+ * reason of that line tells narration from the reply. Only `end_turn` proves the
+ * reply; anything else (missing, `max_tokens`, unknown) stays unknown.
+ */
+export function claudeAssistantPhase(message: SDKMessage): OrchestrationV2AssistantPhase {
+  if (message.type !== "assistant") return "unknown";
+  const content = message.message.content;
+  if (content.some((block) => block.type === "tool_use")) return "narration";
+  return message.message.stop_reason === "end_turn" ? "answer" : "unknown";
 }
 
 const CLAUDE_USAGE_LIMIT_WINDOWS = {
@@ -3252,6 +3320,22 @@ interface ActiveClaudeTurnContext {
     emittedNativeItemIds: Set<string>;
     // The CLI repeats a notice that ends a prompt as the turn's result text.
     noticeTexts: Set<string>;
+    /**
+     * Each emitted text, with the SDK message it came from. The CLI writes one message per content
+     * block, so a text and the tool call after it can be separate messages that share `message.id`.
+     * A group that later calls a tool makes its texts narration; the turn's result settles the rest.
+     */
+    readonly textGroups: Map<
+      string,
+      { readonly nativeItemId: string; readonly text: string; readonly groupId: string | null }
+    >;
+    /** SDK message groups (by `message.id`) that contained a tool call. */
+    readonly toolGroups: Set<string>;
+    /**
+     * SDK message groups whose stream reported `stop_reason: end_turn`. That proves the reply even when
+     * a steer keeps the run going, so the turn's final result is not the only answer.
+     */
+    readonly endedGroups: Set<string>;
   };
   readonly reasoning: {
     messageId: string | null;
@@ -4544,6 +4628,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly status: OrchestrationV2ProviderTurn["status"];
           readonly completedAt: DateTime.Utc | null;
+          /** The CLI's terminal stop reason (`end_turn`, `max_tokens`, ...); absent until the turn ends. */
+          readonly finish?: string | null;
         }): OrchestrationV2ProviderTurn => ({
           id: input.context.providerTurnId,
           providerThreadId: input.context.input.providerThread.id,
@@ -4558,6 +4644,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           status: input.status,
           startedAt: input.context.startedAt,
           completedAt: input.completedAt,
+          ...(input.finish === undefined ? {} : { finish: input.finish }),
         });
 
         const buildToolCallArtifacts = (input: {
@@ -6533,6 +6620,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context: input.context,
                     status: input.status,
                     completedAt: input.completedAt,
+                    // The terminal result reports the stop reason; a turn that ended with no result has none.
+                    finish: input.result?.stop_reason ?? null,
                   }),
                   turnTokenUsage: normalizeClaudeTurnTokenUsage(
                     input.result,
@@ -6639,11 +6728,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly context: ActiveClaudeTurnContext;
           readonly nativeItemId: string;
           readonly text: string;
+          readonly phase?: OrchestrationV2AssistantPhase;
+          /** The SDK message this text came from (`message.id`), which later tool or end evidence can name. */
+          readonly groupId?: string | null;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
           }
           input.context.assistant.emittedNativeItemIds.add(input.nativeItemId);
+          input.context.assistant.textGroups.set(input.nativeItemId, {
+            nativeItemId: input.nativeItemId,
+            text: input.text,
+            groupId: input.groupId ?? null,
+          });
           const now = yield* DateTime.now;
           const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
           const artifacts = buildAssistantArtifacts({
@@ -6655,6 +6752,53 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ordinal,
             startedAt: now,
             completedAt: now,
+            ...(input.phase === undefined ? {} : { phase: input.phase }),
+          });
+          yield* Effect.all(
+            [
+              emitProviderEvent({
+                type: "node.updated",
+                driver: CLAUDE_PROVIDER,
+                node: artifacts.node,
+              }),
+              emitProviderEvent({
+                type: "message.updated",
+                driver: CLAUDE_PROVIDER,
+                message: artifacts.message,
+              }),
+              emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CLAUDE_PROVIDER,
+                turnItem: artifacts.turnItem,
+              }),
+            ],
+            { concurrency: 1 },
+          );
+        });
+
+        /**
+         * Corrects the phase of a text already emitted, once later evidence settles it. The ids are
+         * derived from the native item, so the projection updates the same message in place.
+         */
+        const reemitAssistantPhase = Effect.fnUntraced(function* (input: {
+          readonly context: ActiveClaudeTurnContext;
+          readonly nativeItemId: string;
+          readonly phase: OrchestrationV2AssistantPhase;
+        }) {
+          const recorded = input.context.assistant.textGroups.get(input.nativeItemId);
+          if (recorded === undefined) return;
+          const now = yield* DateTime.now;
+          const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+          const artifacts = buildAssistantArtifacts({
+            idAllocator,
+            turnInput: input.context.input,
+            providerTurnId: input.context.providerTurnId,
+            nativeItemId: input.nativeItemId,
+            text: recorded.text,
+            ordinal,
+            startedAt: now,
+            completedAt: now,
+            phase: input.phase,
           });
           yield* Effect.all(
             [
@@ -7330,6 +7474,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 usage === undefined ? null : { messageId: event.message.id, usage };
               if (usage !== undefined) yield* emitContextUsage(context, usage);
             } else if (event.type === "message_delta") {
+              const endedGroup = reasoning.messageId;
+              if (event.delta.stop_reason === "end_turn" && endedGroup !== null) {
+                context.assistant.endedGroups.add(endedGroup);
+                if (!context.assistant.toolGroups.has(endedGroup)) {
+                  for (const recorded of context.assistant.textGroups.values()) {
+                    if (recorded.groupId === endedGroup) {
+                      yield* reemitAssistantPhase({
+                        context,
+                        nativeItemId: recorded.nativeItemId,
+                        phase: "answer",
+                      });
+                    }
+                  }
+                }
+              }
               const usage: typeof event.usage | undefined = event.usage;
               const stream = context.streamUsage;
               if (stream?.usage && usage !== undefined) {
@@ -8206,11 +8365,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
             return;
           }
+          if (message.type === "assistant") {
+            const groupId = typeof message.message.id === "string" ? message.message.id : null;
+            // A tool call in this message makes the message's texts narration, and so does an earlier
+            // text from the same message group that the CLI split out before the tool call.
+            if (
+              groupId !== null &&
+              message.message.content.some((block) => block.type === "tool_use")
+            ) {
+              context.assistant.toolGroups.add(groupId);
+              for (const recorded of context.assistant.textGroups.values()) {
+                if (recorded.groupId === groupId) {
+                  yield* reemitAssistantPhase({
+                    context,
+                    nativeItemId: recorded.nativeItemId,
+                    phase: "narration",
+                  });
+                }
+              }
+            }
+          }
           if (assistantText !== null && assistantText.text.length > 0) {
+            const textGroupId =
+              message.type === "assistant" && typeof message.message.id === "string"
+                ? message.message.id
+                : null;
+            const nativePhase = claudeAssistantPhase(message);
+            // The stream can report the group's end_turn before the CLI writes its text line.
+            const endedReply =
+              nativePhase === "unknown" &&
+              textGroupId !== null &&
+              context.assistant.endedGroups.has(textGroupId) &&
+              !context.assistant.toolGroups.has(textGroupId);
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
+              phase: endedReply ? "answer" : nativePhase,
+              groupId: textGroupId,
             });
             return;
           }
@@ -8360,6 +8552,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               resultFailure?.class === "usage_limit"
                 ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
                 : resultFailure;
+            // The result is the only place the turn's stop reason is reported. A text with no tool call
+            // in its message group is the reply when the turn ended with end_turn: settle its phase now.
+            if (message.stop_reason === "end_turn") {
+              // Only the last tool-free text is the reply. An earlier one that no tool call followed is
+              // still an aside, so it stays unknown rather than being presented as the answer.
+              const tailFree = [...context.assistant.textGroups.values()].filter(
+                (recorded) =>
+                  recorded.groupId === null || !context.assistant.toolGroups.has(recorded.groupId),
+              );
+              const reply = tailFree.at(-1);
+              if (reply !== undefined) {
+                yield* reemitAssistantPhase({
+                  context,
+                  nativeItemId: reply.nativeItemId,
+                  phase: "answer",
+                });
+              }
+            }
             yield* finalizeActiveTurn({
               context,
               status: interrupted
@@ -8923,13 +9133,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           nativeThreadId: string,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          const recallUrl = adapterOptions.environment.ROBOB_RECALL_MCP_URL?.trim();
           const mcpOverrides = claudeMcpQueryOverrides({
-            mcpSession: yield* mcpSessions.read(turnInput.threadId),
+            mcpSession,
             readOnlySandbox:
               sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly",
             ...(queryPolicy.allowedTools === undefined
               ? {}
               : { allowedTools: queryPolicy.allowedTools }),
+            ...(recallUrl ? { recall: { url: recallUrl, threadId: turnInput.threadId } } : {}),
           });
           const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
@@ -9029,6 +9242,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(mcpOverrides.mcpServers === undefined
               ? {}
               : { mcpServers: mcpOverrides.mcpServers }),
+            t3ToolAvailability: claudeT3ToolAvailability(mcpSession),
             permissionMode: queryPolicy.permissionMode,
             ...(queryPolicy.allowDangerouslySkipPermissions === undefined
               ? {}
@@ -9208,6 +9422,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 fallbackNativeItemId: `assistant:${turnInput.runId}`,
                 emittedNativeItemIds: new Set(),
                 noticeTexts: new Set(),
+                textGroups: new Map(),
+                toolGroups: new Set(),
+                endedGroups: new Set(),
               },
               reasoning: {
                 messageId: null,

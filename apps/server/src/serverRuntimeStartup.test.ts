@@ -47,6 +47,8 @@ import { ServerActivation } from "./serverActivation.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
+import * as StartupPhaseLog from "./ardud/observability/StartupPhaseLog.ts";
+import * as TestClock from "effect/testing/TestClock";
 
 it("uses the canonical Codex model for auto-bootstrap", () => {
   assert.deepEqual(ServerRuntimeStartup.getAutoBootstrapThreadModelSelection(), {
@@ -60,6 +62,7 @@ it.effect.each([
   "disabled-default",
   "launch-failure",
   "project-failure",
+  "slow-recovery",
 ] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -68,6 +71,17 @@ it.effect.each([
         scenario === "disabled-default" ? "custom" : "codex",
       );
       const events: ServerLifecycleStreamEvent[] = [];
+      const records: Array<{ phase: string; outcome: string; durationMs?: number }> = [];
+      const logger: StartupPhaseLog.StartupPhaseLog["Service"] = {
+        start: (phase) => {
+          records.push({ phase, outcome: "start" });
+        },
+        end: (phase, _at, durationMs, outcome) => {
+          records.push({ phase, outcome, durationMs });
+        },
+      };
+      const recoveryStarted = yield* Deferred.make<void>();
+      const releaseRecovery = yield* Deferred.make<void>();
       const recovery = {
         terminalizedRuns: 0,
         stoppedSessions: 0,
@@ -121,7 +135,13 @@ it.effect.each([
           importPendingTranscripts: Effect.succeed(imports),
         }),
         Layer.mock(ProviderRuntimeRecovery.ProviderRuntimeRecoveryService)({
-          recover: Effect.succeed(recovery),
+          recover:
+            scenario === "slow-recovery"
+              ? Deferred.succeed(recoveryStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRecovery)),
+                  Effect.as(recovery),
+                )
+              : Effect.succeed(recovery),
           prepareForShutdown: Effect.void,
           reconcile: () => Effect.succeed(recovery),
         }),
@@ -229,6 +249,31 @@ it.effect.each([
       yield* Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* startup.markHttpListening;
+        if (scenario === "slow-recovery") {
+          yield* Deferred.await(recoveryStarted);
+          const descriptorReturned = yield* Deferred.make<void>();
+          // layerCommandReadiness awaits this same gate before running HTTP handlers.
+          const descriptor = yield* startup.awaitCommandReady.pipe(
+            Effect.andThen(Deferred.succeed(descriptorReturned, undefined)),
+            Effect.forkChild,
+          );
+          assert.isFalse(yield* Deferred.isDone(descriptorReturned));
+          assert.deepEqual(
+            records.filter((record) => record.phase === "orchestration-v2.recovery"),
+            [{ phase: "orchestration-v2.recovery", outcome: "start" }],
+          );
+          yield* TestClock.adjust("7 seconds");
+          yield* Deferred.succeed(releaseRecovery, undefined);
+          yield* Fiber.join(descriptor);
+          assert.isTrue(yield* Deferred.isDone(descriptorReturned));
+          assert.deepEqual(
+            records.filter((record) => record.phase === "orchestration-v2.recovery"),
+            [
+              { phase: "orchestration-v2.recovery", outcome: "start" },
+              { phase: "orchestration-v2.recovery", outcome: "success", durationMs: 7000 },
+            ],
+          );
+        }
         const ready = yield* Effect.exit(startup.awaitCommandReady);
         assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
         const welcome = events.find((event) => event.type === "welcome");
@@ -243,6 +288,7 @@ it.effect.each([
         }
       }).pipe(
         Effect.provide(ServerRuntimeStartup.layerWithOptions().pipe(Layer.provide(dependencies))),
+        Effect.provideService(StartupPhaseLog.StartupPhaseLog, logger),
         Effect.provideService(ServerActivation, Effect.never),
       );
     }),

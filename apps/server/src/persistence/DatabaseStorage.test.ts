@@ -118,7 +118,11 @@ const compactionLayer = (
   DatabaseStorage.layer.pipe(
     Layer.provide(
       Layer.succeed(ProjectionMaintenance.ProjectionMaintenanceV2, {
-        compactEventStore,
+        compactEventStore: Effect.die("background compaction must be paced"),
+        compactEventStoreWith: ({ minPageIntervalMs }) => {
+          assert.equal(minPageIntervalMs, 25);
+          return compactEventStore;
+        },
         verify: Effect.die("unexpected verification"),
         rebuild: Effect.die("unexpected rebuild"),
       }),
@@ -129,13 +133,21 @@ const compactionLayer = (
 const minute = 60_000;
 const hour = 60 * minute;
 const startupTime = Date.UTC(2026, 9, 19);
-const emptyCompaction = { deletedEventCount: 0, deletedReceiptCount: 0, reclaimableBytes: 0 };
+const emptyCompaction = {
+  deletedEventCount: 0,
+  deletedReceiptCount: 0,
+  reclaimableBytes: 0,
+  consideredTextEventCount: 0,
+  deletedTextEventCount: 0,
+  retainedTextEventCount: 0,
+  deletedTextPayloadBytes: 0,
+};
 
 it.effect.each([
-  { name: "recent success", saved: String(startupTime - 2 * hour), delay: 4 * hour },
-  { name: "overdue success", saved: String(startupTime - 7 * hour), delay: minute },
-  { name: "nearly due success", saved: String(startupTime - 6 * hour + 1), delay: minute },
-  { name: "future timestamp", saved: String(startupTime + hour), delay: 6 * hour },
+  { name: "recent success", saved: String(startupTime - 2 * hour), delay: 22 * hour },
+  { name: "overdue success", saved: String(startupTime - 25 * hour), delay: minute },
+  { name: "nearly due success", saved: String(startupTime - 24 * hour + 1), delay: minute },
+  { name: "future timestamp", saved: String(startupTime + hour), delay: 24 * hour },
   { name: "missing timestamp", saved: undefined, delay: minute },
   { name: "invalid timestamp", saved: "not a timestamp", delay: minute },
   { name: "unreadable timestamp", saved: undefined, delay: minute },
@@ -163,7 +175,7 @@ it.effect.each([
 );
 
 it.effect.each(["success", "compaction failure", "timestamp write failure"] as const)(
-  "keeps the six-hour cadence after %s and remembers only successful completion",
+  "keeps the daily cadence after %s and remembers only successful completion",
   (outcome) =>
     Effect.gen(function* () {
       yield* TestClock.setTime(startupTime);
@@ -171,7 +183,7 @@ it.effect.each(["success", "compaction failure", "timestamp write failure"] as c
       const path = yield* Path.Path;
       const config = yield* ServerConfig.ServerConfig;
       const timestampPath = path.join(path.dirname(config.dbPath), "compacted-at");
-      const previous = String(startupTime - 7 * hour);
+      const previous = String(startupTime - 25 * hour);
       if (outcome === "timestamp write failure") yield* fs.makeDirectory(timestampPath);
       else yield* fs.writeFileString(timestampPath, previous);
       const starts = yield* Queue.unbounded<number>();
@@ -194,10 +206,10 @@ it.effect.each(["success", "compaction failure", "timestamp write failure"] as c
         }
         yield* Queue.offer(finish, undefined);
         if (outcome !== "compaction failure") yield* Deferred.await(writeFinished);
-        yield* TestClock.adjust(6 * hour - 1);
+        yield* TestClock.adjust(24 * hour - 1);
         assert.equal(yield* Queue.size(starts), 0);
         yield* TestClock.adjust(1);
-        assert.equal(yield* Queue.take(starts), startupTime + 3 * minute + 6 * hour);
+        assert.equal(yield* Queue.take(starts), startupTime + 3 * minute + 24 * hour);
       }).pipe(
         Effect.provide(compactionLayer(compact)),
         Effect.provideService(FileSystem.FileSystem, {
@@ -213,4 +225,34 @@ it.effect.each(["success", "compaction failure", "timestamp write failure"] as c
         assert.equal(saved, outcome === "success" ? startupTime + 3 * minute : Number(previous));
       }
     }).pipe(Effect.provide(testConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+it.effect("does not overlap a running compaction or mark an interrupted pass complete", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(startupTime);
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const config = yield* ServerConfig.ServerConfig;
+    const timestampPath = path.join(path.dirname(config.dbPath), "compacted-at");
+    const previous = String(startupTime - 25 * hour);
+    yield* fs.writeFileString(timestampPath, previous);
+    const starts = yield* Queue.unbounded<number>();
+    const stopped = yield* Deferred.make<void>();
+    const compact = Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) => Queue.offer(starts, now)),
+      Effect.andThen(Effect.never),
+      Effect.ensuring(Deferred.succeed(stopped, undefined)),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.adjust(minute);
+        assert.equal(yield* Queue.take(starts), startupTime + minute);
+        yield* TestClock.adjust(25 * hour);
+        assert.equal(yield* Queue.size(starts), 0);
+        assert.equal(yield* fs.readFileString(timestampPath), previous);
+      }).pipe(Effect.provide(compactionLayer(compact))),
+    );
+    yield* Deferred.await(stopped);
+    assert.equal(yield* fs.readFileString(timestampPath), previous);
+  }).pipe(Effect.provide(testConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
 );

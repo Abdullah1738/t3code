@@ -3,19 +3,24 @@
 import { randomUUID } from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
+const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
 
 const HELP = `t3ctl <command> [options]
 
   login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
   health                               check the connection and token
+  live SHA-OR-REF [--repo PATH]        check whether a commit is in the running build
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
   models                               default model and available models
+  usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
@@ -52,78 +57,89 @@ Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
 ${SHARED_TOKEN_FILE}.`;
 
-const { values: flags, positionals } = NodeUtil.parseArgs({
-  allowPositionals: true,
-  options: {
-    url: { type: "string" },
-    token: { type: "string" },
-    driver: { type: "string" },
-    instance: { type: "string" },
-    agent: { type: "string" },
-    prompt: { type: "string" },
-    title: { type: "string" },
-    dir: { type: "string" },
-    project: { type: "string" },
-    model: { type: "string" },
-    variant: { type: "string" },
-    option: { type: "string", multiple: true },
-    mode: { type: "string" },
-    origin: { type: "string" },
-    plan: { type: "boolean" },
-    wait: { type: "boolean" },
-    drain: { type: "boolean" },
-    timeout: { type: "string" },
-    "request-timeout": { type: "string" },
-    "request-id": { type: "string" },
-    active: { type: "boolean" },
-    state: { type: "string" },
-    since: { type: "string" },
-    limit: { type: "string" },
-    "all-kinds": { type: "boolean" },
-    last: { type: "boolean" },
-    role: { type: "string" },
-    approve: { type: "boolean" },
-    deny: { type: "boolean" },
-    always: { type: "boolean" },
-    dismiss: { type: "boolean" },
-    answer: { type: "string", multiple: true },
-    archive: { type: "boolean" },
-    unarchive: { type: "boolean" },
-    settle: { type: "boolean" },
-    unsettle: { type: "boolean" },
-    thread: { type: "string" },
-    session: { type: "string" },
-    "expect-run": { type: "string" },
-    "expect-attempt": { type: "string" },
-    reason: { type: "string" },
-    "native-id": { type: "string" },
-    "agent-id": { type: "string" },
-    task: { type: "string" },
-    scope: { type: "string" },
-    ticket: { type: "string" },
-    evidence: { type: "string" },
-    types: { type: "string" },
-    after: { type: "string" },
-    text: { type: "boolean" },
-    help: { type: "boolean", short: "h" },
-  },
-});
-
-const [command, ...args] = positionals;
-const print = (value) => console.log(JSON.stringify(value, null, 2));
-const need = (value, name) => {
-  if (!value) {
-    console.error(`missing ${name}\n\n${HELP}`);
-    process.exit(2);
+/** Check whether a ref is an ancestor of the build reported by health. */
+export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
+  let response;
+  try {
+    response = await health();
+  } catch {
+    return { commit, buildCommit: null, live: null, reason: "health unavailable" };
   }
-  return value;
-};
-const timeoutMs = () => (flags.timeout ? Number(flags.timeout) * 1000 : 10 * 60_000);
+  if (response?.ok !== true || response?.status !== "healthy") {
+    return { commit, buildCommit: null, live: null, reason: "invalid health response" };
+  }
+  const buildCommit = response.buildCommit;
+  if (
+    typeof buildCommit !== "string" ||
+    buildCommit.trim() !== buildCommit ||
+    !/^[0-9a-f]{7,40}$/.test(buildCommit)
+  ) {
+    return { commit, buildCommit: null, live: null, reason: "build commit unavailable" };
+  }
+  if (typeof commit !== "string" || !commit || commit.startsWith("-")) {
+    return { commit: commit ?? null, buildCommit, live: null, reason: "invalid commit or ref" };
+  }
+
+  const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+  ])
+    delete gitEnv[key];
+  const git = (...args) =>
+    NodeChildProcess.spawnSync("git", args, {
+      cwd: repo,
+      env: gitEnv,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+  const objectId = (prefix) => {
+    const result = git("rev-parse", `--disambiguate=${prefix.toLowerCase()}`);
+    const matches = result.stdout?.trim().split("\n").filter(Boolean) ?? [];
+    return result.status === 0 &&
+      matches.length === 1 &&
+      git("cat-file", "-t", matches[0]).stdout?.trim() === "commit"
+      ? matches[0]
+      : null;
+  };
+  const target = /^[0-9a-f]{7,40}$/i.test(commit)
+    ? objectId(commit)
+    : (() => {
+        const result = git("rev-parse", "--verify", "--end-of-options", `${commit}^{commit}`);
+        return result.status === 0 ? result.stdout.trim() : null;
+      })();
+  if (target === null) {
+    return { commit, buildCommit, live: null, reason: "commit or ref unavailable" };
+  }
+  const build = objectId(buildCommit);
+  if (build === null) {
+    return { commit, buildCommit, live: null, reason: "build commit unavailable in repo" };
+  }
+  const result = git("merge-base", "--is-ancestor", target, build);
+  if (result.status === 0) return { commit, buildCommit, live: true, reason: "ancestor of build" };
+  if (result.status === 1) {
+    const shallow = git("rev-parse", "--is-shallow-repository");
+    if (shallow.status === 0 && shallow.stdout.trim() === "false") {
+      return { commit, buildCommit, live: false, reason: "not ancestor of build" };
+    }
+    return { commit, buildCommit, live: null, reason: "ancestry incomplete or unavailable" };
+  }
+  return { commit, buildCommit, live: null, reason: "git ancestry check failed" };
+}
+
 const shellQuote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
 const shellOption = (name, value) =>
   value.startsWith("-") ? `--${name}=${shellQuote(value)}` : `--${name} ${shellQuote(value)}`;
 
-function sendRetry(threadId, text, requestId, token) {
+function sendRetry(flags, threadId, text, requestId, token) {
   const retry = ["t3ctl", "send"];
   const threadNeedsSeparator = threadId.startsWith("-");
   if (!threadNeedsSeparator) retry.push(shellQuote(threadId));
@@ -180,18 +196,89 @@ function transportDisconnected(error) {
   return false;
 }
 
-const modelOptions = () =>
-  flags.option?.map((entry) => {
-    const index = entry.indexOf("=");
-    if (index <= 0 || index === entry.length - 1) {
-      throw new Error("--option needs a non-empty K=V");
-    }
-    const id = entry.slice(0, index);
-    const value = entry.slice(index + 1);
-    return { id, value: value === "true" ? true : value === "false" ? false : value };
+async function main() {
+  const { values: flags, positionals } = NodeUtil.parseArgs({
+    allowPositionals: true,
+    options: {
+      url: { type: "string" },
+      token: { type: "string" },
+      driver: { type: "string" },
+      instance: { type: "string" },
+      agent: { type: "string" },
+      prompt: { type: "string" },
+      title: { type: "string" },
+      dir: { type: "string" },
+      repo: { type: "string" },
+      project: { type: "string" },
+      model: { type: "string" },
+      variant: { type: "string" },
+      option: { type: "string", multiple: true },
+      mode: { type: "string" },
+      origin: { type: "string" },
+      plan: { type: "boolean" },
+      wait: { type: "boolean" },
+      drain: { type: "boolean" },
+      timeout: { type: "string" },
+      "request-timeout": { type: "string" },
+      "request-id": { type: "string" },
+      active: { type: "boolean" },
+      state: { type: "string" },
+      since: { type: "string" },
+      until: { type: "string" },
+      board: { type: "string" },
+      limit: { type: "string" },
+      "all-pages": { type: "boolean" },
+      "all-kinds": { type: "boolean" },
+      last: { type: "boolean" },
+      role: { type: "string" },
+      approve: { type: "boolean" },
+      deny: { type: "boolean" },
+      always: { type: "boolean" },
+      dismiss: { type: "boolean" },
+      answer: { type: "string", multiple: true },
+      archive: { type: "boolean" },
+      unarchive: { type: "boolean" },
+      settle: { type: "boolean" },
+      unsettle: { type: "boolean" },
+      thread: { type: "string" },
+      session: { type: "string" },
+      "expect-run": { type: "string" },
+      "expect-attempt": { type: "string" },
+      reason: { type: "string" },
+      "native-id": { type: "string" },
+      "agent-id": { type: "string" },
+      task: { type: "string" },
+      scope: { type: "string" },
+      ticket: { type: "string" },
+      evidence: { type: "string" },
+      types: { type: "string" },
+      after: { type: "string" },
+      text: { type: "boolean" },
+      help: { type: "boolean", short: "h" },
+    },
   });
 
-async function main() {
+  const [command, ...args] = positionals;
+  const print = (value) => console.log(JSON.stringify(value, null, 2));
+  const need = (value, name) => {
+    if (!value) {
+      console.error(`missing ${name}\n\n${HELP}`);
+      process.exit(2);
+    }
+    return value;
+  };
+  const timeoutMs = () => (flags.timeout ? Number(flags.timeout) * 1000 : 10 * 60_000);
+  const modelOptions = () =>
+    flags.option?.map((entry) => {
+      const index = entry.indexOf("=");
+      if (index <= 0 || index === entry.length - 1) {
+        throw new Error("--option needs a non-empty K=V");
+      }
+      const id = entry.slice(0, index);
+      const value = entry.slice(index + 1);
+      return { id, value: value === "true" ? true : value === "false" ? false : value };
+    });
+
   if (!command || flags.help) {
     console.log(HELP);
     return;
@@ -205,6 +292,17 @@ async function main() {
     });
     NodeFS.chmodSync(TOKEN_FILE, 0o600);
     console.log(`saved ${TOKEN_FILE}`);
+    return;
+  }
+  if (command === "live") {
+    const commit = need(args[0], "SHA-OR-REF");
+    const result = await checkLive(commit, {
+      repo: flags.repo,
+      health: () =>
+        new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" }).health(),
+    });
+    print(result);
+    process.exitCode = result.live === true ? 0 : result.live === false ? 3 : 2;
     return;
   }
   let requestTimeoutMs;
@@ -241,6 +339,34 @@ async function main() {
       return print(await client.projects());
     case "models":
       return print(await client.models());
+    case "usage": {
+      const filters = {
+        since: need(flags.since, "--since"),
+        until: flags.until,
+        boardId: flags.board,
+        limit: flags.limit,
+      };
+      const first = await client.usage(filters);
+      if (!flags["all-pages"]) return print(first);
+      const items = [];
+      const seen = new Set();
+      let page = first;
+      while (true) {
+        if (
+          !page ||
+          !Array.isArray(page.items) ||
+          (page.nextCursor !== null && typeof page.nextCursor !== "string")
+        ) {
+          throw new Error("invalid usage page");
+        }
+        for (const item of page.items) items.push(item);
+        const cursor = page.nextCursor;
+        if (cursor === null) return print({ ...first, items, nextCursor: null });
+        if (seen.has(cursor)) throw new Error("usage pagination returned a repeated cursor");
+        seen.add(cursor);
+        page = await client.usage({ ...filters, cursor });
+      }
+    }
     case "desktop-lease": {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";
@@ -377,7 +503,7 @@ async function main() {
         const timedOut = controller.signal.aborted || transportRetry(error);
         if (timedOut || transportDisconnected(error)) {
           console.error(
-            `send ${timedOut ? "timed out" : "connection dropped"}; it may or may not have been delivered. Retry safely with: ${sendRetry(threadId, text, requestId, client.token)}`,
+            `send ${timedOut ? "timed out" : "connection dropped"}; it may or may not have been delivered. Retry safely with: ${sendRetry(flags, threadId, text, requestId, client.token)}`,
           );
           process.exitCode = 4;
           return;
@@ -491,7 +617,19 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.code ? `${error.code}: ${error.message}` : (error.message ?? String(error)));
-  process.exit(1);
-});
+let isMain = false;
+try {
+  isMain =
+    !!process.argv[1] &&
+    NodeFS.realpathSync(process.argv[1]) === NodeURL.fileURLToPath(import.meta.url);
+} catch {
+  // An importing process may have a non-file argv[1].
+}
+if (isMain) {
+  main().catch((error) => {
+    console.error(
+      error.code ? `${error.code}: ${error.message}` : (error.message ?? String(error)),
+    );
+    process.exitCode = process.argv[2] === "live" ? 2 : 1;
+  });
+}

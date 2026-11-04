@@ -155,6 +155,20 @@ export class ControlClient {
   }
 
   /**
+   * @param {{ since: string | number, until?: string | number, cursor?: string,
+   *   limit?: number | string, boardId?: string }} filters
+   * @returns {Promise<{ items: unknown[], nextCursor: string | null }>}
+   */
+  usage(filters) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
+    }
+    const suffix = query.size > 0 ? `?${query}` : "";
+    return this.request("GET", `/usage${suffix}`);
+  }
+
+  /**
    * @param {{ origin?: string, active?: boolean, state?: string, updatedSince?: string | number,
    *   projectId?: string, parentThreadId?: string, includeSubagents?: boolean, archived?: boolean, limit?: number,
    *   ids?: string[] }} [filters]

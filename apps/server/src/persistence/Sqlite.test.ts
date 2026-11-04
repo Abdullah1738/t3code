@@ -14,6 +14,9 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { WAL_SIZE_LIMIT_BYTES } from "./Sqlite.ts";
 import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 
 const lockHolderSource = `
 const { DatabaseSync } = require("node:sqlite");
@@ -25,6 +28,73 @@ setTimeout(() => {
   db.close();
 }, Number(process.argv[2]));
 `;
+
+it.effect("logs migration before a blocked shell-index phase", () => {
+  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-phases-"));
+  const read = () =>
+    NodeFS.readFileSync(NodePath.join(tempDir, "startup-phases.ndjson"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { phase: string; outcome: string });
+  return Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const fiber = yield* SqlitePersistence.runSqliteSetupPhases(
+      Effect.void,
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+    ).pipe(Effect.provide(StartupPhaseLog.layer(tempDir)), Effect.forkChild);
+    yield* Deferred.await(entered);
+    assert.deepEqual(
+      read().map(({ phase, outcome }) => [phase, outcome]),
+      [
+        ["sqlite.migrations", "start"],
+        ["sqlite.migrations", "success"],
+        ["sqlite.shell-indexes", "start"],
+      ],
+    );
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(fiber);
+    assert.deepEqual(read().at(-1)?.outcome, "success");
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("logs the actual SQLite open, setup, migration and index boundaries", () => {
+  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-phases-"));
+  const dbPath = NodePath.join(tempDir, "state.sqlite");
+  return Effect.gen(function* () {
+    yield* Effect.gen(function* () {
+      yield* SqlClient.SqlClient;
+    }).pipe(
+      Effect.provide(
+        SqlitePersistence.layerFromPath(dbPath).pipe(
+          Layer.provide(NodeServices.layer),
+          Layer.provide(StartupPhaseLog.layer(tempDir)),
+        ),
+      ),
+    );
+    const records = NodeFS.readFileSync(NodePath.join(tempDir, "startup-phases.ndjson"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { phase: string; outcome: string });
+    assert.deepEqual(
+      records.map(({ phase, outcome }) => [phase, outcome]),
+      [
+        ["sqlite.open", "start"],
+        ["sqlite.open", "success"],
+        ["sqlite.setup", "start"],
+        ["sqlite.migrations", "start"],
+        ["sqlite.migrations", "success"],
+        ["sqlite.shell-indexes", "start"],
+        ["sqlite.shell-indexes", "success"],
+        ["sqlite.setup", "success"],
+      ],
+    );
+  }).pipe(
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+  );
+});
 
 const spawnWriteLockHolder = (dbPath: string, holdMs: number) =>
   Effect.promise(

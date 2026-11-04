@@ -46,6 +46,17 @@ const controlEnv = (url: string) => ({
 const runCli = (url: string, args: string[]) =>
   runCommand(process.execPath, [cli, ...args], controlEnv(url));
 
+const runUsageCli = (url: string, args: string[]) =>
+  execFile(process.execPath, [
+    NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
+    "usage",
+    ...args,
+    "--url",
+    url,
+    "--token",
+    "test",
+  ]);
+
 describe("discoverConfig", () => {
   const saved = {
     url: process.env.T3_CONTROL_URL,
@@ -358,6 +369,193 @@ describe("ControlClient", () => {
       expect(result.code).toBe(1);
       expect(result.stderr).toMatch(/--request-timeout must be a positive number of seconds/);
     }
+  });
+
+  it("forwards usage filters, encoding cursors and board IDs and omitting absent values", async () => {
+    const seen: Array<{
+      method: string | undefined;
+      url: string;
+      authorization: string | undefined;
+    }> = [];
+    const url = await listen((request, response) => {
+      seen.push({
+        method: request.method,
+        url: request.url!,
+        authorization: request.headers.authorization,
+      });
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ items: [{ id: "one" }], nextCursor: "next/+=" }));
+    });
+    const client = new ControlClient({ url, token: "test" });
+    const filters = {
+      since: 0,
+      until: "2026-11-03T10:00:00+04:00",
+      cursor: "cursor/+?=&%",
+      limit: 3,
+      boardId: "board:/ &?#",
+    };
+    expect(await client.usage(filters)).toEqual({ items: [{ id: "one" }], nextCursor: "next/+=" });
+    await client.usage({ since: "2026-11-01T00:00:00Z" });
+
+    expect(seen.map(({ method, authorization }) => ({ method, authorization }))).toEqual([
+      { method: "GET", authorization: "Bearer test" },
+      { method: "GET", authorization: "Bearer test" },
+    ]);
+    const first = new URL(seen[0]!.url, url);
+    expect(first.pathname).toBe("/api/ardud/control/usage");
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      ...filters,
+      since: "0",
+      limit: "3",
+    });
+    const second = new URL(seen[1]!.url, url);
+    expect(second.pathname).toBe("/api/ardud/control/usage");
+    expect(Object.fromEntries(second.searchParams)).toEqual({ since: "2026-11-01T00:00:00Z" });
+  });
+
+  it("t3ctl usage prints one page and forwards its filters", async () => {
+    const seen: string[] = [];
+    const page = { ok: true, items: [{ id: "first" }], nextCursor: "cursor-2" };
+    const url = await listen((request, response) => {
+      seen.push(request.url!);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(page));
+    });
+    const result = await runUsageCli(url, [
+      "--since",
+      "2026-11-01T00:00:00Z",
+      "--until",
+      "2026-11-03T10:00:00+04:00",
+      "--board",
+      "board:one/a",
+      "--limit",
+      "2",
+    ]);
+    expect(JSON.parse(result.stdout)).toEqual(page);
+    expect(seen).toHaveLength(1);
+    const request = new URL(seen[0]!, url);
+    expect(request.pathname).toBe("/api/ardud/control/usage");
+    expect(Object.fromEntries(request.searchParams)).toEqual({
+      since: "2026-11-01T00:00:00Z",
+      until: "2026-11-03T10:00:00+04:00",
+      boardId: "board:one/a",
+      limit: "2",
+    });
+  });
+
+  it("t3ctl usage follows every cursor without dropping filters and combines the pages", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const cursor1 = "first/+?=&%";
+    const cursor2 = "second cursor";
+    const url = await listen((request, response) => {
+      const query = new URL(request.url!, "http://localhost").searchParams;
+      seen.push(Object.fromEntries(query));
+      const cursor = query.get("cursor");
+      const page =
+        cursor === null
+          ? { ok: true, items: [{ id: 1 }], nextCursor: cursor1 }
+          : cursor === cursor1
+            ? { ok: true, items: [{ id: 2 }], nextCursor: cursor2 }
+            : { ok: true, items: [{ id: 3 }], nextCursor: null };
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(page));
+    });
+    const result = await runUsageCli(url, [
+      "--since",
+      "0",
+      "--until",
+      "1234567890000",
+      "--board",
+      "board:/ &?#",
+      "--limit",
+      "1",
+      "--all-pages",
+    ]);
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: true,
+      items: [{ id: 1 }, { id: 2 }, { id: 3 }],
+      nextCursor: null,
+    });
+    const filters = { since: "0", until: "1234567890000", boardId: "board:/ &?#", limit: "1" };
+    expect(seen).toEqual([
+      filters,
+      { ...filters, cursor: cursor1 },
+      { ...filters, cursor: cursor2 },
+    ]);
+  });
+
+  it("t3ctl usage fails on repeated cursors instead of looping or printing partial results", async () => {
+    let calls = 0;
+    const url = await listen((_request, response) => {
+      calls++;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ items: [{ id: calls }], nextCursor: "repeat" }));
+    });
+    await expect(runUsageCli(url, ["--since", "0", "--all-pages"])).rejects.toMatchObject({
+      code: 1,
+      stdout: "",
+      stderr: expect.stringContaining("repeated cursor"),
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("t3ctl usage follows a cursor when until is omitted", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const url = await listen((request, response) => {
+      const query = new URL(request.url!, "http://localhost").searchParams;
+      seen.push(Object.fromEntries(query));
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify(
+          query.has("cursor")
+            ? { items: [{ id: 2 }], nextCursor: null }
+            : { items: [{ id: 1 }], nextCursor: "next" },
+        ),
+      );
+    });
+    const result = await runUsageCli(url, ["--since", "1000", "--all-pages"]);
+    expect(JSON.parse(result.stdout)).toEqual({ items: [{ id: 1 }, { id: 2 }], nextCursor: null });
+    expect(seen).toEqual([{ since: "1000" }, { since: "1000", cursor: "next" }]);
+  });
+
+  it("t3ctl usage reports later page errors without printing partial results", async () => {
+    let calls = 0;
+    const url = await listen((_request, response) => {
+      calls++;
+      response.setHeader("content-type", "application/json");
+      if (calls === 1) {
+        response.end(JSON.stringify({ items: [{ id: 1 }], nextCursor: "next" }));
+      } else {
+        response.statusCode = 500;
+        response.end(JSON.stringify({ ok: false, error: { code: "internal", message: "failed" } }));
+      }
+    });
+    await expect(runUsageCli(url, ["--since", "0", "--all-pages"])).rejects.toMatchObject({
+      code: 1,
+      stdout: "",
+      stderr: expect.stringContaining("internal: failed"),
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("t3ctl usage rejects malformed pages instead of returning partial results", async () => {
+    const url = await listen((_request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ items: [] }));
+    });
+    await expect(runUsageCli(url, ["--since", "0", "--all-pages"])).rejects.toMatchObject({
+      code: 1,
+      stdout: "",
+      stderr: expect.stringContaining("invalid usage page"),
+    });
+  });
+
+  it("t3ctl usage requires --since", async () => {
+    const url = await listen((_request, response) => response.end());
+    await expect(runUsageCli(url, [])).rejects.toMatchObject({
+      code: 2,
+      stderr: expect.stringContaining("missing --since"),
+    });
   });
 
   it("forwards guarded interrupt options from the client and CLI", async () => {

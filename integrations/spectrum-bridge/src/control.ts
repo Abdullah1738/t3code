@@ -79,11 +79,21 @@ export interface ControlMessage {
   runId: string | null;
   role: "user" | "assistant" | "system";
   text: string;
+  /** Whether the assistant text is the reply or narration before a tool call; "unknown" when the provider did not say. */
+  phase?: "answer" | "narration" | "unknown";
   streaming: boolean;
   createdBy?: string;
   creationSource?: string;
   createdAt: string | null;
   updatedAt: string | null;
+}
+
+export interface RunEvidence {
+  runId: string;
+  status: string;
+  toolEvidence: "ran" | "none" | "unknown";
+  complete: boolean;
+  messages: Array<{ id: string; phase: "answer" | "narration" | "unknown"; text: string }>;
 }
 
 export interface ControlEventFrame {
@@ -186,6 +196,15 @@ export class ControlClient {
       if (value !== undefined) query.set(key, Array.isArray(value) ? value.join(",") : String(value));
     }
     return this.request("GET", `/threads${query.size ? `?${query}` : ""}`);
+  }
+
+  /**
+   * One run's own evidence: whether a tool ran (`toolEvidence`) and its assistant messages with
+   * their phase. `none` comes only from a settled run with every item read, so callers can
+   * retry on `none` and must not on anything else.
+   */
+  runEvidence(threadId: string, runId: string): Promise<RunEvidence> {
+    return this.request("GET", `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/evidence`);
   }
 
   messages(threadId: string): Promise<{ messages: ControlMessage[]; state: ThreadState; status: string; runId: string | null }> {

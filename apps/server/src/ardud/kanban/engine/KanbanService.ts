@@ -47,6 +47,7 @@ import {
 import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -77,12 +78,14 @@ import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
+import * as Text from "./text.ts";
 import { KanbanThreads } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 
 /** Typing shows while an agent's turn runs; refreshed by the tick, cleared at turn end. */
 const TYPING_MS = 90_000;
+export const BOARD_WRITE_START_DEADLINE_MS = 20_000;
 
 const wakeKey = (threadId: string, at: string) =>
   `wake:${NodeCrypto.createHash("sha256").update(`${threadId}|${at}`).digest("hex").slice(0, 32)}`;
@@ -225,6 +228,12 @@ export interface KanbanServiceShape {
     readonly name: string;
     readonly defaultProjectId: ProjectId | null;
     readonly evaluatorModel?: ModelSelection | undefined;
+  }) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly openBoard: (input: {
+    readonly slug: string;
+    readonly name: string;
+    readonly defaultProjectId: ProjectId | null;
+    readonly icon?: string | null | undefined;
   }) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly updateBoard: (
     boardId: KanbanBoard["id"],
@@ -373,6 +382,7 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     title: string,
     actor: KanbanActor,
+    blocks?: ReadonlyArray<KanbanBlock>,
   ) => Effect.Effect<KanbanDiscussion, KanbanError>;
   /** Owner only: rename, settle, snooze or pin a discussion. */
   readonly updateDiscussion: (
@@ -391,6 +401,11 @@ export interface KanbanServiceShape {
   readonly attachmentPath: (attachment: ChatAttachment) => string | null;
   readonly post: (
     discussionId: KanbanDiscussion["id"],
+    author: KanbanActor,
+    blocks: ReadonlyArray<KanbanBlock>,
+  ) => Effect.Effect<KanbanMessage, KanbanError>;
+  readonly postToCard: (
+    cardId: KanbanCard["id"],
     author: KanbanActor,
     blocks: ReadonlyArray<KanbanBlock>,
   ) => Effect.Effect<KanbanMessage, KanbanError>;
@@ -529,6 +544,57 @@ const uuid = () => NodeCrypto.randomUUID();
 
 const failWith = (code: KanbanError["code"], detail: string) =>
   Effect.fail(new KanbanError({ code, detail }));
+
+const checkText = (fields: ReadonlyArray<readonly [string, string | null | undefined]>) => {
+  const problem = Text.textProblem(fields);
+  return problem ? failWith("invalid", problem) : Effect.void;
+};
+
+const cardTextFields = (input: NewCard | CardPatch) => [
+  ["title", input.title],
+  ["description", input.description],
+  ["prompt", input.prompt],
+  ...("question" in input ? [["question", input.question] as const] : []),
+  ...("comment" in input ? [["comment", input.comment] as const] : []),
+  ...(input.subtasks ?? []).map((subtask) => ["subtask text", subtask.text] as const),
+] as const;
+
+const normalizeMessageBlock = (block: KanbanBlock): KanbanBlock => {
+  if (block._tag === "collapse") return { ...block, title: block.title.trim() };
+  if (block._tag === "choice") {
+    return {
+      ...block,
+      question: block.question.trim(),
+      options: block.options.map((option) => ({ ...option, label: option.label.trim() })),
+    };
+  }
+  return block;
+};
+
+export const messageTextFields = (blocks: ReadonlyArray<KanbanBlock>) => {
+  const fields: Array<readonly [string, string | null]> = [];
+  for (const block of blocks) {
+    switch (block._tag) {
+      case "md":
+        fields.push(["message", block.text]);
+        break;
+      case "collapse":
+        fields.push(["message", block.title], ["message", block.text]);
+        break;
+      case "html":
+        fields.push(["message", block.html], ["message", block.title]);
+        break;
+      case "choice":
+        fields.push(["message", block.question]);
+        for (const option of block.options) fields.push(["message", option.label]);
+        break;
+      case "image":
+        fields.push(["message", block.alt]);
+        break;
+    }
+  }
+  return fields;
+};
 
 const isKanbanError = Schema.is(KanbanError);
 
@@ -2231,6 +2297,7 @@ const make = Effect.gen(function* () {
     blocks: ReadonlyArray<KanbanBlock>,
     route = true,
   ) {
+    yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
       return yield* failWith("invalid", "a message needs at least one block");
     const discussion = yield* discussionOf(discussionId);
@@ -2246,7 +2313,7 @@ const make = Effect.gen(function* () {
     }
     // Board files are kept on purpose: nothing deletes them yet. Claimed paths
     // are released if the message never gets stored.
-    const claim = yield* attachments.claim(discussion.boardId, blocks);
+    const claim = yield* attachments.claim(discussion.boardId, blocks.map(normalizeMessageBlock));
     const storedBlocks = [...claim.blocks];
     const message: KanbanMessage = {
       discussionId,
@@ -2767,7 +2834,7 @@ const make = Effect.gen(function* () {
     yield* Ref.set(scanned, true);
   });
 
-  /** Marks a thread paused on the model its failed run used. A reused evaluator is reopened so it stays wakeable. */
+  /** Pauses on the failed run's model, keeping its epoch on repeat reports and reopening evaluators. */
   const pauseThread = Effect.fn("KanbanService.pauseThread")(function* (
     link: KanbanThreadLink,
     model: ModelSelection,
@@ -2781,11 +2848,12 @@ const make = Effect.gen(function* () {
     });
     const at = yield* nowIso;
     const now = yield* nowMillis;
+    const sameRun = link.paused !== null && link.paused.runId === runId;
     yield* store.putThreadLink({
       ...link,
       model,
       endedAt: link.role === "evaluator" ? null : link.endedAt,
-      paused: { at: link.paused?.at ?? at, message, runId },
+      paused: { at: sameRun ? link.paused!.at : at, message, runId },
     });
     const key = Rules.modelKey(model);
     if (runId === null || link.paused?.runId !== runId) {
@@ -4167,7 +4235,48 @@ const make = Effect.gen(function* () {
   });
 
   const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    lock.withPermits(1)(effect).pipe(Effect.mapError(toKanbanError));
+    Clock.clockWith((clock) =>
+      Effect.suspend(() => {
+        let started = false;
+        let expired = false;
+        const start = clock.monotonicTimeNanosUnsafe();
+        const busy = () => failWith("failed", "Board busy: not written. Safe to retry once.");
+        const write = lock.withPermits(1)(
+          Effect.uninterruptible(
+            Effect.suspend<A, E | KanbanError, R>(() => {
+              // The timer can be delayed by a stalled event loop; check again at the permit.
+              if (
+                expired ||
+                clock.monotonicTimeNanosUnsafe() - start >=
+                  BigInt(BOARD_WRITE_START_DEADLINE_MS) * 1_000_000n
+              ) {
+                return busy();
+              }
+              started = true;
+              return effect;
+            }),
+          ),
+        );
+        const deadline = Effect.sleep(BOARD_WRITE_START_DEADLINE_MS).pipe(
+          Effect.flatMap(() =>
+            Effect.suspend(() => {
+              if (started) return Effect.never;
+              expired = true;
+              return busy();
+            }),
+          ),
+        );
+        // The winner sets the state synchronously, before a late permit can start a write.
+        return Effect.raceFirst(write, deadline).pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              expired = true;
+            }),
+          ),
+          Effect.mapError(toKanbanError),
+        );
+      }),
+    );
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(toKanbanError));
   // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
@@ -4209,6 +4318,7 @@ const make = Effect.gen(function* () {
   const createBoard: KanbanServiceShape["createBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
         if ((yield* store.boards).some((board) => board.slug === slug)) {
           return yield* failWith("conflict", `a board with slug ${slug} already exists`);
@@ -4267,6 +4377,7 @@ const make = Effect.gen(function* () {
   const ensureBoard: KanbanServiceShape["ensureBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["name", input.name]]);
         const slug = input.slug.trim().toLowerCase();
         const existing = (yield* store.boards).find((board) => board.slug === slug);
         if (existing) return existing;
@@ -4274,61 +4385,89 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const updateBoardUnlocked = Effect.fn("KanbanService.updateBoardUnlocked")(function* (
+    boardId: KanbanBoard["id"],
+    patch: BoardPatch,
+  ) {
+    yield* checkText([
+      ["name", patch.name],
+      ["model routing", patch.instructions?.modelRouting],
+      ["reviewer routing", patch.instructions?.reviewerRouting],
+      ["escalation", patch.instructions?.escalation],
+    ]);
+    const board = yield* boardOf(boardId);
+    const managerModel = patch.managerModel
+      ? yield* canonicalModel(patch.managerModel)
+      : board.managerModel;
+    const evaluatorModel = patch.evaluatorModel
+      ? yield* canonicalModel(patch.evaluatorModel)
+      : board.evaluatorModel;
+    const defaultCardModel = patch.defaultCardModel
+      ? yield* canonicalModel(patch.defaultCardModel)
+      : board.defaultCardModel;
+    const reviewChains =
+      patch.reviewChains === undefined
+        ? board.reviewChains
+        : yield* Effect.forEach(patch.reviewChains, (chain) =>
+            Effect.map(Effect.forEach(chain.steps, canonicalModel), (steps) => ({
+              ...chain,
+              steps,
+            })),
+          );
+    const next: KanbanBoard = {
+      ...board,
+      ...patch,
+      managerModel,
+      evaluatorModel,
+      defaultCardModel,
+      reviewChains,
+    };
+    if (patch.managerModel) yield* checkModel(managerModel);
+    if (patch.evaluatorModel) yield* checkModel(evaluatorModel);
+    if (patch.defaultCardModel) yield* checkModel(defaultCardModel);
+    // Only steps that differ from the stored chain are checked. A step already saved
+    // (even if its model has since left the catalog) must not block fixing another step.
+    for (const chain of patch.reviewChains === undefined ? [] : reviewChains) {
+      const stored = board.reviewChains.find((c) => c.name === chain.name);
+      for (const [index, step] of chain.steps.entries()) {
+        const previous = stored?.steps[index];
+        const unchanged =
+          previous !== undefined &&
+          previous.instanceId === step.instanceId &&
+          previous.model === step.model &&
+          sameOptions(previous.options ?? [], step.options ?? []);
+        if (!unchanged) yield* checkModel(step);
+      }
+    }
+    const pools = missingPools(yield* store.pools(board.id), boardModels(next));
+    yield* store.putBoardWithPools(next, pools);
+    if (pools.length > 0) {
+      yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
+    }
+    yield* publish(board.id, { _tag: "board", board: next });
+    yield* kick;
+    return next;
+  });
+
   const updateBoard: KanbanServiceShape["updateBoard"] = (boardId, patch) =>
+    guard(updateBoardUnlocked(boardId, patch));
+
+  const openBoard: KanbanServiceShape["openBoard"] = (input) =>
     guard(
       Effect.gen(function* () {
-        const board = yield* boardOf(boardId);
-        const managerModel = patch.managerModel
-          ? yield* canonicalModel(patch.managerModel)
-          : board.managerModel;
-        const evaluatorModel = patch.evaluatorModel
-          ? yield* canonicalModel(patch.evaluatorModel)
-          : board.evaluatorModel;
-        const defaultCardModel = patch.defaultCardModel
-          ? yield* canonicalModel(patch.defaultCardModel)
-          : board.defaultCardModel;
-        const reviewChains =
-          patch.reviewChains === undefined
-            ? board.reviewChains
-            : yield* Effect.forEach(patch.reviewChains, (chain) =>
-                Effect.map(Effect.forEach(chain.steps, canonicalModel), (steps) => ({
-                  ...chain,
-                  steps,
-                })),
-              );
-        const next: KanbanBoard = {
-          ...board,
-          ...patch,
-          managerModel,
-          evaluatorModel,
-          defaultCardModel,
-          reviewChains,
+        const slug = input.slug.trim().toLowerCase();
+        const board =
+          (yield* store.boards).find((existing) => existing.slug === slug) ??
+          (yield* insertBoardUnlocked({ ...input, slug }));
+        const patch: BoardPatch = {
+          ...(input.defaultProjectId && board.defaultProjectId === null
+            ? { defaultProjectId: input.defaultProjectId }
+            : {}),
+          ...(input.icon && board.icon === null ? { icon: input.icon } : {}),
         };
-        if (patch.managerModel) yield* checkModel(managerModel);
-        if (patch.evaluatorModel) yield* checkModel(evaluatorModel);
-        if (patch.defaultCardModel) yield* checkModel(defaultCardModel);
-        // Only steps that differ from the stored chain are checked. A step already saved
-        // (even if its model has since left the catalog) must not block fixing another step.
-        for (const chain of patch.reviewChains === undefined ? [] : reviewChains) {
-          const stored = board.reviewChains.find((c) => c.name === chain.name);
-          for (const [index, step] of chain.steps.entries()) {
-            const previous = stored?.steps[index];
-            const unchanged =
-              previous !== undefined &&
-              previous.instanceId === step.instanceId &&
-              previous.model === step.model &&
-              sameOptions(previous.options ?? [], step.options ?? []);
-            if (!unchanged) yield* checkModel(step);
-          }
-        }
-        const pools = missingPools(yield* store.pools(board.id), boardModels(next));
-        yield* store.putBoardWithPools(next, pools);
-        if (pools.length > 0) {
-          yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
-        }
-        yield* publish(board.id, { _tag: "board", board: next });
-        yield* kick;
-        return next;
+        return Object.keys(patch).length === 0
+          ? board
+          : yield* updateBoardUnlocked(board.id, patch);
       }),
     );
 
@@ -4472,6 +4611,7 @@ const make = Effect.gen(function* () {
     input: NewCard,
     actor: KanbanActor,
   ) {
+    yield* checkText(cardTextFields(input));
     // A thread's or a script's card waits for an evaluator to write its packet;
     // the owner's and the evaluators' own come written.
     const packet = actor._tag === "thread" || actor._tag === "script";
@@ -4639,6 +4779,7 @@ const make = Effect.gen(function* () {
   const createForThread: KanbanServiceShape["createForThread"] = (threadId, input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(cardTextFields(input));
         const thread = yield* workThreadOf(threadId);
         // The thread's live model comes first: a switch moves the thread even after every
         // card that carried the switch is released, and the held slot follows it.
@@ -4747,6 +4888,7 @@ const make = Effect.gen(function* () {
   const editCard: KanbanServiceShape["editCard"] = (cardId, patch, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
@@ -4859,6 +5001,10 @@ const make = Effect.gen(function* () {
   const moveCard: KanbanServiceShape["moveCard"] = (cardId, to, role, actor, options) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["note", options?.note],
+          ["question", options?.question],
+        ]);
         const card = yield* cardOf(cardId);
         if (role === "cardThread") {
           if (actor._tag !== "thread" || card.activeThreadId !== actor.threadId) {
@@ -4934,6 +5080,10 @@ const make = Effect.gen(function* () {
   const askOwner: KanbanServiceShape["askOwner"] = (cardId, input, actor, role) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["question", input.question],
+          ...(input.options ?? []).map((option) => ["question", option] as const),
+        ]);
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
@@ -5003,6 +5153,7 @@ const make = Effect.gen(function* () {
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["reason", reason]]);
         const card = yield* cardOf(cardId);
         // A stop from the owner, an evaluator or another thread is theirs to lift
         // or reword; a thread replacing it with its own flag could then clear it.
@@ -5089,6 +5240,7 @@ const make = Effect.gen(function* () {
   ) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
         const scriptName = role === "script" ? (yield* scriptFor(card, actor)).name : null;
         const check = Subtasks.checkMark(card, subtaskId, state, role, note, scriptName);
@@ -5168,6 +5320,7 @@ const make = Effect.gen(function* () {
   const handBack: KanbanServiceShape["handBack"] = (cardId, subtaskId, note, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
         const script = yield* scriptFor(card, actor);
         const check = Subtasks.checkHandBack(card, subtaskId, script.name, note);
@@ -5251,6 +5404,7 @@ const make = Effect.gen(function* () {
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(findings.map((finding) => ["finding", finding] as const));
         const link = yield* store.threadLink(threadId);
         if (!link || link.role !== "review" || link.cardId === null) {
           return yield* failWith("denied", "only a card's review thread records a review result");
@@ -5358,6 +5512,7 @@ const make = Effect.gen(function* () {
   const cardThread: KanbanServiceShape["cardThread"] = (cardId, action, text, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["note", text]]);
         const card = yield* cardOf(cardId);
         const at = yield* nowIso;
         if (action === "steer") {
@@ -5767,6 +5922,11 @@ const make = Effect.gen(function* () {
   const setGoal: KanbanServiceShape["setGoal"] = (boardId, input) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["name", input.name],
+          ["now", input.now],
+          ["story", input.story],
+        ]);
         const goals = yield* store.goals(boardId);
         const at = yield* nowIso;
         const existing = input.id ? goals.find((goal) => goal.id === input.id) : undefined;
@@ -5800,24 +5960,40 @@ const make = Effect.gen(function* () {
   const setGroups: KanbanServiceShape["setGroups"] = (boardId, groups) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText(
+          groups.flatMap((group) => [
+            ["name", group.name] as const,
+            ["summary", group.summary] as const,
+          ]),
+        );
         const at = yield* nowIso;
-        const next = groups.map((group) => ({ ...group, updatedAt: at }));
+        const next = groups.map((group) => ({ ...group, name: group.name.trim(), updatedAt: at }));
         yield* store.putGroups(boardId, next);
         yield* publish(boardId, { _tag: "groups", groups: next });
       }),
     );
 
-  const createDiscussion: KanbanServiceShape["createDiscussion"] = (boardId, title, actor) =>
+  const createDiscussion: KanbanServiceShape["createDiscussion"] = (
+    boardId,
+    title,
+    actor,
+    blocks,
+  ) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["title", title]]);
         yield* boardOf(boardId);
-        return yield* newDiscussion(boardId, title, null, actor);
+        const discussion = yield* newDiscussion(boardId, title, null, actor);
+        if (!blocks?.length) return discussion;
+        yield* postUnlocked(discussion.id, actor, blocks);
+        return yield* discussionOf(discussion.id);
       }),
     );
 
   const updateDiscussion: KanbanServiceShape["updateDiscussion"] = (discussionId, patch, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["title", patch.title]]);
         if (actor._tag !== "owner") {
           return yield* failWith("denied", "only the owner renames, settles, snoozes or pins");
         }
@@ -5876,6 +6052,7 @@ const make = Effect.gen(function* () {
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([["answer", text]]);
         const discussion = yield* discussionOf(discussionId);
         const message = yield* store.message(discussionId, seq);
         if (!message) return yield* failWith("not-found", `message ${seq}`);
@@ -5985,6 +6162,10 @@ const make = Effect.gen(function* () {
   const writeWiki: KanbanServiceShape["writeWiki"] = (boardId, page, actor) =>
     guard(
       Effect.gen(function* () {
+        yield* checkText([
+          ["title", page.title],
+          ["wiki body", page.body],
+        ]);
         yield* boardOf(boardId);
         const slug = page.slug
           .trim()
@@ -6111,6 +6292,7 @@ const make = Effect.gen(function* () {
   return KanbanService.of({
     boards: readDb(store.boards),
     ensureBoard,
+    openBoard,
     createBoard,
     updateBoard,
     snapshot: (boardId) => readDb(snapshotOf(boardId)),
@@ -6162,6 +6344,13 @@ const make = Effect.gen(function* () {
     }),
     messages: (id, options) => readDb(store.messages(id, options)),
     post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
+    postToCard: (cardId, author, blocks) =>
+      guard(
+        Effect.gen(function* () {
+          const discussion = yield* cardDiscussionUnlocked(cardId);
+          return yield* postUnlocked(discussion.id, author, blocks);
+        }),
+      ),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
@@ -6174,6 +6363,7 @@ const make = Effect.gen(function* () {
     startSetup: (boardId, input) =>
       guard(
         Effect.gen(function* () {
+          yield* checkText([["text", input.text]]);
           const board = yield* boardOf(boardId);
           if (board.setup?.status === "running") {
             return yield* failWith("invalid", `board ${board.slug} is already in setup`);
@@ -6198,6 +6388,13 @@ const make = Effect.gen(function* () {
     startEvaluator: (boardId, purpose, text) =>
       guard(
         Effect.gen(function* () {
+          yield* checkText([
+            ["text", text],
+            [
+              "text",
+              purpose.kind === "setup" || purpose.kind === "request" ? purpose.text : undefined,
+            ],
+          ]);
           const board = yield* boardOf(boardId);
           if (
             purpose.kind === "stalled" ||

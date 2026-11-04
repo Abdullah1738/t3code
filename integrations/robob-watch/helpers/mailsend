@@ -438,7 +438,7 @@ def chrome_probe(doc, h):
         src = os.path.join(tmp, "card.html")
         with open(src, "w") as fh:
             fh.write(doc)
-        r = subprocess.run([cp.CHROME, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+        r = subprocess.run([cp.chrome(), "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
                             f"--user-data-dir={os.path.join(tmp, 'profile')}", "--force-device-scale-factor=1",
                             "--virtual-time-budget=1500", f"--window-size={CARD_W},{h}", "--dump-dom",
                             "file://" + src], capture_output=True, timeout=60)
@@ -469,7 +469,11 @@ def render_card(d, page, n, total, h, out):
         die(f"error: card helper missing at {CARD_LIB} (nothing was sent)", 1)
     sys.path.insert(0, CARD_LIB)
     import cardpreview as cp
-    if not os.path.isfile(cp.CHROME):
+    try:
+        chrome = cp.chrome()
+        if not os.path.isfile(chrome) or not os.access(chrome, os.X_OK):
+            raise FileNotFoundError(chrome)
+    except FileNotFoundError:
         die("error: headless Chrome not found, so the card can't be drawn (nothing was sent)", 1)
     need, fit = chrome_probe(doc, h)
     if need > h - FOOT_PAD:

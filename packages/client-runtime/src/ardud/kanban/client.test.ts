@@ -144,6 +144,16 @@ const vote = {
 } as never;
 
 describe("createKanbanClient", () => {
+  it("lifts the requested board pause", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const lifted = client.liftPause("board-toy");
+    const request = fake.take("kanban.board.pause");
+    expect(request.input).toEqual({ boardId: "board-toy", clear: true });
+    request.resolve({});
+    await lifted;
+  });
+
   it("reports a denied grant as false, so its control is disabled", () => {
     const fake = fakeTransport(new Set(["kanban.pool.set"]));
     const client = createKanbanClient(fake.transport);

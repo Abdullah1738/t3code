@@ -4,7 +4,7 @@
  * card; an evaluator acts on the whole board. The service enforces the moves.
  */
 import {
-  KanbanBlock,
+  KanbanBlockInput,
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
@@ -32,6 +32,7 @@ const dependencies = [
 
 const Record = Schema.Unknown;
 const Records = Schema.Array(Schema.Unknown);
+const RawBoardText = Schema.toType(TrimmedNonEmptyString);
 
 const describe = <S extends Schema.Top>(schema: S, description: string) =>
   schema.annotate({ description });
@@ -93,7 +94,7 @@ const SubtasksInput = describe(
           "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
         ),
       ),
-      text: TrimmedNonEmptyString,
+      text: RawBoardText,
       owner: describe(
         Schema.Literals(["work", "review", "evaluator", "script"]),
         "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
@@ -118,7 +119,7 @@ const BlocksInput = {
   text: Schema.optional(describe(Schema.String, "Markdown message (shortcut for one md block).")),
   blocks: Schema.optional(
     describe(
-      Schema.Array(KanbanBlock),
+      Schema.Array(KanbanBlockInput),
       'Rich blocks, each with _tag: md {text}, collapse {title, text}, html {html, title, height}, choice {id, style "poll"|"pick", question, options [{id,label}], multi}, card {cardId}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (the id comes from t3_attachment_prepare_upload).',
     ),
   ),
@@ -479,7 +480,7 @@ const GroupSet = tool(
     groups: Schema.Array(
       Schema.Struct({
         id: TrimmedNonEmptyString,
-        name: TrimmedNonEmptyString,
+        name: RawBoardText,
         summary: Schema.String,
         cards: Schema.Array(CardRef),
       }),
@@ -493,7 +494,7 @@ const DiscussionCreate = tool(
   "discussion_create",
   "Open a discussion",
   "Evaluators: open a new discussion channel with the owner, then post into it with discussion_post.",
-  { title: TrimmedNonEmptyString, ...BlocksInput },
+  { title: RawBoardText, ...BlocksInput },
   { discussion: Record },
   { readonly: false },
 );
@@ -502,7 +503,7 @@ const WikiWrite = tool(
   "wiki_write",
   "Write a wiki page",
   "Evaluators: create or replace a wiki page of lessons future threads should know.",
-  { slug: TrimmedNonEmptyString, title: TrimmedNonEmptyString, body: Schema.String },
+  { slug: TrimmedNonEmptyString, title: RawBoardText, body: Schema.String },
   { page: Record },
   { readonly: false },
 );
@@ -513,7 +514,7 @@ const BoardOpen = tool(
   "Create a board (or return the existing one with this slug). projectId is the T3 project its threads run in. icon is shown beside its name; it is set only while the board has none, so the owner's pick stays.",
   {
     slug: TrimmedNonEmptyString,
-    name: TrimmedNonEmptyString,
+    name: RawBoardText,
     projectId: Schema.optional(TrimmedNonEmptyString),
     icon: Schema.optional(KanbanBoardIcon),
   },

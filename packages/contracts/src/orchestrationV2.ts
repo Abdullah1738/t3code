@@ -383,6 +383,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+  // ardud: once history is migrated, selection owns the active provider row, including after rollback.
+  harnessMigrationFence: Schema.optional(Schema.Boolean),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(
@@ -863,11 +865,22 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
 );
 export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2PendingBackgroundTask.Type;
 
+// ardud: native history staged from OpenCode, before the target's first turn.
+export const OrchestrationV2SeededHistory = Schema.Struct({
+  source: Schema.Literal("opencode"),
+  sourceSessionId: TrimmedNonEmptyString,
+  digest: TrimmedNonEmptyString,
+  mode: Schema.Literals(["claude-transcript", "codex-inject"]),
+  stagedPath: Schema.optional(TrimmedNonEmptyString),
+  injectedNativeId: Schema.optional(TrimmedNonEmptyString),
+});
+
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  seededHistory: Schema.optional(OrchestrationV2SeededHistory),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
@@ -1006,6 +1019,10 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
+  /** The provider's native finish reason (e.g. Claude stop_reason); null when not reported. */
+  finish: Schema.optional(Schema.NullOr(Schema.String)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
 
@@ -1106,6 +1123,18 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+/**
+ * Whether an assistant message is the turn's answer or narration that came before a tool call.
+ * Rows written before this field existed have none, so they decode as "unknown" and never count
+ * as an answer.
+ */
+export const OrchestrationV2AssistantPhase = Schema.Literals(["answer", "narration", "unknown"]);
+export type OrchestrationV2AssistantPhase = typeof OrchestrationV2AssistantPhase.Type;
+
+const assistantPhaseField = Schema.optional(OrchestrationV2AssistantPhase).pipe(
+  Schema.withDecodingDefault(Effect.succeed("unknown" as const)),
+);
+
 export const OrchestrationV2ConversationMessage = Schema.Struct({
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
@@ -1122,6 +1151,7 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   nodeId: Schema.NullOr(NodeId),
   role: Schema.Literals(["user", "assistant", "system"]),
   text: Schema.String,
+  phase: assistantPhaseField,
   context: Schema.optional(OrchestrationMessageContext),
   attachments: Schema.Array(ChatAttachment),
   streaming: Schema.Boolean,
@@ -1423,6 +1453,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
@@ -2190,6 +2221,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     type: Schema.Literal("assistant_message"),
     messageId: MessageId,
     text: Schema.String,
+    phase: assistantPhaseField,
     attachments: Schema.optional(Schema.Array(ChatAttachment)),
     streaming: Schema.Boolean,
   }),
@@ -3175,6 +3207,28 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     runId: RunId,
     htmlRender: OrchestrationV2HtmlRender,
+  }),
+  // ardud: internal so only the migration service can re-point a thread.
+  // Codex injection has no native ID until the first turn.
+  Schema.Struct({
+    type: Schema.Literal("thread.adopt-native-history"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    modelSelection: ModelSelection,
+    expectedActiveProviderThreadId: Schema.NullOr(ProviderThreadId),
+    target: Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("new"),
+        driver: ProviderDriverKind,
+        nativeId: Schema.NullOr(TrimmedNonEmptyString),
+        headId: Schema.NullOr(TrimmedNonEmptyString),
+        seededHistory: OrchestrationV2SeededHistory,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("existing"),
+        providerThreadId: ProviderThreadId,
+      }),
+    ]),
   }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
