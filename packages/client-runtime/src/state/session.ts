@@ -1,7 +1,9 @@
 import type { AuthSessionState, EnvironmentId, ServerConfig } from "@t3tools/contracts";
 import * as Data from "effect/Data";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient } from "effect/http";
@@ -36,6 +38,31 @@ function initialConfigOption<E>(
 }
 
 const DEFAULT_SESSION_STATE_TIMEOUT_MS = 6_000;
+
+/**
+ * A busy server (a reload fetching every open thread at once) can answer the
+ * session read after the timeout. Grants gate every write control and nothing
+ * re-reads a failed session, so a single slow read used to leave the client
+ * without grants until a remount. Transient failures retry with backoff while
+ * the atom is mounted; credential and scope answers do not.
+ */
+const SESSION_STATE_RETRY_SCHEDULE = Schedule.exponential("1 second").pipe(
+  Schedule.modifyDelay(({ duration }) =>
+    Effect.succeed(Duration.min(duration, Duration.seconds(15))),
+  ),
+);
+
+export function isTransientSessionStateError(error: {
+  readonly _tag: string;
+  readonly cause?: unknown;
+}): boolean {
+  if (error._tag === "RemoteEnvironmentAuthTimeoutError") return true;
+  // A fetch error carrying a session answer is a rejected renewal, not transport.
+  return (
+    error._tag === "RemoteEnvironmentAuthFetchError" &&
+    !(typeof error.cause === "object" && error.cause !== null && "authenticated" in error.cause)
+  );
+}
 
 export const fetchEnvironmentSessionState = Effect.fn(
   "clientRuntime.state.fetchEnvironmentSessionState",
@@ -138,7 +165,13 @@ function makeEnvironmentSessionAtoms<R, E>(
             prepared,
             signer,
             remoteAuthorization,
-          }).pipe(Effect.provideService(HttpClient.HttpClient, client.value));
+          }).pipe(
+            Effect.retry({
+              while: isTransientSessionStateError,
+              schedule: SESSION_STATE_RETRY_SCHEDULE,
+            }),
+            Effect.provideService(HttpClient.HttpClient, client.value),
+          );
         });
       })
       .pipe(
