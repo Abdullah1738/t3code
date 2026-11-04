@@ -37,11 +37,12 @@ export interface SlotWrites {
 type SlotWriteRequest = {
   write: () => Promise<boolean | void> | boolean | void;
   dropped: () => void;
+  kind: "count" | "level";
 };
 
 function serialQueue(onIdle: () => void = () => {}) {
   let inFlight = false;
-  let queued: SlotWriteRequest | null = null;
+  const queued: SlotWriteRequest[] = [];
 
   const run = async (request: SlotWriteRequest) => {
     inFlight = true;
@@ -52,9 +53,8 @@ function serialQueue(onIdle: () => void = () => {}) {
       result = false;
     }
     if (result === false) request.dropped();
-    if (queued !== null) {
-      const next = queued;
-      queued = null;
+    const next = queued.shift();
+    if (next !== undefined) {
       void run(next);
     } else {
       inFlight = false;
@@ -67,9 +67,13 @@ function serialQueue(onIdle: () => void = () => {}) {
       void run(request);
       return;
     }
-    const previous = queued;
-    queued = request;
-    previous?.dropped();
+    const previous = queued.at(-1);
+    if (request.kind === "count" && previous?.kind === "count") {
+      queued[queued.length - 1] = request;
+      previous.dropped();
+    } else {
+      queued.push(request);
+    }
   };
 }
 
@@ -79,11 +83,13 @@ export function serialSender(
   dropped: (id: number) => void,
 ): (id: number, value: number) => void {
   const send = serialQueue();
-  return (id, value) => send({ write: () => write(value), dropped: () => dropped(id) });
+  return (id, value) =>
+    send({ kind: "count", write: () => write(value), dropped: () => dropped(id) });
 }
 
 // A Settings view can unmount while its RPC is pending. Share the queue until it drains.
 const poolQueues = new Map<string, ReturnType<typeof serialQueue>>();
+const poolLevels = new Map<string, { boardId: string; poolKey: string; saved: boolean }>();
 const poolQueueListeners = new Set<() => void>();
 let poolQueueVersion = 0;
 
@@ -103,13 +109,23 @@ export function poolSlotsPending(boardId: string, poolKey: string): boolean {
   return poolQueues.has(JSON.stringify([boardId, poolKey]));
 }
 
-export function sendPoolSlots(
-  boardId: string,
-  poolKey: string,
-  value: number,
-  write: (value: number) => Promise<boolean | void> | boolean | void,
-  dropped: () => void = () => {},
-): void {
+export function poolLevelPending(boardId: string, poolKey: string): boolean {
+  return poolLevels.has(JSON.stringify([boardId, poolKey]));
+}
+
+// Keep the old row locked until its rename reaches the board feed, not merely the RPC response.
+export function observePoolLevels(boardId: string, poolKeys: ReadonlyArray<string>): void {
+  let changed = false;
+  for (const [key, level] of poolLevels) {
+    if (level.boardId === boardId && level.saved && !poolKeys.includes(level.poolKey)) {
+      poolLevels.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) poolQueueChanged();
+}
+
+function sendPoolRequest(boardId: string, poolKey: string, request: SlotWriteRequest): void {
   const key = JSON.stringify([boardId, poolKey]);
   let send = poolQueues.get(key);
   if (send === undefined) {
@@ -120,7 +136,51 @@ export function sendPoolSlots(
     poolQueues.set(key, send);
     poolQueueChanged();
   }
-  send({ write: () => write(value), dropped });
+  send(request);
+}
+
+export function sendPoolSlots(
+  boardId: string,
+  poolKey: string,
+  value: number,
+  write: (value: number) => Promise<boolean | void> | boolean | void,
+  dropped: () => void = () => {},
+): void {
+  if (poolLevelPending(boardId, poolKey)) {
+    dropped();
+    return;
+  }
+  sendPoolRequest(boardId, poolKey, { kind: "count", write: () => write(value), dropped });
+}
+
+export function sendPoolLevel(
+  boardId: string,
+  poolKey: string,
+  write: () => Promise<boolean>,
+): void {
+  const key = JSON.stringify([boardId, poolKey]);
+  if (poolLevels.has(key)) return;
+  const level = { boardId, poolKey, saved: false };
+  poolLevels.set(key, level);
+  poolQueueChanged();
+  const drop = () => {
+    if (poolLevels.get(key) === level) {
+      poolLevels.delete(key);
+      poolQueueChanged();
+    }
+  };
+  sendPoolRequest(boardId, poolKey, {
+    kind: "level",
+    write: async () => {
+      const ok = await write();
+      if (ok) {
+        level.saved = true;
+        poolQueueChanged();
+      }
+      return ok;
+    },
+    dropped: drop,
+  });
 }
 
 /**

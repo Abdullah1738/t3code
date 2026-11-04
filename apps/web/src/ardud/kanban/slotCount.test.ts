@@ -5,9 +5,12 @@ import {
   currentSlots,
   editedSlots,
   failedSlot,
+  observePoolLevels,
   observeSlots,
+  poolLevelPending,
   poolSlotsPending,
   poolSlotsVersion,
+  sendPoolLevel,
   sendPoolSlots,
   sentSlots,
   serialSender,
@@ -269,44 +272,87 @@ describe("serialSender", () => {
     expect(active).toBe(0);
   });
 
-  it("keeps level changes blocked until the queued pause has saved", async () => {
+  it("saves the queued pause before changing the pool level", async () => {
     const board = "board-pause-before-level";
     const pool = "high";
-    const calls: number[] = [];
+    const calls: string[] = [];
     const resolvers: Array<() => void> = [];
     let saved = 5;
+    let currentKey = "high";
     const versions: number[] = [];
     const unsubscribe = subscribePoolSlots(() => versions.push(poolSlotsVersion()));
     const write = (value: number) => {
-      calls.push(value);
+      calls.push(`count:${value}`);
       return new Promise<boolean>((resolve) => {
         resolvers.push(() => {
-          saved = value;
-          resolve(true);
+          const matches = currentKey === pool;
+          if (matches) saved = value;
+          resolve(matches);
         });
       });
     };
 
     sendPoolSlots(board, pool, 12, write);
     sendPoolSlots(board, pool, 0, write);
+    sendPoolLevel(board, pool, () => {
+      calls.push("level:max");
+      currentKey = "max";
+      return Promise.resolve(true);
+    });
     expect(poolSlotsPending(board, pool)).toBe(true);
+    expect(poolLevelPending(board, pool)).toBe(true);
     expect(poolSlotsPending(board, "another-pool")).toBe(false);
-    expect(calls).toEqual([12]);
-    expect(versions).toHaveLength(1);
+    expect(calls).toEqual(["count:12"]);
+    let laterDropped = false;
+    sendPoolSlots(board, pool, 14, write, () => (laterDropped = true));
+    expect(laterDropped).toBe(true);
 
     resolvers[0]!();
     await Promise.resolve();
     expect(poolSlotsPending(board, pool)).toBe(true);
-    expect(calls).toEqual([12, 0]);
-    expect(versions).toHaveLength(1);
+    expect(calls).toEqual(["count:12", "count:0"]);
 
     resolvers[1]!();
     await Promise.resolve();
-    expect(poolSlotsPending(board, pool)).toBe(false);
+    expect(calls).toEqual(["count:12", "count:0", "level:max"]);
     expect(saved).toBe(0);
-    expect(versions).toHaveLength(2);
-    expect(versions[1]).toBeGreaterThan(versions[0]!);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(poolSlotsPending(board, pool)).toBe(false);
+    expect(poolLevelPending(board, pool)).toBe(true);
+    observePoolLevels(board, ["high"]);
+    expect(poolLevelPending(board, pool)).toBe(true);
+    observePoolLevels(board, ["max"]);
+    expect(poolLevelPending(board, pool)).toBe(false);
+    expect(saved).toBe(0);
+    expect(versions.length).toBeGreaterThan(1);
+    expect(versions.at(-1)).toBeGreaterThan(versions[0]!);
     unsubscribe();
+  });
+
+  it("unlocks the pool when a queued level change fails", async () => {
+    const board = "board-failed-level";
+    const pool = "high";
+    let finishCount!: () => void;
+    let attemptedLevel = false;
+    sendPoolSlots(
+      board,
+      pool,
+      0,
+      () => new Promise<boolean>((resolve) => (finishCount = () => resolve(true))),
+    );
+    sendPoolLevel(board, pool, () => {
+      attemptedLevel = true;
+      return Promise.resolve(false);
+    });
+    expect(poolLevelPending(board, pool)).toBe(true);
+    finishCount();
+    await Promise.resolve();
+    expect(attemptedLevel).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(poolLevelPending(board, pool)).toBe(false);
+    expect(poolSlotsPending(board, pool)).toBe(false);
   });
 
   it("keeps independent boards and pools independent", async () => {

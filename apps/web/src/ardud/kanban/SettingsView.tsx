@@ -1,5 +1,5 @@
 import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon, Trash2Icon } from "lucide-react";
-import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 
 import {
@@ -48,9 +48,11 @@ import {
   currentSlots,
   editedSlots,
   failedSlot,
+  observePoolLevels,
   observeSlots,
-  poolSlotsPending,
+  poolLevelPending,
   poolSlotsVersion,
+  sendPoolLevel,
   sendPoolSlots,
   sentSlots,
   subscribePoolSlots,
@@ -261,9 +263,17 @@ export function SettingsView(props: { state: KanbanBoardState }) {
 
 function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardState }) {
   const { environmentId, state } = props;
-  useSyncExternalStore(subscribePoolSlots, poolSlotsVersion);
+  const poolVersion = useSyncExternalStore(subscribePoolSlots, poolSlotsVersion);
   const board = state.board;
   const pools = poolViews(state);
+  useEffect(() => {
+    observePoolLevels(
+      board.id,
+      pools.map((pool) => pool.key),
+    );
+    // A rename response can arrive after its feed update, so observe that transition too.
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [board.id, pools, poolVersion]);
   const providers =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
   const settings = useEnvironmentSettings(environmentId);
@@ -294,7 +304,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       </Section>
       <Section title="Pools">
         {pools.map((pool) => {
-          const savingSlots = poolSlotsPending(board.id, pool.key);
+          const changingLevel = poolLevelPending(board.id, pool.key);
           const listed = poolListed(pool.model, providers, settings);
           const unlisted = listed === false;
           const blocked = !canPool || unlisted;
@@ -331,10 +341,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                     modelOptions={pool.model.options ?? []}
                     allowPromptInjectedEffort={false}
                     planModeEnabled={settings.planModeEnabled}
-                    disabled={blocked || savingSlots}
+                    disabled={blocked || changingLevel}
                     onModelOptionsChange={(options) => {
-                      // Renaming the pool would invalidate a queued count's replaces key.
-                      if (poolSlotsPending(board.id, pool.key)) return;
+                      if (poolLevelPending(board.id, pool.key)) return;
                       const level = selectionEffort(
                         createModelSelection(pool.model.instanceId, pool.model.model, options),
                       );
@@ -343,12 +352,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                         ? reportSelectionConflict(boardPoolLevelChange(pool.model, level, instanceEntries))
                         : boardModelSelection({ instanceId: pool.model.instanceId, model: pool.model.model, variant: level });
                       if (!next) return;
-                      void runAction("Couldn't change the pool's level", () =>
-                        kanban.setPool(
-                          board.id,
-                          next,
-                          undefined,
-                          { replaces: pool.key },
+                      sendPoolLevel(board.id, pool.key, () =>
+                        runAction("Couldn't change the pool's level", () =>
+                          kanban.setPool(board.id, next, undefined, { replaces: pool.key }),
                         ),
                       );
                     }}
@@ -381,7 +387,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 value={pool.slots}
                 min={0}
                 max={unlisted ? 0 : undefined}
-                disabled={blocked}
+                disabled={blocked || changingLevel}
                 disabledReason={blockedReason}
                 onChange={(slots, dropped) =>
                   sendPoolSlots(
@@ -400,7 +406,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 size="sm"
                 checked={pool.slots > 0}
                 // An unlisted pool can always be paused (switch off); switching it on is refused.
-                disabled={!canPool || (unlisted && pool.slots === 0)}
+                disabled={!canPool || changingLevel || (unlisted && pool.slots === 0)}
                 title={blockedReason}
                 aria-label={`${pool.name} pool on`}
                 onCheckedChange={(on) =>
@@ -414,6 +420,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
               {pool.slots === 0 && pool.busy === 0 && canPool ? (
                 <button
                   type="button"
+                  disabled={changingLevel}
                   aria-label={`Remove ${pool.name} pool`}
                   title="Remove pool"
                   onClick={() =>
