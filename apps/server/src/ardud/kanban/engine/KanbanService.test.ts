@@ -605,6 +605,194 @@ it.effect("a queued write expires without changing the card or recording an even
   }),
 );
 
+it.effect("repeating the same edit writes nothing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "repeat-edit",
+        name: "Repeat",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const patch = { description: "  description X  " };
+      const first = yield* kanban.editCard(card.id, patch, owner);
+      const before = yield* kanban.card(card.id);
+      yield* TestClock.adjust("5 minutes");
+      const repeated = yield* kanban.editCard(card.id, patch, owner);
+      const after = yield* kanban.card(card.id);
+      assert.deepStrictEqual(repeated, first);
+      assert.strictEqual(repeated.updatedAt, first.updatedAt);
+      assert.deepStrictEqual(after.events, before.events);
+      assert.lengthOf(
+        after.events.filter((event) => event.kind === "edited"),
+        1,
+      );
+      const link = { links: [{ url: " https://example.com/a ", label: "A" }] };
+      yield* kanban.editCard(card.id, link, owner);
+      const linked = yield* kanban.card(card.id);
+      yield* kanban.editCard(card.id, link, owner);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, linked.events);
+      const relabelled = yield* kanban.editCard(
+        card.id,
+        { links: [{ url: "https://example.com/a", label: "B" }] },
+        owner,
+      );
+      assert.strictEqual(relabelled.links[0]?.label, "B");
+      const renamed = yield* kanban.editCard(card.id, { title: "Other" }, owner);
+      assert.strictEqual(renamed.title, "Other");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a repeated comment within 10 minutes is saved once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "repeat-comment",
+        name: "Repeat",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const first = yield* kanban.editCard(card.id, { comment: "  C  " }, owner);
+      const before = yield* kanban.card(card.id);
+      yield* TestClock.adjust("1 minute");
+      assert.deepStrictEqual(yield* kanban.editCard(card.id, { comment: "C" }, owner), first);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+      yield* TestClock.adjust("11 minutes");
+      yield* kanban.editCard(card.id, { comment: "C" }, owner);
+      const worker: KanbanActor = { _tag: "thread", threadId: ThreadId.make("different-author") };
+      yield* kanban.editCard(card.id, { comment: "C" }, worker);
+      yield* kanban.editCard(card.id, { comment: "D" }, worker);
+      yield* kanban.editCard(card.id, { description: "intervening edit" }, worker);
+      yield* kanban.editCard(card.id, { comment: "D" }, worker);
+      let detail = yield* kanban.card(card.id);
+      assert.deepStrictEqual(
+        detail.events.filter((event) => event.kind === "comment").map((event) => event.body),
+        ["C", "C", "C", "D", "D"],
+      );
+
+      const combined = { description: "combined", comment: "combined comment" };
+      const saved = yield* kanban.editCard(card.id, combined, owner);
+      detail = yield* kanban.card(card.id);
+      yield* TestClock.adjust("10 minutes");
+      assert.deepStrictEqual(yield* kanban.editCard(card.id, combined, owner), saved);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, detail.events);
+      yield* TestClock.adjust(1);
+      yield* kanban.editCard(card.id, combined, owner);
+      assert.lengthOf((yield* kanban.card(card.id)).events, detail.events.length + 2);
+
+      // An empty patch remains an edit; it must not be classified as a retry.
+      const beforeEmpty = yield* kanban.card(card.id);
+      assert.isFalse(
+        KanbanService.editRepeats(
+          beforeEmpty.card,
+          {},
+          beforeEmpty.events,
+          owner,
+          yield* Clock.currentTimeMillis,
+        ),
+      );
+      yield* kanban.editCard(card.id, {}, owner);
+      assert.strictEqual(
+        (yield* kanban.card(card.id)).card.updatedAt,
+        yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("repeating the same post returns the first message", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "repeat-post",
+        name: "Repeat",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const discussion = yield* kanban.createDiscussion(board.id, "Posts", owner);
+      const author: KanbanActor = { _tag: "thread", threadId: ThreadId.make("author-a") };
+      const other: KanbanActor = { _tag: "thread", threadId: ThreadId.make("author-b") };
+      const blocks = [{ _tag: "collapse", title: "  Details  ", text: "X" }] as const;
+      const first = yield* kanban.post(discussion.id, author, blocks);
+      const before = yield* kanban.discussion(discussion.id);
+      yield* TestClock.adjust("1 minute");
+      const alreadyNormalized = [{ _tag: "collapse", title: "Details", text: "X" }] as const;
+      assert.deepStrictEqual(yield* kanban.post(discussion.id, author, alreadyNormalized), first);
+      assert.deepStrictEqual(yield* kanban.discussion(discussion.id), before);
+      assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+      assert.notStrictEqual((yield* kanban.post(discussion.id, other, blocks)).seq, first.seq);
+      yield* kanban.post(discussion.id, other, [{ _tag: "md", text: "different" }]);
+      yield* TestClock.adjust("11 minutes");
+      yield* kanban.post(discussion.id, other, [{ _tag: "md", text: "different" }]);
+      assert.lengthOf(yield* kanban.messages(discussion.id), 4);
+
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const post = yield* kanban.postToCard(card.id, author, [{ _tag: "md", text: "One" }]);
+      const again = yield* kanban.postToCard(card.id, author, [{ _tag: "md", text: "One" }]);
+      assert.deepStrictEqual(again, post);
+      assert.lengthOf(yield* kanban.messages(post.discussionId), 1);
+      assert.lengthOf(
+        (yield* kanban.discussions(board.id)).filter((entry) => entry.cardId === card.id),
+        1,
+      );
+
+      // Skipping a retry must not re-route a worker's question to the evaluator.
+      const questionBoard = yield* kanban.ensureBoard({
+        slug: "retry-question",
+        name: "Questions",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(questionBoard.id, questionBoard.defaultCardModel, 1);
+      const questionCard = yield* kanban.createCard(
+        questionBoard.id,
+        { prompt: "Q", title: "Q" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const workerId = (yield* kanban.card(questionCard.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId: workerId };
+      yield* kanban.postToCard(questionCard.id, worker, [{ _tag: "md", text: "What now?" }]);
+      const discussionAfterQuestion = yield* kanban.cardDiscussion(questionCard.id);
+      const evaluatorId = discussionAfterQuestion.evaluatorThreadId!;
+      assert.isNotNull(evaluatorId);
+      const beforeRetry = (yield* Ref.get(fake.threads)).get(evaluatorId)!.messages.length;
+      yield* kanban.postToCard(questionCard.id, worker, [{ _tag: "md", text: "What now?" }]);
+      assert.strictEqual(
+        (yield* Ref.get(fake.threads)).get(evaluatorId)!.messages.length,
+        beforeRetry,
+      );
+
+      // Two distinct asks must each have their own message and sequence, even with identical text.
+      yield* kanban.askOwner(card.id, { question: "Same?", blocking: false }, owner, "owner");
+      const twice = yield* kanban.askOwner(
+        card.id,
+        { question: "Same?", blocking: false },
+        owner,
+        "owner",
+      );
+      assert.notStrictEqual(twice.asks[0]?.seq, twice.asks[1]?.seq);
+      const cardDiscussion = yield* kanban.cardDiscussion(card.id);
+      const system: KanbanActor = { _tag: "system", component: "test" };
+      const a = yield* kanban.post(cardDiscussion.id, system, [{ _tag: "md", text: "notice" }]);
+      const b = yield* kanban.post(cardDiscussion.id, system, [{ _tag: "md", text: "notice" }]);
+      assert.notStrictEqual(a.seq, b.seq);
+      const image = [{ _tag: "image", url: "https://example.com/a.png", alt: null }] as const;
+      const c = yield* kanban.post(cardDiscussion.id, owner, image);
+      const d = yield* kanban.post(cardDiscussion.id, owner, image);
+      assert.notStrictEqual(c.seq, d.seq);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a started write finishes after the start deadline", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

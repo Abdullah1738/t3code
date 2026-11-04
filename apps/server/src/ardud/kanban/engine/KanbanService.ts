@@ -647,6 +647,49 @@ export const mergeLinks = (
   return next;
 };
 
+const RETRY_WINDOW_MS = 10 * 60_000;
+
+const withinRetryWindow = (at: string, nowMs: number) => {
+  return nowMs - Date.parse(at) <= RETRY_WINDOW_MS;
+};
+
+export const editRepeats = (
+  card: KanbanCard,
+  patch: CardPatch,
+  events: ReadonlyArray<KanbanCardEvent>,
+  actor: KanbanActor,
+  nowMs: number,
+): boolean => {
+  const fields = Object.entries(patch).filter(([, value]) => value !== undefined);
+  if (
+    fields.length === 0 ||
+    fields.some(([key]) => !["description", "links", "comment"].includes(key))
+  ) {
+    return false;
+  }
+  if (patch.description !== undefined && patch.description.trim() !== card.description)
+    return false;
+  for (const link of patch.links ?? []) {
+    const url = link.url.trim();
+    if (!url) continue;
+    const existing = card.links.find((entry) => entry.url === url);
+    if (!existing || (link.label !== undefined && link.label !== existing.label)) return false;
+  }
+  const comment = patch.comment?.trim();
+  if (comment) {
+    const last = events.at(-1);
+    if (
+      !last ||
+      last.kind !== "comment" ||
+      actorKey(last.actor) !== actorKey(actor) ||
+      last.body !== comment ||
+      !withinRetryWindow(last.at, nowMs)
+    )
+      return false;
+  }
+  return true;
+};
+
 const fallbackTitle = (prompt: string) => {
   const first = prompt.trim().split("\n")[0] ?? "";
   return first.length > 60 ? `${first.slice(0, 57).trimEnd()}...` : first || "Untitled";
@@ -2298,17 +2341,37 @@ const make = Effect.gen(function* () {
     yield* toEvaluator(current, text);
   });
 
-  /** `route` false posts without passing it on: an owner's own question on his move. */
+  /** Internal posts, including asks that own a sequence, must not deduplicate. */
   const postUnlocked = Effect.fn("KanbanService.postUnlocked")(function* (
     discussionId: KanbanDiscussion["id"],
     author: KanbanActor,
     blocks: ReadonlyArray<KanbanBlock>,
     route = true,
+    dedupe = false,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
       return yield* failWith("invalid", "a message needs at least one block");
     const discussion = yield* discussionOf(discussionId);
+    if (
+      dedupe &&
+      author._tag !== "system" &&
+      discussion.lastSeq > 0 &&
+      !blocks.some((block) => block._tag === "attachment" || block._tag === "image")
+    ) {
+      const last = yield* store.message(discussionId, discussion.lastSeq);
+      if (
+        last &&
+        actorKey(last.author) === actorKey(author) &&
+        withinRetryWindow(last.createdAt, yield* Clock.currentTimeMillis)
+      ) {
+        // The comparison deliberately matches the persisted JSON representation of normalized blocks.
+        const sameBlocks =
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          JSON.stringify(blocks.map(normalizeMessageBlock)) === JSON.stringify(last.blocks);
+        if (sameBlocks) return last;
+      }
+    }
     const at = yield* nowIso;
     let authorName = OWNER_NAME;
     if (author._tag === "thread" || author._tag === "evaluator") {
@@ -5325,6 +5388,9 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
+        // A retry of an already saved edit must not emit another event or update the card.
+        const events = patch.comment?.trim() ? yield* store.cardEvents(card.id) : [];
+        if (editRepeats(card, patch, events, actor, yield* Clock.currentTimeMillis)) return card;
         const at = yield* nowIso;
         const pools = yield* store.pools(card.boardId);
         const models = patch.models ? yield* cardModels(card.boardId, patch.models) : null;
@@ -6780,12 +6846,13 @@ const make = Effect.gen(function* () {
       return existing ?? (yield* guard(cardDiscussionUnlocked(cardId)));
     }),
     messages: (id, options) => readDb(store.messages(id, options)),
-    post: (discussionId, author, blocks) => guard(postUnlocked(discussionId, author, blocks)),
+    post: (discussionId, author, blocks) =>
+      guard(postUnlocked(discussionId, author, blocks, true, true)),
     postToCard: (cardId, author, blocks) =>
       guard(
         Effect.gen(function* () {
           const discussion = yield* cardDiscussionUnlocked(cardId);
-          return yield* postUnlocked(discussion.id, author, blocks);
+          return yield* postUnlocked(discussion.id, author, blocks, true, true);
         }),
       ),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
