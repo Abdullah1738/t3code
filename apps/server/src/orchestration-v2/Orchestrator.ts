@@ -507,6 +507,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "queued-run.reorder":
     case "queued-run.cancel":
     case "queued-run.edit":
+    case "queued-run.rebind-selection":
     case "runtime-request.respond":
     case "thread.user-input.dismiss":
     case "checkpoint.rollback":
@@ -2605,6 +2606,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: command.commandId,
         commandType: command.type,
         cause: `Thread ${command.threadId} is deleted.`,
+      });
+    }
+    if (
+      ((command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
+        command.expectedModelSelection !== undefined &&
+        (!modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection) ||
+         thread.archivedAt !== null || thread.settledAt !== null)) ||
+      (command.type === "thread.runtime-mode.set" &&
+        ((command.expectedRuntimeMode !== undefined && thread.runtimeMode !== command.expectedRuntimeMode) ||
+         (command.expectedModelSelection !== undefined && !modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection)) ||
+         (command.expectedInteractionMode !== undefined && thread.interactionMode !== command.expectedInteractionMode) ||
+         (command.expectedRuntimeMode !== undefined && (thread.archivedAt !== null || thread.settledAt !== null))))
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Thread ${command.threadId} changed since the mutation was planned.`,
       });
     }
     if (
@@ -8581,6 +8599,87 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
   });
 
+  // ardud: only the harness migration sends this. Same guards as queued-run.edit;
+  // it changes the run's model and nothing else, so order, attachments, hold and
+  // the message stay as they were. A run that already started is never rebound.
+  const dispatchQueuedRunRebindSelection = Effect.fn(
+    "Orchestrator.dispatchQueuedRunRebindSelection",
+  )(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "queued-run.rebind-selection" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const projection = yield* readCommandProjection(command.threadId);
+    const queuedRun = projection.runs.find((candidate) => candidate.id === command.runId);
+    if (queuedRun === undefined || queuedRun.status !== "queued") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Run ${command.runId} is not queued.`,
+      });
+    }
+    if (command.expectedModelSelection !== undefined && !modelSelectionsEqual(queuedRun.modelSelection, command.expectedModelSelection)) {
+      return yield* new OrchestratorDispatchError({ commandId: command.commandId, commandType: command.type, cause: `Queued run ${command.runId} changed selection.` });
+    }
+    if (modelSelectionsEqual(queuedRun.modelSelection, command.modelSelection)) return;
+    const now = yield* DateTime.now;
+    const emitEvent = emit(events, command);
+    let providerThreadId = queuedRun.providerThreadId;
+    if (queuedRun.providerInstanceId !== command.modelSelection.instanceId) {
+      const attempt = projection.attempts.find((item) => item.id === queuedRun.activeAttemptId);
+      const node = projection.nodes.find((item) => item.id === queuedRun.rootNodeId);
+      if (attempt === undefined || node === undefined || attempt.status !== "pending" || node.status !== "pending") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Queued run ${queuedRun.id} is missing pending execution state.`,
+        });
+      }
+      const adapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(mapDispatchError(command));
+      const existing = queuedRun.contextReset === true
+        ? undefined
+        : rootProviderThreadsForProvider(projection, command.modelSelection.instanceId)[0];
+      const target: OrchestrationV2ProviderThread = existing ?? {
+        id: idAllocator.derive.providerThread({ driver: adapter.driver, nativeThreadId: `pending:${queuedRun.id}:${command.modelSelection.instanceId}:${command.commandId}` }),
+        driver: adapter.driver,
+        providerInstanceId: command.modelSelection.instanceId,
+        providerSessionId: null,
+        appThreadId: command.threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "not_loaded",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      providerThreadId = target.id;
+      if (existing === undefined) {
+        yield* emitEvent({ type: "provider-thread.updated", threadId: command.threadId, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: target });
+      }
+      yield* emitEvent({ type: "run-attempt.updated", threadId: command.threadId, runId: queuedRun.id, nodeId: node.id, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: { ...attempt, providerInstanceId: command.modelSelection.instanceId, providerThreadId } });
+      yield* emitEvent({ type: "node.updated", threadId: command.threadId, runId: queuedRun.id, nodeId: node.id, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: { ...node, providerThreadId, checkpointScopeId: null } });
+    }
+    yield* emitEvent({
+      type: "run.updated",
+      threadId: command.threadId,
+      runId: queuedRun.id,
+      providerInstanceId: command.modelSelection.instanceId,
+      occurredAt: now,
+      payload: {
+        ...queuedRun,
+        providerInstanceId: command.modelSelection.instanceId,
+        providerThreadId,
+        modelSelection: command.modelSelection,
+      },
+    });
+  });
+
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
     command: OrchestrationV2Command,
     fields: ReadonlyArray<K>,
@@ -11769,6 +11868,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "queued-run.edit":
         yield* dispatchQueuedRunEdit(command, events);
+        break;
+      case "queued-run.rebind-selection":
+        yield* dispatchQueuedRunRebindSelection(command, events);
         break;
       case "checkpoint.rollback":
         yield* dispatchCheckpointRollback(command, events, effects);

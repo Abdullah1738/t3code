@@ -12,6 +12,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
 import type { ProjectRow } from "./ProjectStore.ts";
@@ -32,6 +33,7 @@ export interface ProjectMetaUpdateCommand {
   readonly title?: string;
   readonly workspaceRoot?: string;
   readonly defaultModelSelection?: ModelSelection | null;
+  readonly expectedDefaultModelSelection?: ModelSelection | null;
   readonly defaultThreadEnvMode?: ThreadEnvMode | null;
   readonly autoPull?: boolean;
   readonly faviconPath?: string | null;
@@ -173,6 +175,13 @@ export function planProjectCommand(input: {
     case "project.meta.update": {
       const project = activeProject;
       if (project === undefined) return missingProject();
+      if (command.expectedDefaultModelSelection !== undefined) {
+        const expected = command.expectedDefaultModelSelection;
+        const actual = project.defaultModelSelection;
+        if (expected === null ? actual != null : actual == null || !modelSelectionsEqual(actual, expected)) {
+          return invariant("Project default model selection changed since the update was planned.");
+        }
+      }
       if (
         command.projectIcon?.kind === "monogram" &&
         Array.from(monogramSegmenter.segment(command.projectIcon.text)).length > 2

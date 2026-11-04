@@ -212,6 +212,7 @@ export type KanbanWatchEvent =
 
 export interface KanbanServiceShape {
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanError>;
+  readonly withSelectionMigrationLock: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   readonly ensureBoard: (input: {
     readonly slug: string;
     readonly name: string;
@@ -6830,6 +6831,7 @@ const make = Effect.gen(function* () {
 
   return KanbanService.of({
     boards: readDb(store.boards),
+    withSelectionMigrationLock: (effect) => lock.withPermits(1)(effect),
     ensureBoard,
     openBoard,
     createBoard,

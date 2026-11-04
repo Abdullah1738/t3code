@@ -185,6 +185,7 @@ const fixture = Effect.fn("fixture")(function* (
             deviceOnboardingCompleted:
               patch.deviceOnboardingCompleted ?? current.deviceOnboardingCompleted,
           })),
+        updateSettingsIf: () => Effect.die("Unexpected conditional settings mutation"),
         streamChanges: Stream.empty,
         subscribeChanges: Effect.succeed(Stream.empty),
       }),

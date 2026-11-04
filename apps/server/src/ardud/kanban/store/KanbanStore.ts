@@ -232,6 +232,18 @@ export interface KanbanStoreShape {
     pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
     cards: ReadonlyArray<KanbanCard>,
   ) => Effect.Effect<void, KanbanStoreError>;
+  /**
+   * Writes a board migration: the board record, its pools (old keys removed, new ones put),
+   * the cards and the open thread links, in one transaction. A failure leaves the board
+   * untouched. Unlike rekeyBoard, it also rewrites models, not only keys.
+   */
+  readonly migrateBoardSelections: (input: {
+    readonly board: KanbanBoard;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly oldPoolKeys: ReadonlyArray<string>;
+    readonly cards: ReadonlyArray<KanbanCard>;
+    readonly threadLinks: ReadonlyArray<KanbanThreadLink>;
+  }) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
     boardId: KanbanBoardId,
@@ -577,6 +589,61 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+  const migrateBoardSelections = (input: {
+    readonly board: KanbanBoard;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly oldPoolKeys: ReadonlyArray<string>;
+    readonly cards: ReadonlyArray<KanbanCard>;
+    readonly threadLinks: ReadonlyArray<KanbanThreadLink>;
+  }) =>
+    run(
+      "migrate board selections",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const boardJson = yield* Board.encode(input.board);
+          yield* sql`
+            INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${input.board.id}, ${input.board.slug}, ${boardJson})
+            ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
+          `;
+          // The board reads its pools in insertion order (ORDER BY rowid), so a migrated pool keeps its row
+          // and its place: a key change is an in-place UPDATE, never a delete and re-insert. Only a key
+          // that leaves the board is deleted. `oldPoolKeys` and `pools` are paired by position.
+          // Re-keyed pools move first, so their rows are never deleted in the way; the removal pass that
+          // follows only sees keys that genuinely left the board.
+          const survivingKeys = new Set(input.pools.map((pool) => pool.key));
+          for (const [index, pool] of input.pools.entries()) {
+            const poolJson = yield* Pool.encode(pool);
+            const oldKey = input.oldPoolKeys[index];
+            if (oldKey !== undefined && oldKey !== pool.key) {
+              yield* sql`
+                UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${poolJson}
+                WHERE board_id = ${input.board.id} AND key = ${oldKey}
+              `;
+              continue;
+            }
+            yield* sql`
+              INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${input.board.id}, ${pool.key}, ${poolJson})
+              ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
+            `;
+          }
+          for (const key of input.oldPoolKeys) {
+            if (survivingKeys.has(key)) continue;
+            yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
+          }
+          for (const card of input.cards) {
+            const json = yield* Card.encode(card);
+            yield* sql`
+              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
+              WHERE id = ${card.id}
+            `;
+          }
+          for (const link of input.threadLinks) {
+            const json = yield* ThreadLink.encode(link);
+            yield* sql`UPDATE ardud_kanban_threads SET json = ${json} WHERE thread_id = ${link.threadId}`;
+          }
+        }),
+      ),
+    );
   const removePool = (boardId: KanbanBoardId, key: string) =>
     run(
       "remove pool",
@@ -916,6 +983,7 @@ const make = Effect.gen(function* () {
     putPool,
     removePool,
     rekeyBoard,
+    migrateBoardSelections,
     groups,
     putGroups,
     discussions,
