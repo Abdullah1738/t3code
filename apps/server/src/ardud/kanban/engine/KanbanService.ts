@@ -539,6 +539,12 @@ const EVALUATOR_ERRORS_TITLE = "Evaluator errors";
 // gets its evaluator woken once: a card made by an evaluator wakes nobody else.
 const STEP_WAIT_P1_MS = 15 * 60_000;
 const STEP_WAIT_MS = 60 * 60_000;
+const waitingOnEvaluatorStep = (card: KanbanCard) =>
+  card.stage === "todo" &&
+  card.settledAt === null &&
+  card.activeThreadId === null &&
+  card.stalled?.by._tag !== "evaluator" &&
+  kanbanEvaluatorStep(card);
 // An owner message a running evaluator hasn't answered gets one reminder; its turn
 // end covers an idle evaluator, so the tick doesn't double it.
 const OWNER_WAIT_MS = 15 * 60_000;
@@ -850,6 +856,13 @@ const make = Effect.gen(function* () {
       { readonly key: string; readonly since: number; readonly woken: boolean }
     >
   >(new Map());
+  const forgetStepWait = (cardId: KanbanCard["id"]) =>
+    Ref.update(stepWaits, (all) => {
+      if (!all.has(cardId)) return all;
+      const next = new Map(all);
+      next.delete(cardId);
+      return next;
+    });
   // Discussions whose owner message was already reminded: discussion id -> its lastSeq then.
   const ownerWaits = yield* Ref.make<ReadonlyMap<KanbanDiscussionId, number>>(new Map());
   const hold = (threadId: ThreadId, boardId: string, pool: string) =>
@@ -1128,6 +1141,7 @@ const make = Effect.gen(function* () {
     by?: KanbanActor,
   ) {
     yield* store.putCard(card);
+    if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
     yield* publish(
       card.boardId,
       by === undefined ? { _tag: "card", card } : { _tag: "card", card, by },
@@ -4351,21 +4365,12 @@ const make = Effect.gen(function* () {
           );
         }
       }
-      // A todo card whose step is only evaluator subtasks (its packet) and nobody has
-      // done them: its discussion's evaluator is woken once, after a wait.
+      // A todo card waiting on an evaluator step wakes its evaluator once. An evaluator
+      // flag means it is waiting outside the board, so there is nothing to do until the
+      // flag clears; the in-memory woken bit would otherwise be lost on a restart.
       for (const card of yield* cardsForPlan) {
-        const waiting =
-          card.stage === "todo" &&
-          card.settledAt === null &&
-          card.activeThreadId === null &&
-          kanbanEvaluatorStep(card);
-        if (!waiting) {
-          yield* Ref.update(stepWaits, (all) => {
-            if (!all.has(card.id)) return all;
-            const next = new Map(all);
-            next.delete(card.id);
-            return next;
-          });
+        if (!waitingOnEvaluatorStep(card)) {
+          yield* forgetStepWait(card.id);
           continue;
         }
         const key = Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"));
@@ -4380,12 +4385,12 @@ const make = Effect.gen(function* () {
         if (wait.woken || now - wait.since < limit) continue;
         const current = yield* store.card(card.id);
         const currentWait = (yield* Ref.get(stepWaits)).get(card.id);
+        if (current !== null && !waitingOnEvaluatorStep(current)) {
+          yield* forgetStepWait(card.id);
+          continue;
+        }
         if (
           current === null ||
-          current.stage !== "todo" ||
-          current.settledAt !== null ||
-          current.activeThreadId !== null ||
-          !kanbanEvaluatorStep(current) ||
           Subtasks.subtaskIds(kanbanStepSubtasks(current, "evaluator")) !== key ||
           currentWait !== wait ||
           now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS)

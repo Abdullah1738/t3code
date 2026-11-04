@@ -3491,6 +3491,238 @@ it.effect("a P3 card waits an hour before the wake", () =>
   }),
 );
 
+it.effect("an evaluator-stalled step never wakes over multiple ticks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval-stalled") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Wait for the author",
+          title: "Author fix",
+          priority: 3,
+          subtasks: [{ step: 1, owner: "evaluator", text: "Author fix round" }],
+        },
+        evaluator,
+      );
+      yield* kanban.flagCard(card.id, "Waiting for the author", evaluator);
+      yield* kanban.tick;
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stalled?.by._tag, "evaluator");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("clearing an evaluator stall starts a fresh step-wait clock", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval-clear") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Wait for the author",
+          title: "Author fix",
+          priority: 3,
+          subtasks: [{ step: 1, owner: "evaluator", text: "Author fix round" }],
+        },
+        evaluator,
+      );
+      yield* kanban.tick;
+      yield* TestClock.adjust("40 minutes");
+      yield* kanban.flagCard(card.id, "Waiting for the author", evaluator);
+      yield* kanban.tick;
+      yield* TestClock.adjust("120 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* kanban.flagCard(card.id, null, evaluator);
+      yield* kanban.tick;
+      yield* TestClock.adjust("59 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  { action: "flag" as const, afterWake: false },
+  { action: "flag" as const, afterWake: true },
+  { action: "stop" as const, afterWake: false },
+  { action: "stop" as const, afterWake: true },
+])("a brief evaluator $action after wake=$afterWake starts a fresh wait", ({ action, afterWake }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval-brief") };
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Wait for the author",
+          title: "Author fix",
+          priority: 3,
+          subtasks: [{ step: 1, owner: "evaluator", text: "Author fix round" }],
+        },
+        evaluator,
+      );
+      yield* kanban.tick;
+      yield* TestClock.adjust(afterWake ? "60 minutes" : "40 minutes");
+      if (afterWake) yield* kanban.tick;
+      const before = afterWake ? 1 : 0;
+      assert.strictEqual(yield* stepWaitsTo(fake), before);
+      if (action === "flag") {
+        yield* kanban.flagCard(card.id, "Waiting for the author", evaluator);
+      } else {
+        yield* kanban.cardThread(card.id, "stop", "Waiting for the author", evaluator);
+      }
+      assert.strictEqual((yield* kanban.card(card.id)).card.stalled?.by._tag, "evaluator");
+      yield* kanban.flagCard(card.id, null, evaluator);
+      yield* kanban.tick;
+      yield* TestClock.adjust("59 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), before);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), before + 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), before + 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  { _tag: "system", component: "dispatcher" },
+  { _tag: "owner" },
+  { _tag: "thread", threadId: ThreadId.make("another-worker") },
+  { _tag: "script", scriptId: KanbanScriptId.make("script-test") },
+] as const)("a step stalled by $_tag still wakes its evaluator", (stalledBy) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 3,
+          subtasks: [{ step: 1, owner: "evaluator", text: "Packet" }],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval-other-stall") },
+      );
+      yield* kanban.flagCard(card.id, "A different kind of stall", stalledBy);
+      yield* kanban.tick;
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a newly flagged card is rechecked before its evaluator is woken", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const control: { cardId?: KanbanCardId; armed: boolean; changed: boolean } = {
+      armed: false,
+      changed: false,
+    };
+    const racingStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          cards: (boardId) =>
+            real.cards(boardId).pipe(
+              Effect.tap((cards) => {
+                const card = cards.find((item) => item.id === control.cardId);
+                if (!control.armed || !card) return Effect.void;
+                control.armed = false;
+                control.changed = true;
+                return real.putCard({
+                  ...card,
+                  stalled: {
+                    reason: "Waiting for the author",
+                    by: { _tag: "evaluator", threadId: ThreadId.make("eval-race") },
+                    at: "2026-10-25T14:00:00.000Z",
+                  },
+                });
+              }),
+            ),
+        }),
+      ),
+    );
+    const layer = KanbanService.layer.pipe(
+      Layer.provideMerge(fake.layer),
+      Layer.provideMerge(KanbanModels.layerTest(null)),
+      Layer.provideMerge(racingStore.pipe(Layer.provide(KanbanStore.layer))),
+      Layer.provideMerge(Sqlite.layerMemory),
+      Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+      Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+      Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+      Layer.provideMerge(boardFilesLayer),
+    );
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Packet card",
+          title: "Packet",
+          priority: 3,
+          subtasks: [{ step: 1, owner: "evaluator", text: "Packet" }],
+        },
+        { _tag: "evaluator", threadId: ThreadId.make("eval-race") },
+      );
+      yield* kanban.tick;
+      yield* TestClock.adjust("60 minutes");
+      control.cardId = card.id;
+      control.armed = true;
+      yield* kanban.tick;
+      assert.isTrue(control.changed);
+      assert.strictEqual((yield* kanban.card(card.id)).card.stalled?.by._tag, "evaluator");
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      // Clear before another scan sees the flag; the fresh recheck must discard the old wait.
+      yield* kanban.flagCard(card.id, null, {
+        _tag: "evaluator",
+        threadId: ThreadId.make("eval-race"),
+      });
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("59 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 0);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+      yield* TestClock.adjust("60 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* stepWaitsTo(fake), 1);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
 it.effect("a card whose evaluator step changes starts its own clock", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
