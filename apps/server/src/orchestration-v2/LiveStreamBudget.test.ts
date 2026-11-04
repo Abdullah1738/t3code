@@ -1,7 +1,13 @@
 import { it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { EventId, ProviderSessionId, ThreadId, type OrchestrationV2StoredEvent } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -13,6 +19,8 @@ import {
   replayAndBufferLiveEvents,
   type RetainedLiveItem,
 } from "./LiveStreamBudget.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 
 describe("LiveStreamBudget", () => {
   it.effect("closes the source without releasing a batch still waiting for an ACK", () =>
@@ -76,6 +84,66 @@ it.effect("stops draining a slow subscriber when its unacknowledged tail fills",
 type Event = { readonly sequence: number; readonly text: string; readonly threadId?: string };
 
 describe("replayAndBufferLiveEvents", () => {
+  it.live("deduplicates real persisted events committed across high-water and replay boundaries", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "live-budget-race-" });
+      const layer = OrchestrationEventStore.layer.pipe(
+        Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(dir, "state.sqlite"))),
+      );
+      yield* Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore.OrchestrationEventStore;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:live-budget-race");
+        const pubsub = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
+        const append = (index: number) => store.appendAgentEvents({
+          events: [{
+            id: EventId.make(`event:live-budget-race:${index}`),
+            type: "provider-session.detached",
+            threadId,
+            occurredAt: now,
+            payload: { providerSessionId: ProviderSessionId.make("session:race"), detachedAt: now },
+          }],
+        });
+        const seed = yield* append(0);
+        const highWaterStarted = yield* Deferred.make<void>();
+        const allowHighWater = yield* Deferred.make<void>();
+        const replayStarted = yield* Deferred.make<void>();
+        const allowReplay = yield* Deferred.make<void>();
+        const source = replayAndBufferLiveEvents({
+          subscribe: PubSub.subscribe(pubsub),
+          latestSequence: Deferred.succeed(highWaterStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(allowHighWater)),
+            Effect.andThen(store.latestAgentSequence(threadId)),
+          ),
+          replay: (throughSequence) => Stream.unwrap(
+            Deferred.succeed(replayStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(allowReplay)),
+              Effect.as(store.readAgentEvents({ threadId, throughSequence })),
+            ),
+          ),
+        });
+        const reader = yield* source.pipe(Stream.take(4), Stream.runCollect, Effect.forkScoped);
+        yield* Deferred.await(highWaterStarted);
+        const overlapping = yield* append(1);
+        yield* PubSub.publishAll(pubsub, overlapping);
+        yield* Deferred.succeed(allowHighWater, undefined);
+        yield* Deferred.await(replayStarted);
+        const afterHead = yield* append(2);
+        yield* PubSub.publishAll(pubsub, afterHead);
+        yield* Deferred.succeed(allowReplay, undefined);
+        const sentinel = yield* append(3);
+        yield* PubSub.publishAll(pubsub, sentinel);
+        expect(Array.from(yield* Fiber.join(reader))).toEqual([
+          ...seed,
+          ...overlapping,
+          ...afterHead,
+          ...sentinel,
+        ]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("30 seconds")),
+  );
   it.effect.each(["high-water", "replay"] as const)(
     "unsubscribes and cancels a blocked %s read on live overflow",
     (phase) =>

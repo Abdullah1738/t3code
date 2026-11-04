@@ -8,6 +8,7 @@ import {
   ProjectScript,
   ThreadEnvMode,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -263,9 +264,11 @@ export const make = Effect.gen(function* () {
     get,
     list,
     findActiveByWorkspaceRoot,
-    getShell: (projectId) => get(projectId).pipe(Effect.map(Option.map(toShell))),
+    getShell: (projectId) =>
+      get(projectId).pipe(NodeSqliteClient.readOnly, Effect.map(Option.map(toShell))),
     listShells: (options) =>
       list(options?.projectIds === undefined ? undefined : { projectIds: options.projectIds }).pipe(
+        NodeSqliteClient.readOnly,
         Effect.map((rows) => rows.map(toShell)),
       ),
   });

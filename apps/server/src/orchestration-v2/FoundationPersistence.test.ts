@@ -148,6 +148,157 @@ function threadCreatedEvent(input: {
   };
 }
 
+const fileBackedEventSinkLayer = (database: ReturnType<typeof SqlitePersistence.layerFromPath>) => {
+  const stores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
+    Layer.provideMerge(database),
+  );
+  return EventSink.layer.pipe(Layer.provideMerge(stores));
+};
+
+it.live.each([true, false])(
+  "replays multiple EventSink pages with a held writer, then delivers live events once (bounded=%s)",
+  (bounded) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "event-sink-reader-" });
+      const layer = fileBackedEventSinkLayer(
+        SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite")),
+      );
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const sink = yield* EventSink.EventSinkV2;
+        const store = yield* EventStore.EventStoreV2;
+        const now = yield* DateTime.now;
+        const thread = makeThread(ThreadId.make(`thread:reader-catch-up:${bounded}`), now);
+        const commandId = CommandId.make(`command:reader-catch-up:${bounded}`);
+        const event = (index: number): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:reader-catch-up:${bounded}:${index}`),
+          type: "thread.metadata-updated",
+          threadId: thread.id,
+          occurredAt: now,
+          payload: { ...thread, title: `Update ${index}` },
+        });
+        const initial = yield* sink.write({
+          commandId,
+          events: [
+            threadCreatedEvent({ id: `event:reader-catch-up:${bounded}:created`, thread, now }),
+            ...Array.from({ length: 270 }, (_, index) => event(index)),
+          ],
+        });
+        const baseline = Array.from(yield* store.read({ threadId: thread.id }).pipe(Stream.runCollect));
+        assert.deepEqual(baseline, initial);
+        assert.deepEqual(
+          Array.from(yield* store.readByCommandId({ commandId }).pipe(Stream.runCollect)),
+          baseline,
+        );
+        yield* sql`CREATE TABLE reader_test_lock (value INTEGER)`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO reader_test_lock VALUES (1)`;
+            yield* Deferred.succeed(held, undefined);
+            yield* Deferred.await(release);
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(held);
+
+        assert.deepEqual(
+          Array.from(yield* store.read({ threadId: thread.id }).pipe(Stream.runCollect)),
+          baseline,
+        );
+        assert.deepEqual(
+          Array.from(yield* store.readByCommandId({ commandId }).pipe(Stream.runCollect)),
+          baseline,
+        );
+        const pull = yield* Stream.toPull(sink.stream({ threadId: thread.id, bounded }));
+        const replay: Array<(typeof baseline)[number]> = [];
+        while (replay.length < baseline.length) replay.push(...(yield* pull));
+        assert.deepEqual(replay, baseline);
+        assert.isFalse(yield* Deferred.isDone(release));
+
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(writer);
+        const live = yield* sink.write({ events: [event(270), event(271)] });
+        const received: Array<(typeof baseline)[number]> = [];
+        while (received.length < live.length) received.push(...(yield* pull));
+        assert.deepEqual(received, live);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("30 seconds")),
+);
+
+it.live.each([true, false])(
+  "does not lose or duplicate commits at EventSink subscribe/high-water/replay boundaries (bounded=%s)",
+  (bounded) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "event-sink-race-" });
+      const layer = fileBackedEventSinkLayer(
+        SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite")),
+      );
+      yield* Effect.gen(function* () {
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const thread = makeThread(ThreadId.make(`thread:reader-race:${bounded}`), now);
+        const update = (index: number): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:reader-race:${bounded}:${index}`),
+          type: "thread.metadata-updated",
+          threadId: thread.id,
+          occurredAt: now,
+          payload: { ...thread, title: `Race ${index}` },
+        });
+        const seed = yield* sink.write({
+          events: [threadCreatedEvent({ id: `event:reader-race:${bounded}:seed`, thread, now })],
+        });
+        const highWaterStarted = yield* Deferred.make<void>();
+        const allowHighWater = yield* Deferred.make<void>();
+        const replayStarted = yield* Deferred.make<void>();
+        const allowReplay = yield* Deferred.make<void>();
+        let seenHighWater = false;
+        let seenReplay = false;
+        const gates: Statement.Transformer = (statement) => {
+          const [query] = statement.compile();
+          if (!seenHighWater && query.includes("MAX(sequence)") && query.includes("orchestration_events")) {
+            seenHighWater = true;
+            return Deferred.succeed(highWaterStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(allowHighWater)),
+              Effect.as(statement),
+            );
+          }
+          if (!seenReplay && query.includes("FROM orchestration_events") && query.includes("payload_json")) {
+            seenReplay = true;
+            return Deferred.succeed(replayStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(allowReplay)),
+              Effect.as(statement),
+            );
+          }
+          return Effect.succeed(statement);
+        };
+        const reader = yield* sink.stream({ threadId: thread.id, bounded }).pipe(
+          Stream.provideService(Statement.CurrentTransformer, gates),
+          Stream.take(4),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(highWaterStarted);
+        const betweenSubscribeAndHead = yield* sink.write({ events: [update(1)] });
+        yield* Deferred.succeed(allowHighWater, undefined);
+        yield* Deferred.await(replayStarted);
+        const betweenHeadAndReplay = yield* sink.write({ events: [update(2)] });
+        yield* Deferred.succeed(allowReplay, undefined);
+        const sentinel = yield* sink.write({ events: [update(3)] });
+        assert.deepEqual(Array.from(yield* Fiber.join(reader)), [
+          ...seed,
+          ...betweenSubscribeAndHead,
+          ...betweenHeadAndReplay,
+          ...sentinel,
+        ]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("30 seconds")),
+);
+
 it.effect("rebuilds event history one bounded page at a time", () =>
   Effect.gen(function* () {
     const eventStore = yield* EventStore.EventStoreV2;

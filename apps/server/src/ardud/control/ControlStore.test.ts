@@ -1,5 +1,11 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -104,6 +110,88 @@ const run = <A, E>(body: Effect.Effect<A, E, ControlStore.ControlStore | SqlClie
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ControlStore native ids", () => {
+  it.live("reads origins, native bindings and live IDs while the writer is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-reader-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* ControlStore.ControlStore;
+        yield* seed;
+        yield* store.setOrigin("t-moved", "imessage");
+        yield* sql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+          VALUES ('ses_import', 't-moved', '2026-01-01T00:00:00.000Z')`;
+        yield* sql`INSERT INTO orchestration_v2_projection_runs ${sql.insert({
+          run_id: "run-reader",
+          thread_id: "t-moved",
+          ordinal: 1,
+          provider: "opencode",
+          status: "running",
+          requested_at: "2026-01-01T00:00:00.000Z",
+          completed_at: null,
+          payload_json: "{}",
+        })}`;
+        yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert({
+          runtime_request_id: "request-reader",
+          thread_id: "t-detached",
+          node_id: "node",
+          provider_turn_id: null,
+          kind: "user_input",
+          status: "pending",
+          created_at: "2026-01-01T00:00:00.000Z",
+          resolved_at: null,
+          payload_json: "{}",
+        })}`;
+
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        yield* Deferred.await(held);
+        const result = yield* Effect.all({
+          origin: store.getOrigin("t-moved"),
+          origins: store.getOrigins(["t-moved", "t-detached"]),
+          native: store.nativeSessionIds(["t-moved", "t-detached"]),
+          bindings: store.nativeBindings(["t-moved", "t-detached"]),
+          imported: store.threadIdForNativeSession("ses_import", "opencode"),
+          active: store.threadIdForNativeSession("claude-moved-uuid", "claudeAgent"),
+          live: store.liveThreadIds(),
+          pending: store.pendingRequestThreadIds(),
+        }).pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(writer);
+        assert.strictEqual(result.origin, "imessage");
+        assert.strictEqual(result.origins.get("t-moved"), "imessage");
+        assert.strictEqual(result.native.get("t-moved"), "claude-moved-uuid");
+        assert.deepStrictEqual(result.bindings.get("t-moved"), {
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          nativeId: "claude-moved-uuid",
+        });
+        assert.strictEqual(result.imported, "t-moved");
+        assert.strictEqual(result.active, "t-moved");
+        assert.deepStrictEqual([...result.live].sort(), ["t-detached", "t-moved"]);
+        assert.deepStrictEqual(result.pending, ["t-detached"]);
+
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* store.setOrigin("t-moved", "automation");
+            assert.strictEqual(yield* store.getOrigin("t-moved"), "automation");
+          }),
+        );
+        assert.strictEqual(yield* store.getOrigin("t-moved"), "automation");
+      }).pipe(
+        Effect.provide(
+          ControlStore.layer.pipe(
+            Layer.provideMerge(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect("reports no current session id for a thread whose active binding has none", () =>
     run(
       Effect.gen(function* () {

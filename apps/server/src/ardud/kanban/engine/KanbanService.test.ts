@@ -10710,6 +10710,7 @@ it.live("card lookups by number and an existing card discussion don't wait for t
         caller: kanban.caller(thread),
         carried: kanban.carried(thread),
         ownCards: kanban.ownCards(thread),
+        summaries: Stream.runCollect(Stream.take(kanban.boardSummaries, 1)),
       }).pipe(
         Effect.timeout("5 seconds"),
         Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
@@ -10721,6 +10722,11 @@ it.live("card lookups by number and an existing card discussion don't wait for t
       assert.strictEqual(reads.caller?.cardId, created.id);
       assert.isTrue(reads.carried.some((card) => card.id === created.id));
       assert.isTrue(reads.ownCards.some((card) => card.id === created.id));
+      assert.isTrue(
+        Array.from(reads.summaries).some((entries) =>
+          entries.some((entry) => entry.boardId === board.id),
+        ),
+      );
     }).pipe(Effect.provide(fileTestLayer(fake.layer, path.join(directory, "state.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   ComposerContextId,
@@ -6,9 +7,13 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
@@ -42,6 +47,18 @@ const layerTest = Layer.mergeAll(
   layerImporterProvided,
   layerProjectionMaintenanceProvided,
 );
+
+function fileImporterLayer(filename: string) {
+  const database = SqlitePersistence.layerFromPath(filename);
+  const stores = Layer.mergeAll(
+    database,
+    EventStore.layer.pipe(Layer.provide(database)),
+    ProjectionStore.layer.pipe(Layer.provide(database)),
+  );
+  const sink = EventSink.layer.pipe(Layer.provide(stores));
+  const importer = LegacyV1ThreadImporter.layer.pipe(Layer.provide(Layer.merge(stores, sink)));
+  return Layer.mergeAll(stores, sink, importer);
+}
 
 const seedPendingTranscripts = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -78,6 +95,253 @@ const seedPendingTranscripts = Effect.gen(function* () {
   }
   yield* importer.reconcileShells;
 });
+
+it.live(
+  "probes imported and missing transcripts while a writer is held without caching a miss",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-legacy-reader-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const importedId = ThreadId.make("thread:first");
+        const futureId = ThreadId.make("thread:future");
+        yield* seedPendingTranscripts;
+        // Mark it without invoking ensureTranscript, so its first probe is not cached.
+        yield* sql`UPDATE orchestration_v2_legacy_imports
+        SET transcript_imported_at = '2026-01-03T00:00:00.000Z'
+        WHERE thread_id = ${importedId}`;
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          yield* Deferred.await(held);
+          const results = yield* Effect.all([
+            importer.ensureTranscript(importedId),
+            importer.ensureTranscript(futureId),
+          ]);
+          assert.deepEqual(results, [
+            { importedThreadCount: 0, importedMessageCount: 0 },
+            { importedThreadCount: 0, importedMessageCount: 0 },
+          ]);
+          assert.deepEqual(
+            yield* importer
+              .ensureTranscript(importedId)
+              .pipe(
+                Effect.provideService(Statement.CurrentTransformer, () =>
+                  Effect.die("A confirmed transcript should not query SQLite again"),
+                ),
+              ),
+            { importedThreadCount: 0, importedMessageCount: 0 },
+          );
+        }).pipe(
+          Effect.timeout("15 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(writer);
+
+        // A row that did not exist at the probe can arrive in a later reconciliation.
+        yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, created_at, updated_at
+        ) VALUES (
+          ${futureId}, 'project:background', 'Future thread',
+          '{"instanceId":"codex","model":"gpt-5.4"}', 'full-access', 'default',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+        )
+      `;
+        yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id, thread_id, role, text, is_streaming, created_at, updated_at
+        ) VALUES
+          ('future:old', ${futureId}, 'user', 'Future question', 0,
+            '2026-01-01T01:00:00.000Z', '2026-01-01T01:00:00.000Z'),
+          ('future:middle', ${futureId}, 'assistant', 'Earlier answer', 0,
+            '2026-01-01T02:00:00.000Z', '2026-01-01T02:00:00.000Z'),
+          ('future:new', ${futureId}, 'assistant', 'Future answer', 0,
+            '2026-01-02T01:00:00.000Z', '2026-01-02T01:00:00.000Z')
+      `;
+        yield* importer.reconcileShells;
+        assert.deepEqual(yield* importer.ensureTranscript(futureId), {
+          importedThreadCount: 1,
+          importedMessageCount: 1,
+        });
+        assert.deepEqual(
+          (yield* projections.getThreadProjection(futureId)).messages.map(
+            (message) => message.text,
+          ),
+          ["Future question", "Earlier answer", "Future answer"],
+        );
+        assert.deepEqual(yield* importer.ensureTranscript(futureId), {
+          importedThreadCount: 0,
+          importedMessageCount: 0,
+        });
+      }).pipe(Effect.provide(fileImporterLayer(path.join(directory, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("serializes concurrent hydration after both callers probe an unimported transcript", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-legacy-concurrent-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:later");
+      yield* seedPendingTranscripts;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* Effect.forkChild(
+        sql.withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ),
+      );
+      const probe1 = yield* Deferred.make<void>();
+      const probe2 = yield* Deferred.make<void>();
+      const lockedRecheck = yield* Deferred.make<void>();
+      const observeProbe = (): Statement.Transformer => {
+        let reads = 0;
+        return (statement) => {
+          const [query] = statement.compile();
+          if (!query.includes("FROM orchestration_v2_legacy_imports"))
+            return Effect.succeed(statement);
+          reads += 1;
+          return reads === 1
+            ? Effect.succeed(statement)
+            : Deferred.succeed(lockedRecheck, undefined).pipe(Effect.as(statement));
+        };
+      };
+      const probeTracer = (probe: typeof probe1) =>
+        Tracer.make({
+          span(options) {
+            const span = new Tracer.NativeSpan(options);
+            const end = span.end.bind(span);
+            span.end = (endTime, exit) => {
+              end(endTime, exit);
+              const query = span.attributes.get("db.query.text");
+              if (
+                typeof query === "string" &&
+                query.includes("FROM orchestration_v2_legacy_imports") &&
+                Exit.isSuccess(exit)
+              ) {
+                Deferred.doneUnsafe(probe, Effect.void);
+              }
+            };
+            return span;
+          },
+        });
+      yield* Deferred.await(held);
+      const first = yield* importer
+        .ensureTranscript(threadId)
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, observeProbe()),
+          Effect.withTracer(probeTracer(probe1)),
+          Effect.forkChild,
+        );
+      const second = yield* importer
+        .ensureTranscript(threadId)
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, observeProbe()),
+          Effect.withTracer(probeTracer(probe2)),
+          Effect.forkChild,
+        );
+      yield* Effect.all([
+        Deferred.await(probe1),
+        Deferred.await(probe2),
+        Deferred.await(lockedRecheck),
+      ]).pipe(Effect.timeout("15 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(writer);
+      const results = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+      assert.equal(
+        results.reduce((total, result) => total + result.importedThreadCount, 0),
+        1,
+      );
+      assert.equal(
+        results.reduce((total, result) => total + result.importedMessageCount, 0),
+        1,
+      );
+      assert.deepEqual(
+        (yield* projections.getThreadProjection(threadId)).messages.map((message) => message.text),
+        ["Old question", "Latest question"],
+      );
+      const imported = yield* sql<{
+        readonly transcript_imported_at: string | null;
+        readonly imported_message_count: number;
+      }>`
+        SELECT transcript_imported_at, imported_message_count
+        FROM orchestration_v2_legacy_imports WHERE thread_id = ${threadId}
+      `;
+      assert.isString(imported[0]?.transcript_imported_at);
+      assert.equal(imported[0]?.imported_message_count, 2);
+      const events = yield* sql<{ readonly event_id: string; readonly count: number }>`
+        SELECT event_id, COUNT(*) AS count FROM orchestration_events
+        WHERE application_event_version = 2 AND stream_id = ${threadId}
+          AND (event_id LIKE 'migration:v1:message:%' OR event_id LIKE 'migration:v1:turn-item:%')
+        GROUP BY event_id ORDER BY event_id
+      `;
+      assert.deepEqual(
+        events.map((row) => row.event_id),
+        [
+          "migration:v1:message:thread:later:latest",
+          "migration:v1:message:thread:later:old",
+          "migration:v1:turn-item:thread:later:latest",
+          "migration:v1:turn-item:thread:later:old",
+        ],
+      );
+      assert.isTrue(events.every((event) => event.count === 1));
+    }).pipe(Effect.provide(fileImporterLayer(path.join(directory, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("probes and imports a newly inserted legacy row inside its writer transaction", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-legacy-own-writes-" });
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const importer = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:first");
+      yield* seedPendingTranscripts;
+      yield* sql`DELETE FROM orchestration_v2_legacy_imports WHERE thread_id = ${threadId}`;
+      const summary = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`
+            INSERT INTO orchestration_v2_legacy_imports (
+              thread_id, source_updated_at, shell_imported_at, transcript_imported_at,
+              imported_message_count, last_error
+            ) VALUES (
+              ${threadId}, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+              NULL, 1, NULL
+            )
+          `;
+          return yield* importer.ensureTranscript(threadId);
+        }),
+      );
+      assert.deepEqual(summary, { importedThreadCount: 1, importedMessageCount: 1 });
+      assert.deepEqual(
+        (yield* projections.getThreadProjection(threadId)).messages.map((message) => message.text),
+        ["Old question", "Latest question"],
+      );
+      const rows = yield* sql<{ readonly transcript_imported_at: string | null }>`
+        SELECT transcript_imported_at FROM orchestration_v2_legacy_imports
+        WHERE thread_id = ${threadId}
+      `;
+      assert.isString(rows[0]?.transcript_imported_at);
+    }).pipe(Effect.provide(fileImporterLayer(path.join(directory, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect(
   "keeps hydrating later transcripts after a defect and leaves the failed thread pending",
