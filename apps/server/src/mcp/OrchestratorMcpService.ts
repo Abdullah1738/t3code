@@ -1784,6 +1784,10 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
+      startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
+      startPending:
+        childRun?.startedAt == null &&
+        (childRun?.status === "preparing" || childRun?.status === "starting"),
       workState,
       hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
       providerInstanceId: modelSelection.instanceId,

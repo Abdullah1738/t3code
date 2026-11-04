@@ -67,6 +67,21 @@ describe("orchestrator MCP contracts", () => {
     expect(result.status).toBe("completed");
     expect(result.summary).toBe("Workspace inspected.");
     expect(result.pendingApproval).toBeNull();
+    expect(result.startedAt).toBeUndefined();
+    expect(result.startPending).toBeUndefined();
+    expect(decodeDelegateTaskResult({ ...result, startedAt: null, startPending: true })).toMatchObject({
+      startedAt: null,
+      startPending: true,
+    });
+    expect(
+      decodeDelegateTaskResult({
+        ...result,
+        startedAt: "2026-11-04T12:00:00.000Z",
+        startPending: false,
+      }),
+    ).toMatchObject({ startedAt: "2026-11-04T12:00:00.000Z", startPending: false });
+    expect(() => decodeDelegateTaskResult({ ...result, startedAt: 123 })).toThrow();
+    expect(() => decodeDelegateTaskResult({ ...result, startPending: "true" })).toThrow();
     const pendingApproval = {
       requestId: "request-approval-1",
       kind: "command",
