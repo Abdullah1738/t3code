@@ -395,6 +395,7 @@ it.effect("coalesces request liveness writes and makes trusted touch durable", (
     now = 61_000;
     yield* first.resolve(token);
     yield* first.resolve(token);
+    yield* TestClock.adjust("1 minute");
     expect(writes).toBe(1);
     expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(61_000);
     now = 61_001;
