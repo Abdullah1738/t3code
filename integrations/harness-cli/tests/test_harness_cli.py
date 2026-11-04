@@ -597,6 +597,9 @@ class CanaryTests(FakeCliTestCase):
         self.seed_patch = mock.patch.object(hc, "seed_codex_rollout", side_effect=fake_seed)
         self.seed_mock = self.seed_patch.start()
         self.addCleanup(self.seed_patch.stop)
+        self.wait_patch = mock.patch.object(hc, "wait_for_codex_fixture", return_value=True)
+        self.wait_patch.start()
+        self.addCleanup(self.wait_patch.stop)
 
     def install_binary(self, tool: str, version: str, body: bytes) -> Path:
         bin_dir = self.root / tool / version / "bin"
@@ -642,6 +645,17 @@ class CanaryTests(FakeCliTestCase):
         result = hc.thinking_replay_check(first, [{**request, "response_transformations": [[]]},
                                                   {**request, "response_transformations": [[{"type": "dropped"}]]}])
         self.assertFalse(result["inputTransformationsEmpty"])
+
+    def test_signed_empty_thinking_replay_is_detected(self) -> None:
+        payload = b'{"content":[{"type":"thinking","thinking":"","signature":"signature"}]}'
+        record = {}
+        hc.Recorder("http://127.0.0.1:20128", "dummy").capture_response(payload, record)
+        req = {"body": {"messages": [{"role": "assistant", "content": [{"type": "thinking",
+                "thinking": "", "signature": "signature"}]}]}, "response_transformations": [[]]}
+        result = hc.thinking_replay_check([record], [req])
+        self.assertTrue(result["thinkingReplayed"])
+        self.assertEqual(result["turn1SignedBlocks"], 1)
+        self.assertTrue(result["inputTransformationsEmpty"])
 
     def test_nested_tool_input_is_not_transformation_evidence(self) -> None:
         record = {}
@@ -1244,15 +1258,17 @@ except OSError: print('signal denied')
         base = f"http://127.0.0.1:{allowed.server_port}"
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "ANTHROPIC_BASE_URL": base}
         py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        python_root = Path(sys.executable).resolve().parent.parent
         sockpath = str(self.tmp / 'local-sock')
         listener = __import__('socket').socket(__import__('socket').AF_UNIX)
         listener.bind(sockpath); listener.listen()
         self.addCleanup(listener.close)
         protected = self.tmp / "personal-secret"
         protected.write_text("not accessible")
-        result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath,
-                                 str(protected), str(os.getpid())],
-                            env=env, cwd=work, sandbox_root=work, recorder_url=base)
+        with mock.patch.object(hc, "SANDBOX_SYSTEM_READ_ROOTS", hc.SANDBOX_SYSTEM_READ_ROOTS + (str(python_root),)):
+            result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath,
+                                     str(protected), str(os.getpid())],
+                                env=env, cwd=work, sandbox_root=work, recorder_url=base)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("recorder allowed", result.stdout)
         self.assertIn("bypass denied", result.stdout)
@@ -1281,8 +1297,10 @@ except OSError: print('signal denied')
         hc.prepare_isolated_home(home)
         work = home.parent
         py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        python_root = Path(sys.executable).resolve().parent.parent
         code = "import socket; s=socket.socket(); print(s.connect_ex(('127.0.0.1',20128)))"
-        proc = hc.run_cli(py, ["-c", code], env={"HOME": str(home)}, cwd=work, sandbox_root=work)
+        with mock.patch.object(hc, "SANDBOX_SYSTEM_READ_ROOTS", hc.SANDBOX_SYSTEM_READ_ROOTS + (str(python_root),)):
+            proc = hc.run_cli(py, ["-c", code], env={"HOME": str(home)}, cwd=work, sandbox_root=work)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "1")
 

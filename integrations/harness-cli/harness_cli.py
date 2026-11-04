@@ -113,6 +113,9 @@ CLAUDE_MODEL_IDS = {
 }
 DEFAULT_TIMEOUT = 600
 CANARY_SCHEMA_VERSION = 2
+SANDBOX_SYSTEM_READ_ROOTS = ("/System", "/usr", "/bin", "/dev", "/private/etc",
+                             "/private/var/db", "/private/var/run", "/private/var/protected", "/private/var/tmp")
+SANDBOX_EXEC_ALLOWLIST: tuple[str, ...] = ()  # The selected binary is added per invocation.
 
 
 class HarnessError(Exception):
@@ -518,6 +521,7 @@ class Recorder:
         self.paths: list[str] = []
         self.requests: list[dict] = []
         self.violations: list[dict] = []
+        self.hold_primary = None
         self.server = None
         self.thread = None
 
@@ -586,6 +590,8 @@ class Recorder:
                     with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(req, timeout=300) as resp:
                         payload = resp.read()
                         recorder.capture_response(payload, record)
+                        if recorder.hold_primary is not None:
+                            recorder.hold_primary(record)
                         self.send_response(resp.status)
                         for k, v in resp.headers.items():
                             if k.lower() not in ("transfer-encoding", "connection", "content-length"):
@@ -629,8 +635,9 @@ class Recorder:
         try:
             doc = json.loads(text)
             for block in (doc.get("content") or []) if isinstance(doc, dict) else []:
-                if isinstance(block, dict) and block.get("type") == "thinking":
-                    found.append({"thinking": block.get("thinking", ""), "signature": block.get("signature", "")})
+                if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"):
+                    found.append({"type": block["type"], "thinking": block.get("thinking", ""),
+                                  "signature": block.get("signature", ""), "data": block.get("data", "")})
             return found
         except json.JSONDecodeError:
             pass
@@ -644,8 +651,9 @@ class Recorder:
                 continue
             if event.get("type") == "content_block_start":
                 block = event.get("content_block") or {}
-                if block.get("type") == "thinking":
-                    current = {"thinking": block.get("thinking", ""), "signature": block.get("signature", "")}
+                if block.get("type") in ("thinking", "redacted_thinking"):
+                    current = {"type": block["type"], "thinking": block.get("thinking", ""),
+                               "signature": block.get("signature", ""), "data": block.get("data", "")}
                     found.append(current)
                 else:
                     current = None
@@ -707,12 +715,15 @@ def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
         raise HarnessError("CLI scratch root must be a private temporary directory")
     binary = binary.resolve(strict=True)
     sb = lambda value: json.dumps(str(value))
+    exec_paths = (str(binary), *SANDBOX_EXEC_ALLOWLIST)
     rules = ["(version 1)", "(allow default)", "(deny process-exec)",
-             f"(allow process-exec (literal {sb(binary)}))", "(deny network-outbound)",
+             '(allow process-exec ' + ' '.join(f'(literal {sb(p)})' for p in exec_paths) + ')', "(deny network-outbound)",
              "(deny file-write*)", f"(allow file-write* (subpath {sb(scratch)}) (literal \"/dev/null\"))",
-             '(deny file-read-data (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders"))',
-             f"(allow file-read-data (subpath {sb(scratch)}) (literal {sb(binary)}))",
-             '(allow file-read-data (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/dev") (subpath "/private/etc"))',
+             '(deny file-read-data)',
+             f"(allow file-read-data (subpath {sb(scratch)}) (literal {sb(binary)}) (literal \"/\"))",
+             '(allow file-read-data ' + ' '.join(f'(subpath {sb(p)})' for p in SANDBOX_SYSTEM_READ_ROOTS) + ')',
+             '(allow file-read-metadata (subpath "/private/tmp"))',
+             f'(allow file-read-data (literal {sb("/private/tmp/claude-" + str(os.getuid()))}))',
              '(deny signal)',
              '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc") (global-name "com.apple.securityd.general"))']
     if recorder_url is not None:
@@ -813,8 +824,8 @@ THINKING_CANARY_WORD = "ROBOB-THINK-4417"
 
 def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> dict:
     """Require a matching signed block in turn two and explicit empty response transformations."""
-    replies = [b for rec in first_turn for b in rec.get("response_thinking", [])
-               if b.get("thinking") and b.get("signature")]
+    all_blocks = [b for rec in first_turn for b in rec.get("response_thinking", [])]
+    replies = [b for b in all_blocks if b.get("signature")]
     matched = False
     reports = []
     observed = False
@@ -827,15 +838,20 @@ def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> di
                 content = message.get("content")
                 if isinstance(content, list):
                     blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
-                    this_match = any(b.get("thinking") == r["thinking"] and b.get("signature") == r["signature"]
+                    this_match = any(b.get("thinking", "") == r.get("thinking", "") and b.get("signature") == r["signature"]
                                      for b in blocks for r in replies)
                     if this_match:
                         matched = True
                         transformations = rec.get("response_transformations") or []
                         observed = observed or bool(transformations)
                         reports.append(bool(transformations) and all(v == [] for v in transformations))
-    return {"turn1ThinkingBlocks": len(replies), "thinkingReplayed": matched,
-            "inputTransformationsObserved": observed, "inputTransformationsEmpty": bool(reports) and all(reports)}
+    types = {t: sum(1 for b in all_blocks if b.get("type", "thinking") == t) for t in ("thinking", "redacted_thinking")}
+    all_transformations = [v for rec in second_turn for v in rec.get("response_transformations", [])]
+    return {"turn1ThinkingBlocks": len(replies), "turn1BlockTypes": types,
+            "turn1SignedBlocks": len(replies), "thinkingReplayed": matched,
+            "inputTransformationsObserved": observed,
+            "responseTransformationsObserved": bool(all_transformations),
+            "inputTransformationsEmpty": bool(reports) and all(reports)}
 
 
 def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> dict:
@@ -874,13 +890,15 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         session_id = str(uuid_for(work))
         turn1 = run_cli(binary, ["-p", f"Remember the code {THINKING_CANARY_WORD}. Think it through briefly, "
                                  "then reply with the single word OK.", "--model", routed,
-                                 "--effort", "high", "--session-id", session_id, "--output-format", "text"],
+                                 "--effort", "high", "--thinking", "adaptive", "--thinking-display", "summarized",
+                                 "--session-id", session_id, "--output-format", "text"],
                         env=env, timeout=240, cwd=project, sandbox_root=work, recorder_url=base)
         turn1_ok = turn1.returncode == 0 and "OK" in turn1.stdout
         first_turn = list(recorder.requests)
         boundary = len(first_turn)
         turn2 = run_cli(binary, ["-p", "What code did I ask you to remember? Reply with the code only.",
-                                 "--model", routed, "--effort", "high", "--resume", session_id,
+                                 "--model", routed, "--effort", "high", "--thinking", "adaptive",
+                                 "--thinking-display", "summarized", "--resume", session_id,
                                  "--output-format", "text"], env=env, timeout=240, cwd=project,
                         sandbox_root=work, recorder_url=base)
         turn2_ok = turn2.returncode == 0 and THINKING_CANARY_WORD in turn2.stdout
@@ -1040,6 +1058,26 @@ def codex_memory_positive_evidence(chome: Path, fixture_id: str) -> list[str]:
     return ["memories_1.sqlite:stage1_outputs:content"] if rows else []
 
 
+def wait_for_codex_fixture(chome: Path, fixture_id: str, timeout: float = 120) -> bool:
+    """Observe async extraction while the primary response keeps Codex alive."""
+    import sqlite3
+    from contextlib import closing
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        db = chome / "memories_1.sqlite"
+        if db.is_file() and db.stat().st_size:
+            try:
+                with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=1)) as conn:
+                    row = conn.execute("SELECT EXISTS(SELECT 1 FROM stage1_outputs WHERE thread_id = ? AND (length(trim(raw_memory)) > 0 OR length(trim(rollout_summary)) > 0))", (fixture_id,)).fetchone()
+                    if row and row[0]:
+                        return True
+            except sqlite3.OperationalError as exc:
+                if not any(x in str(exc).lower() for x in ("no such table", "locked", "busy")):
+                    raise
+        time.sleep(0.5)
+    return False
+
+
 def codex_memory_in_body(body, sentinel: str, instruction_text: str | None = None) -> tuple[bool, bool]:
     """Inspect decoded JSON strings, including nested Responses API input/content items."""
     sentinel_seen = False
@@ -1107,18 +1145,24 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                "CODEX_HOME": str(chome), "NINEROUTER_KEY": nine_router_key(),
                "NINEROUTER_BASE": base, "LANG": "en_US.UTF-8"}
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
-        if enable_memory:
-            cfg += ["-c", "memories.min_rollout_idle_hours=1", "-c", "memories.max_rollouts_per_startup=1"]
+        cfg += ["-c", "memories.min_rollout_idle_hours=1", "-c", "memories.max_rollouts_per_startup=1",
+                "-c", f'memories.extract_model="{models[0]}"']
         bootstrap = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
-                                    "-m", models[0], *cfg, "Reply exactly OK."], env=env, timeout=240,
+                                    "-m", models[0], *cfg, "-c", "features.memories=false", "Reply exactly OK."], env=env, timeout=240,
                             cwd=work, sandbox_root=work, recorder_url=base)
         if bootstrap.returncode or not recorder.requests:
             raise HarnessError("Codex memory-control bootstrap failed")
         fixture_id = seed_codex_rollout(chome, work, version)
+        prompt = "Reply exactly OK. This is primary probe " + uuid.uuid4().hex
+        if enable_memory:
+            def hold_primary(record):
+                if prompt in json.dumps(record.get("body")):
+                    wait_for_codex_fixture(chome, fixture_id)
+            recorder.hold_primary = hold_primary
         for model in models:
             before = len(recorder.requests)
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
-                                    "-m", model, *cfg, "Reply exactly OK."], env=env, timeout=240,
+                                    "-m", model, *cfg, prompt], env=env, timeout=240,
                            cwd=work, sandbox_root=work, recorder_url=base)
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
