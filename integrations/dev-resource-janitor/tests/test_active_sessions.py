@@ -7,6 +7,7 @@ Both sources are stubbed over real HTTP sockets.
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -176,13 +177,14 @@ class ActiveSetTests(unittest.TestCase):
 
     def test_runless_native_children_are_read_by_their_own_query_not_the_active_one(self):
         # `active=true` is built from runs and pending requests, so a native child with neither is missing from it.
-        # The janitor reads those children with a second query (creationSource=provider, inside the native window).
+        # The janitor reads those children with a second query (provider and mcp, inside the 48-hour window).
         stub = self.serve(threads=[thread(1)], opencode={"ses_a": True})
         active.snapshot()
         queries = [r for r in stub.requests if "/threads" in r]
         self.assertEqual(len(queries), 2, queries)
         self.assertTrue(any("active=true" in r for r in queries), queries)
-        self.assertTrue(any("creationSource=provider" in r for r in queries), queries)
+        self.assertTrue(any(parse_qs(urlparse(r).query).get("creationSource") == ["provider,mcp"]
+                            for r in queries), queries)
 
     def test_runless_native_child_is_kept_as_in_use(self):
         # A native child that is idle (no run, no pending request) can still own a worktree: it counts as in use.
@@ -236,8 +238,7 @@ NOW_MS = 1_800_000_000_000  # a fixed clock, so the native window's cut is exact
 
 
 class TwoQueryActiveSetTests(unittest.TestCase):
-    """The active set is the union of two complete queries: (a) every non-idle thread, (b) the provider-native
-    children updated inside the 48 h window. Each must be complete on its own."""
+    """Both the non-idle and recent provider/MCP queries must be complete."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -270,16 +271,16 @@ class TwoQueryActiveSetTests(unittest.TestCase):
         stub = self.serve(threads=[], honor_filters=True)
         self.read_snapshot()
         active_q = [r for r in stub.requests if "active=true" in r]
-        native_q = [r for r in stub.requests if "creationSource=provider" in r]
+        native_q = [r for r in stub.requests if "creationSource" in parse_qs(urlparse(r).query)]
         self.assertEqual(len(active_q), 1, stub.requests)
         self.assertEqual(len(native_q), 1, stub.requests)
-        self.assertIn("includeSubagents=true", active_q[0])
-        self.assertIn("limit=500", active_q[0])
-        self.assertIn("includeSubagents=true", native_q[0])
-        self.assertIn("limit=500", native_q[0])
+        self.assertEqual(parse_qs(urlparse(active_q[0]).query),
+                         {"active": ["true"], "includeSubagents": ["true"], "limit": ["500"]})
         # The window: updatedSince = now - 48 h, to within a minute (the test pins the clock, so it is exact).
-        from urllib.parse import parse_qs as pq, urlparse as up
-        since = int(pq(up(native_q[0]).query)["updatedSince"][0])
+        params = parse_qs(urlparse(native_q[0]).query)
+        self.assertEqual(params.pop("creationSource"), ["provider,mcp"])
+        since = int(params.pop("updatedSince")[0])
+        self.assertEqual(params, {"includeSubagents": ["true"], "limit": ["500"]})
         self.assertAlmostEqual(since, NOW_MS - 48 * 3600 * 1000, delta=60_000)
 
     def test_native_window_is_forty_eight_hours(self):
@@ -298,6 +299,41 @@ class TwoQueryActiveSetTests(unittest.TestCase):
         self.assertEqual(set(snap["threads"]), {"thread-app-run", "thread-native-idle"})
         self.assertTrue(active.in_use(snap["threads"]["thread-app-run"]))
         self.assertTrue(active.in_use(snap["threads"]["thread-native-idle"]))
+
+    def test_recent_idle_delegate_protects_its_expo_process(self):
+        import dev_janitor
+
+        delegate = {"threadId": "delegate", "state": "idle", "worktreePath": "/work/app/task",
+                    "creationSource": "mcp", "relationshipToParent": "subagent",
+                    "updatedAtMs": NOW_MS - 3600_000}
+        self.serve(threads=[delegate], honor_filters=True, opencode={})
+        db_path = Path(self.tmp.name) / "opencode.db"
+        with sqlite3.connect(db_path) as con:
+            con.execute("CREATE TABLE session_message (session_id TEXT, time_created INTEGER, data TEXT)")
+            con.execute("CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT)")
+        process = {"pid": 1111, "ppid": 1, "age_s": 9000, "rss_mb": 1, "cmd": "expo start"}
+        with patch.object(active.time, "time", return_value=NOW_MS / 1000), \
+                patch.object(dev_janitor, "OC_DB", str(db_path)), \
+                patch.object(dev_janitor, "procs", return_value=[process]), \
+                patch.object(dev_janitor, "cwd_of", return_value="/work/app"), \
+                patch.object(dev_janitor, "keep_list", return_value=[]), \
+                patch.object(dev_janitor, "sh", return_value=(1, "", "")):
+            snap = active.snapshot()
+            result = dev_janitor.scan()
+        self.assertTrue(snap["complete"], snap["problems"])
+        self.assertEqual(snap["workspaces"], {"delegate": "/work/app/task"})
+        expo = next(r for r in result["resources"] if r["id"] == "expo:1111")
+        self.assertFalse(expo["candidate"])
+        self.assertIn("running_session_in_cwd:thread:delegate", expo["keep_reasons"])
+
+    def test_mcp_query_truncation_fails_closed(self):
+        delegates = [{"threadId": f"delegate-{i}", "state": "idle", "creationSource": "mcp",
+                      "relationshipToParent": "subagent", "worktreePath": f"/w/{i}",
+                      "updatedAtMs": NOW_MS - 1000} for i in range(501)]
+        self.serve(threads=delegates, honor_filters=True, opencode={})
+        snap = self.read_snapshot()
+        self.assertFalse(snap["complete"])
+        self.assertTrue(any("native" in problem and "truncated" in problem for problem in snap["problems"]))
 
     def test_twenty_six_thousand_thread_server_is_complete(self):
         # The bug: the old single full-list query said "26140 threads, only 500 returned" and kept everything. Here

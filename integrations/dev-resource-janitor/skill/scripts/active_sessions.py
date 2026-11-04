@@ -4,8 +4,8 @@ Two sources, unioned:
   - Robob's control API, read in two queries that are each complete on their own, merged by threadId:
       a. GET /threads?active=true&includeSubagents=true: every non-idle thread (runs and pending requests). The
          server builds this from its live ids, so it is small (about 100 on a 26k-thread server).
-      b. GET /threads?creationSource=provider&includeSubagents=true&updatedSince=<now - 48 h>: provider-native
-         children updated in the last 48 h. A native child with no run or pending request is idle, and (a) misses
+      b. GET /threads?creationSource=provider,mcp&includeSubagents=true&updatedSince=<now - 48 h>: recent
+         provider-native and delegated children. A child with no run or pending request is idle, and (a) misses
          it, but it can still own a checkout between turns. A child idle for 2 days owns nothing live, so the
          window bounds the list. The janitor's own idle threshold is 60 min.
     Each thread is judged by in_use(), and its workspace is its worktree path or, on the root workspace, its
@@ -43,8 +43,8 @@ CONTROL_CFGS = tuple(
 )
 # The control API's page cap. A full page is not proof of completeness, so we check `total` too.
 CONTROL_PAGE = 500
-# How far back a provider-native child still counts as possibly holding a checkout. The janitor's own idle
-# threshold is 60 min; a native child idle for two days owns nothing live.
+# How far back a provider-native or delegated child still counts as possibly holding a checkout. The janitor's idle
+# threshold is 60 min; a child idle for two days owns nothing live.
 NATIVE_WINDOW_MS = 48 * 60 * 60 * 1000
 # The native query scans the full thread shell table server-side (7-46 s on the 26k-thread server), so it gets a
 # longer timeout than the default 20 s.
@@ -138,13 +138,13 @@ def robob_active(timeout=20, now_ms=None):
         timeout, "active")
     if err:
         return None, err
-    # (b) Provider-native children updated in the window. An idle native child has no run or pending request, so
-    # (a) doesn't list it, but it can still own its checkout between turns. The server needs the creationSource
-    # filter for this query; an older Robob ignores it, returns the unfiltered list, and that is truncated here.
+    # (b) Provider-native and MCP-delegated children updated in the window. Idle children have no run or pending
+    # request, so (a) doesn't list them, but they can still own their checkout between turns. An older Robob ignores
+    # creationSource; if the resulting unfiltered list is truncated, the snapshot remains incomplete.
     now = int(time.time() * 1000) if now_ms is None else now_ms
     native, err = _control_threads(
         "/threads?" + urllib.parse.urlencode({
-            "creationSource": "provider",
+            "creationSource": "provider,mcp",
             "includeSubagents": "true",
             "updatedSince": str(now - NATIVE_WINDOW_MS),
             "limit": CONTROL_PAGE,
