@@ -108,23 +108,29 @@ def build_fixture(root: Path) -> Fixture:
     oc.close()
     state = sqlite3.connect(root / "statev2.sqlite")
     state.executescript("""
-      CREATE TABLE orchestration_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, stream_id TEXT);
+      CREATE TABLE orchestration_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, stream_id TEXT, payload_json TEXT);
       CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
-      CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT, driver TEXT);
+      CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT, driver TEXT,
+          provider_thread_id TEXT UNIQUE);
       CREATE INDEX provider_thread ON orchestration_v2_projection_provider_threads(thread_id);
-      CREATE TABLE orchestration_v2_projection_subagents (thread_id TEXT, child_thread_id TEXT, payload_json TEXT);
+      CREATE TABLE orchestration_v2_projection_subagents (thread_id TEXT, child_thread_id TEXT, payload_json TEXT,
+          subagent_id TEXT UNIQUE);
       CREATE INDEX subagent_thread ON orchestration_v2_projection_subagents(thread_id);
       CREATE INDEX subagent_child ON orchestration_v2_projection_subagents(child_thread_id);
       CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
       CREATE INDEX import_thread ON ardud_opencode_import(thread_id);
       CREATE TRIGGER thread_added AFTER INSERT ON orchestration_v2_projection_threads BEGIN
-        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.created',NEW.thread_id); END;
+        INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES('thread.created',NEW.thread_id,NEW.payload_json); END;
       CREATE TRIGGER thread_changed AFTER UPDATE ON orchestration_v2_projection_threads BEGIN
-        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.metadata-updated',NEW.thread_id); END;
+        INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES('thread.metadata-updated',NEW.thread_id,NEW.payload_json); END;
       CREATE TRIGGER thread_removed AFTER DELETE ON orchestration_v2_projection_threads BEGIN
-        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.deleted',OLD.thread_id); END;
+        INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES('thread.deleted',OLD.thread_id,OLD.payload_json); END;
       CREATE TRIGGER provider_added AFTER INSERT ON orchestration_v2_projection_provider_threads BEGIN
         INSERT INTO orchestration_events(event_type,stream_id) VALUES('provider-thread.updated',NEW.thread_id); END;
+      CREATE TRIGGER provider_changed AFTER UPDATE ON orchestration_v2_projection_provider_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id,payload_json)
+          VALUES('provider-thread.updated',NEW.thread_id,
+            json_object('id',NEW.provider_thread_id,'appThreadId',NEW.thread_id)); END;
       CREATE TRIGGER provider_removed AFTER DELETE ON orchestration_v2_projection_provider_threads BEGIN
         INSERT INTO orchestration_events(event_type,stream_id) VALUES('provider-thread.updated',OLD.thread_id); END;
     """)
@@ -136,7 +142,7 @@ def build_fixture(root: Path) -> Fixture:
         state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       (tid, json.dumps({"nativeThreadRef": {"nativeId": f"native-{i}"}})))
         if parent:
-            state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            state.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
                           (parent, tid, json.dumps({"nativeTaskRef": {"nativeId": f"agent-{i}"}})))
     state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                   ("thread-other", json.dumps({"lineage": {"rootThreadId": "thread-other"}})))
@@ -297,6 +303,80 @@ class RecallTest(unittest.TestCase):
                 with patch.object(rc, "_state_tree", side_effect=lambda ids, **_: _oracle_state_tree(ids)):
                     expected = rc.lineage_exclusions(caller)
                 self.assertEqual(rc.lineage_exclusions(caller), expected)
+
+    def test_cross_stream_provider_native_change_uses_payload_owner(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('rollback-owner','{}')")
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver,provider_thread_id) "
+                       "VALUES (?,?,?,?)", ("rollback-owner", json.dumps({"nativeThreadRef": {"nativeId": "rollback-old"}}),
+                                             "codex", "rollback-provider"))
+        writer.commit()
+        try:
+            rc._state_tree({"rollback-owner"}, caller="rollback-owner")
+            writer.execute("DROP TRIGGER provider_changed")
+            writer.execute("UPDATE orchestration_v2_projection_provider_threads SET payload_json=? WHERE provider_thread_id=?",
+                           (json.dumps({"nativeThreadRef": {"nativeId": "rollback-new"}}), "rollback-provider"))
+            writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                           ("provider-thread.updated", "unrelated-stream", json.dumps({"id": "rollback-provider",
+                            "appThreadId": "rollback-owner", "nativeThreadRef": {"nativeId": "rollback-new"}})))
+            writer.commit()
+            expected = _oracle_state_tree({"rollback-new"})
+            self.assertEqual(rc._state_tree({"rollback-new"}, caller="rollback-new"), expected)
+            self.assertIn("rollback-owner", rc.lineage_exclusions("rollback-new"))
+            rc.validate_driver("rollback-new", "codex")
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='rollback-provider'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='rollback-owner'")
+            writer.execute("CREATE TRIGGER provider_changed AFTER UPDATE ON orchestration_v2_projection_provider_threads BEGIN "
+                           "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES('provider-thread.updated',NEW.thread_id, "
+                           "json_object('id',NEW.provider_thread_id,'appThreadId',NEW.thread_id)); END")
+            writer.commit()
+            writer.close()
+
+    def test_provider_move_invalidates_old_and_new_owner(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [("move-old", "{}"), ("move-new", "{}")])
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver,provider_thread_id) "
+                       "VALUES (?,?,?,?)", ("move-old", json.dumps({"nativeThreadRef": {"nativeId": "moving-native"}}),
+                                             "codex", "moving-provider"))
+        writer.commit()
+        try:
+            self.assertIn("move-old", rc._state_tree({"moving-native"}, caller="moving-native"))
+            writer.execute("UPDATE orchestration_v2_projection_provider_threads SET thread_id='move-new' "
+                           "WHERE provider_thread_id='moving-provider'")
+            writer.commit()
+            self.assertEqual(rc._state_tree({"moving-native"}, caller="moving-native"),
+                             _oracle_state_tree({"moving-native"}))
+            self.assertEqual(rc.lineage_exclusions("moving-native"), frozenset({"moving-native", "move-new"}))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='moving-provider'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('move-old','move-new')")
+            writer.commit()
+            writer.close()
+
+    def test_provider_owner_becomes_null_clears_old_binding(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('detached-owner','{}')")
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver,provider_thread_id) "
+                       "VALUES (?,?,?,?)", ("detached-owner", json.dumps({"nativeThreadRef": {"nativeId": "detached-native"}}),
+                                             "codex", "detached-provider"))
+        writer.commit()
+        try:
+            self.assertIn("detached-owner", rc._state_tree({"detached-native"}, caller="detached-native"))
+            writer.execute("UPDATE orchestration_v2_projection_provider_threads SET thread_id=NULL WHERE provider_thread_id='detached-provider'")
+            writer.commit()
+            self.assertEqual(rc._state_tree({"detached-native"}, caller="detached-native"),
+                             _oracle_state_tree({"detached-native"}))
+            with self.assertRaises(rc.UnknownCaller):
+                rc.validate_driver("detached-native", "codex")
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='detached-provider'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='detached-owner'")
+            writer.commit()
+            writer.close()
 
     def test_returned_alias_that_is_also_a_thread_is_expanded(self):
         writer = sqlite3.connect(rc.STATE_DB)
@@ -582,6 +662,268 @@ class RecallTest(unittest.TestCase):
             with patch.object(rc, "_state_index", wraps=rc._state_index) as index:
                 self.assertIn("other-native", rc._state_tree({"thread-other"}, caller="thread-other"))
                 index.assert_not_called()
+        finally:
+            writer.close()
+
+    def test_unrelated_and_status_events_do_not_retry_tree_or_closure(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('stable-root',?)",
+                       (json.dumps({"lineage": {"rootThreadId": "stable-root"}}),))
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('stable-child',?)",
+                       (json.dumps({"lineage": {"parentThreadId": "stable-root", "rootThreadId": "stable-root"}}),))
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver,provider_thread_id) "
+                       "VALUES (?,?,?,?)", ("stable-root", json.dumps({"nativeThreadRef": {"nativeId": "stable-native"}}),
+                                             "codex", "stable-provider"))
+        writer.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json,subagent_id) "
+                       "VALUES (?,?,?,?)", ("stable-root", "stable-child", json.dumps({"nativeTaskRef": {"nativeId": "stable-agent"}}),
+                                             "stable-task"))
+        writer.commit()
+        try:
+            rc._state_tree({"stable-root"}, caller="stable-root")
+            def status_event():
+                for kind, stream, payload in (
+                    ("provider-thread.updated", "stable-root", {"id": "stable-provider", "appThreadId": "stable-root",
+                     "nativeThreadRef": {"nativeId": "stable-native"}, "status": "running"}),
+                    ("thread.created", "unrelated-child", {"id": "unrelated-child", "lineage": {"parentThreadId": "unrelated-root"}}),
+                    ("subagent.updated", "unrelated-root", {"threadId": "unrelated-root", "childThreadId": "unrelated-child"}),
+                    ("subagent.updated", "stable-root", {"id": "stable-task", "threadId": "stable-root", "childThreadId": "stable-child",
+                     "nativeTaskRef": {"nativeId": "stable-agent"}, "status": "running"}),
+                    ("thread.pull-request-link-updated", "stable-root", {"host": "github", "repository": "repo", "number": 42}),
+                ):
+                    writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                                   (kind, stream, json.dumps(payload)))
+                writer.commit()
+            real_tree = rc._state_tree_once
+            def tree(*args):
+                result = real_tree(*args)
+                status_event()
+                return result
+            with patch.object(rc, "_state_tree_once", side_effect=tree) as spy:
+                self.assertIn("stable-native", rc._state_tree({"stable-root"}, caller="stable-root"))
+                self.assertEqual(spy.call_count, 1)
+            real_closure = rc._lineage_exclusions_once
+            def closure(*args, **kwargs):
+                result = real_closure(*args, **kwargs)
+                status_event()
+                return result
+            with patch.object(rc, "_lineage_exclusions_once", side_effect=closure) as spy:
+                self.assertIn("stable-native", rc.lineage_exclusions("stable-root"))
+                self.assertEqual(spy.call_count, 1)
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id='stable-task'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='stable-provider'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('stable-root','stable-child')")
+            writer.commit()
+            writer.close()
+
+    def test_relevant_move_during_read_retries_even_with_cross_stream_event(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [("race-old", "{}"), ("race-new", "{}")])
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver,provider_thread_id) "
+                       "VALUES (?,?,?,?)", ("race-old", json.dumps({"nativeThreadRef": {"nativeId": "race-native"}}),
+                                             "codex", "race-provider"))
+        writer.commit()
+        real = rc._state_tree_once
+        moved = False
+        def race(ids, snapshot):
+            nonlocal moved
+            result = real(ids, snapshot)
+            if not moved:
+                moved = True
+                writer.execute("DROP TRIGGER provider_changed")
+                writer.execute("UPDATE orchestration_v2_projection_provider_threads SET thread_id='race-new' "
+                               "WHERE provider_thread_id='race-provider'")
+                writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                               ("provider-thread.updated", "unrelated-stream", json.dumps({"id": "race-provider",
+                                "appThreadId": "race-new", "nativeThreadRef": {"nativeId": "race-native"}})))
+                writer.commit()
+            return result
+        try:
+            rc._state_tree({"race-native"}, caller="race-native")
+            with patch.object(rc, "_state_tree_once", side_effect=race) as spy:
+                result = rc._state_tree({"race-native"}, caller="race-native")
+                self.assertGreaterEqual(spy.call_count, 2)
+            self.assertEqual(result, _oracle_state_tree({"race-native"}))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id='race-provider'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('race-old','race-new')")
+            writer.execute("CREATE TRIGGER provider_changed AFTER UPDATE ON orchestration_v2_projection_provider_threads BEGIN "
+                           "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES('provider-thread.updated',NEW.thread_id, "
+                           "json_object('id',NEW.provider_thread_id,'appThreadId',NEW.thread_id)); END")
+            writer.commit()
+            writer.close()
+
+    def test_subagent_moving_away_during_read_uses_previous_edge(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [("task-root", "{}"), ("task-child", "{}"), ("task-other", "{}")])
+        writer.executemany("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                           [(thread, json.dumps({"nativeThreadRef": {"nativeId": native}})) for thread, native in
+                            (("task-root", "task-native"), ("task-child", "child-native"), ("task-other", "other-task-native"))])
+        writer.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json,subagent_id) "
+                       "VALUES (?,?,?,?)", ("task-root", "task-child", json.dumps({"nativeTaskRef": {"nativeId": "task-agent"}}), "task-id"))
+        writer.commit()
+        real = rc._state_tree_once
+        moved = False
+        def race(ids, snapshot):
+            nonlocal moved
+            result = real(ids, snapshot)
+            if not moved:
+                moved = True
+                writer.execute("UPDATE orchestration_v2_projection_subagents SET thread_id='task-other',child_thread_id=NULL "
+                               "WHERE subagent_id='task-id'")
+                writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                               ("subagent.updated", "task-other", json.dumps({"id": "task-id", "threadId": "task-other",
+                                "childThreadId": None, "nativeTaskRef": {"nativeId": "new-agent"}})))
+                writer.commit()
+            return result
+        try:
+            rc._state_tree({"task-root"}, caller="task-root")
+            with patch.object(rc, "_state_tree_once", side_effect=race) as spy:
+                result = rc._state_tree({"task-root"}, caller="task-root")
+                self.assertGreaterEqual(spy.call_count, 2)
+            self.assertEqual(result, _oracle_state_tree({"task-root"}))
+            self.assertNotIn("child-native", result)
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id='task-id'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id IN ('task-root','task-child','task-other')")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('task-root','task-child','task-other')")
+            writer.commit()
+            writer.close()
+
+    def test_status_after_task_move_does_not_reuse_stale_observation(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                           [("retry-root", "{}"), ("retry-a", "{}"), ("retry-b", "{}")])
+        writer.executemany("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                           [(thread, json.dumps({"nativeThreadRef": {"nativeId": native}})) for thread, native in
+                            (("retry-root", "retry-native"), ("retry-a", "retry-native-a"), ("retry-b", "retry-native-b"))])
+        writer.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json,subagent_id) "
+                       "VALUES (?,?,?,?)", ("retry-root", "retry-a", json.dumps({"nativeTaskRef": {"nativeId": "retry-agent"}}), "retry-task"))
+        writer.commit()
+        real = rc._state_tree_once
+        calls = 0
+        def race(ids, snapshot):
+            nonlocal calls
+            result = real(ids, snapshot)
+            calls += 1
+            if calls == 1:
+                writer.execute("UPDATE orchestration_v2_projection_subagents SET child_thread_id='retry-b' WHERE subagent_id='retry-task'")
+            writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                           ("subagent.updated", "retry-root", json.dumps({"id": "retry-task", "threadId": "retry-root",
+                            "childThreadId": "retry-b", "nativeTaskRef": {"nativeId": "retry-agent"}, "status": "running"})))
+            writer.commit()
+            return result
+        try:
+            rc._state_tree({"retry-root"}, caller="retry-root")
+            with patch.object(rc, "_state_tree_once", side_effect=race):
+                result = rc._state_tree({"retry-root"}, caller="retry-root")
+            self.assertEqual(calls, 2)
+            self.assertEqual(result, _oracle_state_tree({"retry-root"}))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id='retry-task'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id IN ('retry-root','retry-a','retry-b')")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('retry-root','retry-a','retry-b')")
+            writer.commit()
+            writer.close()
+
+    def test_new_task_seen_mid_walk_cannot_hide_already_visited_parent(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [
+            ("visited-root", "{}"),
+            ("visited-child", json.dumps({"lineage": {"parentThreadId": "visited-root"}}))])
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                       ("visited-root", json.dumps({"nativeThreadRef": {"nativeId": "visited-native"}})))
+        writer.commit()
+        real_sequence = rc._state_sequence
+        sequences = 0
+        inserted = False
+        def sequence(con):
+            nonlocal sequences, inserted
+            result = real_sequence(con)
+            sequences += 1
+            if sequences == 3 and not inserted:
+                inserted = True
+                writer.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json,subagent_id) "
+                               "VALUES (?,?,?,?)", ("visited-root", "visited-child", json.dumps({"nativeTaskRef": {"nativeId": "late-agent"}}), "late-task"))
+                writer.execute("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)",
+                               ("subagent.updated", "visited-root", json.dumps({"id": "late-task", "threadId": "visited-root",
+                                "childThreadId": "visited-child", "nativeTaskRef": {"nativeId": "late-agent"}})))
+                writer.commit()
+            return result
+        try:
+            rc._state_tree({"visited-root"}, caller="visited-root")
+            with patch.object(rc, "_state_sequence", side_effect=sequence):
+                result = rc._state_tree({"visited-root"}, caller="visited-root")
+            self.assertEqual(result, _oracle_state_tree({"visited-root"}))
+            self.assertIn("visited-native:agent:late-agent", result)
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id='late-task'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='visited-root'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('visited-root','visited-child')")
+            writer.commit()
+            writer.close()
+
+    def test_thread_moving_away_during_read_uses_previous_edge(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.executemany("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)", [
+            ("lineage-root", "{}"), ("lineage-child", json.dumps({"lineage": {"parentThreadId": "lineage-root"}}))])
+        writer.executemany("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                           [(thread, json.dumps({"nativeThreadRef": {"nativeId": native}})) for thread, native in
+                            (("lineage-root", "root-native"), ("lineage-child", "lineage-child-native"))])
+        writer.commit()
+        real = rc._state_tree_once
+        moved = False
+        def race(ids, snapshot):
+            nonlocal moved
+            result = real(ids, snapshot)
+            if not moved:
+                moved = True
+                writer.execute("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id='lineage-child'",
+                               (json.dumps({"id": "lineage-child", "lineage": {"parentThreadId": "other-root"}}),))
+                writer.commit()
+            return result
+        try:
+            rc._state_tree({"lineage-root"}, caller="lineage-root")
+            with patch.object(rc, "_state_tree_once", side_effect=race) as spy:
+                result = rc._state_tree({"lineage-root"}, caller="lineage-root")
+                self.assertGreaterEqual(spy.call_count, 2)
+            self.assertEqual(result, _oracle_state_tree({"lineage-root"}))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id IN ('lineage-root','lineage-child')")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id IN ('lineage-root','lineage-child')")
+            writer.commit()
+            writer.close()
+
+    def test_hard_deleted_thread_during_read_invalidates_snapshot(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                       ("delete-root", json.dumps({"lineage": {"rootThreadId": "delete-root"}})))
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                       ("delete-root", json.dumps({"nativeThreadRef": {"nativeId": "delete-native"}})))
+        writer.commit()
+        real = rc._state_tree_once
+        deleted = False
+        def race(ids, snapshot):
+            nonlocal deleted
+            result = real(ids, snapshot)
+            if not deleted:
+                deleted = True
+                writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='delete-root'")
+                writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='delete-root'")
+                writer.commit()
+            return result
+        try:
+            rc._state_tree({"delete-root"}, caller="delete-root")
+            with patch.object(rc, "_state_tree_once", side_effect=race) as spy:
+                self.assertEqual(rc._state_tree({"delete-root"}, caller="delete-root"), set())
+                self.assertGreaterEqual(spy.call_count, 2)
         finally:
             writer.close()
 
@@ -894,7 +1236,7 @@ class RecallTest(unittest.TestCase):
              for native in ("nested-native-old", "nested-native-new")],
         )
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            "INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
             [(parent, child, json.dumps({"nativeTaskRef": {"nativeId": agent}})) for parent, child, agent in (
                 ("nested-root", "nested-child", "nested-agent-child"),
                 ("nested-child", "nested-grandchild", "nested-agent-grandchild"),
@@ -992,7 +1334,7 @@ class RecallTest(unittest.TestCase):
         state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("owner-root", json.dumps({"nativeThreadRef": {"nativeId": "owner-native"}})))
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            "INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
             [(parent, child, json.dumps({"nativeTaskRef": {"nativeId": agent}})) for parent, child, agent in (
                 ("owner-root", "owner-missing", "owner-child-agent"),
                 ("owner-missing", "owner-grandchild", "owner-grandchild-agent"),
@@ -1027,7 +1369,7 @@ class RecallTest(unittest.TestCase):
                       ("dangling-parent", json.dumps({"lineage": {"rootThreadId": "dangling-root"}})))
         state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("dangling-root", json.dumps({"nativeThreadRef": {"nativeId": "dangling-native"}})))
-        state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+        state.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
                       ("dangling-parent", None, json.dumps({"nativeTaskRef": {"nativeId": "dangling-agent"}})))
         state.commit()
         state.close()
@@ -1044,10 +1386,10 @@ class RecallTest(unittest.TestCase):
 
             # A known path must not hide a second, dangling ownership path.
             state = sqlite3.connect(rc.STATE_DB)
-            state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            state.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
                           ("dangling-root", "dangling-parent",
                            json.dumps({"nativeTaskRef": {"nativeId": "linked-agent"}})))
-            state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            state.execute("INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
                           ("missing-owner", "dangling-parent",
                            json.dumps({"nativeTaskRef": {"nativeId": "other-linked-agent"}})))
             state.commit()
@@ -1091,7 +1433,7 @@ class RecallTest(unittest.TestCase):
             )],
         )
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            "INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
             [(parent, child, json.dumps({"nativeTaskRef": {"nativeId": agent}})) for parent, child, agent in (
                 ("cycle-root", "cycle-child", "cycle-child-agent"),
                 ("cycle-child", "cycle-grandchild", "cycle-grandchild-agent"),
@@ -1126,7 +1468,7 @@ class RecallTest(unittest.TestCase):
         state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("deep-native-thread-0", json.dumps({"nativeThreadRef": {"nativeId": "deep-native-root"}})))
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
+            "INSERT INTO orchestration_v2_projection_subagents(thread_id,child_thread_id,payload_json) VALUES (?,?,?)",
             [(f"deep-native-thread-{i - 1}", f"deep-native-thread-{i}",
               json.dumps({"nativeTaskRef": {"nativeId": f"deep-agent-{i}"}})) for i in range(1, 121)],
         )
