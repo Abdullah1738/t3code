@@ -215,6 +215,9 @@ export function Chat(props: {
             {discussionId !== null && messages === undefined && !feed.failure ? (
               <LoadingLine />
             ) : null}
+            {discussionId !== null && messages !== undefined && (messages[0]?.seq ?? 1) > 1 ? (
+              <LoadEarlier boardId={boardId} discussionId={discussionId} />
+            ) : null}
             {messages?.map((message) => (
               <Fragment key={message.seq}>
                 <MessageView
@@ -395,6 +398,21 @@ function BlockView(props: {
   readonly onOpenCard: (cardId: string) => void;
 }) {
   const { block } = props;
+  if (
+    (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
+    block.truncated &&
+    props.discussionId !== null
+  ) {
+    return (
+      <TruncatedBlock
+        block={block}
+        boardId={props.boardId}
+        discussionId={props.discussionId}
+        seq={props.message.seq}
+        resolveKanbanLink={props.resolveKanbanLink}
+      />
+    );
+  }
   switch (block._tag) {
     case "md":
       return (
@@ -554,7 +572,102 @@ function Collapse(props: {
   );
 }
 
+function QuietButton(props: {
+  readonly label: string;
+  readonly disabled?: boolean;
+  readonly onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      disabled={props.disabled}
+      onPress={props.onPress}
+      className="min-h-8 self-start justify-center rounded-full bg-screen px-3"
+    >
+      <Text className="text-[13px] font-t3-medium text-foreground">{props.label}</Text>
+    </Pressable>
+  );
+}
+
+/** Reads the page before the oldest message shown. */
+function LoadEarlier(props: { readonly boardId: string; readonly discussionId: string }) {
+  const action = useBoardAction();
+  return (
+    <View className="items-center">
+      <QuietButton
+        label={action.pending ? "Loading…" : "Load earlier messages"}
+        disabled={action.pending}
+        onPress={() =>
+          void action.run("Couldn't load earlier messages", () =>
+            kanbanClient().loadEarlier(props.boardId, props.discussionId),
+          )
+        }
+      />
+    </View>
+  );
+}
+
+/** A big block sent as a preview, with a button that reads the message in full. */
+function TruncatedBlock(props: {
+  readonly block: Extract<KanbanBlock, { _tag: "md" | "collapse" | "html" }>;
+  readonly boardId: string;
+  readonly discussionId: string;
+  readonly seq: number;
+  readonly resolveKanbanLink: ResolveKanbanLink;
+}) {
+  const { block } = props;
+  const action = useBoardAction();
+  const size = `${Math.max(1, Math.round((block.fullBytes ?? 0) / 1024))} KB`;
+  return (
+    <View className="gap-2">
+      {block._tag === "html" ? (
+        <Text className="text-[13px] font-t3-medium text-foreground">{block.title ?? "Page"}</Text>
+      ) : (
+        <>
+          {block._tag === "collapse" ? (
+            <Text className="text-[13px] font-t3-medium text-foreground">{block.title}</Text>
+          ) : null}
+          <MarkdownText
+            text={block.text}
+            maxLines={MESSAGE_LINES}
+            resolveKanbanLink={props.resolveKanbanLink}
+          />
+        </>
+      )}
+      <QuietButton
+        label={action.pending ? "Loading…" : `Show full (${size})`}
+        disabled={action.pending}
+        onPress={() =>
+          void action.run("Couldn't load the message", () =>
+            kanbanClient().expandMessage(props.boardId, props.discussionId, props.seq),
+          )
+        }
+      />
+    </View>
+  );
+}
+
+/** A WebView per message is heavy: the page loads only when tapped. */
 function HtmlBlock(props: {
+  readonly html: string;
+  readonly title: string | null;
+  readonly height: number | null;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <View className="gap-1.5">
+        {props.title ? (
+          <Text className="text-[13px] font-t3-medium text-foreground">{props.title}</Text>
+        ) : null}
+        <QuietButton label="Show page" onPress={() => setOpen(true)} />
+      </View>
+    );
+  }
+  return <LiveHtml {...props} />;
+}
+
+function LiveHtml(props: {
   readonly html: string;
   readonly title: string | null;
   readonly height: number | null;

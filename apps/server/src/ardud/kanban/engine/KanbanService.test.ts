@@ -3507,7 +3507,8 @@ it.effect("an owner reminder is keyed to the owner's message, not later system p
   }),
 );
 
-// Fails the next `allReadFailures.remaining` full-history message reads.
+// Fails the next `allReadFailures.remaining` owner-wait reads; a full-history read always dies,
+// so the tick is shown never to read the whole discussion.
 const allReadFailures = { remaining: 0 };
 const failingAllReadStore = Layer.effect(
   KanbanStore.KanbanStore,
@@ -3515,17 +3516,57 @@ const failingAllReadStore = Layer.effect(
     const real = yield* KanbanStore.KanbanStore;
     return {
       ...real,
-      allMessages: (id) =>
+      allMessages: () => Effect.die("the tick read a whole discussion"),
+      ownerWait: (id) =>
         allReadFailures.remaining > 0
           ? ((allReadFailures.remaining -= 1),
             Effect.fail(
               new KanbanStore.KanbanStoreError({
-                operation: "read all messages",
+                operation: "read owner wait",
                 cause: "injected",
               }),
             ))
-          : real.allMessages(id),
+          : real.ownerWait(id),
     };
+  }),
+);
+
+it.effect("the owner-wait reminder reads no whole discussion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const kanban = yield* KanbanService.KanbanService;
+      const { board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Big talk", owner);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "First" }]);
+      const evaluator = (yield* kanban.discussion(channel.id)).evaluatorThreadId!;
+      yield* setRunStart(fake, evaluator, true, "2026-10-25T13:00:00.000Z");
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "x".repeat(200_000) },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Second" }]);
+      for (let i = 0; i < 5; i++) {
+        yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+          { _tag: "md", text: `Status ${i}` },
+        ]);
+      }
+      yield* TestClock.adjust("16 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* ownerWaitsTo(fake, evaluator), 1);
+      // The evaluator answers after the owner's latest message: no more reminders.
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Done" },
+      ]);
+      yield* kanban.post(channel.id, { _tag: "system", component: "scribe" }, [
+        { _tag: "md", text: "Later status" },
+      ]);
+      const ask = yield* (yield* KanbanStore.KanbanStore).ownerWait(channel.id);
+      assert.deepStrictEqual(ask && { seq: ask.seq, answered: ask.answered }, {
+        seq: 3,
+        answered: true,
+      });
+    }).pipe(Effect.provide(failingAllReadLayer(fake.layer)));
   }),
 );
 
@@ -8320,7 +8361,7 @@ it.effect(
           asked.filter((prompt) => prompt.startsWith("You suggest goals")),
           1,
         );
-        assert.lengthOf(yield* kanban.messages(ideas.id, { limit: 300 }), 206);
+        assert.lengthOf(yield* (yield* KanbanStore.KanbanStore).allMessages(ideas.id), 206);
       }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
     }),
 );
@@ -8348,7 +8389,7 @@ it.effect("a skipped proposal is not proposed again after 100+ replies", () =>
       yield* TestClock.adjust("25 hours");
       yield* kanban.tick;
       // The skipped Search proposal is still in the history: it is not posted again.
-      const messages = yield* kanban.messages(ideas.id, { limit: 300 });
+      const messages = yield* (yield* KanbanStore.KanbanStore).allMessages(ideas.id);
       const choices = messages.flatMap((message) =>
         message.blocks.filter((block) => block._tag === "choice"),
       );
@@ -11705,5 +11746,170 @@ it.live("markReadSoon logs a failed read mark without failing the caller", () =>
         Layer.merge(testLayer(fake.layer), Logger.layer([logger], { mergeWithExisting: false })),
       ),
     );
+  }),
+);
+
+const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+
+it.effect("message pages are cut by size, page back with beforeSeq and stub big blocks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Big", owner);
+      const bigMd = "m".repeat(900 * 1024);
+      const bigHtml = `<h1>Report</h1>${"h".repeat(1024 * 1024)}`;
+      // 250 messages with three 1 MB-ish blocks among them.
+      for (let seq = 1; seq <= 250; seq++) {
+        const blocks: Array<KanbanBlock> =
+          seq === 10
+            ? [{ _tag: "html", html: bigHtml, title: "Report", height: null }]
+            : seq === 120 || seq === 249
+              ? [{ _tag: "md", text: bigMd }]
+              : [{ _tag: "md", text: `${seq} ${"w".repeat(4_000)}` }];
+        yield* kanban.post(channel.id, scribe, blocks);
+      }
+      const latest = yield* kanban.messages(channel.id);
+      const bytes = latest.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
+      assert.isAtMost(latest.length, 50);
+      assert.isAtLeast(latest.length, 1);
+      assert.isAtMost(bytes, 256 * 1024);
+      assert.strictEqual(latest.at(-1)!.seq, 250);
+      // Seqs have no holes inside a page.
+      latest.forEach((message, index) => assert.strictEqual(message.seq, latest[0]!.seq + index));
+      const stub = latest.find((message) => message.seq === 249)!.blocks[0]!;
+      assert.strictEqual(stub._tag, "md");
+      if (stub._tag === "md") {
+        assert.isTrue(stub.truncated);
+        assert.strictEqual(stub.fullBytes, bigMd.length);
+        assert.isAtMost(stub.text.length, 2_100);
+      }
+      // Older clients asking for 200 still get a size-bounded page.
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const legacy = yield* ws[M.messages]({ discussionId: channel.id, limit: 200 });
+      assert.isAtMost(
+        legacy.reduce((sum, message) => sum + JSON.stringify(message).length, 0),
+        256 * 1024,
+      );
+      assert.strictEqual(legacy.at(-1)!.seq, 250);
+      // Paging back reaches the first message without gaps or repeats.
+      const seen: Array<number> = latest.map((message) => message.seq);
+      let before = latest[0]!.seq;
+      while (before > 1) {
+        const page = yield* ws[M.messages]({ discussionId: channel.id, beforeSeq: before });
+        assert.isAbove(page.length, 0);
+        assert.strictEqual(page.at(-1)!.seq, before - 1);
+        seen.unshift(...page.map((message) => message.seq));
+        before = page[0]!.seq;
+      }
+      assert.deepStrictEqual(
+        seen,
+        Array.from({ length: 250 }, (_, index) => index + 1),
+      );
+      // The html stub keeps its tag and title; the full message comes by seq.
+      const early = yield* ws[M.messages]({ discussionId: channel.id, beforeSeq: 11, limit: 1 });
+      const html = early[0]!.blocks[0]!;
+      assert.strictEqual(html._tag, "html");
+      if (html._tag === "html") {
+        assert.isTrue(html.truncated);
+        assert.strictEqual(html.title, "Report");
+        assert.include(html.html, "Report");
+        assert.isBelow(html.html.length, 200);
+      }
+      const full = yield* ws[M.message]({ discussionId: channel.id, seq: 10 });
+      const fullBlock = full.blocks[0]!;
+      assert.strictEqual(fullBlock._tag === "html" ? fullBlock.html : "", bigHtml);
+      assert.isUndefined(fullBlock._tag === "html" ? fullBlock.truncated : true);
+      const missing = yield* ws[M.message]({ discussionId: channel.id, seq: 999 }).pipe(
+        Effect.flip,
+      );
+      assert.strictEqual(missing.code, "not-found");
+      // A stub decodes as a block, so older and newer clients read the same shape.
+      yield* Schema.decodeUnknownEffect(KanbanBlock)(stub);
+      // A window between two cursors.
+      const one = yield* ws[M.messages]({
+        discussionId: channel.id,
+        afterSeq: 248,
+        beforeSeq: 250,
+      });
+      assert.deepStrictEqual(
+        one.map((message) => message.seq),
+        [249],
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("the board feed sends big message blocks as stubs", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Feed", owner);
+      const events = yield* kanban.watch(board.id).pipe(
+        Stream.filter((event) => event._tag === "change" && event.change._tag === "message"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      const posted = yield* kanban.post(channel.id, scribe, [
+        { _tag: "md", text: "z".repeat(100 * 1024) },
+      ]);
+      // The poster gets the message in full.
+      assert.strictEqual(
+        posted.blocks[0]?._tag === "md" && posted.blocks[0].text.length,
+        100 * 1024,
+      );
+      const [event] = yield* Fiber.join(events);
+      assert.strictEqual(event?._tag, "change");
+      if (event?._tag === "change" && event.change._tag === "message") {
+        const block = event.change.message.blocks[0]!;
+        assert.isTrue(block._tag === "md" && block.truncated === true);
+      }
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a read already marked never waits on the board lock", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const lockHeld = yield* Deferred.make<void>();
+    const releaseLock = yield* Deferred.make<void>();
+    const blockedThreads = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            Deferred.succeed(lockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLock)),
+              Effect.andThen(threads.launch(input)),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Read", owner);
+      const message = yield* kanban.post(channel.id, scribe, [{ _tag: "md", text: "Hi" }]);
+      yield* kanban.markRead(channel.id, owner, message.seq);
+      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(lockHeld);
+      // The lock is held: a read already recorded (or past lastSeq) returns at once.
+      yield* kanban.markRead(channel.id, owner, message.seq);
+      yield* kanban.markRead(channel.id, owner, message.seq + 5);
+      // A real write still waits for the lock and expires like any write.
+      const queued = yield* Effect.forkChild(
+        kanban
+          .markRead(channel.id, { _tag: "evaluator", threadId: ThreadId.make("e") }, 1)
+          .pipe(Effect.flip),
+      );
+      yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
+      assert.include((yield* Fiber.join(queued)).message, "Board busy");
+      yield* Deferred.succeed(releaseLock, undefined);
+      yield* Fiber.join(dispatch);
+    }).pipe(Effect.provide(testLayer(blockedThreads)));
   }),
 );

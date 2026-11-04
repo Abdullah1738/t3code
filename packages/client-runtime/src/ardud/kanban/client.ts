@@ -37,11 +37,7 @@ import {
   type KanbanBoardState,
 } from "./boardState.ts";
 import { mergeBoardList } from "./threads.ts";
-import {
-  isKanbanServerError,
-  type KanbanRequestTag,
-  type KanbanTransport,
-} from "./transport.ts";
+import { isKanbanServerError, type KanbanRequestTag, type KanbanTransport } from "./transport.ts";
 import { mergeMessages } from "./viewModel.ts";
 
 /**
@@ -65,7 +61,16 @@ export interface KanbanClient {
   /** Every board with its list counts, kept current by the server. */
   readonly boards: SnapshotStore<ReadonlyArray<KanbanBoardSummary>>;
   board(boardId: string): SnapshotStore<KanbanBoardState>;
+  /**
+   * The newest page of a discussion, kept current by the board feed, plus any earlier pages
+   * read with `loadEarlier`. Seqs have no holes, so a first seq above 1 means more are
+   * earlier. Big blocks come as stubs (`truncated`) until `expandMessage` reads them.
+   */
   messages(boardId: string, discussionId: string): SnapshotStore<ReadonlyArray<KanbanMessage>>;
+  /** Reads the page before the oldest held message into the open messages store. */
+  loadEarlier(boardId: string, discussionId: string): Promise<void>;
+  /** Reads one message in full; the open messages store shows its blocks whole from then on. */
+  expandMessage(boardId: string, discussionId: string, seq: number): Promise<void>;
   card(boardId: string, cardId: string): SnapshotStore<KanbanCardDetail>;
   wiki(boardId: string): SnapshotStore<ReadonlyArray<KanbanWikiPage>>;
   /** Every thread the board started, cards and evaluators alike. */
@@ -145,7 +150,7 @@ export interface KanbanClient {
 }
 
 const PREVIEW_FETCH_LIMIT = 40;
-const MESSAGE_PAGE = 200;
+const MESSAGE_PAGE = 50;
 const RETRY_MIN_MS = 5_000;
 const RETRY_MAX_MS = 60_000;
 const SCRIPT_RUNS_PAGE = 20;
@@ -492,27 +497,59 @@ export function createKanbanClient(
     }
   };
 
+  // The open messages stores, for loadEarlier and expandMessage.
+  const messageControls = new Map<
+    string,
+    { readonly loadEarlier: () => Promise<void>; readonly expand: (seq: number) => Promise<void> }
+  >();
+
   const messages = createKeyedSnapshotStores<string, ReadonlyArray<KanbanMessage>>(
     (key, emit, fail) => {
       const [boardId = "", discussionId = ""] = key.split("\n");
       let list: ReadonlyArray<KanbanMessage> = [];
       let loaded = false;
+      let closed = false;
+      // Full blocks read by seq. Blocks never change after a post (answers do), so they
+      // stay good while the list copy brings the answers.
+      const expanded = new Map<number, KanbanMessage["blocks"]>();
+      const shown = new WeakMap<KanbanMessage, KanbanMessage>();
+      const view = (message: KanbanMessage) => {
+        const blocks = expanded.get(message.seq);
+        if (blocks === undefined) return message;
+        let full = shown.get(message);
+        if (full === undefined) {
+          full = { ...message, blocks };
+          shown.set(message, full);
+        }
+        return full;
+      };
+      const show = () => {
+        if (loaded) emit(list.map(view));
+      };
       // Messages a live change brought while a read was out; they are newer
       // than the read's copies (answers only grow).
       let live: Map<number, KanbanMessage> | null = null;
-      // Every read takes the newest page, so answers to recent messages made
-      // while away show up too. Only a server answer fails the store; a
-      // dropped connection keeps what is shown and tries again.
+      // The first read takes the newest page. Later ones (a reconnect) read only past the
+      // newest held message, from the most recent poll in the newest page so answers made
+      // while away show up too. Only a server answer fails the store; a dropped connection
+      // keeps what is shown and tries again.
       const reads = serialLoader(async () => {
         // Taken before the read: live messages landing during it must not
         // count as held, or a gap behind them would go unnoticed.
-        const newestHeld = list.at(-1)?.seq ?? 0;
+        const newestHeld = loaded ? (list.at(-1)?.seq ?? 0) : 0;
+        const poll = loaded
+          ? list
+              .slice(-MESSAGE_PAGE)
+              .find((message) => message.blocks.some((block) => block._tag === "choice"))
+          : undefined;
+        const afterSeq = poll ? poll.seq - 1 : newestHeld;
         const during = new Map<number, KanbanMessage>();
         live = during;
         let page: ReadonlyArray<KanbanMessage>;
         try {
           page = await transport.request(M.messages, {
             discussionId: discussionId as never,
+            ...(afterSeq > 0 ? { afterSeq } : {}),
             limit: MESSAGE_PAGE,
           });
         } catch (error) {
@@ -522,14 +559,44 @@ export function createKanbanClient(
         } finally {
           if (live === during) live = null;
         }
-        // A full page that starts past what is held means more were missed
-        // than one page holds: show the newest page alone, never a hole.
+        // A page that starts past what is held means more were missed than one
+        // page holds: show the newest page alone, never a hole.
         const oldestRead = page[0]?.seq ?? 0;
-        const base = page.length >= MESSAGE_PAGE && oldestRead > newestHeld + 1 ? [] : list;
+        const base = oldestRead > newestHeld + 1 ? [] : list;
         list = mergeMessages(mergeMessages(base, page), [...during.values()]);
         loaded = true;
-        emit(list);
+        show();
       });
+      let earlier: Promise<void> | null = null;
+      const loadEarlier = () => {
+        earlier ??= (async () => {
+          const oldest = list[0]?.seq ?? 0;
+          if (!loaded || oldest <= 1) return;
+          const page = await transport.request(M.messages, {
+            discussionId: discussionId as never,
+            beforeSeq: oldest,
+            limit: MESSAGE_PAGE,
+          });
+          // A gap reset while this was out replaced what it would join.
+          if (closed || list[0]?.seq !== oldest || page.at(-1)?.seq !== oldest - 1) return;
+          list = mergeMessages(page, list);
+          show();
+        })().finally(() => {
+          earlier = null;
+        });
+        return earlier;
+      };
+      const expand = async (seq: number) => {
+        if (expanded.has(seq)) return;
+        const message = await transport.request(M.message, {
+          discussionId: discussionId as never,
+          seq,
+        });
+        if (closed) return;
+        expanded.set(seq, message.blocks);
+        show();
+      };
+      messageControls.set(key, { loadEarlier, expand });
       const off = follow(
         boardId,
         (event) => {
@@ -542,12 +609,14 @@ export function createKanbanClient(
           if (change._tag !== "message" || change.message.discussionId !== discussionId) return;
           live?.set(change.message.seq, change.message);
           list = mergeMessages(list, [change.message]);
-          if (loaded) emit(list);
+          show();
         },
         reads.run,
       );
       reads.run();
       return () => {
+        closed = true;
+        if (messageControls.get(key)?.expand === expand) messageControls.delete(key);
         reads.close();
         off();
       };
@@ -787,6 +856,12 @@ export function createKanbanClient(
     boards,
     board,
     messages: (boardId, discussionId) => messages(`${boardId}\n${discussionId}`),
+    async loadEarlier(boardId, discussionId) {
+      await messageControls.get(`${boardId}\n${discussionId}`)?.loadEarlier();
+    },
+    async expandMessage(boardId, discussionId, seq) {
+      await messageControls.get(`${boardId}\n${discussionId}`)?.expand(seq);
+    },
     card: (boardId, cardId) => card(`${boardId}\n${cardId}`),
     wiki,
     threads,

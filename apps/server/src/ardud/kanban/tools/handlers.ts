@@ -11,6 +11,7 @@ import {
   type KanbanCard,
   type KanbanCardModel,
   type KanbanError,
+  type KanbanMessage,
   type KanbanThreadLink,
   type ModelSelection,
 } from "@t3tools/contracts";
@@ -23,6 +24,12 @@ import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { textProblem } from "../engine/text.ts";
+import {
+  AGENT_READ_BYTES,
+  MESSAGE_PAGE_MAX,
+  messageBytes,
+  stubMessage,
+} from "../engine/messagePages.ts";
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
 
@@ -84,7 +91,9 @@ const asEvaluator = <A, R>(
   );
 
 // An unlinked subagent isn't an outside orchestrator if a card thread started it.
-const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (caller: Caller) {
+const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (
+  caller: Caller,
+) {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const seen = new Set<string>();
   let id = caller.threadId;
@@ -550,12 +559,32 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
-        const messages = yield* service.messages(
-          discussion.id,
-          input.afterSeq !== undefined ? { afterSeq: input.afterSeq } : undefined,
-        );
+        let messages: ReadonlyArray<KanbanMessage>;
+        let note: string | undefined;
+        if (input.seq !== undefined) {
+          messages = [yield* service.message(discussion.id, input.seq)];
+        } else {
+          messages = yield* service.messages(discussion.id, {
+            ...(input.afterSeq === undefined ? {} : { afterSeq: input.afterSeq }),
+            ...(input.beforeSeq === undefined ? {} : { beforeSeq: input.beforeSeq }),
+            limit: MESSAGE_PAGE_MAX,
+            full: true,
+            maxBytes: AGENT_READ_BYTES,
+          });
+          // One message alone past the cap comes as a stub; seq reads it whole.
+          const only = messages.length === 1 ? messages[0]! : undefined;
+          if (only !== undefined && messageBytes(only) > AGENT_READ_BYTES) {
+            messages = [stubMessage(only)];
+            note = `Message ${only.seq} is too big for a list read; read it alone with seq: ${only.seq}.`;
+          }
+        }
         if (discussion.lastSeq > 0)
           yield* service.markReadSoon(discussion.id, caller.actor, discussion.lastSeq);
+        const oldest = messages[0]?.seq;
+        const earlierBefore =
+          input.seq === undefined && oldest !== undefined && oldest > (input.afterSeq ?? 0) + 1
+            ? oldest
+            : undefined;
         // Agents open attachments by path; the id alone is not enough to read the file.
         const withPaths = messages.map((message) => ({
           ...message,
@@ -565,7 +594,12 @@ const handlers = {
               : block,
           ),
         }));
-        return { discussion, messages: withPaths };
+        return {
+          discussion,
+          messages: withPaths,
+          ...(earlierBefore === undefined ? {} : { earlierBefore }),
+          ...(note === undefined ? {} : { note }),
+        };
       }),
     ),
   ),
@@ -813,12 +847,7 @@ const handlers = {
         const blocks = blocksOf(input);
         const board = yield* boardFor(service, caller);
         return {
-          discussion: yield* service.createDiscussion(
-            board.id,
-            input.title,
-            caller.actor,
-            blocks,
-          ),
+          discussion: yield* service.createDiscussion(board.id, input.title, caller.actor, blocks),
         };
       }),
     ),

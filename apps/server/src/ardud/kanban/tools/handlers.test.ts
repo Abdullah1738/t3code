@@ -1154,3 +1154,63 @@ it.effect("card_search finds cards by words or number and hides settled ones by 
     assert.deepStrictEqual(numbers(exact), [kafka.number]);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("discussion_read keeps blocks whole, caps a reply near 1 MB and reads one by seq", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "big-read",
+      name: "Big read",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const discussion = yield* kanban.createDiscussion(board.id, "Big", owner);
+    const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+    const big = "b".repeat(400 * 1024);
+    const huge = "h".repeat(1200 * 1024);
+    for (let index = 0; index < 4; index++) {
+      yield* kanban.post(discussion.id, scribe, [{ _tag: "md", text: big }]);
+    }
+    yield* kanban.post(discussion.id, scribe, [{ _tag: "md", text: huge }]);
+    const reader = ThreadId.make("thread-reader");
+
+    const latest = yield* call(reader, "discussion_read", { discussionId: discussion.id });
+    assert.isFalse(latest.isError, latest.text);
+    const latestMessages = latest.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string; truncated?: boolean }>;
+    }>;
+    // The newest alone is past the cap: it comes as a stub with a pointer to the seq read.
+    assert.deepStrictEqual(
+      latestMessages.map((message) => message.seq),
+      [5],
+    );
+    assert.isTrue(latestMessages[0]!.blocks[0]!.truncated);
+    assert.include(String(latest.structured.note), "seq: 5");
+    assert.strictEqual(latest.structured.earlierBefore, 5);
+
+    const earlier = yield* call(reader, "discussion_read", {
+      discussionId: discussion.id,
+      beforeSeq: 5,
+    });
+    const earlierMessages = earlier.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string; truncated?: boolean }>;
+    }>;
+    // Whole blocks, about 1 MB at most: two of the four 400 KB messages.
+    assert.deepStrictEqual(
+      earlierMessages.map((message) => message.seq),
+      [3, 4],
+    );
+    assert.strictEqual(earlierMessages[0]!.blocks[0]!.text, big);
+    assert.strictEqual(earlier.structured.earlierBefore, 3);
+
+    const one = yield* call(reader, "discussion_read", { discussionId: discussion.id, seq: 5 });
+    const oneMessages = one.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string }>;
+    }>;
+    assert.strictEqual(oneMessages[0]!.blocks[0]!.text, huge);
+    assert.isUndefined(one.structured.earlierBefore);
+  }).pipe(Effect.provide(layer));
+});
