@@ -319,7 +319,7 @@ class PromoteRollbackTests(FakeCliTestCase):
                     "cu": {"memoryCanaryChecked": True, "positiveControlFired": True, "readControlFired": True}})
         binary = self.root / tool / version / "bin" / tool
         hc.write_record("canary", tool, version, "passed" if passed else "failed",
-                        binarySha256=hc.sha256_file(binary), canary=canary)
+                        binarySha256=hc.sha256_file(binary), canary=canary, canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
 
     def test_promote_swaps_current_and_records_last_known_good(self) -> None:
         self.install_version("claude", "2.1.316")
@@ -352,6 +352,16 @@ class PromoteRollbackTests(FakeCliTestCase):
             hc.promote("claude", "2.1.316")
         self.assertIn("no passing canary", str(ctx.exception))
         self.assertFalse((self.root / "claude" / "current").is_symlink())
+
+    def test_legacy_pass_record_cannot_promote(self) -> None:
+        self.install_version("claude", "2.1.316")
+        binary = self.root / "claude" / "2.1.316" / "bin" / "claude"
+        hc.write_record("canary", "claude", "2.1.316", "passed", binarySha256=hc.sha256_file(binary),
+                        canary={"memoryCanaryChecked": True, "thinkingCheckChecked": True,
+                                "thinkingReplayed": True, "inputTransformationsEmpty": True})
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
 
     def test_promote_refused_when_memory_check_failed(self) -> None:
         self.install_version("claude", "2.1.316")
@@ -447,6 +457,7 @@ class CodexRotationTests(FakeCliTestCase):
     def record_codex_canary(self, version: str) -> None:
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
                         canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
                                 "readControlFired": True, "cu": {"memoryCanaryChecked": True,
                                 "positiveControlFired": True, "readControlFired": True}})
@@ -537,6 +548,7 @@ class CodexRotationTests(FakeCliTestCase):
     def record_claude(self) -> None:
         hc.write_record("canary", "claude", "2.1.316", "passed",
                         binarySha256=hc.sha256_file(self.root / "claude" / "2.1.316" / "bin" / "claude"),
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
                         canary={"memoryCanaryChecked": True, "memoryCanaryLeaked": False,
                                 "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True})
 
@@ -583,7 +595,7 @@ class CanaryTests(FakeCliTestCase):
             (chome / "fixture-id").write_text("fixture")
             return "fixture"
         self.seed_patch = mock.patch.object(hc, "seed_codex_rollout", side_effect=fake_seed)
-        self.seed_patch.start()
+        self.seed_mock = self.seed_patch.start()
         self.addCleanup(self.seed_patch.stop)
 
     def install_binary(self, tool: str, version: str, body: bytes) -> Path:
@@ -664,6 +676,12 @@ class CanaryTests(FakeCliTestCase):
         self.assertTrue(any("memory-off canary failed" in r for r in verdict["reasons"]))
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
+
+    def test_disabled_memory_probe_seeds_indexed_rollout(self) -> None:
+        self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertTrue(verdict["passed"], verdict)
+        self.assertEqual(self.seed_mock.call_count, 4)
 
     def test_codex_memory_sentinel_detects_decoded_nested_text(self) -> None:
         sentinel = "ROBOB-CODEX-MEMORY-test"
@@ -789,6 +807,22 @@ class CanaryTests(FakeCliTestCase):
         with self.assertRaises(hc.HarnessError):
             hc.Recorder("https://api.example.com", "k")
 
+    def test_recorder_blocks_other_methods_and_paths(self) -> None:
+        import urllib.error
+        import urllib.request
+        recorder = hc.Recorder(f"http://127.0.0.1:{self.upstream.server_address[1]}", "k")
+        base = recorder.start()
+        self.addCleanup(recorder.stop)
+        for method, path in (("POST", "/api/admin"), ("POST", "/v1/responses/../admin"),
+                             ("POST", "/v1/messages?beta=true&other=1"), ("GET", "/v1/messages")):
+            req = urllib.request.Request(base + path, data=b'{}' if method == 'POST' else None, method=method)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(error.exception.code, 403)
+            error.exception.close()
+        self.assertEqual(len(recorder.violations), 4)
+        self.assertEqual(len(recorder.requests), 0)
+
     def test_stale_pass_cannot_promote_after_a_later_failed_canary(self) -> None:
         # Reviewer's reproduction: a pass is recorded, then the next check fails, and promote must
         # refuse on the newer failure rather than the old pass.
@@ -828,7 +862,8 @@ def passing_canary(tool: str, version: str) -> dict:
                   "readControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
                                                       "readControlFired": True}})
     binary = hc.version_dir(tool, version) / "bin" / tool
-    hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body)
+    hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body,
+                    canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
     return {"passed": True, "reasons": [], "result": body}
 
 
@@ -1022,6 +1057,7 @@ class RotationGateTests(FakeCliTestCase):
         self.install_codex(version)
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
                         canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False,
                                 "positiveControlFired": True, "readControlFired": True,
                                 "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
@@ -1188,7 +1224,7 @@ class StatusAndNotifyTests(FakeCliTestCase):
         home = work / "home"
         hc.prepare_isolated_home(home)
         outside = self.tmp / "outside"
-        code = '''import os,sys,urllib.request,subprocess,socket
+        code = '''import os,sys,urllib.request,subprocess,socket,signal
 def post(url):
  try: urllib.request.urlopen(urllib.request.Request(url,data=b'x'),timeout=3).read(); return 'allowed'
  except Exception: return 'denied'
@@ -1200,6 +1236,10 @@ try: subprocess.run(['/bin/echo','bad'],check=True); print('exec allowed')
 except (OSError,subprocess.SubprocessError): print('exec denied')
 try: socket.socket(socket.AF_UNIX).connect(sys.argv[4]); print('unix allowed')
 except OSError: print('unix denied')
+try: open(sys.argv[5]).read(); print('read allowed')
+except OSError: print('read denied')
+try: os.kill(int(sys.argv[6]),signal.SIGCONT); print('signal allowed')
+except OSError: print('signal denied')
 '''
         base = f"http://127.0.0.1:{allowed.server_port}"
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "ANTHROPIC_BASE_URL": base}
@@ -1208,7 +1248,10 @@ except OSError: print('unix denied')
         listener = __import__('socket').socket(__import__('socket').AF_UNIX)
         listener.bind(sockpath); listener.listen()
         self.addCleanup(listener.close)
-        result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath],
+        protected = self.tmp / "personal-secret"
+        protected.write_text("not accessible")
+        result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath,
+                                 str(protected), str(os.getpid())],
                             env=env, cwd=work, sandbox_root=work, recorder_url=base)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("recorder allowed", result.stdout)
@@ -1216,6 +1259,8 @@ except OSError: print('unix denied')
         self.assertIn("write denied", result.stdout)
         self.assertIn("exec denied", result.stdout)
         self.assertIn("unix denied", result.stdout)
+        self.assertIn("read denied", result.stdout)
+        self.assertIn("signal denied", result.stdout)
         self.assertEqual(Sink.hits, 1)
         self.assertFalse(outside.exists())
 

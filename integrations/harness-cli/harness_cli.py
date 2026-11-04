@@ -112,6 +112,7 @@ CLAUDE_MODEL_IDS = {
     "claude-haiku-5-5": "cc/claude-haiku-5-5",
 }
 DEFAULT_TIMEOUT = 600
+CANARY_SCHEMA_VERSION = 2
 
 
 class HarnessError(Exception):
@@ -516,6 +517,7 @@ class Recorder:
         self.bodies: list[bytes] = []
         self.paths: list[str] = []
         self.requests: list[dict] = []
+        self.violations: list[dict] = []
         self.server = None
         self.thread = None
 
@@ -531,9 +533,21 @@ class Recorder:
             def log_message(self, *args):  # keep test output clean
                 pass
 
+            def reject(self):
+                recorder.violations.append({"method": self.command, "path": self.path[:256]})
+                self.send_error(403)
+
+            def do_GET(self): self.reject()
+            def do_PUT(self): self.reject()
+            def do_DELETE(self): self.reject()
+            def do_PATCH(self): self.reject()
+            def do_CONNECT(self): self.reject()
+            def do_HEAD(self): self.reject()
+            def do_OPTIONS(self): self.reject()
+
             def do_POST(self):
-                if self.path.startswith("http:") or self.path.startswith("https:") or not self.path.startswith("/") or self.path.startswith("//"):
-                    self.send_error(400)
+                if self.path not in ("/v1/messages", "/v1/messages?beta=true", "/v1/responses"):
+                    self.reject()
                     return
                 length = int(self.headers.get("content-length", "0"))
                 body = self.rfile.read(length)
@@ -547,8 +561,9 @@ class Recorder:
                     parsed = None
                 record = {"path": self.path, "headers": safe_headers, "body": parsed}
                 recorder.requests.append(record)
-                headers = {k: v for k, v in self.headers.items()
-                           if k.lower() not in ("host", "content-length", "authorization", "x-api-key")}
+                allowed_headers = {"content-type", "accept", "anthropic-version", "anthropic-beta",
+                                   "user-agent", "x-app", "x-9router-token-saver"}
+                headers = {k: v for k, v in self.headers.items() if k.lower() in allowed_headers}
                 if self.path.startswith("/v1/messages") and isinstance(parsed, dict) and any(
                         isinstance(msg, dict) and isinstance(msg.get("content"), list)
                         and any(isinstance(block, dict) and block.get("type") == "thinking"
@@ -560,7 +575,6 @@ class Recorder:
                         values.append("thinking-binding-controls-2026-08-01")
                     headers[beta] = ",".join(values)
                     record["headers"]["anthropic-beta"] = headers[beta]
-                headers = {k: v for k, v in headers.items() if k.lower() not in ("proxy-connection", "proxy-authorization")}
                 headers["x-api-key"] = recorder.key
                 headers["authorization"] = f"Bearer {recorder.key}"
                 req = urllib.request.Request(recorder.upstream + self.path, data=body, headers=headers,
@@ -692,22 +706,15 @@ def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
     if not scratch.is_relative_to(Path(tempfile.gettempdir()).resolve()) or scratch == Path(tempfile.gettempdir()).resolve():
         raise HarnessError("CLI scratch root must be a private temporary directory")
     binary = binary.resolve(strict=True)
-    # These paths come from the account database rather than the disposable HOME.
-    import pwd
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     sb = lambda value: json.dumps(str(value))
     rules = ["(version 1)", "(allow default)", "(deny process-exec)",
              f"(allow process-exec (literal {sb(binary)}))", "(deny network-outbound)",
              "(deny file-write*)", f"(allow file-write* (subpath {sb(scratch)}) (literal \"/dev/null\"))",
-             f"(deny file-read* (subpath {sb(real_home / 'Library' / 'Keychains')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.claude')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.codex')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.robob')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.9router')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.config')}))",
-             f"(deny file-read* (subpath {sb(real_home / '.local')}))",
-             f"(deny file-read* (subpath {sb('/Volumes/ExternalSSD/codex')}))",
-             '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc"))']
+             '(deny file-read-data (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders"))',
+             f"(allow file-read-data (subpath {sb(scratch)}) (literal {sb(binary)}))",
+             '(allow file-read-data (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/dev") (subpath "/private/etc"))',
+             '(deny signal)',
+             '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc") (global-name "com.apple.securityd.general"))']
     if recorder_url is not None:
         from urllib.parse import urlsplit
         try:
@@ -719,8 +726,22 @@ def run_cli(binary: Path, args: list[str], *, env: dict, timeout: int = 300,
             raise HarnessError("CLI recorder must be an exact loopback HTTP port")
         rules.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
     profile = "".join(rules)
-    return subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(binary), *args], env=env, capture_output=True, text=True,
-                           timeout=timeout, cwd=str(cwd) if cwd else None)
+    env = dict(env, TMPDIR=str(scratch / "tmp"))
+    Path(env["TMPDIR"]).mkdir(exist_ok=True)
+    proc = subprocess.Popen(["/usr/bin/sandbox-exec", "-p", profile, str(binary), *args], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(cwd), start_new_session=True)
+    import signal
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    finally:
+        # The sandbox denies signalling outside the candidate; the unsandboxed parent
+        # owns this process group and kills any surviving in-group descendants.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def make_throwaway_homes(work: Path) -> tuple[Path, Path]:
@@ -889,6 +910,7 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         results["memoryCanaryLeaked"] = leaked
         results["memoryCanaryChecked"] = seed_present and len(recorder.bodies) > 0
         results["requests"] = len(recorder.bodies)
+        results["recorderViolations"] = len(recorder.violations)
     finally:
         recorder.stop()
     return results
@@ -1053,6 +1075,13 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
     """
     chome = work / "codex-home" / ".codex"
     shutil.copytree(generated_home, chome, dirs_exist_ok=True)
+    # The copied catalog must stay inside the confined probe, not the generator's sibling tree.
+    config = chome / "config.toml"
+    original = config.read_text(encoding="utf-8")
+    original = re.sub(r'^model_catalog_json\s*=\s*.*$',
+                      lambda _: "model_catalog_json = " + json.dumps(str(chome / "models.json")),
+                      original, flags=re.MULTILINE)
+    config.write_text(original, encoding="utf-8")
     if enable_memory:
         cfg_path = chome / "config.toml"
         text = cfg_path.read_text(encoding="utf-8")
@@ -1080,12 +1109,12 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         cfg = ["-c", f'model_providers.ninerouter.base_url="{base}/v1"']
         if enable_memory:
             cfg += ["-c", "memories.min_rollout_idle_hours=1", "-c", "memories.max_rollouts_per_startup=1"]
-            bootstrap = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
-                                        "-m", models[0], *cfg, "Reply exactly OK."], env=env, timeout=240,
-                                cwd=work, sandbox_root=work, recorder_url=base)
-            if bootstrap.returncode or not recorder.requests:
-                raise HarnessError("Codex positive-control bootstrap failed")
-            fixture_id = seed_codex_rollout(chome, work, version)
+        bootstrap = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
+                                    "-m", models[0], *cfg, "Reply exactly OK."], env=env, timeout=240,
+                            cwd=work, sandbox_root=work, recorder_url=base)
+        if bootstrap.returncode or not recorder.requests:
+            raise HarnessError("Codex memory-control bootstrap failed")
+        fixture_id = seed_codex_rollout(chome, work, version)
         for model in models:
             before = len(recorder.requests)
             proc = run_cli(binary, ["exec", "--skip-git-repo-check", "-s", "read-only",
@@ -1110,6 +1139,7 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         results["memorySentinelSeen"] = any(m.get("memorySentinelInRequest") for m in results["models"].values())
         results["memoryPromptSeen"] = any(m.get("memorySectionInRequest") for m in results["models"].values())
         results["requests"] = len(recorder.requests)
+        results["recorderViolations"] = len(recorder.violations)
     finally:
         recorder.stop()
     return results
@@ -1147,6 +1177,7 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
         "memoryPromptSeen": real["memoryPromptSeen"],
         "memoryCanaryChecked": bool(detector_fires and read_control_fires and real["requests"] > 0),
         "requests": real["requests"],
+        "recorderViolations": control["recorderViolations"] + real["recorderViolations"],
     }
     return results
 
@@ -1228,6 +1259,8 @@ def canary(tool: str, version: str) -> dict:
             reasons.append("memory-off check did not run")
         if requests == 0:
             reasons.append("no request reached the recording proxy")
+        if result.get("recorderViolations", 0) or (result.get("cu") or {}).get("recorderViolations", 0):
+            reasons.append("recording proxy rejected an unexpected request")
     except HarnessError as exc:
         reasons.append(str(exc))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -1235,7 +1268,8 @@ def canary(tool: str, version: str) -> dict:
     passed = not reasons
     write_record("canary", tool, version, "passed" if passed else "failed",
                  binarySha256=digest, canary=result, reasons=reasons,
-                 harnessHomes=harness_home_hashes(), keyPresent=bool(os.environ.get("NINEROUTER_KEY")))
+                 harnessHomes=harness_home_hashes(), keyPresent=bool(os.environ.get("NINEROUTER_KEY")),
+                 canarySchemaVersion=CANARY_SCHEMA_VERSION)
     return {"passed": passed, "reasons": reasons, "result": result}
 
 
@@ -1414,7 +1448,10 @@ def latest_canary(tool: str, version: str) -> dict | None:
                      and (canary_body.get("cu") or {}).get("positiveControlFired") is True
                      and canary_body.get("readControlFired") is True
                      and (canary_body.get("cu") or {}).get("readControlFired") is True)
-    passed = found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
+    passed = (found.get("canarySchemaVersion") == CANARY_SCHEMA_VERSION
+              and found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
+              and not canary_body.get("recorderViolations")
+              and not (canary_body.get("cu") or {}).get("recorderViolations"))
     return {
         "passed": passed,
         "binarySha256": found.get("binarySha256"),
