@@ -122,7 +122,19 @@ import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
-const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
+// Bun's HTTP client closes a silent request after five minutes. Leave room for
+// the final projection read and response before that transport deadline.
+const MAX_WAIT_TIMEOUT_MS = 4 * 60 * 1_000 + 30 * 1_000;
+const remainingWaitMs = (startNanos: bigint, timeoutMs: number | undefined) =>
+  Clock.monotonicTimeNanos.pipe(
+    Effect.map((now) =>
+      Math.max(
+        0,
+        Math.min(MAX_WAIT_TIMEOUT_MS, Math.max(1, timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS)) -
+          Number(now - startNanos) / 1_000_000,
+      ),
+    ),
+  );
 const TASK_WAKE_EVENTS = [
   { thread: "parent", eventType: "subagent.updated" },
   { thread: "child", eventType: "run.updated" },
@@ -2348,6 +2360,7 @@ const make = Effect.gen(function* () {
       },
     ),
     requestSecret: Effect.fn("OrchestratorMcpService.requestSecret")(function* (scope, input) {
+      const waitStartedAt = yield* Clock.monotonicTimeNanos;
       const { scope: threadScope, parent } = yield* loadThreadCaller(scope, "request_secret");
       const threadId = threadScope.thread.threadId;
       const run = ThreadManagementService.latestActiveRun(
@@ -2435,11 +2448,7 @@ const make = Effect.gen(function* () {
           yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
         }
       }).pipe(
-        Effect.timeoutOption(
-          Duration.millis(
-            Math.min(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
-          ),
-        ),
+        Effect.timeoutOption(Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs))),
         Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : closeCard)),
       );
       if (Option.isNone(answered)) yield* closeCard;
@@ -2539,6 +2548,7 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      const waitStartedAt = yield* Clock.monotonicTimeNanos;
       let retryKey = input.clientRequestId;
       const bounded = <A, E, R>(stage: string, effect: Effect.Effect<A, E, R>, taskId?: string) =>
         McpDeadline.withDeadline(effect, {
@@ -2708,10 +2718,7 @@ const make = Effect.gen(function* () {
       if (input.mode !== "wait") {
         return yield* bounded("result", readTask(scope, taskId, false, true), taskId);
       }
-      const timeoutMs = Math.min(
-        MAX_WAIT_TIMEOUT_MS,
-        Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
-      );
+      const timeoutMs = yield* remainingWaitMs(waitStartedAt, input.timeoutMs);
       const waited = yield* waitForTask(scope, taskId, timeoutMs);
       if (Option.isSome(waited) && isTerminalTaskStatus(waited.value.status)) {
         return waited.value;
@@ -3332,16 +3339,14 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadSendResult;
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
+      const waitStartedAt = yield* Clock.monotonicTimeNanos;
       const { target } = yield* loadScopedThread(scope, input.threadId);
       const result = yield* threadManagement
         .waitForThread({
           projectId: target.thread.projectId,
           threadId: input.threadId,
           ...(input.runId === undefined ? {} : { runId: input.runId }),
-          timeoutMs: Math.min(
-            MAX_WAIT_TIMEOUT_MS,
-            Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
-          ),
+          timeoutMs: yield* remainingWaitMs(waitStartedAt, input.timeoutMs),
         })
         .pipe(Effect.mapError(threadManagementFailure));
       return {

@@ -28,6 +28,8 @@ import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
+import * as Duration from "effect/Duration";
+import * as Stream from "effect/Stream";
 import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
@@ -1558,6 +1560,356 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.equal(commandIds[0], commandIds[1]);
         }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
       }),
+  );
+
+  it.effect.each([
+    { timeoutMs: 1_000, budgetMs: 1_000 },
+    { timeoutMs: 600_000, budgetMs: 270_000 },
+    { timeoutMs: 3_600_000, budgetMs: 270_000 },
+    { timeoutMs: undefined, budgetMs: 270_000 },
+  ])("bounds delegation from call start (requested $timeoutMs)", ({ timeoutMs, budgetMs }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const enteredPreparation = yield* Deferred.make<void>();
+        const releasePreparation = yield* Deferred.make<void>();
+        const watching = yield* Deferred.make<void>();
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          runId: parentRunId,
+          parentNodeId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: codexInstanceId,
+          model: "gpt-5.4",
+          status: "running",
+          result: null,
+        };
+        const parent = parentProjection([task]);
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            getThreadRecords: (threadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? { ...parent, thread: { ...parent.thread, worktreePath: null } }
+                  : childProjection,
+              ),
+            getThreadEventSequence: () => Deferred.succeed(watching, undefined).pipe(Effect.as(1)),
+            streamStoredEventsFrom: () => Stream.never,
+            dispatch: (command) =>
+              Effect.succeed(
+                command.type === "delegated_task.request"
+                  ? ({
+                      sequence: 1,
+                      storedEvents: [
+                        { event: { type: "subagent.updated", payload: task } },
+                        {
+                          event: {
+                            type: "run.created",
+                            threadId: childThreadId,
+                            payload: {
+                              id: RunId.make("run:wait-budget-child"),
+                              workspacePreparation: { type: "worktree", baseRef: "HEAD" },
+                            },
+                          },
+                        },
+                      ],
+                    } as never)
+                  : ({} as never),
+              ),
+          }),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            prepareRun: () =>
+              Deferred.succeed(enteredPreparation, undefined).pipe(
+                Effect.andThen(Deferred.await(releasePreparation)),
+              ),
+          }),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({
+            resolveCommit: () => Effect.succeed({ commitSha: "abc123" } as never),
+          }),
+          Layer.mock(ProjectService.ProjectService)({
+            getById: () => Effect.succeed(Option.some({ id: projectId, workspaceRoot: "/repo" } as never)),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            providerSnapshot({ instanceId: codexInstanceId, driver: ProviderDriverKind.make("codex"), model: "gpt-5.4" }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const call = yield* service
+            .delegateTask(scope, {
+              task: "Review.",
+              isolation: "worktree",
+              mode: "wait",
+              timeoutMs,
+              clientRequestId: "wait-budget",
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(enteredPreparation);
+          yield* TestClock.adjust(600);
+          yield* Deferred.succeed(releasePreparation, undefined);
+          yield* Deferred.await(watching);
+          yield* TestClock.adjust(budgetMs - 600);
+          assert.isDefined(call.pollUnsafe(), "the call must finish within its total wait budget");
+          const result = yield* Fiber.join(call);
+          assert.equal(result.taskId, taskId);
+          assert.isTrue(result.waitTimedOut);
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      }),
+    ),
+  );
+
+  it.effect("counts thread lookup against the thread wait budget", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const enteredLookup = yield* Deferred.make<void>();
+        const releaseLookup = yield* Deferred.make<void>();
+        const watching = yield* Deferred.make<void>();
+        const parent = parentProjection([]);
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () =>
+              Deferred.succeed(enteredLookup, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseLookup)),
+                Effect.as(parent),
+              ),
+            waitForThread: ({ timeoutMs }) =>
+              Deferred.succeed(watching, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.timeoutOption(Duration.millis(timeoutMs)),
+                Effect.as({ threadId: parentThreadId, run: parent.runs[0]!, timedOut: true }),
+              ),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([]),
+          adapterRegistryLayer([]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const call = yield* service
+            .waitForThread(scope, { threadId: parentThreadId, timeoutMs: 1_000 })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(enteredLookup);
+          yield* TestClock.adjust(600);
+          yield* Deferred.succeed(releaseLookup, undefined);
+          yield* Deferred.await(watching);
+          yield* TestClock.adjust(400);
+          assert.isDefined(call.pollUnsafe(), "the call must finish within its total wait budget");
+          const result = yield* Fiber.join(call);
+          assert.equal(result.threadId, parentThreadId);
+          assert.isTrue(result.timedOut);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+    ),
+  );
+
+  it.effect("counts secret request setup against the wait budget", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const enteredSetup = yield* Deferred.make<void>();
+        const releaseSetup = yield* Deferred.make<void>();
+        const watching = yield* Deferred.make<void>();
+        let recorded = false;
+        let closed = false;
+        const parent = { ...parentProjection([]), turnItems: [] };
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () =>
+              recorded
+                ? Deferred.succeed(watching, undefined).pipe(Effect.as(parent))
+                : Effect.succeed(parent),
+            dispatch: (command) => {
+              if (command.type === "secret_request.record" && command.secretStatus === "pending") {
+                return Deferred.succeed(enteredSetup, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseSetup)),
+                  Effect.tap(() => Effect.sync(() => { recorded = true; })),
+                  Effect.as({} as never),
+                );
+              }
+              return Effect.sync(() => { closed = true; }).pipe(Effect.as({} as never));
+            },
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([]),
+          adapterRegistryLayer([]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const call = yield* service
+            .requestSecret(scope, {
+              label: "Test secret",
+              reason: "A test.",
+              timeoutMs: 1_000,
+              clientRequestId: "secret-wait-budget",
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(enteredSetup);
+          yield* TestClock.adjust(600);
+          yield* Deferred.succeed(releaseSetup, undefined);
+          yield* Deferred.await(watching);
+          yield* TestClock.adjust(400);
+          assert.isDefined(call.pollUnsafe(), "the call must finish within its total wait budget");
+          assert.deepEqual(yield* Fiber.join(call), { status: "timed_out" });
+          assert.isTrue(closed);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+    ),
+  );
+
+  it.effect.each(["async", "wait"] as const)(
+    "replays the same delegation in %s mode without another child or run",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const driver = ProviderDriverKind.make("codex");
+          const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+            {
+              instanceId: codexInstanceId,
+              driver,
+              getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+              planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+              openSession: () => Effect.die("No provider process is needed to test receipt replay."),
+            },
+          ]);
+          const database = SqlitePersistence.layerMemory;
+          const orchestratorLayer = ProviderReplayHarness.layerWithRegistry(
+            { name: `mcp-delegate-retry-${mode}` },
+            layerRegistry,
+            { databaseLayer: database, runEffectWorker: false },
+          );
+          const settings = ServerSettings.layerTest();
+          const threads = ThreadManagementService.layer.pipe(
+            Layer.provideMerge(orchestratorLayer),
+            Layer.provide(
+              LegacyV1ThreadImporter.layer.pipe(
+                Layer.provide(orchestratorLayer),
+                Layer.provide(database),
+              ),
+            ),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(database))),
+            Layer.provideMerge(settings),
+          );
+          const firstWatch = yield* Deferred.make<void>();
+          const secondWatch = yield* Deferred.make<void>();
+          const watchCount = yield* Ref.make(0);
+          const threadsWithWatchSignal = Layer.effect(
+            ThreadManagementService.ThreadManagementService,
+            Effect.gen(function* () {
+              const real = yield* ThreadManagementService.ThreadManagementService;
+              return {
+                ...real,
+                getThreadEventSequence: (threadId) =>
+                  real.getThreadEventSequence(threadId).pipe(
+                    Effect.tap(() =>
+                      Ref.updateAndGet(watchCount, (count) => count + 1).pipe(
+                        Effect.flatMap((count) =>
+                          Deferred.succeed(count === 1 ? firstWatch : secondWatch, undefined),
+                        ),
+                      ),
+                    ),
+                  ),
+              } satisfies ThreadManagementService.ThreadManagementServiceShape;
+            }),
+          ).pipe(Layer.provideMerge(threads));
+          const layerTest = layerOrchestratorService.pipe(
+            Layer.provideMerge(threadsWithWatchSignal),
+            Layer.provide(
+              Layer.mergeAll(
+                NodeServices.layer,
+                layerRegistry,
+                settings,
+                providerRegistryLayer([
+                  providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
+                ]),
+                Layer.mock(ProjectService.ProjectService)({}),
+                Layer.mock(SecretRequests.SecretRequests)({}),
+                Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+              ),
+            ),
+          );
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make("parent:create"),
+              threadId: parentThreadId,
+              projectId,
+              title: "MCP parent",
+              modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              createdBy: "user",
+              creationSource: "web",
+              commandId: CommandId.make("parent:start"),
+              threadId: parentThreadId,
+              messageId: MessageId.make("parent:message"),
+              text: "Delegate a review.",
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+            });
+            const request = {
+              task: "Review.",
+              mode,
+              timeoutMs: 1_000,
+              clientRequestId: `delegate-replay-${mode}`,
+            } as const;
+            const firstCall = yield* service.delegateTask(scope, request).pipe(Effect.forkScoped);
+            if (mode === "wait") {
+              yield* Deferred.await(firstWatch);
+              yield* TestClock.adjust(1_000);
+            }
+            const first = yield* Fiber.join(firstCall);
+            assert.equal(first.waitTimedOut, mode === "wait");
+            const retry = yield* service.delegateTask(scope, request).pipe(Effect.forkScoped);
+            if (mode === "wait") {
+              yield* Deferred.await(secondWatch);
+              yield* TestClock.adjust(500);
+              assert.isUndefined(retry.pollUnsafe(), "retry must wait for the existing child");
+              yield* orchestrator.dispatch({
+                type: "run.interrupt",
+                commandId: CommandId.make("interrupt-child"),
+                threadId: first.childThreadId,
+                runId: first.childRunId!,
+              });
+            }
+            const replayed = yield* Fiber.join(retry);
+            assert.equal(replayed.taskId, first.taskId);
+            assert.equal(replayed.childThreadId, first.childThreadId);
+            assert.equal(replayed.childRunId, first.childRunId);
+            if (mode === "wait") {
+              assert.equal(replayed.status, "interrupted");
+              assert.isFalse(replayed.waitTimedOut);
+            }
+            const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+            const child = yield* orchestrator.getThreadProjection(first.childThreadId);
+            assert.equal(parent.subagents.length, 1);
+            assert.equal(child.runs.length, 1);
+          }).pipe(Effect.provide(layerTest));
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
   );
 
   it.effect(

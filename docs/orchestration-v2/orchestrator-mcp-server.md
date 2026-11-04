@@ -258,8 +258,11 @@ provider session. The request becomes the V2 command
 
 `mode: "async"` returns the current durable state immediately.
 `mode: "wait"` waits for the task result, including nested work and completion follow-ups, or until
-the timeout expires. A wait timeout does not cancel the child; the result sets
-`waitTimedOut: true`, and the caller can continue with `task_status`. A pending blocking
+the timeout expires. The total budget starts at call entry, includes setup, and defaults to and is
+capped at 4 minutes 30 seconds. A wait timeout does not cancel the child; the result sets
+`waitTimedOut: true`, and the caller can continue with `task_status`. If the transport loses the
+response, retry `delegate_task` with the same `clientRequestId` from the same parent thread to
+recover the same task without starting another child. A pending blocking
 question also ends the wait with `hasPendingQuestion: true` and `waitTimedOut: false`.
 If `hasPendingQuestion`, pass `threadId=childThreadId` to `t3_pending_request_list`,
 `t3_pending_request_read` (with `requestId`) and `t3_pending_request_respond`, or ask
