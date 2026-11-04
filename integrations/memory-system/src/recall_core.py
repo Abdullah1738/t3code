@@ -962,33 +962,248 @@ def _alias_table_tree(ids: set[str]) -> set[str]:
     return out
 
 
-def _state_tree(ids: set[str]) -> set[str]:
+_state_reads = threading.BoundedSemaphore(2)
+_state_refresh_lock = threading.Lock()
+_state_snapshot = None
+_STATE_CHUNK = 2000
+_STATE_REFRESH_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class _StateSnapshot:
+    path: Path
+    sequence: int
+    built_sequence: int
+    checked_at: float
+    lineage: dict[str, tuple[str | None, str | None]]
+    neighbors: dict[str, frozenset[str]]
+    children: dict[str, frozenset[str]]
+    natives_by_thread: dict[str, frozenset[str]]
+    threads_by_native: dict[str, frozenset[str]]
+
+
+def _state_index(path: Path, sequence: int, lineage: dict, natives: dict, *, built_sequence: int | None = None) -> _StateSnapshot:
+    neighbors: dict[str, set[str]] = {}
+    children: dict[str, set[str]] = {}
+    by_native: dict[str, set[str]] = {}
+    for child, (parent, root) in lineage.items():
+        for other in (parent, root):
+            if other and other != child:
+                neighbors.setdefault(other, set()).add(child)
+                neighbors.setdefault(child, set()).add(other)
+        if parent and parent != child:
+            children.setdefault(parent, set()).add(child)
+    for thread, ids in natives.items():
+        for native in ids:
+            by_native.setdefault(native, set()).add(thread)
+    return _StateSnapshot(
+        path, sequence, sequence if built_sequence is None else built_sequence, time.monotonic(), lineage,
+        {k: frozenset(v) for k, v in neighbors.items()},
+        {k: frozenset(v) for k, v in children.items()},
+        {k: frozenset(v) for k, v in natives.items()},
+        {k: frozenset(v) for k, v in by_native.items()},
+    )
+
+
+def _state_sequence(con: sqlite3.Connection) -> int:
+    return con.execute("SELECT max(sequence) FROM orchestration_events").fetchone()[0] or 0
+
+
+def _state_changed(con: sqlite3.Connection, start: int, end: int) -> bool:
+    while start < end:
+        rows = con.execute(
+            "SELECT sequence,event_type FROM orchestration_events "
+            "WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+            (start, end, _STATE_CHUNK),
+        ).fetchall()
+        if not rows:
+            break
+        start = rows[-1][0]
+        if any(kind.startswith("thread.") or kind in ("provider-thread.updated", "subagent.updated")
+               for _, kind in rows):
+            return True
+    return False
+
+
+def _build_state_snapshot(con: sqlite3.Connection, path: Path, sequence: int) -> _StateSnapshot:
+    # Each page ends its own implicit read transaction before the next begins.
+    lineage = {}
+    natives: dict[str, set[str]] = {}
+    for table, columns in (
+        ("orchestration_v2_projection_threads",
+         "thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
+         "json_extract(payload_json,'$.lineage.rootThreadId')"),
+        ("orchestration_v2_projection_provider_threads",
+         "thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId')"),
+    ):
+        rowid = 0
+        while True:
+            rows = con.execute(
+                f"SELECT rowid,{columns} FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?",
+                (rowid, _STATE_CHUNK),
+            ).fetchall()
+            if not rows:
+                break
+            rowid = rows[-1][0]
+            if table == "orchestration_v2_projection_threads":
+                for _, thread, parent, root in rows:
+                    lineage[thread] = (parent, root)
+            else:
+                for _, thread, native in rows:
+                    if thread and native:
+                        natives.setdefault(thread, set()).add(native)
+    return _state_index(path, sequence, lineage, natives)
+
+
+def _state_with_changes(con: sqlite3.Connection, snapshot: _StateSnapshot, sequence: int) -> _StateSnapshot:
+    """Overlay projections changed since the base, including changes during a paged build."""
+    if sequence <= snapshot.sequence:
+        return snapshot
+    changed = set()
+    cursor = snapshot.sequence
+    while cursor < sequence:
+        rows = con.execute(
+            "SELECT sequence,event_type,stream_id FROM orchestration_events "
+            "WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+            (cursor, sequence, _STATE_CHUNK),
+        ).fetchall()
+        if not rows:
+            break
+        cursor = rows[-1][0]
+        changed.update(stream for _, kind, stream in rows
+                       if stream and (kind.startswith("thread.") or kind == "provider-thread.updated"))
+    if not changed:
+        return _StateSnapshot(snapshot.path, sequence, snapshot.built_sequence, snapshot.checked_at, snapshot.lineage,
+                              snapshot.neighbors, snapshot.children, snapshot.natives_by_thread,
+                              snapshot.threads_by_native)
+    updates_lineage = {}
+    updates_natives: dict[str, set[str]] = {}
+    changed_list = list(changed)
+    for i in range(0, len(changed_list), _STATE_CHUNK):
+        chunk = changed_list[i:i + _STATE_CHUNK]
+        for thread, parent, root in con.execute(
+            "SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
+            "json_extract(payload_json,'$.lineage.rootThreadId') FROM orchestration_v2_projection_threads "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(set(chunk)),)
+        ).fetchall():
+            updates_lineage[thread] = (parent, root)
+        for thread, native in con.execute(
+            "SELECT thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId') "
+            "FROM orchestration_v2_projection_provider_threads "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(set(chunk)),)
+        ).fetchall():
+            if native:
+                updates_natives.setdefault(thread, set()).add(native)
+    if all(snapshot.lineage.get(thread) == updates_lineage.get(thread)
+           and snapshot.natives_by_thread.get(thread, frozenset()) == updates_natives.get(thread, set())
+           for thread in changed):
+        return _StateSnapshot(snapshot.path, sequence, snapshot.built_sequence, snapshot.checked_at, snapshot.lineage,
+                              snapshot.neighbors, snapshot.children, snapshot.natives_by_thread,
+                              snapshot.threads_by_native)
+    lineage = dict(snapshot.lineage)
+    natives = dict(snapshot.natives_by_thread)
+    for thread in changed:
+        lineage.pop(thread, None)
+        natives.pop(thread, None)
+    lineage.update(updates_lineage)
+    natives.update(updates_natives)
+    result = _state_index(snapshot.path, sequence, lineage, natives, built_sequence=snapshot.built_sequence)
+    return _StateSnapshot(result.path, result.sequence, result.built_sequence, snapshot.checked_at, result.lineage,
+                          result.neighbors, result.children, result.natives_by_thread, result.threads_by_native)
+
+
+def _state_cache(*, caller: str | None = None, after_sequence: int | None = None) -> _StateSnapshot:
+    global _state_snapshot
+    path = STATE_DB
+    snapshot = _state_snapshot
+    if snapshot is None or snapshot.path != path:
+        with _state_refresh_lock:
+            snapshot = _state_snapshot
+            if snapshot is None or snapshot.path != path:
+                with _state_reads, closing(connect_ro(path)) as con:
+                    snapshot = _build_state_snapshot(con, path, _state_sequence(con))
+                    snapshot = _state_with_changes(con, snapshot, _state_sequence(con))
+                    _state_snapshot = snapshot
+    # A missing caller can have appeared since the last build. Serialize its
+    # forced incremental refresh without occupying a database-reader slot.
+    native = caller.split(":agent:", 1)[0] if caller else None
+    missing = caller and caller not in snapshot.lineage and native not in snapshot.threads_by_native
+    due = time.monotonic() - snapshot.checked_at >= _STATE_REFRESH_SECONDS
+    if missing or due or (after_sequence is not None and after_sequence > snapshot.sequence):
+        acquired = _state_refresh_lock.acquire(blocking=bool(missing))
+        if acquired:
+            try:
+                current = _state_snapshot
+                if current is not None and current.path == path:
+                    snapshot = current
+                with _state_reads, closing(connect_ro(path)) as con:
+                    sequence = _state_sequence(con)
+                    due = time.monotonic() - snapshot.checked_at >= _STATE_REFRESH_SECONDS
+                    if due and sequence != snapshot.built_sequence:
+                        snapshot = _build_state_snapshot(con, path, sequence)
+                    elif due:
+                        snapshot = _StateSnapshot(snapshot.path, snapshot.sequence, snapshot.built_sequence, time.monotonic(), snapshot.lineage,
+                                                  snapshot.neighbors, snapshot.children, snapshot.natives_by_thread,
+                                                  snapshot.threads_by_native)
+                    snapshot = _state_with_changes(con, snapshot, _state_sequence(con))
+                    _state_snapshot = snapshot
+            finally:
+                _state_refresh_lock.release()
+    # Event rows are indexed by sequence and read in pages. An overlay closes
+    # the window where an existing caller acquires a new child within 60 s.
+    # It is local when a rebuild is in flight, so known callers do not wait.
+    with _state_reads, closing(connect_ro(path)) as con:
+        snapshot = _state_with_changes(con, snapshot, _state_sequence(con))
+    if _state_refresh_lock.acquire(blocking=False):
+        try:
+            current = _state_snapshot
+            if (current is not None and current.path == path and snapshot.sequence > current.sequence
+                    and snapshot.built_sequence == current.built_sequence
+                    and snapshot.checked_at == current.checked_at):
+                _state_snapshot = snapshot
+        finally:
+            _state_refresh_lock.release()
+    return snapshot
+
+
+def _state_tree(ids: set[str], *, caller: str | None = None) -> set[str]:
     """Interim D1 reader. State is read-only; it is not a second identity writer."""
-    with closing(connect_ro(STATE_DB)) as con:
-        con.execute("BEGIN")
+    after_sequence = None
+    for _ in range(3):
+        snapshot = _state_cache(caller=caller, after_sequence=after_sequence)
+        result = _state_tree_once(ids, snapshot)
+        # The paged cache and indexed queries are separate snapshots. Do not
+        # expose a partial tree if a relevant commit landed between them.
+        with _state_reads, closing(connect_ro(STATE_DB)) as con:
+            end = _state_sequence(con)
+            changed = _state_changed(con, snapshot.sequence, end)
+        if not changed:
+            return result
+        after_sequence = end
+    raise UnknownCaller("caller lineage changed while being read")
+
+
+def _state_tree_once(ids: set[str], snapshot: _StateSnapshot) -> set[str]:
+    with _state_reads, closing(connect_ro(STATE_DB)) as con:
         thread_table = "orchestration_v2_projection_threads"
         provider_table = "orchestration_v2_projection_provider_threads"
         subagent_table = "orchestration_v2_projection_subagents"
         natives = {ident.split(":agent:", 1)[0] for ident in ids}
         seeds = {r[0] for r in con.execute(
             f"SELECT thread_id FROM {thread_table} WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
-        )}
-        seeds.update(r[0] for r in con.execute(
-            f"SELECT DISTINCT thread_id FROM {provider_table} "
-            "WHERE json_extract(payload_json,'$.nativeThreadRef.nativeId') IN (SELECT value FROM json_each(?)) "
-            "AND thread_id IS NOT NULL", (_members(natives),)
-        ))
+        ).fetchall()}
+        seeds.update(thread for native in natives for thread in snapshot.threads_by_native.get(native, ()))
         seeds.update(r[0] for r in con.execute(
             "SELECT thread_id FROM ardud_opencode_import WHERE native_session_id IN (SELECT value FROM json_each(?))", (_members(natives),)
-        ))
+        ).fetchall())
         seeds.update(r[0] for r in con.execute(
             f"SELECT child_thread_id FROM {subagent_table} "
             "WHERE child_thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
-        ) if r[0])
+        ).fetchall() if r[0])
         seeds.update(r[0] for r in con.execute(
             f"SELECT thread_id FROM {subagent_table} "
             "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(ids),)
-        ) if r[0])
+        ).fetchall() if r[0])
         if not seeds:
             return set()
         # Root hints and explicit edges all establish possible membership, even
@@ -1004,15 +1219,6 @@ def _state_tree(ids: set[str]) -> set[str]:
             if owns:
                 ownership_children.setdefault(parent, set()).add(child)
 
-        # The JSON lineage fields have no index, so read them once.
-        for child, parent, root in con.execute(
-            f"SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
-            f"json_extract(payload_json,'$.lineage.rootThreadId') FROM {thread_table}"
-        ):
-            if parent:
-                link(parent, child, owns=True)
-            if root:
-                link(root, child, owns=False)
         threads = set(seeds)
         frontier = set(seeds)
         subagents = set()
@@ -1026,7 +1232,7 @@ def _state_tree(ids: set[str]) -> set[str]:
             for parent, child, _agent in rows:
                 if child:
                     link(parent, child, owns=True)
-            found = set().union(*(neighbors.get(thread, set()) for thread in frontier))
+            found = set().union(*(snapshot.neighbors.get(thread, frozenset()) | neighbors.get(thread, set()) for thread in frontier))
             frontier = found - threads
             threads.update(frontier)
         out = set(threads)
@@ -1034,14 +1240,14 @@ def _state_tree(ids: set[str]) -> set[str]:
         for thread, native_id in con.execute(
             f"SELECT thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId') FROM {provider_table} "
             "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(threads),)
-        ):
+        ).fetchall():
             if native_id:
                 out.add(native_id)
                 natives_by_thread.setdefault(thread, set()).add(native_id)
         for thread, native_id in con.execute(
             "SELECT thread_id,native_session_id FROM ardud_opencode_import "
             "WHERE thread_id IN (SELECT value FROM json_each(?))", (_members(threads),)
-        ):
+        ).fetchall():
             if native_id:
                 out.add(native_id)
                 natives_by_thread.setdefault(thread, set()).add(native_id)
@@ -1052,7 +1258,7 @@ def _state_tree(ids: set[str]) -> set[str]:
         pending = deque((thread, native) for thread, natives in owners.items() for native in natives)
         while pending:
             parent, native = pending.popleft()
-            for child in ownership_children.get(parent, ()):
+            for child in snapshot.children.get(parent, frozenset()) | ownership_children.get(parent, set()):
                 if child in threads and native not in owners.get(child, ()):
                     owners.setdefault(child, set()).add(native)
                     pending.append((child, native))
@@ -1063,7 +1269,7 @@ def _state_tree(ids: set[str]) -> set[str]:
         pending_dangling = deque(dangling)
         while pending_dangling:
             parent = pending_dangling.popleft()
-            for child in ownership_children.get(parent, ()):
+            for child in snapshot.children.get(parent, frozenset()) | ownership_children.get(parent, set()):
                 if child in threads and child not in dangling:
                     dangling.add(child)
                     pending_dangling.append(child)
@@ -1125,12 +1331,15 @@ def _catalog_tree(ids: set[str]) -> set[str]:
 
 def validate_driver(ident: str, driver: str) -> None:
     """Qualifiers must agree with a persisted provider binding."""
-    with closing(connect_ro(STATE_DB)) as con:
+    snapshot = _state_cache(caller=ident)
+    with _state_reads, closing(connect_ro(STATE_DB)) as con:
         native = ident.split(":agent:", 1)[0]
+        threads = set(snapshot.threads_by_native.get(native, ())) | {ident}
         row = con.execute(
             "SELECT 1 FROM orchestration_v2_projection_provider_threads "
-            "WHERE (thread_id=? OR json_extract(payload_json,'$.nativeThreadRef.nativeId')=?) "
-            "AND COALESCE(driver,json_extract(payload_json,'$.driver'))=? LIMIT 1", (ident, native, driver)
+            "WHERE thread_id IN (SELECT value FROM json_each(?)) "
+            "AND (thread_id=? OR json_extract(payload_json,'$.nativeThreadRef.nativeId')=?) "
+            "AND COALESCE(driver,json_extract(payload_json,'$.driver'))=? LIMIT 1", (_members(threads), ident, native, driver)
         ).fetchone()
         if not row and driver == "opencode":
             row = con.execute("SELECT 1 FROM ardud_opencode_import WHERE thread_id=? OR native_session_id=?", (ident, native)).fetchone()
@@ -1139,6 +1348,25 @@ def validate_driver(ident: str, driver: str) -> None:
 
 
 def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
+    """All known aliases in the caller's complete root tree, or fail closed."""
+    if not canonical_or_native_id or not canonical_or_native_id.strip():
+        raise UnknownCaller("caller identity is missing")
+    try:
+        for _ in range(3):
+            with _state_reads, closing(connect_ro(STATE_DB)) as con:
+                start = _state_sequence(con)
+            result = _lineage_exclusions_once(canonical_or_native_id, fresh_legacy=fresh_legacy)
+            with _state_reads, closing(connect_ro(STATE_DB)) as con:
+                end = _state_sequence(con)
+                changed = _state_changed(con, start, end)
+            if not changed:
+                return result
+        raise UnknownCaller("caller lineage changed while being read")
+    except sqlite3.Error as e:
+        raise UnknownCaller("caller lineage could not be read") from e
+
+
+def _lineage_exclusions_once(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
     """All known aliases in the caller's complete root tree, or fail closed."""
     # Robob commits identity rows before creating a transcript; capture reads
     # that transcript later. Recheck after retrieval before exposing candidates.
@@ -1149,14 +1377,27 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
     if not ident:
         raise UnknownCaller("caller identity is missing")
     try:
+        memo: dict[frozenset[str], set[str]] = {}
+        expanded: set[str] = set()
+        def state_tree(ids: set[str]) -> set[str]:
+            key = frozenset(ids)
+            if key not in memo:
+                memo[key] = _state_tree(ids, caller=ident if not expanded else None)
+                expanded.update(ids)
+            return memo[key]
+
         oc = opencode_ro()
         edges = _opencode_edges(oc) if oc is not None else None
         aliases = _alias_table_tree({ident})
         try:
-            aliases.update(_state_tree({ident}))
+            initial = state_tree({ident})
+            aliases.update(initial)
             # An alias row can predate its state's descendants. Expand from
             # every historical binding, but require a current state anchor.
-            state_anchor = bool(_state_tree(set(aliases) | {ident}))
+            remaining = aliases - expanded
+            additional = state_tree(remaining) if remaining else set()
+            state_anchor = bool(initial or additional)
+            aliases.update(additional)
             state_available = True
         except sqlite3.Error:
             raise UnknownCaller("caller identity store unavailable") from None
@@ -1168,9 +1409,13 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
             ).fetchone():
                 raise UnknownCaller("caller identity is unknown")
             explicit = {ident} | _opencode_tree({ident}, edges) | _catalog_tree({ident})
-            aliases.update(_alias_table_tree(explicit) | _state_tree(explicit))
+            explicit_state = state_tree(explicit - expanded) if explicit - expanded else set()
+            aliases.update(_alias_table_tree(explicit) | explicit_state)
             aliases.update(explicit if aliases else _legacy_lineage(ident, fresh=fresh_legacy))
-            state_anchor = bool(_state_tree(aliases))
+            pending_state = aliases - expanded
+            anchor_state = state_tree(pending_state) if pending_state else set()
+            state_anchor = bool(explicit_state or anchor_state)
+            aliases.update(anchor_state)
         if not state_anchor and not (ident.startswith("ses_") and oc is not None and oc.execute(
                 "SELECT 1 FROM session_v2 WHERE id=?", (ident,)).fetchone()):
             raise UnknownCaller("caller has no current identity anchor")
@@ -1182,7 +1427,9 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
         while frontier:
             found = _opencode_tree(frontier, edges) | _alias_table_tree(frontier) | _catalog_tree(frontier)
             if state_available:
-                found.update(_state_tree(frontier))
+                pending_state = frontier - expanded
+                if pending_state:
+                    found.update(state_tree(pending_state))
             for sid in frontier:
                 if sid.startswith("ses_") and sid not in legacy_checked:
                     legacy_checked.add(sid)

@@ -11,6 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,32 +108,162 @@ def build_fixture(root: Path) -> Fixture:
     oc.close()
     state = sqlite3.connect(root / "statev2.sqlite")
     state.executescript("""
+      CREATE TABLE orchestration_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, stream_id TEXT);
       CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
-      CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT);
+      CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT, driver TEXT);
       CREATE INDEX provider_thread ON orchestration_v2_projection_provider_threads(thread_id);
       CREATE TABLE orchestration_v2_projection_subagents (thread_id TEXT, child_thread_id TEXT, payload_json TEXT);
       CREATE INDEX subagent_thread ON orchestration_v2_projection_subagents(thread_id);
+      CREATE INDEX subagent_child ON orchestration_v2_projection_subagents(child_thread_id);
       CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
+      CREATE INDEX import_thread ON ardud_opencode_import(thread_id);
+      CREATE TRIGGER thread_added AFTER INSERT ON orchestration_v2_projection_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.created',NEW.thread_id); END;
+      CREATE TRIGGER thread_changed AFTER UPDATE ON orchestration_v2_projection_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.metadata-updated',NEW.thread_id); END;
+      CREATE TRIGGER thread_removed AFTER DELETE ON orchestration_v2_projection_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id) VALUES('thread.deleted',OLD.thread_id); END;
+      CREATE TRIGGER provider_added AFTER INSERT ON orchestration_v2_projection_provider_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id) VALUES('provider-thread.updated',NEW.thread_id); END;
+      CREATE TRIGGER provider_removed AFTER DELETE ON orchestration_v2_projection_provider_threads BEGIN
+        INSERT INTO orchestration_events(event_type,stream_id) VALUES('provider-thread.updated',OLD.thread_id); END;
     """)
     for i in range(101):
         tid = f"thread-{i}"
         parent = f"thread-{i-1}" if i else None
         state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                       (tid, json.dumps({"lineage": {"rootThreadId": "thread-0", "parentThreadId": parent}})))
-        state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+        state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       (tid, json.dumps({"nativeThreadRef": {"nativeId": f"native-{i}"}})))
         if parent:
             state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
                           (parent, tid, json.dumps({"nativeTaskRef": {"nativeId": f"agent-{i}"}})))
     state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                   ("thread-other", json.dumps({"lineage": {"rootThreadId": "thread-other"}})))
-    state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+    state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                   ("thread-other", json.dumps({"nativeThreadRef": {"nativeId": "other-native"}})))
     state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_resume_old", "thread-0"))
     state.execute("INSERT INTO ardud_opencode_import VALUES (?,?)", ("ses_migration_new", "thread-other"))
     state.commit()
     state.close()
     return f
+
+
+# The original unbounded reader, retained only as a temporary-database oracle.
+def _oracle_state_tree(ids: set[str]) -> set[str]:
+    """Interim D1 reader. State is read-only; it is not a second identity writer."""
+    with closing(rc.connect_ro(rc.STATE_DB)) as con:
+        con.execute("BEGIN")
+        thread_table = "orchestration_v2_projection_threads"
+        provider_table = "orchestration_v2_projection_provider_threads"
+        subagent_table = "orchestration_v2_projection_subagents"
+        natives = {ident.split(":agent:", 1)[0] for ident in ids}
+        seeds = {r[0] for r in con.execute(
+            f"SELECT thread_id FROM {thread_table} WHERE thread_id IN (SELECT value FROM json_each(?))", (rc._members(ids),)
+        )}
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT DISTINCT thread_id FROM {provider_table} "
+            "WHERE json_extract(payload_json,'$.nativeThreadRef.nativeId') IN (SELECT value FROM json_each(?)) "
+            "AND thread_id IS NOT NULL", (rc._members(natives),)
+        ))
+        seeds.update(r[0] for r in con.execute(
+            "SELECT thread_id FROM ardud_opencode_import WHERE native_session_id IN (SELECT value FROM json_each(?))", (rc._members(natives),)
+        ))
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT child_thread_id FROM {subagent_table} "
+            "WHERE child_thread_id IN (SELECT value FROM json_each(?))", (rc._members(ids),)
+        ) if r[0])
+        seeds.update(r[0] for r in con.execute(
+            f"SELECT thread_id FROM {subagent_table} "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (rc._members(ids),)
+        ) if r[0])
+        if not seeds:
+            return set()
+        # Root hints and explicit edges all establish possible membership, even
+        # when projections disagree. Only direct parent edges prove ownership.
+        neighbors: dict[str, set[str]] = {}
+        ownership_children: dict[str, set[str]] = {}
+
+        def link(parent: str, child: str, *, owns: bool) -> None:
+            if not parent or not child or parent == child:
+                return
+            neighbors.setdefault(parent, set()).add(child)
+            neighbors.setdefault(child, set()).add(parent)
+            if owns:
+                ownership_children.setdefault(parent, set()).add(child)
+
+        # The JSON lineage fields have no index, so read them once.
+        for child, parent, root in con.execute(
+            f"SELECT thread_id,json_extract(payload_json,'$.lineage.parentThreadId'),"
+            f"json_extract(payload_json,'$.lineage.rootThreadId') FROM {thread_table}"
+        ):
+            if parent:
+                link(parent, child, owns=True)
+            if root:
+                link(root, child, owns=False)
+        threads = set(seeds)
+        frontier = set(seeds)
+        subagents = set()
+        while frontier:
+            rows = con.execute(
+                f"SELECT thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId') "
+                f"FROM {subagent_table} WHERE thread_id IN (SELECT value FROM json_each(?)) "
+                "OR child_thread_id IN (SELECT value FROM json_each(?))", (rc._members(frontier), rc._members(frontier))
+            ).fetchall()
+            subagents.update(rows)
+            for parent, child, _agent in rows:
+                if child:
+                    link(parent, child, owns=True)
+            found = set().union(*(neighbors.get(thread, set()) for thread in frontier))
+            frontier = found - threads
+            threads.update(frontier)
+        out = set(threads)
+        natives_by_thread: dict[str, set[str]] = {}
+        for thread, native_id in con.execute(
+            f"SELECT thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId') FROM {provider_table} "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (rc._members(threads),)
+        ):
+            if native_id:
+                out.add(native_id)
+                natives_by_thread.setdefault(thread, set()).add(native_id)
+        for thread, native_id in con.execute(
+            "SELECT thread_id,native_session_id FROM ardud_opencode_import "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))", (rc._members(threads),)
+        ):
+            if native_id:
+                out.add(native_id)
+                natives_by_thread.setdefault(thread, set()).add(native_id)
+        # Native subagents may have no provider row. Carry every possible
+        # ancestor incarnation through the ownership graph; a nearer provider
+        # does not prove that older/root incarnations did not capture the task.
+        owners = {thread: set(natives) for thread, natives in natives_by_thread.items()}
+        pending = deque((thread, native) for thread, natives in owners.items() for native in natives)
+        while pending:
+            parent, native = pending.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and native not in owners.get(child, ()):
+                    owners.setdefault(child, set()).add(native)
+                    pending.append((child, native))
+        # A second possible ownership path can have no provider even when
+        # another path has one. Propagate that uncertainty rather than using
+        # a root hint to guess the missing incarnation.
+        dangling = threads - owners.keys()
+        pending_dangling = deque(dangling)
+        while pending_dangling:
+            parent = pending_dangling.popleft()
+            for child in ownership_children.get(parent, ()):
+                if child in threads and child not in dangling:
+                    dangling.add(child)
+                    pending_dangling.append(child)
+        if dangling:
+            raise rc.UnknownCaller("subagent provider ownership could not be resolved")
+        for parent, _child, agent in subagents:
+            if agent:
+                out.add(agent)
+                out.update(f"{n}:agent:{agent}" for n in owners[parent])
+        return out
+
+
 
 
 class RecallTest(unittest.TestCase):
@@ -157,6 +290,382 @@ class RecallTest(unittest.TestCase):
 
     def ids(self, res):
         return [s["session_id"] for s in res["sessions"]]
+
+    def test_state_cache_matches_original_lineage_oracle(self):
+        for caller in ("thread-0", "native-50", "native-0:agent:agent-1", "ses_resume_old", "thread-other"):
+            with self.subTest(caller=caller):
+                with patch.object(rc, "_state_tree", side_effect=lambda ids, **_: _oracle_state_tree(ids)):
+                    expected = rc.lineage_exclusions(caller)
+                self.assertEqual(rc.lineage_exclusions(caller), expected)
+
+    def test_returned_alias_that_is_also_a_thread_is_expanded(self):
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                       ("native-0:agent:agent-1", "{}"))
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                       ("native-0:agent:agent-1", json.dumps({"nativeThreadRef": {"nativeId": "distinct-secret"}})))
+        writer.commit()
+        try:
+            self.assertIn("distinct-secret", rc.lineage_exclusions("native-0"))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='native-0:agent:agent-1'")
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='native-0:agent:agent-1'")
+            writer.commit()
+            writer.close()
+
+    def test_state_cache_reuses_pages_and_finishes_each_snapshot(self):
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("PRAGMA journal_mode=WAL").fetchall()
+        statements = []
+        opened = []
+        real_connect = rc.connect_ro
+
+        def traced(path):
+            con = real_connect(path)
+            if path == rc.STATE_DB:
+                con.set_trace_callback(statements.append)
+                opened.append(con)
+            return con
+
+        rc._state_snapshot = None
+        with patch.object(rc, "connect_ro", side_effect=traced):
+            first = rc._state_tree({"thread-other"}, caller="thread-other")
+            statements.clear()
+            second = rc._state_tree({"thread-other"}, caller="thread-other")
+        self.assertEqual(first, second)
+        self.assertFalse(any("WHERE rowid>" in sql for sql in statements), statements)
+        self.assertFalse(any(sql.strip().upper().startswith("BEGIN") for sql in statements), statements)
+        self.assertFalse(any("FROM orchestration_events WHERE sequence>" in sql for sql in statements), statements)
+        for con in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                con.execute("SELECT 1")
+        self.assertEqual(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+        writer.close()
+
+    def test_fresh_caller_forces_incremental_refresh_without_rebuild(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                       ("new-caller", json.dumps({"lineage": {"parentThreadId": "thread-other"}})))
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json,driver) VALUES (?,?,?)",
+                       ("new-caller", json.dumps({"nativeThreadRef": {"nativeId": "new-native"}}), "codex"))
+        writer.commit()
+        try:
+            with patch.object(rc, "_build_state_snapshot", wraps=rc._build_state_snapshot) as builds:
+                result = rc.lineage_exclusions("new-native")
+                rc.validate_driver("new-native", "codex")
+                builds.assert_not_called()
+            self.assertIn("new-caller", result)
+            self.assertIn("other-native", result)
+            self.assertIn("new-native", result)
+            with self.assertRaises(rc.UnknownCaller):
+                rc.validate_driver("new-native", "opencode")
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='new-caller'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='new-caller'")
+            writer.commit()
+            writer.close()
+
+    def test_same_call_does_not_reexpand_state_ids(self):
+        real = rc._state_tree
+        calls = []
+
+        def counted(ids, **kwargs):
+            calls.append(set(ids))
+            return real(ids, **kwargs)
+
+        with patch.object(rc, "_state_tree", side_effect=counted):
+            self.assertIn("native-50", rc.lineage_exclusions("native-50"))
+        self.assertEqual(len(calls), 3)  # the final, new OpenCode resume needs one lookup
+        for i, ids in enumerate(calls):
+            for other in calls[i + 1:]:
+                self.assertFalse(ids & other)
+
+    def test_state_reads_are_limited_to_two(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        lock = threading.Lock()
+        both = threading.Event()
+        release = threading.Event()
+        start = threading.Barrier(17)
+        active = 0
+        maximum = 0
+        real_connect = rc.connect_ro
+
+        class Connection:
+            def __init__(self, con):
+                self.con = con
+            def __getattr__(self, key):
+                return getattr(self.con, key)
+            def close(self):
+                nonlocal active
+                self.con.close()
+                with lock:
+                    active -= 1
+
+        def observed(path):
+            nonlocal active, maximum
+            con = real_connect(path)
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    both.set()
+            if not release.wait(5):
+                raise AssertionError("reader test stalled")
+            return Connection(con)
+
+        def run(i):
+            start.wait(timeout=5)
+            if i % 2:
+                return rc._state_tree({"thread-other"}, caller="thread-other")
+            return rc.validate_driver("thread-other", "unmatched")
+
+        def checked(i):
+            try:
+                run(i)
+            except rc.UnknownCaller:
+                pass
+
+        with patch.object(rc, "connect_ro", side_effect=observed), ThreadPoolExecutor(max_workers=16) as pool:
+            futures = [pool.submit(checked, i) for i in range(16)]
+            start.wait(timeout=5)
+            try:
+                self.assertTrue(both.wait(5))
+                self.assertEqual(maximum, 2)
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=10)
+        self.assertEqual(active, 0)
+        self.assertEqual(maximum, 2)
+
+    def test_state_refresh_is_single_flight_and_known_readers_keep_serving(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_events(event_type,stream_id) VALUES('other','unrelated')")
+        writer.commit()
+        snapshot = rc._state_snapshot
+        rc._state_snapshot = rc._StateSnapshot(snapshot.path, snapshot.sequence, snapshot.built_sequence,
+                                                0, snapshot.lineage, snapshot.neighbors, snapshot.children,
+                                                snapshot.natives_by_thread, snapshot.threads_by_native)
+        entered, release = threading.Event(), threading.Event()
+        real = rc._build_state_snapshot
+
+        def delayed(*args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("refresh stalled")
+            return real(*args)
+
+        try:
+            with patch.object(rc, "_build_state_snapshot", side_effect=delayed) as build, ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(rc._state_tree, {"thread-other"}, caller="thread-other")
+                try:
+                    self.assertTrue(entered.wait(5))
+                    second = pool.submit(rc._state_tree, {"thread-other"}, caller="thread-other")
+                    self.assertIn("other-native", second.result(timeout=3))
+                    self.assertEqual(build.call_count, 1)
+                finally:
+                    release.set()
+                self.assertIn("other-native", first.result(timeout=5))
+        finally:
+            writer.close()
+
+    def test_event_overlay_retains_fresh_child_while_refresh_is_paused(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                       ("overlay-child", json.dumps({"lineage": {"parentThreadId": "thread-other"}})))
+        writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                       ("overlay-child", json.dumps({"nativeThreadRef": {"nativeId": "overlay-native"}})))
+        writer.commit()
+        try:
+            self.assertIn("overlay-native", rc.lineage_exclusions("thread-other"))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='overlay-child'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='overlay-child'")
+            writer.commit()
+            writer.close()
+
+    def test_change_during_paged_build_is_replayed(self):
+        rc._state_snapshot = None
+        writer = sqlite3.connect(rc.STATE_DB)
+        real = rc._build_state_snapshot
+
+        def changed_after_build(*args):
+            snapshot = real(*args)
+            writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                           ("during-build", json.dumps({"lineage": {"parentThreadId": "thread-other"}})))
+            writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                           ("during-build", json.dumps({"nativeThreadRef": {"nativeId": "during-native"}})))
+            writer.commit()
+            return snapshot
+
+        try:
+            with patch.object(rc, "_build_state_snapshot", side_effect=changed_after_build):
+                self.assertIn("during-native", rc.lineage_exclusions("thread-other"))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='during-build'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='during-build'")
+            writer.commit()
+            writer.close()
+
+    def test_commit_after_cache_read_retries_before_return(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        real = rc._state_cache
+        inserted = False
+
+        def add_after_cache(**kwargs):
+            nonlocal inserted
+            snapshot = real(**kwargs)
+            if not inserted:
+                inserted = True
+                writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                               ("after-cache", json.dumps({"lineage": {"parentThreadId": "thread-other"}})))
+                writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                               ("after-cache", json.dumps({"nativeThreadRef": {"nativeId": "after-native"}})))
+                writer.commit()
+            return snapshot
+
+        try:
+            with patch.object(rc, "_state_cache", side_effect=add_after_cache) as cache:
+                result = rc._state_tree({"thread-other"}, caller="thread-other")
+            self.assertIn("after-native", result)
+            self.assertGreaterEqual(cache.call_count, 2)
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='after-cache'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='after-cache'")
+            writer.commit()
+            writer.close()
+
+    def test_commit_during_other_alias_expansion_retries_entire_closure(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        real = rc._catalog_tree
+        inserted = False
+
+        def add_during_closure(ids):
+            nonlocal inserted
+            result = real(ids)
+            if not inserted:
+                inserted = True
+                writer.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
+                               ("during-closure", json.dumps({"lineage": {"parentThreadId": "thread-other"}})))
+                writer.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
+                               ("during-closure", json.dumps({"nativeThreadRef": {"nativeId": "closure-native"}})))
+                writer.commit()
+            return result
+
+        try:
+            with patch.object(rc, "_catalog_tree", side_effect=add_during_closure):
+                self.assertIn("closure-native", rc.lineage_exclusions("thread-other"))
+        finally:
+            writer.execute("DELETE FROM orchestration_v2_projection_threads WHERE thread_id='during-closure'")
+            writer.execute("DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id='during-closure'")
+            writer.commit()
+            writer.close()
+
+    def test_status_only_event_does_not_rebuild_memory_index(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_events(event_type,stream_id) VALUES('provider-thread.updated','thread-other')")
+        writer.commit()
+        try:
+            with patch.object(rc, "_state_index", wraps=rc._state_index) as index:
+                self.assertIn("other-native", rc._state_tree({"thread-other"}, caller="thread-other"))
+                index.assert_not_called()
+        finally:
+            writer.close()
+
+    def test_older_overlay_cannot_replace_newer_rebuild(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        snap = rc._state_snapshot
+        rc._state_snapshot = rc._StateSnapshot(snap.path, snap.sequence, snap.built_sequence, 0,
+                                                snap.lineage, snap.neighbors, snap.children,
+                                                snap.natives_by_thread, snap.threads_by_native)
+        writer = sqlite3.connect(rc.STATE_DB)
+        writer.execute("INSERT INTO orchestration_events(event_type,stream_id) VALUES('other','first')")
+        writer.commit()
+        build_ready, build_release = threading.Event(), threading.Event()
+        overlay_ready, overlay_release = threading.Event(), threading.Event()
+        real_build, real_overlay = rc._build_state_snapshot, rc._state_with_changes
+
+        def build(*args):
+            result = real_build(*args)
+            build_ready.set()
+            self.assertTrue(build_release.wait(5))
+            return result
+
+        def overlay(*args):
+            result = real_overlay(*args)
+            if threading.current_thread().name.startswith("stale-reader"):
+                overlay_ready.set()
+                self.assertTrue(overlay_release.wait(5))
+            return result
+
+        try:
+            with patch.object(rc, "_build_state_snapshot", side_effect=build), \
+                 patch.object(rc, "_state_with_changes", side_effect=overlay), \
+                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="fresh-build") as builder, \
+                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="stale-reader") as reader:
+                first = builder.submit(rc._state_cache, caller="thread-other")
+                try:
+                    self.assertTrue(build_ready.wait(5))
+                    writer.execute("INSERT INTO orchestration_events(event_type,stream_id) VALUES('other','second')")
+                    writer.commit()
+                    second = reader.submit(rc._state_cache, caller="thread-other")
+                    self.assertTrue(overlay_ready.wait(5))
+                    build_release.set()
+                    fresh = first.result(timeout=5)
+                    overlay_release.set()
+                    second.result(timeout=5)
+                    self.assertEqual(rc._state_snapshot.built_sequence, fresh.built_sequence)
+                    self.assertEqual(rc._state_snapshot.checked_at, fresh.checked_at)
+                finally:
+                    build_release.set()
+                    overlay_release.set()
+            with patch.object(rc, "_build_state_snapshot", wraps=real_build) as builds:
+                rc._state_tree({"thread-other"}, caller="thread-other")
+                builds.assert_not_called()
+        finally:
+            writer.close()
+
+    def test_cache_rebuild_interval_and_watermark(self):
+        rc._state_snapshot = None
+        rc._state_tree({"thread-other"}, caller="thread-other")
+        writer = sqlite3.connect(rc.STATE_DB)
+
+        def expire():
+            snapshot = rc._state_snapshot
+            rc._state_snapshot = rc._StateSnapshot(snapshot.path, snapshot.sequence, snapshot.built_sequence,
+                                                    0, snapshot.lineage, snapshot.neighbors, snapshot.children,
+                                                    snapshot.natives_by_thread, snapshot.threads_by_native)
+
+        try:
+            with patch.object(rc, "_build_state_snapshot", wraps=rc._build_state_snapshot) as builds:
+                expire()
+                rc._state_tree({"thread-other"}, caller="thread-other")
+                self.assertEqual(builds.call_count, 0)
+                writer.execute("INSERT INTO orchestration_events(event_type,stream_id) VALUES('other','changed')")
+                writer.commit()
+                rc._state_tree({"thread-other"}, caller="thread-other")
+                self.assertEqual(builds.call_count, 0)
+                expire()
+                rc._state_tree({"thread-other"}, caller="thread-other")
+                self.assertEqual(builds.call_count, 1)
+                rc._state_tree({"thread-other"}, caller="thread-other")
+                self.assertEqual(builds.call_count, 1)
+        finally:
+            writer.close()
 
     def test_work_check_thin_skips_without_model(self):
         called = []
@@ -380,7 +889,7 @@ class RecallTest(unittest.TestCase):
             ],
         )
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+            "INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
             [("nested-root", json.dumps({"nativeThreadRef": {"nativeId": native}}))
              for native in ("nested-native-old", "nested-native-new")],
         )
@@ -480,7 +989,7 @@ class RecallTest(unittest.TestCase):
                 ("owner-grandchild", json.dumps({"lineage": {"parentThreadId": "owner-missing"}})),
             ],
         )
-        state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+        state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("owner-root", json.dumps({"nativeThreadRef": {"nativeId": "owner-native"}})))
         state.executemany(
             "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
@@ -516,7 +1025,7 @@ class RecallTest(unittest.TestCase):
                       ("dangling-root", json.dumps({"lineage": {"rootThreadId": "dangling-root"}})))
         state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                       ("dangling-parent", json.dumps({"lineage": {"rootThreadId": "dangling-root"}})))
-        state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+        state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("dangling-root", json.dumps({"nativeThreadRef": {"nativeId": "dangling-native"}})))
         state.execute("INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
                       ("dangling-parent", None, json.dumps({"nativeTaskRef": {"nativeId": "dangling-agent"}})))
@@ -575,7 +1084,7 @@ class RecallTest(unittest.TestCase):
             ],
         )
         state.executemany(
-            "INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+            "INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
             [(thread, json.dumps({"nativeThreadRef": {"nativeId": native}})) for thread, native in (
                 ("cycle-root", "cycle-root-old"), ("cycle-root", "cycle-root-new"),
                 ("cycle-child", "cycle-child-native"),
@@ -614,7 +1123,7 @@ class RecallTest(unittest.TestCase):
                 "parentThreadId": f"deep-native-thread-{i - 1}" if i else None,
             }})) for i in range(121)],
         )
-        state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+        state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                       ("deep-native-thread-0", json.dumps({"nativeThreadRef": {"nativeId": "deep-native-root"}})))
         state.executemany(
             "INSERT INTO orchestration_v2_projection_subagents VALUES (?,?,?)",
@@ -729,7 +1238,7 @@ class RecallTest(unittest.TestCase):
                     state = sqlite3.connect(rc.STATE_DB)
                     state.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                                   ("thread-race", json.dumps({"lineage": {"parentThreadId": "thread-0", "rootThreadId": "thread-0"}})))
-                    state.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+                    state.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                                   ("thread-race", json.dumps({"nativeThreadRef": {"nativeId": "native-race"}})))
                     state.commit()
                     state.close()
@@ -915,7 +1424,7 @@ class RecallTest(unittest.TestCase):
         con = sqlite3.connect(rc.STATE_DB)
         con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?,?)",
                     ("fork-child", json.dumps({"lineage": {"parentThreadId": "thread-0"}})))
-        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?)",
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads(thread_id,payload_json) VALUES (?,?)",
                     ("fork-child", json.dumps({"nativeThreadRef": {"nativeId": "native-fork"}})))
         con.commit()
         con.close()
