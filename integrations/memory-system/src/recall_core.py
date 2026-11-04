@@ -1088,11 +1088,11 @@ def _state_changed(con: sqlite3.Connection, start: int, end: int, relevant: set[
                 old = getattr(_local, "state_subagents", {}).get(task_id, ()) if task_id else ()
                 identity = (payload.get("threadId") or stream, payload.get("childThreadId"), native_ref.get("nativeId"))
                 if current & relevant and old and all(previous == identity for previous in old):
-                    # The event may have committed before this task was read.
-                    # Recompute once from a post-event view in that case.
-                    reader = getattr(_local, "state_subagent_read_sequence", {})
-                    if any(seq >= event_sequence for seq in reader.get(task_id, ())):
-                        return True
+                    # Same endpoints and task alias as every read of this task:
+                    # the lineage is unchanged whether the read came before or
+                    # after the event, so a status-only update never retries.
+                    # (Retrying here failed busy callers closed, 4 Nov.)
+                    pass
                 elif current & relevant:
                     return True
                 if task_id:
