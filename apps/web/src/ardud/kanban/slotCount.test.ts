@@ -6,9 +6,12 @@ import {
   editedSlots,
   failedSlot,
   observeSlots,
+  poolSlotsPending,
+  poolSlotsVersion,
   sendPoolSlots,
   sentSlots,
   serialSender,
+  subscribePoolSlots,
   type SlotWrites,
 } from "./slotCount";
 
@@ -264,6 +267,46 @@ describe("serialSender", () => {
     await Promise.resolve();
     expect(saved).toEqual([12, 0]);
     expect(active).toBe(0);
+  });
+
+  it("keeps level changes blocked until the queued pause has saved", async () => {
+    const board = "board-pause-before-level";
+    const pool = "high";
+    const calls: number[] = [];
+    const resolvers: Array<() => void> = [];
+    let saved = 5;
+    const versions: number[] = [];
+    const unsubscribe = subscribePoolSlots(() => versions.push(poolSlotsVersion()));
+    const write = (value: number) => {
+      calls.push(value);
+      return new Promise<boolean>((resolve) => {
+        resolvers.push(() => {
+          saved = value;
+          resolve(true);
+        });
+      });
+    };
+
+    sendPoolSlots(board, pool, 12, write);
+    sendPoolSlots(board, pool, 0, write);
+    expect(poolSlotsPending(board, pool)).toBe(true);
+    expect(poolSlotsPending(board, "another-pool")).toBe(false);
+    expect(calls).toEqual([12]);
+    expect(versions).toHaveLength(1);
+
+    resolvers[0]!();
+    await Promise.resolve();
+    expect(poolSlotsPending(board, pool)).toBe(true);
+    expect(calls).toEqual([12, 0]);
+    expect(versions).toHaveLength(1);
+
+    resolvers[1]!();
+    await Promise.resolve();
+    expect(poolSlotsPending(board, pool)).toBe(false);
+    expect(saved).toBe(0);
+    expect(versions).toHaveLength(2);
+    expect(versions[1]).toBeGreaterThan(versions[0]!);
+    unsubscribe();
   });
 
   it("keeps independent boards and pools independent", async () => {

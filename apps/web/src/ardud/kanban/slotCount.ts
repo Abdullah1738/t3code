@@ -84,6 +84,24 @@ export function serialSender(
 
 // A Settings view can unmount while its RPC is pending. Share the queue until it drains.
 const poolQueues = new Map<string, ReturnType<typeof serialQueue>>();
+const poolQueueListeners = new Set<() => void>();
+let poolQueueVersion = 0;
+
+function poolQueueChanged() {
+  poolQueueVersion++;
+  for (const listener of poolQueueListeners) listener();
+}
+
+export function subscribePoolSlots(listener: () => void): () => void {
+  poolQueueListeners.add(listener);
+  return () => poolQueueListeners.delete(listener);
+}
+
+export const poolSlotsVersion = () => poolQueueVersion;
+
+export function poolSlotsPending(boardId: string, poolKey: string): boolean {
+  return poolQueues.has(JSON.stringify([boardId, poolKey]));
+}
 
 export function sendPoolSlots(
   boardId: string,
@@ -95,8 +113,12 @@ export function sendPoolSlots(
   const key = JSON.stringify([boardId, poolKey]);
   let send = poolQueues.get(key);
   if (send === undefined) {
-    send = serialQueue(() => poolQueues.delete(key));
+    send = serialQueue(() => {
+      poolQueues.delete(key);
+      poolQueueChanged();
+    });
     poolQueues.set(key, send);
+    poolQueueChanged();
   }
   send({ write: () => write(value), dropped });
 }

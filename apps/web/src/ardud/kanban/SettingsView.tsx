@@ -1,5 +1,5 @@
 import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon, Trash2Icon } from "lucide-react";
-import { useRef, useState, type ReactNode } from "react";
+import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 
 import {
@@ -49,8 +49,11 @@ import {
   editedSlots,
   failedSlot,
   observeSlots,
+  poolSlotsPending,
+  poolSlotsVersion,
   sendPoolSlots,
   sentSlots,
+  subscribePoolSlots,
   type SlotWrites,
 } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
@@ -258,6 +261,7 @@ export function SettingsView(props: { state: KanbanBoardState }) {
 
 function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardState }) {
   const { environmentId, state } = props;
+  useSyncExternalStore(subscribePoolSlots, poolSlotsVersion);
   const board = state.board;
   const pools = poolViews(state);
   const providers =
@@ -290,6 +294,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       </Section>
       <Section title="Pools">
         {pools.map((pool) => {
+          const savingSlots = poolSlotsPending(board.id, pool.key);
           const listed = poolListed(pool.model, providers, settings);
           const unlisted = listed === false;
           const blocked = !canPool || unlisted;
@@ -326,8 +331,10 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                     modelOptions={pool.model.options ?? []}
                     allowPromptInjectedEffort={false}
                     planModeEnabled={settings.planModeEnabled}
-                    disabled={blocked}
+                    disabled={blocked || savingSlots}
                     onModelOptionsChange={(options) => {
+                      // Renaming the pool would invalidate a queued count's replaces key.
+                      if (poolSlotsPending(board.id, pool.key)) return;
                       const level = selectionEffort(
                         createModelSelection(pool.model.instanceId, pool.model.model, options),
                       );
