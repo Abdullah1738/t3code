@@ -49,6 +49,7 @@ export class McpSessionRegistry extends Context.Service<
 interface CredentialRecord extends CredentialStore.CredentialRecord {
   readonly persistedAliveAt: number;
   readonly dirty: boolean;
+  readonly livenessWrites: Semaphore.Semaphore;
 }
 
 interface RegistryState {
@@ -91,7 +92,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     records: new Map(
       loaded.map((record) => [
         record.tokenHash,
-        { ...record, persistedAliveAt: record.lastAliveAt, dirty: false },
+        {
+          ...record,
+          persistedAliveAt: record.lastAliveAt,
+          dirty: false,
+          livenessWrites: Semaphore.makeUnsafe(1),
+        },
       ]),
     ),
   });
@@ -110,22 +116,29 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const flushLiveness = Effect.fn("McpSessionRegistry.flushLiveness")(function* () {
     const { records } = yield* SynchronizedRef.get(state);
     const dirty = Array.from(records.values()).filter((record) => record.dirty);
-    for (const { tokenHash, lastAliveAt } of dirty) {
-      yield* store.updateLiveness(environmentId, tokenHash, lastAliveAt).pipe(
-        Effect.andThen(
-          SynchronizedRef.update(state, ({ records }) => {
-            const current = records.get(tokenHash);
-            if (!current) return { records };
-            const next = new Map(records);
-            next.set(tokenHash, {
-              ...current,
-              persistedAliveAt: lastAliveAt,
-              dirty: current.lastAliveAt > lastAliveAt,
-            });
-            return { records: next };
-          }),
-        ),
-        Effect.catch(() => Effect.logWarning("Failed to persist MCP credential liveness.")),
+    for (const { tokenHash, livenessWrites } of dirty) {
+      yield* livenessWrites.withPermits(1)(
+        Effect.gen(function* () {
+          const current = (yield* SynchronizedRef.get(state)).records.get(tokenHash);
+          if (!current?.dirty || current.livenessWrites !== livenessWrites) return;
+          const lastAliveAt = current.lastAliveAt;
+          yield* store.updateLiveness(environmentId, tokenHash, lastAliveAt).pipe(
+            Effect.andThen(
+              SynchronizedRef.update(state, ({ records }) => {
+                const latest = records.get(tokenHash);
+                if (!latest || latest.livenessWrites !== livenessWrites) return { records };
+                const next = new Map(records);
+                next.set(tokenHash, {
+                  ...latest,
+                  persistedAliveAt: lastAliveAt,
+                  dirty: latest.lastAliveAt > lastAliveAt,
+                });
+                return { records: next };
+              }),
+            ),
+            Effect.catch(() => Effect.logWarning("Failed to persist MCP credential liveness.")),
+          );
+        }),
       );
     }
   });
@@ -164,6 +177,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         lastAliveAt: issuedAt,
         persistedAliveAt: issuedAt,
         dirty: false,
+        livenessWrites: Semaphore.makeUnsafe(1),
       };
       yield* durableWrites
         .withPermits(1)(
@@ -209,8 +223,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         next.set(tokenHash, {
           ...record,
           lastAliveAt,
-          dirty:
-            record.dirty || lastAliveAt - record.persistedAliveAt >= LIVENESS_WRITE_INTERVAL_MS,
+          dirty: record.dirty || lastAliveAt > record.persistedAliveAt,
         });
         return [record.scope, { records: next }] as const;
       });
@@ -221,33 +234,40 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     function* (threadId) {
       yield* Effect.gen(function* () {
         const timestamp = yield* currentTimeMillis;
-        const lastAliveAt = yield* SynchronizedRef.modify(state, ({ records }) => {
+        const matching = yield* SynchronizedRef.modify(state, ({ records }) => {
           const matching = Array.from(records.values()).filter(
             (record) => record.scope.thread.threadId === threadId,
           );
-          if (matching.length === 0) return [undefined, { records }] as const;
+          if (matching.length === 0) return [matching, { records }] as const;
           const lastAliveAt = Math.max(timestamp, ...matching.map((record) => record.lastAliveAt));
           const next = new Map(records);
           for (const record of matching)
             next.set(record.tokenHash, { ...record, lastAliveAt, dirty: true });
-          return [lastAliveAt, { records: next }] as const;
+          return [matching, { records: next }] as const;
         });
-        if (lastAliveAt === undefined) return;
-        yield* store.touchThread(environmentId, threadId, lastAliveAt).pipe(Effect.orDie);
-        yield* SynchronizedRef.update(state, ({ records }) => {
-          const next = new Map(records);
-          for (const [hash, record] of records) {
-            if (record.scope.thread.threadId !== threadId) continue;
-            const aliveAt = Math.max(lastAliveAt, record.lastAliveAt);
-            next.set(hash, {
-              ...record,
-              lastAliveAt: aliveAt,
-              persistedAliveAt: lastAliveAt,
-              dirty: aliveAt > lastAliveAt,
-            });
-          }
-          return { records: next };
-        });
+        // Per-credential writes cannot backdate a token issued while this touch is pending.
+        for (const { tokenHash, livenessWrites } of matching) {
+          yield* livenessWrites.withPermits(1)(
+            Effect.gen(function* () {
+              const current = (yield* SynchronizedRef.get(state)).records.get(tokenHash);
+              if (!current || current.livenessWrites !== livenessWrites) return;
+              const lastAliveAt = current.lastAliveAt;
+              if (lastAliveAt <= current.persistedAliveAt) return;
+              yield* store.updateLiveness(environmentId, tokenHash, lastAliveAt).pipe(Effect.orDie);
+              yield* SynchronizedRef.update(state, ({ records }) => {
+                const latest = records.get(tokenHash);
+                if (!latest || latest.livenessWrites !== livenessWrites) return { records };
+                const next = new Map(records);
+                next.set(tokenHash, {
+                  ...latest,
+                  persistedAliveAt: lastAliveAt,
+                  dirty: latest.lastAliveAt > lastAliveAt,
+                });
+                return { records: next };
+              });
+            }),
+          );
+        }
       }).pipe(Effect.uninterruptible);
     },
   );
