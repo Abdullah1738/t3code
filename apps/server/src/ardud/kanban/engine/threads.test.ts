@@ -123,6 +123,42 @@ describe("backgroundWorkOf", () => {
   });
 });
 
+it.effect("find distinguishes a failed shell read from a missing thread while view hides failures", () =>
+  Effect.gen(function* () {
+    const failedId = ThreadId.make("thread-shell-read-failed");
+    const missingId = ThreadId.make("thread-shell-missing");
+    const readError = new Orchestrator.OrchestratorProjectionError({
+      threadId: failedId,
+      cause: "injected shell read failure",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: (threadId) =>
+        threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const result = yield* Effect.result(threads.find(failedId));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("view");
+        expect(result.failure.detail).toBe(readError.message);
+      }
+      expect(yield* threads.view(failedId)).toBeNull();
+      expect(yield* threads.find(missingId)).toBeNull();
+      expect(yield* threads.view(missingId)).toBeNull();
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
 it.effect("a keyed send passes stable command and message ids to thread management", () =>
   Effect.gen(function* () {
     const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];
