@@ -2830,6 +2830,7 @@ export const OrchestrationV2Command = Schema.Union([
     runtimeMode: RuntimeMode,
     expectedRuntimeMode: Schema.optional(RuntimeMode),
     expectedInteractionMode: Schema.optional(ProviderInteractionMode),
+    expectedModelSelection: Schema.optional(ModelSelection),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.interaction-mode.set"),

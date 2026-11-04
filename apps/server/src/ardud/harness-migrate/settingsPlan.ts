@@ -10,6 +10,27 @@ type ModelFavorite = typeof ModelFavoriteSchema.Type;
 
 import { planSelection, type SelectionPlan } from "./selectionPlan.ts";
 
+const OVERRIDE_FIELDS = [
+  "defaultModelSelection",
+  "sourceControlWriterModelSelection",
+  "reviewGuideModelSelection",
+] as const;
+type OverrideField = (typeof OVERRIDE_FIELDS)[number];
+
+export const projectOverrideRef = (projectId: string, field: OverrideField): string =>
+  `projectSettingsOverrides:${encodeURIComponent(projectId)}:${field}`;
+
+export const parseProjectOverrideRef = (ref: string): { projectId: string; field: OverrideField } | null => {
+  const [prefix, id, field, ...extra] = ref.split(":");
+  if (prefix !== "projectSettingsOverrides" || !id || !field || extra.length !== 0 ||
+      !OVERRIDE_FIELDS.some((candidate) => candidate === field)) return null;
+  try {
+    return { projectId: decodeURIComponent(id), field: field as OverrideField };
+  } catch {
+    return null;
+  }
+};
+
 /**
  * One settings field the migration rewrites. `before` and `after` are the whole field: a list,
  * a map, or one selection. A ledger row restores the field as a whole, never an element of it.
@@ -152,16 +173,11 @@ export const planSettings = (settings: ServerSettings): SettingsPlan => {
   const overrides = settings.projectSettingsOverrides;
   const nextOverrides: Record<string, Record<string, unknown>> = {};
   let overridesChanged = false;
-  const fields = [
-    "defaultModelSelection",
-    "sourceControlWriterModelSelection",
-    "reviewGuideModelSelection",
-  ] as const;
   for (const [projectId, override] of Object.entries(overrides)) {
     const projectFields: Record<string, unknown> = {};
-    for (const field of fields) {
+    for (const field of OVERRIDE_FIELDS) {
       const current = override[field];
-      const fieldPath = `projectSettingsOverrides.${projectId}.${field}`;
+      const fieldPath = projectOverrideRef(projectId, field);
       const selection = withSelection(changes, conflicts, fieldPath, current);
       if (selection !== current) {
         projectFields[field] = selection;

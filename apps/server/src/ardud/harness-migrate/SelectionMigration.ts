@@ -35,8 +35,9 @@ import * as ProjectService from "../../project/ProjectService.ts";
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { planBoard, type BoardPlan, type BoardSnapshot } from "./boardPlan.ts";
-import { planSettings, type SettingsPlan } from "./settingsPlan.ts";
+import { parseProjectOverrideRef, planSettings, type SettingsPlan } from "./settingsPlan.ts";
 import { planFallbacks, type FallbackPlan } from "./fallbackPlan.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import { planSelection, sameValue } from "./selectionPlan.ts";
@@ -97,12 +98,14 @@ export interface SelectionMigrationReport {
 export interface SelectionMigrationApplyResult {
   readonly applied: number;
   readonly skipped: number;
+  readonly retired: ReadonlyArray<{ readonly scope: string; readonly ref: string; readonly reason: string }>;
   readonly report: SelectionMigrationReport;
 }
 
 export interface SelectionMigrationRollbackResult {
   readonly reverted: number;
   readonly skipped: ReadonlyArray<{ readonly ref: string; readonly reason: string }>;
+  readonly retired: ReadonlyArray<{ readonly ref: string; readonly reason: string }>;
 }
 
 export class SelectionMigrationError extends Error {
@@ -163,16 +166,13 @@ const LedgerValueJson = Schema.fromJsonString(Schema.Unknown);
 const encodeLedgerValue = Schema.encodeEffect(LedgerValueJson);
 const decodeLedgerValue = Schema.decodeUnknownEffect(LedgerValueJson);
 
-/**
- * Reads a settings ref: a top-level field (`favorites`) or a per-project override
- * (`projectSettingsOverrides.<projectId>.<field>`). Only the three selection fields are overrides.
- */
+/** Reads a top-level settings field or one per-project override. */
 const readSettingsPath = (settingsValue: ServerSettings, ref: string): unknown => {
-  const parts = ref.split(".");
-  if (parts[0] === "projectSettingsOverrides" && parts.length === 3) {
+  const path = parseProjectOverrideRef(ref);
+  if (path !== null) {
     const overrides: Record<string, Record<string, unknown> | undefined> =
       settingsValue.projectSettingsOverrides;
-    return overrides[parts[1] ?? ""]?.[parts[2] ?? ""];
+    return overrides[path.projectId]?.[path.field];
   }
   return (settingsValue as unknown as Record<string, unknown>)[ref];
 };
@@ -192,10 +192,9 @@ const settingsPatchFor = (
   ref: string,
   value: unknown,
 ): ServerSettingsPatch => {
-  const parts = ref.split(".");
-  if (parts[0] === "projectSettingsOverrides" && parts.length === 3) {
-    const projectId = parts[1] ?? "";
-    const field = parts[2] ?? "";
+  const path = parseProjectOverrideRef(ref);
+  if (path !== null) {
+    const { projectId, field } = path;
     const overrides: Record<string, Record<string, unknown> | undefined> =
       settingsValue.projectSettingsOverrides;
     const current = overrides[projectId] ?? {};
@@ -556,21 +555,38 @@ export const make = Effect.gen(function* () {
     yield* sql`UPDATE ardud_harness_selection_migration SET applied_at = ${now} WHERE id = ${id}`
       .pipe(Effect.mapError((cause) => migrationError("confirm intent", cause)));
   });
+  const retireIntent = Effect.fn("SelectionMigration.retireIntent")(function* (id: number) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    yield* sql`UPDATE ardud_harness_selection_migration SET rolled_back_at = ${now} WHERE id = ${id} AND applied_at IS NULL`
+      .pipe(Effect.mapError((cause) => migrationError("retire intent", cause)));
+  });
 
   const apply: SelectionMigrationShape["apply"] = Effect.gen(function* () {
-    // Reconcile a write whose owner committed but whose receipt did not. Never guess when the
-    // current value differs from both sides; surface it as a conflict for an operator.
+    // Confirm a completed write; retire an ineligible owner's remaining intent.
+    // Divergence on a still-eligible owner remains a conflict.
     const pending = yield* sql<LedgerRow>`SELECT id, scope, ref, before_json, after_json, applied_at
       FROM ardud_harness_selection_migration WHERE version = ${SELECTION_MIGRATION_VERSION}
       AND applied_at IS NULL AND rolled_back_at IS NULL ORDER BY id`
       .pipe(Effect.mapError((cause) => migrationError("read pending intents", cause)));
+    const retired: Array<{ scope: string; ref: string; reason: string }> = [];
     for (const row of pending) {
       const before = yield* decodeLedgerValue(row.before_json).pipe(Effect.mapError((cause) => migrationError("decode intent", cause)));
       const after = yield* decodeLedgerValue(row.after_json).pipe(Effect.mapError((cause) => migrationError("decode intent", cause)));
-      const current = yield* currentValue(row.scope, row.ref);
+      const current = yield* currentValue(row.scope, row.ref, true);
+      const ownerIneligible = (row.scope === "queued-run" || row.scope === "thread" || row.scope === "thread-runtime") &&
+        (yield* currentValue(row.scope, row.ref)) === undefined;
+      if (ownerIneligible) {
+        if (sameValue(current, after)) yield* finishIntent(row.id);
+        else {
+          yield* retireIntent(row.id);
+          retired.push({ scope: row.scope, ref: row.ref, reason: "owner is no longer eligible" });
+        }
+        continue;
+      }
       if (sameValue(current, after)) yield* finishIntent(row.id);
-      else if (!sameValue(current, before)) return yield* Effect.fail(migrationError(`pending intent ${row.scope}:${row.ref} diverged`));
-      else if (row.scope === "thread-runtime") {
+      else if (!sameValue(current, before)) {
+        return yield* Effect.fail(migrationError(`pending intent ${row.scope}:${row.ref} diverged`));
+      } else if (row.scope === "thread-runtime") {
         const related = yield* sql<{ after_json: string }>`SELECT after_json FROM ardud_harness_selection_migration
           WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${row.ref}
           AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`
@@ -579,6 +595,11 @@ export const make = Effect.gen(function* () {
           const selection = yield* decodeLedgerValue(related[0].after_json).pipe(Effect.mapError((cause) => migrationError("decode thread intent", cause)));
           const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(row.ref))
             .pipe(Effect.mapError((cause) => migrationError("read thread intent owner", cause)));
+          if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null || projection.thread.settledAt !== null) {
+            yield* retireIntent(row.id);
+            retired.push({ scope: row.scope, ref: row.ref, reason: "thread is dormant" });
+            continue;
+          }
           if (sameValue(projection.thread.modelSelection, selection)) {
             if (projection.thread.interactionMode === "plan") return yield* Effect.fail(migrationError(`pending runtime intent ${row.ref} is now in plan mode`));
             yield* orchestrator.dispatch({
@@ -587,6 +608,7 @@ export const make = Effect.gen(function* () {
               runtimeMode: after as "full-access",
               expectedRuntimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access",
               expectedInteractionMode: projection.thread.interactionMode,
+              expectedModelSelection: selection as ModelSelection,
             }).pipe(Effect.mapError((cause) => migrationError("recover runtime intent", cause)));
             yield* finishIntent(row.id);
           }
@@ -719,6 +741,7 @@ export const make = Effect.gen(function* () {
             runtimeMode: plan.widenTo,
             expectedRuntimeMode: plan.runtimeBefore,
             expectedInteractionMode: plan.interactionBefore,
+            expectedModelSelection: plan.next ?? plan.before,
           })
           .pipe(Effect.mapError((cause) => migrationError(`widen thread ${plan.threadId}`, cause)));
         yield* finishIntent(runtimeIntent!);
@@ -728,6 +751,7 @@ export const make = Effect.gen(function* () {
     return {
       applied: counter.applied,
       skipped: report.changes.length - counter.applied,
+      retired,
       report,
     };
   });
@@ -736,7 +760,10 @@ export const make = Effect.gen(function* () {
    * Puts one ledger row's `before` back through its owner, but only while the owner still holds the
    * `after` value apply wrote. Returns why it was skipped, or null when it was reverted.
    */
-  const restoreRow = Effect.fn("SelectionMigration.restoreRow")(function* (row: LedgerRow) {
+  const restoreRow = Effect.fn("SelectionMigration.restoreRow")(function* (
+    row: LedgerRow,
+    retired: Array<{ readonly ref: string; readonly reason: string }>,
+  ) {
     const before = yield* decodeLedgerValue(row.before_json).pipe(
       Effect.mapError((cause) => migrationError("decode ledger", cause)),
     );
@@ -744,9 +771,17 @@ export const make = Effect.gen(function* () {
       Effect.mapError((cause) => migrationError("decode ledger", cause)),
     );
     const current = yield* currentValue(row.scope, row.ref);
+    if (row.applied_at === null && current === undefined && (row.scope === "queued-run" || row.scope === "thread" || row.scope === "thread-runtime")) {
+      yield* retireIntent(row.id);
+      retired.push({ ref: row.ref, reason: "owner is no longer eligible" });
+      return "owner is no longer eligible for rollback";
+    }
     if (current === undefined) return "owner has no record for this row";
     // An unfinished apply intent that never reached the owner is not an applied row.
-    if (row.applied_at === null && sameValue(current, before)) return "intent was not applied";
+    if (row.applied_at === null && sameValue(current, before)) {
+      retired.push({ ref: row.ref, reason: "intent was not applied" });
+      return null;
+    }
     if (!sameJson(current, after)) return "value changed after apply";
     // A pending runtime intent is only ours if the corresponding selection switch
     // committed; the same permission value alone could have been set by a user.
@@ -764,6 +799,13 @@ export const make = Effect.gen(function* () {
     return yield* writeValue(row.scope, row.ref, before, after);
   });
 
+  const readOwnerProjection = (threadId: ThreadId) => orchestrator.getThreadProjection(threadId).pipe(
+    Effect.map((projection) => projection ?? null),
+    Effect.catch((error) => Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError)(error.cause)
+      ? Effect.succeed(null)
+      : Effect.fail(migrationError("read thread", error))),
+  );
+
   /**
    * The owner's current value for one ledger row. `undefined` means the record is gone. Board and
    * card rows are not read here: a board is restored as a whole, by `restoreBoard`.
@@ -771,6 +813,7 @@ export const make = Effect.gen(function* () {
   const currentValue = (
     scope: LedgerScope,
     ref: string,
+    includeDormant = false,
   ): Effect.Effect<unknown, SelectionMigrationError> =>
     Effect.gen(function* () {
       switch (scope) {
@@ -800,16 +843,17 @@ export const make = Effect.gen(function* () {
         case "queued-run": {
           const [encodedThread, encodedRun] = ref.split(":");
           if (!encodedThread || !encodedRun) return undefined;
-          const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(decodeURIComponent(encodedThread)))
-            .pipe(Effect.mapError((cause) => migrationError("read queued run", cause)));
+          const projection = yield* readOwnerProjection(ThreadIdSchema.make(decodeURIComponent(encodedThread)));
+          if (projection === null) return undefined;
           const run = projection.runs.find((item) => item.id === decodeURIComponent(encodedRun));
-          return run?.status === "queued" ? run.modelSelection : undefined;
+          const liveThread = projection.thread.archivedAt === null && projection.thread.deletedAt === null && projection.thread.settledAt === null;
+          return run !== undefined && (includeDormant || (liveThread && run.status === "queued")) ? run.modelSelection : undefined;
         }
         case "thread":
         case "thread-runtime": {
-          const projection = yield* orchestrator.getThreadProjection(ThreadIdSchema.make(ref))
-            .pipe(Effect.mapError((cause) => migrationError("read thread", cause)));
-          if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null || projection.thread.settledAt !== null) return undefined;
+          const projection = yield* readOwnerProjection(ThreadIdSchema.make(ref));
+          if (projection === null) return undefined;
+          if (!includeDormant && (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null || projection.thread.settledAt !== null)) return undefined;
           return scope === "thread" ? projection.thread.modelSelection : projection.thread.runtimeMode;
         }
         case "board":
@@ -883,7 +927,16 @@ export const make = Effect.gen(function* () {
           return null;
         }
         case "thread-runtime": {
-          yield* orchestrator.dispatch({ type: "thread.runtime-mode.set", commandId: yield* newCommandId(`rollback-runtime:${ref}`), threadId: ThreadIdSchema.make(ref), runtimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedRuntimeMode: after as "approval-required" | "auto" | "auto-accept-edits" | "full-access" })
+          const related = yield* sql<{ after_json: string }>`SELECT after_json FROM ardud_harness_selection_migration
+            WHERE version = ${SELECTION_MIGRATION_VERSION} AND scope = ${"thread"} AND ref = ${ref}
+            AND rolled_back_at IS NULL ORDER BY id DESC LIMIT 1`
+            .pipe(Effect.mapError((cause) => migrationError("read runtime selection", cause)));
+          if (related[0] === undefined) return "runtime selection intent is missing";
+          const expectedModelSelection = yield* decodeLedgerValue(related[0].after_json)
+            .pipe(Effect.mapError((cause) => migrationError("decode runtime selection", cause)));
+          const current = yield* currentValue("thread", ref);
+          if (!sameValue(current, expectedModelSelection)) return "thread selection changed after apply";
+          yield* orchestrator.dispatch({ type: "thread.runtime-mode.set", commandId: yield* newCommandId(`rollback-runtime:${ref}`), threadId: ThreadIdSchema.make(ref), runtimeMode: before as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedRuntimeMode: after as "approval-required" | "auto" | "auto-accept-edits" | "full-access", expectedModelSelection: expectedModelSelection as ModelSelection })
             .pipe(Effect.mapError((cause) => migrationError("restore runtime mode", cause)));
           return null;
         }
@@ -985,6 +1038,19 @@ export const make = Effect.gen(function* () {
         restored.oldPoolKeys.push(afterPool.key);
       }
     }
+    // A rekey must not strand a card that acquired a slot after apply. All
+    // affected cards must be among the unchanged ledger rows restored below.
+    const removedKeys = new Set(restored.oldPoolKeys);
+    for (const card of current.cards) {
+      if (card.activePool !== null && removedKeys.has(card.activePool) && !restored.cards.has(card.id)) {
+        return `card ${card.id} acquired migrated pool ${card.activePool} after apply`;
+      }
+    }
+    const retainedKeys = new Set(current.pools.filter((pool) => !removedKeys.has(pool.key)).map((pool) => pool.key));
+    for (const pool of restored.pools.values()) {
+      if (retainedKeys.has(pool.key)) return `pool ${pool.key} was created after apply`;
+      retainedKeys.add(pool.key);
+    }
     // The rows restored in full. Old keys are the after keys, so the store removes them first.
     yield* store
       .migrateBoardSelections({
@@ -1021,6 +1087,7 @@ export const make = Effect.gen(function* () {
       `.pipe(Effect.mapError((cause) => migrationError("read ledger", cause)));
 
       const skipped: Array<{ readonly ref: string; readonly reason: string }> = [];
+      const retired: Array<{ readonly ref: string; readonly reason: string }> = [];
       let reverted = 0;
 
       // Boards first, one unit each: a board's rows are restored together or not at all.
@@ -1055,7 +1122,7 @@ export const make = Effect.gen(function* () {
       // Every other row is restored alone, through its owner, and stamped only when it was written.
       for (const row of rows) {
         if (row.scope === "board") continue;
-        const reason = yield* restoreRow(row);
+        const reason = yield* restoreRow(row, retired);
         if (reason === null) {
           yield* markRolledBack([row.id]);
           reverted += 1;
@@ -1063,7 +1130,7 @@ export const make = Effect.gen(function* () {
           skipped.push({ ref: row.ref, reason });
         }
       }
-      return { reverted, skipped };
+      return { reverted, skipped, retired };
     },
   );
 

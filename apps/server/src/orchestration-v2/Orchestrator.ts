@@ -2605,6 +2605,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          thread.archivedAt !== null || thread.settledAt !== null)) ||
       (command.type === "thread.runtime-mode.set" &&
         ((command.expectedRuntimeMode !== undefined && thread.runtimeMode !== command.expectedRuntimeMode) ||
+         (command.expectedModelSelection !== undefined && !modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection)) ||
          (command.expectedInteractionMode !== undefined && thread.interactionMode !== command.expectedInteractionMode) ||
          (command.expectedRuntimeMode !== undefined && (thread.archivedAt !== null || thread.settledAt !== null))))
     ) {

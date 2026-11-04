@@ -353,3 +353,96 @@ it.effect("round 2: rollback reports an operator's edit back to the original set
     assert.isTrue(rolled.skipped.some((entry) => entry.ref === "defaultModelSelection"));
   }).pipe(Effect.provide(testLayer)),
 );
+
+it.effect("rollback releases a settings intent whose apply receipt was lost", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const sql = yield* SqlClient.SqlClient;
+    const original = { instanceId: "opencode", model: "opus/claude-opus-5-5" } as never;
+    yield* settings.updateSettings({ defaultModelSelection: original });
+    yield* sql.unsafe(`CREATE TRIGGER r3_reject_receipt BEFORE UPDATE OF applied_at ON ardud_harness_selection_migration
+      WHEN OLD.scope = 'settings' BEGIN SELECT RAISE(FAIL, 'lost receipt'); END`);
+    yield* migration.apply.pipe(Effect.flip);
+    yield* sql.unsafe(`DROP TRIGGER r3_reject_receipt`);
+    const rollback = yield* migration.rollback(1);
+    assert.deepStrictEqual(rollback.skipped, []);
+    assert.deepStrictEqual((yield* settings.getSettings).defaultModelSelection, original);
+    // Re-applying after a successful rollback must still perform the write.
+    yield* migration.apply;
+    assert.strictEqual((yield* settings.getSettings).defaultModelSelection?.instanceId, 'claudeAgent');
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rollback skips the board when a new card occupies a migrated pool", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({slug: 'r3-occupancy', name: 'R3 occupancy', defaultProjectId: ProjectId.make('project-1')});
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    yield* migration.apply;
+    const pools = yield* store.pools(board.id);
+    const pool = pools.find(p => p.slots > 0)!;
+    const card = yield* kanban.createCard(board.id, {prompt: 'new work', title: 'new work'}, owner);
+    yield* store.putCard({...card, stage: 'working', activePool: pool.key});
+    const cards = yield* store.cards(board.id);
+    const links = yield* store.threadLinks({ boardId: board.id, open: true });
+    const rolled = yield* migration.rollback(1);
+    assert.isTrue(rolled.skipped.some((entry) => entry.ref === `board:${board.id}` && entry.reason.includes(card.id) && entry.reason.includes(pool.key)));
+    assert.deepStrictEqual(yield* store.pools(board.id), pools);
+    assert.deepStrictEqual(yield* store.cards(board.id), cards);
+    assert.deepStrictEqual(yield* store.threadLinks({ boardId: board.id, open: true }), links);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rollback skips the board when a former pool key has been reoccupied", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({ slug: "r3-key-collision", name: "Collision", defaultProjectId: ProjectId.make("project-1") });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    const old = (yield* store.pools(board.id))[0]!;
+    yield* migration.apply;
+    yield* store.putPool(board.id, old);
+    const pools = yield* store.pools(board.id);
+    const rolled = yield* migration.rollback(1);
+    assert.isTrue(rolled.skipped.some((entry) => entry.ref === `board:${board.id}` && entry.reason.includes(old.key)));
+    assert.deepStrictEqual(yield* store.pools(board.id), pools);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rollback restores a project override whose id contains dots and colons", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const projectId = ProjectId.make('ardud-opencode-import:project:/Users/ardud/.robob/worktrees');
+    const original = { instanceId: 'opencode', model: 'opus/claude-opus-5-5' } as never;
+    yield* settings.updateSettings({projectSettingsOverrides: {[projectId]: {defaultModelSelection: original}}});
+    yield* migration.apply;
+    const rolled = yield* migration.rollback(1);
+    assert.deepStrictEqual(rolled.skipped, []);
+    assert.deepStrictEqual((yield* settings.getSettings).projectSettingsOverrides[projectId]?.defaultModelSelection, original);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("a lost override receipt with a dotted project id is recovered and restored", () =>
+  Effect.gen(function* () {
+    const migration = yield* SelectionMigration.SelectionMigration;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("ardud-opencode-import:project:/Users/ardud/.robob/worktrees");
+    const original = { instanceId: "opencode", model: "opus/claude-opus-5-5" } as never;
+    yield* settings.updateSettings({ projectSettingsOverrides: { [projectId]: { defaultModelSelection: original } } });
+    yield* sql.unsafe(`CREATE TRIGGER dotted_receipt BEFORE UPDATE OF applied_at ON ardud_harness_selection_migration
+      WHEN OLD.scope = 'settings' BEGIN SELECT RAISE(FAIL, 'lost receipt'); END`);
+    yield* migration.apply.pipe(Effect.flip);
+    assert.strictEqual((yield* settings.getSettings).projectSettingsOverrides[projectId]?.defaultModelSelection?.instanceId, "claudeAgent");
+    yield* sql.unsafe(`DROP TRIGGER dotted_receipt`);
+    yield* migration.apply;
+    const rolled = yield* migration.rollback(1);
+    assert.deepStrictEqual(rolled.skipped, []);
+    assert.deepStrictEqual((yield* settings.getSettings).projectSettingsOverrides[projectId]?.defaultModelSelection, original);
+  }).pipe(Effect.provide(testLayer)),
+);

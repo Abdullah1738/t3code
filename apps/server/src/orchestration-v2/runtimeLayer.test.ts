@@ -5813,7 +5813,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         projectId: ProjectId.make("runtime-layer-queued-rebind-project"),
         title: "Rebind queued work",
         modelSelection,
-        runtimeMode: "full-access",
+        runtimeMode: "approval-required",
         interactionMode: "default",
         branch: null,
         worktreePath: "/tmp/runtime-layer-queued-rebind",
@@ -5866,6 +5866,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         instanceId: alternateInstanceId,
         model: "gpt-5.4",
       } satisfies ModelSelection;
+
+      const guardedWiden = yield* orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("runtime-layer-queued-rebind-runtime-cas"),
+        threadId,
+        runtimeMode: "full-access",
+        expectedRuntimeMode: "approval-required",
+        expectedModelSelection: rebound,
+      }).pipe(Effect.flip);
+      assert.equal(guardedWiden._tag, "OrchestratorDispatchError");
+      assert.equal((yield* orchestrator.getThreadProjection(threadId)).thread.runtimeMode, "approval-required");
 
       const events = yield* EventSink.EventSinkV2;
       const now = yield* DateTime.now;
