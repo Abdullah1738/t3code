@@ -355,6 +355,34 @@ describe("serialSender", () => {
     expect(poolSlotsPending(board, pool)).toBe(false);
   });
 
+  it("clears a level rename the feed acknowledged before the RPC returned", async () => {
+    const board = "board-level-round-trip";
+    const pool = "high";
+    let finishLevel!: (ok: boolean) => void;
+    const writes: number[] = [];
+    let dropped = false;
+    sendPoolLevel(board, pool, () => new Promise<boolean>((resolve) => (finishLevel = resolve)));
+    expect(poolLevelPending(board, pool)).toBe(true);
+    observePoolLevels(board, ["max"]);
+    observePoolLevels(board, ["high"]);
+    finishLevel(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(poolLevelPending(board, pool)).toBe(false);
+    sendPoolSlots(
+      board,
+      pool,
+      0,
+      (value) => {
+        writes.push(value);
+      },
+      () => (dropped = true),
+    );
+    expect(dropped).toBe(false);
+    expect(writes).toEqual([0]);
+    await Promise.resolve();
+  });
+
   it("keeps independent boards and pools independent", async () => {
     const calls: string[] = [];
     const resolvers: Array<() => void> = [];

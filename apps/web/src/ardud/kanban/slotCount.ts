@@ -89,7 +89,10 @@ export function serialSender(
 
 // A Settings view can unmount while its RPC is pending. Share the queue until it drains.
 const poolQueues = new Map<string, ReturnType<typeof serialQueue>>();
-const poolLevels = new Map<string, { boardId: string; poolKey: string; saved: boolean }>();
+const poolLevels = new Map<
+  string,
+  { boardId: string; poolKey: string; saved: boolean; acked: boolean }
+>();
 const poolQueueListeners = new Set<() => void>();
 let poolQueueVersion = 0;
 
@@ -117,9 +120,12 @@ export function poolLevelPending(boardId: string, poolKey: string): boolean {
 export function observePoolLevels(boardId: string, poolKeys: ReadonlyArray<string>): void {
   let changed = false;
   for (const [key, level] of poolLevels) {
-    if (level.boardId === boardId && level.saved && !poolKeys.includes(level.poolKey)) {
-      poolLevels.delete(key);
-      changed = true;
+    if (level.boardId === boardId && !poolKeys.includes(level.poolKey)) {
+      level.acked = true;
+      if (level.saved) {
+        poolLevels.delete(key);
+        changed = true;
+      }
     }
   }
   if (changed) poolQueueChanged();
@@ -160,7 +166,7 @@ export function sendPoolLevel(
 ): void {
   const key = JSON.stringify([boardId, poolKey]);
   if (poolLevels.has(key)) return;
-  const level = { boardId, poolKey, saved: false };
+  const level = { boardId, poolKey, saved: false, acked: false };
   poolLevels.set(key, level);
   poolQueueChanged();
   const drop = () => {
@@ -175,6 +181,7 @@ export function sendPoolLevel(
       const ok = await write();
       if (ok) {
         level.saved = true;
+        if (level.acked && poolLevels.get(key) === level) poolLevels.delete(key);
         poolQueueChanged();
       }
       return ok;
