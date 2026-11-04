@@ -19,6 +19,8 @@ import {
 } from "./claudeWorkflowProgress.ts";
 
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
+// ardud: a staged transcript must be resumed even before its first Robob turn.
+import { isClaudeSeeded } from "../../ardud/harness-migrate/seededGuard.ts";
 import { normalizeClaudeTurnTokenUsage } from "../../provider/ClaudeTurnTokenUsage.ts";
 import {
   type CanUseTool,
@@ -9223,7 +9225,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           // provider session is idle-released. A prior turn on this native id
           // requires resume; sessionId would fail with "already in use".
           const hasPersistedProviderTurn =
-            turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1;
+            isClaudeSeeded(turnInput.providerThread) ||
+            (turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1);
           const shouldResume =
             resumeSessionAt !== undefined || openedWithResume || hasPersistedProviderTurn;
           const queryOptions = makeClaudeQueryOptions({

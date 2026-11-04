@@ -1572,7 +1572,7 @@ describe("orchestration v2 provider switching", () => {
       ),
   );
 
-  it.live.each(["native", "legacy"] as const)(
+  it.live.each(["native", "legacy", "confirmed-seed"] as const)(
     "starts a replacement native thread as new after the resume fallback with %s attempts",
     (attempts) =>
       Effect.scoped(
@@ -1645,6 +1645,29 @@ describe("orchestration v2 provider switching", () => {
             if (providerThread === undefined || providerThread.providerSessionId === null) {
               return yield* Effect.die("Expected a provider session after the first turn.");
             }
+            if (attempts === "confirmed-seed") {
+              yield* (yield* EventSink.EventSinkV2).write({
+                events: [
+                  {
+                    id: EventId.make("resume-fallback-confirmed-seed"),
+                    type: "provider-thread.updated",
+                    threadId,
+                    occurredAt: yield* DateTime.now,
+                    payload: {
+                      ...providerThread,
+                      nativeMetadata: {
+                        seededHistory: {
+                          source: "opencode",
+                          sourceSessionId: "ses_source",
+                          digest: "sha256:seed",
+                          mode: "claude-transcript",
+                        },
+                      },
+                    },
+                  },
+                ],
+              });
+            }
             yield* orchestrator.dispatch({
               type: "provider-session.detach",
               commandId: CommandId.make("resume-fallback:detach"),
@@ -1668,6 +1691,11 @@ describe("orchestration v2 provider switching", () => {
             }
             yield* Ref.set(failResumeOnce, true);
             yield* runToCompletion(2);
+            if (attempts === "confirmed-seed") {
+              const replacement = (yield* orchestrator.getThreadProjection(threadId))
+                .providerThreads[0];
+              assert.isUndefined(replacement?.nativeMetadata?.seededHistory);
+            }
             yield* runToCompletion(3);
 
             const turns = yield* Ref.get(capturedTurns);
