@@ -4,18 +4,6 @@ import { LARGE_REPLY_BYTES, type LargeReplyRecorder, utf8BytesIfLarge } from "./
 
 const protocolTags = new Set(["Exit", "Chunk", "Defect", "Request", "Pong", "ClientEnd"]);
 
-interface PendingRequest {
-  readonly method: string;
-  readonly threadId: string | undefined;
-  readonly discussionId: string | undefined;
-}
-
-const idField = (payload: unknown, key: "threadId" | "discussionId"): string | undefined => {
-  if (typeof payload !== "object" || payload === null || !(key in payload)) return undefined;
-  const value = (payload as Record<string, unknown>)[key];
-  return typeof value === "string" && value.length <= 200 ? value : undefined;
-};
-
 export const wrap = (
   serialization: RpcSerialization.RpcSerialization["Service"],
   log: LargeReplyRecorder,
@@ -25,7 +13,7 @@ export const wrap = (
     ...serialization,
     makeUnsafe: () => {
       const parser = serialization.makeUnsafe();
-      const pending = new Map<string | number, PendingRequest>();
+      const pending = new Map<string | number, string>();
       return {
         decode: (data) => {
           const messages = parser.decode(data);
@@ -40,12 +28,7 @@ export const wrap = (
                 typeof message.tag === "string" &&
                 allowedMethods.has(message.tag)
               ) {
-                const payload = "payload" in message ? message.payload : undefined;
-                pending.set(message.id, {
-                  method: message.tag,
-                  threadId: idField(payload, "threadId"),
-                  discussionId: idField(payload, "discussionId"),
-                });
+                pending.set(message.id, message.tag);
               } else if (
                 message._tag === "Interrupt" &&
                 "requestId" in message &&
@@ -71,7 +54,7 @@ export const wrap = (
               (typeof envelope.requestId === "string" || typeof envelope.requestId === "number")
                 ? envelope.requestId
                 : undefined;
-            const request = requestId === undefined ? undefined : pending.get(requestId);
+            const method = requestId === undefined ? undefined : pending.get(requestId);
             if (tag === "Exit" && requestId !== undefined) pending.delete(requestId);
             // Size the string the transport is about to send; never re-serialize.
             const bytes =
@@ -84,11 +67,9 @@ export const wrap = (
               log.record({
                 kind: "ws",
                 name:
-                  request?.method ??
+                  method ??
                   (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
                 bytes,
-                threadId: request?.threadId,
-                discussionId: request?.discussionId,
               });
             }
           } catch {
