@@ -6,6 +6,7 @@ import { LARGE_REPLY_BYTES, type LargeReplyRecorder } from "./LargeReplyLog.ts";
 
 export interface McpReplyCapture {
   name: string | undefined;
+  readonly threadId: string | undefined;
 }
 
 export const recordResponse = (
@@ -16,7 +17,7 @@ export const recordResponse = (
   const record = (bytes: number) => {
     try {
       if (capture.name !== undefined && bytes >= LARGE_REPLY_BYTES) {
-        log.record({ kind: "mcp", name: capture.name, bytes });
+        log.record({ kind: "mcp", name: capture.name, bytes, threadId: capture.threadId });
       }
     } catch {
       // The response must still go out if diagnostics fail.

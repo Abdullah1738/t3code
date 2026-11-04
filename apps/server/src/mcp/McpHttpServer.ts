@@ -198,7 +198,10 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         providerToken: looksLikeProviderToken(token),
       });
     }
-    const capture: McpReplySize.McpReplyCapture = { name: undefined };
+    const capture: McpReplySize.McpReplyCapture = {
+      name: undefined,
+      threadId: invocation.thread?.threadId,
+    };
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
       Effect.provideService(McpReplyCapture, capture),

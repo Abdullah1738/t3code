@@ -70,54 +70,84 @@ describe("LargeReplyLog", () => {
     expect(() =>
       log.record({ kind: "ws", name: "Exit", bytes: LargeReplyLog.LARGE_REPLY_BYTES }),
     ).not.toThrow();
-    expect(() => LargeReplyLog.make("\0").record({ kind: "ws", name: "Exit", bytes: 2e6 })).not.toThrow();
+    expect(() =>
+      LargeReplyLog.make("\0").record({ kind: "ws", name: "Exit", bytes: 2e6 }),
+    ).not.toThrow();
   });
 
   it.effect("records the real serialized MCP response under the tool's name", () =>
-    Effect.scoped(Effect.gen(function* () {
-      const entries: LargeReplyLog.LargeReply[] = [];
-      const toolkit = Toolkit.make(Tool.make("large_probe", {
-        description: "Returns a large test value.",
-        success: Schema.Struct({ text: Schema.String }),
-      }));
-      const serverLayer = McpHttpServer.toolkitRegistration(
-        toolkit,
-        McpToolAccess.toLayer(toolkit, {
-          large_probe: McpToolAccess.reads(() => Effect.succeed({ text: "private".repeat(200_000) })),
-        }),
-      ).pipe(
-        Layer.provideMerge(McpHttpServer.layerMcpTransport),
-        Layer.provide(Layer.succeed(LargeReplyLog.LargeReplyLog, { record: (entry) => entries.push(entry) })),
-        Layer.provide(Layer.mock(McpSessionRegistry.McpSessionRegistry)({
-          resolve: () => Effect.succeed({
-            environmentId: EnvironmentId.make("test"),
-            requestNamespace: "test",
-            thread: {
-              threadId: ThreadId.make("test"),
-              providerSessionId: "test",
-              providerInstanceId: ProviderInstanceId.make("test"),
-            },
-            client: undefined,
-            capabilities: new Set(["orchestration"]),
-            issuedAt: 1,
+    Effect.scoped(
+      Effect.gen(function* () {
+        const entries: LargeReplyLog.LargeReply[] = [];
+        const toolkit = Toolkit.make(
+          Tool.make("large_probe", {
+            description: "Returns a large test value.",
+            success: Schema.Struct({ text: Schema.String }),
           }),
-        })),
-      );
-      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(Layer.build);
-      const http = yield* HttpClient.HttpClient;
-      const headers = { accept: "application/json, text/event-stream", authorization: "Bearer test" };
-      const initialized = yield* http.post("/mcp", {
-        headers,
-        body: HttpBody.text('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}', "application/json"),
-      });
-      expect(initialized.status).toBe(200);
-      const response = yield* http.post("/mcp", {
-        headers: { ...headers, "mcp-session-id": initialized.headers["mcp-session-id"]!, "mcp-protocol-version": "2025-06-18" },
-        body: HttpBody.text('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"large_probe","arguments":{}}}', "application/json"),
-      });
-      expect(response.status).toBe(200);
-      const body = yield* response.arrayBuffer;
-      expect(entries).toEqual([{ kind: "mcp", name: "large_probe", bytes: body.byteLength }]);
-    })).pipe(Effect.provide(NodeHttpServer.layerTest)),
+        );
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          toolkit,
+          McpToolAccess.toLayer(toolkit, {
+            large_probe: McpToolAccess.reads(() =>
+              Effect.succeed({ text: "private".repeat(200_000) }),
+            ),
+          }),
+        ).pipe(
+          Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(
+            Layer.succeed(LargeReplyLog.LargeReplyLog, { record: (entry) => entries.push(entry) }),
+          ),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: () =>
+                Effect.succeed({
+                  environmentId: EnvironmentId.make("test"),
+                  requestNamespace: "test",
+                  thread: {
+                    threadId: ThreadId.make("test"),
+                    providerSessionId: "test",
+                    providerInstanceId: ProviderInstanceId.make("test"),
+                  },
+                  client: undefined,
+                  capabilities: new Set(["orchestration"]),
+                  issuedAt: 1,
+                }),
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const http = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer test",
+        };
+        const initialized = yield* http.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}',
+            "application/json",
+          ),
+        });
+        expect(initialized.status).toBe(200);
+        const response = yield* http.post("/mcp", {
+          headers: {
+            ...headers,
+            "mcp-session-id": initialized.headers["mcp-session-id"]!,
+            "mcp-protocol-version": "2025-06-18",
+          },
+          body: HttpBody.text(
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"large_probe","arguments":{}}}',
+            "application/json",
+          ),
+        });
+        expect(response.status).toBe(200);
+        const body = yield* response.arrayBuffer;
+        expect(entries).toEqual([
+          { kind: "mcp", name: "large_probe", bytes: body.byteLength, threadId: "test" },
+        ]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 });

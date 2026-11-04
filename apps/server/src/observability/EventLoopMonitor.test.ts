@@ -137,7 +137,7 @@ describe("EventLoopMonitor", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("records heap spaces above 1.5 GiB even without a stall", () =>
+  it.effect("records heap spaces past 75% of the heap limit even without a stall", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-event-loop-" });
@@ -156,6 +156,7 @@ describe("EventLoopMonitor", () => {
               physical_space_size: 128 * 1024 * 1024,
             },
           ],
+          2048 * 1024 * 1024,
         ),
       );
       yield* TestClock.adjust("60 seconds");
@@ -163,13 +164,17 @@ describe("EventLoopMonitor", () => {
       assert.lengthOf(lines, 1);
       const line = JSON.parse(lines[0]!);
       assert.isString(line.at);
-      assert.deepStrictEqual({ ...line, at: "timestamp" }, {
-        at: "timestamp",
-        kind: "heap-spaces",
-        heapUsedMb: 1536,
-        rssMb: 1536,
-        spaces: [{ name: "large_object_space", usedMb: 100, sizeMb: 128 }],
-      });
+      assert.deepStrictEqual(
+        { ...line, at: "timestamp" },
+        {
+          at: "timestamp",
+          kind: "heap-spaces",
+          heapUsedMb: 1536,
+          heapLimitMb: 2048,
+          rssMb: 1536,
+          spaces: [{ name: "large_object_space", usedMb: 100, sizeMb: 128 }],
+        },
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

@@ -22,7 +22,9 @@ const RESOLUTION_MS = 1000;
 const STALL_THRESHOLD_MS = 2000;
 const SAMPLE_INTERVAL = "30 seconds";
 const STALL_LOG_MAX_BYTES = 256 * 1024;
-const HIGH_HEAP_BYTES = 1.5 * 1024 * 1024 * 1024;
+// Heap space stats are logged past this share of V8's limit, so an OOM
+// leaves a record of which space was filling.
+const HIGH_HEAP_RATIO = 0.75;
 
 /** Delay in ns, active time in ms, CPU in µs. */
 export interface EventLoopReadings {
@@ -122,6 +124,7 @@ export const layerWith = (
   makeSampler: Effect.Effect<Effect.Effect<EventLoopReadings>, never, Scope.Scope>,
   stallLog: StallLogOptions,
   readHeapSpaces: typeof NodeV8.getHeapSpaceStatistics = NodeV8.getHeapSpaceStatistics,
+  heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -144,13 +147,14 @@ export const layerWith = (
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
         yield* recordGauges(readings);
-        if (readings.heapUsedBytes > HIGH_HEAP_BYTES && stallSink !== undefined) {
+        if (readings.heapUsedBytes > heapLimitBytes * HIGH_HEAP_RATIO && stallSink !== undefined) {
           const at = DateTime.formatIso(yield* DateTime.now);
           yield* Effect.try(() => {
             return {
               at,
               kind: "heap-spaces",
               heapUsedMb: Math.round(readings.heapUsedBytes / 1024 / 1024),
+              heapLimitMb: Math.round(heapLimitBytes / 1024 / 1024),
               rssMb: Math.round(readings.rssBytes / 1024 / 1024),
               spaces: readHeapSpaces().map((space) => ({
                 name: space.space_name,
