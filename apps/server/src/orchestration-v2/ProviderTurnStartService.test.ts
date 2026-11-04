@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
+  ContextHandoffId,
   CheckpointScopeId,
   EnvironmentId,
   ContextTransferId,
@@ -9,6 +10,7 @@ import {
   NodeId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
@@ -291,6 +293,7 @@ function makeLocalCommandHarness(input: {
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly resumeSuccess?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -506,17 +509,35 @@ function makeLocalCommandHarness(input: {
       ),
     ),
   );
+  const resumeFallbackEnsure = vi.fn(() => Effect.succeed(providerThread));
+  const resumeThread = vi.fn(
+    ({ providerThread: existing }: { providerThread: typeof providerThread }) =>
+      input.resumeSuccess === true
+        ? Effect.succeed(existing)
+        : Effect.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver: providerThread.driver,
+              providerSessionId,
+              cause: "native thread is gone",
+            }),
+          ),
+  );
   const resumeFallbackSession = {
     driver: providerThread.driver,
-    resumeThread: () =>
-      Effect.fail(
-        new ProviderAdapter.ProviderAdapterEventStreamError({
-          driver: providerThread.driver,
-          providerSessionId,
-          cause: "native thread is gone",
-        }),
-      ),
-    ensureThread: () => Effect.succeed(providerThread),
+    providerSession: {
+      id: providerSessionId,
+      driver: providerThread.driver,
+      providerInstanceId: newInstanceId,
+      status: "ready" as const,
+      cwd: "/tmp/native-account-command",
+      model: null,
+      capabilities: CodexProviderCapabilitiesV2,
+      createdAt: now,
+      updatedAt: now,
+      lastError: null,
+    },
+    resumeThread,
+    ensureThread: resumeFallbackEnsure,
   };
   const open = vi.fn(() =>
     input.interruptOpen === true
@@ -561,7 +582,7 @@ function makeLocalCommandHarness(input: {
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true
+    input.failReadsAfterRunning === true || input.resumeSuccess === true
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -684,6 +705,8 @@ function makeLocalCommandHarness(input: {
     resolveRuntimePolicy,
     createWorktree,
     open,
+    resumeThread,
+    resumeFallbackEnsure,
     writeIfRunCurrent,
     startRootRun,
     tryHandlePromptCommand,
@@ -1158,10 +1181,289 @@ effectIt.effect(
 
       expect(error._tag).toBe("ProviderTurnStartError");
       expect((error.cause as { _tag?: string } | undefined)?._tag).toBe("ProjectionStoreReadError");
+      expect(harness.resumeFallbackEnsure).toHaveBeenCalledOnce();
       expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
       expect(harness.projection().runs.at(-1)?.status).toBe("starting");
       expect(harness.events).toEqual([]);
     }),
+);
+
+effectIt.effect.each([
+  "resume failed",
+  "uncertain delivery",
+  "missing native ref",
+  "missing native id",
+  "injected Codex missing native id",
+  "Codex local goal completed before resume failure",
+] as const)("fails a seeded turn without opening a fresh session on %s", (scenario) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("unexpected fallback"),
+    });
+    const projection = harness.projection();
+    const providerThread = projection.providerThreads.at(-1)!;
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((candidate) =>
+        candidate.id !== providerThread.id
+          ? candidate
+          : {
+              ...candidate,
+              ...(scenario === "missing native ref" ||
+              scenario === "injected Codex missing native id"
+                ? { nativeThreadRef: null }
+                : scenario === "missing native id"
+                  ? { nativeThreadRef: { ...candidate.nativeThreadRef!, nativeId: null } }
+                  : {}),
+              nativeMetadata: {
+                seededHistory: {
+                  source: "opencode",
+                  sourceSessionId: "ses_source",
+                  digest: "sha256:seed",
+                  ...(scenario === "injected Codex missing native id" ||
+                  scenario === "Codex local goal completed before resume failure"
+                    ? { mode: "codex-inject" as const, injectedNativeId: "native-injected" }
+                    : { mode: "claude-transcript" as const }),
+                },
+              },
+            },
+      ),
+      providerTurns:
+        scenario === "Codex local goal completed before resume failure"
+          ? [
+              {
+                id: ProviderTurnId.make("completed-goal-command"),
+                providerThreadId: providerThread.id,
+                nodeId: projection.nodes[0]!.id,
+                runAttemptId: null,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "completed",
+                startedAt: projection.updatedAt,
+                completedAt: projection.updatedAt,
+              },
+            ]
+          : [],
+      contextHandoffs:
+        scenario === "uncertain delivery"
+          ? [
+              {
+                id: ContextHandoffId.make("handoff:uncertain-seed"),
+                threadId: projection.thread.id,
+                targetRunId: projection.runs.at(-1)!.id,
+                fromProviderThreadIds: [],
+                toProviderThreadId: providerThread.id,
+                coveredRunOrdinals: { from: 1, to: 1 },
+                strategy: "manual_context",
+                status: "ready",
+                summaryMessageId: null,
+                summaryText: "Pending handoff",
+                createdByProviderInstanceId: null,
+                createdAt: projection.updatedAt,
+                updatedAt: projection.updatedAt,
+                delivery: {
+                  nativeThreadId: providerThread.nativeThreadRef!.nativeId!,
+                  status: "pending",
+                  itemIds: [],
+                },
+              },
+            ]
+          : [],
+    });
+
+    yield* harness.start;
+
+    expect(harness.resumeThread).toHaveBeenCalledTimes(
+      scenario === "resume failed" ||
+        scenario === "Codex local goal completed before resume failure"
+        ? 1
+        : 0,
+    );
+    expect(harness.resumeFallbackEnsure).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+    expect(harness.projection().turnItems).toMatchObject([
+      {
+        type: "error",
+        failure: {
+          message:
+            "This thread's moved history could not be resumed, so the turn stopped instead of starting without it. Roll the move back with t3ctl harness-migrate rollback <thread>, or retry.",
+        },
+      },
+    ]);
+  }),
+);
+
+effectIt.effect("fails an unconfirmed seeded turn when resumed handoffs do not fit", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("unexpected fallback"),
+      resumeSuccess: true,
+    });
+    const projection = harness.projection();
+    const providerThread = projection.providerThreads.at(-1)!;
+    const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((candidate) => ({
+        ...candidate,
+        contextUsage: { usedTokens: 99_000, maxTokens: 100_000 },
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_source",
+            digest: "sha256:seed",
+            mode: "claude-transcript",
+          },
+        },
+      })),
+      contextHandoffs: [
+        {
+          id: ContextHandoffId.make("handoff:seeded-budget"),
+          threadId: projection.thread.id,
+          targetRunId: projection.runs.at(-1)!.id,
+          fromProviderThreadIds: [],
+          toProviderThreadId: providerThread.id,
+          coveredRunOrdinals: { from: 1, to: 1 },
+          strategy: "manual_context",
+          status: "ready",
+          summaryMessageId: null,
+          summaryText: "Pending handoff",
+          createdByProviderInstanceId: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+    });
+
+    yield* harness.start;
+
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.resumeFallbackEnsure).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(harness.projection().turnItems).toMatchObject([
+      { type: "error", failure: { message: expect.stringContaining("moved history") } },
+    ]);
+  }),
+);
+
+effectIt.effect("passes native history for a seeded Claude first turn with no handoffs", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("unexpected history read"),
+      resumeSuccess: true,
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((candidate) => ({
+        ...candidate,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_source",
+            digest: "sha256:seed",
+            mode: "claude-transcript",
+          },
+        },
+      })),
+    });
+
+    yield* harness.start;
+
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.resumeFallbackEnsure).not.toHaveBeenCalled();
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    const turn = harness.startRootRun.mock.calls[0]?.[0];
+    expect(turn?.nativeThreadHasTurns).toBe(true);
+    expect(turn?.providerTurnOrdinal).toBe(1);
+    expect(turn?.providerThread.nativeMetadata?.seededHistory?.mode).toBe("claude-transcript");
+  }),
+);
+
+effectIt.effect("allows a first Codex staged injection to create its native thread", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("unexpected history read"),
+      resumeSuccess: true,
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((candidate) => ({
+        ...candidate,
+        nativeThreadRef: null,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_source",
+            digest: "sha256:seed",
+            mode: "codex-inject",
+            stagedPath: "/staged/input",
+          },
+        },
+      })),
+    });
+
+    yield* harness.start;
+
+    expect(harness.resumeThread).not.toHaveBeenCalled();
+    expect(harness.resumeFallbackEnsure).toHaveBeenCalledOnce();
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(
+      harness.startRootRun.mock.calls[0]?.[0].providerThread.nativeMetadata?.seededHistory,
+    ).toMatchObject({ mode: "codex-inject", stagedPath: "/staged/input" });
+  }),
+);
+
+effectIt.effect("allows the normal fresh-session recovery after a seeded turn completed", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("expected history read"),
+    });
+    const projection = harness.projection();
+    const providerThread = projection.providerThreads.at(-1)!;
+    const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((candidate) => ({
+        ...candidate,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_source",
+            digest: "sha256:seed",
+            mode: "claude-transcript",
+          },
+        },
+      })),
+      providerTurns: [
+        {
+          id: ProviderTurnId.make("completed-seeded-turn"),
+          providerThreadId: providerThread.id,
+          nodeId: projection.nodes[0]!.id,
+          runAttemptId: null,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+        },
+      ],
+    });
+
+    const error = yield* harness.start.pipe(Effect.flip);
+
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.resumeFallbackEnsure).toHaveBeenCalledOnce();
+  }),
 );
 
 effectIt.effect("does not mistake a failed state read for a superseded run", () =>
