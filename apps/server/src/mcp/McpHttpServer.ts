@@ -27,6 +27,8 @@ import * as HtmlRender from "../htmlRender/HtmlRender.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
+import * as McpReplySize from "../observability/McpReplySize.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import {
   type AgentThread,
@@ -150,6 +152,10 @@ type McpAuthMiddleware = (
   HttpServerRequest.HttpServerRequest
 >;
 
+class McpReplyCapture extends Context.Service<McpReplyCapture, McpReplySize.McpReplyCapture>()(
+  "t3/mcp/McpHttpServer/McpReplyCapture",
+) {}
+
 export const normalizeMcpHttpResponse = (
   response: HttpServerResponse.HttpServerResponse,
 ): HttpServerResponse.HttpServerResponse => {
@@ -168,6 +174,7 @@ const looksLikeProviderToken = (token: string) => token.length > 0 && !token.inc
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
+  const largeReplies = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
@@ -191,9 +198,16 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         providerToken: looksLikeProviderToken(token),
       });
     }
+    const capture: McpReplySize.McpReplyCapture = { name: undefined };
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.provideService(McpReplyCapture, capture),
       Effect.map(normalizeMcpHttpResponse),
+      Effect.map((response) =>
+        Option.isSome(largeReplies)
+          ? McpReplySize.recordResponse(response, capture, largeReplies.value)
+          : response,
+      ),
     );
   }) satisfies McpAuthMiddleware;
 }).pipe(Effect.withSpan("McpHttpServer.makeAuthMiddleware"));
@@ -841,7 +855,6 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
-    if (Option.isNone(analytics)) return yield* registration;
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
     const shellOf = (threadId: string) =>
@@ -895,6 +908,7 @@ const withToolAnalytics =
           result: McpSchema.CallToolResult | undefined,
           durationMs: number,
         ) {
+          if (Option.isNone(analytics)) return;
           // Client credentials (no calling thread) report an unknown caller.
           const invocation = Option.getOrUndefined(
             yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
@@ -949,6 +963,8 @@ const withToolAnalytics =
           handle:
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
+              const capture = yield* Effect.serviceOption(McpReplyCapture);
+              if (Option.isSome(capture)) capture.value.name = options.tool.name;
               const startedAt = yield* Clock.currentTimeMillis;
               return yield* options.handle(payload).pipe(
                 Effect.onExit((exit) => {
