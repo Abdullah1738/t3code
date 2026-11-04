@@ -32,6 +32,7 @@ import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 // ardud: the restart note checks OpenCode children before it says they were cancelled.
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
+import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -75,6 +76,10 @@ const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const refusedBeforePrompt = (error: unknown): boolean =>
   Predicate.isTagged(error, "ClaudeBackgroundWorkBlocksQueryReplacementError") ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
+
+const codexHistoryNotSent = (error: unknown): boolean =>
+  error instanceof CodexHistoryNotSentError ||
+  (Predicate.hasProperty(error, "cause") && codexHistoryNotSent(error.cause));
 
 export interface ProviderTurnStartServiceV2Shape {
   readonly start: (input: {
@@ -940,16 +945,19 @@ export const layer: Layer.Layer<
           let existingProviderThread = providerThread;
           if (seeded?.mode === "codex-inject" && seeded.injectedNativeId === undefined) {
             if (seeded.injectionPending === true) {
-              return yield* loadFromProvider(Effect.fail(
-                new ProviderAdapter.ProviderAdapterEnsureThreadError({
-                  driver: session.driver,
-                  threadId: projection.thread.id,
-                  cause: new ProviderAdapter.ProviderAdapterProtocolError({
+              return yield* loadFromProvider(
+                Effect.fail(
+                  new ProviderAdapter.ProviderAdapterEnsureThreadError({
                     driver: session.driver,
-                    detail: "Moved history delivery is uncertain; reconciliation is required before retrying",
+                    threadId: projection.thread.id,
+                    cause: new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: session.driver,
+                      detail:
+                        "Moved history delivery is uncertain; reconciliation is required before retrying",
+                    }),
                   }),
-                }),
-              ));
+                ),
+              );
             }
             existingProviderThread = {
               ...providerThread,
@@ -960,15 +968,17 @@ export const layer: Layer.Layer<
             };
             const claimed = yield* eventSink.writeIfProviderThreadUnchanged({
               expected: providerThread,
-              events: [{
-                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
-                type: "provider-thread.updated",
-                threadId: projection.thread.id,
-                driver: session.driver,
-                providerInstanceId: run.providerInstanceId,
-                occurredAt: yield* DateTime.now,
-                payload: existingProviderThread,
-              }],
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                  type: "provider-thread.updated",
+                  threadId: projection.thread.id,
+                  driver: session.driver,
+                  providerInstanceId: run.providerInstanceId,
+                  occurredAt: yield* DateTime.now,
+                  payload: existingProviderThread,
+                },
+              ],
             });
             if (!claimed.committed) {
               return yield* new ProviderTurnStartError({
@@ -976,22 +986,61 @@ export const layer: Layer.Layer<
                 cause: "The adopted provider thread changed before history delivery.",
               });
             }
-            if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
+            if (!(yield* isCurrentAttemptInStatus("starting"))) {
+              yield* eventSink.writeIfProviderThreadUnchanged({
+                expected: existingProviderThread,
+                events: [
+                  {
+                    id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                    type: "provider-thread.updated",
+                    threadId: projection.thread.id,
+                    driver: session.driver,
+                    providerInstanceId: run.providerInstanceId,
+                    occurredAt: yield* DateTime.now,
+                    payload: providerThread,
+                  },
+                ],
+              });
+              return undefined;
+            }
           }
           // Hand the run's provider thread to the adapter so it adopts this
           // row's identity when attaching native state. An adapter that mints
           // its own row instead leaves two live rows per app thread, and
           // `activeProviderThreadId` then flaps between them on every update.
-          return yield* loadFromProvider(
-            session.ensureThread({
-              threadId: projection.thread.id,
-              title: projection.thread.title,
-              modelSelection: run.modelSelection,
-              runtimePolicy: resolvedRuntimePolicy,
-              providerSessionId,
-              existingProviderThread,
-            }),
-          );
+          const loading = session.ensureThread({
+            threadId: projection.thread.id,
+            title: projection.thread.title,
+            modelSelection: run.modelSelection,
+            runtimePolicy: resolvedRuntimePolicy,
+            providerSessionId,
+            existingProviderThread,
+          });
+          const loaded = yield* Effect.result(loading);
+          if (loaded._tag === "Success") return loaded.success;
+          if (seeded?.mode === "codex-inject" && codexHistoryNotSent(loaded.failure)) {
+            const cleared = yield* eventSink.writeIfProviderThreadUnchanged({
+              expected: existingProviderThread,
+              events: [
+                {
+                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                  type: "provider-thread.updated",
+                  threadId: projection.thread.id,
+                  driver: session.driver,
+                  providerInstanceId: run.providerInstanceId,
+                  occurredAt: yield* DateTime.now,
+                  payload: providerThread,
+                },
+              ],
+            });
+            if (!cleared.committed) {
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Could not clear the staged history delivery claim.",
+              });
+            }
+          }
+          return yield* loadFromProvider(Effect.fail(loaded.failure));
         }
         const uncertainDelivery = projection.contextHandoffs.some(
           (handoff) =>

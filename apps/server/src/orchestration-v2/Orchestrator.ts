@@ -1589,6 +1589,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               (run) =>
                 isHandoffSourceRun(run) &&
                 run.ordinal > (targetLastCompletedRun?.ordinal ?? 0) &&
+                // ardud: adoption's snapshot covers source runs at its creation,
+                // even if the first target run is cancelled before native start.
+                (deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" ||
+                  run.ordinal >= (deliveryProviderThread.firstRunOrdinal ?? queuedRun.ordinal)) &&
                 run.ordinal <= latestHandoffRun.ordinal,
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
@@ -5586,8 +5590,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // ardud: a context reset's only context is its note, so no imported history either.
     const legacyImportItems =
       command.contextReset !== true &&
-      !(activeProviderThread?.nativeMetadata?.seededHistory?.mode === "codex-inject" &&
-        activeProviderThread.providerInstanceId === modelSelection.instanceId) &&
+      !(
+        activeProviderThread?.nativeMetadata?.seededHistory?.mode === "codex-inject" &&
+        activeProviderThread.providerInstanceId === modelSelection.instanceId
+      ) &&
       projection.thread.historyOrigin === "v1_import"
         ? yield* readHandoffItems(command.threadId, [null])
         : [];
@@ -11913,11 +11919,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // changed before its transaction. Destination identity is checked there too.
     const adoptionSequence =
       command.type === "thread.adopt-native-history"
-        ? yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(
-            Effect.mapError(
-              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-            ),
-          )
+        ? yield* eventSink
+            .latestSequence({ threadId: command.threadId })
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+              ),
+            )
         : undefined;
 
     const plan = yield* dispatchOnce(command).pipe(

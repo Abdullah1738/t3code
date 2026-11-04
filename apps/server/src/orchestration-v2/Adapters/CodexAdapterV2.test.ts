@@ -1,7 +1,11 @@
 import * as NodeOS from "node:os";
 
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
-import { codexHistoryItems, type StagedHistory } from "../../ardud/harness-migrate/StagedHistory.ts";
+import {
+  codexHistoryItems,
+  type StagedHistory,
+} from "../../ardud/harness-migrate/StagedHistory.ts";
+import { CodexHistoryNotSentError } from "../../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
 import {
   makeProviderTextDeltaCoalescer,
   type ProviderTextDeltaUpdate,
@@ -1839,17 +1843,18 @@ describe("CodexAdapterV2 session initialize", () => {
                 (client) =>
                   ({
                     ...client,
-                     request: (method, params) =>
-                       Effect.sync(() => {
-                         if (method === "initialize") initializeRequests++;
-                         requests.push({ method, params });
-                       }).pipe(Effect.andThen(client.request(method, params))),
-                     raw: {
-                       ...client.raw,
-                       request: (method, params) => Effect.sync(() => {
-                         requests.push({ method, params });
-                       }).pipe(Effect.andThen(client.raw.request(method, params))),
-                     },
+                    request: (method, params) =>
+                      Effect.sync(() => {
+                        if (method === "initialize") initializeRequests++;
+                        requests.push({ method, params });
+                      }).pipe(Effect.andThen(client.request(method, params))),
+                    raw: {
+                      ...client.raw,
+                      request: (method, params) =>
+                        Effect.sync(() => {
+                          requests.push({ method, params });
+                        }).pipe(Effect.andThen(client.raw.request(method, params))),
+                    },
                   }) satisfies CodexClient.CodexAppServerClient["Service"],
               ),
               Effect.mapError(
@@ -1890,122 +1895,184 @@ describe("CodexAdapterV2 session initialize", () => {
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
 
-  it.effect.each(["success", "invalid", "unsupported", "missing-path", "missing-file", "bad-json", "wrong-source", "wrong-digest"] as const)(
-    "delivers seeded history on first start (%s)",
-    (scenario) =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "codex-staged-" });
-        const path = `${directory}/history.json`;
-        const history: StagedHistory = {
-          version: 1,
-          sourceSessionId: "ses_source",
-          digest: "sha256:source",
-          turns: [
-            { role: "user", text: "earlier", label: "[user]", timestamp: "2026-01-01T00:00:00Z" },
-            { role: "assistant", text: "reply", label: "[assistant]", timestamp: "2026-01-01T00:00:01Z" },
-          ],
-        };
-        if (scenario !== "missing-file") {
-          yield* fs.writeFileString(path, scenario === "bad-json" ? "{" : JSON.stringify(history));
-        }
-        const nativeThreadId = `seeded-${scenario}`;
-        const preamble = replayPreamble(nativeThreadId);
-        const injectExpected = scenario === "success" || scenario === "invalid" || scenario === "unsupported";
-        const session = yield* openReplaySession(makeCodexReplayTranscript({
+  it.effect.each([
+    "success",
+    "invalid",
+    "unsupported",
+    "missing-path",
+    "missing-file",
+    "bad-json",
+    "wrong-source",
+    "wrong-digest",
+  ] as const)("delivers seeded history on first start (%s)", (scenario) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "codex-staged-" });
+      const path = `${directory}/history.json`;
+      const history: StagedHistory = {
+        version: 1,
+        sourceSessionId: "ses_source",
+        digest: "sha256:source",
+        turns: [
+          { role: "user", text: "earlier", label: "[user]", timestamp: "2026-01-01T00:00:00Z" },
+          {
+            role: "assistant",
+            text: "reply",
+            label: "[assistant]",
+            timestamp: "2026-01-01T00:00:01Z",
+          },
+        ],
+      };
+      if (scenario !== "missing-file") {
+        yield* fs.writeFileString(path, scenario === "bad-json" ? "{" : JSON.stringify(history));
+      }
+      const nativeThreadId = `seeded-${scenario}`;
+      const preamble = replayPreamble(nativeThreadId);
+      const injectExpected =
+        scenario === "success" || scenario === "invalid" || scenario === "unsupported";
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
           scenario: `seeded-${scenario}`,
           entries: [
             ...preamble.slice(0, 5),
-            ...(injectExpected ? [
-              {
-                type: "expect_outbound" as const,
-                label: "inject",
-                frame: { id: 3, method: "thread/inject_items", params: { threadId: nativeThreadId, items: codexHistoryItems(history) } },
-              },
-              {
-                type: "emit_inbound" as const,
-                label: "inject-result",
-                frame: scenario === "success"
-                  ? { id: 3, result: {} }
-                  : { id: 3, error: { code: scenario === "unsupported" ? -32601 : -32602, message: "Injection rejected" } },
-              },
-            ] : []),
+            ...(injectExpected
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "inject",
+                    frame: {
+                      id: 3,
+                      method: "thread/inject_items",
+                      params: { threadId: nativeThreadId, items: codexHistoryItems(history) },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "inject-result",
+                    frame:
+                      scenario === "success"
+                        ? { id: 3, result: {} }
+                        : {
+                            id: 3,
+                            error: {
+                              code: scenario === "unsupported" ? -32601 : -32602,
+                              message: "Injection rejected",
+                            },
+                          },
+                  },
+                ]
+              : []),
           ],
-        }));
-        const threadId = ThreadId.make(`thread-seeded-${scenario}`);
-        const now = yield* DateTime.now;
-        const existing: OrchestrationV2ProviderThread = {
-          id: ProviderThreadId.make(`adopted-${scenario}`),
-          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
-          providerInstanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
-          providerSessionId: null,
-          appThreadId: threadId,
-          ownerNodeId: NodeId.make("owner"),
-          nativeThreadRef: null,
-          nativeConversationHeadRef: null,
-          status: "not_loaded",
-          firstRunOrdinal: null,
-          lastRunOrdinal: null,
-          handoffIds: [],
-          forkedFrom: null,
-          createdAt: now,
-          updatedAt: now,
-          nativeMetadata: {
-            title: "Original title",
-            seededHistory: {
-              source: "opencode",
-              sourceSessionId: scenario === "wrong-source" ? "ses_other" : history.sourceSessionId,
-              digest: scenario === "wrong-digest" ? "sha256:other" : history.digest,
-              mode: "codex-inject",
-              ...(scenario === "missing-path" ? {} : { stagedPath: path }),
-              injectionPending: true,
-            },
+        }),
+      );
+      const threadId = ThreadId.make(`thread-seeded-${scenario}`);
+      const now = yield* DateTime.now;
+      const existing: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make(`adopted-${scenario}`),
+        driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+        providerInstanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: NodeId.make("owner"),
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "not_loaded",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        nativeMetadata: {
+          title: "Original title",
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: scenario === "wrong-source" ? "ses_other" : history.sourceSessionId,
+            digest: scenario === "wrong-digest" ? "sha256:other" : history.digest,
+            mode: "codex-inject",
+            ...(scenario === "missing-path" ? {} : { stagedPath: path }),
+            injectionPending: true,
           },
-        };
-        const result = yield* session.ensureThread(threadId, existing).pipe(Effect.result);
-        assert.deepEqual(session.requests.map((request) => request.method), [
-          "initialize", "thread/start", ...(injectExpected ? ["thread/inject_items"] : []),
-        ]);
+        },
+      };
+      const result = yield* session.ensureThread(threadId, existing).pipe(Effect.result);
+      assert.deepEqual(
+        session.requests.map((request) => request.method),
+        ["initialize", "thread/start", ...(injectExpected ? ["thread/inject_items"] : [])],
+      );
+      if (scenario === "success") {
+        assert.equal(result._tag, "Success");
+        if (result._tag !== "Success") return;
+        assert.equal(result.success.id, existing.id);
+        assert.equal(result.success.ownerNodeId, existing.ownerNodeId);
+        assert.equal(result.success.createdAt, existing.createdAt);
+        assert.equal(result.success.nativeThreadRef?.nativeId, nativeThreadId);
+        assert.equal(result.success.nativeMetadata?.title, "Original title");
+        assert.deepEqual(result.success.nativeMetadata?.seededHistory, {
+          source: "opencode",
+          sourceSessionId: history.sourceSessionId,
+          digest: history.digest,
+          mode: "codex-inject",
+          stagedPath: path,
+          injectedNativeId: nativeThreadId,
+        });
         if (scenario === "success") {
-          assert.equal(result._tag, "Success");
-          if (result._tag !== "Success") return;
-          assert.equal(result.success.id, existing.id);
-          assert.equal(result.success.ownerNodeId, existing.ownerNodeId);
-          assert.equal(result.success.createdAt, existing.createdAt);
-          assert.equal(result.success.nativeThreadRef?.nativeId, nativeThreadId);
-          assert.equal(result.success.nativeMetadata?.title, "Original title");
-          assert.deepEqual(result.success.nativeMetadata?.seededHistory, {
-            source: "opencode", sourceSessionId: history.sourceSessionId, digest: history.digest,
-            mode: "codex-inject", stagedPath: path, injectedNativeId: nativeThreadId,
+          assert.deepEqual(session.requests.at(-1)?.params, {
+            threadId: nativeThreadId,
+            items: codexHistoryItems(history),
           });
-          if (scenario === "success") {
-            assert.deepEqual(session.requests.at(-1)?.params, { threadId: nativeThreadId, items: codexHistoryItems(history) });
-          }
-        } else {
-          assert.equal(result._tag, "Failure");
-          if (result._tag !== "Failure") return;
-          assert.equal(result.failure._tag, "ProviderAdapterEnsureThreadError");
-          assert.propertyVal(result.failure.cause, "_tag", "ProviderAdapterProtocolError");
-          assert.propertyVal(result.failure.cause, "detail", "Moved history could not be delivered.");
         }
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer)),
+      } else {
+        assert.equal(result._tag, "Failure");
+        if (result._tag !== "Failure") return;
+        assert.equal(result.failure._tag, "ProviderAdapterEnsureThreadError");
+        assert.propertyVal(result.failure.cause, "_tag", "ProviderAdapterProtocolError");
+        assert.propertyVal(result.failure.cause, "detail", "Moved history could not be delivered.");
+          if (Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(result.failure.cause)) {
+          assert.equal(
+            result.failure.cause.cause instanceof CodexHistoryNotSentError,
+            !injectExpected,
+          );
+        }
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
+    ),
   );
 
   it.effect("resumes an already injected row without starting or injecting again", () =>
     Effect.gen(function* () {
       const nativeThreadId = "already-injected";
       const preamble = replayPreamble(nativeThreadId);
-      const session = yield* openReplaySession(makeCodexReplayTranscript({
-        scenario: "resume-seeded",
-        entries: [
-          ...preamble.slice(0, 3),
-          { type: "expect_outbound", label: "resume", frame: { id: 2, method: "thread/resume", params: { threadId: nativeThreadId, excludeTurns: true, config: CodexAdapterV2.CODEX_THREAD_CONFIG } } },
-          { type: "emit_inbound", label: "resume", frame: { id: 2, result: { thread: { id: nativeThreadId, updatedAt: 1782622450 } } } },
-        ],
-      }));
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
+          scenario: "resume-seeded",
+          entries: [
+            ...preamble.slice(0, 3),
+            {
+              type: "expect_outbound",
+              label: "resume",
+              frame: {
+                id: 2,
+                method: "thread/resume",
+                params: {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "resume",
+              frame: { id: 2, result: { thread: { id: nativeThreadId, updatedAt: 1782622450 } } },
+            },
+          ],
+        }),
+      );
       const threadId = ThreadId.make("thread-already-injected");
       const now = yield* DateTime.now;
       const existing: OrchestrationV2ProviderThread = {
@@ -2015,20 +2082,48 @@ describe("CodexAdapterV2 session initialize", () => {
         providerSessionId: null,
         appThreadId: threadId,
         ownerNodeId: null,
-        nativeThreadRef: { driver: CodexAdapterV2.CODEX_DRIVER_KIND, nativeId: nativeThreadId, strength: "strong" },
+        nativeThreadRef: {
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeId: nativeThreadId,
+          strength: "strong",
+        },
         nativeConversationHeadRef: null,
-        status: "idle", firstRunOrdinal: null, lastRunOrdinal: null, handoffIds: [], forkedFrom: null,
-        createdAt: now, updatedAt: now,
-        nativeMetadata: { seededHistory: { source: "opencode", sourceSessionId: "ses_source", digest: "digest", mode: "codex-inject", stagedPath: "/not/read", injectedNativeId: nativeThreadId } },
+        status: "idle",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_source",
+            digest: "digest",
+            mode: "codex-inject",
+            stagedPath: "/not/read",
+            injectedNativeId: nativeThreadId,
+          },
+        },
       };
-      const refused = yield* session.ensureThread(threadId, { ...existing, nativeThreadRef: null }).pipe(Effect.result);
+      const refused = yield* session
+        .ensureThread(threadId, { ...existing, nativeThreadRef: null })
+        .pipe(Effect.result);
       assert.equal(refused._tag, "Failure");
       assert.deepEqual(session.requests, []);
       const resumed = yield* session.runtime.resumeThread({ providerThread: existing, threadId });
       assert.equal(resumed.id, existing.id);
       assert.deepEqual(resumed.nativeMetadata, existing.nativeMetadata);
-      assert.deepEqual(session.requests.map(({ method }) => method), ["initialize", "thread/resume"]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer))),
+      assert.deepEqual(
+        session.requests.map(({ method }) => method),
+        ["initialize", "thread/resume"],
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
@@ -2496,7 +2591,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               frame: {
                 id: 3,
                 method: "thread/resume",
-                params: { threadId: nativeThreadId, excludeTurns: true, config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+                params: {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                },
               },
             },
             {
