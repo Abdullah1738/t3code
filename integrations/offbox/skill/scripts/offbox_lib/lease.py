@@ -17,6 +17,7 @@ from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
+RESUME_STUCK_S = 90
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
@@ -430,8 +431,9 @@ _FOLLOW_STOP_S = 160
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
-              since: float | None = None, stale_error: str | None = None) -> dict:
-    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error)
+              since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
+    options = {"on_state": on_state} if on_state is not None else {}
+    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
     ssh_sync.setup(box_id)
     ssh_sync.wait_ssh(box_id)
     if recipe:
@@ -559,7 +561,11 @@ def _bigger(a: str | None, b: str | None) -> bool:
 
 
 class ArchivingSkip(OffboxError):
-    """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
+    """A box that cannot be resumed yet is skipped by pool callers like a busy box."""
+
+
+class _ResumeExpired(Exception):
+    """The stopped box's data expired while a resume was being requested."""
 
 
 def _forget_expired(con, box_id: str, why: str) -> None:
@@ -708,31 +714,62 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
-        try:
-            api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
-        except api.ApiError as e:
-            if e.api_code in api.DATA_GONE:
-                _forget_expired(con, box_id, str(e))
-                return None
-            # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
-            if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
-                    or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
-                tb = _too_big(con, box_id, e)
-                if tb:
-                    raise tb from e
-                raise
-            if capacity.supply_until(s.get("type")):
-                raise api.SupplyOut(s.get("type"), box_id, str(e), tried=True) from e
-            say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
-            want = s.get("type")
+        def request_resume():
+            nonlocal want
             try:
-                api.resume(box_id, RUN_TTL_S, None)
-            except api.ApiError as e2:
-                tb = _too_big(con, box_id, e2)
-                if tb:
-                    raise tb from e2
-                raise
-        up = _bring_up(box_id, since=t, stale_error=s.get("error"))
+                api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
+            except api.ApiError as e:
+                if e.api_code in api.DATA_GONE:
+                    _forget_expired(con, box_id, str(e))
+                    raise _ResumeExpired from e
+                # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
+                if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
+                        or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
+                    tb = _too_big(con, box_id, e)
+                    if tb:
+                        raise tb from e
+                    raise
+                if capacity.supply_until(s.get("type")):
+                    raise api.SupplyOut(s.get("type"), box_id, str(e), tried=True) from e
+                say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
+                want = s.get("type")
+                try:
+                    api.resume(box_id, RUN_TTL_S, None)
+                except api.ApiError as e2:
+                    tb = _too_big(con, box_id, e2)
+                    if tb:
+                        raise tb from e2
+                    raise
+
+        try:
+            request_resume()
+            sent_at = now()
+            resent = False
+            left_stopped = False
+
+            def check_resume(state):
+                nonlocal sent_at, resent, left_stopped
+                if state.get("state") not in api.STOPPED_STATES:
+                    left_stopped = True
+                if left_stopped or now() - sent_at < RESUME_STUCK_S:
+                    return
+                if not resent:
+                    request_resume()
+                    sent_at = now()
+                    resent = True
+                    event(con, box_id, "resume_resent", f"still archived after {RESUME_STUCK_S}s")
+                    return
+                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+                con.commit()
+                event(con, box_id, "resume_stuck", f"still archived after two resumes, {RESUME_STUCK_S}s each")
+                message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
+                if skip_archiving:
+                    raise ArchivingSkip(message, code=EXIT_BUSY)
+                raise OffboxError(message)
+
+            up = _bring_up(box_id, since=t, stale_error=s.get("error"), on_state=check_resume)
+        except _ResumeExpired:
+            return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
         event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")
