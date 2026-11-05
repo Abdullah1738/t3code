@@ -415,7 +415,7 @@ export const make = Effect.gen(function* () {
   ) {
     if (events.length === 0) return events;
     const rows = yield* sql<{ readonly event_id: string }>`
-        SELECT event_id FROM orchestration_events
+        SELECT event_id FROM ardud_history_events
         WHERE application_event_version = 2
           AND aggregate_kind = 'thread'
           AND stream_id = ${threadId}

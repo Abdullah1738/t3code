@@ -230,7 +230,7 @@ const make = Effect.gen(function* () {
           THEN json_extract(t.payload_json, '$.modelSelection')
           ELSE (
             SELECT json_extract(event.payload_json, '$.modelSelection')
-            FROM orchestration_events AS event INDEXED BY idx_orchestration_events_agent_stream_sequence
+            FROM ardud_history_events AS event
             WHERE event.aggregate_kind = 'thread'
               AND event.application_event_version = 2
               AND event.stream_id = a.thread_id

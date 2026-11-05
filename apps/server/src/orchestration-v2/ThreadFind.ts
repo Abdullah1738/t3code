@@ -240,7 +240,7 @@ export const makeThreadFind = Effect.fn("makeThreadFind")(function* (
       SELECT item.thread_id, item.turn_item_id, item.payload_json,
         COALESCE(json_extract(item.payload_json, '$.messageId'), item.turn_item_id) AS entry_id,
         json_extract(item.payload_json, '$.type') AS item_type
-      FROM orchestration_v2_projection_turn_items AS item
+      FROM ardud_history_turn_items AS item
       JOIN json_each(${sources}) AS wanted
         ON item.thread_id = json_extract(wanted.value, '$.threadId')
           AND item.turn_item_id = json_extract(wanted.value, '$.id')
