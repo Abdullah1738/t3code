@@ -13,8 +13,9 @@ case "$name" in
   harness-homes) exec "${0:A:h}/harness-homes/install.zsh" "$@" ;;  # Robob's Claude/Codex homes, see harness-homes/README.md
   harness-cli) exec "${0:A:h}/harness-cli/install.zsh" "$@" ;;  # pinned Claude/Codex CLIs + daily job, see harness-cli/README.md
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
+  robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|harness-hooks> [--dry-run]"; exit 2 ;;
+  *) print -u2 "usage: deploy.zsh <agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks> [--dry-run]"; exit 2 ;;
 esac
 
 src="${0:A:h}/$name/"
