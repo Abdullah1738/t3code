@@ -1,14 +1,13 @@
 import { ThreadId, TurnItemId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { runMigrations } from "../persistence/Migrations.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpAppModelContext from "./McpAppModelContext.ts";
 
-const database = NodeSqliteClient.layer({ filename: ":memory:" });
+const database = SqlitePersistence.layerMemory;
 const layer = it.layer(
   Layer.merge(database, McpAppModelContext.layer.pipe(Layer.provide(database))),
 );
@@ -34,7 +33,6 @@ const insertAppItem = (itemId: string, runId: string, runStatus: string) =>
 layer("McpAppModelContext", (it) => {
   it.effect("sends only apps still in the thread's history, including a fork's", () =>
     Effect.gen(function* () {
-      yield* runMigrations();
       const store = yield* McpAppModelContext.McpAppModelContext;
       yield* insertAppItem("item-kept", "run-a", "completed");
       yield* insertAppItem("item-rolled-back", "run-bb", "rolled_back");

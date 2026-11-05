@@ -267,7 +267,7 @@ it.live.each([true, false])(
               Effect.as(statement),
             );
           }
-          if (!seenReplay && query.includes("FROM orchestration_events") && query.includes("payload_json")) {
+          if (!seenReplay && /FROM "?ardud_history_events"?/.test(query) && query.includes("payload_json")) {
             seenReplay = true;
             return Deferred.succeed(replayStarted, undefined).pipe(
               Effect.andThen(Deferred.await(allowReplay)),
@@ -1145,7 +1145,9 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           const blockRead: Statement.Transformer = (statement) => {
             const [query] = statement.compile();
             if (
-              query.includes("FROM orchestration_events") &&
+              (phase === "high-water"
+                ? query.includes("FROM orchestration_events")
+                : /FROM "?ardud_history_events"?/.test(query)) &&
               query.includes("MAX(sequence)") === (phase === "high-water")
             ) {
               return Deferred.succeed(readStarted, undefined).pipe(
@@ -2286,7 +2288,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       const pageLimits: Array<number> = [];
       const recordReads: Statement.Transformer = (statement) => {
         const [query, params] = statement.compile();
-        if (query.includes("FROM orchestration_events") && query.includes("command_id")) {
+        if (/FROM "?ardud_command_history_events"?/.test(query) && query.includes("command_id")) {
           const limit = params.at(-1);
           if (typeof limit === "number") {
             pageLimits.push(limit);
