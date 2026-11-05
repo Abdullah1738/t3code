@@ -76,7 +76,9 @@ const historicalModel = Schema.Struct({
   variant: Schema.optional(Schema.String),
 });
 const historicalSession = Schema.decodeUnknownEffect(
-  Schema.Struct({ data: Schema.Struct({ model: Schema.optional(Schema.NullOr(historicalModel)) }) }),
+  Schema.Struct({
+    data: Schema.Struct({ model: Schema.optional(Schema.NullOr(historicalModel)) }),
+  }),
 );
 const historicalMessages = Schema.decodeUnknownEffect(
   Schema.Struct({ data: Schema.Array(Schema.Struct({ model: Schema.optional(historicalModel) })) }),
@@ -405,7 +407,7 @@ export const make = Effect.gen(function* () {
     Effect.gen(function* () {
       if (events.length === 0) return events;
       const rows = yield* sql<{ readonly event_id: string }>`
-        SELECT event_id FROM orchestration_events
+        SELECT event_id FROM ardud_history_events
         WHERE application_event_version = 2
           AND aggregate_kind = 'thread'
           AND stream_id = ${threadId}

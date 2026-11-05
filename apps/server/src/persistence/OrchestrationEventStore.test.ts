@@ -35,6 +35,7 @@ import { PersistenceDecodeError } from "./Errors.ts";
 import { toShellApplicationEvent } from "../orchestration-v2/ShellStream.ts";
 import * as OrchestrationEventStore from "./OrchestrationEventStore.ts";
 import * as SqlitePersistence from "./Sqlite.ts";
+import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
 const isPersistenceDecodeError = Schema.is(PersistenceDecodeError);
 const isLiveStreamBufferError = Schema.is(LiveStreamBufferError);
 
@@ -221,6 +222,30 @@ layer("OrchestrationEventStore", (it) => {
         throughSequence: yield* store.latestApplicationSequence,
       });
       assert.isAbove(applicationStats.rawPayloadBytes, prompt.length * 6);
+      // Prompt anchors can be cold even while later referring rows remain hot.
+      const columns = liveColumns("orchestration_events");
+      yield* sql.unsafe(
+        `INSERT INTO ardud_archive.ardud_events (${columns})
+        SELECT ${columns} FROM orchestration_events WHERE stream_id = ? AND sequence < ?`,
+        [threadId, yield* store.latestApplicationSequence],
+      );
+      yield* sql`DELETE FROM orchestration_events WHERE stream_id = ${threadId}
+        AND sequence < ${yield* store.latestApplicationSequence}`;
+      assert.deepEqual(
+        (yield* store.readAgentEvents({ threadId, afterSequence }).pipe(Stream.runCollect)).map(
+          (entry) => entry.event,
+        ),
+        events,
+      );
+      assert.deepEqual(
+        yield* store.getAgentReplayStats({
+          threadId,
+          afterSequence,
+          throughSequence: yield* store.latestApplicationSequence,
+          maxEvents: events.length,
+        }),
+        stats,
+      );
     }),
   );
 
@@ -990,7 +1015,9 @@ it.effect.each(["high-water", "replay"] as const)(
         const blockRead: Statement.Transformer = (statement) => {
           const [query] = statement.compile();
           if (
-            query.includes("FROM orchestration_events") &&
+            /FROM (?:orchestration_events|"?ardud_(?:application_|command_)?history_events"?)/.test(
+              query,
+            ) &&
             query.includes("MAX(sequence)") === (phase === "high-water")
           ) {
             return Deferred.succeed(readStarted, undefined).pipe(

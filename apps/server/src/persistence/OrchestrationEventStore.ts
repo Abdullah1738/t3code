@@ -300,7 +300,7 @@ const makeEventStore = Effect.gen(function* () {
       json_remove(orchestration_events.payload_json, '$.promptSequence'),
       '$.prompt',
       (SELECT json_extract(anchor.payload_json, '$.prompt')
-       FROM orchestration_events AS anchor
+       FROM ardud_history_events AS anchor
        WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence'))
     )
     ELSE orchestration_events.payload_json
@@ -414,16 +414,13 @@ const makeEventStore = Effect.gen(function* () {
         application_event_version,
         causation_event_id,
         correlation_id
-      FROM orchestration_events
-      ${
-        // The sequence range otherwise wins and a command lookup scans every
-        // V2 event, which blocks the server for seconds on large histories.
+      FROM ${sql(
         input.commandId !== undefined
-          ? sql`INDEXED BY idx_orch_events_command_id`
+          ? "ardud_command_history_events"
           : input.onlyAgentEvents === true
-            ? sql``
-            : sql`INDEXED BY idx_orchestration_events_application_high_water`
-      }
+            ? "ardud_history_events"
+            : "ardud_application_history_events",
+      )} AS orchestration_events
       WHERE sequence > ${input.afterSequence}
         AND sequence <= ${input.throughSequence ?? Number.MAX_SAFE_INTEGER}
         AND (
@@ -464,7 +461,7 @@ const makeEventStore = Effect.gen(function* () {
           const storedPayload =
             hint !== undefined && subagent !== undefined
               ? sql`CASE WHEN EXISTS (
-                  SELECT 1 FROM orchestration_events
+                  SELECT 1 FROM ardud_history_events AS orchestration_events
                   WHERE sequence = ${hint}
                     AND json_type(payload_json, '$.promptSequence') IS NULL
                     AND json_extract(payload_json, '$.prompt') = ${subagent.prompt}
@@ -607,7 +604,7 @@ const makeEventStore = Effect.gen(function* () {
         COALESCE(MAX(event_type = 'thread.created'), 0) AS "hasCreateEvent"
       FROM (
         SELECT ${restoredPayloadJson} AS payload_json, event_type
-        FROM orchestration_events
+        FROM ardud_history_events AS orchestration_events
         WHERE aggregate_kind = 'thread'
           AND stream_id = ${input.threadId}
           AND application_event_version = 2
@@ -631,7 +628,7 @@ const makeEventStore = Effect.gen(function* () {
       SELECT
         COUNT(*) AS "eventCount",
         COALESCE(SUM(octet_length(${restoredPayloadJson})), 0) AS "rawPayloadBytes"
-      FROM orchestration_events INDEXED BY idx_orchestration_events_application_high_water
+      FROM ardud_application_history_events AS orchestration_events
       WHERE sequence > ${input.afterSequence}
         AND sequence <= ${input.throughSequence}
         AND (

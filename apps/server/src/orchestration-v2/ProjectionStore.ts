@@ -2835,6 +2835,63 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
       );
 
+    // Correlated predicates must reach each branch before SQLite can materialize
+    // the history union; otherwise a single run lookup scans the entire archive.
+    const lookupHistoryTurnItems = (where: Statement.Fragment, orderBy: Statement.Fragment) => sql`
+      SELECT * FROM (
+      SELECT item.rowid AS item_rowid, item.turn_item_id, item.ordinal, item.type,
+        item.updated_at, item.payload_json
+      FROM main.orchestration_v2_projection_turn_items AS item
+      WHERE ${where}
+      ORDER BY ${orderBy} LIMIT 1
+      )
+      UNION ALL
+      SELECT * FROM (
+      SELECT item.ardud_locator AS item_rowid, item.turn_item_id, item.ordinal, item.type,
+        item.updated_at, item.payload_json
+      FROM ardud_archive.ardud_turn_items AS item
+      WHERE ${where}
+        AND NOT EXISTS (
+          SELECT 1 FROM main.orchestration_v2_projection_turn_items AS hot
+          WHERE hot.turn_item_id = item.turn_item_id
+        )
+      ORDER BY ${orderBy} LIMIT 1
+      )
+      UNION ALL
+      SELECT * FROM (
+      SELECT -item.rowid AS item_rowid, item.turn_item_id, item.ordinal, item.type,
+        item.updated_at, item.payload_json
+      FROM ardud_base.orchestration_v2_projection_turn_items AS item
+      WHERE ${where}
+        AND NOT EXISTS (
+          SELECT 1 FROM main.orchestration_v2_projection_turn_items AS hot
+          WHERE hot.turn_item_id = item.turn_item_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM ardud_archive.ardud_turn_items AS delta
+          WHERE delta.turn_item_id = item.turn_item_id
+        )
+      ORDER BY ${orderBy} LIMIT 1
+      )
+    `;
+
+    const latestFailurePayload = (
+      threadId: Statement.Fragment,
+      runId: Statement.Fragment,
+      rootNodeId: Statement.Fragment,
+    ) => sql`
+      SELECT error.payload_json FROM (
+        ${lookupHistoryTurnItems(
+          sql`item.thread_id = ${threadId} AND item.run_id = ${runId}
+            AND item.node_id IS ${rootNodeId}
+            AND item.type = 'error' AND item.status = 'failed'`,
+          sql`item.updated_at DESC, item.ordinal DESC, item.turn_item_id DESC`,
+        )}
+      ) AS error
+      ORDER BY error.updated_at DESC, error.ordinal DESC, error.turn_item_id DESC
+      LIMIT 1
+    `;
+
     // Share selection so counting discarded ancestry preserves payload-read positions.
     const retainedWindowRows = (
       threadId: ThreadId,
@@ -2845,17 +2902,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         readonly requiredRunId?: RunId | undefined;
       },
     ) => sql`
-                WITH eligible AS NOT MATERIALIZED (
+                WITH thread_items AS NOT MATERIALIZED (
+                  SELECT * FROM ardud_history_turn_items WHERE thread_id = ${threadId}
+                ), eligible AS NOT MATERIALIZED (
                   SELECT item.rowid AS item_rowid, item.payload_json, item.ordinal, item.turn_item_id,
                     item.run_id, item.node_id, item.type
-                  FROM orchestration_v2_projection_turn_items AS item
+                  FROM thread_items AS item
                   LEFT JOIN orchestration_v2_projection_runs AS run
                     ON run.run_id = item.run_id
                   WHERE item.thread_id = ${threadId}
                     AND item.ordinal <= COALESCE(
                       (
                         SELECT ordinal
-                        FROM orchestration_v2_projection_turn_items
+                        FROM thread_items
                         WHERE thread_id = ${threadId}
                           AND turn_item_id = ${window.anchorItemId ?? null}
                         LIMIT 1
@@ -2903,7 +2962,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       )
                       AND NOT EXISTS (
                         SELECT 1
-                        FROM orchestration_v2_projection_turn_items AS request
+                        FROM thread_items AS request
                         WHERE request.thread_id = item.thread_id
                           AND request.run_id = item.run_id
                           AND request.type = 'run_interrupt_request'
@@ -2921,10 +2980,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   SELECT start.ordinal, start.type
                   FROM orchestration_v2_projection_runs AS recent_run
                   CROSS JOIN eligible AS start ON start.item_rowid = (
-                    SELECT first_input.rowid
-                    FROM orchestration_v2_projection_turn_items AS first_input
-                    WHERE first_input.run_id = recent_run.run_id
-                      AND first_input.type IN ('user_message', 'notification')
+                    SELECT first_input.item_rowid FROM (
+                      ${lookupHistoryTurnItems(
+                        sql`item.run_id = recent_run.run_id
+                          AND item.type IN ('user_message', 'notification')`,
+                        sql`item.ordinal`,
+                      )}
+                    ) AS first_input
                     ORDER BY first_input.ordinal
                     LIMIT 1
                   )
@@ -2932,7 +2994,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     AND recent_run.ordinal <= COALESCE(
                       (
                         SELECT anchor_run.ordinal
-                        FROM orchestration_v2_projection_turn_items AS anchor_item
+                        FROM thread_items AS anchor_item
                         JOIN orchestration_v2_projection_runs AS anchor_run
                           ON anchor_run.run_id = anchor_item.run_id
                         WHERE anchor_item.thread_id = ${threadId}
@@ -2998,7 +3060,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   SELECT item_rowid, ordinal, turn_item_id FROM selected
                   UNION
                   SELECT request.rowid AS item_rowid, request.ordinal, request.turn_item_id
-                  FROM orchestration_v2_projection_turn_items AS request
+                  FROM thread_items AS request
                   WHERE request.run_id IN (
                       SELECT run_id FROM selected
                       WHERE type = 'run_interrupt_result' AND run_id IS NOT NULL
@@ -3008,7 +3070,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   SELECT latest.item_rowid, latest.ordinal, latest.turn_item_id
                   FROM (
                     SELECT rowid AS item_rowid, ordinal, turn_item_id
-                    FROM orchestration_v2_projection_turn_items
+                    FROM thread_items
                     WHERE thread_id = ${threadId}
                       AND ${window.anchorItemId ?? null} IS NULL
                       AND ${window.requiredRunId ?? null} IS NULL
@@ -3051,7 +3113,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? yield* sql<PayloadRow>`
                 SELECT payload_json
-                FROM orchestration_v2_projection_turn_items
+                FROM ardud_history_turn_items
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
@@ -3061,13 +3123,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               `
               : yield* sql<PayloadRow>`
                 ${retainedWindowRows(threadId, window)}
-                -- CROSS JOIN keeps the sorted IDs as the outer loop, so SQLite
-                -- skips sorting again once the payloads are attached. Carry the
-                -- rowid through selection to avoid a second string-key index lookup.
-                SELECT item.payload_json
+                -- Fetch each retained body by its branch-local locator instead
+                -- of materializing the history union to join on its rowid.
+                SELECT CASE WHEN retained.item_rowid > 0 THEN (
+                  SELECT item.payload_json FROM main.orchestration_v2_projection_turn_items AS item
+                  WHERE item.rowid = retained.item_rowid
+                ) WHEN retained.item_rowid > -1000000000000 THEN (
+                  SELECT item.payload_json FROM ardud_base.orchestration_v2_projection_turn_items AS item
+                  WHERE item.rowid = -retained.item_rowid
+                ) ELSE (
+                  SELECT item.payload_json FROM ardud_archive.ardud_turn_items AS item
+                  WHERE item.ardud_locator = retained.item_rowid
+                ) END AS payload_json
                 FROM retained
-                CROSS JOIN orchestration_v2_projection_turn_items AS item
-                  ON item.rowid = retained.item_rowid
                 ORDER BY retained.ordinal ASC, retained.turn_item_id ASC
               `;
         // Reuse the decoded items for cohort IDs and the resulting projection.
@@ -3481,7 +3549,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         if (fields !== undefined && fields.includes("messages") && messages.length > 1) {
           const rows = yield* sql<{ message_id: string; ordinal: number }>`
             SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
-            FROM orchestration_v2_projection_turn_items
+            FROM ardud_history_turn_items
             WHERE thread_id = ${threadId} AND type IN ('user_message', 'assistant_message')
             GROUP BY json_extract(payload_json, '$.messageId')
           `;
@@ -3598,7 +3666,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ), fork_boundary AS (
                     SELECT (
                       SELECT item.ordinal
-                      FROM orchestration_v2_projection_turn_items AS item
+                      FROM ardud_history_turn_items AS item
                       WHERE item.run_id = run.run_id
                       ORDER BY item.ordinal DESC
                       LIMIT 1
@@ -3608,7 +3676,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       AND run.ordinal <= (SELECT ordinal FROM fork_run)
                       AND EXISTS (
                         SELECT 1
-                        FROM orchestration_v2_projection_turn_items AS item
+                        FROM ardud_history_turn_items AS item
                         WHERE item.run_id = run.run_id
                         LIMIT 1
                       )
@@ -3619,7 +3687,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       (SELECT ordinal FROM fork_boundary),
                       (
                         SELECT ordinal
-                        FROM orchestration_v2_projection_turn_items
+                        FROM ardud_history_turn_items
                         WHERE thread_id = ${forkedFrom.threadId}
                           AND run_id IS NULL
                           AND json_extract(payload_json, '$.historyOrigin') = 'v1_import'
@@ -3630,7 +3698,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     ) AS ordinal
                   )
                   SELECT turn_item_id
-                  FROM orchestration_v2_projection_turn_items
+                  FROM ardud_history_turn_items
                   WHERE thread_id = ${forkedFrom.threadId}
                     AND ordinal <= COALESCE(
                       (SELECT ordinal FROM effective_boundary),
@@ -3639,7 +3707,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     AND (
                       ${anchorBelongsToSource ? 1 : 0} = 0
                       OR ordinal <= COALESCE(
-                        (SELECT ordinal FROM orchestration_v2_projection_turn_items
+                        (SELECT ordinal FROM ardud_history_turn_items
                          WHERE thread_id = ${forkedFrom.threadId}
                            AND turn_item_id = ${historyAnchor?.itemId ?? null}
                          LIMIT 1),
@@ -3740,8 +3808,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           readonly failure_payload_json: string;
           readonly last_error: string | null;
         }>`
-          SELECT t.payload_json, r.run_id, r.completed_at,
-            item.payload_json AS failure_payload_json,
+          WITH failures AS MATERIALIZED (
+          SELECT t.thread_id, t.payload_json, r.run_id, r.completed_at,
+            (${latestFailurePayload(
+              sql`t.thread_id`,
+              sql`r.run_id`,
+              sql`json_extract(r.payload_json, '$.rootNodeId')`,
+            )}) AS failure_payload_json,
             (
               SELECT json_extract(session.payload_json, '$.lastError')
               -- Keep bindings outermost: one provider instance can hold every session.
@@ -3767,55 +3840,50 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               latest.ordinal DESC, latest.run_id DESC
             LIMIT 1
           ) AND r.status = 'failed'
-          INNER JOIN orchestration_v2_projection_turn_items item ON item.turn_item_id = (
-            SELECT error.turn_item_id FROM orchestration_v2_projection_turn_items error
-            WHERE error.thread_id = t.thread_id AND error.run_id = r.run_id
-              AND error.type = 'error' AND error.status = 'failed'
-              AND error.node_id IS json_extract(r.payload_json, '$.rootNodeId')
-            ORDER BY error.updated_at DESC, error.ordinal DESC, error.turn_item_id DESC
-            LIMIT 1
-          )
           WHERE t.deleted_at IS NULL
             -- The sweep runs every scheduler tick. Without this list the latest-run
             -- lookup above sorts every run of every thread, tens of milliseconds
             -- for one long thread; only threads with a usage-limit failure qualify.
             AND t.thread_id IN (
-              SELECT failure.thread_id FROM orchestration_v2_projection_turn_items failure
+              SELECT failure.thread_id FROM ardud_history_turn_items failure
               WHERE failure.type = 'error' AND failure.status = 'failed'
                 AND json_extract(failure.payload_json, '$.failure.class') = 'usage_limit'
             )
             AND json_extract(t.payload_json, '$.archivedAt') IS NULL
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
-            AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
-            AND json_extract(item.payload_json, '$.failure.resetAt') IS NOT NULL
-            AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
-            AND (
-              (
-                json_extract(t.payload_json, '$.limitRecovery.runId') IS r.run_id
-                AND json_extract(t.payload_json, '$.limitRecovery.resetAt') IS json_extract(item.payload_json, '$.failure.resetAt')
-                AND json_extract(t.payload_json, '$.limitRecovery.autoResume') = 1
-                AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) <= julianday(${DateTime.formatIso(options.now)})
-                AND (
-                  json_extract(t.payload_json, '$.snoozedUntil') IS NULL
-                  OR julianday(json_extract(t.payload_json, '$.snoozedUntil')) <= julianday(${DateTime.formatIso(options.now)})
-                )
-              )
-              OR (
-                (
-                  json_extract(t.payload_json, '$.limitRecovery.runId') IS NOT r.run_id
-                  OR json_extract(t.payload_json, '$.limitRecovery.resetAt') IS NOT json_extract(item.payload_json, '$.failure.resetAt')
-                )
-                AND (
-                  ${booleanInt(options.autoResume)}
-                  OR (${booleanInt(options.snooze)} AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(${DateTime.formatIso(options.now)}))
-                )
-              )
-            )
             AND NOT EXISTS (
               SELECT 1 FROM orchestration_v2_projection_runtime_requests request
               WHERE request.thread_id = t.thread_id AND request.status = 'pending'
             )
-          ORDER BY t.thread_id
+          )
+          SELECT payload_json, run_id, completed_at, failure_payload_json, last_error
+          FROM failures
+          WHERE json_extract(failure_payload_json, '$.failure.class') = 'usage_limit'
+            AND json_extract(failure_payload_json, '$.failure.resetAt') IS NOT NULL
+            AND julianday(json_extract(failure_payload_json, '$.failure.resetAt')) > julianday(COALESCE(completed_at, json_extract(payload_json, '$.updatedAt')))
+            AND (
+              (
+                json_extract(payload_json, '$.limitRecovery.runId') IS run_id
+                AND json_extract(payload_json, '$.limitRecovery.resetAt') IS json_extract(failure_payload_json, '$.failure.resetAt')
+                AND json_extract(payload_json, '$.limitRecovery.autoResume') = 1
+                AND julianday(json_extract(failure_payload_json, '$.failure.resetAt')) <= julianday(${DateTime.formatIso(options.now)})
+                AND (
+                  json_extract(payload_json, '$.snoozedUntil') IS NULL
+                  OR julianday(json_extract(payload_json, '$.snoozedUntil')) <= julianday(${DateTime.formatIso(options.now)})
+                )
+              )
+              OR (
+                (
+                  json_extract(payload_json, '$.limitRecovery.runId') IS NOT run_id
+                  OR json_extract(payload_json, '$.limitRecovery.resetAt') IS NOT json_extract(failure_payload_json, '$.failure.resetAt')
+                )
+                AND (
+                  ${booleanInt(options.autoResume)}
+                  OR (${booleanInt(options.snooze)} AND julianday(json_extract(failure_payload_json, '$.failure.resetAt')) > julianday(${DateTime.formatIso(options.now)}))
+                )
+              )
+            )
+          ORDER BY thread_id
         `;
         const candidates: Array<ProjectionLimitRecoveryCandidate> = [];
         for (const row of rows) {
@@ -4081,7 +4149,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ];
         const pageSize = 500;
         for (const table of tables) {
-          let afterRowId = 0;
+          const tableName =
+            table.name === "turn_items"
+              ? "ardud_history_turn_items"
+              : `orchestration_v2_projection_${table.name}`;
+          let afterRowId = table.name === "turn_items" ? Number.MIN_SAFE_INTEGER : 0;
           while (true) {
             const rows = yield* sql<{
               readonly row_id: number;
@@ -4094,7 +4166,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ${sql(table.name === "context_transfers" ? "source_thread_id" : "thread_id")} AS thread_id,
                 ${table.name === "context_transfers" ? sql`target_thread_id` : sql`NULL`} AS target_thread_id,
                 payload_json
-              FROM ${sql(`orchestration_v2_projection_${table.name}`)}
+              FROM ${sql(tableName)}
               WHERE rowid > ${afterRowId}
               ORDER BY rowid ASC LIMIT ${pageSize}
             `;
@@ -4198,7 +4270,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               WHERE source_thread_id = ${threadId} OR target_thread_id = ${threadId} ORDER BY rowid ASC
             `.pipe(Effect.flatMap(decodeRows(decodeContextTransferPayload, threadId)));
             const turnItems = yield* sql<PayloadRow>`
-              SELECT payload_json FROM orchestration_v2_projection_turn_items
+              SELECT payload_json FROM ardud_history_turn_items
               WHERE thread_id = ${threadId} AND run_id = ${runId} ORDER BY ordinal ASC, turn_item_id ASC
             `.pipe(Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)));
             const providerSessions = yield* sql<PayloadRow>`
@@ -4255,7 +4327,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     )(
       function* (threadId, runIds) {
         const rows = yield* sql<PayloadRow>`
-          SELECT payload_json FROM orchestration_v2_projection_turn_items
+          SELECT payload_json FROM ardud_history_turn_items
           WHERE thread_id = ${threadId}
             AND type IN ('user_message','assistant_message','command_execution','error',
               'run_interrupt_result','file_change','proposed_plan')
@@ -4677,10 +4749,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         function* (threadId, requestId, resultId) {
           const rows = yield* sql<{ pending: number }>`
         SELECT EXISTS (
-          SELECT 1 FROM orchestration_v2_projection_turn_items
+          SELECT 1 FROM ardud_history_turn_items
           WHERE thread_id = ${threadId} AND turn_item_id = ${requestId}
         ) AND NOT EXISTS (
-          SELECT 1 FROM orchestration_v2_projection_turn_items
+          SELECT 1 FROM ardud_history_turn_items
           WHERE thread_id = ${threadId} AND turn_item_id = ${resultId}
         ) AS pending
       `;
@@ -4867,7 +4939,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_nodes
           WHERE thread_id = ${threadId} AND node_id = ${request.nodeId}`;
             const itemRows =
-              yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_turn_items
+              yield* sql<PayloadRow>`SELECT payload_json FROM ardud_history_turn_items
           WHERE thread_id = ${threadId} AND node_id = ${request.nodeId} AND type IN ('approval_request', 'user_input_request')
             AND json_extract(payload_json, '$.requestId') = ${requestId}
           ORDER BY ordinal ASC LIMIT 1`;
@@ -5159,14 +5231,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       );
     const getNextTurnItemOrdinal: ProjectionStoreV2Shape["getNextTurnItemOrdinal"] = (threadId) =>
       sql<{ ordinal: number | null }>`SELECT MAX(ordinal) AS ordinal
-        FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}`.pipe(
+        FROM ardud_history_turn_items WHERE thread_id = ${threadId}`.pipe(
         Effect.map((rows) => (rows[0]?.ordinal ?? 0) + 1),
         Effect.mapError(controlReadError(threadId)),
       );
 
     const getTurnItem: ProjectionStoreV2Shape["getTurnItem"] = ({ threadId, itemId }) =>
       sql<{ payload_json: string }>`SELECT payload_json
-        FROM orchestration_v2_projection_turn_items
+        FROM ardud_history_turn_items
         WHERE turn_item_id = ${itemId} AND thread_id = ${threadId}`.pipe(
         Effect.flatMap((rows) =>
           rows[0] === undefined
@@ -5188,7 +5260,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         // live in the attachment store too.
         sql<{ type: string; payload_json: string }>`
       SELECT type, payload_json
-      FROM orchestration_v2_projection_turn_items
+      FROM ardud_history_turn_items
       WHERE thread_id = ${threadId}
         AND (type = 'html_render' OR (type = 'dynamic_tool'
           AND (payload_json LIKE '%htmlRender%' OR payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`})))
@@ -5312,7 +5384,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.createdBy') END AS created_by,
           CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.creationSource') END AS creation_source,
           CASE WHEN type IN ('user_message', 'assistant_message') THEN json_extract(payload_json, '$.messageId') END AS message_id
-        FROM orchestration_v2_projection_turn_items WHERE thread_id = ${threadId}
+        FROM ardud_history_turn_items WHERE thread_id = ${threadId}
         ORDER BY ordinal ASC, turn_item_id ASC`;
         const items: Array<TimelineIndexItem> = rows.map((row) => ({
           id: TurnItemId.make(row.turn_item_id),
@@ -5452,7 +5524,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               payload_json: string;
             }>`
           SELECT item.thread_id, item.turn_item_id, item.payload_json
-          FROM orchestration_v2_projection_turn_items item JOIN json_each(${sources}) wanted
+          FROM ardud_history_turn_items item JOIN json_each(${sources}) wanted
           ON item.thread_id = json_extract(wanted.value, '$.threadId')
             AND item.turn_item_id = json_extract(wanted.value, '$.id')`;
             const byIdentity = new Map(
@@ -5531,7 +5603,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     item: row.synthetic,
                   };
                 const payloads =
-                  yield* sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_turn_items
+                  yield* sql<PayloadRow>`SELECT payload_json FROM ardud_history_turn_items
           WHERE thread_id = ${row.sourceThreadId} AND turn_item_id = ${row.sourceItemId}`;
                 const decoded = yield* decodeRows(
                   decodeTurnItemPayload,
@@ -5583,7 +5655,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       options.anchorThreadId ??
                       (yield* sql<{ readonly thread_id: string }>`
                         SELECT thread_id
-                        FROM orchestration_v2_projection_turn_items
+                        FROM ardud_history_turn_items
                         WHERE turn_item_id = ${options.anchorItemId}
                         LIMIT 1
                       `).map((row) => ThreadId.make(row.thread_id))[0] ??
@@ -5677,30 +5749,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 LIMIT 1
               ) AS last_error,
               (
-                SELECT item.payload_json
-                FROM orchestration_v2_projection_turn_items item
-                INNER JOIN orchestration_v2_projection_runs r ON r.run_id = item.run_id
-                WHERE r.run_id = presented.run_id
-                  AND r.status = 'failed'
-                  AND item.thread_id = t.thread_id
-                  AND item.type = 'error' AND item.status = 'failed'
-                  AND item.node_id IS json_extract(r.payload_json, '$.rootNodeId')
-                ORDER BY item.updated_at DESC, item.ordinal DESC, item.turn_item_id DESC
-                LIMIT 1
+                SELECT (${latestFailurePayload(
+                  sql`t.thread_id`,
+                  sql`presented.run_id`,
+                  sql`json_extract(presented.payload_json, '$.rootNodeId')`,
+                )}) WHERE presented.status = 'failed'
               ) AS terminal_failure_payload_json,
               blocked.run_id AS blocking_run_id,
               blocked.requested_at AS blocking_run_requested_at,
               json_extract(blocked.payload_json, '$.startedAt') AS blocking_run_started_at,
               blocked.completed_at AS blocking_run_completed_at,
               (
-                SELECT item.payload_json
-                FROM orchestration_v2_projection_turn_items item
-                WHERE item.thread_id = t.thread_id
-                  AND item.run_id = blocked.run_id
-                  AND item.type = 'error' AND item.status = 'failed'
-                  AND item.node_id IS json_extract(blocked.payload_json, '$.rootNodeId')
-                ORDER BY item.updated_at DESC, item.ordinal DESC, item.turn_item_id DESC
-                LIMIT 1
+                ${latestFailurePayload(
+                  sql`t.thread_id`,
+                  sql`blocked.run_id`,
+                  sql`json_extract(blocked.payload_json, '$.rootNodeId')`,
+                )}
               ) AS blocking_failure_payload_json,
               (
                 SELECT request.payload_json
@@ -5753,7 +5817,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT COALESCE(SUM(per_run.item_count), 0)
                 FROM (
                   SELECT i.run_id, COUNT(*) AS item_count
-                  FROM orchestration_v2_projection_turn_items i
+                  FROM ardud_history_turn_items i
                   WHERE i.thread_id = t.thread_id
                   GROUP BY i.run_id
                 ) per_run
@@ -5763,7 +5827,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ) AS item_count,
               (
                 SELECT COUNT(*)
-                FROM orchestration_v2_projection_turn_items i
+                FROM ardud_history_turn_items i
                 WHERE i.thread_id = t.thread_id
                   AND i.run_id IS NULL
               ) AS runless_item_count
@@ -5838,13 +5902,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadIds === undefined
         ? sql<ShellRunItemCountRow>`
             SELECT thread_id, run_id, COUNT(*) AS item_count
-            FROM orchestration_v2_projection_turn_items
+            FROM ardud_history_turn_items
             WHERE run_id IS NOT NULL
             GROUP BY thread_id, run_id
           `
         : sql<ShellRunItemCountRow>`
             SELECT thread_id, run_id, COUNT(*) AS item_count
-            FROM orchestration_v2_projection_turn_items
+            FROM ardud_history_turn_items
             WHERE run_id IS NOT NULL
               AND thread_id IN ${sql.in(threadIds)}
             GROUP BY thread_id, run_id

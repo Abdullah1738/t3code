@@ -72,7 +72,7 @@ export const layer = Layer.effect(
       return yield* sql<McpAppModelContextEntry>`
         SELECT context.item_id AS "itemId", context.server, context.tool, context.text
         FROM mcp_app_model_context AS context
-        JOIN orchestration_v2_projection_turn_items AS item
+        JOIN ardud_history_turn_items AS item
           ON item.turn_item_id = context.item_id
         LEFT JOIN orchestration_v2_projection_runs AS run
           ON run.run_id = item.run_id
