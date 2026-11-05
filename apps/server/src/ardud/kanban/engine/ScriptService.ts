@@ -253,15 +253,25 @@ const make = Effect.gen(function* () {
     command: Scripts.PoolCommand,
   ) {
     const pools = yield* io(store.pools(script.boardId));
+    const exact = pools.filter((entry) => entry.key === command.model);
+    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
+    const keyedPool = exact[0];
     const apply = yield* routingEnabled;
-    const selected = modelSelectionResult(command, apply);
+    // A stored pool key names its captured selection, not an OpenCode model id.
+    const selected = modelSelectionResult(
+      keyedPool === undefined
+        ? command
+        : {
+            ...command,
+            model: keyedPool.model.model,
+            instanceId: command.instanceId ?? keyedPool.model.instanceId,
+          },
+      apply,
+    );
     if (selected.kind === "conflict") {
       return `Couldn't resize the ${command.model} pool: ${selected.reason}`;
     }
-    const exact = pools.filter((entry) => entry.key === command.model);
-    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
     const namedLevel = selectionEffort(selected.selection);
-    const keyedPool = exact[0];
     if (
       keyedPool &&
       ((command.instanceId !== undefined && command.instanceId !== keyedPool.model.instanceId) ||

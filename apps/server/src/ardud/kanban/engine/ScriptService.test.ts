@@ -535,6 +535,9 @@ it.effect("a legacy script resolves only when enabled and exact pool keys stay u
           `echo '{"kanban":"pool","instanceId":"opencode","model":"opus/claude-opus-5-5#high","slots":2}'`,
           `echo '{"kanban":"pool","instanceId":"opencode","model":"opus/claude-opus-5-5#high","variant":"xhigh","slots":3}'`,
           `echo '{"kanban":"pool","model":"claudeAgent/claude-opus-5-5#high","slots":4}'`,
+          `echo '{"kanban":"pool","model":"claudeAgent/claude-opus-5-5#high","variant":"xhigh","slots":5}'`,
+          `echo '{"kanban":"pool","model":"claudeAgent/claude-opus-5-5#high","instanceId":"codex","slots":6}'`,
+          `echo '{"kanban":"pool","model":"claudeAgent/claude-unknown#high","slots":7}'`,
           "",
         ].join("\n"),
       ),
@@ -545,6 +548,8 @@ it.effect("a legacy script resolves only when enabled and exact pool keys stay u
     assert.include(done?.output, "pool to 2 slots");
     assert.include(done?.output, "conflicting efforts");
     assert.include(done?.output, "pool to 4 slots");
+    assert.include(done?.output, "conflicts with its instance or effort");
+    assert.include(done?.output, "No verified native harness mapping");
     const pool = (yield* kanban.snapshot(board.id)).pools.find(
       (entry) => entry.key === Rules.poolKey(native),
     );
