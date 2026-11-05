@@ -5,10 +5,12 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
+export { assertReplicaFresh, assertThreadInReplica } from './readonly-db.mjs';
 
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
-  db: process.env.STREAM_RECOVERY_DB || join(HOME, ".robob/userdata/statev2.sqlite"),
+  db: replicaPath(),
   ocPassword: join(HOME, ".config/opencode-service/password"),
   dataDir: process.env.STREAM_RECOVERY_DATA || join(HOME, ".local/share/stream-recovery/data"),
   bun: join(HOME, ".bun/bin/bun"),
@@ -27,7 +29,17 @@ const parse = (text) => {
 // ---------- Robob state DB (read-only, indexed lookups only) ----------
 
 export function openDb(path = PATHS.db) {
-  return new DatabaseSync(path, { readOnly: true });
+  const safePath = assertReplicaPath(path);
+  const db = new DatabaseSync(safePath, { readOnly: true });
+  try {
+    // Pin readiness and all dependent rows to one complete export.
+    db.exec('BEGIN');
+    registerReplica(db, safePath);
+    return guardReplica(db);
+  } catch (e) {
+    db.close();
+    throw e;
+  }
 }
 
 export function failedRunsSince(db, sinceIso) {
@@ -469,8 +481,8 @@ export async function threadByNative(ses) {
   }
 }
 
-export async function interruptThread(threadId, { clientRequestId, reason } = {}) {
-  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason });
+export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
 }
 
 // Live top-level threads (running, waiting, queued, needs-input).

@@ -179,7 +179,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       await ocStop(stall);
     } else {
       try {
-        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}` });
+        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           stall.runId = res.runId ?? stall.runId;
@@ -259,7 +259,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         continue;
       }
       try {
-        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}` });
+        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           // Track the run we verified, not whatever run the server reports back.

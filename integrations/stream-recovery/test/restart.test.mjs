@@ -154,6 +154,8 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
   const calls = { send: [], telegram: [], commands: [], saves: [] };
   const io = {
     OC_URL: 'http://oc',
+    assertReplicaFresh: () => {},
+    assertThreadInReplica: () => {},
     serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
     restartRunsSince: () => runs,
@@ -488,6 +490,33 @@ test('restartScan sends one note per affected thread and one summary, then never
   await restartScan(scanArgs(state, { now: T0 + 11 * 60_000 }), io);
   assert.equal(calls.send.length, 3);
   assert.equal(calls.telegram.length, 1);
+});
+
+test('an unavailable or expired replica never causes recovery or consumes retries', async () => {
+  const fake = fakeIo({ subs: restartBurst(), threads });
+  const state = { handled: {}, servers: [] };
+  const unavailable = () => { throw Object.assign(new Error('replica stale'), { code: 'REPLICA_UNAVAILABLE' }); };
+  fake.io.assertReplicaFresh = unavailable;
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  assert.deepEqual(state.handled, {});
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+
+  let checks = 0;
+  fake.io.assertReplicaFresh = () => { if (++checks > 1) unavailable(); };
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /replica stale/);
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+  assert.equal(Object.values(state.handled).some((h) => h.done), false);
+});
+
+test('a newer control thread defers recovery without sending or consuming failure retries', async () => {
+  const fake = fakeIo({ subs: restartBurst(), threads });
+  fake.io.assertThreadInReplica = () => {
+    throw Object.assign(new Error('thread newer than replica'), { code: 'REPLICA_UNAVAILABLE' });
+  };
+  const state = { handled: {}, servers: [] };
+  await assert.rejects(restartScan(scanArgs(state), fake.io), /thread newer than replica/);
+  assert.equal(fake.calls.send.length + fake.calls.commands.length, 0);
+  assert.equal(Object.values(state.handled).some((entry) => entry.done || entry.failures), false);
 });
 
 test('restartScan waits only briefly to settle, never for the installer, and never acts on a dry run or seed', async () => {

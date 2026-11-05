@@ -110,6 +110,7 @@ test('happy path: waits out the 15 min, interrupts once through Robob, sends one
   await stallScan({ state, now: scan2, log }, fake.io);
   assert.equal(fake.calls.interruptThread.length, 1);
   assert.equal(fake.calls.interruptThread[0].clientRequestId, STALL_ID);
+  assert.equal(fake.calls.interruptThread[0].expectedRunId, 'run:8');
   const stall = state.stalls[STALL_ID];
   assert.equal(stall.kind, 'ghost');
   assert.equal(stall.action, 'robob');

@@ -13,6 +13,7 @@ it.live("opens the install-time split with the real server SQL layer and reads c
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    yield* fs.makeDirectory(path.resolve(".t3"), { recursive: true });
     const directory = yield* fs.makeTempDirectoryScoped({
       directory: path.resolve(".t3"),
       prefix: "split-server-open-",
