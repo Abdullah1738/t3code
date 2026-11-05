@@ -11,6 +11,12 @@ import {
 } from "@t3tools/shared/orchestrationV2ThreadError";
 import { threadPullRequestsOf } from "@t3tools/shared/threadPullRequests";
 import {
+  compactTranscriptItems,
+  recentTranscriptEnabled,
+  recentTranscriptRunIds,
+  TRANSCRIPT_ITEM_LIMIT,
+} from "../ardud/harness-migrate/recentTranscript.ts";
+import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
   threadPullRequestKeysEqual,
@@ -1046,6 +1052,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       );
 
+  const readSwitchTranscript = Effect.fn("Orchestrator.readSwitchTranscript")(function* (
+    threadId: ThreadId,
+    targetInstanceId: string,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+    runIds?: ReadonlyArray<RunId | null>,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+    const promptOnly = recentTranscriptEnabled(settings, targetInstanceId);
+    if (!promptOnly) return { items: yield* readHandoffItems(threadId, runIds), promptOnly };
+    const records = yield* projectionStore
+      .getThreadRecords(threadId, ["turnItems"], {
+        turnItemRunIds: recentTranscriptRunIds(
+          runs,
+          runIds,
+          settings.ardudHarnessMigration?.transcript?.lastTurns,
+        ),
+        turnItemTypes: ["user_message", "assistant_message"],
+        recentTurnItemLimit: TRANSCRIPT_ITEM_LIMIT,
+      })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+    return { items: compactTranscriptItems(records.turnItems), promptOnly };
+  });
+
   const getProjectionWithPendingEvents =
     /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
     Effect.fnUntraced(function* (
@@ -1598,12 +1627,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 run.ordinal <= latestHandoffRun.ordinal,
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
-      const legacyImportItems =
+      const legacyTranscript =
         !freshContext &&
         deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" &&
         projection.thread.historyOrigin === "v1_import"
-          ? yield* readHandoffItems(threadId, [null])
-          : [];
+          ? yield* readSwitchTranscript(threadId, queuedRun.providerInstanceId, [], [null])
+          : { items: [], promptOnly: false };
+      const legacyImportItems = legacyTranscript.items;
       const handoffStrategy = needsFullContext
         ? ("full_thread_summary" as const)
         : ("delta_since_target_last_seen" as const);
@@ -1635,6 +1665,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           strategy: needsFullContext ? "full_thread_summary" : "delta_context",
         });
       }
+      const switchTranscript =
+        transferId === null
+          ? null
+          : yield* readSwitchTranscript(threadId, queuedRun.providerInstanceId, projection.runs, [
+              ...(needsFullContext &&
+              latestCompletedRun !== undefined &&
+              deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" &&
+              projection.thread.historyOrigin === "v1_import"
+                ? [null]
+                : []),
+              ...coveredRuns.map((run) => run.id),
+            ]);
       const handoff =
         transferId === null || latestHandoffRun === undefined
           ? null
@@ -1659,15 +1701,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 },
                 runs: projection.runs,
                 strategy: handoffStrategy,
-                items: [
-                  ...(needsFullContext && latestCompletedRun !== undefined
-                    ? legacyImportItems
-                    : []),
-                  ...(yield* readHandoffItems(
-                    threadId,
-                    coveredRuns.map((run) => run.id),
-                  )),
-                ],
+                promptOnly: switchTranscript!.promptOnly,
+                items: switchTranscript!.items,
                 createdAt: now,
               })
               .pipe(
@@ -1689,6 +1724,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 toProviderThreadId: queuedProviderThread.id,
                 toProviderInstanceId: queuedRun.providerInstanceId,
                 items: legacyImportItems,
+                promptOnly: legacyTranscript.promptOnly,
                 createdAt: now,
               })
               .pipe(
@@ -4492,6 +4528,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           type: "provider_handoff",
         }),
       );
+      const switchTranscript = yield* readSwitchTranscript(
+        input.command.threadId,
+        input.modelSelection.instanceId,
+        input.projection.runs.filter((run) => run.ordinal <= targetRun.ordinal),
+      );
       restartHandoff = yield* contextHandoffService
         .prepareProviderHandoff({
           threadId: input.command.threadId,
@@ -4503,7 +4544,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           toProviderInstanceId: input.modelSelection.instanceId,
           coveredRunOrdinals: { from: 1, to: targetRun.ordinal },
           strategy: "full_thread_summary",
-          items: yield* readHandoffItems(input.command.threadId),
+          items: switchTranscript.items,
+          promptOnly: switchTranscript.promptOnly,
           runs: input.projection.runs,
           createdAt: now,
         })
@@ -5607,15 +5649,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const latestCompletedRun = projection.runs.findLast((run) => run.status === "completed");
     const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
     // ardud: a context reset's only context is its note, so no imported history either.
-    const legacyImportItems =
+    const legacyTranscript =
       command.contextReset !== true &&
       !(
         activeProviderThread?.nativeMetadata?.seededHistory?.mode === "codex-inject" &&
         activeProviderThread.providerInstanceId === modelSelection.instanceId
       ) &&
       projection.thread.historyOrigin === "v1_import"
-        ? yield* readHandoffItems(command.threadId, [null])
-        : [];
+        ? yield* readSwitchTranscript(command.threadId, modelSelection.instanceId, [], [null])
+        : { items: [], promptOnly: false };
+    const legacyImportItems = legacyTranscript.items;
     const isProviderSwitch =
       activeProviderThread !== undefined &&
       activeProviderThread.providerInstanceId !== modelSelection.instanceId;
@@ -5685,6 +5728,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               toProviderThreadId: providerThreadId,
               toProviderInstanceId: modelSelection.instanceId,
               items: legacyImportItems,
+              promptOnly: legacyTranscript.promptOnly,
               createdAt: now,
             })
             .pipe(mapDispatchError(command))
@@ -6225,19 +6269,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 (requiresFullProviderSwitchContext ? 0 : (targetLastCompletedRun?.ordinal ?? 0)) &&
               run.ordinal <= latestHandoffRun.ordinal,
           );
-    const providerSwitchItems =
+    const switchTranscript =
       providerSwitchCoveredRuns.length === 0
-        ? []
-        : [
-            ...(latestCompletedRun !== undefined &&
-            (targetProviderThread === undefined || requiresFullProviderSwitchContext)
-              ? legacyImportItems
-              : []),
-            ...(yield* readHandoffItems(
-              command.threadId,
-              providerSwitchCoveredRuns.map((run) => run.id),
-            )),
-          ];
+        ? null
+        : yield* readSwitchTranscript(
+            command.threadId,
+            modelSelection.instanceId,
+            projection.runs,
+            [
+              ...(latestCompletedRun !== undefined &&
+              projection.thread.historyOrigin === "v1_import" &&
+              (targetProviderThread === undefined || requiresFullProviderSwitchContext)
+                ? [null]
+                : []),
+              ...providerSwitchCoveredRuns.map((run) => run.id),
+            ],
+          );
+    const providerSwitchItems = switchTranscript?.items ?? [];
     const providerSwitchTransferId =
       providerSwitchCoveredRuns.length === 0 || latestHandoffRun === undefined
         ? null
@@ -6289,6 +6337,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   ? "full_thread_summary"
                   : "delta_since_target_last_seen",
               items: providerSwitchItems,
+              promptOnly: switchTranscript!.promptOnly,
               runs: projection.runs,
               createdAt: now,
             })
@@ -6315,6 +6364,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               toProviderThreadId: ensuredProviderThread.id,
               toProviderInstanceId: modelSelection.instanceId,
               items: legacyImportItems,
+              promptOnly: legacyTranscript.promptOnly,
               createdAt: now,
             })
             .pipe(mapDispatchError(command))

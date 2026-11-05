@@ -777,6 +777,7 @@ const migrationMessage = (
 // actual flag, receipt store, resolver and management dispatch remain real.
 const migrationHarness = (input: {
   readonly mode?: "off" | "dryrun" | "apply";
+  readonly threadIds?: ReadonlyArray<ThreadId>;
   readonly allowConflicts?: boolean;
   readonly stored?: ModelSelection;
   readonly targetEnabled?: boolean;
@@ -784,6 +785,8 @@ const migrationHarness = (input: {
   readonly runs?: ReadonlyArray<{ readonly status: OrchestrationV2Run["status"] }>;
   readonly failSelection?: boolean;
   readonly failMessageOnce?: boolean;
+  readonly pendingRequest?: boolean;
+  readonly backgroundTask?: boolean;
 }) => {
   const calls: Array<OrchestrationV2ServerCommand> = [];
   let stored = input.stored ?? legacySelection;
@@ -804,8 +807,19 @@ const migrationHarness = (input: {
                   lineage: { relationshipToParent: "root" },
                   creationSource: "web",
                   modelSelection: stored,
+                  activeProviderThreadId: input.backgroundTask ? "active" : null,
                 },
                 runs: input.runs ?? [],
+                runtimeRequests: input.pendingRequest ? [{ status: "pending" }] : [],
+                providerThreads: input.backgroundTask
+                  ? [
+                      {
+                        id: "active",
+                        pendingBackgroundTasks: [{ taskId: "task:live", kind: "subagent" }],
+                      },
+                    ]
+                  : [],
+                subagents: [],
               }) as unknown as OrchestrationV2ThreadProjection,
           ),
         dispatch: (command) =>
@@ -838,11 +852,12 @@ const migrationHarness = (input: {
     ),
     Layer.provide(
       ServerSettings.layerTest({
-        ...(input.mode === undefined
+        ...(input.mode === undefined && input.threadIds === undefined
           ? {}
           : {
               ardudHarnessMigration: {
-                selections: input.mode,
+                ...(input.mode === undefined ? {} : { selections: input.mode }),
+                ...(input.threadIds === undefined ? {} : { threadIds: input.threadIds }),
                 ...(input.allowConflicts === undefined
                   ? {}
                   : { allowConflicts: input.allowConflicts }),
@@ -879,6 +894,24 @@ it.effect("migrates a dormant stored selection once before multiple inherited se
     expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
     expect(harness.calls[1]).not.toHaveProperty("modelSelection");
     expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("routes only allowlisted threads while global selection routing stays off", () => {
+  const harness = migrationHarness({ mode: "off", threadIds: [migrationThreadId] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("allowlisted"));
+    expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("does not route a different thread on the allowlist", () => {
+  const harness = migrationHarness({ threadIds: [ThreadId.make("thread:someone-else")] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("not-allowlisted"));
+    expect(harness.getStored()).toEqual(legacySelection);
   }).pipe(Effect.provide(harness.layerTest));
 });
 
@@ -1053,6 +1086,20 @@ it.effect.each(["running", "queued"] as const)(
         cause: expect.stringContaining("active or queued"),
       });
       expect(harness.calls).toEqual([]);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect.each(["pendingRequest", "backgroundTask"] as const)(
+  "does not detach a provider with $0",
+  (blocker) => {
+    const harness = migrationHarness({ threadIds: [migrationThreadId], [blocker]: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(threads.dispatch(migrationMessage(blocker)));
+      expect(error).toMatchObject({ _tag: "OrchestratorCommandRejectedError" });
+      expect(harness.calls).toEqual([]);
+      expect(harness.getStored()).toEqual(legacySelection);
     }).pipe(Effect.provide(harness.layerTest));
   },
 );

@@ -47,6 +47,7 @@ import {
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
+import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -785,7 +786,13 @@ const make = Effect.gen(function* () {
       resolvedStored.kind !== "conflict" &&
       !modelSelectionsEqual(stored, resolvedStored.selection)
     ) {
-      const { thread, runs } = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
+      const quiet = yield* orchestrator.getThreadRecords(command.threadId, [
+        "runs",
+        "runtimeRequests",
+        "providerThreads",
+        "subagents",
+      ]);
+      const { thread, runs } = quiet;
       if (isProviderNativeSubagentThread(thread)) {
         return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
           commandId: command.commandId,
@@ -804,12 +811,15 @@ const make = Effect.gen(function* () {
       if (
         thread.deletedAt !== null ||
         thread.archivedAt !== null ||
-        runs.some((run) => isActiveRun(run) || run.status === "queued")
+        runs.some((run) => isActiveRun(run) || run.status === "queued") ||
+        quiet.runtimeRequests.some((request) => request.status === "pending") ||
+        runningBackgroundWork(quiet).length > 0
       ) {
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "Cannot migrate an archived or deleted thread, or one with active or queued runs.",
+          cause:
+            "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
         });
       }
       yield* orchestrator.dispatch({
@@ -841,7 +851,10 @@ const make = Effect.gen(function* () {
     return serverSettings.getSettings.pipe(
       Effect.orDie,
       Effect.flatMap((settings) => {
-        if (settings.ardudHarnessMigration?.selections !== "apply") {
+        if (
+          settings.ardudHarnessMigration?.selections !== "apply" &&
+          !settings.ardudHarnessMigration?.threadIds?.includes(command.threadId)
+        ) {
           return dispatchUnchanged(command);
         }
         return selectionDispatchLock.withLock(

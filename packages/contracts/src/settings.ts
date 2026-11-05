@@ -1,4 +1,5 @@
 import { SshDeviceHostConfigs } from "./device.ts";
+import { HarnessSwitchTranscript, HarnessSwitchThreadIds } from "./ardud/harnessSwitch.ts";
 import {
   AuthOrchestrationOperateScope,
   AuthSettingsWriteScope,
@@ -1094,6 +1095,8 @@ export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 export const ArdudHarnessMigrationSettings = Schema.Struct({
   selections: Schema.optionalKey(Schema.Literals(["off", "dryrun", "apply"])),
   allowConflicts: Schema.optionalKey(Schema.Boolean),
+  transcript: Schema.optionalKey(HarnessSwitchTranscript),
+  threadIds: Schema.optionalKey(HarnessSwitchThreadIds),
 });
 export type ArdudHarnessMigrationSettings = typeof ArdudHarnessMigrationSettings.Type;
 
