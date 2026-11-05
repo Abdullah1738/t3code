@@ -136,7 +136,7 @@ def idle_for(con, box_id: str, size: str | None, snap: dict | None = None) -> in
 def cap_check() -> None:
     cap = read_json(CAP_PATH, {})
     if cap.get("capped"):
-        raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap $500). New leases are refused.",
+        raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap ${cap.get('cap', 500):.0f}). New leases are refused.",
                           code=EXIT_CAP)
 
 
