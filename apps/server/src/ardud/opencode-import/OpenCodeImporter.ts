@@ -44,6 +44,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { makeSubagentChildThread } from "@t3tools/provider-core/server/subagentProjection";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as OpenCodeHttp from "./OpenCodeHttp.ts";
 import {
   IMPORT_PREFIX,
@@ -76,7 +77,9 @@ const historicalModel = Schema.Struct({
   variant: Schema.optional(Schema.String),
 });
 const historicalSession = Schema.decodeUnknownEffect(
-  Schema.Struct({ data: Schema.Struct({ model: Schema.optional(Schema.NullOr(historicalModel)) }) }),
+  Schema.Struct({
+    data: Schema.Struct({ model: Schema.optional(Schema.NullOr(historicalModel)) }),
+  }),
 );
 const historicalMessages = Schema.decodeUnknownEffect(
   Schema.Struct({ data: Schema.Array(Schema.Struct({ model: Schema.optional(historicalModel) })) }),
@@ -142,26 +145,27 @@ interface ImportRow {
   readonly archived: number | null;
 }
 
-const ensureTables = (sql: SqlClient.SqlClient) =>
-  Effect.gen(function* () {
-    // Shared with the other fork workers; identical DDL (tmp/memory/shared-contracts.md).
-    yield* sql`
+const ensureTables = Effect.fn("OpenCodeImporter.ensureTables")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  // Shared with the other fork workers; identical DDL (tmp/memory/shared-contracts.md).
+  yield* sql`
       CREATE TABLE IF NOT EXISTS ardud_thread_origin (
         thread_id   TEXT PRIMARY KEY,
         origin      TEXT NOT NULL,
         created_at  TEXT NOT NULL
       )
     `;
-    yield* sql`
+  yield* sql`
       CREATE TABLE IF NOT EXISTS ardud_opencode_import (
         native_session_id TEXT PRIMARY KEY,
         thread_id         TEXT NOT NULL UNIQUE,
         imported_at       TEXT NOT NULL
       )
     `;
-    // Importer-only state: what a thread last mirrored, and how far its
-    // transcript was read.
-    yield* sql`
+  // Importer-only state: what a thread last mirrored, and how far its
+  // transcript was read.
+  yield* sql`
       CREATE TABLE IF NOT EXISTS ardud_opencode_import_state (
         native_session_id   TEXT PRIMARY KEY,
         thread_id           TEXT NOT NULL,
@@ -172,10 +176,11 @@ const ensureTables = (sql: SqlClient.SqlClient) =>
         transcript_at       TEXT
       )
     `;
-  });
+});
 
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   // Optional so the hook can sit under layers built before projects exist.
@@ -189,7 +194,7 @@ export const make = Effect.gen(function* () {
   // Thread id -> native session id, or null for threads this importer does not own.
   const sessionsByThread = new Map<ThreadId, string | null>();
 
-  yield* ensureTables(sql).pipe(
+  yield* BoardsDatabase.initialize(ensureTables(controlSql)).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("Could not create the OpenCode import tables", { cause }),
     ),
@@ -261,7 +266,7 @@ export const make = Effect.gen(function* () {
     (effect) => effect.pipe(Effect.timeout("60 seconds"), Effect.provide(FetchHttpClient.layer)),
   );
 
-  const readImportRows = sql<ImportRow>`
+  const readImportRows = controlSql<ImportRow>`
     SELECT
       mapping.native_session_id,
       mapping.thread_id,
@@ -283,54 +288,53 @@ export const make = Effect.gen(function* () {
   `;
 
   /** The T3 project for a project root: an existing one, else a new one. */
-  const projectFor = (
+  const projectFor = Effect.fn("OpenCodeImporter.projectFor")(function* (
     root: { readonly path: string; readonly title: string },
     cache: Map<string, ProjectId | null>,
     counters: { projectsCreated: number },
     dryRun: boolean,
-  ) =>
-    Effect.gen(function* () {
-      const cached = cache.get(root.path);
-      if (cached !== undefined) return cached;
-      if (Option.isNone(projectService)) {
-        return yield* new OpenCodeImportError({ operation: "projects are unavailable" });
-      }
-      const projects = projectService.value;
-      const existing = yield* projects.getByWorkspaceRoot(root.path).pipe(Effect.option);
-      if (Option.isSome(existing) && Option.isSome(existing.value)) {
-        cache.set(root.path, existing.value.value.id);
-        return existing.value.value.id;
-      }
-      if (dryRun) {
-        counters.projectsCreated += 1;
-        const placeholder = ProjectId.make(`${IMPORT_PREFIX}:dry-run:${root.path}`);
-        cache.set(root.path, placeholder);
-        return placeholder;
-      }
-      const created = yield* projects
-        .bootstrap({
-          commandId: CommandId.make(`${IMPORT_PREFIX}:project:${root.path}`),
-          projectId: ProjectId.make(`${IMPORT_PREFIX}:project:${root.path}`),
-          title: root.title,
-          workspaceRoot: root.path,
-        })
-        .pipe(
-          Effect.tapError((cause) =>
-            Effect.logWarning("Could not create a project for imported OpenCode sessions", {
-              root: root.path,
-              cause,
-            }),
-          ),
-          Effect.option,
-        );
-      if (Option.isNone(created)) {
-        cache.set(root.path, null);
-        return null;
-      }
-      if (created.value.created) counters.projectsCreated += 1;
-      cache.set(root.path, created.value.project.id);
-      return created.value.project.id;
-    });
+  ) {
+    const cached = cache.get(root.path);
+    if (cached !== undefined) return cached;
+    if (Option.isNone(projectService)) {
+      return yield* new OpenCodeImportError({ operation: "projects are unavailable" });
+    }
+    const projects = projectService.value;
+    const existing = yield* projects.getByWorkspaceRoot(root.path).pipe(Effect.option);
+    if (Option.isSome(existing) && Option.isSome(existing.value)) {
+      cache.set(root.path, existing.value.value.id);
+      return existing.value.value.id;
+    }
+    if (dryRun) {
+      counters.projectsCreated += 1;
+      const placeholder = ProjectId.make(`${IMPORT_PREFIX}:dry-run:${root.path}`);
+      cache.set(root.path, placeholder);
+      return placeholder;
+    }
+    const created = yield* projects
+      .bootstrap({
+        commandId: CommandId.make(`${IMPORT_PREFIX}:project:${root.path}`),
+        projectId: ProjectId.make(`${IMPORT_PREFIX}:project:${root.path}`),
+        title: root.title,
+        workspaceRoot: root.path,
+      })
+      .pipe(
+        Effect.tapError((cause) =>
+          Effect.logWarning("Could not create a project for imported OpenCode sessions", {
+            root: root.path,
+            cause,
+          }),
+        ),
+        Effect.option,
+      );
+    if (Option.isNone(created)) {
+      cache.set(root.path, null);
+      return null;
+    }
+    if (created.value.created) counters.projectsCreated += 1;
+    cache.set(root.path, created.value.project.id);
+    return created.value.project.id;
+  });
 
   const providerThreadFor = (input: {
     readonly sessionId: string;
@@ -360,60 +364,66 @@ export const make = Effect.gen(function* () {
     updatedAt: input.at,
   });
 
-  const recordMapping = (input: {
-    readonly sessionId: string;
-    readonly threadId: ThreadId;
-    readonly origin: string | null;
-    readonly sessionUpdatedMs: number | null;
-    readonly title: string | null;
-    readonly archived: number | null;
-  }) =>
-    Effect.gen(function* () {
-      const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
-        INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
-        VALUES (${input.sessionId}, ${input.threadId}, ${now})
-        ON CONFLICT(native_session_id) DO NOTHING
-      `;
-      yield* sql`
-        INSERT INTO ardud_opencode_import_state (
-          native_session_id, thread_id, session_updated_ms, title, archived
-        )
-        VALUES (
-          ${input.sessionId}, ${input.threadId}, ${input.sessionUpdatedMs},
-          ${input.title}, ${input.archived}
-        )
-        ON CONFLICT(native_session_id) DO UPDATE SET
-          session_updated_ms = excluded.session_updated_ms,
-          title = excluded.title,
-          archived = excluded.archived
-      `;
-      if (input.origin !== null) {
-        yield* sql`
-          INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
-          VALUES (${input.threadId}, ${input.origin}, ${now})
-          ON CONFLICT(thread_id) DO NOTHING
-        `;
-      }
+  const recordMapping = Effect.fn("OpenCodeImporter.recordMapping")(
+    function* (input: {
+      readonly sessionId: string;
+      readonly threadId: ThreadId;
+      readonly origin: string | null;
+      readonly sessionUpdatedMs: number | null;
+      readonly title: string | null;
+      readonly archived: number | null;
+    }) {
+      yield* controlSql.withTransaction(
+        Effect.gen(function* () {
+          const now = DateTime.formatIso(yield* DateTime.now);
+          yield* controlSql`
+            INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+            VALUES (${input.sessionId}, ${input.threadId}, ${now})
+            ON CONFLICT(native_session_id) DO NOTHING
+          `;
+          yield* controlSql`
+            INSERT INTO ardud_opencode_import_state (
+              native_session_id, thread_id, session_updated_ms, title, archived
+            )
+            VALUES (
+              ${input.sessionId}, ${input.threadId}, ${input.sessionUpdatedMs},
+              ${input.title}, ${input.archived}
+            )
+            ON CONFLICT(native_session_id) DO UPDATE SET
+              session_updated_ms = excluded.session_updated_ms,
+              title = excluded.title,
+              archived = excluded.archived
+          `;
+          if (input.origin !== null) {
+            yield* controlSql`
+              INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
+              VALUES (${input.threadId}, ${input.origin}, ${now})
+              ON CONFLICT(thread_id) DO NOTHING
+            `;
+          }
+        }),
+      );
       sessionsByThread.set(input.threadId, input.sessionId);
-    }).pipe(
-      Effect.mapError((cause) => new OpenCodeImportError({ operation: "record mapping", cause })),
-    );
+    },
+    Effect.mapError((cause) => new OpenCodeImportError({ operation: "record mapping", cause })),
+  );
 
   /** Drops events the store already has, so an interrupted write can be retried. */
-  const unwritten = (threadId: ThreadId, events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
-    Effect.gen(function* () {
-      if (events.length === 0) return events;
-      const rows = yield* sql<{ readonly event_id: string }>`
+  const unwritten = Effect.fn("OpenCodeImporter.unwritten")(function* (
+    threadId: ThreadId,
+    events: ReadonlyArray<OrchestrationV2DomainEvent>,
+  ) {
+    if (events.length === 0) return events;
+    const rows = yield* sql<{ readonly event_id: string }>`
         SELECT event_id FROM orchestration_events
         WHERE application_event_version = 2
           AND aggregate_kind = 'thread'
           AND stream_id = ${threadId}
           AND event_id LIKE ${`${IMPORT_PREFIX}:%`}
       `;
-      const existing = new Set(rows.map((row) => row.event_id));
-      return events.filter((event) => !existing.has(event.id));
-    });
+    const existing = new Set(rows.map((row) => row.event_id));
+    return events.filter((event) => !existing.has(event.id));
+  });
 
   const run: OpenCodeImporterShape["run"] = (options = {}) =>
     runLock
@@ -672,7 +682,7 @@ export const make = Effect.gen(function* () {
               pending.push({
                 threadId,
                 events,
-                after: sql`
+                after: controlSql`
                 UPDATE ardud_opencode_import_state
                 SET session_updated_ms = ${session.time.updated},
                     title = ${title},
@@ -709,178 +719,178 @@ export const make = Effect.gen(function* () {
         ),
       );
 
-  const lookupSession = (threadId: ThreadId) =>
-    Effect.gen(function* () {
-      const known = sessionsByThread.get(threadId);
-      if (known !== undefined) return known;
-      const rows = yield* sql<{ readonly native_session_id: string }>`
+  const lookupSession = Effect.fn("OpenCodeImporter.lookupSession")(function* (threadId: ThreadId) {
+    const known = sessionsByThread.get(threadId);
+    if (known !== undefined) return known;
+    const rows = yield* controlSql<{ readonly native_session_id: string }>`
         SELECT native_session_id FROM ardud_opencode_import WHERE thread_id = ${threadId} LIMIT 1
       `;
-      const sessionId = rows[0]?.native_session_id ?? null;
-      sessionsByThread.set(threadId, sessionId);
-      return sessionId;
-    });
+    const sessionId = rows[0]?.native_session_id ?? null;
+    sessionsByThread.set(threadId, sessionId);
+    return sessionId;
+  });
 
   /** Child threads for the subagent calls in a transcript, as read-only subagent threads. */
-  const childThreadEvents = (
+  const childThreadEvents = Effect.fn("OpenCodeImporter.childThreadEvents")(function* (
     parent: OrchestrationV2AppThread,
     calls: ReturnType<typeof subagentCalls>,
     conn: OpenCodeHttp.OpenCodeConnection,
-  ) =>
-    Effect.gen(function* () {
-      const events: Array<OrchestrationV2DomainEvent> = [];
-      const mappings: Array<Effect.Effect<void, OpenCodeImportError>> = [];
-      const origin = yield* sql<{ readonly origin: string }>`
+  ) {
+    const events: Array<OrchestrationV2DomainEvent> = [];
+    const mappings: Array<Effect.Effect<void, OpenCodeImportError>> = [];
+    const origin = yield* controlSql<{ readonly origin: string }>`
         SELECT origin FROM ardud_thread_origin WHERE thread_id = ${parent.id} LIMIT 1
       `.pipe(Effect.map((rows) => rows[0]?.origin ?? null));
-      for (const call of calls) {
-        if ((yield* lookupSession(call.childThreadId)) !== null) continue;
-        if (Option.isSome(yield* projectionStore.getThread(call.childThreadId).pipe(Effect.option)))
-          continue;
-        const providerThread = providerThreadFor({
+    for (const call of calls) {
+      if ((yield* lookupSession(call.childThreadId)) !== null) continue;
+      if (Option.isSome(yield* projectionStore.getThread(call.childThreadId).pipe(Effect.option)))
+        continue;
+      const providerThread = providerThreadFor({
+        sessionId: call.sessionId,
+        threadId: call.childThreadId,
+        ownerNodeId: null,
+        at: call.at,
+      });
+      const child: OrchestrationV2AppThread = {
+        ...makeSubagentChildThread({
+          parentThread: parent,
+          childThreadId: call.childThreadId,
+          parentNodeId: NodeId.make(`${IMPORT_PREFIX}:subagent:${call.sessionId}`),
+          activeProviderThreadId: providerThread.id,
+          providerInstanceId: OPENCODE_INSTANCE,
+          modelSelection: yield* childSelection(conn, call.sessionId),
+          title: call.title,
+          now: call.at,
+          createdBy: "agent",
+          creationSource: "provider",
+        }),
+        forkedFrom: null,
+        lastVisitedAt: call.at,
+      };
+      events.push(
+        {
+          id: EventId.make(`${IMPORT_PREFIX}:thread:${call.childThreadId}:created`),
+          type: "thread.created",
+          threadId: call.childThreadId,
+          providerInstanceId: OPENCODE_INSTANCE,
+          occurredAt: call.at,
+          payload: child,
+        },
+        {
+          id: EventId.make(`${IMPORT_PREFIX}:provider-thread:${call.childThreadId}`),
+          type: "provider-thread.updated",
+          threadId: call.childThreadId,
+          driver: OPENCODE_DRIVER,
+          providerInstanceId: OPENCODE_INSTANCE,
+          occurredAt: call.at,
+          payload: providerThread,
+        },
+      );
+      mappings.push(
+        recordMapping({
           sessionId: call.sessionId,
           threadId: call.childThreadId,
-          ownerNodeId: null,
-          at: call.at,
-        });
-        const child: OrchestrationV2AppThread = {
-          ...makeSubagentChildThread({
-            parentThread: parent,
-            childThreadId: call.childThreadId,
-            parentNodeId: NodeId.make(`${IMPORT_PREFIX}:subagent:${call.sessionId}`),
-            activeProviderThreadId: providerThread.id,
-            providerInstanceId: OPENCODE_INSTANCE,
-            modelSelection: yield* childSelection(conn, call.sessionId),
-            title: call.title,
-            now: call.at,
-            createdBy: "agent",
-            creationSource: "provider",
-          }),
-          forkedFrom: null,
-          lastVisitedAt: call.at,
-        };
-        events.push(
-          {
-            id: EventId.make(`${IMPORT_PREFIX}:thread:${call.childThreadId}:created`),
-            type: "thread.created",
-            threadId: call.childThreadId,
-            providerInstanceId: OPENCODE_INSTANCE,
-            occurredAt: call.at,
-            payload: child,
-          },
-          {
-            id: EventId.make(`${IMPORT_PREFIX}:provider-thread:${call.childThreadId}`),
-            type: "provider-thread.updated",
-            threadId: call.childThreadId,
-            driver: OPENCODE_DRIVER,
-            providerInstanceId: OPENCODE_INSTANCE,
-            occurredAt: call.at,
-            payload: providerThread,
-          },
-        );
-        mappings.push(
-          recordMapping({
-            sessionId: call.sessionId,
-            threadId: call.childThreadId,
-            origin,
-            sessionUpdatedMs: null,
-            title: null,
-            archived: null,
-          }),
-        );
-      }
-      return { events, mappings };
-    });
+          origin,
+          sessionUpdatedMs: null,
+          title: null,
+          archived: null,
+        }),
+      );
+    }
+    return { events, mappings };
+  });
 
   /**
    * Reads the session's newest messages into runless history. Later reads add
    * only messages that arrived after the last one read. Once T3 has run a turn
    * on the thread, the adapter records new messages itself.
    */
-  const hydrate = (threadId: ThreadId, sessionId: string) =>
-    Effect.gen(function* () {
-      const state = yield* sql<{ readonly transcript_head: string | null }>`
+  const hydrate = Effect.fn("OpenCodeImporter.hydrate")(function* (
+    threadId: ThreadId,
+    sessionId: string,
+  ) {
+    const state = yield* controlSql<{ readonly transcript_head: string | null }>`
         SELECT transcript_head FROM ardud_opencode_import_state
         WHERE native_session_id = ${sessionId} LIMIT 1
       `;
-      const head = state[0]?.transcript_head ?? null;
-      const runs = yield* sql<{ readonly count: number }>`
+    const head = state[0]?.transcript_head ?? null;
+    const runs = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
       `;
-      if (head !== null && (runs[0]?.count ?? 0) > 0) return;
-      const parent = yield* projectionStore.getThread(threadId);
-      const conn = yield* connection;
-      const { messages, truncated } = yield* OpenCodeHttp.listRecentMessages(conn, sessionId, {
-        limit: TRANSCRIPT_MESSAGE_LIMIT,
-        ...(head === null ? {} : { afterId: head }),
-      });
-      if (messages.length > 0) {
-        const lastOrdinal = yield* sql<{ readonly ordinal: number | null }>`
+    if (head !== null && (runs[0]?.count ?? 0) > 0) return;
+    const parent = yield* projectionStore.getThread(threadId);
+    const conn = yield* connection;
+    const { messages, truncated } = yield* OpenCodeHttp.listRecentMessages(conn, sessionId, {
+      limit: TRANSCRIPT_MESSAGE_LIMIT,
+      ...(head === null ? {} : { afterId: head }),
+    });
+    if (messages.length > 0) {
+      const lastOrdinal = yield* sql<{ readonly ordinal: number | null }>`
           SELECT MAX(ordinal) AS ordinal FROM orchestration_v2_turn_item_positions
           WHERE thread_id = ${threadId} AND ordinal < ${RUN_ORDINAL_FLOOR}
         `;
-        const firstOrdinal = Math.max(FIRST_HISTORY_ORDINAL, (lastOrdinal[0]?.ordinal ?? 0) + 1);
-        const context = {
-          threadId,
-          instanceId: OPENCODE_INSTANCE,
-          childThreadId: (childSessionId: string) =>
-            idAllocator.derive.threadFromProviderThread({
-              driver: OPENCODE_DRIVER,
-              providerInstanceId: OPENCODE_INSTANCE,
-              nativeThreadId: childSessionId,
-            }),
-        };
-        const history = historyEvents({ ...context, messages, firstOrdinal });
-        const notice =
-          head === null && truncated
-            ? truncationNotice({
-                threadId,
-                sessionId,
-                at: millis(messages[0]!.time.created),
-                shown: messages.length,
-              })
-            : undefined;
-        const children =
-          parent.lineage.relationshipToParent === "subagent"
-            ? { events: [], mappings: [] }
-            : yield* childThreadEvents(parent, subagentCalls({ ...context, messages }), conn);
+      const firstOrdinal = Math.max(FIRST_HISTORY_ORDINAL, (lastOrdinal[0]?.ordinal ?? 0) + 1);
+      const context = {
+        threadId,
+        instanceId: OPENCODE_INSTANCE,
+        childThreadId: (childSessionId: string) =>
+          idAllocator.derive.threadFromProviderThread({
+            driver: OPENCODE_DRIVER,
+            providerInstanceId: OPENCODE_INSTANCE,
+            nativeThreadId: childSessionId,
+          }),
+      };
+      const history = historyEvents({ ...context, messages, firstOrdinal });
+      const notice =
+        head === null && truncated
+          ? truncationNotice({
+              threadId,
+              sessionId,
+              at: millis(messages[0]!.time.created),
+              shown: messages.length,
+            })
+          : undefined;
+      const children =
+        parent.lineage.relationshipToParent === "subagent"
+          ? { events: [], mappings: [] }
+          : yield* childThreadEvents(parent, subagentCalls({ ...context, messages }), conn);
 
-        // Positions first: the sink keeps a supplied position for a known item.
-        yield* sql.withTransaction(
-          Effect.forEach(
-            [
-              ...(notice === undefined ? [] : [{ turnItemId: notice.turnItemId, ordinal: 1 }]),
-              ...history.positions,
-            ],
-            (position) => sql`
+      // Positions first: the sink keeps a supplied position for a known item.
+      yield* sql.withTransaction(
+        Effect.forEach(
+          [
+            ...(notice === undefined ? [] : [{ turnItemId: notice.turnItemId, ordinal: 1 }]),
+            ...history.positions,
+          ],
+          (position) => sql`
               INSERT INTO orchestration_v2_turn_item_positions (thread_id, turn_item_id, ordinal)
               VALUES (${threadId}, ${position.turnItemId}, ${position.ordinal})
               ON CONFLICT(thread_id, turn_item_id) DO NOTHING
             `,
-            { discard: true },
-          ),
-        );
-        if (children.events.length > 0) {
-          yield* eventSink.write({ events: children.events });
-          yield* Effect.forEach(children.mappings, (mapping) => mapping, { discard: true });
-        }
-        const events = yield* unwritten(threadId, [
-          ...(notice === undefined ? [] : [notice.event]),
-          ...history.events,
-        ]);
-        for (let index = 0; index < events.length; index += EVENT_BATCH_SIZE) {
-          yield* eventSink.write({ events: events.slice(index, index + EVENT_BATCH_SIZE) });
-          yield* Effect.yieldNow;
-        }
+          { discard: true },
+        ),
+      );
+      if (children.events.length > 0) {
+        yield* eventSink.write({ events: children.events });
+        yield* Effect.forEach(children.mappings, (mapping) => mapping, { discard: true });
       }
-      const newest = messages.at(-1)?.id ?? head;
-      const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
+      const events = yield* unwritten(threadId, [
+        ...(notice === undefined ? [] : [notice.event]),
+        ...history.events,
+      ]);
+      for (let index = 0; index < events.length; index += EVENT_BATCH_SIZE) {
+        yield* eventSink.write({ events: events.slice(index, index + EVENT_BATCH_SIZE) });
+        yield* Effect.yieldNow;
+      }
+    }
+    const newest = messages.at(-1)?.id ?? head;
+    const now = DateTime.formatIso(yield* DateTime.now);
+    yield* controlSql`
         UPDATE ardud_opencode_import_state
         SET transcript_head = ${newest}, transcript_at = ${now}
         WHERE native_session_id = ${sessionId}
       `;
-    });
+  });
 
   const ensureTranscript: OpenCodeImporterShape["ensureTranscript"] = (threadId) =>
     freshTranscripts.has(threadId)

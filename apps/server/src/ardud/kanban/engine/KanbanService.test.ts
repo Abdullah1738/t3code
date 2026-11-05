@@ -16,6 +16,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as Statement from "effect/sql/Statement";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -10247,6 +10248,68 @@ it.effect(
         }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
       }).pipe(Effect.provide(probeDeps(fake.layer)));
     }),
+);
+
+it.effect.each([false, true])("first-boot requests wait for pool rekey with transient read failure %s", (failFirstRead) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const { board } = yield* toyBoard.pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+      const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+      const oldKey = Rules.modelKey(haiku);
+      const pool = (yield* store.pools(board.id)).find((pool) => pool.key === Rules.poolKey(haiku))!;
+      yield* store.rekeyBoard(board.id, [{ from: pool.key, pool: { ...pool, key: oldKey, slots: 1 } }], []);
+      const sql = yield* SqlClient.SqlClient;
+      const ready = yield* Deferred.make<void>();
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const failed = yield* Deferred.make<void>();
+      let attempts = 0;
+      const rekeying = Layer.succeed(KanbanStore.KanbanStore, KanbanStore.KanbanStore.of({
+        ...store,
+        boards: Effect.suspend(() => {
+          attempts++;
+          return failFirstRead && attempts === 1
+            ? Deferred.succeed(failed, undefined).pipe(Effect.andThen(Effect.fail(
+                new KanbanStore.KanbanStoreError({ operation: "read boards", cause: "transient" }),
+              )))
+            : store.boards;
+        }),
+        rekeyBoard: (id, pools, cards) => Deferred.succeed(reached, undefined).pipe(
+          Effect.andThen(Deferred.await(release)), Effect.andThen(store.rekeyBoard(id, pools, cards)),
+        ),
+      }));
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const changed = yield* Deferred.make<void>();
+        const write = yield* kanban.setPool(board.id, haiku, 2).pipe(
+          Effect.andThen(Deferred.succeed(changed, undefined)), Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        assert.isFalse(yield* Deferred.isDone(changed));
+        yield* Deferred.succeed(ready, undefined);
+        if (failFirstRead) {
+          yield* Deferred.await(failed);
+          assert.isFalse(yield* Deferred.isDone(changed));
+          yield* TestClock.adjust("1 second");
+        }
+        yield* Deferred.await(reached);
+        assert.isFalse(yield* Deferred.isDone(changed));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(write);
+        const pools = yield* store.pools(board.id);
+        assert.isFalse(pools.some((pool) => pool.key === oldKey));
+        assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(haiku))?.slots, 2);
+        assert.isAtLeast(attempts, failFirstRead ? 2 : 1);
+      }).pipe(
+        Effect.provide(Layer.fresh(KanbanService.layer).pipe(Layer.provide(rekeying))),
+        Effect.provideService(BoardsDatabase.BoardsDatabase, BoardsDatabase.BoardsDatabase.of({
+          sql, ready: Deferred.await(ready), path: ":memory:",
+        })),
+      );
+    }).pipe(Effect.provide(probeDeps(fake.layer)));
+  }),
 );
 
 it.effect(

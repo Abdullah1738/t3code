@@ -2,7 +2,6 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
@@ -28,103 +27,8 @@ import {
 } from "@t3tools/contracts";
 
 import { SummaryCard } from "./summaryCard.ts";
-
-/**
- * Fork tables for the Missions board. Rows keep the whole record as JSON plus
- * the few columns we filter on; the records are small and always read whole.
- * Never add these to persistence/Migrations.ts (upstream owns that list).
- */
-const DDL = [
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_boards (
-    id TEXT PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    json TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_cards (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    number INTEGER NOT NULL,
-    stage TEXT NOT NULL,
-    active_thread_id TEXT,
-    json TEXT NOT NULL,
-    UNIQUE (board_id, number)
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_board ON ardud_kanban_cards (board_id, stage)`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_cards_thread ON ardud_kanban_cards (active_thread_id)`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_card_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_card_events_card ON ardud_kanban_card_events (card_id, id)`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_goals (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_pools (
-    board_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (board_id, key)
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_groups (
-    board_id TEXT PRIMARY KEY,
-    json TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_discussions (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    card_id TEXT,
-    evaluator_thread_id TEXT,
-    json TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_discussions_board ON ardud_kanban_discussions (board_id)`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_messages (
-    discussion_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (discussion_id, seq)
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_scripts (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_script_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    script_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_script_runs_script ON ardud_kanban_script_runs (script_id, id)`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_automations (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    json TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_wiki (
-    board_id TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (board_id, slug)
-  )`,
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_threads (
-    thread_id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL,
-    card_id TEXT,
-    ended INTEGER NOT NULL DEFAULT 0,
-    json TEXT NOT NULL
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_threads_card ON ardud_kanban_threads (card_id)`,
-  // Every card a work thread has carried; one thread can serve several cards.
-  `CREATE TABLE IF NOT EXISTS ardud_kanban_thread_cards (
-    thread_id TEXT NOT NULL,
-    card_id TEXT NOT NULL,
-    joined_at TEXT NOT NULL,
-    PRIMARY KEY (thread_id, card_id)
-  )`,
-  `CREATE INDEX IF NOT EXISTS ardud_kanban_thread_cards_card ON ardud_kanban_thread_cards (card_id)`,
-];
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
 
 export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("KanbanStoreError", {
   operation: Schema.String,
@@ -352,13 +256,13 @@ export const actorKey = (actor: KanbanActor): string => {
 };
 
 const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   const fail = (operation: string) => (cause: unknown) =>
     new KanbanStoreError({ operation, cause });
 
-  yield* Effect.forEach(DDL, (statement) => sql.unsafe(statement), { discard: true }).pipe(
-    Effect.mapError(fail("create tables")),
-  );
+  yield* BoardsDatabase.initialize(
+    Effect.forEach(kanbanDDL, (statement) => sql.unsafe(statement), { discard: true }),
+  ).pipe(Effect.mapError(fail("create tables")));
 
   const decodeAll = <A, E>(
     rows: ReadonlyArray<JsonRow>,

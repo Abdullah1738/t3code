@@ -51,6 +51,8 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Schedule from "effect/Schedule";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -67,6 +69,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as Asks from "./asks.ts";
 import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
@@ -815,6 +818,7 @@ const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const attachments = makeBoardAttachments(serverConfig, yield* FileSystem.FileSystem);
   const scope = yield* Effect.scope;
+  const startupReady = yield* Deferred.make<void>();
 
   const lock = yield* Semaphore.make(1);
   const changes = yield* PubSub.unbounded<{
@@ -4762,7 +4766,7 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  const guardReady = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Clock.clockWith((clock) =>
       Effect.suspend(() => {
         let started = false;
@@ -4805,12 +4809,14 @@ const make = Effect.gen(function* () {
         );
       }),
     );
+  const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect)));
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    effect.pipe(Effect.mapError(toKanbanError));
+    Deferred.await(startupReady).pipe(Effect.andThen(effect), Effect.mapError(toKanbanError));
   // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
   // which a single write can hold for 15 s under load.
   const readDb = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    effect.pipe(NodeSqliteClient.readOnly, Effect.mapError(toKanbanError));
+    read(effect.pipe(NodeSqliteClient.readOnly));
 
   /** Every model a board uses, deduped by pool key. */
   const boardModels = (board: KanbanBoard): Array<ModelSelection> => {
@@ -6828,20 +6834,39 @@ const make = Effect.gen(function* () {
         ),
       ),
   );
-  yield* Effect.forEach(yield* store.boards, rekeyBoard, { discard: true });
+  yield* BoardsDatabase.onReady(
+    lock
+      .withPermits(1)(
+        Effect.flatMap(store.boards, (boards) =>
+          Effect.forEach(boards, rekeyBoard, { discard: true }),
+        ),
+      )
+      .pipe(
+        Effect.tapError((cause) => Effect.logWarning("Board startup recovery will retry", { cause })),
+        Effect.retry(Schedule.spaced("1 second")),
+        Effect.andThen(Deferred.succeed(startupReady, undefined)),
+      ),
+  );
 
   const runJob = (job: Job) =>
-    lock
-      .withPermits(1)(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId))
-      .pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban job failed", { job: job._tag, cause }),
-        ),
-      );
+    Deferred.await(startupReady).pipe(
+      Effect.andThen(
+        lock
+          .withPermits(1)(
+            job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId),
+          )
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban job failed", { job: job._tag, cause }),
+            ),
+          ),
+      ),
+    );
 
   return KanbanService.of({
     boards: readDb(store.boards),
-    withSelectionMigrationLock: (effect) => lock.withPermits(1)(effect),
+    withSelectionMigrationLock: (effect) =>
+      Deferred.await(startupReady).pipe(Effect.andThen(lock.withPermits(1)(effect))),
     ensureBoard,
     openBoard,
     createBoard,
