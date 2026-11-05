@@ -16,7 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -73,9 +73,19 @@ def passing_codex_home(models: list[str]) -> dict:
             "positiveControlEvidence": ["memories_1.sqlite:stage1_outputs:content"],
             "memoryPromptSeen": False, "positiveControlFired": True, "readControlFired": True,
             "positiveElapsedSeconds": window / 2, "observationComplete": True,
+            "memoryAudit": passing_audit(), "positiveControlAudit": passing_audit(positive=True),
             "observationWindowSeconds": window, "observedSeconds": [window] * len(models),
             "requests": len(models) + 1, "recorderViolations": 0,
-            "models": {model: {"ok": True, "requests": 1} for model in models}}
+            "models": {model: {"ok": True, "requests": 1, "memoryPipelineRequests": 0,
+                                "memorySentinelInRequest": False, "memorySentinelInPrimaryRequest": False,
+                                "memorySectionInRequest": False} for model in models}}
+
+
+def passing_audit(*, positive=False) -> dict:
+    return {"method": "sqlite-triggers-v1", "sourceCommit": hc.CODEX_MEMORY_SOURCE, "identityVerified": True,
+            "stores": {name: {"rowCounts": {"jobs": int(positive), "stage1_outputs": int(positive)},
+                               "activity": {"jobs": 1, "stage1_outputs": 1} if positive else {},
+                               "consolidationProgress": [[1, 0]]} for name in hc.CODEX_MEMORY_DATABASES}}
 
 
 def passing_codex_result() -> dict:
@@ -84,6 +94,8 @@ def passing_codex_result() -> dict:
 
 def passing_claude_result() -> dict:
     return {"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
+            "thinkingSettingsChecked": True, "thinkingInconclusive": False,
+            "thinkingAttempts": [{"status": "passed", "settingsChecked": True, "turn1ThinkingBlocks": 1}],
             "thinkingReplayed": True, "inputTransformationsEmpty": True, "requests": 3,
             "recorderViolations": 0, **{model: {"ok": True} for model in hc.MODEL_CANARIES["claude"]}}
 
@@ -105,6 +117,7 @@ class FakeCliTestCase(unittest.TestCase):
         self.env_patch = mock.patch.dict(os.environ, {
             "HARNESS_CLI_HOME": str(self.root),
             "HARNESS_CLI_NPM": str(self.bin / "npm"),
+            "HARNESS_CLI_PYTHON": sys.executable,
             "HARNESS_CLI_MODEL_MANIFEST": str(self.manifest),
             "HARNESS_CLI_HOMES": str(self.tmp / "live-homes"),
             "FAKE_NPM_DB": str(self.npm_db),
@@ -206,15 +219,17 @@ if "--resume" in sys.argv and session.exists():
     messages.append({"role": "assistant", "content": [json.loads(session.read_text())]})
 if LEAK:
     messages.append({"role": "user", "content": "ROBOB-MEMCANARY-7f3a91"})
-body = {"messages": messages, "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
+messages[0]["content"] = sys.argv[sys.argv.index("-p") + 1]
+body = {"messages": messages, "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}, "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
 req = urllib.request.Request(base + "/v1/messages", data=json.dumps(body).encode(),
                              headers={"content-type": "application/json", "anthropic-beta": "context-management-test"})
 response = json.loads(urllib.request.urlopen(req, timeout=10).read())
 if "--session-id" in sys.argv:
     session.write_text(json.dumps(response["content"][0]))
-print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
+print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK 11440 407")
 '''
-        return script.replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode()
+        return (script.replace("/opt/homebrew/bin/python3", sys.executable)
+                .replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode())
 
     def fake_codex_binary(self, version: str, body_extra: str = "", *, leak_read: bool = False) -> bytes:
         script = r'''#!/opt/homebrew/bin/python3
@@ -235,7 +250,8 @@ if (config.get("features", {}).get("memories") and (home / "fixture-id").exists(
     conn = sqlite3.connect(home / "memories_1.sqlite")
     conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)")
-    conn.execute("INSERT INTO stage1_outputs VALUES (?, 'extracted preference', '')", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.execute("INSERT OR REPLACE INTO stage1_outputs (thread_id,source_updated_at,raw_memory,rollout_summary,generated_at) VALUES (?,0,'extracted preference','',0)", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.execute("INSERT OR REPLACE INTO jobs (kind,job_key,status,retry_remaining) VALUES ('memory_stage1','fixture','done',0)")
     conn.commit(); conn.close()
 enabled = config.get("features", {}).get("memories")
 input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"
@@ -250,7 +266,8 @@ req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", da
 urllib.request.urlopen(req, timeout=10).read()
 print("OK")
 '''
-        return (script.replace("VERSION", version).replace("LEAK_READ", str(leak_read))
+        return (script.replace("/opt/homebrew/bin/python3", sys.executable)
+                .replace("VERSION", version).replace("LEAK_READ", str(leak_read))
                 .replace("LEAK", str(bool(body_extra))).encode())
 
     def package_tgz(self, name: str, tool: str, version: str, binary: bytes) -> Path:
@@ -474,13 +491,6 @@ class PromoteRollbackTests(FakeCliTestCase):
 
 
 class CodexRotationTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        # Rotation tests exercise behavior after an independently verified canary.
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
-
     def install_codex(self, version: str) -> None:
         bin_dir = self.root / "codex" / version / "bin"
         bin_dir.mkdir(parents=True)
@@ -497,7 +507,8 @@ class CodexRotationTests(FakeCliTestCase):
         self.install_codex("0.166.0")
         for target in ("plain", "cu"):
             for field in ("memorySentinelSeen", "memoryPipelineRan", "memoryPromptSeen", "models",
-                          "observedSeconds", "positiveElapsedSeconds", "recorderViolations"):
+                          "observedSeconds", "positiveElapsedSeconds", "recorderViolations",
+                          "memoryAudit", "positiveControlAudit"):
                 with self.subTest(target=target, field=field):
                     proof = passing_codex_result()
                     home = proof if target == "plain" else proof["cu"]
@@ -687,6 +698,59 @@ class CanaryTests(FakeCliTestCase):
         with self.assertRaises(hc.HarnessError):
             hc.promote("claude", "2.1.316")
 
+    def test_no_thinking_retries_once_but_cannot_turn_inconclusive_into_pass(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(
+            b'if "--session-id" in sys.argv:\n    session.write_text',
+            b'if "--session-id" in sys.argv and response["content"]:\n    session.write_text')
+        self.install_binary("claude", "2.1.316", body)
+        capture = hc.Recorder.capture_response
+        seen = []
+        def no_first_thinking(recorder, payload, record):
+            capture(recorder, payload, record)
+            seen.append(record)
+            if len(seen) == 1:
+                record["response_thinking"] = []
+        with mock.patch.object(hc.Recorder, "capture_response", no_first_thinking):
+            verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        result = verdict["result"]
+        self.assertTrue(result["thinkingInconclusive"])
+        self.assertEqual([a["status"] for a in result["thinkingAttempts"]], ["inconclusive", "passed"])
+        self.assertTrue(result["thinkingReplayed"])
+        self.assertEqual(json.loads(hc.records_path().read_text().splitlines()[-1])["result"], "inconclusive")
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
+
+    def test_thinking_replay_failure_is_not_retried(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(
+            b'if "--resume" in sys.argv and session.exists():', b'if False:')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(verdict["result"]["thinkingInconclusive"])
+        self.assertEqual(len(verdict["result"]["thinkingAttempts"]), 1)
+        self.assertEqual(verdict["result"]["requests"], 3)
+
+    def test_missing_thinking_exhausts_bounded_retry(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        capture = hc.Recorder.capture_response
+        def no_thinking(recorder, payload, record):
+            capture(recorder, payload, record)
+            record["response_thinking"] = []
+        with mock.patch.object(hc.Recorder, "capture_response", no_thinking):
+            verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertEqual([a["status"] for a in verdict["result"]["thinkingAttempts"]],
+                         ["inconclusive", "inconclusive"])
+        self.assertEqual(verdict["result"]["requests"], 4)
+
+    def test_claude_ignored_thinking_effort_flags_block_promotion(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(b'"effort": "max"', b'"effort": "high"')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(verdict["result"]["thinkingSettingsChecked"])
+
     def test_transformed_or_unreported_thinking_response_fails_closed(self) -> None:
         first = [{"response_thinking": [{"thinking": "t", "signature": "s"}]}]
         request = {"body": {"messages": [{"role": "assistant", "content":
@@ -737,24 +801,25 @@ class CanaryTests(FakeCliTestCase):
     def test_codex_uses_generated_cu_home_and_memory_positive_control(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         verdict = self.run_canary("codex", "0.166.0")
-        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["passed"], verdict)
         self.assertTrue(verdict["result"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["models"]["gpt-6.1-terra"]["ok"])
         for result in (verdict["result"], verdict["result"]["cu"]):
-            self.assertFalse(result["memoryCanaryChecked"])
-            self.assertIn("transient jobs", result["memoryObservationLimitation"])
+            self.assertTrue(result["memoryCanaryChecked"])
+            self.assertTrue(hc.valid_codex_memory_audit(result["memoryAudit"], clean=True))
             self.assertTrue(result["readControlFired"])
             self.assertFalse(result["memorySentinelSeen"])
             self.assertFalse(result["memoryPromptSeen"])
             self.assertIn("memories/MEMORY.md", result["memoryBaseline"])
-            self.assertEqual(result["memoryArtifacts"], [])
-        with self.assertRaises(hc.HarnessError):
-            hc.promote("codex", "0.166.0")
+        hc.promote("codex", "0.166.0")
 
-    def test_synthetic_clean_codex_record_cannot_bypass_observation_limit(self) -> None:
+    def test_clean_codex_record_without_audit_cannot_promote(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         passing_canary("codex", "0.166.0")
+        record = json.loads(hc.records_path().read_text().splitlines()[-1])
+        del record["canary"]["memoryAudit"]
+        hc.append_record(record)
         self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
@@ -986,7 +1051,7 @@ class CanaryTests(FakeCliTestCase):
             b'if not enabled and (home / "fixture-id").exists():\n'
             b'    def queue_job():\n'
             b'        conn = sqlite3.connect(home / "memories_1.sqlite"); conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")\n'
-            b'        conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)"); conn.execute("INSERT INTO jobs VALUES (\'queued\')"); conn.commit(); conn.close()\n'
+            b'        conn.execute("INSERT INTO jobs (kind,job_key,status,retry_remaining) VALUES (\'memory_stage1\',\'fixture\',\'queued\',0)"); conn.commit(); conn.close()\n'
             b'    timer = threading.Timer(0.20, queue_job); timer.daemon = True; timer.start()\n'
             b'body = {"input":')
         self.install_binary("codex", "0.166.0", body)
@@ -998,10 +1063,27 @@ class CanaryTests(FakeCliTestCase):
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
 
+    def test_job_created_and_deleted_in_one_transaction_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'body = {"input":',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    conn = sqlite3.connect(home / "memories_1.sqlite")\n'
+            b'    conn.execute("INSERT INTO jobs (kind,job_key,status,retry_remaining) VALUES (\'memory_stage1\',\'fixture\',\'queued\',0)")\n'
+            b'    conn.execute("DELETE FROM jobs"); conn.commit(); conn.close()\n'
+            b'body = {"input":')
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertTrue(result["memoryPipelineRan"])
+            self.assertIn("memories_1.sqlite:audit:jobs", result["memoryPipelineEvidence"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
     def test_disabled_memory_probe_seeds_indexed_rollout(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         verdict = self.run_canary("codex", "0.166.0")
-        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["passed"], verdict)
         self.assertEqual(self.seed_mock.call_count, 4)
 
     def test_codex_memory_sentinel_detects_decoded_nested_text(self) -> None:
@@ -1031,6 +1113,17 @@ class CanaryTests(FakeCliTestCase):
         (home / "raw_memories.md").write_text("new")
         after = hc.codex_memory_snapshot(home)
         self.assertEqual(set(after) - set(before), {"phase2-output", "raw_memories.md"})
+
+    def test_memory_snapshot_does_not_hash_rotating_sqlite_files(self) -> None:
+        home = self.tmp / "rotating-sqlite"
+        home.mkdir()
+        for name in hc.CODEX_MEMORY_DATABASES:
+            for suffix in ("", "-wal", "-shm"):
+                (home / (name + suffix)).touch()
+        with mock.patch.object(hc, "sha256_file", side_effect=FileNotFoundError("WAL rotated")):
+            snapshot = hc.codex_memory_snapshot(home)
+        self.assertEqual(len(snapshot), 6)
+        self.assertEqual(set(snapshot.values()), {"sqlite-store"})
 
     def test_empty_codex_database_does_not_count_as_pipeline_work(self) -> None:
         body = self.fake_codex_binary("0.166.0")
@@ -1064,6 +1157,54 @@ class CanaryTests(FakeCliTestCase):
             conn.commit()
         after = hc.codex_memory_snapshot(home)
         self.assertIn("memories_1.sqlite:stage1_outputs", hc.codex_memory_pipeline_evidence(home, before, after))
+
+    def test_memory_audit_accepts_only_empty_untouched_stores(self) -> None:
+        import sqlite3
+        home = self.tmp / "audited"
+        home.mkdir()
+        audit = hc.CodexMemoryAudit(home, "0.166.0")
+        self.assertTrue(hc.valid_codex_memory_audit(audit.read(), clean=True))
+        for name in hc.CODEX_MEMORY_DATABASES:
+            with self.subTest(store=name):
+                with closing(sqlite3.connect(home / name)) as conn:
+                    conn.execute("INSERT INTO stage1_outputs (thread_id,source_updated_at,raw_memory,rollout_summary,generated_at) VALUES ('fixture',0,'content','',0)")
+                    conn.execute("DELETE FROM stage1_outputs")
+                    conn.commit()
+                result = audit.read()
+                self.assertFalse(hc.valid_codex_memory_audit(result, clean=True))
+                self.assertEqual(result["stores"][name]["rowCounts"]["stage1_outputs"], 0)
+                self.assertEqual(result["stores"][name]["activity"]["stage1_outputs"], 2)
+
+    def test_memory_audit_fails_closed_on_tampering(self) -> None:
+        import sqlite3
+        for change in ("trigger", "identity", "migration", "replaced", "missing"):
+            with self.subTest(change=change):
+                home = self.tmp / f"tampered-{change}"
+                home.mkdir()
+                audit = hc.CodexMemoryAudit(home, "0.166.0")
+                db = home / "memories_1.sqlite"
+                if change in ("replaced", "missing"):
+                    db.rename(db.with_suffix(".backup"))
+                    if change == "replaced":
+                        shutil.copy2(db.with_suffix(".backup"), db)
+                else:
+                    with closing(sqlite3.connect(db)) as conn:
+                        conn.execute({"trigger": "DROP TRIGGER robob_canary_jobs_insert",
+                                      "identity": "DELETE FROM robob_canary_identity",
+                                      "migration": "UPDATE _sqlx_migrations SET checksum=x'00' WHERE version=1"}[change])
+                        conn.commit()
+                with self.assertRaises(hc.HarnessError):
+                    audit.read()
+
+    def test_memory_audit_rejects_unknown_cli_version(self) -> None:
+        with self.assertRaises(hc.HarnessError):
+            hc.CodexMemoryAudit(self.tmp, "0.167.0")
+
+    def test_positive_control_needs_audited_jobs_and_outputs(self) -> None:
+        proof = passing_codex_home(hc.MODEL_CANARIES["codex"])
+        for store in proof["positiveControlAudit"]["stores"].values():
+            store["activity"] = {}
+        self.assertFalse(hc.valid_codex_canary_home(proof, hc.MODEL_CANARIES["codex"]))
 
     def test_jobs_or_consolidation_initialization_is_not_positive_extraction(self) -> None:
         import sqlite3
@@ -1241,7 +1382,8 @@ class CanaryTests(FakeCliTestCase):
 
     def test_incomplete_claude_pass_cannot_promote(self) -> None:
         binary = self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
-        for field in ("memoryCanaryLeaked", "recorderViolations", "requests", "claude-haiku-5-5"):
+        for field in ("memoryCanaryLeaked", "recorderViolations", "requests", "claude-haiku-5-5",
+                      "thinkingSettingsChecked", "thinkingInconclusive", "thinkingAttempts"):
             with self.subTest(field=field):
                 proof = passing_claude_result()
                 del proof[field]
@@ -1301,12 +1443,6 @@ def passing_canary(tool: str, version: str) -> dict:
 
 
 class AutoTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
-
     def publish_both(self, claude_latest: str, codex_latest: str) -> None:
         """Answer npm the way the registry does: the wrapper package's `version` (what discover asks)
         and the native darwin package's dist.integrity and tarball (what stage fetches)."""
@@ -1484,12 +1620,6 @@ class RefreshTests(FakeCliTestCase):
 
 
 class RotationGateTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
-
     """The standing OK, the snapshot's fail-closed rule, and the rotation path end to end."""
 
     def install_codex(self, version: str = "0.166.0") -> None:
