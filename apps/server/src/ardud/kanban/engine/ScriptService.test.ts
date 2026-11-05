@@ -4,17 +4,22 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KanbanBoardId,
+  KanbanScriptId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
   type KanbanActor,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanScript,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
 
@@ -127,6 +132,224 @@ const register = (
     const scripts = yield* ScriptService.KanbanScripts;
     return yield* scripts.register({ boardId: board.id, name, path, trigger }, owner);
   });
+
+const scriptWriteFixture = () => {
+  const first: KanbanScript = {
+    id: KanbanScriptId.make("script-first"),
+    boardId: KanbanBoardId.make("board-first"),
+    name: "First",
+    path: "/unused.sh",
+    trigger: manual,
+    enabled: true,
+    createdBy: owner,
+    createdAt: "1970-01-01T00:00:00.000Z",
+    lastRun: null,
+  };
+  const second: KanbanScript = {
+    ...first,
+    id: KanbanScriptId.make("script-second"),
+    boardId: KanbanBoardId.make("board-second"),
+    name: "Second",
+  };
+  const records = new Map([
+    [first.id, first],
+    [second.id, second],
+  ]);
+  const store = {
+    script: (id: KanbanScript["id"]) => Effect.sync(() => records.get(id) ?? null),
+    putScript: (script: KanbanScript) =>
+      Effect.sync(() => {
+        records.set(script.id, script);
+      }),
+    allScripts: Effect.sync(() => [...records.values()]),
+    scriptRuns: () => Effect.succeed([]),
+  };
+  return { first, second, records, store };
+};
+
+const scriptWriteLayer = (
+  store: Partial<KanbanStore.KanbanStore["Service"]>,
+  announce: KanbanService.KanbanService["Service"]["announce"] = () => Effect.void,
+) =>
+  ScriptService.layer.pipe(
+    Layer.provide(Layer.mock(KanbanStore.KanbanStore)(store)),
+    Layer.provide(
+      Layer.mock(KanbanService.KanbanService)({ announce, attachmentPath: () => null }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+  );
+
+it.effect("script writes serialize per board without blocking another board", () =>
+  Effect.gen(function* () {
+    const { first, second, records, store } = scriptWriteFixture();
+    const neighbor = { ...first, id: KanbanScriptId.make("script-neighbor") };
+    records.set(neighbor.id, neighbor);
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const neighborRead = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const writing = yield* Effect.forkChild(scripts.setEnabled(first.id, false));
+      yield* Deferred.await(held);
+      const queued = yield* Effect.forkChild(scripts.setEnabled(neighbor.id, false));
+      yield* Deferred.await(neighborRead);
+      yield* Effect.gen(function* () {
+        const other = yield* scripts.setEnabled(second.id, false);
+        assert.isFalse(other.enabled);
+        assert.isTrue(records.get(first.id)?.enabled);
+        assert.isTrue(records.get(neighbor.id)?.enabled);
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(writing);
+      yield* Fiber.join(queued);
+      assert.isFalse(records.get(first.id)?.enabled);
+      assert.isFalse(records.get(neighbor.id)?.enabled);
+    }).pipe(
+      Effect.provide(
+        scriptWriteLayer({
+          ...store,
+          script: (id) =>
+            store
+              .script(id)
+              .pipe(
+                Effect.tap(() =>
+                  id === neighbor.id ? Deferred.succeed(neighborRead, undefined) : Effect.void,
+                ),
+              ),
+          putScript: (script) =>
+            (script.id === first.id
+              ? Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void
+            ).pipe(Effect.andThen(store.putScript(script))),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("a queued toggle rereads the last run after a same-board write", () =>
+  Effect.gen(function* () {
+    const { first, records, store } = scriptWriteFixture();
+    records.set(first.id, {
+      ...first,
+      lastRun: { startedAt: first.createdAt, endedAt: null, exitCode: null },
+    });
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const toggleRead = yield* Deferred.make<void>();
+    let recovering = false;
+    yield* TestClock.adjust("1 minute");
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const recovery = yield* Effect.forkChild(scripts.recover);
+      yield* Deferred.await(held);
+      const toggle = yield* Effect.forkChild(scripts.setEnabled(first.id, false));
+      yield* Deferred.await(toggleRead).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(recovery);
+      const after = yield* Fiber.join(toggle);
+      assert.isFalse(after.enabled);
+      assert.strictEqual(after.lastRun?.endedAt, "1970-01-01T00:01:00.000Z");
+      assert.deepStrictEqual(records.get(first.id), after);
+    }).pipe(
+      Effect.provide(
+        scriptWriteLayer({
+          ...store,
+          script: (id) =>
+            store
+              .script(id)
+              .pipe(
+                Effect.tap(() =>
+                  recovering && id === first.id
+                    ? Deferred.succeed(toggleRead, undefined)
+                    : Effect.void,
+                ),
+              ),
+          putScript: (script) =>
+            (script.id === first.id && script.lastRun?.endedAt !== null && script.enabled
+              ? Effect.sync(() => {
+                  recovering = true;
+                }).pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                )
+              : Effect.void
+            ).pipe(Effect.andThen(store.putScript(script))),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("an unchanged toggle is checked after the preceding toggle commits", () =>
+  Effect.gen(function* () {
+    const { first, records, store } = scriptWriteFixture();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const enableRead = yield* Deferred.make<void>();
+    let disabling = false;
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const disable = yield* Effect.forkChild(scripts.setEnabled(first.id, false));
+      yield* Deferred.await(held);
+      const enable = yield* Effect.forkChild(scripts.setEnabled(first.id, true));
+      yield* Deferred.await(enableRead).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(disable);
+      assert.isTrue((yield* Fiber.join(enable)).enabled);
+      assert.isTrue(records.get(first.id)?.enabled);
+    }).pipe(
+      Effect.provide(
+        scriptWriteLayer({
+          ...store,
+          script: (id) =>
+            store
+              .script(id)
+              .pipe(
+                Effect.tap(() =>
+                  disabling && id === first.id
+                    ? Deferred.succeed(enableRead, undefined)
+                    : Effect.void,
+                ),
+              ),
+          putScript: (script) =>
+            (!script.enabled
+              ? Effect.sync(() => {
+                  disabling = true;
+                }).pipe(
+                  Effect.andThen(Deferred.succeed(held, undefined)),
+                  Effect.andThen(Deferred.await(release)),
+                )
+              : Effect.void
+            ).pipe(Effect.andThen(store.putScript(script))),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("a delayed script announcement does not hold the board write lock", () =>
+  Effect.gen(function* () {
+    const { first, records, store } = scriptWriteFixture();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const disable = yield* Effect.forkChild(scripts.setEnabled(first.id, false));
+      yield* Deferred.await(held);
+      yield* Effect.gen(function* () {
+        assert.isTrue((yield* scripts.setEnabled(first.id, true)).enabled);
+        assert.isTrue(records.get(first.id)?.enabled);
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(disable);
+    }).pipe(
+      Effect.provide(
+        scriptWriteLayer(store, (_boardId, change) =>
+          change._tag === "script" && !change.script.enabled
+            ? Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+        ),
+      ),
+    );
+  }),
+);
 
 it.effect("refuses scripts it couldn't run", () =>
   Effect.gen(function* () {
