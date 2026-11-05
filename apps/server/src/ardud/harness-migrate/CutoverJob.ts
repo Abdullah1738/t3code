@@ -12,6 +12,22 @@ export class CutoverJob extends Context.Service<
   }
 >()("t3/ardud/harness-migrate/CutoverJob") {}
 
+const done = (item: Cutover.CutoverStatus["items"][number]) =>
+  item.state === "briefed" || (item.state === "switched" && item.kind !== "thread");
+const exhausted = (item: Cutover.CutoverStatus["items"][number]) =>
+  item.state === "failed" &&
+  item.attempts >= 3 &&
+  ((item.kind !== "selection" && item.kind !== "thread") ||
+    item.rolledBack ||
+    item.rollbackAttempts >= 3);
+const terminal = (state: Cutover.CutoverStatus) =>
+  state.completed ||
+  state.refusals.length > 0 ||
+  (state.items.some(exhausted) &&
+    state.items
+      .filter((item) => item.kind !== "finalize")
+      .every((item) => done(item) || exhausted(item)));
+
 export const layer = Layer.effect(
   CutoverJob,
   Effect.gen(function* () {
@@ -22,7 +38,7 @@ export const layer = Layer.effect(
     const start = Effect.fn("CutoverJob.start")(function* () {
       if (yield* Ref.get(active)) return yield* cutover.status();
       const first = yield* cutover.run();
-      if (first.completed || first.refusals.length > 0) return first;
+      if (terminal(first)) return first;
       yield* Ref.set(active, true);
       yield* Effect.forkIn(
         Effect.gen(function* () {
@@ -30,20 +46,7 @@ export const layer = Layer.effect(
             // Provider acceptance and owner answers arrive independently; no writer or board lock is held here.
             yield* Effect.sleep("2 seconds");
             const state = yield* cutover.run();
-            if (
-              state.completed ||
-              state.refusals.length > 0 ||
-              (state.items
-                .filter((item) => item.kind !== "finalize")
-                .every(
-                  (item) =>
-                    item.state === "briefed" ||
-                    (item.state === "switched" && item.kind !== "thread") ||
-                    item.attempts >= 3,
-                ) &&
-                state.items.some((item) => item.attempts >= 3))
-            )
-              return;
+            if (terminal(state)) return;
           }
         }).pipe(
           Effect.catchCause((cause) => Effect.logWarning("Harness cutover job paused", { cause })),

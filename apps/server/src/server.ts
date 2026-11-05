@@ -67,6 +67,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as CredentialStore from "./ardud/mcp/CredentialStore.ts";
+import * as BoardsDatabase from "./ardud/persistence/BoardsDatabase.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
@@ -326,7 +327,9 @@ const layerHttpServer = Layer.unwrap(
 
 const layerPlatformServices = NodeServices.layer;
 
-const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
+const layerPersistence = BoardsDatabase.layerConfig.pipe(
+  Layer.provideMerge(SqlitePersistence.layerConfig),
+);
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
 
@@ -1075,7 +1078,8 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
-          Layer.provide(CredentialStore.layer.pipe(Layer.provide(layerPersistence))),
+          Layer.provide(CredentialStore.layer),
+          Layer.provide(layerPersistence),
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
         ),
       ),

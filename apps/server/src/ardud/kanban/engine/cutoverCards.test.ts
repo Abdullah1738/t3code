@@ -15,6 +15,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as ServerConfig from "../../../config.ts";
 import * as Sqlite from "../../../persistence/Sqlite.ts";
@@ -22,6 +23,8 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { KanbanService, layer as kanbanLayer } from "./KanbanService.ts";
 import { planCutoverCardRestore } from "./cutoverCards.ts";
@@ -293,30 +296,56 @@ const threadView = (threadId: ThreadId): KanbanThreadView => ({
   prs: [],
   archived: false,
 });
+const separateBoardsLayer = Layer.effect(
+  BoardsDatabase.BoardsDatabase,
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    return BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:boards" });
+  }),
+).pipe(Layer.provide(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" }))));
 const testLayer = (
   options: {
     readonly exists?: boolean;
     readonly failLinkWrite?: boolean;
+    readonly failEventWrite?: boolean;
+    readonly separateBoards?: boolean;
     readonly threads?: Partial<KanbanThreadsShape>;
   } = {},
 ) => {
-  const storeLayer = options.failLinkWrite
-    ? Layer.effect(
-        KanbanStore.KanbanStore,
-        Effect.map(KanbanStore.KanbanStore, (real) => ({
-          ...real,
-          putThreadLink: (value: KanbanThreadLink) =>
-            value.endedAt === null
-              ? Effect.fail(
-                  new KanbanStore.KanbanStoreError({
-                    operation: "fixture failure",
-                    cause: new Error("link write failed"),
-                  }),
-                )
-              : real.putThreadLink(value),
-        })),
-      ).pipe(Layer.provide(KanbanStore.layer))
-    : KanbanStore.layer;
+  const storeLayer =
+    options.failLinkWrite || options.failEventWrite
+      ? Layer.effect(
+          KanbanStore.KanbanStore,
+          Effect.map(KanbanStore.KanbanStore, (real) => ({
+            ...real,
+            putThreadLink: (value: KanbanThreadLink) =>
+              options.failLinkWrite && value.endedAt === null
+                ? Effect.fail(
+                    new KanbanStore.KanbanStoreError({
+                      operation: "fixture failure",
+                      cause: new Error("link write failed"),
+                    }),
+                  )
+                : real.putThreadLink(value),
+            addCardEvent: (event) =>
+              real
+                .addCardEvent(event)
+                .pipe(
+                  Effect.flatMap((saved) =>
+                    options.failEventWrite
+                      ? Effect.fail(
+                          new KanbanStore.KanbanStoreError({
+                            operation: "event fixture failure",
+                            cause: new Error("event write failed"),
+                          }),
+                        )
+                      : Effect.succeed(saved),
+                  ),
+                ),
+          })),
+        ).pipe(Layer.provide(KanbanStore.layer))
+      : KanbanStore.layer;
   return kanbanLayer.pipe(
     Layer.provideMerge(
       Layer.mock(KanbanThreads)({
@@ -327,6 +356,7 @@ const testLayer = (
     ),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(storeLayer),
+    Layer.provideMerge(options.separateBoards ? separateBoardsLayer : Layer.empty),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -413,6 +443,42 @@ it.effect("card/link/event writes roll back together if the link write fails", (
     }>`SELECT stage, active_thread_id FROM ardud_kanban_cards WHERE id = ${stopped.id}`;
     assert.deepStrictEqual(rows, [{ stage: "todo", active_thread_id: null }]);
   }).pipe(Effect.provide(testLayer({ failLinkWrite: true }))),
+);
+
+it.effect("separate board database rolls back the card when reopening its link fails", () =>
+  Effect.gen(function* () {
+    const store = yield* seed;
+    const service = yield* KanbanService;
+    const main = yield* SqlClient.SqlClient;
+    const boards = yield* BoardsDatabase.client;
+    assert.notStrictEqual(main, boards);
+    const mainTables =
+      yield* main`SELECT name FROM sqlite_schema WHERE name = 'ardud_kanban_cards'`;
+    assert.deepStrictEqual(mainTables, []);
+    yield* service
+      .restoreCutoverCard({ cardId: stopped.id, threadId: worker, stage: "working" })
+      .pipe(Effect.flip);
+    assert.deepStrictEqual(yield* store.card(stopped.id), stopped);
+    assert.deepStrictEqual(yield* store.threadLink(worker), link());
+    assert.deepStrictEqual(yield* store.cardEvents(stopped.id), []);
+  }).pipe(Effect.provide(testLayer({ separateBoards: true, failLinkWrite: true }))),
+);
+
+it.effect(
+  "separate board database rolls back card, link and event after an event write failure",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* seed;
+      const service = yield* KanbanService;
+      const main = yield* SqlClient.SqlClient;
+      assert.notStrictEqual(main, yield* BoardsDatabase.client);
+      yield* service
+        .restoreCutoverCard({ cardId: stopped.id, threadId: worker, stage: "working" })
+        .pipe(Effect.flip);
+      assert.deepStrictEqual(yield* store.card(stopped.id), stopped);
+      assert.deepStrictEqual(yield* store.threadLink(worker), link());
+      assert.deepStrictEqual(yield* store.cardEvents(stopped.id), []);
+    }).pipe(Effect.provide(testLayer({ separateBoards: true, failEventWrite: true }))),
 );
 
 it.effect(

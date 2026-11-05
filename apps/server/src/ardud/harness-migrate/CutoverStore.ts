@@ -6,6 +6,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 import * as ServerConfig from "../../config.ts";
 import type { CutoverItem, CutoverPlan } from "./CutoverEngine.ts";
@@ -343,6 +344,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
-    return yield* make(path.join(config.stateDir, "harness-cutover-plan.json"));
+    const sql = yield* BoardsDatabase.client;
+    return yield* make(path.join(config.stateDir, "harness-cutover-plan.json")).pipe(Effect.provideService(SqlClient.SqlClient, sql));
   }),
 );

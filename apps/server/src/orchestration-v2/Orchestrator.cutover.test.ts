@@ -222,7 +222,7 @@ it.effect.each([
     }).pipe(Effect.provide(layerTest())),
 );
 
-it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_owned"] as const)(
+it.effect.each(["busy", "request", "roster", "provider_native", "app_owned"] as const)(
   "prompt-only adoption refuses %s work without changing the thread",
   (state) =>
     Effect.gen(function* () {
@@ -233,7 +233,7 @@ it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_o
       yield* seedSource(threadId);
       const { source } = sourceFixture(threadId);
 
-      if (state === "busy" || state === "queued") {
+      if (state === "busy") {
         for (const ancestor of ["root", "parent"]) {
           const ancestorId = ThreadId.make(`thread:cutover:${ancestor}`);
           yield* sink.write({
@@ -255,30 +255,24 @@ it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_o
             ),
           });
         }
-        const send = (suffix: string, type: "defer_start" | "queue_after_active") =>
-          orchestrator.dispatch({
-            type: "message.dispatch",
-            commandId: CommandId.make(`send:${threadId}:${suffix}`),
-            threadId,
-            messageId: MessageId.make(`message:${threadId}:${suffix}`),
-            text: "Continue the review",
-            attachments: [],
-            createdBy: "user",
-            creationSource: "web",
-            dispatchMode: { type },
-          });
-        yield* send("first", "defer_start");
-        if (state === "queued") yield* send("second", "queue_after_active");
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`send:${threadId}:first`),
+          threadId,
+          messageId: MessageId.make(`message:${threadId}:first`),
+          text: "Continue the review",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type: "defer_start" },
+        });
         const first = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
         yield* projections.apply({
           id: EventId.make(`event:${threadId}:run`),
           type: "run.updated",
           threadId,
           occurredAt: at,
-          payload:
-            state === "busy"
-              ? { ...first, status: "running", startedAt: at }
-              : { ...first, status: "completed", completedAt: at },
+          payload: { ...first, status: "running", startedAt: at },
         });
       } else if (state === "request") {
         yield* sink.write({
@@ -352,10 +346,10 @@ it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_o
       }
 
       const before = yield* orchestrator.getThreadProjection(threadId);
-      if (state === "busy" || state === "queued") {
+      if (state === "busy") {
         assert.deepEqual(
           before.runs.map((run) => run.status),
-          state === "busy" ? ["running"] : ["completed", "queued"],
+          ["running"],
         );
       } else {
         assert.lengthOf(before.runs, 0);
@@ -364,7 +358,7 @@ it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_o
       const error = yield* orchestrator.dispatch(adopt(threadId)).pipe(Effect.flip);
       assert.include(
         errorCause(error),
-        state === "busy" || state === "queued"
+        state === "busy"
           ? "queued or active"
           : state === "request"
             ? "pending runtime request"
@@ -372,6 +366,133 @@ it.effect.each(["busy", "queued", "request", "roster", "provider_native", "app_o
       );
       assert.equal(yield* sink.latestSequence({ threadId }), sequence);
       assert.deepEqual(yield* orchestrator.getThreadProjection(threadId), before);
+    }).pipe(Effect.provide(layerTest())),
+);
+
+it.effect.each(["same-harness", "mixed-harness"] as const)(
+  "prompt-only adoption preserves a %s mapped queue without reordering or releasing holds",
+  (kind) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make(`thread:cutover:queued:${kind}`);
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      yield* sink.write({
+        events: sourceEvents(threadId).map((event) =>
+          event.type === "thread.created"
+            ? {
+                ...event,
+                payload: {
+                  ...event.payload,
+                  lineage: {
+                    parentThreadId: null,
+                    relationshipToParent: null,
+                    rootThreadId: threadId,
+                  },
+                  forkedFrom: null,
+                },
+              }
+            : event,
+        ),
+      });
+      for (const [suffix, type] of [
+        ["first", "defer_start"],
+        ["second", "queue_after_active"],
+        ["third", "queue_after_active"],
+      ] as const) {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`send:${threadId}:${suffix}`),
+          threadId,
+          messageId: MessageId.make(`message:${threadId}:${suffix}`),
+          text: `Review ${suffix}`,
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+          dispatchMode: { type },
+        });
+      }
+      const initial = yield* orchestrator.getThreadProjection(threadId);
+      const [first, second, third] = initial.runs;
+      assert.isDefined(first);
+      assert.isDefined(second);
+      assert.isDefined(third);
+      assert.deepEqual(
+        initial.runs.map((run) => run.status),
+        ["preparing", "queued", "queued"],
+      );
+      const selections = [
+        codexSelection,
+        kind === "mixed-harness" ? claudeSelection : codexSelection,
+      ];
+      // Preparation maps each queued selection independently; adoption must not rewrite those rows.
+      for (const [index, run] of [second!, third!].entries()) {
+        const selection = selections[index]!;
+        yield* projections.apply({
+          id: EventId.make(`event:${threadId}:map:${index}`),
+          type: "run.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            ...run,
+            providerInstanceId: selection.instanceId,
+            modelSelection: selection,
+            queueHeld: index === 0,
+          },
+        });
+      }
+      yield* projections.apply({
+        id: EventId.make(`event:${threadId}:completed`),
+        type: "run.updated",
+        threadId,
+        occurredAt: at,
+        payload: { ...first!, status: "completed", completedAt: at },
+      });
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const queued = before.runs.filter((run) => run.status === "queued");
+      assert.deepEqual(
+        queued.map((run) => ({
+          id: run.id,
+          modelSelection: run.modelSelection,
+          held: run.queueHeld,
+        })),
+        [
+          { id: second!.id, modelSelection: selections[0]!, held: true },
+          { id: third!.id, modelSelection: selections[1]!, held: false },
+        ],
+      );
+      assert.equal(before.thread.activeProviderThreadId, sourceFixture(threadId).source.id);
+
+      const command = adopt(threadId);
+      yield* orchestrator.dispatch(command);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(after.thread.modelSelection, codexSelection);
+      assert.notEqual(after.thread.activeProviderThreadId, before.thread.activeProviderThreadId);
+      assert.deepEqual(after.runs, before.runs);
+      assert.deepEqual(
+        after.runs.filter((run) => run.status === "queued"),
+        queued,
+      );
+      assert.deepEqual(after.messages, before.messages);
+      assert.deepEqual(after.contextHandoffs, before.contextHandoffs);
+      assert.deepEqual(after.contextTransfers, before.contextTransfers);
+      const target = after.providerThreads.find(
+        (row) => row.id === after.thread.activeProviderThreadId,
+      );
+      assert.isDefined(target);
+      assert.equal(target!.status, "not_loaded");
+      assert.isNull(target!.nativeThreadRef);
+      assert.isNull(target!.nativeConversationHeadRef);
+      assert.isNull(target!.providerSessionId);
+      assert.isUndefined(target!.nativeMetadata?.seededHistory);
+      assert.deepEqual(
+        after.providerThreads.find((row) => row.id === before.thread.activeProviderThreadId),
+        before.providerThreads[0],
+      );
+      const sequence = yield* sink.latestSequence({ threadId });
+      yield* orchestrator.dispatch(command);
+      assert.equal(yield* sink.latestSequence({ threadId }), sequence);
+      assert.deepEqual(yield* orchestrator.getThreadProjection(threadId), after);
     }).pipe(Effect.provide(layerTest())),
 );
 

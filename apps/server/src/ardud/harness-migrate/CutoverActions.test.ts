@@ -56,6 +56,8 @@ import * as Settings from "../../serverSettings.ts";
 import * as Kanban from "../kanban/engine/KanbanService.ts";
 import * as Rules from "../kanban/engine/rules.ts";
 import * as BoardStore from "../kanban/store/KanbanStore.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../persistence/kanbanSchema.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import * as Actions from "./CutoverActions.ts";
 import * as PendingContext from "./CutoverContext.ts";
@@ -484,6 +486,26 @@ const database = Layer.unwrap(
   }),
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
+const splitDatabase = Layer.unwrap(
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "cutover-actions-split-" });
+    const boardContext = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+    const sql = yield* SqlClient.SqlClient.pipe(Effect.provide(boardContext));
+    for (const ddl of kanbanDDL) yield* sql.unsafe(ddl);
+    return Layer.mergeAll(
+      BoardStore.layer,
+      CutoverStore.layerWithOptions({ snapshotPath: path.join(directory, "plan.json") }),
+    ).pipe(
+      Layer.provideMerge(
+        Layer.succeed(BoardsDatabase.BoardsDatabase, { sql, ready: Effect.void, path: ":memory:" }),
+      ),
+      Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+    );
+  }),
+).pipe(Layer.provideMerge(NodeServices.layer));
+
 const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
   options: {
     readonly threads?: readonly OrchestrationV2ThreadProjection[];
@@ -492,14 +514,24 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     readonly withDefaults?: boolean;
     readonly withFallback?: boolean;
     readonly pageSize?: number;
+    readonly realPendingContext?: boolean;
   } = {},
 ) {
   const store = yield* BoardStore.KanbanStore;
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "cutover-actions-state-" });
   const config = { stateDir, baseDir: stateDir } as ServerConfig.ServerConfig["Service"];
+  const realPending = options.realPendingContext
+    ? yield* PendingContext.CutoverContext.pipe(
+        Effect.provide(
+          PendingContext.layer.pipe(
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+          ),
+        ),
+      )
+    : undefined;
   const records = new Map(
     (options.threads ?? fixtureThreads()).map((entry) => [entry.thread.id, entry]),
   );
@@ -577,6 +609,11 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
       const current = get(id);
       return {
         ...current,
+        messages: current.messages.filter(
+          (message) =>
+            !filter?.messageRunIds ||
+            (message.runId !== null && filter.messageRunIds.includes(message.runId)),
+        ),
         turnItems: current.turnItems.filter(
           (item) =>
             (!filter?.turnItemTypes || filter.turnItemTypes.includes(item.type)) &&
@@ -756,17 +793,26 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
           return [{ id: "fixture-native", ready: true, reason: "healthy" }];
         }),
     }),
-    Layer.mock(PendingContext.CutoverContext)({
-      status: () => Effect.sync(() => (accepted ? ("accepted" as const) : ("pending" as const))),
-      put: (value) =>
-        Effect.sync(() => {
-          contexts.push(value);
+    realPending
+      ? Layer.succeed(PendingContext.CutoverContext, {
+          ...realPending,
+          put: (value) =>
+            Effect.sync(() => {
+              contexts.push(value);
+            }).pipe(Effect.andThen(realPending.put(value))),
+        })
+      : Layer.mock(PendingContext.CutoverContext)({
+          status: () =>
+            Effect.sync(() => (accepted ? ("accepted" as const) : ("pending" as const))),
+          put: (value) =>
+            Effect.sync(() => {
+              contexts.push(value);
+            }),
+          remove: (id) =>
+            Effect.sync(() => {
+              removedContexts.push(id);
+            }),
         }),
-      remove: (id) =>
-        Effect.sync(() => {
-          removedContexts.push(id);
-        }),
-    }),
     Layer.mock(ProviderSessions.ProviderSessionManagerV2)({
       peek: (id) =>
         Effect.sync(() => {
@@ -790,6 +836,7 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     removedContexts,
     fileWrites,
     stateDir,
+    pending: realPending,
     released: (id: string) =>
       cutoverThreadReleased(id).pipe(Effect.provideService(ServerConfig.ServerConfig, config)),
     settingsWrites,
@@ -805,8 +852,8 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     project: () => currentProject,
     task: () => currentTask,
     shellReads: () => shellReads,
-    failAdoptions: () => {
-      failAdoptions = true;
+    failAdoptions: (value = true) => {
+      failAdoptions = value;
     },
     failSends: () => {
       failSends = true;
@@ -862,6 +909,46 @@ it.effect(
         const sql = yield* SqlClient.SqlClient;
         const before = yield* sql`SELECT name, sql FROM sqlite_schema ORDER BY name`;
         const plan = yield* h.actions.plan;
+        const scopeCounts = plan.items.reduce<Record<string, number>>((counts, item) => {
+          const scope = item.key.split(":")[0]!;
+          counts[scope] = (counts[scope] ?? 0) + 1;
+          return counts;
+        }, {});
+        assert.deepStrictEqual(
+          {
+            items: plan.items.length,
+            scopes: scopeCounts,
+            selectionChanges: plan.items.filter((item) => item.kind === "selection").length,
+            wakeThreads: plan.items.filter((item) => item.kind === "thread" && item.wake).length,
+            quietThreads: plan.items.filter((item) => item.kind === "thread" && !item.wake).length,
+            queueReleaseThreads: (
+              itemFor(plan, "finalize").payload as { queueThreads: readonly string[] }
+            ).queueThreads.length,
+            refusals: plan.refusals,
+            readiness: plan.readiness,
+          },
+          {
+            items: 27,
+            scopes: {
+              settings: 7,
+              project: 1,
+              board: 1,
+              pinned: 3,
+              schedule: 1,
+              fallback: 1,
+              thread: 9,
+              queued: 1,
+              card: 2,
+              finalize: 1,
+            },
+            selectionChanges: 15,
+            wakeThreads: 5,
+            quietThreads: 4,
+            queueReleaseThreads: 9,
+            refusals: [],
+            readiness: [{ id: "fixture-native", ready: true, reason: "healthy" }],
+          },
+        );
         assert.deepStrictEqual(plan.refusals, []);
         assert.deepStrictEqual(plan.readiness, [
           { id: "fixture-native", ready: true, reason: "healthy" },
@@ -1622,6 +1709,109 @@ it.effect(
         assert.strictEqual(new Set(h.sends.map((value) => value.messageId)).size, 1);
         assert.isFalse(status.completed);
         assert.deepStrictEqual(h.settingsWrites, []);
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "board, pinned and fallback changes roll back in the board database without touching the main database",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const main = yield* SqlClient.SqlClient;
+        const boards = yield* BoardsDatabase.client;
+        assert.notStrictEqual(main, boards);
+        const h = yield* makeHarness();
+        const beforeMain = yield* main`SELECT name, sql FROM sqlite_schema ORDER BY name`;
+        const plan = yield* h.actions.plan;
+        const selected = plan.items.filter((entry) =>
+          ["board:", "pinned:", "fallback:"].some((prefix) => entry.key.startsWith(prefix)),
+        );
+        for (const entry of selected) yield* h.actions.apply(entry, "switch");
+        assert.deepStrictEqual((yield* h.store.card(pinned.id))!.model, nativeOpus);
+        assert.deepStrictEqual((yield* h.store.boards)[0]!.defaultCardModel, nativeOpus);
+        assert.deepStrictEqual(yield* readBlockRetry(boards, task), {
+          ...retry,
+          fallbacks: [nativeSol, glm, nativeOpus],
+        });
+        for (const entry of selected.toReversed()) yield* h.actions.apply(entry, "rollback");
+        assert.deepStrictEqual(yield* h.store.boards, [board]);
+        assert.deepStrictEqual(yield* h.store.cards(board.id), cards);
+        assert.deepStrictEqual(yield* h.store.pools(board.id), pools);
+        assert.deepStrictEqual(yield* readBlockRetry(boards, task), retry);
+        assert.deepStrictEqual(
+          yield* main`SELECT name, sql FROM sqlite_schema ORDER BY name`,
+          beforeMain,
+        );
+        assert.deepStrictEqual(
+          yield* main`SELECT name FROM sqlite_schema WHERE name GLOB 'ardud_kanban_*' OR name = 'ardud_scheduled_task_block_retry'`,
+          [],
+        );
+      }),
+    ).pipe(Effect.provide(splitDatabase)),
+);
+
+it.effect(
+  "a failed adoption retries the same final owner-answer context without losing its queued answer",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness({
+          ...onlyThread("answer-retry", "interrupted"),
+          realPendingContext: true,
+        });
+        const entry = itemFor(yield* h.actions.plan, "thread:answer-retry");
+        const original = h.get("answer-retry");
+        const answer = {
+          ...makeRun(original.thread, "queued", 2),
+          userMessageId: MessageId.make("async-answer:owner-decision"),
+        };
+        const message: OrchestrationV2ThreadProjection["messages"][number] = {
+          id: answer.userMessageId,
+          threadId: original.thread.id,
+          runId: answer.id,
+          nodeId: null,
+          role: "user",
+          text: "Keep the branch and wait for my deploy approval.",
+          attachments: [],
+          streaming: false,
+          createdBy: "user",
+          creationSource: "server",
+          createdAt: now,
+          updatedAt: now,
+        };
+        h.replace("answer-retry", { runs: [...original.runs, answer], messages: [message] });
+        h.failAdoptions();
+        const failed = yield* Effect.result(h.actions.apply(entry, "switch"));
+        assert.isTrue(Result.isFailure(failed));
+        if (Result.isFailure(failed) && failed.failure._tag === "CutoverError")
+          assert.strictEqual(failed.failure.operation, "switch");
+        assert.strictEqual(yield* h.pending!.status("answer-retry"), "pending");
+        h.failAdoptions(false);
+        yield* h.actions.apply(entry, "switch");
+        assert.strictEqual(h.contexts.length, 2);
+        assert.deepStrictEqual(h.contexts[0], h.contexts[1]);
+        assert.strictEqual(h.contexts[0]!.refreshPending, true);
+        assert.include(h.contexts[0]!.text, `Owner answered: ${message.text}`);
+        assert.strictEqual(h.contexts[0]!.text.split(message.text).length - 1, 1);
+        assert.deepStrictEqual(h.get("answer-retry").messages, [message]);
+        assert.deepStrictEqual(h.get("answer-retry").runs[1], {
+          ...answer,
+          modelSelection: nativeOpus,
+          providerInstanceId: nativeOpus.instanceId,
+        });
+        assert.strictEqual(
+          h.commands.filter((command) => command.type === "queued-run.rebind-selection").length,
+          1,
+        );
+        const claim = {
+          threadId: "answer-retry",
+          targetInstance: "claudeAgent",
+          runId: "native:carry-on",
+        };
+        assert.strictEqual(yield* h.pending!.read(claim), h.contexts[0]!.text);
+        assert.strictEqual(yield* h.pending!.status("answer-retry"), "claimed");
+        assert.deepStrictEqual(h.sends, []);
       }),
     ).pipe(Effect.provide(database)),
 );

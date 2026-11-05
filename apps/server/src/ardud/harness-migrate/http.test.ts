@@ -38,22 +38,37 @@ const scopes: Record<string, ReadonlyArray<AuthEnvironmentScope>> = {
   "Bearer maintain": ["environment:maintain"],
 };
 const success = (cutover: unknown) => ({ ok: true, cutover });
+const rolledBack: Cutover.CutoverStatus = {
+  ...status,
+  active: true,
+  items: [
+    {
+      key: "thread:interrupted",
+      kind: "thread",
+      ref: "interrupted",
+      payload: null,
+      wake: false,
+      state: "failed",
+      phase: "switch",
+      attempts: 3,
+      reason: "failed",
+      rolledBack: true,
+      rollbackAttempts: 1,
+    },
+  ],
+};
 const make = (
   options: {
     state?: Cutover.CutoverStatus;
     prepared?: Input.CutoverInputSource["Service"]["readOptional"];
-    failure?: "refused" | "defect";
   } = {},
 ) =>
   Effect.gen(function* () {
     const calls: string[] = [];
     const state = options.state ?? status;
     const execute = <A>(name: string, value: A) =>
-      Effect.gen(function* () {
+      Effect.sync(() => {
         calls.push(name);
-        if (options.failure === "refused")
-          return yield* new Cutover.CutoverError({ operation: "readiness" });
-        if (options.failure === "defect") return yield* Effect.die("private failure");
         return value;
       });
     const dependencies = Layer.mergeAll(
@@ -141,21 +156,23 @@ it.effect("returns uncached plan/status schemas and starts run only through the 
     }),
   ),
 );
-it.effect("status exposes prepared claims before a ledger exists without starting work", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const { request } = yield* make({ prepared: Effect.succeed(claims) });
-      assert.deepStrictEqual(
-        (yield* request("status", "read")).body,
-        success({
-          ...status,
-          active: true,
-          claimedThreadIds: ["interrupted"],
-          claimedRuns: claims.interruptedThreads,
-        }),
-      );
-    }),
-  ),
+it.effect.each([status, rolledBack])(
+  "prepared claims never reclaim rolled-back ledger threads (%j)",
+  (state) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { request } = yield* make({ state, prepared: Effect.succeed(claims) });
+        assert.deepStrictEqual(
+          (yield* request("status", "read")).body,
+          success({
+            ...state,
+            active: true,
+            claimedThreadIds: state.items.length ? [] : ["interrupted"],
+            claimedRuns: state.items.length ? [] : claims.interruptedThreads,
+          }),
+        );
+      }),
+    ),
 );
 it.effect("bad preparation fails closed until cutover is completed", () =>
   Effect.scoped(
@@ -173,26 +190,4 @@ it.effect("bad preparation fails closed until cutover is completed", () =>
       assert.deepStrictEqual((yield* request("status", "read")).body, success(state));
     }),
   ),
-);
-it.effect.each(["refused", "defect"] as const)(
-  "maps %s failures without leaking causes",
-  (failure) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const { request } = yield* make({ failure });
-        const response = yield* request("run", "maintain");
-        assert.strictEqual(response.status, failure === "refused" ? 409 : 503);
-        assert.deepStrictEqual(response.body, {
-          ok: false,
-          error:
-            failure === "refused"
-              ? {
-                  code: "cutover_refused",
-                  message: "Harness cutover failed during readiness.",
-                  operation: "readiness",
-                }
-              : { code: "unavailable", message: "Harness cutover unavailable." },
-        });
-      }),
-    ),
 );

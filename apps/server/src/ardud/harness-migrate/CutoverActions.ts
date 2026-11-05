@@ -21,7 +21,6 @@ import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as ServerConfig from "../../config.ts";
-import * as SqlClient from "effect/sql/SqlClient";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as Threads from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Projects from "../../project/ProjectService.ts";
@@ -32,6 +31,7 @@ import * as Projections from "../../orchestration-v2/ProjectionStore.ts";
 import { sessionHoldsWork } from "../archive-if-idle/idle.ts";
 import * as Kanban from "../kanban/engine/KanbanService.ts";
 import * as BoardStore from "../kanban/store/KanbanStore.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { runningBackgroundWork } from "../context-reset/backgroundWork.ts";
 import { planBoard, type BoardSnapshot } from "./boardPlan.ts";
 import { planSettings, parseProjectOverrideRef } from "./settingsPlan.ts";
@@ -104,7 +104,7 @@ export const layer = Layer.effect(
     const threads = yield* Threads.ThreadManagementService;
     const boards = yield* Kanban.KanbanService;
     const store = yield* BoardStore.KanbanStore;
-    const sql = yield* SqlClient.SqlClient;
+    const boardSql = yield* BoardsDatabase.client;
     const inputSource = yield* Input.CutoverInputSource;
     const readiness = yield* Readiness.CutoverReadiness;
     const pending = yield* PendingContext.CutoverContext;
@@ -124,6 +124,7 @@ export const layer = Layer.effect(
       const asksByThread = new Map<string, string[]>();
       const deferredBoardThreads = new Set<string>();
       const queueThreads = new Set<ThreadId>();
+      const releaseBoardIds = new Set<string>();
       const current = yield* settings.getSettings.pipe(Effect.mapError(fail("settings")));
       const input = yield* inputSource.read.pipe(Effect.result);
       if (input._tag === "Failure") refusals.push({ ref: "input", reason: input.failure.message });
@@ -260,7 +261,7 @@ export const layer = Layer.effect(
       const scheduled = yield* schedules.list().pipe(Effect.mapError(fail("schedules")));
       for (const task of scheduled.tasks) {
         addSelection("schedule", task.id, task.modelSelection);
-        const retry = yield* readBlockRetry(sql, task, { readOnly: true }).pipe(
+      const retry = yield* readBlockRetry(boardSql, task, { readOnly: true }).pipe(
           Effect.mapError(fail("fallbacks")),
         );
         if (retry !== null) {
@@ -421,6 +422,7 @@ export const layer = Layer.effect(
           });
           continue;
         }
+        releaseBoardIds.add(currentCard.boardId);
         items.push({
           key: `card:${card.id}`,
           kind: "card",
@@ -439,7 +441,7 @@ export const layer = Layer.effect(
         wake: false,
         payload: {
           boards: boardList
-            .filter((board) => board.pause !== null)
+            .filter((board) => board.pause !== null && releaseBoardIds.has(board.id))
             .map((board) => ({ id: board.id, pause: board.pause })),
           queueThreads: [...queueThreads],
         },
@@ -769,13 +771,13 @@ export const layer = Layer.effect(
         };
         const value =
           phase === "rollback" ? { ...source, before: source.after, after: source.before } : source;
-        const current = yield* readBlockRetry(sql, value.task).pipe(
+        const current = yield* readBlockRetry(boardSql, value.task).pipe(
           Effect.mapError(fail("fallback-read")),
         );
         if (sameValue(current, value.after)) return;
         if (!sameValue(current, value.before))
           return yield* new CutoverError({ operation: "fallback-changed" });
-        yield* writeBlockRetry(sql, value.task, value.after).pipe(
+        yield* writeBlockRetry(boardSql, value.task, value.after).pipe(
           Effect.mapError(fail("fallback-write")),
         );
       } else if (item.key.startsWith("pinned:")) {
@@ -784,7 +786,7 @@ export const layer = Layer.effect(
           phase === "rollback" ? { before: source.after, after: source.before } : source;
         yield* boards
           .withSelectionMigrationLock(
-            sql.withTransaction(
+            boardSql.withTransaction(
               Effect.gen(function* () {
                 const current = yield* store.card(value.before.id);
                 if (sameValue(current, value.after)) return;
@@ -823,7 +825,7 @@ export const layer = Layer.effect(
           phase === "rollback" ? { before: source.after, after: source.before } : source;
         yield* boards
           .withSelectionMigrationLock(
-            sql.withTransaction(
+            boardSql.withTransaction(
               Effect.gen(function* () {
                 const board = (yield* store.boards).find(
                   (entry) => entry.id === payload.before.board.id,

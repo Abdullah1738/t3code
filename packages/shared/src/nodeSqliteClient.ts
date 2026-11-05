@@ -46,6 +46,8 @@ export interface SqliteClientConfig {
    * Ignored for in-memory databases.
    */
   readonly checkpointWorker?: boolean | undefined;
+  /** Used by split stores to gate public access until their background copy commits. */
+  readonly beforeAcquire?: Effect.Effect<void> | undefined;
 }
 
 // SqlClient masks transaction acquisition, so readOnly carries the caller's interruption policy.
@@ -1073,14 +1075,22 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const readerSemaphore = yield* Semaphore.make(1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
-  const route = Effect.withFiber((fiber) =>
-    acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
-      ? Effect.map(acquireReader, (readerConnection) =>
-          readerConnection === undefined
-            ? writer
-            : { name: "reader" as const, lock: readerSemaphore, connection: readerConnection },
-        )
-      : Effect.succeed(writer),
+  const admission = Effect.withFiber((fiber) => {
+    const wait = options.beforeAcquire ?? Effect.void;
+    const restore = fiber.getRef(TransactionAcquire)?.restore;
+    return restore === undefined ? wait : restore(wait);
+  });
+  const route = Effect.andThen(
+    admission,
+    Effect.withFiber((fiber) =>
+      acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
+        ? Effect.map(acquireReader, (readerConnection) =>
+            readerConnection === undefined
+              ? writer
+              : { name: "reader" as const, lock: readerSemaphore, connection: readerConnection },
+          )
+        : Effect.succeed(writer),
+    ),
   );
 
   const acquired = (

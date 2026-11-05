@@ -1535,7 +1535,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           candidate.runId === queuedRun.id &&
           candidate.messageId === queuedRun.userMessageId,
       );
-      const queuedProviderThread = projection.providerThreads.find(
+      const storedQueuedProviderThread = projection.providerThreads.find(
         (candidate) => candidate.id === providerThreadId,
       );
       const storedCheckpointScope = projection.checkpointScopes.find(
@@ -1545,7 +1545,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNode === undefined ||
         attempt === undefined ||
         queuedMessage === undefined ||
-        queuedProviderThread === undefined ||
+        storedQueuedProviderThread === undefined ||
         (rootNode.checkpointScopeId !== null && storedCheckpointScope === undefined)
       ) {
         return yield* new OrchestratorDispatchError({
@@ -1555,6 +1555,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
+      const activeProviderThread = projection.providerThreads.find(
+        (candidate) => candidate.id === projection.thread.activeProviderThreadId,
+      );
+      const freshContext = queuedRun.contextReset === true;
+      // Cutover maps queues before the carry-on creates its native conversation.
+      // Resume that conversation instead of starting the untouched queue placeholder.
+      const resumeCutoverThread =
+        projection.thread.harnessMigrationFence === true &&
+        !freshContext &&
+        storedQueuedProviderThread.nativeThreadRef === null &&
+        storedQueuedProviderThread.firstRunOrdinal === null &&
+        activeProviderThread?.providerInstanceId === queuedRun.providerInstanceId &&
+        activeProviderThread.nativeThreadRef?.nativeId != null;
+      const queuedProviderThread = resumeCutoverThread
+        ? activeProviderThread
+        : storedQueuedProviderThread;
+      const providerThreadChanged = queuedProviderThread.id !== providerThreadId;
       const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
       const now = yield* DateTime.now;
       const selectionChanged = !modelSelectionsEqual(
@@ -1575,12 +1592,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ),
             )
         : null;
-      const activeProviderThread = projection.providerThreads.find(
-        (candidate) => candidate.id === projection.thread.activeProviderThreadId,
-      );
       // ardud: a context-reset note's only context is the note, so it never
       // resumes the old native thread or folds earlier runs into a handoff.
-      const freshContext = queuedRun.contextReset === true;
       const canResumeAcrossInstances =
         !freshContext &&
         switchPlan?.instanceChanged === true &&
@@ -1752,7 +1765,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               )
           : null;
       const activeHandoff = handoff ?? legacyImportRecoveryHandoff;
-      const checkpointScope =
+      const preparedCheckpointScope =
         storedCheckpointScope ??
         (yield* runtimePolicy
           .resolve({ thread: projection.thread, modelSelection: queuedRun.modelSelection })
@@ -1776,6 +1789,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }),
             ),
           ));
+      const checkpointScope = providerThreadChanged
+        ? { ...preparedCheckpointScope, providerThreadId: queuedProviderThread.id }
+        : preparedCheckpointScope;
       const providerSessionId =
         (!canResumeAcrossInstances &&
         queuedProviderThread.providerSessionId !== null &&
@@ -1813,6 +1829,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       };
       const startingRun: OrchestrationV2Run = {
         ...queuedRun,
+        providerThreadId: queuedProviderThread.id,
         ordinal,
         status: "starting",
         queuePosition: null,
@@ -1851,6 +1868,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? {}
             : { senderThreadId: queuedMessage.senderThreadId }),
         }),
+        providerThreadId: queuedProviderThread.id,
         inputIntent: "queued_turn",
         startedAt: now,
         completedAt: now,
@@ -1898,7 +1916,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               summary: activeHandoff.summaryText,
             };
       const checkpointEvents: ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">> =
-        storedCheckpointScope === undefined
+        storedCheckpointScope === undefined || providerThreadChanged
           ? [
               {
                 type: "checkpoint-scope.created",
@@ -1916,7 +1934,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 nodeId: rootNode.id,
                 providerInstanceId: queuedRun.providerInstanceId,
                 occurredAt: now,
-                payload: { ...rootNode, checkpointScopeId: checkpointScope.id },
+                payload: {
+                  ...rootNode,
+                  providerThreadId: queuedProviderThread.id,
+                  checkpointScopeId: checkpointScope.id,
+                },
               },
             ]
           : [];
@@ -2054,6 +2076,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             },
           })),
           ...checkpointEvents,
+          ...(providerThreadChanged
+            ? [{
+                type: "run-attempt.updated" as const,
+                threadId,
+                runId: queuedRun.id,
+                nodeId: rootNodeId,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: { ...attempt, providerThreadId: queuedProviderThread.id },
+              }]
+            : []),
           {
             type: "provider-thread.updated",
             threadId,
@@ -5278,7 +5311,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       !command.commandId.startsWith("harness-cutover:v1:") &&
       (yield* admissionHeld(command.threadId, modelSelection));
     const queueBehindRun =
-      activeRun ?? worktreeMissingRun ?? (heldForCutover ? latestRun : undefined);
+      activeRun ?? worktreeMissingRun ?? (heldForCutover ? latestRun ?? undefined : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     // ardud: a pending fork or merge-back would carry another thread's context
     // into the run a context reset starts, so refuse and leave it pending.

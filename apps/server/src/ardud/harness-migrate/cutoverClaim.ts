@@ -18,9 +18,9 @@ const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(Claims));
 const decodeCutover = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(1) })),
 );
-const decodeExemption = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(1), threadId: Schema.String })),
-);
+const ExemptionJson = Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(1), threadId: Schema.String }));
+const decodeExemption = Schema.decodeUnknownEffect(ExemptionJson);
+const encodeExemption = Schema.encodeEffect(ExemptionJson);
 
 const exemptionFile = Effect.fn("HarnessCutover.exemptionFile")(function* (threadId: string) {
   const config = yield* ServerConfig.ServerConfig;
@@ -50,7 +50,7 @@ export const releaseCutoverThread = Effect.fn("HarnessCutover.releaseThread")(fu
   const temporary = yield* fs.makeTempFileScoped({ directory: root, prefix: ".pending-" });
   yield* fs.chmod(temporary, 0o600);
   const handle = yield* fs.open(temporary, { flag: "w", mode: 0o600 });
-  yield* handle.writeAll(Buffer.from(JSON.stringify({ version: 1, threadId }), "utf8"));
+  yield* handle.writeAll(Buffer.from(yield* encodeExemption({ version: 1, threadId }), "utf8"));
   yield* handle.sync;
   yield* fs.rename(temporary, target);
   const directory = yield* fs.open(root, { flag: "r" });

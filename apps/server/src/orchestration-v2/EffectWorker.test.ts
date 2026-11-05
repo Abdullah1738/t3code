@@ -787,7 +787,10 @@ it.effect("uses durable deadlines, notifications, and a slow liveness poll", () 
     );
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Queue.take(available),
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
+      runControlOnce: Effect.succeed(false),
+      nextControlClaimableAt: Effect.succeed(Option.none()),
       runOnce: Effect.gen(function* () {
         const count = yield* Ref.updateAndGet(attempts, (current) => current + 1);
         if (count === 2) {
@@ -807,6 +810,7 @@ it.effect("uses durable deadlines, notifications, and a slow liveness poll", () 
 
     yield* EffectWorker.runDaemonWithOptions({
       concurrency: 1,
+      controlLaneConcurrency: 0,
       livenessPollIntervalMs: 1_000,
     }).pipe(
       Effect.provideService(EffectWorker.OrchestrationEffectWorkerV2, worker),
@@ -838,7 +842,10 @@ it.effect("does not hot-loop when a claim fails", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
+      runControlOnce: Effect.succeed(false),
+      nextControlClaimableAt: Effect.succeed(Option.none()),
       runOnce: Ref.update(attempts, (count) => count + 1).pipe(
         Effect.andThen(
           new EffectWorker.OrchestrationEffectWorkerError({
@@ -853,6 +860,7 @@ it.effect("does not hot-loop when a claim fails", () =>
 
     yield* EffectWorker.runDaemonWithOptions({
       concurrency: 1,
+      controlLaneConcurrency: 0,
       livenessPollIntervalMs: 1_000,
     }).pipe(
       Effect.provideService(EffectWorker.OrchestrationEffectWorkerV2, worker),
@@ -873,7 +881,10 @@ it.effect("backs off briefly when a due deadline loses a claim race", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
+      runControlOnce: Effect.succeed(false),
+      nextControlClaimableAt: Effect.succeed(Option.none()),
       runOnce: Ref.update(attempts, (count) => count + 1).pipe(Effect.as(false)),
       nextClaimableAt: Effect.succeed(Option.some(now)),
       drain: () => Effect.succeed(0),
@@ -881,6 +892,7 @@ it.effect("backs off briefly when a due deadline loses a claim race", () =>
 
     yield* EffectWorker.runDaemonWithOptions({
       concurrency: 1,
+      controlLaneConcurrency: 0,
       livenessPollIntervalMs: 1_000,
     }).pipe(
       Effect.provideService(EffectWorker.OrchestrationEffectWorkerV2, worker),

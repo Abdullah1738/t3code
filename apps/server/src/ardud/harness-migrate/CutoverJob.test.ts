@@ -51,6 +51,11 @@ const terminalStates = [
   exhausted("thread"),
   exhausted("card"),
   exhausted("finalize"),
+  { ...pending, items: [...exhausted("thread").items, { ...item, kind: "finalize" as const }] },
+  {
+    ...pending,
+    items: [{ ...exhausted("thread").items[0]!, rolledBack: false, rollbackAttempts: 3 }],
+  },
 ];
 const build = (run: Cutover.HarnessCutover["Service"]["run"]) => {
   const engine = Layer.succeed(Cutover.HarnessCutover, {
@@ -63,22 +68,33 @@ const build = (run: Cutover.HarnessCutover["Service"]["run"]) => {
   );
 };
 
-it.effect("does nothing on startup and retains one paced worker beyond the request scope", () =>
+it.effect("starts only explicitly, serializes duplicate runs and outlives the request scope", () =>
   Effect.scoped(
     Effect.gen(function* () {
       let runs = 0;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
       const nextBatch = yield* Deferred.make<void>();
       const job = yield* build(() =>
         Effect.gen(function* () {
           runs++;
-          if (runs === 1) return pending;
+          if (runs === 1) {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return pending;
+          }
           yield* Deferred.succeed(nextBatch, undefined);
           return completed;
         }),
       );
       yield* TestClock.adjust("1 minute");
       assert.strictEqual(runs, 0);
-      yield* Effect.scoped(job.start());
+      const first = yield* Effect.forkChild(Effect.scoped(job.start()));
+      yield* Deferred.await(entered);
+      const second = yield* Effect.forkChild(job.start());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
       assert.deepStrictEqual(yield* job.start(), pending);
       yield* TestClock.adjust(1_999);
       assert.strictEqual(runs, 1);
@@ -90,36 +106,6 @@ it.effect("does nothing on startup and retains one paced worker beyond the reque
   ),
 );
 
-it.effect("serializes concurrent starts while the first batch is still being accepted", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const entered = yield* Deferred.make<void>();
-      const competing = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      let runs = 0;
-      const job = yield* build(() =>
-        Effect.gen(function* () {
-          runs++;
-          yield* Deferred.succeed(entered, undefined);
-          yield* Deferred.await(release);
-          return pending;
-        }),
-      );
-      const first = yield* Effect.forkChild(job.start());
-      yield* Deferred.await(entered);
-      const second = yield* Deferred.succeed(competing, undefined).pipe(
-        Effect.andThen(job.start()),
-        Effect.forkChild,
-      );
-      yield* Deferred.await(competing);
-      assert.strictEqual(runs, 1);
-      yield* Deferred.succeed(release, undefined);
-      yield* Fiber.join(first);
-      yield* Fiber.join(second);
-      assert.strictEqual(runs, 1);
-    }),
-  ),
-);
 it.effect.each(terminalStates)(
   "stops on terminal status in the first or background batch (%j)",
   (terminal) =>
@@ -167,27 +153,44 @@ it.effect("a server scope restart does not resume persisted work until explicitl
   }),
 );
 
-it.effect("keeps processing untouched work after a different item exhausts its retries", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      let runs = 0;
-      const settled = yield* Deferred.make<void>();
-      const job = yield* build(() =>
-        Effect.gen(function* () {
-          runs++;
-          if (runs === 1) return pending;
-          if (runs === 2)
-            return { ...pending, items: [...exhausted("thread").items, { ...item, key: "other" }] };
-          yield* Deferred.succeed(settled, undefined);
-          return completed;
-        }),
-      );
-      yield* job.start();
-      yield* TestClock.adjust("2 seconds");
-      yield* TestClock.adjust("2 seconds");
-      yield* Deferred.await(settled);
-      yield* TestClock.adjust("1 minute");
-      assert.strictEqual(runs, 3);
-    }),
-  ),
+it.effect.each(["untouched", "rollback", "successful-third-attempt"])(
+  "keeps %s work actionable",
+  (work) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let runs = 0;
+        const settled = yield* Deferred.make<void>();
+        const job = yield* build(() =>
+          Effect.gen(function* () {
+            runs++;
+            if (runs === 1) return pending;
+            if (runs === 2) {
+              const failed = exhausted("thread").items[0]!;
+              const items =
+                work === "untouched"
+                  ? [failed, { ...item, key: "other" }]
+                  : work === "rollback"
+                    ? [{ ...failed, rolledBack: false }]
+                    : [
+                        {
+                          ...item,
+                          state: "switched" as const,
+                          phase: "brief" as const,
+                          attempts: 3,
+                        },
+                      ];
+              return { ...pending, items };
+            }
+            yield* Deferred.succeed(settled, undefined);
+            return completed;
+          }),
+        );
+        yield* job.start();
+        yield* TestClock.adjust("2 seconds");
+        yield* TestClock.adjust("2 seconds");
+        yield* Deferred.await(settled);
+        yield* TestClock.adjust("1 minute");
+        assert.strictEqual(runs, 3);
+      }),
+    ),
 );
