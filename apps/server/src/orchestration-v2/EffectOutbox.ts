@@ -218,6 +218,7 @@ const isEffectOutboxError = Schema.is(EffectOutboxError);
 
 export interface EffectOutboxV2Shape {
   readonly awaitAvailable: Effect.Effect<void>;
+  readonly awaitControlAvailable: Effect.Effect<void>;
   readonly notifyAvailable: (count?: number) => Effect.Effect<void>;
   /** Persist rows only. Notify workers after the surrounding transaction commits. */
   readonly enqueue: (
@@ -319,6 +320,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const available = yield* Queue.dropping<void>(64);
+    const controlAvailable = yield* Queue.dropping<void>(64);
     const cancellationSignals = new Map<string, Deferred.Deferred<void>>();
     const settledSignals = new Map<string, Deferred.Deferred<void>>();
     const signalSettled = (effectIds: ReadonlyArray<string>) =>
@@ -332,11 +334,18 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         { discard: true },
       );
-    const notifyAvailable = (count = 1) =>
-      Queue.offerAll(
-        available,
-        Array.from({ length: Math.min(64, Math.max(0, Math.floor(count))) }, () => undefined),
-      ).pipe(Effect.asVoid);
+    const notifyAvailable = (count = 1) => {
+      const signals = Array.from(
+        { length: Math.min(64, Math.max(0, Math.floor(count))) },
+        () => undefined,
+      );
+      // A control worker cannot claim starts; its wakeup must not steal the
+      // only notification from an idle general worker (or vice versa).
+      return Queue.offerAll(available, signals).pipe(
+        Effect.andThen(Queue.offerAll(controlAvailable, signals)),
+        Effect.asVoid,
+      );
+    };
     // An earlier effect waiting out a retry backoff still blocks later ones, so
     // a turn cannot start while a failed rollback is about to restore files.
     const claimableCandidatePredicate = (
@@ -449,6 +458,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           Effect.mapError((cause) => new EffectOutboxError({ operation: "get", effectId, cause })),
         ),
       awaitAvailable: Queue.take(available),
+      awaitControlAvailable: Queue.take(controlAvailable),
       notifyAvailable,
       listByCommandId: (commandId) =>
         sql<EffectRow>`

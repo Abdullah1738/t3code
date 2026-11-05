@@ -574,6 +574,7 @@ const isOrchestrationEffectWorkerError = Schema.is(OrchestrationEffectWorkerErro
 
 export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
+  readonly awaitControlWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
@@ -831,6 +832,7 @@ export const layerWithOptions = (
 
       return OrchestrationEffectWorkerV2.of({
         awaitWork: outbox.awaitAvailable,
+        awaitControlWork: outbox.awaitControlAvailable,
         runOnce: runOnce(),
         runRecoveryOnce: runOnce(true),
         runControlOnce: runOnce(false, true),
@@ -931,7 +933,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             },
           });
           yield* Effect.raceFirst(
-            worker.awaitWork.pipe(Effect.as("notified" as const)),
+            (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
+              Effect.as("notified" as const),
+            ),
             Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
           );
         }

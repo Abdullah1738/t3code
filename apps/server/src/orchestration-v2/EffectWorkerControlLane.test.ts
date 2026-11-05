@@ -63,6 +63,97 @@ const workerLayer = (
     ),
   );
 
+it.effect("wakes an idle general worker when a control waiter is first", () =>
+  Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const releaseGeneral = yield* Deferred.make<void>();
+    const laneWaiting = yield* Deferred.make<void>();
+    const allWaiting = yield* Deferred.make<void>();
+    const waits = yield* Ref.make(0);
+    const ran = yield* Deferred.make<void>();
+    const observed: EffectOutbox.EffectOutboxV2Shape = {
+      ...outbox,
+      claimNext: (input) =>
+        (input.onlyEffectTypes === undefined ? Deferred.await(releaseGeneral) : Effect.void).pipe(
+          Effect.andThen(outbox.claimNext(input)),
+        ),
+      awaitControlAvailable: Effect.gen(function* () {
+        yield* Deferred.succeed(laneWaiting, undefined);
+        yield* outbox.awaitControlAvailable;
+      }),
+      awaitAvailable: Effect.gen(function* () {
+        const count = yield* Ref.updateAndGet(waits, (n) => n + 1);
+        if (count === 4) yield* Deferred.succeed(allWaiting, undefined);
+        yield* outbox.awaitAvailable;
+      }),
+    };
+    yield* Effect.gen(function* () {
+      yield* EffectWorker.runDaemonWithOptions().pipe(Effect.forkScoped);
+      yield* Deferred.await(laneWaiting);
+      yield* TestClock.adjust("0 millis");
+      yield* Deferred.succeed(releaseGeneral, undefined);
+      yield* Deferred.await(allWaiting);
+      yield* TestClock.adjust("0 millis");
+      yield* outbox.enqueue([start("single-notification")]);
+      yield* outbox.notifyAvailable();
+      yield* TestClock.adjust("1 second");
+      assert.isTrue(yield* Deferred.isDone(ran));
+    }).pipe(
+      Effect.provide(workerLayer(observed, () => Deferred.succeed(ran, undefined).pipe(Effect.asVoid))),
+      Effect.scoped,
+    );
+  }).pipe(Effect.provide(Layer.merge(layerOutbox, TestClock.layer()))),
+);
+
+it.effect("wakes a control worker even if general workers consume a notification first", () =>
+  Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const generalBlocked = yield* Queue.unbounded<void>();
+    const releaseGeneral = yield* Deferred.make<void>();
+    const allWaiting = yield* Deferred.make<void>();
+    const laneWaiting = yield* Deferred.make<void>();
+    const waits = yield* Ref.make(0);
+    const generalWake = yield* Deferred.make<void>();
+    const holdGeneral = yield* Deferred.make<void>();
+    const executed = yield* Deferred.make<void>();
+    const observed: EffectOutbox.EffectOutboxV2Shape = {
+      ...outbox,
+      claimNext: (input) =>
+        (input.onlyEffectTypes === undefined
+          ? Queue.offer(generalBlocked, undefined).pipe(Effect.andThen(Deferred.await(releaseGeneral)))
+          : Effect.void
+        ).pipe(Effect.andThen(outbox.claimNext(input))),
+      awaitAvailable: Effect.gen(function* () {
+        const count = yield* Ref.updateAndGet(waits, (n) => n + 1);
+        if (count === 4) yield* Deferred.succeed(allWaiting, undefined);
+        yield* outbox.awaitAvailable;
+        yield* Deferred.succeed(generalWake, undefined);
+        yield* Deferred.await(holdGeneral);
+      }),
+      awaitControlAvailable: Deferred.await(laneWaiting).pipe(
+        Effect.andThen(outbox.awaitControlAvailable),
+      ),
+    };
+    yield* Effect.gen(function* () {
+      yield* EffectWorker.runDaemonWithOptions().pipe(Effect.forkScoped);
+      yield* Effect.forEach([0, 1, 2, 3], () => Queue.take(generalBlocked));
+      yield* Deferred.succeed(releaseGeneral, undefined);
+      yield* Deferred.await(allWaiting);
+      yield* TestClock.adjust("0 millis");
+      yield* outbox.enqueue([interrupt("single-control-notification")]);
+      yield* outbox.notifyAvailable();
+      yield* Deferred.await(generalWake);
+      yield* Deferred.succeed(laneWaiting, undefined);
+      yield* TestClock.adjust("1 second");
+      assert.isTrue(yield* Deferred.isDone(executed));
+      assert.equal(Option.getOrThrow(yield* outbox.get("single-control-notification")).attemptCount, 1);
+    }).pipe(
+      Effect.provide(workerLayer(observed, () => Deferred.succeed(executed, undefined).pipe(Effect.asVoid))),
+      Effect.scoped,
+    );
+  }).pipe(Effect.provide(Layer.merge(layerOutbox, TestClock.layer()))),
+);
+
 it.effect("runs an interrupt while all four general workers are blocked by starts", () =>
   Effect.gen(function* () {
     const outbox = yield* EffectOutbox.EffectOutboxV2;

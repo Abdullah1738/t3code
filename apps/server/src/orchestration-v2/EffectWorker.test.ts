@@ -787,6 +787,7 @@ it.effect("uses durable deadlines, notifications, and a slow liveness poll", () 
     );
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Queue.take(available),
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
       nextControlClaimableAt: Effect.succeed(Option.none()),
@@ -841,6 +842,7 @@ it.effect("does not hot-loop when a claim fails", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
       nextControlClaimableAt: Effect.succeed(Option.none()),
@@ -879,6 +881,7 @@ it.effect("backs off briefly when a due deadline loses a claim race", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
       nextControlClaimableAt: Effect.succeed(Option.none()),
