@@ -384,6 +384,8 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
+    readonly afterThreadId?: string;
+    readonly limit?: number;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error

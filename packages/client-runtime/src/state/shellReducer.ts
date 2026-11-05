@@ -88,6 +88,11 @@ export function mergeShellSnapshotProjects(
   }
 
   const isEnrichment = options !== undefined;
+  if (!isEnrichment && next.page?.after != null) {
+    const threads = new Map(previous.threads.map((thread) => [thread.id, thread]));
+    for (const thread of next.threads) threads.set(thread.id, thread);
+    return { ...previous, threads: [...threads.values()], page: next.page };
+  }
   const resolvedRootSet = isEnrichment ? new Set(options.resolvedRepositoryIdentityRoots) : null;
 
   if (isEnrichment) {

@@ -17,6 +17,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import * as Statement from "effect/sql/Statement";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -10410,6 +10411,16 @@ it.effect.each([false, true])("first-boot requests wait for pool rekey with tran
         );
         yield* Effect.yieldNow;
         assert.isFalse(yield* Deferred.isDone(changed));
+        const snapshots = yield* Effect.forEach([1, 2], () =>
+          kanban.watch(board.id).pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped),
+        );
+        yield* Effect.yieldNow;
+        const builders = yield* ReplyBuilders.ReplyBuilders;
+        assert.isTrue(
+          yield* builders.takeIfAvailable(2),
+          "board startup waits must not occupy reply builders",
+        );
+        yield* builders.release(2);
         yield* Deferred.succeed(ready, undefined);
         if (failFirstRead) {
           yield* Deferred.await(failed);
@@ -10418,8 +10429,14 @@ it.effect.each([false, true])("first-boot requests wait for pool rekey with tran
         }
         yield* Deferred.await(reached);
         assert.isFalse(yield* Deferred.isDone(changed));
+        assert.isTrue(
+          yield* builders.takeIfAvailable(2),
+          "pool rekey waits must not occupy reply builders",
+        );
+        yield* builders.release(2);
         yield* Deferred.succeed(release, undefined);
         yield* Fiber.join(write);
+        yield* Effect.forEach(snapshots, Fiber.join);
         const pools = yield* store.pools(board.id);
         assert.isFalse(pools.some((pool) => pool.key === oldKey));
         assert.strictEqual(pools.find((pool) => pool.key === Rules.poolKey(haiku))?.slots, 2);
@@ -10429,6 +10446,7 @@ it.effect.each([false, true])("first-boot requests wait for pool rekey with tran
         Effect.provideService(BoardsDatabase.BoardsDatabase, BoardsDatabase.BoardsDatabase.of({
           sql, ready: Deferred.await(ready), path: ":memory:",
         })),
+        Effect.provide(ReplyBuilders.layer),
       );
     }).pipe(Effect.provide(probeDeps(fake.layer)));
   }),

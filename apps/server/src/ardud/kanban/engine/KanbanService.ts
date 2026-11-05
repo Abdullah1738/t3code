@@ -83,6 +83,8 @@ import * as Subtasks from "./subtasks.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
 import * as Pages from "./messagePages.ts";
+import * as BoardReplies from "./boardReplies.ts";
+import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
@@ -216,6 +218,7 @@ export type KanbanWatchEvent =
   | { readonly _tag: "change"; readonly change: KanbanChange };
 
 export interface KanbanServiceShape {
+  readonly ready: Effect.Effect<void>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanError>;
   readonly withSelectionMigrationLock: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
@@ -250,6 +253,10 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<KanbanBoard, KanbanError>;
   readonly snapshot: (
     boardId: KanbanBoard["id"],
+  ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
+  readonly replySnapshot: (
+    boardId: KanbanBoard["id"],
+    page?: { readonly after: number; readonly limit: number },
   ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
   readonly watch: (boardId: KanbanBoard["id"]) => Stream.Stream<KanbanWatchEvent, KanbanError>;
   /** Every board with its list counts, then what changed whenever a count, board or thread does. */
@@ -1215,9 +1222,13 @@ const make = Effect.gen(function* () {
     return [...running, ...ended];
   });
 
-  const snapshotOf = Effect.fn("KanbanService.snapshotOf")(function* (boardId: KanbanBoard["id"]) {
+  const snapshotOf = Effect.fn("KanbanService.snapshotOf")(function* (
+    boardId: KanbanBoard["id"],
+    feed = false,
+    page?: { readonly after: number; readonly limit: number },
+  ) {
     const board = yield* boardOf(boardId);
-    const cards = yield* store.cards(boardId);
+    const cards = yield* feed ? store.feedCards(boardId, page) : store.cards(boardId);
     const live = [
       ...new Set(cards.flatMap((card) => (card.activeThreadId ? [card.activeThreadId] : []))),
     ];
@@ -1232,8 +1243,10 @@ const make = Effect.gen(function* () {
     });
     return {
       board,
-      cards,
-      goals: yield* store.goals(boardId),
+      cards: feed ? cards.map(BoardReplies.feedCard) : cards,
+      goals: (yield* feed ? store.feedGoals(boardId) : store.goals(boardId)).map((goal) =>
+        feed ? BoardReplies.feedGoal(goal) : goal,
+      ),
       pools: yield* store.pools(boardId),
       groups: yield* store.groups(boardId),
       threads: states.flat(),
@@ -7010,21 +7023,23 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  // The apps never show a card's prompt (they read one card in full through card), and on big boards prompts are most of the feed.
-  const feedCard = (card: KanbanCard): KanbanCard => ({ ...card, prompt: "" });
   // Big message blocks go out as stubs too; the chat reads the full message by seq.
   const feedChange = (change: KanbanChange): KanbanChange =>
     change._tag === "card"
-      ? { ...change, card: feedCard(change.card) }
+      ? { ...change, card: BoardReplies.feedCard(change.card) }
       : change._tag === "message"
         ? { ...change, message: Pages.stubMessage(change.message) }
-        : change;
+        : change._tag === "goal"
+          ? { ...change, goal: BoardReplies.feedGoal(change.goal) }
+          : change;
 
   const watch: KanbanServiceShape["watch"] = (boardId) =>
     Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
-        const snapshot = yield* readDb(snapshotOf(boardId));
+        const snapshot = yield* read(
+          ReplyBuilders.bounded(snapshotOf(boardId, true).pipe(NodeSqliteClient.readOnly)),
+        );
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
           Stream.map((entry): KanbanWatchEvent => ({
@@ -7035,7 +7050,7 @@ const make = Effect.gen(function* () {
         return Stream.concat(
           Stream.succeed<KanbanWatchEvent>({
             _tag: "snapshot",
-            snapshot: { ...snapshot, cards: snapshot.cards.map(feedCard) },
+            snapshot,
           }),
           live,
         );
@@ -7129,6 +7144,7 @@ const make = Effect.gen(function* () {
     );
 
   return KanbanService.of({
+    ready: Deferred.await(startupReady),
     boards: readDb(store.boards),
     withSelectionMigrationLock: (effect) =>
       Deferred.await(startupReady).pipe(Effect.andThen(locks.exclusive(effect))),
@@ -7137,6 +7153,7 @@ const make = Effect.gen(function* () {
     createBoard,
     updateBoard,
     snapshot: (boardId) => readDb(snapshotOf(boardId)),
+    replySnapshot: (boardId, page) => readDb(snapshotOf(boardId, true, page)),
     watch,
     boardSummaries,
     announce: (boardId, change) => Effect.asVoid(publish(boardId, change)),

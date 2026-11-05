@@ -33,6 +33,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.ts";
 import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import { checkJsonReply } from "../ardud/http/jsonReply.ts";
 
 const isThreadTranscriptTooLargeError = Schema.is(
   ThreadManagementService.ThreadTranscriptTooLargeError,
@@ -75,17 +76,34 @@ export const layer = HttpApiBuilder.group(
         ),
     );
 
-    const loadShellSnapshot = Effect.fn("http.orchestration.loadShellSnapshot")(function* () {
+    const loadShellSnapshot = Effect.fn("http.orchestration.loadShellSnapshot")(function* (
+      after?: string,
+      paged = false,
+    ) {
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "active",
+            ...(paged ? { limit: 501 } : {}),
+            ...(after === undefined ? {} : { afterThreadId: after }),
+          }),
           listProjects: projectStore.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         }),
       );
       const projects = yield* enrichProjectShells(base.projects);
-      return { ...base, projects };
+      if (!paged) return { ...base, projects };
+      const threads = base.threads.slice(0, 500);
+      return {
+        ...base,
+        projects,
+        threads,
+        page: {
+          after: after ?? null,
+          nextAfter: base.threads.length > 500 ? threads.at(-1)!.id : null,
+        },
+      };
     });
 
     const loadThreadSnapshot = Effect.fn("http.orchestration.loadThreadSnapshot")(function* (
@@ -108,6 +126,7 @@ export const layer = HttpApiBuilder.group(
             return yield* failEnvironmentInternal(failureReason, error);
           }),
         ),
+        checkJsonReply,
       );
     });
 
@@ -144,6 +163,7 @@ export const layer = HttpApiBuilder.group(
                 return yield* failEnvironmentInternal("orchestration_thread_history_failed", error);
               }),
             ),
+            checkJsonReply,
           );
       },
     );
@@ -154,7 +174,8 @@ export const layer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          return yield* loadShellSnapshot().pipe(
+          return yield* loadShellSnapshot(args.query.after, args.query.paged === "true").pipe(
+            checkJsonReply,
             traceLocalHandlerWork,
             Effect.catch((cause) =>
               failEnvironmentInternal("orchestration_snapshot_failed", cause),
@@ -171,10 +192,10 @@ export const layer = HttpApiBuilder.group(
             args.params.threadId,
             "orchestration_thread_snapshot_failed",
           ).pipe(traceLocalHandlerWork);
-          return {
+          return yield* checkJsonReply(Effect.succeed({
             snapshotSequence: snapshot.snapshotSequence,
             projection: snapshot.projection,
-          };
+          }));
         }),
       )
       .handle(
@@ -199,6 +220,7 @@ export const layer = HttpApiBuilder.group(
                 );
               }),
             ),
+            checkJsonReply,
           );
         }),
       )
@@ -214,13 +236,13 @@ export const layer = HttpApiBuilder.group(
             projection: snapshot.projection,
             snapshotSequence: snapshot.snapshotSequence,
           });
-          return {
+          return yield* checkJsonReply(Effect.succeed({
             snapshotSequence: snapshot.snapshotSequence,
             ...boundedSnapshotResponseFields({
               bounded,
               compactTurnItems: args.query.compactTurnItems === "1",
             }),
-          };
+          }));
         }),
       )
       .handle(
@@ -254,6 +276,7 @@ export const layer = HttpApiBuilder.group(
                   );
                 }),
               ),
+              checkJsonReply,
             );
         }),
       );

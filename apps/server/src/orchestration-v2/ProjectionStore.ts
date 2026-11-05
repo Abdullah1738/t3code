@@ -382,6 +382,8 @@ export interface ProjectionTimelinePage {
 }
 
 export interface ShellSnapshotOptions {
+  readonly afterThreadId?: string;
+  readonly limit?: number;
   readonly location?: "active" | "archive";
   readonly projectId?: ProjectId;
   readonly unsettledOnly?: boolean;
@@ -5638,6 +5640,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         projectId,
         unsettledOnly = false,
         pullRequestCandidatesOnly = false,
+        afterThreadId,
+        limit,
       }: ShellSnapshotOptions = {},
     ) =>
       sql<ShellThreadRow>`
@@ -5831,7 +5835,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ? sql` AND (json_extract(t.payload_json, '$.branch') IS NOT NULL OR json_extract(t.payload_json, '$.branchPullRequest') IS NOT NULL)`
                 : sql``
             }
-            ORDER BY t.updated_at ASC, t.thread_id ASC
+            ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
+            ${limit === undefined ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC` : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`}
           `;
 
     const selectShellRunRows = (threadIds?: ReadonlyArray<ThreadId>) =>

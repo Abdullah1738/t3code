@@ -25,7 +25,8 @@ export const recordResponse = (
   };
   const body = response.body;
   if (body._tag === "Uint8Array") {
-    record(body.body.byteLength);
+    // Text-backed bodies encode lazily; measuring must not allocate a full byte copy.
+    record(body.contentLength);
   } else if (body._tag === "Stream") {
     let bytes = 0;
     const measured = body.stream.pipe(
