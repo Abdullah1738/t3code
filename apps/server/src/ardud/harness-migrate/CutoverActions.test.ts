@@ -3,9 +3,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DEFAULT_SERVER_SETTINGS,
   CommandId,
+  EventId,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
+  KanbanScriptId,
   MessageId,
   NodeId,
   ProjectId,
@@ -14,6 +16,8 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   RunId,
+  RunAttemptId,
+  ProviderTurnId,
   RuntimeRequestId,
   ScheduledTaskId,
   ThreadId,
@@ -36,6 +40,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { derive } from "@t3tools/provider-core/server/IdAllocator";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -48,6 +53,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as ServerConfig from "../../config.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as Projections from "../../orchestration-v2/ProjectionStore.ts";
+import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProviderSessions from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as Threads from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Projects from "../../project/ProjectService.ts";
@@ -60,7 +66,6 @@ import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { kanbanDDL } from "../persistence/kanbanSchema.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import * as Actions from "./CutoverActions.ts";
-import * as PendingContext from "./CutoverContext.ts";
 import * as CutoverEngine from "./CutoverEngine.ts";
 import * as Input from "./CutoverInput.ts";
 import * as Readiness from "./CutoverReadiness.ts";
@@ -514,7 +519,7 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     readonly withDefaults?: boolean;
     readonly withFallback?: boolean;
     readonly pageSize?: number;
-    readonly realPendingContext?: boolean;
+    readonly transcriptEnabled?: boolean;
   } = {},
 ) {
   const store = yield* BoardStore.KanbanStore;
@@ -523,15 +528,6 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
   const path = yield* Path.Path;
   const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "cutover-actions-state-" });
   const config = { stateDir, baseDir: stateDir } as ServerConfig.ServerConfig["Service"];
-  const realPending = options.realPendingContext
-    ? yield* PendingContext.CutoverContext.pipe(
-        Effect.provide(
-          PendingContext.layer.pipe(
-            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
-          ),
-        ),
-      )
-    : undefined;
   const records = new Map(
     (options.threads ?? fixtureThreads()).map((entry) => [entry.thread.id, entry]),
   );
@@ -549,19 +545,24 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     });
   let currentSettings =
     options.withDefaults === false ? { ...DEFAULT_SERVER_SETTINGS } : initialSettings();
+  if (options.transcriptEnabled)
+    currentSettings = {
+      ...currentSettings,
+      ardudHarnessMigration: {
+        ...currentSettings.ardudHarnessMigration,
+        transcript: { enabled: true, lastTurns: 8 },
+      },
+    };
   let currentProject = project;
   let currentTask = task;
   let failAdoptions = false;
   let failSends = false;
   let liveRuntime: Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime> = Option.none();
   let nativeActive = 0;
-  let accepted = false;
   let acceptOnSend = true;
   const commands: OrchestrationV2ServerCommand[] = [];
   const sends: Threads.ThreadManagementSendInput[] = [];
   const interrupts: Threads.ThreadManagementInterruptInput[] = [];
-  const contexts: Parameters<PendingContext.CutoverContext["Service"]["put"]>[0][] = [];
-  const removedContexts: string[] = [];
   const fileWrites: { path: string; text: string }[] = [];
   const settingsWrites: ServerSettingsPatch[] = [];
   const projectWrites: Projects.ProjectUpdateInput[] = [];
@@ -710,13 +711,19 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
       dispatch: (value) =>
         Effect.gen(function* () {
           commands.push(value);
-          if (value.type === "thread.adopt-native-history" && failAdoptions)
+          if (
+            value.type === "provider.switch" &&
+            !value.commandId.endsWith(":rollback") &&
+            failAdoptions
+          )
             return yield* new Orchestrator.OrchestratorDispatchError({
               commandId: value.commandId,
               commandType: value.type,
-              cause: "Native adoption unavailable",
+              cause: "Native switch unavailable",
             });
-          if (value.type === "thread.adopt-native-history" || value.type === "provider.switch") {
+          if (value.type === "provider.switch") {
+            if (!value.commandId.endsWith(":rollback"))
+              assert.isFalse(currentSettings.ardudHarnessMigration?.transcript?.enabled === true);
             const current = get(value.threadId);
             replace(value.threadId, {
               thread: {
@@ -754,6 +761,7 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
         }),
       sendToThread: (value) =>
         Effect.gen(function* () {
+          assert.isFalse(currentSettings.ardudHarnessMigration?.transcript?.enabled === true);
           sends.push(value);
           if (failSends)
             return yield* new Orchestrator.OrchestratorDispatchError({
@@ -762,7 +770,70 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
               cause: "Native send unavailable",
             });
           receipts.add(value.commandId);
-          if (acceptOnSend) accepted = true;
+          const current = get(value.threadId);
+          const runId = RunId.make(`wake:${value.messageId}`);
+          const attemptId = RunAttemptId.make(`attempt:${value.messageId}`);
+          const rootNodeId = NodeId.make(`node:${value.messageId}`);
+          const selection = value.modelSelection!;
+          replace(value.threadId, {
+            runs: [
+              ...current.runs,
+              {
+                ...makeRun(
+                  current.thread,
+                  acceptOnSend ? "running" : "starting",
+                  current.runs.length + 1,
+                  selection,
+                ),
+                id: runId,
+                userMessageId: value.messageId,
+                rootNodeId,
+                activeAttemptId: attemptId,
+                startedAt: acceptOnSend ? now : null,
+              },
+            ],
+            attempts: [
+              ...current.attempts,
+              {
+                id: attemptId,
+                runId,
+                rootNodeId,
+                attemptOrdinal: 1,
+                providerInstanceId: selection.instanceId,
+                providerThreadId: current.thread.activeProviderThreadId!,
+                providerTurnId: null,
+                reason: "initial",
+                status: acceptOnSend ? "running" : "pending",
+                startedAt: acceptOnSend ? now : null,
+                completedAt: null,
+              },
+            ],
+            providerTurns: [
+              ...current.providerTurns,
+              ...(acceptOnSend
+                ? [
+                    {
+                      id: ProviderTurnId.make(`turn:${value.messageId}`),
+                      providerThreadId: current.thread.activeProviderThreadId!,
+                      nodeId: rootNodeId,
+                      runAttemptId: attemptId,
+                      nativeTurnRef: {
+                        driver: ProviderDriverKind.make(
+                          selection.instanceId === "claudeAgent" ? "claudeAgent" : "codex",
+                        ),
+                        nativeId: `native:${value.messageId}`,
+                        strength: "strong" as const,
+                      },
+                      ordinal: 1,
+                      status: "running" as const,
+                      promptAcceptedAt: now,
+                      startedAt: now,
+                      completedAt: null,
+                    },
+                  ]
+                : []),
+            ],
+          });
           // The action ignores the owner's return value; only delivery inputs are under test.
           return {} as Threads.ThreadManagementSendResult;
         }),
@@ -793,26 +864,6 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
           return [{ id: "fixture-native", ready: true, reason: "healthy" }];
         }),
     }),
-    realPending
-      ? Layer.succeed(PendingContext.CutoverContext, {
-          ...realPending,
-          put: (value) =>
-            Effect.sync(() => {
-              contexts.push(value);
-            }).pipe(Effect.andThen(realPending.put(value))),
-        })
-      : Layer.mock(PendingContext.CutoverContext)({
-          status: () =>
-            Effect.sync(() => (accepted ? ("accepted" as const) : ("pending" as const))),
-          put: (value) =>
-            Effect.sync(() => {
-              contexts.push(value);
-            }),
-          remove: (id) =>
-            Effect.sync(() => {
-              removedContexts.push(id);
-            }),
-        }),
     Layer.mock(ProviderSessions.ProviderSessionManagerV2)({
       peek: (id) =>
         Effect.sync(() => {
@@ -832,11 +883,8 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
     commands,
     sends,
     interrupts,
-    contexts,
-    removedContexts,
     fileWrites,
     stateDir,
-    pending: realPending,
     released: (id: string) =>
       cutoverThreadReleased(id).pipe(Effect.provideService(ServerConfig.ServerConfig, config)),
     settingsWrites,
@@ -862,7 +910,32 @@ const makeHarness = Effect.fn("CutoverActionsTest.make")(function* (
       nativeActive = count;
     },
     accepted: (value: boolean) => {
-      accepted = value;
+      for (const send of sends) {
+        const current = get(send.threadId);
+        const run = current.runs.find((run) => run.userMessageId === send.messageId);
+        if (!run || !value) continue;
+        replace(send.threadId, {
+          providerTurns: [
+            ...current.providerTurns,
+            {
+              id: ProviderTurnId.make(`turn:${send.messageId}`),
+              providerThreadId: current.thread.activeProviderThreadId!,
+              nodeId: run.rootNodeId!,
+              runAttemptId: run.activeAttemptId!,
+              nativeTurnRef: {
+                driver: ProviderDriverKind.make("codex"),
+                nativeId: `native:${send.messageId}`,
+                strength: "strong",
+              },
+              ordinal: 1,
+              status: "running",
+              promptAcceptedAt: now,
+              startedAt: now,
+              completedAt: null,
+            },
+          ],
+        });
+      }
     },
     acceptOnSend: (value: boolean) => {
       acceptOnSend = value;
@@ -1007,19 +1080,13 @@ it.effect(
         for (const id of ["ordinary:idle", "imessage:idle", evaluator, discussionThread]) {
           const entry = itemFor(plan, `thread:${id}`);
           assert.isFalse(entry.wake);
-          assert.include((entry.payload as { brief: string }).brief, "do not resume idle work");
+          assert.notProperty(entry.payload, "brief");
         }
-        const workBrief = (itemFor(plan, `thread:${worker}`).payload as { brief: string }).brief;
-        for (const text of [
-          worker,
-          `ses_source_${worker}`,
-          "Last actual request",
-          "Already sent this answer",
-          "existing branch",
-          "Keep my deployment question",
-        ])
-          assert.include(workBrief, text);
-        assert.notInclude(workBrief, "Already answered");
+        for (const item of plannedThreads) {
+          assert.notProperty(item.payload, "brief");
+          assert.notInclude(JSON.stringify(item.payload), "Last actual request");
+          assert.notInclude(JSON.stringify(item.payload), "Keep my deployment question");
+        }
         assert.isAbove(h.pageReads.length, 1);
         assert.deepStrictEqual(h.pageReads[0], { limit: 100 });
         assert.isTrue(h.pageReads.slice(1).every((read) => read.afterThreadId !== undefined));
@@ -1030,8 +1097,8 @@ it.effect(
           before,
         );
         assert.deepStrictEqual(
-          [h.commands, h.sends, h.contexts, h.settingsWrites, h.restorations],
-          [[], [], [], [], []],
+          [h.commands, h.sends, h.settingsWrites, h.restorations],
+          [[], [], [], []],
         );
       }),
     ).pipe(Effect.provide(database)),
@@ -1049,6 +1116,49 @@ it.effect("a plan with schedules but no fallback table remains read-only", () =>
       assert.deepStrictEqual(yield* sql`SELECT name FROM sqlite_schema ORDER BY name`, before);
     }),
   ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "registered external board scripts block planning and resumed readiness without source mutation",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const file = path.join(h.stateDir, "external-coordinator.ts");
+        const content = 'client.session.prompt({ agent: "unknown-reviewer" }); exec("crw tick")';
+        yield* fs.writeFileString(file, content);
+        yield* h.store.putScript({
+          id: KanbanScriptId.make("script:external"),
+          boardId: board.id,
+          name: "External coordinator",
+          path: file,
+          trigger: { _tag: "manual" },
+          enabled: false,
+          createdBy: { _tag: "owner" },
+          createdAt: at,
+          lastRun: null,
+        });
+        const plan = yield* h.actions.plan;
+        assert.lengthOf(plan.refusals, 1);
+        assert.include(plan.refusals[0]!.reason, file);
+        assert.include(plan.refusals[0]!.reason, "before cutover");
+        const checks = yield* h.actions.check!(plan.items);
+        assert.isTrue(checks.some((row) => !row.ready && row.id.includes("script:external")));
+        assert.equal(yield* fs.readFileString(file), content);
+        assert.deepEqual(h.commands, []);
+        assert.deepEqual(h.sends, []);
+        yield* fs.writeFileString(file, "await nativeCoordinator.tick();");
+        const prepared = yield* h.actions.plan;
+        assert.isEmpty(prepared.refusals);
+        assert.isFalse((yield* h.actions.check!(prepared.items)).some((row) => !row.ready));
+        yield* fs.writeFileString(file, 'exec("crw tick");');
+        const drifted = yield* h.actions.check!(prepared.items);
+        assert.isTrue(drifted.some((row) => !row.ready && row.reason?.includes("External crw")));
+        assert.equal(yield* fs.readFileString(file), 'exec("crw tick");');
+      }),
+    ).pipe(Effect.provide(database)),
 );
 
 it.effect(
@@ -1219,7 +1329,7 @@ it.effect(
 );
 
 it.effect(
-  "adopts idle threads internally with bounded carry-on context but no imported or seeded native history and no wake",
+  "switches idle threads normally without staging context, replacing native history or waking them",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1231,33 +1341,22 @@ it.effect(
           yield* h.actions.apply(entry, "switch");
           yield* h.actions.apply(entry, "brief");
           yield* h.actions.apply(entry, "switch");
-          const adopt = h.commands.filter(
-            (command) => command.type === "thread.adopt-native-history" && command.threadId === id,
+          const switches = h.commands.filter(
+            (command) => command.type === "provider.switch" && command.threadId === id,
           );
-          assert.strictEqual(adopt.length, 1);
+          assert.strictEqual(switches.length, 1);
           const expected = id === discussionThread ? nativeSol : nativeOpus;
-          assert.deepStrictEqual(adopt[0], {
-            type: "thread.adopt-native-history",
+          assert.deepStrictEqual(switches[0], {
+            type: "provider.switch",
             commandId: CommandId.make(`harness-cutover:v1:thread:${id}:switch`),
             threadId: ThreadId.make(id),
             modelSelection: expected,
-            expectedActiveProviderThreadId: old.thread.activeProviderThreadId,
-            target: {
-              kind: "new",
-              driver: ProviderDriverKind.make(
-                expected.instanceId === "claudeAgent" ? "claudeAgent" : "codex",
-              ),
-              nativeId: null,
-              headId: null,
-            },
+            expectedModelSelection: old.thread.modelSelection,
           });
           assert.deepStrictEqual(h.get(id).providerThreads, old.providerThreads);
           assert.strictEqual(h.get(id).thread.branch, old.thread.branch);
           assert.strictEqual(h.get(id).thread.worktreePath, old.thread.worktreePath);
-          const context = h.contexts.find((value) => value.threadId === id)!;
-          assert.strictEqual(context.targetInstance, expected.instanceId);
-          assert.include(context.text, `t3_thread_read({threadId:${JSON.stringify(id)}`);
-          assert.include(context.text, "do not resume idle work");
+          assert.notProperty(entry.payload, "brief");
         }
         assert.isTrue(h.peeks.length >= 4);
         assert.deepStrictEqual(h.sends, []);
@@ -1284,7 +1383,6 @@ it.effect(
             reason: "Harness cutover",
           },
         ]);
-        assert.deepStrictEqual(h.contexts, []);
         assert.deepStrictEqual(h.commands, []);
         h.replace("running", {
           runs: h
@@ -1296,28 +1394,28 @@ it.effect(
         yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
         h.nativeActive(3);
         yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
-        assert.strictEqual(h.sends.length, 2);
-        assert.deepStrictEqual(h.sends[0], h.sends[1]);
+        assert.strictEqual(h.sends.length, 1);
         assert.deepStrictEqual(h.sends[0], {
           projectId,
           threadId: ThreadId.make("running"),
           commandId: CommandId.make("harness-cutover:v1:thread:running:resume:0"),
           messageId: MessageId.make("harness-cutover:v1:thread:running:resume:0"),
-          text: "Read the harness carry-on context, then continue the interrupted work exactly where it stopped. Do not announce the switch or repeat messages already sent.",
+          text: "Robob upgrade moved this thread to Codex. Carry on where you left off; do not redo finished work or resend messages.",
           attachments: [],
           modelSelection: nativeSol,
           mode: "queue",
           createdBy: "system",
           creationSource: "server",
         });
-        assert.strictEqual(h.contexts.length, 1);
-        assert.include(h.contexts[0]!.text, "Carry on exactly where you left off");
+        h.accepted(true);
+        yield* h.actions.apply(entry, "brief");
+        assert.strictEqual(h.sends.length, 1);
       }),
     ).pipe(Effect.provide(database)),
 );
 
 it.effect(
-  "defers pending owner requests, active children, stale rosters and buffered provider work before adoption",
+  "defers pending owner requests, active children, stale rosters and buffered provider work before switching",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1391,13 +1489,13 @@ it.effect(
           holdsWorkForThread: () => Effect.die("Probe unavailable"),
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime);
         yield* deferred(h.actions.apply(entry, "switch"), "buffered wake");
-        assert.deepStrictEqual([h.commands, h.contexts, h.interrupts, h.sends], [[], [], [], []]);
+        assert.deepStrictEqual([h.commands, h.interrupts, h.sends], [[], [], []]);
         h.runtime({
           holdsWorkForThread: () => Effect.succeed(false),
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime);
         yield* h.actions.apply(entry, "switch");
         assert.strictEqual(
-          h.commands.filter((value) => value.type === "thread.adopt-native-history").length,
+          h.commands.filter((value) => value.type === "provider.switch").length,
           1,
         );
       }),
@@ -1405,7 +1503,7 @@ it.effect(
 );
 
 it.effect(
-  "rebinds queued selections under the admission barrier before fresh adoption without waking idle work",
+  "rebinds queued selections under the admission barrier before normal switching without waking idle work",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1421,7 +1519,7 @@ it.effect(
         yield* h.actions.apply(entry, "switch");
         assert.deepStrictEqual(
           h.commands.slice(0, 2).map((value) => value.type),
-          ["queued-run.rebind-selection", "thread.adopt-native-history"],
+          ["queued-run.rebind-selection", "provider.switch"],
         );
         assert.deepStrictEqual(h.get("queued-parent").runs[1]!.modelSelection, nativeSol);
         yield* h.actions.apply(entry, "brief");
@@ -1480,17 +1578,291 @@ it.effect(
         yield* h.actions.apply(entry, "switch");
         h.acceptOnSend(false);
         yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
-        h.acceptOnSend(true);
+        h.accepted(true);
         yield* h.actions.apply(entry, "brief");
-        assert.strictEqual(h.sends.length, 2);
-        assert.deepStrictEqual(h.sends[0], h.sends[1]);
-        assert.strictEqual(h.contexts.length, 1);
+        assert.strictEqual(h.sends.length, 1);
       }),
     ).pipe(Effect.provide(database)),
 );
 
 it.effect(
-  "interrupted evaluators and discussion workers stage next-request context rather than unsolicited board messages",
+  "a provisional Claude running or completed turn without matching prompt acceptance cannot finish cutover",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(onlyThread("provisional", "interrupted"));
+        const entry = itemFor(yield* h.actions.plan, "thread:provisional");
+        yield* h.actions.apply(entry, "switch");
+        h.acceptOnSend(false);
+        yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
+        h.accepted(true);
+        const current = h.get("provisional");
+        for (const status of ["running", "completed"] as const) {
+          h.replace("provisional", {
+            providerTurns: current.providerTurns.map(
+              ({ promptAcceptedAt: _acceptedAt, ...turn }) => ({ ...turn, status }),
+            ),
+          });
+          yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
+          assert.lengthOf(h.sends, 1);
+        }
+        const wake = current.runs.at(-1)!;
+        for (const status of ["failed", "interrupted", "cancelled"] as const) {
+          h.replace("provisional", {
+            runs: current.runs.map((run) =>
+              run.id === wake.id ? { ...run, status, startedAt: now, completedAt: now } : run,
+            ),
+            providerTurns: current.providerTurns.map(
+              ({ promptAcceptedAt: _acceptedAt, ...turn }) => ({ ...turn, status }),
+            ),
+          });
+          yield* deferred(h.actions.apply(entry, "brief"), "ambiguous");
+          assert.lengthOf(h.sends, 1);
+        }
+        h.replace("provisional", {
+          providerTurns: current.providerTurns.map((turn) => ({
+            ...turn,
+            status: "completed",
+            completedAt: now,
+          })),
+        });
+        yield* h.actions.apply(entry, "brief");
+        assert.lengthOf(h.sends, 1);
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect.each([opus, sol, terra])(
+  "native prompt acceptance survives later terminal outcomes (%j)",
+  (selection) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(onlyThread("accepted-terminal", "interrupted", selection));
+        const entry = itemFor(yield* h.actions.plan, "thread:accepted-terminal");
+        yield* h.actions.apply(entry, "switch");
+        h.acceptOnSend(false);
+        yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
+        h.accepted(true);
+        const current = h.get("accepted-terminal");
+        const wake = current.runs.at(-1)!;
+        for (const status of ["completed", "failed", "interrupted", "cancelled"] as const) {
+          h.replace("accepted-terminal", {
+            runs: current.runs.map((run) =>
+              run.id === wake.id ? { ...run, status, startedAt: now, completedAt: now } : run,
+            ),
+            providerTurns: current.providerTurns.map((turn) => ({
+              ...turn,
+              status,
+              completedAt: now,
+            })),
+          });
+          yield* h.actions.apply(entry, "brief");
+          assert.lengthOf(h.sends, 1);
+        }
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "persisted acceptance survives markerless usage and recovery cancellation without resending the wake",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(onlyThread("accepted-recovery", "interrupted"));
+        const entry = itemFor(yield* h.actions.plan, "thread:accepted-recovery");
+        yield* h.actions.apply(entry, "switch");
+        h.acceptOnSend(false);
+        yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
+        h.accepted(true);
+        const current = h.get("accepted-recovery");
+        const accepted = current.providerTurns.at(-1)!;
+        const { promptAcceptedAt: _acceptedAt, ...markerless } = accepted;
+        yield* Effect.gen(function* () {
+          const persisted = yield* Projections.ProjectionStoreV2;
+          yield* persisted.apply({
+            id: EventId.make("event:accepted-recovery:thread"),
+            type: "thread.created",
+            threadId: current.thread.id,
+            occurredAt: now,
+            payload: current.thread,
+          });
+          for (const payload of [
+            accepted,
+            { ...markerless, tokenUsage: { usedTokens: 1000, maxTokens: 200_000, updatedAt: at } },
+            { ...markerless, status: "cancelled" as const, completedAt: now },
+          ])
+            yield* persisted.apply({
+              id: EventId.make(`event:accepted-recovery:${payload.status}`),
+              type: "provider-turn.updated",
+              threadId: current.thread.id,
+              occurredAt: now,
+              payload,
+            });
+          const reloaded = yield* persisted.getThreadRecords(current.thread.id, ["providerTurns"]);
+          assert.deepEqual(reloaded.providerTurns[0]?.promptAcceptedAt, now);
+          const wake = current.runs.at(-1)!;
+          h.replace("accepted-recovery", {
+            providerTurns: reloaded.providerTurns,
+            runs: current.runs.map((run) =>
+              run.id === wake.id
+                ? { ...run, status: "cancelled", startedAt: now, completedAt: now }
+                : run,
+            ),
+          });
+        }).pipe(
+          Effect.provide(Projections.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
+        );
+        yield* h.actions.apply(entry, "brief");
+        assert.lengthOf(h.sends, 1);
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "three proven-unsent handoff failures roll back even after running timestamps were written",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(onlyThread("unsent-budget", "interrupted"));
+        h.acceptOnSend(false);
+        const engine = yield* realEngine(h);
+        for (let trial = 0; trial < 3; trial++) {
+          yield* engine.run();
+          const current = h.get("unsent-budget");
+          const wake = current.runs.at(-1)!;
+          const attempt = current.attempts.find((attempt) => attempt.id === wake.activeAttemptId)!;
+          const providerThread = current.providerThreads.find(
+            (thread) => thread.id === attempt.providerThreadId,
+          )!;
+          h.replace("unsent-budget", {
+            runs: current.runs.map((run) =>
+              run.id === wake.id
+                ? { ...run, status: "failed", startedAt: now, completedAt: now }
+                : run,
+            ),
+            attempts: current.attempts.map((attempt) =>
+              attempt.runId === wake.id
+                ? { ...attempt, status: "failed", startedAt: now, completedAt: now }
+                : attempt,
+            ),
+            turnItems: [
+              ...current.turnItems,
+              {
+                ...current.turnItems[0]!,
+                id: TurnItemId.make(`error:budget:${trial}`),
+                runId: wake.id,
+                nodeId: attempt.rootNodeId,
+                providerThreadId: attempt.providerThreadId,
+                providerTurnId: derive.providerTurn({
+                  driver: providerThread.driver,
+                  nativeTurnId: `failed:${attempt.id}`,
+                }),
+                type: "error",
+                failure: {
+                  class: "provider_error",
+                  message: "Handoff budget exhausted before prompt send",
+                  code: "provider_prompt_not_sent",
+                  retryable: false,
+                },
+              },
+            ],
+          });
+        }
+        for (let retry = 0; retry < 3; retry++) yield* engine.run();
+        const status = yield* engine.status();
+        const row = status.items.find((row) => row.key === "thread:unsent-budget")!;
+        assert.isTrue(row.rolledBack);
+        assert.lengthOf(h.sends, 3);
+        assert.deepEqual(h.get("unsent-budget").thread.modelSelection, opus);
+        assert.isTrue(yield* h.released("unsent-budget"));
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect("disables lite transcript mode before the first native switch or wake", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        ...onlyThread("lite-enabled", "interrupted"),
+        transcriptEnabled: true,
+      });
+      const entry = itemFor(yield* h.actions.plan, "thread:lite-enabled");
+      assert.isTrue(h.settings().ardudHarnessMigration?.transcript?.enabled);
+      yield* h.actions.apply(entry, "switch");
+      assert.deepEqual(h.settings().ardudHarnessMigration?.transcript, { enabled: false });
+      yield* h.actions.apply(entry, "brief");
+      assert.lengthOf(h.sends, 1);
+      assert.equal(
+        h.sends[0]!.text,
+        "Robob upgrade moved this thread to Claude Code. Carry on where you left off; do not redo finished work or resend messages.",
+      );
+      assert.isFalse(h.settings().ardudHarnessMigration?.cutoverComplete === true);
+    }),
+  ).pipe(Effect.provide(database)),
+);
+
+it.effect.each([false, true])(
+  "retries only a known pre-prompt terminal wake, not an ambiguous started run (%s)",
+  (started) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness(onlyThread("retry-wake", "interrupted"));
+        const entry = itemFor(yield* h.actions.plan, "thread:retry-wake");
+        yield* h.actions.apply(entry, "switch");
+        h.acceptOnSend(false);
+        yield* deferred(h.actions.apply(entry, "brief"), "waiting for native prompt acceptance");
+        const current = h.get("retry-wake");
+        const wake = current.runs.at(-1)!;
+        h.replace("retry-wake", {
+          runs: current.runs.map((run) =>
+            run.id === wake.id
+              ? { ...run, status: "failed", startedAt: started ? now : null, completedAt: now }
+              : run,
+          ),
+          attempts: current.attempts.map((attempt) =>
+            attempt.runId === wake.id
+              ? { ...attempt, status: "failed", startedAt: started ? now : null, completedAt: now }
+              : attempt,
+          ),
+        });
+        h.acceptOnSend(true);
+        if (started) {
+          yield* deferred(h.actions.apply(entry, "brief"), "ambiguous");
+          assert.lengthOf(h.sends, 1);
+        } else {
+          yield* h.actions.apply(entry, "brief");
+          assert.lengthOf(h.sends, 2);
+          assert.equal(h.sends[1]!.messageId, "harness-cutover:v1:thread:retry-wake:resume:1");
+        }
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "switches a settled thread quietly without the active-only expected-selection guard",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = makeThread("settled", opus, { settledAt: now, settledOverride: "settled" });
+        const h = yield* makeHarness({ ...onlyThread("unused"), threads: [projection(thread)] });
+        const entry = itemFor(yield* h.actions.plan, "thread:settled");
+        yield* h.actions.apply(entry, "switch");
+        yield* h.actions.apply(entry, "brief");
+        const command = h.commands.find((command) => command.type === "provider.switch")!;
+        assert.notProperty(command, "expectedModelSelection");
+        assert.deepEqual(h.get("settled").thread, {
+          ...thread,
+          providerInstanceId: nativeOpus.instanceId,
+          modelSelection: nativeOpus,
+          runtimeMode: "full-access",
+        });
+        assert.deepEqual(h.sends, []);
+      }),
+    ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "interrupted evaluators and discussion workers wait for the next request rather than unsolicited board messages",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1506,7 +1878,7 @@ it.effect(
         for (const id of [evaluator, discussionThread]) {
           const entry = itemFor(plan, `thread:${id}`);
           assert.isFalse(entry.wake);
-          assert.include((entry.payload as { brief: string }).brief, "do not resume idle work");
+          assert.notProperty(entry.payload, "brief");
           yield* h.actions.apply(entry, "switch");
           yield* h.actions.apply(entry, "brief");
         }
@@ -1543,7 +1915,7 @@ it.effect(
         assert.isFalse(native.wake);
         assert.isTrue(itemFor(plan, "thread:delegated-child").wake);
         assert.deepStrictEqual((native.payload as { queuedBefore: unknown }).queuedBefore, []);
-        assert.include((native.payload as { brief: string }).brief, "do not resume idle work");
+        assert.notProperty(native.payload, "brief");
         yield* h.actions.apply(native, "switch");
         yield* h.actions.apply(native, "brief");
         assert.deepStrictEqual(h.get("native-child").thread.modelSelection, nativeOpus);
@@ -1604,7 +1976,7 @@ it.effect(
           ...migration,
           selections: "apply",
           cutoverComplete: true,
-          transcript: { enabled: true, lastTurns: 8 },
+          transcript: { enabled: false },
         });
         assert.deepStrictEqual(h.fileWrites, [
           { path: `${h.stateDir}/harness-cutover-released.json`, text: '{"version":1}' },
@@ -1637,7 +2009,7 @@ const realEngine = Effect.fn("CutoverActionsTest.engine")(function* (h: Harness)
 });
 
 it.effect(
-  "three failed real adoptions exhaust attempts, remove pending context and retain the exact OpenCode source",
+  "three failed normal switches exhaust attempts and retain the exact OpenCode source",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1655,10 +2027,9 @@ it.effect(
         const status = yield* engine.status();
         assert.deepStrictEqual(status.claimedThreadIds, []);
         assert.deepStrictEqual(h.get("fail-switch"), source);
-        assert.deepStrictEqual(h.removedContexts, ["fail-switch"]);
         assert.isTrue(yield* h.released("fail-switch"));
         assert.strictEqual(
-          h.commands.filter((value) => value.type === "thread.adopt-native-history").length,
+          h.commands.filter((value) => value.type === "provider.switch").length,
           3,
         );
         assert.strictEqual(new Set(h.commands.map((value) => value.commandId)).size, 1);
@@ -1690,14 +2061,15 @@ it.effect(
         assert.deepStrictEqual(h.get("fail-wake").providerThreads, source.providerThreads);
         assert.deepStrictEqual(h.get("fail-wake").runs, source.runs);
         assert.deepStrictEqual(h.get("fail-wake").turnItems, source.turnItems);
-        assert.deepStrictEqual(h.removedContexts, ["fail-wake"]);
         assert.isTrue(yield* h.released("fail-wake"));
         assert.strictEqual(
-          h.commands.filter((value) => value.type === "thread.adopt-native-history").length,
-          1,
+          h.commands.filter((value) => value.type === "provider.switch").length,
+          2,
         );
         assert.deepStrictEqual(
-          h.commands.find((value) => value.type === "provider.switch"),
+          h.commands.find(
+            (value) => value.type === "provider.switch" && value.commandId.endsWith(":rollback"),
+          ),
           {
             type: "provider.switch",
             commandId: CommandId.make("harness-cutover:v1:thread:fail-wake:rollback"),
@@ -1751,67 +2123,52 @@ it.effect(
     ).pipe(Effect.provide(splitDatabase)),
 );
 
-it.effect(
-  "a failed adoption retries the same final owner-answer context without losing its queued answer",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const h = yield* makeHarness({
-          ...onlyThread("answer-retry", "interrupted"),
-          realPendingContext: true,
-        });
-        const entry = itemFor(yield* h.actions.plan, "thread:answer-retry");
-        const original = h.get("answer-retry");
-        const answer = {
-          ...makeRun(original.thread, "queued", 2),
-          userMessageId: MessageId.make("async-answer:owner-decision"),
-        };
-        const message: OrchestrationV2ThreadProjection["messages"][number] = {
-          id: answer.userMessageId,
-          threadId: original.thread.id,
-          runId: answer.id,
-          nodeId: null,
-          role: "user",
-          text: "Keep the branch and wait for my deploy approval.",
-          attachments: [],
-          streaming: false,
-          createdBy: "user",
-          creationSource: "server",
-          createdAt: now,
-          updatedAt: now,
-        };
-        h.replace("answer-retry", { runs: [...original.runs, answer], messages: [message] });
-        h.failAdoptions();
-        const failed = yield* Effect.result(h.actions.apply(entry, "switch"));
-        assert.isTrue(Result.isFailure(failed));
-        if (Result.isFailure(failed) && failed.failure._tag === "CutoverError")
-          assert.strictEqual(failed.failure.operation, "switch");
-        assert.strictEqual(yield* h.pending!.status("answer-retry"), "pending");
-        h.failAdoptions(false);
-        yield* h.actions.apply(entry, "switch");
-        assert.strictEqual(h.contexts.length, 2);
-        assert.deepStrictEqual(h.contexts[0], h.contexts[1]);
-        assert.strictEqual(h.contexts[0]!.refreshPending, true);
-        assert.include(h.contexts[0]!.text, `Owner answered: ${message.text}`);
-        assert.strictEqual(h.contexts[0]!.text.split(message.text).length - 1, 1);
-        assert.deepStrictEqual(h.get("answer-retry").messages, [message]);
-        assert.deepStrictEqual(h.get("answer-retry").runs[1], {
-          ...answer,
-          modelSelection: nativeOpus,
-          providerInstanceId: nativeOpus.instanceId,
-        });
-        assert.strictEqual(
-          h.commands.filter((command) => command.type === "queued-run.rebind-selection").length,
-          1,
-        );
-        const claim = {
-          threadId: "answer-retry",
-          targetInstance: "claudeAgent",
-          runId: "native:carry-on",
-        };
-        assert.strictEqual(yield* h.pending!.read(claim), h.contexts[0]!.text);
-        assert.strictEqual(yield* h.pending!.status("answer-retry"), "claimed");
-        assert.deepStrictEqual(h.sends, []);
-      }),
-    ).pipe(Effect.provide(database)),
+it.effect("a failed normal switch retries without copying or losing the queued owner answer", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        ...onlyThread("answer-retry", "interrupted"),
+      });
+      const entry = itemFor(yield* h.actions.plan, "thread:answer-retry");
+      const original = h.get("answer-retry");
+      const answer = {
+        ...makeRun(original.thread, "queued", 2),
+        userMessageId: MessageId.make("async-answer:owner-decision"),
+      };
+      const message: OrchestrationV2ThreadProjection["messages"][number] = {
+        id: answer.userMessageId,
+        threadId: original.thread.id,
+        runId: answer.id,
+        nodeId: null,
+        role: "user",
+        text: "Keep the branch and wait for my deploy approval.",
+        attachments: [],
+        streaming: false,
+        createdBy: "user",
+        creationSource: "server",
+        createdAt: now,
+        updatedAt: now,
+      };
+      h.replace("answer-retry", { runs: [...original.runs, answer], messages: [message] });
+      h.failAdoptions();
+      const failed = yield* Effect.result(h.actions.apply(entry, "switch"));
+      assert.isTrue(Result.isFailure(failed));
+      if (Result.isFailure(failed) && failed.failure._tag === "CutoverError")
+        assert.strictEqual(failed.failure.operation, "switch");
+      h.failAdoptions(false);
+      yield* h.actions.apply(entry, "switch");
+      assert.deepStrictEqual(h.get("answer-retry").messages, [message]);
+      assert.deepStrictEqual(h.get("answer-retry").runs[1], {
+        ...answer,
+        modelSelection: nativeOpus,
+        providerInstanceId: nativeOpus.instanceId,
+      });
+      assert.strictEqual(
+        h.commands.filter((command) => command.type === "queued-run.rebind-selection").length,
+        1,
+      );
+      assert.notProperty(entry.payload, "brief");
+      assert.deepStrictEqual(h.sends, []);
+    }),
+  ).pipe(Effect.provide(database)),
 );

@@ -378,6 +378,7 @@ async function main() {
         action === "run" ? {} : undefined,
       );
       print(result);
+      if (action === "run" && result?.cutover?.refusals?.length > 0) process.exitCode = 3;
       return;
     }
     case "desktop-lease": {

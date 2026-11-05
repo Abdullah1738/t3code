@@ -59,7 +59,6 @@ import * as ArdudOpenCodeImporter from "../ardud/opencode-import/OpenCodeImporte
 // ardud: only external OpenCode sessions outlive this server.
 import * as StaleRuns from "../ardud/opencode-import/StaleRuns.ts";
 import { withOpenCodeTranscripts } from "../ardud/opencode-import/layer.ts";
-import * as CutoverContext from "../ardud/harness-migrate/CutoverContext.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
@@ -171,7 +170,6 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
-      CutoverContext.layer,
       layerContextHandoffServiceProvided,
       layerEventSinkProvided,
       IdAllocator.layer,

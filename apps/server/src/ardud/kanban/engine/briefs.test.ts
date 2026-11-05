@@ -102,4 +102,16 @@ describe("board briefs", () => {
       "Finish by calling card_review_result once, with head set to the commit you reviewed (the PR's head sha, or `git rev-parse HEAD` on the card's branch). If the call fails with a connection error or timeout, card_get the card: if no review event from you at that head is there, call it again with the same verdict, findings and head (an exact repeat is ignored, so retrying is safe):",
     );
   });
+
+  it("gives the reviewer and evaluator model-aware delegation without named agents", () => {
+    for (const brief of [
+      reviewBrief(board, card, null, null, []),
+      evaluatorBrief(board, { kind: "check" }),
+    ]) {
+      expect(brief).toContain("use T3 `delegate_task` with role `review`");
+      expect(brief).toContain("Preserve the routed model and effort exactly in target.options");
+      expect(brief).toContain("Do not pass an `agent` selector");
+      expect(brief).toContain("The board review thread alone records card_review_result");
+    }
+  });
 });

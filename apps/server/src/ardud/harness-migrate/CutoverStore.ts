@@ -282,8 +282,8 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
         }),
       )
       .pipe(Effect.mapError(fail("start-snapshot")));
-    for (let offset = 0; offset < sourceItems.length; offset += 16) {
-      const batch = sourceItems.slice(offset, offset + 16);
+    for (let offset = 0; offset < sourceItems.length; offset += 8) {
+      const batch = sourceItems.slice(offset, offset + 8);
       yield* sql
         .withTransaction(
           Effect.gen(function* () {
@@ -345,6 +345,8 @@ export const layer = Layer.effect(
     const config = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
     const sql = yield* BoardsDatabase.client;
-    return yield* make(path.join(config.stateDir, "harness-cutover-plan.json")).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+    return yield* make(path.join(config.stateDir, "harness-cutover-plan.json")).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+    );
   }),
 );

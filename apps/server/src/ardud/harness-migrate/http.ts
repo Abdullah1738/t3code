@@ -9,7 +9,6 @@ import * as Actions from "./CutoverActions.ts";
 import * as Store from "./CutoverStore.ts";
 import * as Input from "./CutoverInput.ts";
 import * as Readiness from "./CutoverReadiness.ts";
-import * as PendingContext from "./CutoverContext.ts";
 import * as Projections from "../../orchestration-v2/ProjectionStore.ts";
 import * as Job from "./CutoverJob.ts";
 
@@ -125,7 +124,6 @@ export const harnessCutoverRouteLayer = routes.pipe(
         Actions.layer.pipe(
           Layer.provide(Readiness.layer),
           Layer.provide(Input.layer),
-          Layer.provide(PendingContext.layer),
           Layer.provide(Projections.layer),
         ),
       ),

@@ -17,17 +17,11 @@ import {
   DEFAULT_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
   handoffCoverage,
-  historyCost,
   historicalMessage,
   renderHistory,
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import {
-  CUTOVER_BRIEF_BYTE_LIMIT,
-  renderCutoverBrief,
-  type CutoverContext,
-} from "../ardud/harness-migrate/CutoverBrief.ts";
 
 export class ContextHandoffPrepareError extends Schema.TaggedError<ContextHandoffPrepareError>()(
   "ContextHandoffPrepareError",
@@ -87,8 +81,6 @@ export interface ContextHandoffServiceV2Shape {
     readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
     readonly runs?: ReadonlyArray<OrchestrationV2Run>;
     readonly promptOnly?: boolean;
-    readonly sourceNativeId?: string;
-    readonly cutoverContext?: CutoverContext;
     readonly strategy: Extract<
       OrchestrationV2ContextHandoff["strategy"],
       "delta_since_target_last_seen" | "full_thread_summary"
@@ -432,8 +424,6 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
       readonly runs?: ReadonlyArray<OrchestrationV2Run>;
       readonly promptOnly?: boolean;
-      readonly sourceNativeId?: string;
-      readonly cutoverContext?: CutoverContext;
       readonly strategy: Extract<
         OrchestrationV2ContextHandoff["strategy"],
         "delta_since_target_last_seen" | "full_thread_summary"
@@ -460,7 +450,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           ),
         );
       const runStatuses = new Map(input.runs?.map((run) => [run.id, run.status]));
-      let coverage = [
+      const coverage = [
         ...(input.promptOnly
           ? [
               "Recent conversation excerpt only, not a complete session migration. Older runs and excess items are intentionally omitted; individual messages may be clipped.",
@@ -468,54 +458,20 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           : []),
         handoffCoverage(input),
       ].join("\n");
-      const messages = input.items.flatMap((item) => {
-        const message = historicalMessage(item);
-        return message === null
-          ? []
-          : [
-              {
-                ...message,
-                ...(item.runId === null ? {} : { runStatus: runStatuses.get(item.runId) }),
-              },
-            ];
-      });
-      const targetInstanceId = input.toProviderInstanceId;
-      const isCutover =
-        input.promptOnly === true &&
-        input.fromProviderInstanceId === "opencode" &&
-        (targetInstanceId === "claudeAgent" ||
-          targetInstanceId === "codex" ||
-          targetInstanceId === "codex-cu");
-      const budget = input.promptOnly ? Math.min(tokenCap, CUTOVER_BRIEF_BYTE_LIMIT) : tokenCap;
-      if (isCutover) {
-        const emptySelection = selectHistory({ messages, coverage, budget: 0 });
-        const brief = yield* Effect.try({
-          try: () =>
-            renderCutoverBrief({
-              ...input.cutoverContext,
-              threadId: input.threadId,
-              targetInstance: targetInstanceId,
-              ...(input.sourceNativeId === undefined
-                ? {}
-                : { sourceSession: input.sourceNativeId }),
-              maxBytes: Math.min(6_000, budget - historyCost([], emptySelection.context) - 64),
-            }),
-          catch: (cause) =>
-            new ContextHandoffPrepareError({
-              threadId: input.threadId,
-              targetRunId: input.targetRunId,
-              fromProviderThreadIds: Array.from(input.fromProviderThreadIds),
-              toProviderThreadId: input.toProviderThreadId,
-              cause,
-            }),
-        });
-        // Delivery reselects history from coverage, not from summaryText.
-        coverage = `${brief}\n${coverage}`;
-      }
       const selected = selectHistory({
-        messages,
+        messages: input.items.flatMap((item) => {
+          const message = historicalMessage(item);
+          return message === null
+            ? []
+            : [
+                {
+                  ...message,
+                  ...(item.runId === null ? {} : { runStatus: runStatuses.get(item.runId) }),
+                },
+              ];
+        }),
         coverage,
-        budget,
+        budget: tokenCap,
       });
       return {
         id: handoffId,

@@ -33,11 +33,6 @@ import * as ServerSettings from "../serverSettings.ts";
 // ardud: the restart note checks OpenCode children before it says they were cancelled.
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
-import * as CutoverContext from "../ardud/harness-migrate/CutoverContext.ts";
-import {
-  CUTOVER_BRIEF_BYTE_LIMIT,
-  cutoverBriefBytes,
-} from "../ardud/harness-migrate/CutoverBrief.ts";
 // ardud: unconfirmed native history must not be replaced by a lossy handoff.
 import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
@@ -78,7 +73,6 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 ) {}
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
-const isAdapterTurnStartError = Schema.is(ProviderAdapter.ProviderAdapterTurnStartError);
 
 /** Claude refuses to replace a process running background work before it reads the prompt. */
 const refusedBeforePrompt = (error: unknown): boolean =>
@@ -107,7 +101,6 @@ export const layer: Layer.Layer<
   never,
   | EventSink.EventSinkV2
   | ContextHandoffService.ContextHandoffServiceV2
-  | CutoverContext.CutoverContext
   | IdAllocator.IdAllocatorV2
   | FileSystem.FileSystem
   | Path.Path
@@ -125,7 +118,6 @@ export const layer: Layer.Layer<
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
     const contextHandoffService = yield* ContextHandoffService.ContextHandoffServiceV2;
-    const cutoverContext = yield* CutoverContext.CutoverContext;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -278,6 +270,7 @@ export const layer: Layer.Layer<
                   source.id === handoff.targetRunId &&
                   (source.status === "failed" ||
                     source.status === "interrupted" ||
+                    source.status === "cancelled" ||
                     (source.status === "completed" &&
                       handoff.delivery === undefined &&
                       projection.messages.some(
@@ -563,11 +556,6 @@ export const layer: Layer.Layer<
         modelSelection: run.modelSelection,
       });
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
-      const cutoverInput = { threadId: projection.thread.id, runId: run.id };
-      const carryOn =
-        message.attachments.length === 0 && message.text.trim().toLowerCase() === "/compact"
-          ? null
-          : yield* cutoverContext.read({ ...cutoverInput, targetInstance: run.providerInstanceId });
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
@@ -580,7 +568,7 @@ export const layer: Layer.Layer<
           ...(existingSessionProjection === undefined
             ? {}
             : { resumeFromSession: existingSessionProjection }),
-          ...(carryOn !== null || providerThread.nativeThreadRef?.nativeId == null
+          ...(providerThread.nativeThreadRef?.nativeId == null
             ? {}
             : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
           ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
@@ -622,7 +610,6 @@ export const layer: Layer.Layer<
         },
       );
       if (sessionResult._tag === "Failure") {
-        if (carryOn !== null) yield* cutoverContext.refused(cutoverInput);
         if (input.willRetry === true) return yield* sessionResult.failure;
         yield* settleStartFailure({
           signal: "provider-session-open-failure",
@@ -632,16 +619,12 @@ export const layer: Layer.Layer<
         return;
       }
       const session = sessionResult.success;
-      if (!(yield* isCurrentAttemptInStatus("starting"))) {
-        if (carryOn !== null) yield* cutoverContext.refused(cutoverInput);
-        return;
-      }
+      if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
         load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,
       ) {
         const loaded = yield* Effect.result(load);
         if (loaded._tag === "Success") return loaded.success;
-        if (carryOn !== null) yield* cutoverContext.refused(cutoverInput);
         if (input.willRetry === true) return yield* loaded.failure;
         yield* settleStartFailure({
           signal: "provider-thread-load-failure",
@@ -837,7 +820,6 @@ export const layer: Layer.Layer<
       };
       const prepareRetryHandoff = Effect.fn("ProviderTurnStartService.prepareRetryHandoff")(
         function* (context: ReturnType<typeof handoffContextForThread>) {
-          if (carryOn !== null) return [];
           const { missedRunIds, coveredItemIds, missedRuns } = context;
           const missedItems =
             missedRunIds.size === 0
@@ -921,27 +903,6 @@ export const layer: Layer.Layer<
       let resumedRetryHandoff: ReadonlyArray<OrchestrationV2ContextHandoff> | undefined;
       let resumedHandoffContext: ReturnType<typeof handoffContextForThread> | undefined;
       const loadedProviderThread = yield* Effect.gen(function* () {
-        if (carryOn !== null) {
-          const { seededHistory: _seededHistory, ...metadata } =
-            providerThread.nativeMetadata ?? {};
-          return yield* loadFromProvider(
-            session.ensureThread({
-              threadId: projection.thread.id,
-              title: projection.thread.title,
-              modelSelection: run.modelSelection,
-              runtimePolicy: resolvedRuntimePolicy,
-              providerSessionId,
-              existingProviderThread: {
-                ...providerThread,
-                nativeThreadRef: null,
-                nativeConversationHeadRef: null,
-                nativeMetadata: metadata,
-                contextUsage: null,
-              },
-              forceNewNativeThread: true,
-            }),
-          );
-        }
         // ardud: a moved session is not safe to replace until it completes a turn.
         const seededGuard = seededUnconfirmed(providerThread, projection.providerTurns);
         const failSeededResume = () =>
@@ -1262,7 +1223,6 @@ export const layer: Layer.Layer<
       });
       if (loadedProviderThread === undefined) return;
       if (!(yield* isCurrentAttemptInStatus("starting"))) {
-        if (carryOn !== null) yield* cutoverContext.refused(cutoverInput);
         return;
       }
       const now = yield* DateTime.now;
@@ -1296,8 +1256,7 @@ export const layer: Layer.Layer<
         // ardud: a fallback replacement drops the adopted marker; otherwise keep it,
         // including delivery updates the adapter returns.
         nativeMetadata:
-          (resumeFellBack || carryOn !== null) &&
-          providerThread.nativeMetadata?.seededHistory !== undefined
+          resumeFellBack && providerThread.nativeMetadata?.seededHistory !== undefined
             ? replacementMetadata
             : providerThread.nativeMetadata?.seededHistory === undefined
               ? loadedProviderThread.nativeMetadata
@@ -1414,7 +1373,6 @@ export const layer: Layer.Layer<
         events,
       });
       if (!runningWrite.committed) {
-        if (carryOn !== null) yield* cutoverContext.refused(cutoverInput);
         return;
       }
       const routableSubagents = projection.subagents.filter((subagent) =>
@@ -1422,74 +1380,55 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
-          const persist = Effect.fn("ProviderTurnStartService.persist")(function* (
-            handoff: OrchestrationV2ContextHandoff,
-          ) {
-            const updatedAt = yield* DateTime.now;
-            yield* eventSink.write({
-              events: [
-                {
-                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
-                  type: "context-handoff.updated",
-                  threadId: projection.thread.id,
-                  runId: run.id,
-                  providerInstanceId: run.providerInstanceId,
-                  occurredAt: updatedAt,
-                  payload: { ...handoff, updatedAt },
-                },
-              ],
-            });
-          });
-          if (carryOn !== null) {
-            if (cutoverBriefBytes(carryOn) > Math.min(CUTOVER_BRIEF_BYTE_LIMIT, yield* budget)) {
-              yield* cutoverContext.refused(cutoverInput);
-              return yield* new CutoverContext.CutoverContextError({
-                operation: "deliver",
-                reason: "budget",
+          const delivery = yield* deliverContextHandoffs({
+            handoffs: [...effectiveHandoffs, ...retryHandoff],
+            deferInline: compact,
+            providerThread: runningProviderThread,
+            budget,
+            alreadyDeliveredItemIds: deliveredItemIds,
+            ...(session.injectHistory === undefined
+              ? {}
+              : {
+                  inject: (history: ProviderAdapter.ProviderAdapterV2HistoricalContext) =>
+                    session.injectHistory!({
+                      providerThread: runningProviderThread,
+                      ...history,
+                    }),
+                }),
+            persist: Effect.fn("ProviderTurnStartService.persist")(function* (handoff) {
+              const updatedAt = yield* DateTime.now;
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: yield* idAllocator.allocate.event({
+                      threadId: projection.thread.id,
+                    }),
+                    type: "context-handoff.updated",
+                    threadId: projection.thread.id,
+                    runId: run.id,
+                    providerInstanceId: run.providerInstanceId,
+                    occurredAt: updatedAt,
+                    payload: { ...handoff, updatedAt },
+                  },
+                ],
               });
-            }
-            // The durable brief replaces the generic transcript, even if this send is refused.
-            // Its claim stays pending across an ambiguous send instead of silently falling back.
-            yield* Effect.forEach(
-              [...effectiveHandoffs, ...retryHandoff],
-              (handoff) => persist({ ...handoff, status: "superseded" }),
-              { discard: true },
-            );
-          }
-          const delivery: {
-            readonly context: string;
-            readonly delivered: Effect.Effect<void, unknown>;
-            readonly unsent: Effect.Effect<void, unknown>;
-          } =
-            carryOn !== null
-              ? {
-                  context: carryOn,
-                  delivered: cutoverContext.accepted(cutoverInput),
-                  unsent: cutoverContext.refused(cutoverInput),
-                }
-              : yield* deliverContextHandoffs({
-                  handoffs: [...effectiveHandoffs, ...retryHandoff],
-                  deferInline: compact,
-                  providerThread: runningProviderThread,
-                  budget,
-                  alreadyDeliveredItemIds: deliveredItemIds,
-                  ...(session.injectHistory === undefined
-                    ? {}
-                    : {
-                        inject: (history: ProviderAdapter.ProviderAdapterV2HistoricalContext) =>
-                          session.injectHistory!({
-                            providerThread: runningProviderThread,
-                            ...history,
-                          }),
-                      }),
-                  persist,
-                });
-          if (!(yield* isCurrentAttemptInStatus("running"))) {
-            if (carryOn !== null) yield* delivery.unsent;
-            return;
-          }
+            }),
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: session.driver,
+                  threadId: projection.thread.id,
+                  providerThreadId: providerThread.id,
+                  runId: run.id,
+                  code: "provider_prompt_not_sent",
+                  cause,
+                }),
+            ),
+          );
+          if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, carryOn === null ? restartNote : ""]
+          const context = [delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -1513,6 +1452,18 @@ export const layer: Layer.Layer<
                   )
                 : Effect.void,
             ),
+            Effect.mapError((cause) =>
+              refusedBeforePrompt(cause)
+                ? new ProviderAdapter.ProviderAdapterTurnStartError({
+                    driver: session.driver,
+                    threadId: projection.thread.id,
+                    providerThreadId: providerThread.id,
+                    runId: run.id,
+                    code: "provider_prompt_not_sent",
+                    cause,
+                  })
+                : cause,
+            ),
           );
           // The provider already accepted the turn. A stale pending marker
           // can force a fresh thread later, but must not stop live ingestion.
@@ -1526,7 +1477,7 @@ export const layer: Layer.Layer<
           );
         },
         Effect.mapError((cause) =>
-          isAdapterTurnStartError(cause)
+          cause._tag === "ProviderAdapterTurnStartError"
             ? cause
             : new ProviderAdapter.ProviderAdapterTurnStartError({
                 driver: session.driver,
@@ -1538,7 +1489,6 @@ export const layer: Layer.Layer<
         ),
       );
       const deliverySession =
-        carryOn === null &&
         effectiveHandoffs.length === 0 &&
         retryHandoff.length === 0 &&
         restartNote === "" &&

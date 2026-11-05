@@ -18,6 +18,11 @@ import * as ServerConfig from "../../config.ts";
 import * as ProviderRegistry from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettingsService from "../../serverSettings.ts";
 import * as CutoverReadiness from "./CutoverReadiness.ts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- fixtures mirror generator SHA-256 metadata.
+import * as NodeCrypto from "node:crypto";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- exercises the real generator only against temporary fixtures.
+import * as NodeChildProcess from "node:child_process";
+import * as ConfigProvider from "effect/ConfigProvider";
 
 const BUILD = "0123456789abcdef";
 const CODEX = ProviderInstanceId.make("codex");
@@ -34,11 +39,40 @@ const CHECKS = [
   "canaries-417",
   "pilot-246",
   "installer-245",
+  "board-delegation",
+  "statev2-guard",
+  "offbox",
+  "betterstack",
+  "coord",
+  "recall-identity",
+];
+const RECALL_URL = "http://127.0.0.1:18765/mcp";
+const RECALL_ENV = [{ name: "ROBOB_RECALL_MCP_URL", value: RECALL_URL, sensitive: false }];
+const MCP_IDS = ["betterstack", "perplexity", "inbody", "flighty", "cua-driver", "dia", "recall"];
+const TOOL_NAMES = [
+  "t3_thread_read",
+  "delegate_task",
+  "board_get",
+  "board_open",
+  "evaluator_start",
+  "card_search",
+  "card_get",
+  "card_update",
+  "card_move",
+  "card_ask",
+  "card_ask_change",
+  "card_flag",
+  "card_review_result",
+  "card_create",
+  "card_claim",
+  "card_next",
+  "card_edit",
+  "card_thread",
 ];
 const HOOKS = Object.fromEntries(
   ["PreToolUse", "UserPromptSubmit", "PostToolUse", "Stop"].map((event) => [
     event,
-    [{ hooks: [{ type: "command", command: "/fixture/guard.py" }] }],
+    [{ matcher: "Bash", hooks: [{ type: "command", command: "/fixture/guard.py" }] }],
   ]),
 );
 const selections: readonly ModelSelection[] = [
@@ -132,6 +166,70 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
   ) {
     yield* fs.writeFileString(file, JSON.stringify(value));
   });
+  const sourceRoot = path.join(config.baseDir, "fixture-sources");
+  const skillRoot = path.join(sourceRoot, "skills");
+  const skill = path.join(skillRoot, "nested", "fixture-directory");
+  yield* fs.makeDirectory(skill, { recursive: true });
+  yield* fs.writeFileString(
+    path.join(skill, "SKILL.md"),
+    "---\nname: canonical-skill\n---\nFixture skill.\n",
+  );
+  const canonical = path.join(sourceRoot, "AGENTS.md");
+  const canonicalText = "Canonical fixture instructions.\n";
+  yield* fs.writeFileString(canonical, canonicalText);
+  const overlays: Record<string, string> = {};
+  const overlayText = (name: string) => `Canonical ${name} overlay.\n`;
+  for (const name of ["claude", "codex", "codex-cu"]) {
+    overlays[name] = path.join(sourceRoot, `${name}.md`);
+    yield* fs.writeFileString(overlays[name]!, overlayText(name));
+  }
+  const manifest = {
+    schemaVersion: 1,
+    harness: "claude",
+    generator: {
+      path: path.join(sourceRoot, "generate_homes.py"),
+      sha256: NodeCrypto.createHash("sha256").update("fixture generator\n").digest("hex"),
+    },
+    artifacts: [] as Array<{ path: string; sha256: string; format?: "claude-owned-json" }>,
+    instructions: {
+      canonical: {
+        path: canonical,
+        sha256: NodeCrypto.createHash("sha256").update(canonicalText).digest("hex"),
+      },
+      overlays: [
+        {
+          path: overlays.claude,
+          sha256: NodeCrypto.createHash("sha256").update(overlayText("claude")).digest("hex"),
+        },
+      ],
+    },
+    skills: [
+      {
+        name: "canonical-skill",
+        source: skill,
+        sha256: NodeCrypto.createHash("sha256")
+          .update("---\nname: canonical-skill\n---\nFixture skill.\n")
+          .digest("hex"),
+      },
+    ],
+    guards: ["live-database", "offbox", "betterstack-scope", "coord-haiku"].map((id) => ({
+      id,
+      sources: [
+        {
+          path: canonical,
+          sha256: NodeCrypto.createHash("sha256").update(canonicalText).digest("hex"),
+        },
+      ],
+    })),
+    mcpServers: MCP_IDS.map((id) => ({ id, ...(id === "recall" ? { url: RECALL_URL } : {}) })),
+  };
+  yield* fs.writeFileString(manifest.generator.path, "fixture generator\n");
+  yield* writeJson(path.join(sourceRoot, "manifest.json"), {
+    skillRoots: [skillRoot],
+    instructions: { canonical },
+    mcpServers: manifest.mcpServers,
+  });
+  const manifestFile = path.join(homes.claude!, "parity-manifest.json");
   const codexConfig = (home: string, cu: boolean) =>
     [
       "[features]",
@@ -142,8 +240,10 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
       "[memories]",
       "generate_memories = false",
       "use_memories = false",
-      "[mcp_servers.dia]",
-      'command = "/fixture/dia"',
+      ...MCP_IDS.flatMap((id) => [
+        `[mcp_servers.${id}]`,
+        id === "recall" ? 'url = "http://127.0.0.1:18765/mcp"' : `command = "/fixture/${id}"`,
+      ]),
       ...Object.keys(HOOKS).flatMap((event) => [
         `[hooks.state.${JSON.stringify(`${home}/hooks.json:${event.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase()}:0:0`)}]`,
         "enabled = true",
@@ -152,6 +252,8 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
     ].join("\n");
   for (const [name, directory] of Object.entries(homes)) {
     yield* fs.makeDirectory(directory, { recursive: true });
+    yield* fs.makeDirectory(path.join(directory, "skills"));
+    yield* fs.symlink(skill, path.join(directory, "skills", "canonical-skill"));
     if (name === "claude") {
       yield* writeJson(path.join(directory, "settings.json"), {
         autoMemoryEnabled: false,
@@ -160,10 +262,19 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
         hooks: HOOKS,
       });
       yield* writeJson(path.join(directory, ".claude.json"), {
-        mcpServers: { dia: { command: "/fixture/dia" } },
+        hasCompletedOnboarding: true,
+        mcpServers: Object.fromEntries(
+          MCP_IDS.map((id) => [
+            id,
+            id === "recall" ? { url: "http://127.0.0.1:18765/mcp" } : { command: `/fixture/${id}` },
+          ]),
+        ),
       });
-      yield* fs.writeFileString(path.join(directory, "CLAUDE.md"), "@/fixture/AGENTS.md\n");
-      yield* fs.writeFileString(path.join(directory, "overlay.md"), "Fixture overlay\n");
+      yield* fs.writeFileString(
+        path.join(directory, "CLAUDE.md"),
+        `@${canonical}\n@${path.join(directory, "overlay.md")}\n`,
+      );
+      yield* fs.writeFileString(path.join(directory, "overlay.md"), overlayText("claude"));
     } else {
       yield* fs.writeFileString(
         path.join(directory, "config.toml"),
@@ -171,24 +282,66 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
       );
       yield* writeJson(path.join(directory, "hooks.json"), { hooks: HOOKS });
       yield* writeJson(path.join(directory, "models.json"), { models: [{ slug: "fixture" }] });
-      yield* fs.writeFileString(path.join(directory, "AGENTS.md"), "Fixture instructions\n");
+      yield* fs.writeFileString(
+        path.join(directory, "AGENTS.md"),
+        `${canonicalText}\n\n${overlayText("codex")}${name === "codex-cu" ? `\n\n${overlayText("codex-cu")}` : ""}`,
+      );
     }
+    const artifacts = [];
+    for (const file of name === "claude"
+      ? ["settings.json", ".claude.json", "CLAUDE.md", "overlay.md"]
+      : ["config.toml", "hooks.json", "AGENTS.md", "models.json"]) {
+      const filePath = path.join(directory, file);
+      const owned = file === ".claude.json";
+      const expected = owned
+        ? JSON.stringify({
+            hasCompletedOnboarding: true,
+            mcpServers: Object.fromEntries(
+              MCP_IDS.toSorted().map((id) => [
+                id,
+                id === "recall" ? { url: RECALL_URL } : { command: `/fixture/${id}` },
+              ]),
+            ),
+          })
+        : yield* fs.readFile(filePath);
+      artifacts.push({
+        path: filePath,
+        sha256: NodeCrypto.createHash("sha256").update(expected).digest("hex"),
+        ...(owned ? { format: "claude-owned-json" as const } : {}),
+      });
+    }
+    if (name === "claude") manifest.artifacts = artifacts;
+    yield* writeJson(path.join(directory, "parity-manifest.json"), {
+      ...manifest,
+      artifacts,
+      harness: name,
+      instructions: {
+        canonical: manifest.instructions.canonical,
+        overlays: (name === "codex-cu" ? ["codex", "codex-cu"] : [name]).map((id) => ({
+          path: overlays[id],
+          sha256: NodeCrypto.createHash("sha256").update(overlayText(id)).digest("hex"),
+        })),
+      },
+    });
   }
   yield* settings.updateSettings({
     providerInstances: {
       [ProviderInstanceId.make("claudeAgent")]: {
         driver: ProviderDriverKind.make("claudeAgent"),
         enabled: true,
+        environment: RECALL_ENV,
         config: { homePath: homes.claude },
       },
       [CODEX]: {
         driver: ProviderDriverKind.make("codex"),
         enabled: true,
+        environment: RECALL_ENV,
         config: { homePath: homes.codex, setupMode: "existing" },
       },
       [ProviderInstanceId.make("codex-cu")]: {
         driver: ProviderDriverKind.make("codex"),
         enabled: true,
+        environment: RECALL_ENV,
         config: { homePath: homes["codex-cu"], setupMode: "existing" },
       },
     },
@@ -202,8 +355,25 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
     checks: Object.fromEntries(
       CHECKS.map((name) => [name, { ready: true, reason: "Operator fixture passed." }]),
     ),
+    homesCheck: {
+      schemaVersion: 1,
+      ok: true,
+      failures: [] as string[],
+      homes: Object.entries(homes).map(([harness, home]) => ({
+        harness,
+        home,
+        parityManifestPath: path.join(home, "parity-manifest.json"),
+      })),
+    },
     models: evidencedModels,
     routes: evidencedModels.map((model) => ({ ...model, route: "Operator fixture native route." })),
+    tools: ["claudeAgent", "codex", "codex-cu"].flatMap((instanceId) =>
+      ["ordinary", "board"].map((scope) => ({
+        instanceId,
+        scope,
+        names: TOOL_NAMES,
+      })),
+    ),
   };
   const writeEvidence = Effect.fn("CutoverReadinessTest.writeEvidence")(function* (
     overrides: Record<string, unknown> = {},
@@ -229,7 +399,23 @@ const fixture = Effect.fn("CutoverReadinessTest.fixture")(function* () {
       ),
     );
   });
-  return { fs, path, homes, settings, check, writeEvidence, writeJson, evidence, evidenceFile };
+  return {
+    fs,
+    path,
+    homes,
+    settings,
+    check,
+    writeEvidence,
+    writeJson,
+    evidence,
+    evidenceFile,
+    manifest,
+    manifestFile,
+    canonical,
+    skill,
+    skillRoot,
+    overlays,
+  };
 });
 
 type Results = Effect.Success<ReturnType<CutoverReadiness.CutoverReadiness["Service"]["check"]>>;
@@ -323,6 +509,9 @@ describe("CutoverReadiness", () => {
       const { "pilot-246": _pilot, ...checks } = f.evidence.checks;
       yield* f.writeEvidence({ checks });
       failed(yield* f.check(), "pilot-246");
+      const { "board-delegation": _board, ...withoutBoard } = f.evidence.checks;
+      yield* f.writeEvidence({ checks: withoutBoard });
+      failed(yield* f.check(), "board-delegation");
       yield* f.writeEvidence({
         checks: { ...checks, hooks: { ready: "true", reason: "Not a boolean." } },
       });
@@ -635,5 +824,404 @@ describe("CutoverReadiness", () => {
       );
       failed(results, "settings");
     }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("requires canonical skill symlinks with exact names and resolved targets", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const farm = f.path.join(f.homes.codex!, "skills");
+      const link = f.path.join(farm, "canonical-skill");
+      yield* f.fs.remove(link);
+      failed(yield* f.check(), "home:codex");
+      yield* f.fs.makeDirectory(link);
+      failed(yield* f.check(), "home:codex");
+      yield* f.fs.remove(link, { recursive: true });
+      yield* f.fs.symlink(f.path.join(f.skillRoot, "missing"), link);
+      failed(yield* f.check(), "home:codex");
+      yield* f.fs.remove(link);
+      yield* f.fs.symlink(f.skillRoot, link);
+      failed(yield* f.check(), "home:codex");
+      yield* f.fs.remove(link);
+      yield* f.fs.symlink(f.skill, link);
+      yield* f.fs.symlink(f.skill, f.path.join(farm, "extra"));
+      failed(yield* f.check(), "home:codex");
+      yield* f.fs.remove(f.path.join(farm, "extra"));
+      assert.isTrue((yield* f.check()).every((row) => row.ready));
+      yield* f.fs.writeFileString(
+        f.path.join(f.skill, "SKILL.md"),
+        "---\nname: renamed-skill\n---\nChanged.\n",
+      );
+      failed(yield* f.check(), "home-sources");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "requires source manifest, current canonical instructions and overlays without requiring agents",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.fs.remove(f.manifestFile);
+        failed(yield* f.check(), "home-sources");
+        yield* f.writeJson(f.manifestFile, f.manifest);
+        yield* f.fs.writeFileString(f.canonical, "New canonical rules.\n");
+        failed(yield* f.check(), "home-sources");
+        yield* f.fs.writeFileString(f.canonical, "Canonical fixture instructions.\n");
+        const claude = f.path.join(f.homes.claude!, "CLAUDE.md");
+        yield* f.fs.writeFileString(claude, "@/wrong/canonical\n");
+        failed(yield* f.check(), "home:claude");
+        yield* f.fs.writeFileString(
+          claude,
+          `@${f.canonical}\n@${f.path.join(f.homes.claude!, "overlay.md")}\n`,
+        );
+        yield* f.fs.writeFileString(f.overlays.claude!, "Changed Claude overlay.\n");
+        failed(yield* f.check(), "home-sources");
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("requires all seven MCPs including recall in the manifest and native homes", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.writeJson(f.manifestFile, {
+        ...f.manifest,
+        mcpServers: f.manifest.mcpServers.filter(({ id }) => id !== "recall"),
+      });
+      failed(yield* f.check(), "home-sources");
+      yield* f.writeJson(f.manifestFile, f.manifest);
+      for (const missing of MCP_IDS) {
+        yield* f.writeJson(f.path.join(f.homes.claude!, ".claude.json"), {
+          mcpServers: Object.fromEntries(
+            MCP_IDS.filter((id) => id !== missing).map((id) => [id, { command: `/fixture/${id}` }]),
+          ),
+        });
+        failed(yield* f.check(), "home:claude");
+      }
+      const toml = f.path.join(f.homes.codex!, "config.toml");
+      const original = yield* f.fs.readFileString(toml);
+      yield* f.fs.writeFileString(
+        toml,
+        original.replace("[mcp_servers.recall]", "[mcp_servers.not-recall]"),
+      );
+      failed(yield* f.check(), "home:codex");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "requires buildbound native T3 inventories for ordinary and board sessions per instance",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.writeEvidence({ tools: undefined });
+        failed(yield* f.check(), "evidence");
+        for (const scope of ["ordinary", "board"]) {
+          for (const missing of [
+            "t3_thread_read",
+            "delegate_task",
+            "card_get",
+            "evaluator_start",
+          ]) {
+            yield* f.writeEvidence({
+              tools: f.evidence.tools.map((entry) =>
+                entry.instanceId === "codex" && entry.scope === scope
+                  ? { ...entry, names: entry.names.filter((name) => name !== missing) }
+                  : entry,
+              ),
+            });
+            failed(yield* f.check(), `tools:codex:${scope}`);
+          }
+        }
+        yield* f.writeEvidence({
+          tools: f.evidence.tools.filter((entry) => entry.instanceId !== "codex-cu"),
+        });
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+        failed(yield* f.check([...selections, terra]), "tools:codex-cu:board");
+        yield* f.writeEvidence({
+          tools: f.evidence.tools.map((entry) => ({
+            ...entry,
+            names: entry.names.map((name) => `mcp__t3-code__${name}`),
+          })),
+        });
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("requires each guard parity acceptance independently of configured hooks", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      for (const name of ["statev2-guard", "offbox", "betterstack", "coord"]) {
+        yield* f.writeEvidence({
+          checks: {
+            ...f.evidence.checks,
+            [name]: { ready: false, reason: "Native denial parity failed." },
+          },
+        });
+        failed(yield* f.check(), name);
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "requires explicit unambiguous per-instance recall identity URL and runtime lineage proof",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const current = yield* f.settings.getSettings;
+        for (const id of ["claudeAgent", "codex", "codex-cu"]) {
+          const instanceId = ProviderInstanceId.make(id);
+          for (const environment of [
+            [],
+            [...RECALL_ENV, ...RECALL_ENV],
+            [{ ...RECALL_ENV[0]!, value: "http://127.0.0.1:9/wrong" }],
+            [{ ...RECALL_ENV[0]!, valueRedacted: true }],
+            [{ ...RECALL_ENV[0]!, value: "" }],
+          ]) {
+            yield* f.settings.updateSettings({
+              providerInstances: {
+                ...current.providerInstances,
+                [instanceId]: { ...current.providerInstances[instanceId]!, environment },
+              },
+            });
+            failed(yield* f.check([...selections, terra]), `recall-identity:${id}`);
+          }
+        }
+        yield* f.settings.updateSettings({ providerInstances: current.providerInstances });
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+        const { "recall-identity": _runtime, ...checks } = f.evidence.checks;
+        yield* f.writeEvidence({ checks });
+        failed(yield* f.check(), "recall-identity");
+        yield* f.writeEvidence({
+          checks: {
+            ...f.evidence.checks,
+            "recall-identity": {
+              ready: false,
+              reason: "Native recall did not exclude caller and child lineage.",
+            },
+          },
+        });
+        failed(yield* f.check(), "recall-identity");
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "refuses changed hook commands, matchers and recall endpoints after successful evidence",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+        for (const [harness, file] of [
+          ["claude", "settings.json"],
+          ["codex", "hooks.json"],
+          ["codex-cu", "hooks.json"],
+        ]) {
+          const target = f.path.join(f.homes[harness!]!, file!);
+          const original = yield* f.fs.readFileString(target);
+          for (const changed of [
+            original.replace("/fixture/guard.py", "/usr/bin/true"),
+            original.replace('"matcher":"Bash"', '"matcher":"NeverMatches"'),
+          ]) {
+            assert.notEqual(changed, original);
+            yield* f.fs.writeFileString(target, changed);
+            failed(yield* f.check([...selections, terra]), `home:${harness}`);
+          }
+          yield* f.fs.writeFileString(target, original);
+        }
+        for (const [harness, file] of [
+          ["claude", ".claude.json"],
+          ["codex", "config.toml"],
+          ["codex-cu", "config.toml"],
+        ]) {
+          const target = f.path.join(f.homes[harness!]!, file!);
+          const original = yield* f.fs.readFileString(target);
+          yield* f.fs.writeFileString(
+            target,
+            original.replace("http://127.0.0.1:18765/mcp", "http://127.0.0.1:9/wrong"),
+          );
+          failed(yield* f.check([...selections, terra]), `home:${harness}`);
+          yield* f.fs.writeFileString(target, original);
+        }
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "requires the complete exact owned artifact set without duplicate or substitute paths",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        for (const artifacts of [
+          [],
+          f.manifest.artifacts.slice(1),
+          [...f.manifest.artifacts.slice(1), f.manifest.artifacts[1]!],
+          [
+            ...f.manifest.artifacts.slice(1),
+            {
+              ...f.manifest.artifacts[0]!,
+              path: f.path.join(f.homes.claude!, "parity-manifest.json"),
+            },
+          ],
+        ]) {
+          yield* f.writeJson(f.manifestFile, { ...f.manifest, artifacts });
+          failed(yield* f.check(), "home:claude");
+        }
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "ignores Claude runtime projects and counters but rejects owned fields or format drift",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const file = f.path.join(f.homes.claude!, ".claude.json");
+        const original = JSON.parse(yield* f.fs.readFileString(file));
+        yield* f.writeJson(file, {
+          projects: { "/fixture/界": { lastSessionId: "changed" } },
+          numStartups: 42,
+          ...original,
+        });
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+        yield* f.writeJson(file, { ...original, hasCompletedOnboarding: false });
+        failed(yield* f.check(), "home:claude");
+        yield* f.writeJson(file, {
+          ...original,
+          mcpServers: { ...original.mcpServers, recall: { url: "http://127.0.0.1:9/changed" } },
+        });
+        failed(yield* f.check(), "home:claude");
+        yield* f.writeJson(file, original);
+        for (const artifacts of [
+          f.manifest.artifacts.map(({ format: _format, ...artifact }) => artifact),
+          f.manifest.artifacts.map((artifact) => ({ ...artifact, format: "claude-owned-json" })),
+        ]) {
+          yield* f.writeJson(f.manifestFile, { ...f.manifest, artifacts });
+          failed(yield* f.check(), "home:claude");
+        }
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "requires a successful exact-home generator report and current guard source hashes",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        for (const homesCheck of [
+          { ...f.evidence.homesCheck, ok: false },
+          { ...f.evidence.homesCheck, failures: ["guard mismatch"] },
+          { ...f.evidence.homesCheck, homes: [] },
+        ]) {
+          yield* f.writeEvidence({ homesCheck });
+          failed(yield* f.check(), "homes-check-report");
+        }
+        yield* f.writeEvidence();
+        yield* f.writeJson(f.manifestFile, {
+          ...f.manifest,
+          guards: f.manifest.guards.map((guard) => ({
+            ...guard,
+            sources: guard.sources.map((source) => ({ ...source, sha256: "0".repeat(64) })),
+          })),
+        });
+        failed(yield* f.check(), "home-sources");
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect("validates the configured handoff cap without silently clamping or enabling it", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      for (const value of ["invalid", "1023", "64001", "48000.5"]) {
+        failed(
+          yield* f
+            .check()
+            .pipe(
+              Effect.provide(
+                ConfigProvider.layer(
+                  ConfigProvider.fromUnknown({ T3CODE_CONTEXT_HANDOFF_TOKEN_CAP: value }),
+                ),
+              ),
+            ),
+          "handoff-budget",
+        );
+      }
+      for (const value of ["16000", "48000", "64000"]) {
+        assert.isTrue(
+          (yield* f
+            .check()
+            .pipe(
+              Effect.provide(
+                ConfigProvider.layer(
+                  ConfigProvider.fromUnknown({ T3CODE_CONTEXT_HANDOFF_TOKEN_CAP: value }),
+                ),
+              ),
+            )).every((row) => row.ready),
+        );
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect(
+    "accepts real generator artifacts and its check report using only temporary sources",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const pkg = yield* f.fs.makeTempDirectoryScoped({ prefix: "readiness-generator-" });
+        const source = f.path.join(process.cwd(), "integrations", "harness-homes");
+        const generator = f.path.join(pkg, "generate_homes.py");
+        yield* f.fs.copyFile(f.path.join(source, "generate_homes.py"), generator);
+        yield* f.fs.makeDirectory(f.path.join(pkg, "vendor"));
+        yield* f.fs.copyFile(
+          f.path.join(source, "vendor", "codex-models-0.166.0.json"),
+          f.path.join(pkg, "vendor", "codex-models-0.166.0.json"),
+        );
+        const manifest = JSON.parse(
+          yield* f.fs.readFileString(f.path.join(source, "manifest.json")),
+        );
+        Object.assign(manifest, {
+          skillRoots: [f.skillRoot],
+          instructions: { canonical: f.canonical, overlays: f.overlays },
+          mcpServers: MCP_IDS.map((id) => ({
+            id,
+            ...(id === "recall" ? { url: RECALL_URL } : { command: `/fixture/${id}` }),
+            args: [],
+            env: { "\u{10000}": "four-byte", "\uE000": "bmp", z: "界" },
+            toolTimeoutSec: 120,
+            startupTimeoutSec: 30,
+          })),
+          hooks: Object.keys(HOOKS).map((event) => ({
+            event,
+            command: "/fixture/guard.py",
+            timeoutSec: 10,
+          })),
+          paritySources: Object.fromEntries(
+            ["live-database", "offbox", "betterstack-scope", "coord-haiku"].map((id) => [
+              id,
+              [f.canonical],
+            ]),
+          ),
+        });
+        yield* f.writeJson(f.path.join(pkg, "manifest.json"), manifest);
+        const root = f.path.dirname(f.homes.claude!);
+        yield* Effect.try(() =>
+          NodeChildProcess.execFileSync("python3", [generator, "generate", "--home-root", root], {
+            encoding: "utf8",
+          }),
+        );
+        const report = yield* Effect.try(() =>
+          NodeChildProcess.execFileSync(
+            "python3",
+            [generator, "check", "--home-root", root, "--json"],
+            { encoding: "utf8" },
+          ),
+        );
+        yield* f.writeEvidence({ homesCheck: JSON.parse(report) });
+        assert.deepEqual(
+          (yield* f.check([...selections])).filter((row) => !row.ready),
+          [],
+        );
+        const claudeFile = f.path.join(f.homes.claude!, ".claude.json");
+        const generated = JSON.parse(yield* f.fs.readFileString(claudeFile));
+        yield* f.writeJson(claudeFile, {
+          ...generated,
+          projects: { "/fixture": { lastSession: "new" } },
+          numStartups: 10,
+        });
+        assert.isTrue((yield* f.check()).every((row) => row.ready));
+        yield* f.writeJson(claudeFile, {
+          ...generated,
+          mcpServers: {
+            ...generated.mcpServers,
+            recall: { ...generated.mcpServers.recall, url: "http://127.0.0.1:9/changed" },
+          },
+        });
+        failed(yield* f.check(), "home:claude");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

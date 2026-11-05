@@ -1022,6 +1022,8 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
+  /** Native acknowledgement of this prompt, not a local start or queue offer. */
+  promptAcceptedAt: Schema.optional(Schema.DateTimeUtc),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
   /** The provider's native finish reason (e.g. Claude stop_reason); null when not reported. */
   finish: Schema.optional(Schema.NullOr(Schema.String)).pipe(
@@ -2160,6 +2162,7 @@ export const OrchestrationV2ProviderTurnJson = OrchestrationV2ProviderTurn.mapFi
   ...fields,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  promptAcceptedAt: Schema.optional(Schema.DateTimeUtcFromString),
 }));
 export type OrchestrationV2ProviderTurnJson = typeof OrchestrationV2ProviderTurnJson.Type;
 
@@ -3247,8 +3250,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
         driver: ProviderDriverKind,
         nativeId: Schema.NullOr(TrimmedNonEmptyString),
         headId: Schema.NullOr(TrimmedNonEmptyString),
-        // Prompt-only cutover creates an empty native binding, never transplanted history.
-        seededHistory: Schema.optional(OrchestrationV2SeededHistory),
+        seededHistory: OrchestrationV2SeededHistory,
       }),
       Schema.Struct({
         kind: Schema.Literal("existing"),

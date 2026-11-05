@@ -26,11 +26,44 @@ import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapter
 import * as ScheduledTaskService from "../../scheduledTasks/ScheduledTaskService.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as SecretRequests from "../../secrets/SecretRequests.ts";
+import { claudeMcpQueryOverrides } from "../../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import { OrchestratorToolkit } from "../../mcp/toolkits/orchestrator/tools.ts";
+import { KanbanToolkit } from "../kanban/tools/tools.ts";
 
 const decode = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
 
+it("attaches and pre-approves the full T3 toolkit for a native full-access board thread", () => {
+  const threadId = ThreadId.make("thread:board:work-or-evaluator");
+  const endpoint = "http://127.0.0.1:43123/mcp";
+  const config = claudeMcpQueryOverrides({
+    mcpSession: {
+      environmentId: EnvironmentId.make("environment:fixture"),
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      providerSessionId: "native-board-session",
+      endpoint,
+      authorizationHeader: "Bearer fixture",
+      browserToolsAvailable: true,
+    },
+    readOnlySandbox: false,
+  });
+  assert.equal(config.mcpServers?.["t3-code"]?.type, "http");
+  assert.deepInclude(config.mcpServers?.["t3-code"], {
+    url: endpoint,
+    headers: { Authorization: "Bearer fixture" },
+  });
+  assert.include(config.allowedTools ?? [], "mcp__t3-code__*");
+  const tools = [
+    ...Object.values(OrchestratorToolkit.tools),
+    ...Object.values(KanbanToolkit.tools),
+  ].map((tool) => tool.name);
+  for (const name of ["t3_thread_read", "delegate_task", "evaluator_start"])
+    assert.include(tools, name);
+  assert.isAbove(tools.filter((name) => name.startsWith("card_")).length, 0);
+});
+
 it.effect.each(["claudeAgent", "codex", "codex-cu"])(
-  "lets a %s MCP caller page the same thread's pre-switch OpenCode activity",
+  "lets a native %s MCP caller page the same thread's pre-switch OpenCode activity",
   (target) => {
     const threadId = ThreadId.make("thread:same-before-and-after-cutover");
     const shell = {

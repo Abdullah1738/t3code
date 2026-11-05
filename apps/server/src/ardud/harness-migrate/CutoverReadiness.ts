@@ -7,7 +7,10 @@ import {
   resolveProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import { resolveSelection } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- parity hashes are deterministic local byte digests.
+import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -21,6 +24,7 @@ import * as ServerConfig from "../../config.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerSettingsService from "../../serverSettings.ts";
 import { selectionProblem } from "../control/model.ts";
+import { DEFAULT_HANDOFF_TOKEN_CAP } from "@t3tools/provider-core/server/handoffBudget";
 
 const Check = Schema.Struct({ ready: Schema.Boolean, reason: Schema.NonEmptyString });
 const Evidence = Schema.Struct({
@@ -29,6 +33,18 @@ const Evidence = Schema.Struct({
   checkedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
   checks: Schema.Record(Schema.String, Check),
+  homesCheck: Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    ok: Schema.Boolean,
+    failures: Schema.Array(Schema.String),
+    homes: Schema.Array(
+      Schema.Struct({
+        harness: Schema.NonEmptyString,
+        home: Schema.NonEmptyString,
+        parityManifestPath: Schema.NonEmptyString,
+      }),
+    ),
+  }),
   models: Schema.Array(ModelSelection),
   routes: Schema.Array(
     Schema.Struct({
@@ -38,12 +54,89 @@ const Evidence = Schema.Struct({
       route: Schema.NonEmptyString,
     }),
   ),
+  tools: Schema.Array(
+    Schema.Struct({
+      instanceId: ProviderInstanceId,
+      scope: Schema.Literals(["ordinary", "board"]),
+      names: Schema.Array(Schema.NonEmptyString),
+    }),
+  ),
 });
 const decodeEvidence = Schema.decodeUnknownEffect(Schema.fromJsonString(Evidence));
 const encodeSelection = Schema.encodeSync(Schema.fromJsonString(ModelSelection));
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeClaude = Schema.decodeUnknownEffect(ClaudeSettings);
 const decodeCodex = Schema.decodeUnknownEffect(CodexSettings);
+const SourceDigest = Schema.Struct({
+  path: Schema.NonEmptyString,
+  sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+});
+const ArtifactDigest = Schema.Struct({
+  ...SourceDigest.fields,
+  format: Schema.optionalKey(Schema.Literal("claude-owned-json")),
+});
+const decodeClaudeOwnedJson = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    mcpServers: Schema.JsonObject,
+    hasCompletedOnboarding: Schema.Boolean,
+  }),
+);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Json));
+const codePointOrder = (left: string, right: string) => {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  for (let index = 0; index < Math.min(a.length, b.length); index++) {
+    const difference = a[index]!.codePointAt(0)! - b[index]!.codePointAt(0)!;
+    if (difference) return difference;
+  }
+  return a.length - b.length;
+};
+const isJsonArray = (value: Schema.Json): value is Schema.JsonArray => Array.isArray(value);
+const canonicalJson = (value: Schema.Json): string => {
+  if (value === null || typeof value !== "object") return encodeJson(value);
+  if (isJsonArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort(codePointOrder)
+    .map((key) => `${encodeJson(key)}:${canonicalJson(value[key]!)}`)
+    .join(",")}}`;
+};
+const decodeGeneratorManifest = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    skillRoots: Schema.Array(Schema.NonEmptyString).check(Schema.isMinLength(1)),
+    instructions: Schema.Struct({ canonical: Schema.NonEmptyString }),
+    mcpServers: Schema.Array(
+      Schema.Struct({ id: Schema.NonEmptyString, url: Schema.optionalKey(Schema.String) }),
+    ),
+  }),
+);
+const decodeHomeManifest = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    harness: Schema.Literals(["claude", "codex", "codex-cu"]),
+    generator: SourceDigest,
+    artifacts: Schema.Array(ArtifactDigest),
+    instructions: Schema.Struct({
+      canonical: SourceDigest,
+      overlays: Schema.Array(SourceDigest),
+    }),
+    mcpServers: Schema.Array(
+      Schema.Struct({ id: Schema.NonEmptyString, url: Schema.optionalKey(Schema.String) }),
+    ),
+    skills: Schema.Array(
+      Schema.Struct({
+        name: Schema.NonEmptyString,
+        source: Schema.NonEmptyString,
+        sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+      }),
+    ),
+    guards: Schema.Array(
+      Schema.Struct({
+        id: Schema.NonEmptyString,
+        sources: Schema.Array(SourceDigest).check(Schema.isMinLength(1)),
+      }),
+    ),
+  }),
+);
 
 const CommandHook = Schema.Struct({
   type: Schema.Literal("command"),
@@ -110,7 +203,42 @@ const REQUIRED_CHECKS = [
   "canaries-417",
   "pilot-246",
   "installer-245",
+  "statev2-guard",
+  "offbox",
+  "betterstack",
+  "coord",
+  "board-delegation",
+  "recall-identity",
 ] as const;
+const REQUIRED_MCP = [
+  "betterstack",
+  "perplexity",
+  "inbody",
+  "flighty",
+  "cua-driver",
+  "dia",
+  "recall",
+];
+const REQUIRED_TOOLS = [
+  "t3_thread_read",
+  "delegate_task",
+  "board_get",
+  "board_open",
+  "evaluator_start",
+  "card_search",
+  "card_get",
+  "card_update",
+  "card_move",
+  "card_ask",
+  "card_ask_change",
+  "card_flag",
+  "card_review_result",
+  "card_create",
+  "card_claim",
+  "card_next",
+  "card_edit",
+  "card_thread",
+];
 const REQUIRED_HOOKS = ["PreToolUse", "UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const HOMES = [
   { name: "claude", instanceId: "claudeAgent", driver: "claudeAgent" },
@@ -179,8 +307,278 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const sourceText = Effect.fn("CutoverReadiness.sourceText")(function* (file: string) {
+    if (!path.isAbsolute(file))
+      return yield* Effect.fail("Home manifest source paths must be absolute.");
+    const text = yield* fs
+      .readFileString(file)
+      .pipe(Effect.mapError(() => "Home manifest source is unreadable."));
+    if (!text.trim()) return yield* Effect.fail("Home manifest source is empty.");
+    return text;
+  });
+  const verifyDigest = Effect.fn("CutoverReadiness.verifyDigest")(function* (
+    source: typeof SourceDigest.Type,
+  ) {
+    if (!path.isAbsolute(source.path))
+      return yield* Effect.fail("Parity source paths must be absolute.");
+    const bytes = yield* fs
+      .readFile(source.path)
+      .pipe(Effect.mapError(() => "Parity source is unreadable."));
+    if (NodeCrypto.createHash("sha256").update(bytes).digest("hex") !== source.sha256)
+      return yield* Effect.fail("Parity source hash differs from current source bytes.");
+  });
+  const verifyArtifact = Effect.fn("CutoverReadiness.verifyArtifact")(function* (
+    artifact: typeof ArtifactDigest.Type,
+  ) {
+    const text = yield* readText(artifact.path);
+    const owned = path.basename(artifact.path) === ".claude.json";
+    if (
+      (owned && artifact.format !== "claude-owned-json") ||
+      (!owned && artifact.format !== undefined)
+    ) {
+      return yield* Effect.fail(
+        "Only .claude.json must use the claude-owned-json artifact format.",
+      );
+    }
+    if (!owned) return yield* verifyDigest(artifact);
+    const value = yield* decodeJson(text).pipe(
+      Effect.flatMap(decodeClaudeOwnedJson),
+      Effect.mapError(() => "Claude generator-owned JSON fields are missing or invalid."),
+    );
+    const digest = NodeCrypto.createHash("sha256")
+      .update(canonicalJson(value), "utf8")
+      .digest("hex");
+    if (digest !== artifact.sha256)
+      return yield* Effect.fail("Claude generator-owned JSON fields differ from expected output.");
+  });
+  const sources = Effect.fn("CutoverReadiness.sources")(function* (cu: boolean) {
+    const manifest = yield* readJson(
+      path.join(config.baseDir, "harness-homes", "claude", "parity-manifest.json"),
+    ).pipe(
+      Effect.flatMap(decodeHomeManifest),
+      Effect.mapError(() => "Generated homes source manifest is missing or invalid."),
+    );
+    if (REQUIRED_MCP.some((id) => !manifest.mcpServers.some((server) => server.id === id))) {
+      return yield* Effect.fail(
+        "Home manifest must include all seven required MCP servers, including recall.",
+      );
+    }
+    const canonical = yield* sourceText(manifest.instructions.canonical.path);
+    yield* verifyDigest(manifest.generator);
+    const generatorFile = path.join(path.dirname(manifest.generator.path), "manifest.json");
+    const generatorManifest = yield* sourceText(generatorFile).pipe(
+      Effect.flatMap(decodeJson),
+      Effect.flatMap(decodeGeneratorManifest),
+      Effect.mapError(() => "Generator source manifest is missing or invalid."),
+    );
+    const declared = generatorManifest.instructions.canonical;
+    const recall = generatorManifest.mcpServers.filter((server) => server.id === "recall");
+    const recallUrl = recall[0]?.url;
+    if (
+      recall.length !== 1 ||
+      !recallUrl ||
+      recallUrl !== recallUrl.trim() ||
+      !URL.canParse(recallUrl)
+    ) {
+      return yield* Effect.fail(
+        "Generator manifest must define one valid recall URL for caller identity injection.",
+      );
+    }
+    const endpoint = new URL(recallUrl);
+    if (
+      !["http:", "https:"].includes(endpoint.protocol) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.hash
+    ) {
+      return yield* Effect.fail(
+        "Recall identity endpoint must be an HTTP(S) URL without credentials or fragment.",
+      );
+    }
+    const actual = manifest.instructions.canonical.path;
+    const userHome =
+      declared.startsWith("~/") && actual.endsWith(declared.slice(1))
+        ? actual.slice(0, -declared.length + 1)
+        : null;
+    const roots = generatorManifest.skillRoots.map((root) =>
+      root.startsWith("~/") && userHome !== null ? `${userHome}${root.slice(1)}` : root,
+    );
+    if (declared !== actual && (userHome === null || `${userHome}${declared.slice(1)}` !== actual))
+      return yield* Effect.fail("Canonical path does not match the generator source manifest.");
+    const overlays = new Map<string, string>();
+    const manifests = [];
+    let codexOverlay: string | undefined;
+    for (const home of HOMES.filter((home) => home.name !== "codex-cu" || cu)) {
+      const parity =
+        home.name === "claude"
+          ? manifest
+          : yield* readJson(
+              path.join(config.baseDir, "harness-homes", home.name, "parity-manifest.json"),
+            ).pipe(
+              Effect.flatMap(decodeHomeManifest),
+              Effect.mapError(() => "Generated parity manifest is missing or invalid."),
+            );
+      if (
+        parity.harness !== home.name ||
+        parity.instructions.canonical.path !== manifest.instructions.canonical.path ||
+        REQUIRED_MCP.some((id) => !parity.mcpServers.some((server) => server.id === id)) ||
+        parity.generator.path !== manifest.generator.path ||
+        parity.generator.sha256 !== manifest.generator.sha256 ||
+        parity.mcpServers.filter((server) => server.id === "recall").length !== 1 ||
+        parity.mcpServers.find((server) => server.id === "recall")?.url !== recallUrl
+      ) {
+        return yield* Effect.fail(
+          "Native parity manifests must share canonical instruction and skill sources.",
+        );
+      }
+      const files = parity.instructions.overlays;
+      if (files.length !== (home.name === "codex-cu" ? 2 : 1))
+        return yield* Effect.fail("Native overlay source list is incomplete.");
+      if (home.name === "codex") codexOverlay = files[0]!.path;
+      if (home.name === "codex-cu" && files[0]!.path !== codexOverlay)
+        return yield* Effect.fail("Codex CU must share the Codex overlay source.");
+      overlays.set(home.name, yield* sourceText(files[files.length - 1]!.path));
+      for (const source of [
+        parity.instructions.canonical,
+        ...files,
+        ...parity.skills.map((skill) => ({
+          path: path.join(skill.source, "SKILL.md"),
+          sha256: skill.sha256,
+        })),
+        ...parity.guards.flatMap((guard) => guard.sources),
+      ])
+        yield* verifyDigest(source);
+      if (
+        ["live-database", "offbox", "betterstack-scope", "coord-haiku"].some(
+          (id) => !parity.guards.some((guard) => guard.id === id),
+        )
+      )
+        return yield* Effect.fail("Guard parity source categories are incomplete.");
+      manifests.push(parity);
+    }
+    const skills = new Map<string, string>();
+    const visited = new Set<string>();
+    const pending = [...roots];
+    while (pending.length) {
+      const directory = pending.pop()!;
+      if (!path.isAbsolute(directory)) return yield* Effect.fail("Skill roots must be absolute.");
+      const real = yield* fs
+        .realPath(directory)
+        .pipe(Effect.mapError(() => "Canonical skill root cannot be resolved."));
+      if (visited.has(real)) continue;
+      visited.add(real);
+      const names = yield* fs
+        .readDirectory(directory)
+        .pipe(Effect.mapError(() => "Canonical skill directory is unreadable."));
+      if (names.includes("SKILL.md")) {
+        const text = yield* sourceText(path.join(directory, "SKILL.md"));
+        const front = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)?.[1];
+        const name = (
+          /^name:\s*(.*?)\s*$/m.exec(front ?? "")?.[1] ?? path.basename(directory)
+        ).replace(/^(["'])(.*)\1$/, "$2");
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || skills.has(name))
+          return yield* Effect.fail("Canonical skill names are invalid or collide.");
+        skills.set(name, real);
+      }
+      for (const name of names) {
+        const child = path.join(directory, name);
+        const stat = yield* fs
+          .stat(child)
+          .pipe(Effect.mapError(() => "Canonical skill entry is unreadable."));
+        if (stat.type === "Directory") pending.push(child);
+      }
+    }
+    if (skills.size === 0) return yield* Effect.fail("Canonical skill roots contain no skills.");
+    for (const parity of manifests) {
+      if (parity.skills.length !== skills.size)
+        return yield* Effect.fail("Parity manifest skill catalog differs from canonical roots.");
+      const names = new Set<string>();
+      for (const skill of parity.skills) {
+        const target = yield* fs
+          .realPath(skill.source)
+          .pipe(Effect.mapError(() => "Parity skill source is missing."));
+        if (names.has(skill.name) || target !== skills.get(skill.name))
+          return yield* Effect.fail(
+            "Parity manifest skill names/targets differ from canonical roots.",
+          );
+        names.add(skill.name);
+      }
+    }
+    return { manifest, canonical, overlays, skills, recallUrl };
+  });
+  const sourceParity = Effect.fn("CutoverReadiness.sourceParity")(function* (
+    home: (typeof HOMES)[number],
+    source: Effect.Success<ReturnType<typeof sources>>,
+  ) {
+    const directory = path.join(config.baseDir, "harness-homes", home.name);
+    const parity = yield* readJson(path.join(directory, "parity-manifest.json")).pipe(
+      Effect.flatMap(decodeHomeManifest),
+      Effect.mapError(() => "Generated parity manifest is missing or invalid."),
+    );
+    const required =
+      home.name === "claude"
+        ? ["settings.json", ".claude.json", "CLAUDE.md", "overlay.md"]
+        : ["config.toml", "hooks.json", "AGENTS.md", "models.json"];
+    const expectedPaths = new Set(required.map((file) => path.join(directory, file)));
+    if (
+      parity.artifacts.length !== expectedPaths.size ||
+      new Set(parity.artifacts.map((artifact) => artifact.path)).size !== expectedPaths.size ||
+      parity.artifacts.some((artifact) => !expectedPaths.has(artifact.path))
+    ) {
+      return yield* Effect.fail(
+        "Parity artifact digests must cover every owned native home file exactly once.",
+      );
+    }
+    for (const artifact of parity.artifacts) {
+      // Runtime .claude.json counters/projects may change; generated MCP/onboarding fields may not.
+      yield* verifyArtifact(artifact);
+    }
+    const farm = path.join(directory, "skills");
+    const realDirectory = yield* fs
+      .realPath(directory)
+      .pipe(Effect.mapError(() => "Native home is missing."));
+    const realFarm = yield* fs
+      .realPath(farm)
+      .pipe(Effect.mapError(() => "Native skill farm is missing."));
+    if (realFarm !== path.join(realDirectory, "skills"))
+      return yield* Effect.fail("Native skill farm must not be redirected.");
+    const links = yield* fs
+      .readDirectory(farm)
+      .pipe(Effect.mapError(() => "Native skill farm is unreadable."));
+    if (links.length !== source.skills.size || links.some((name) => !source.skills.has(name)))
+      return yield* Effect.fail("Native skill names differ from canonical roots.");
+    for (const name of links) {
+      const link = path.join(farm, name);
+      yield* fs
+        .readLink(link)
+        .pipe(Effect.mapError(() => "Every native skill must be a canonical symlink."));
+      const target = yield* fs
+        .realPath(link)
+        .pipe(Effect.mapError(() => "Native skill symlink is broken."));
+      if (target !== source.skills.get(name))
+        return yield* Effect.fail("Native skill symlink points at the wrong source.");
+    }
+    if (home.name === "claude") {
+      const expected = `@${source.manifest.instructions.canonical.path}\n@${path.join(directory, "overlay.md")}\n`;
+      if (
+        (yield* readText(path.join(directory, "CLAUDE.md"))) !== expected ||
+        (yield* readText(path.join(directory, "overlay.md"))) !== source.overlays.get("claude")
+      )
+        return yield* Effect.fail("Claude instructions/overlay differ from canonical sources.");
+    } else {
+      const expected = `${source.canonical}\n\n${source.overlays.get("codex")}${home.name === "codex-cu" ? `\n\n${source.overlays.get("codex-cu")}` : ""}`;
+      if ((yield* readText(path.join(directory, "AGENTS.md"))) !== expected)
+        return yield* Effect.fail("Codex instructions/overlay differ from canonical sources.");
+    }
+  });
+
   const homeCheck = Effect.fn("CutoverReadiness.homeCheck")(
-    function* (home: (typeof HOMES)[number]) {
+    function* (
+      home: (typeof HOMES)[number],
+      source: Effect.Success<ReturnType<typeof sources>> | null,
+    ) {
+      if (source === null)
+        return yield* Effect.fail("Canonical homes source manifest did not pass.");
       const directory = path.join(config.baseDir, "harness-homes", home.name);
       const base = yield* fs
         .realPath(config.baseDir)
@@ -205,9 +603,9 @@ const make = Effect.gen(function* () {
           Effect.flatMap(decodeClaudeMcp),
           Effect.mapError(() => "Claude MCP configuration is invalid."),
         );
-        if (!mcp.mcpServers.dia || mcp.mcpServers["t3-code"]) {
+        if (REQUIRED_MCP.some((id) => !mcp.mcpServers[id]) || mcp.mcpServers["t3-code"]) {
           return yield* Effect.fail(
-            "Dia must be configured and T3 must remain per-thread injected.",
+            "All seven MCP servers must be configured; T3 remains per-thread injected.",
           );
         }
         if (REQUIRED_HOOKS.some((event) => !owned.hooks[event]?.length)) {
@@ -228,7 +626,7 @@ const make = Effect.gen(function* () {
           Effect.mapError(() => "Codex hooks.json is invalid."),
         );
         if (
-          !owned.mcp_servers.dia ||
+          REQUIRED_MCP.some((id) => !owned.mcp_servers[id]) ||
           owned.mcp_servers["t3-code"] ||
           owned.features.computer_use !== (home.name === "codex-cu")
         ) {
@@ -258,6 +656,7 @@ const make = Effect.gen(function* () {
         yield* readText(path.join(directory, "AGENTS.md"));
         yield* readJson(path.join(directory, "models.json"));
       }
+      yield* sourceParity(home, source);
       return row(
         `home:${home.name}`,
         true,
@@ -307,6 +706,48 @@ const make = Effect.gen(function* () {
           check?.reason ?? "Required operator check is missing.",
         );
       });
+      const homesPassed =
+        evidence.homesCheck.ok &&
+        evidence.homesCheck.failures.length === 0 &&
+        HOMES.filter((home) => home.name !== "codex-cu" || cu).every((home) =>
+          evidence.homesCheck.homes.some(
+            (entry) =>
+              entry.harness === home.name &&
+              entry.home === path.join(config.baseDir, "harness-homes", home.name) &&
+              entry.parityManifestPath === path.join(entry.home, "parity-manifest.json"),
+          ),
+        );
+      results.push(
+        row(
+          "homes-check-report",
+          homesPassed,
+          homesPassed
+            ? "Generator check --json passed for the exact native homes."
+            : "Operator evidence lacks a successful generator check --json report for these homes.",
+        ),
+      );
+      for (const home of HOMES.filter((home) => home.name !== "codex-cu" || cu)) {
+        for (const scope of ["ordinary", "board"] as const) {
+          const inventories = evidence.tools.filter(
+            (entry) => entry.instanceId === home.instanceId && entry.scope === scope,
+          );
+          const ready = inventories.some((entry) => {
+            const names = new Set(
+              entry.names.map((name) => name.replace(/^mcp__(?:t3-code|t3_code)__/, "")),
+            );
+            return REQUIRED_TOOLS.every((name) => names.has(name));
+          });
+          results.push(
+            row(
+              `tools:${home.instanceId}:${scope}`,
+              ready,
+              ready
+                ? "Native test session exposed the required T3/board tools."
+                : "Native test-session tool inventory is missing required T3/board tools.",
+            ),
+          );
+        }
+      }
       const models = new Set(evidence.models.map(selectionKey));
       const routes = new Set(
         evidence.routes.filter((entry) => entry.route.trim().length > 0).map(selectionKey),
@@ -341,6 +782,20 @@ const make = Effect.gen(function* () {
     selections: readonly ModelSelection[],
   ) {
     const results: Array<{ id: string; ready: boolean; reason: string }> = [];
+    const budget = yield* Config.Int("T3CODE_CONTEXT_HANDOFF_TOKEN_CAP").pipe(
+      Config.withDefault(DEFAULT_HANDOFF_TOKEN_CAP),
+      Effect.catch(() => Effect.succeed(null)),
+    );
+    const supported = budget !== null && budget >= 1_024 && budget <= 64_000;
+    results.push(
+      row(
+        "handoff-budget",
+        supported,
+        supported
+          ? `Native handoff cap is ${budget} bytes (48,000 recommended; setting is unchanged).`
+          : "T3CODE_CONTEXT_HANDOFF_TOKEN_CAP must be an integer from 1,024 to 64,000 bytes.",
+      ),
+    );
     const targetByKey = new Map<string, ModelSelection>();
     const seen = new Set<string>();
     for (const [index, selection] of selections.entries()) {
@@ -356,7 +811,13 @@ const make = Effect.gen(function* () {
     const targets = [...targetByKey.values()];
     const cu = targets.some((selection) => selection.instanceId === "codex-cu");
     const homes = HOMES.filter((home) => home.name !== "codex-cu" || cu);
-    for (const home of homes) results.push(yield* homeCheck(home));
+    const source = yield* sources(cu).pipe(
+      Effect.catch((reason) => {
+        results.push(row("home-sources", false, reason));
+        return Effect.succeed(null);
+      }),
+    );
+    for (const home of homes) results.push(yield* homeCheck(home, source));
     results.push(...(yield* evidenceCheck(targets, cu)));
     const current = yield* settings.getSettings.pipe(Effect.catch(() => Effect.succeed(null)));
     if (current === null)
@@ -364,6 +825,22 @@ const make = Effect.gen(function* () {
     const providers = yield* registry.getProviders;
     for (const home of homes) {
       const instance = current.providerInstances[ProviderInstanceId.make(home.instanceId)];
+      const recallEntries =
+        instance?.environment?.filter((entry) => entry.name === "ROBOB_RECALL_MCP_URL") ?? [];
+      const recallReady =
+        source !== null &&
+        recallEntries.length === 1 &&
+        recallEntries[0]!.valueRedacted !== true &&
+        recallEntries[0]!.value === source.recallUrl;
+      results.push(
+        row(
+          `recall-identity:${home.instanceId}`,
+          recallReady,
+          recallReady
+            ? "Explicit instance recall URL matches the shared generated caller-identity endpoint."
+            : "Configure exactly one non-redacted ROBOB_RECALL_MCP_URL matching the shared generated recall URL; host environment is not accepted.",
+        ),
+      );
       const decoded =
         instance === undefined
           ? null

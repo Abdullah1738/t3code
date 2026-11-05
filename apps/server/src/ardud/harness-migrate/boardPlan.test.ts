@@ -38,6 +38,7 @@ const board = (overrides: Partial<KanbanBoard> = {}): KanbanBoard =>
     evaluatorModel: sel("opus/claude-opus-5-5", "xhigh"),
     defaultCardModel: sel("opus/claude-opus-5-5", "xhigh"),
     reviewChains: [],
+    instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
     ...overrides,
   }) as unknown as KanbanBoard;
 
@@ -180,4 +181,41 @@ it("a conflicting pinned model on a settled card blocks the board", () => {
   );
   assert.strictEqual(plan.conflicts.length, 1);
   assert.isNull(plan.next);
+});
+
+it("puts converted reviewer instructions in the same board change as the native selections", () => {
+  const before = board({
+    instructions: {
+      modelRouting: "Keep worker weights.",
+      reviewerRouting: "One crpko-reviewer on opus/cx/gpt-6.1-sol#xhigh, exact head only.",
+      escalation: "Ask before a merge.",
+    },
+  });
+  const plan = planBoard(snapshot({ board: before }));
+  assert.strictEqual(plan.conflicts.length, 0);
+  assert.isTrue(plan.changed);
+  assert.isNotNull(plan.next);
+  assert.notInclude(plan.next!.board.instructions.reviewerRouting, "crpko-reviewer");
+  assert.include(plan.next!.board.instructions.reviewerRouting, "Read-only Crpko review role");
+  const change = plan.changes.find((entry) => entry.ref === `board:${before.id}`);
+  assert.deepStrictEqual(change?.before, before);
+  assert.deepStrictEqual(change?.after, plan.next!.board);
+  assert.strictEqual(plan.next!.board.instructions.escalation, before.instructions.escalation);
+});
+
+it("blocks the entire board for an unsupported reviewer without writing partial model changes", () => {
+  const plan = planBoard(
+    snapshot({
+      board: board({
+        instructions: {
+          modelRouting: "",
+          reviewerRouting: "Use agent: private-auditor.",
+          escalation: "",
+        },
+      }),
+    }),
+  );
+  assert.isFalse(plan.changed);
+  assert.isNull(plan.next);
+  assert.strictEqual(plan.conflicts[0]?.field, "instructions.reviewerRouting");
 });

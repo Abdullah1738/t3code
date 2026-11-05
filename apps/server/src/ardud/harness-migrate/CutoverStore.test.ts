@@ -126,7 +126,7 @@ it.effect("duplicate keys and unencodable payloads leave no table or partial cla
 );
 
 it.effect(
-  "imports at most sixteen intents per transaction and resumes an interrupted frozen snapshot",
+  "imports at most eight intents per transaction and resumes an interrupted frozen snapshot",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -183,7 +183,7 @@ it.effect(
           complete.items.map((row) => row.key),
           entries.map((row) => row.key),
         );
-        assert.isTrue(counts.every((count) => count >= 0 && count <= 16));
+        assert.isTrue(counts.every((count) => count >= 0 && count <= 8));
         assert.deepStrictEqual(
           (yield* store.read())!.items.map((row) => row.payload),
           entries.map((row) => row.payload),

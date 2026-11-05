@@ -14,7 +14,15 @@ it("harness-cutover plan/run/status send authenticated requests and preserve err
     authorization: string | undefined;
   }> = [];
   let refusal = false;
-  const payload = { ok: true, cutover: { active: true, completed: false, items: [] } };
+  const payload = {
+    ok: true,
+    cutover: {
+      active: true,
+      completed: false,
+      items: [],
+      refusals: [] as Array<{ ref: string; reason: string }>,
+    },
+  };
   const server = NodeHttp.createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
@@ -70,6 +78,10 @@ it("harness-cutover plan/run/status send authenticated requests and preserve err
       authorization: "Bearer fixture-token",
     });
   }
+  payload.cutover.refusals.push({ ref: "t3-codex", reason: "Required native tools are missing." });
+  const blocked = await invoke("run");
+  assert.strictEqual(blocked.code, 3);
+  assert.include(blocked.stdout, "Required native tools are missing.");
   refusal = true;
   const failed = await invoke("run");
   assert.notStrictEqual(failed.code, 0);
@@ -77,5 +89,5 @@ it("harness-cutover plan/run/status send authenticated requests and preserve err
   const invalid = await invoke("unknown");
   assert.notStrictEqual(invalid.code, 0);
   assert.include(invalid.stderr, "unknown harness-cutover action unknown");
-  assert.strictEqual(received.length, 4);
+  assert.strictEqual(received.length, 5);
 });

@@ -702,8 +702,16 @@ export function upsertProviderTurn(
   next: OrchestrationV2ProviderTurn,
 ): Array<OrchestrationV2ProviderTurn> {
   const current = turns.find((turn) => turn.id === next.id);
+  const promptAcceptedAt =
+    next.promptAcceptedAt ??
+    (current?.providerThreadId === next.providerThreadId &&
+    current.nodeId === next.nodeId &&
+    current.runAttemptId === next.runAttemptId
+      ? current.promptAcceptedAt
+      : undefined);
   return upsertById(turns, {
     ...next,
+    ...(promptAcceptedAt === undefined ? {} : { promptAcceptedAt }),
     ...((next.tokenUsage ?? current?.tokenUsage) === undefined
       ? {}
       : { tokenUsage: next.tokenUsage ?? current?.tokenUsage }),
@@ -2461,7 +2469,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 started_at = excluded.started_at,
                 completed_at = excluded.completed_at,
-                payload_json = excluded.payload_json
+                payload_json = CASE
+                  WHEN orchestration_v2_projection_provider_turns.provider_thread_id IS excluded.provider_thread_id
+                    AND orchestration_v2_projection_provider_turns.node_id IS excluded.node_id
+                    AND orchestration_v2_projection_provider_turns.run_attempt_id IS excluded.run_attempt_id
+                    AND json_type(excluded.payload_json, '$.promptAcceptedAt') IS NULL
+                    AND json_type(orchestration_v2_projection_provider_turns.payload_json, '$.promptAcceptedAt') = 'text'
+                  THEN json_set(excluded.payload_json, '$.promptAcceptedAt',
+                    json_extract(orchestration_v2_projection_provider_turns.payload_json, '$.promptAcceptedAt'))
+                  ELSE excluded.payload_json
+                END
             `;
               break;
             }

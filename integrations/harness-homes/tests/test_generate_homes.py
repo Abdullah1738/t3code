@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
@@ -143,11 +144,14 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["model_providers"]["ninerouter"]["http_headers"],
                          {"x-9router-token-saver": "off", "x-openai-actor-authorization": "robob-9router-local"})
         self.assertEqual(cfg["mcp_servers"]["cua-driver"]["args"], ["mcp"])
+        self.assertEqual(cfg["mcp_servers"]["recall"]["url"], "http://127.0.0.1:18765/mcp")
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
         self.assertEqual(cfg["notify"], [])
         self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"],
-                         ":".join(m["shellPathPrefix"] + m["shellPath"]))
+                          ":".join(m["shellPathPrefix"] + m["shellPath"]))
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["BUN_INSPECT"], "")
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["OFFBOX_GATE"], "1")
         self.assertEqual(cfg["agents"]["max_depth"], 1000000)
         self.assertEqual(cfg["history"], {"persistence": "none"})
 
@@ -601,8 +605,8 @@ class GenerateTests(HarnessTestCase):
                 self.assertIn("/codex.py", group["hooks"][0]["command"])
         for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
             patterns = [re.compile(group["matcher"]) for group in groups]
-            for tool in ("Bash", "mcp__betterstack__monitor", "mcp__example__exec_command",
-                         "mcp__example__shell_command"):
+            for tool in ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__betterstack__monitor", "mcp__example__exec_command",
+                         "mcp__example__shell_command", "mcp__example__shell", "mcp__example__bash"):
                 self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
             self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))
         for hooks in (claude_hooks, codex_hooks):
@@ -902,6 +906,148 @@ class GenerateTests(HarnessTestCase):
     def test_dry_run_writes_nothing(self) -> None:
         out = self.run_gen(extra=["--dry-run"])
         self.assertIn("would write", out)
+        self.assertFalse(self.root.exists())
+
+
+class ParityTests(HarnessTestCase):
+    def json_check(self):
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["check", "--home-root", str(self.root), "--json"])
+        return rc, json.loads(out.getvalue())
+
+    def test_parity_inventory_and_machine_readable_existing_check(self):
+        self.run_gen()
+        rc, result = self.json_check()
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result["schemaVersion"], 1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["failures"], [])
+        for entry in result["homes"]:
+            home = Path(entry["home"])
+            parity = json.loads(Path(entry["parityManifestPath"]).read_text())
+            self.assertEqual(parity["harness"], entry["harness"])
+            self.assertEqual(parity["schemaVersion"], 1)
+            self.assertEqual({skill["name"] for skill in parity["skills"]}, {"alpha", "beta", "gamma"})
+            for skill in parity["skills"]:
+                self.assertEqual(os.readlink(home / "skills" / skill["name"]), skill["source"])
+                self.assertEqual(hashlib.sha256((Path(skill["source"]) / "SKILL.md").read_bytes()).hexdigest(), skill["sha256"])
+            self.assertEqual({server["id"] for server in parity["mcpServers"]},
+                             {server["id"] for server in self.manifest()["mcpServers"]})
+            self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
+            self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
+            self.assertEqual({guard["id"] for guard in parity["guards"]},
+                             {"hook-adapters", "live-database", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall"})
+            self.assertFalse(parity["compactSkillCatalog"]["required"])
+            self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
+            self.assertFalse((home / "src").exists())
+            expected_names = {"settings.json", ".claude.json", "CLAUDE.md", "overlay.md"} if home.name == "claude" else {"config.toml", "hooks.json", "AGENTS.md", "models.json"}
+            self.assertEqual({Path(artifact["path"]).name for artifact in parity["artifacts"]}, expected_names)
+            for artifact in parity["artifacts"]:
+                self.assertTrue(Path(artifact["path"]).is_absolute())
+                self.assertEqual(Path(artifact["path"]).parent, home)
+                content = Path(artifact["path"]).read_bytes()
+                if Path(artifact["path"]).name == ".claude.json":
+                    self.assertEqual(artifact["format"], "claude-owned-json")
+                    content = gh.claude_owned_json(content)
+                else:
+                    self.assertNotIn("format", artifact)
+                self.assertEqual(artifact["sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_artifact_digests_use_expected_not_tampered_output_bytes(self):
+        self.run_gen()
+        for home, name, change in [
+            (self.claude, "settings.json", lambda text: text.replace("Bash|bash|shell|exec_command|shell_command", "NeverMatches")),
+            (self.claude, ".claude.json", lambda text: text.replace("http://127.0.0.1:18765/mcp", "http://127.0.0.1:9/mcp")),
+            (self.codex, "hooks.json", lambda text: text.replace("Bash|bash|shell|exec_command|shell_command", "NeverMatches")),
+            (self.codex, "config.toml", lambda text: text.replace("http://127.0.0.1:18765/mcp", "http://127.0.0.1:9/mcp")),
+            (self.codex_cu, "AGENTS.md", lambda text: text + "\nEdited instructions\n"),
+            (self.codex_cu, "models.json", lambda text: text.replace('"models":', '"edited":')),
+        ]:
+            with self.subTest(home=home.name, file=name):
+                path = home / name
+                original = path.read_bytes()
+                path.write_text(change(original.decode()))
+                with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+                    _, _, _, _, planned = gh.plan_all(str(self.root))
+                parity = json.loads(planned[str(home / gh.PARITY_MANIFEST)])
+                artifact = next(artifact for artifact in parity["artifacts"] if artifact["path"] == str(path))
+                expected_bytes = gh.claude_owned_json(original) if name == ".claude.json" else original
+                actual_bytes = gh.claude_owned_json(path.read_bytes()) if name == ".claude.json" else path.read_bytes()
+                self.assertEqual(artifact["sha256"], hashlib.sha256(expected_bytes).hexdigest())
+                self.assertNotEqual(artifact["sha256"], hashlib.sha256(actual_bytes).hexdigest())
+                self.assertEqual(self.json_check()[0], 1)
+                path.write_bytes(original)
+
+    def test_claude_runtime_fields_do_not_change_owned_artifact_or_check(self):
+        self.run_gen()
+        path = self.claude / ".claude.json"
+        parity_path = self.claude / gh.PARITY_MANIFEST
+        parity_before = parity_path.read_bytes()
+        value = json.loads(path.read_bytes())
+        value.update(projects={"/tmp/example": {"lastCost": 1.25}}, numStartups=42, runtimeField="日常")
+        path.write_text(json.dumps(value, ensure_ascii=False))
+        self.assertEqual(self.json_check()[0], 0)
+        self.assertEqual(parity_path.read_bytes(), parity_before)
+        self.run_gen()
+        self.assertEqual(json.loads(path.read_bytes())["runtimeField"], "日常")
+        self.assertEqual(parity_path.read_bytes(), parity_before)
+        value["mcpServers"]["recall"]["url"] = "http://127.0.0.1:9/mcp"
+        path.write_text(json.dumps(value))
+        self.assertEqual(self.json_check()[0], 1)
+
+    def test_claude_owned_json_is_sorted_compact_utf8(self):
+        content = b'{"runtime":42,"mcpServers":{"z":{"b":2,"a":"\\u65e5"},"a":{}},"hasCompletedOnboarding":true}'
+        expected = '{"hasCompletedOnboarding":true,"mcpServers":{"a":{},"z":{"a":"日","b":2}}}'.encode("utf-8")
+        self.assertEqual(gh.claude_owned_json(content), expected)
+
+    def test_all_roots_and_new_skills_change_inventory_without_fixed_count(self):
+        second = self.tmp / "second-root"
+        write(second / "delta/SKILL.md", "---\nname: delta\n---\nnew\n")
+        alias = self.tmp / "skill-root-alias"
+        alias.symlink_to(self.skill_root, target_is_directory=True)
+        manifest = self.manifest()
+        manifest["skillRoots"].extend([str(second), str(alias)])
+        self.run_gen(manifest)
+        for home in (self.claude, self.codex, self.codex_cu):
+            parity = json.loads((home / gh.PARITY_MANIFEST).read_text())
+            self.assertEqual({skill["name"] for skill in parity["skills"]}, {"alpha", "beta", "gamma", "delta"})
+            self.assertEqual(os.readlink(home / "skills/delta"), str(second / "delta"))
+        self.assertEqual(self.run_check(manifest)[0], 0)
+
+    def test_check_detects_stale_source_inventory_and_tampering_without_writes(self):
+        self.run_gen()
+        path = self.codex / gh.PARITY_MANIFEST
+        before = path.read_bytes()
+        write(self.skill_root / "alpha/SKILL.md", "---\nname: alpha\n---\nupdated body\n")
+        rc, result = self.json_check()
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any(gh.PARITY_MANIFEST in failure for failure in result["failures"]))
+        self.assertEqual(path.read_bytes(), before)
+        self.run_gen()
+        parity = json.loads(path.read_text())
+        parity["guards"] = []
+        path.write_text(json.dumps(parity))
+        self.assertEqual(self.json_check()[0], 1)
+
+    def test_installed_offbox_layout_uses_shared_skill_not_an_extra_copy(self):
+        installed = self.tmp / "installed/remote-compute/scripts/classify.py"
+        write(installed, "# installed fixture\n")
+        digest = gh.parity_source({"source": "missing-source.py", "installed": str(installed)})
+        self.assertEqual(digest["path"], str(installed))
+        self.assertEqual(digest["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+
+    def test_json_check_reports_unreadable_required_source_without_writes(self):
+        manifest = self.manifest()
+        manifest["paritySources"]["live-database"] = ["missing-guard.py"]
+        with mock.patch.object(gh, "load_manifest", return_value=manifest):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["check", "--home-root", str(self.root), "--json"])
+        result = json.loads(out.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("missing-guard.py", result["failures"][0])
         self.assertFalse(self.root.exists())
 
 

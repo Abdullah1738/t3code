@@ -11,6 +11,7 @@ import {
   type OrchestrationV2ProviderSession,
   OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   OrchestrationV2TurnItem,
   type OrchestrationV2ThreadShellSnapshot,
   NodeId,
@@ -63,6 +64,48 @@ const modelSelection = {
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = modelSelection.instanceId;
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+it("keeps native acceptance only for the same provider turn and attempt through usage and recovery updates", () => {
+  const now = DateTime.makeUnsafe("2026-11-06T00:00:00Z");
+  const acknowledged: OrchestrationV2ProviderTurn = {
+    id: ProviderTurnId.make("turn:acknowledged"),
+    providerThreadId: ProviderThreadId.make("provider-thread:acknowledged"),
+    nodeId: NodeId.make("node:acknowledged"),
+    runAttemptId: RunAttemptId.make("attempt:acknowledged"),
+    nativeTurnRef: null,
+    ordinal: 1,
+    status: "running",
+    startedAt: now,
+    completedAt: null,
+    promptAcceptedAt: now,
+  };
+  const { promptAcceptedAt: _acceptedAt, ...withoutMarker } = acknowledged;
+  const usage = { usedTokens: 1000, maxTokens: 200_000, updatedAt: DateTime.formatIso(now) };
+  const updated = ProjectionStore.upsertProviderTurn([acknowledged], {
+    ...withoutMarker,
+    tokenUsage: usage,
+  });
+  const cancelled = ProjectionStore.upsertProviderTurn(updated, {
+    ...withoutMarker,
+    status: "cancelled",
+    completedAt: now,
+  });
+  assert.deepEqual(cancelled[0]?.promptAcceptedAt, now);
+  assert.deepEqual(cancelled[0]?.tokenUsage, usage);
+  for (const change of [
+    { id: ProviderTurnId.make("turn:other") },
+    { providerThreadId: ProviderThreadId.make("provider-thread:other") },
+    { nodeId: NodeId.make("node:other") },
+    { runAttemptId: RunAttemptId.make("attempt:other") },
+    { runAttemptId: null },
+  ]) {
+    const next = { ...withoutMarker, ...change, tokenUsage: usage };
+    assert.isUndefined(
+      ProjectionStore.upsertProviderTurn([acknowledged], next).find((turn) => turn.id === next.id)
+        ?.promptAcceptedAt,
+    );
+  }
+});
 
 const traceSqlStatements = () => {
   const statements: Array<string> = [];
@@ -2098,111 +2141,155 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.isEmpty((yield* read({ turnItemTypes: ["user_message"] })).turnItems);
     }),
   );
-  it.effect("preserves stored provider usage when a terminal update omits it", () =>
-    Effect.gen(function* () {
-      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const now = yield* DateTime.now;
-      const threadId = ThreadId.make("thread:provider-usage-reload");
-      const providerThreadId = ProviderThreadId.make("provider-thread:provider-usage-reload");
-      const providerTurnId = ProviderTurnId.make("provider-turn:provider-usage-reload");
-      const nodeId = NodeId.make("node:provider-usage-reload");
-      const initialUsage = {
-        usedTokens: 12_000,
-        maxTokens: 200_000,
-        inputTokens: 11_000,
-        outputTokens: 1_000,
-        updatedAt: "2026-08-29T12:00:00.000Z",
-      } as const;
-      const replacementUsage = {
-        usedTokens: 18_000,
-        maxTokens: 200_000,
-        inputTokens: 16_000,
-        outputTokens: 2_000,
-        updatedAt: "2026-08-29T12:00:01.000Z",
-      } as const;
+  it.effect(
+    "preserves stored usage and native acceptance through markerless usage and recovery updates",
+    () =>
+      Effect.gen(function* () {
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:provider-usage-reload");
+        const providerThreadId = ProviderThreadId.make("provider-thread:provider-usage-reload");
+        const providerTurnId = ProviderTurnId.make("provider-turn:provider-usage-reload");
+        const nodeId = NodeId.make("node:provider-usage-reload");
+        const initialUsage = {
+          usedTokens: 12_000,
+          maxTokens: 200_000,
+          inputTokens: 11_000,
+          outputTokens: 1_000,
+          updatedAt: "2026-08-29T12:00:00.000Z",
+        } as const;
+        const replacementUsage = {
+          usedTokens: 18_000,
+          maxTokens: 200_000,
+          inputTokens: 16_000,
+          outputTokens: 2_000,
+          updatedAt: "2026-08-29T12:00:01.000Z",
+        } as const;
 
-      yield* projectionStore.apply({
-        id: EventId.make("event:provider-usage-reload:thread"),
-        type: "thread.created",
-        threadId,
-        occurredAt: now,
-        payload: {
-          createdBy: "user",
-          creationSource: "web",
-          id: threadId,
-          projectId: ProjectId.make("project:provider-usage-reload"),
-          title: "Provider usage reload",
-          providerInstanceId,
-          modelSelection,
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          activeProviderThreadId: null,
-          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-          forkedFrom: null,
-          createdAt: now,
-          updatedAt: now,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          lastVisitedAt: null,
-          deletedAt: null,
-        },
-      });
+        yield* projectionStore.apply({
+          id: EventId.make("event:provider-usage-reload:thread"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project:provider-usage-reload"),
+            title: "Provider usage reload",
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
 
-      const providerTurn = {
-        id: providerTurnId,
-        providerThreadId,
-        nodeId,
-        runAttemptId: null,
-        nativeTurnRef: null,
-        ordinal: 1,
-        status: "running" as const,
-        startedAt: now,
-        completedAt: null,
-      };
-      yield* projectionStore.apply({
-        id: EventId.make("event:provider-usage-reload:running"),
-        type: "provider-turn.updated",
-        threadId,
-        nodeId,
-        driver,
-        occurredAt: now,
-        payload: { ...providerTurn, tokenUsage: initialUsage },
-      });
-      yield* projectionStore.apply({
-        id: EventId.make("event:provider-usage-reload:completed"),
-        type: "provider-turn.updated",
-        threadId,
-        nodeId,
-        driver,
-        occurredAt: now,
-        payload: { ...providerTurn, status: "completed", completedAt: now },
-      });
+        const providerTurn = {
+          id: providerTurnId,
+          providerThreadId,
+          nodeId,
+          runAttemptId: RunAttemptId.make("attempt:provider-usage-reload"),
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running" as const,
+          startedAt: now,
+          completedAt: null,
+        };
+        yield* projectionStore.apply({
+          id: EventId.make("event:provider-usage-reload:running"),
+          type: "provider-turn.updated",
+          threadId,
+          nodeId,
+          driver,
+          occurredAt: now,
+          payload: { ...providerTurn, tokenUsage: initialUsage, promptAcceptedAt: now },
+        });
+        yield* projectionStore.apply({
+          id: EventId.make("event:provider-usage-reload:live-usage"),
+          type: "provider-turn.updated",
+          threadId,
+          nodeId,
+          driver,
+          occurredAt: now,
+          payload: { ...providerTurn, tokenUsage: replacementUsage },
+        });
+        yield* projectionStore.apply({
+          id: EventId.make("event:provider-usage-reload:completed"),
+          type: "provider-turn.updated",
+          threadId,
+          nodeId,
+          driver,
+          occurredAt: now,
+          payload: { ...providerTurn, status: "cancelled", completedAt: now },
+        });
 
-      const reloaded = yield* projectionStore.getThreadProjection(threadId);
-      assert.deepEqual(reloaded.providerTurns[0]?.tokenUsage, initialUsage);
-      assert.strictEqual(reloaded.providerTurns[0]?.status, "completed");
+        const reloaded = yield* projectionStore.getThreadProjection(threadId);
+        assert.deepEqual(reloaded.providerTurns[0]?.tokenUsage, replacementUsage);
+        assert.strictEqual(reloaded.providerTurns[0]?.status, "cancelled");
+        assert.deepEqual(reloaded.providerTurns[0]?.promptAcceptedAt, now);
 
-      yield* projectionStore.apply({
-        id: EventId.make("event:provider-usage-reload:replacement"),
-        type: "provider-turn.updated",
-        threadId,
-        nodeId,
-        driver,
-        occurredAt: now,
-        payload: {
-          ...providerTurn,
-          status: "completed",
-          completedAt: now,
-          tokenUsage: replacementUsage,
-        },
-      });
+        yield* projectionStore.apply({
+          id: EventId.make("event:provider-usage-reload:replacement"),
+          type: "provider-turn.updated",
+          threadId,
+          nodeId,
+          driver,
+          occurredAt: now,
+          payload: {
+            ...providerTurn,
+            status: "completed",
+            completedAt: now,
+            tokenUsage: replacementUsage,
+          },
+        });
 
-      const replaced = yield* projectionStore.getThreadProjection(threadId);
-      assert.deepEqual(replaced.providerTurns[0]?.tokenUsage, replacementUsage);
-    }),
+        const replaced = yield* projectionStore.getThreadProjection(threadId);
+        assert.deepEqual(replaced.providerTurns[0]?.tokenUsage, replacementUsage);
+        assert.deepEqual(replaced.providerTurns[0]?.promptAcceptedAt, now);
+
+        for (const tokenUsage of [undefined, replacementUsage]) {
+          // Restore the acknowledged identity before proving each SQL path refuses
+          // to carry its acceptance into a different attempt.
+          yield* projectionStore.apply({
+            id: EventId.make("event:provider-usage-reload:restore-ack"),
+            type: "provider-turn.updated",
+            threadId,
+            nodeId,
+            driver,
+            occurredAt: now,
+            payload: { ...providerTurn, promptAcceptedAt: now },
+          });
+          yield* projectionStore.apply({
+            id: EventId.make("event:provider-usage-reload:different-attempt"),
+            type: "provider-turn.updated",
+            threadId,
+            nodeId,
+            driver,
+            occurredAt: now,
+            payload: {
+              ...providerTurn,
+              runAttemptId: RunAttemptId.make("attempt:replacement"),
+              ...(tokenUsage === undefined ? {} : { tokenUsage }),
+            },
+          });
+          assert.isUndefined(
+            (yield* projectionStore.getThreadProjection(threadId)).providerTurns[0]
+              ?.promptAcceptedAt,
+          );
+        }
+      }),
   );
 
   it.effect("pages complete user turns through SQL regardless of tool count or payload size", () =>

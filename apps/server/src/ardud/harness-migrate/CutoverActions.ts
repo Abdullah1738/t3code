@@ -2,7 +2,6 @@ import {
   CommandId,
   MessageId,
   ProjectId,
-  ProviderDriverKind,
   RunId,
   ThreadId,
   type ModelSelection,
@@ -14,6 +13,7 @@ import {
   type KanbanThreadLink,
   isProviderNativeSubagentThread,
 } from "@t3tools/contracts";
+import { derive } from "@t3tools/provider-core/server/IdAllocator";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -36,18 +36,12 @@ import { runningBackgroundWork } from "../context-reset/backgroundWork.ts";
 import { planBoard, type BoardSnapshot } from "./boardPlan.ts";
 import { planSettings, parseProjectOverrideRef } from "./settingsPlan.ts";
 import { planSelection, sameValue } from "./selectionPlan.ts";
-import {
-  compactTranscriptItems,
-  recentTranscriptRunIds,
-  TRANSCRIPT_ITEM_LIMIT,
-} from "./recentTranscript.ts";
 import { planFallbacks } from "./fallbackPlan.ts";
 import { readBlockRetry, writeBlockRetry, type BlockRetry } from "../schedules/runFollow.ts";
 import * as Input from "./CutoverInput.ts";
 import * as Readiness from "./CutoverReadiness.ts";
-import * as PendingContext from "./CutoverContext.ts";
-import { renderCutoverBrief } from "./CutoverBrief.ts";
 import { releaseCutoverThread } from "./cutoverClaim.ts";
+import { checkBoardScripts } from "./BoardScriptReadiness.ts";
 import {
   CutoverActions,
   CutoverError,
@@ -62,7 +56,6 @@ const SelectionPayload = Schema.Struct({
   after: Schema.Unknown,
   projectId: Schema.optionalKey(ProjectId),
   runId: Schema.optionalKey(RunId),
-  brief: Schema.optionalKey(Schema.String),
   sourceRunId: Schema.optionalKey(Schema.String),
   queuedBefore: Schema.optionalKey(
     Schema.Array(Schema.Struct({ id: RunId, selection: Schema.Unknown })),
@@ -107,7 +100,6 @@ export const layer = Layer.effect(
     const boardSql = yield* BoardsDatabase.client;
     const inputSource = yield* Input.CutoverInputSource;
     const readiness = yield* Readiness.CutoverReadiness;
-    const pending = yield* PendingContext.CutoverContext;
     const providerSessions = yield* ProviderSessions.ProviderSessionManagerV2;
     const projections = yield* Projections.ProjectionStoreV2;
     const fs = yield* FileSystem.FileSystem;
@@ -121,7 +113,6 @@ export const layer = Layer.effect(
       const items: CutoverItem[] = [];
       const refusals: { ref: string; reason: string }[] = [];
       const targets: ModelSelection[] = [];
-      const asksByThread = new Map<string, string[]>();
       const deferredBoardThreads = new Set<string>();
       const queueThreads = new Set<ThreadId>();
       const releaseBoardIds = new Set<string>();
@@ -189,6 +180,11 @@ export const layer = Layer.effect(
           addSelection("project", project.id, project.defaultModelSelection);
       const boardList = yield* boards.boards.pipe(Effect.mapError(fail("boards")));
       for (const board of boardList) {
+        refusals.push(
+          ...(yield* checkBoardScripts(
+            yield* store.scripts(board.id).pipe(Effect.mapError(fail("board-scripts"))),
+          ).pipe(Effect.provideService(FileSystem.FileSystem, fs))),
+        );
         const snapshot: BoardSnapshot = {
           board,
           cards: yield* store.cards(board.id).pipe(Effect.mapError(fail("cards"))),
@@ -201,14 +197,6 @@ export const layer = Layer.effect(
         for (const link of snapshot.openLinks)
           if (link.role === "evaluator" || link.discussionId !== null)
             deferredBoardThreads.add(link.threadId);
-        for (const card of snapshot.cards)
-          for (const id of new Set([card.activeThreadId, card.workThreadId, card.reviewThreadId])) {
-            if (id === null) continue;
-            asksByThread.set(id, [
-              ...(asksByThread.get(id) ?? []),
-              ...card.asks.filter((ask) => ask.closedAt === null).map((ask) => JSON.stringify(ask)),
-            ]);
-          }
         for (const conflict of planned.conflicts)
           refusals.push({ ref: `${board.id}:${conflict.field}`, reason: conflict.reason });
         for (const collision of planned.collisions)
@@ -261,7 +249,7 @@ export const layer = Layer.effect(
       const scheduled = yield* schedules.list().pipe(Effect.mapError(fail("schedules")));
       for (const task of scheduled.tasks) {
         addSelection("schedule", task.id, task.modelSelection);
-      const retry = yield* readBlockRetry(boardSql, task, { readOnly: true }).pipe(
+        const retry = yield* readBlockRetry(boardSql, task, { readOnly: true }).pipe(
           Effect.mapError(fail("fallbacks")),
         );
         if (retry !== null) {
@@ -339,64 +327,12 @@ export const layer = Layer.effect(
               (!deferredBoardThreads.has(thread.id) &&
                 sourceRunId !== null &&
                 sourceRunId !== undefined));
-          const sourceSession =
-            records.providerThreads.find((row) => row.id === thread.activeProviderThreadId)
-              ?.nativeThreadRef?.nativeId ?? null;
-          const recent = yield* engine
-            .getThreadRecords(thread.id, ["turnItems"], {
-              turnItemRunIds: recentTranscriptRunIds(records.runs, undefined),
-              turnItemTypes: ["user_message", "assistant_message"],
-              recentTurnItemLimit: TRANSCRIPT_ITEM_LIMIT,
-            })
-            .pipe(Effect.mapError(fail("recent-transcript")));
-          const summary = yield* engine
-            .getThreadRecords(thread.id, ["turnItems"], {
-              turnItemTypes: ["compaction"],
-              recentTurnItemLimit: 1,
-            })
-            .pipe(Effect.mapError(fail("compaction")));
-          const questions = yield* engine
-            .getThreadRecords(thread.id, ["turnItems"], {
-              turnItemTypes: ["user_input_request", "approval_request"],
-              recentTurnItemLimit: 10,
-            })
-            .pipe(Effect.mapError(fail("questions")));
-          const brief = renderCutoverBrief({
-            mode: wake ? "resume" : "next_request",
-            threadId: thread.id,
-            sourceSession,
-            targetInstance: mapped.next.instanceId,
-            recentTranscript: compactTranscriptItems(recent.turnItems)
-              .map((item) => `${item.type === "user_message" ? "User" : "Assistant"}: ${item.text}`)
-              .join("\n\n"),
-            summary: summary.turnItems
-              .flatMap((item) => (item.type === "compaction" && item.summary ? [item.summary] : []))
-              .at(-1),
-            ownerAsks: [
-              ...(asksByThread.get(thread.id) ?? []),
-              ...questions.turnItems.flatMap((item) =>
-                (item.type === "user_input_request" || item.type === "approval_request") &&
-                records.runtimeRequests.some(
-                  (request) => request.id === item.requestId && request.status === "pending",
-                )
-                  ? [
-                      JSON.stringify(
-                        item.type === "user_input_request"
-                          ? { title: item.title, questions: item.questions }
-                          : { title: item.title, prompt: item.prompt },
-                      ),
-                    ]
-                  : [],
-              ),
-            ],
-          });
           addSelection(
             "thread",
             thread.id,
             thread.modelSelection,
             {
               projectId: thread.projectId,
-              brief,
               ...(sourceRunId == null ? {} : { sourceRunId }),
               queuedBefore: records.runs
                 .filter((run) => run.status === "queued")
@@ -460,6 +396,20 @@ export const layer = Layer.effect(
         item.key.startsWith("schedule:") ||
         item.key.startsWith("queued:")
       ) {
+        if (phase !== "rollback" && item.kind === "thread") {
+          yield* settings
+            .updateSettingsIf((current) =>
+              current.ardudHarnessMigration?.transcript?.enabled === true
+                ? {
+                    ardudHarnessMigration: {
+                      ...current.ardudHarnessMigration,
+                      transcript: { enabled: false },
+                    },
+                  }
+                : null,
+            )
+            .pipe(Effect.mapError(fail("disable-lite-transcript")));
+        }
         const payload = yield* decodeSelection(item.payload).pipe(
           Effect.mapError(fail("decode-selection")),
         );
@@ -473,32 +423,82 @@ export const layer = Layer.effect(
         if (payload.scope === "thread") {
           const id = ThreadId.make(item.ref);
           const records = yield* engine
-            .getThreadRecords(id, ["runs", "providerThreads", "runtimeRequests", "subagents"])
+            .getThreadRecords(id, [
+              "runs",
+              "attempts",
+              "providerTurns",
+              "providerThreads",
+              "runtimeRequests",
+              "subagents",
+              "turnItems",
+            ])
             .pipe(Effect.mapError(fail("read-thread")));
           if (phase === "brief") {
             if (!item.wake) return;
-            const contextStatus = yield* pending
-              .status(id)
-              .pipe(Effect.mapError(fail("context-status")));
-            if (contextStatus === "accepted") return;
             if (records.runtimeRequests.some((request) => request.status === "pending"))
               return yield* new CutoverDeferred({
                 reason: "Waiting for the existing owner question to be answered.",
               });
             let trial = 0;
+            const accepted = (current: typeof records, runId: RunId) => {
+              const attempts = current.attempts.filter((attempt) => attempt.runId === runId);
+              return current.providerTurns.some(
+                (turn) =>
+                  attempts.some(
+                    (attempt) =>
+                      attempt.id === turn.runAttemptId &&
+                      attempt.providerInstanceId === after.instanceId,
+                  ) &&
+                  turn.nativeTurnRef?.nativeId != null &&
+                  turn.promptAcceptedAt !== undefined,
+              );
+            };
             while (trial < 3) {
               const messageId = MessageId.make(`harness-cutover:v1:${item.key}:resume:${trial}`);
               const previous = records.runs.find((run) => run.userMessageId === messageId);
+              if (previous === undefined) break;
+              if (accepted(records, previous.id)) return;
+              if (!["failed", "cancelled", "interrupted"].includes(previous.status))
+                return yield* new CutoverDeferred({
+                  reason: "Carry-on turn dispatched; waiting for native prompt acceptance.",
+                });
+              const attempts = records.attempts.filter((attempt) => attempt.runId === previous.id);
+              // Running timestamps precede handoff delivery. Every started
+              // attempt needs its own runtime failure proof before resending.
+              const provenUnsent =
+                attempts.some((attempt) => attempt.startedAt !== null) &&
+                attempts.every((attempt) => {
+                  if (attempt.startedAt === null) return true;
+                  const providerThread = records.providerThreads.find(
+                    (thread) => thread.id === attempt.providerThreadId,
+                  );
+                  if (providerThread === undefined) return false;
+                  const providerTurnId =
+                    attempt.providerTurnId ??
+                    derive.providerTurn({
+                      driver: providerThread.driver,
+                      nativeTurnId: `failed:${attempt.id}`,
+                    });
+                  return records.turnItems.some(
+                    (item) =>
+                      item.runId === previous.id &&
+                      item.nodeId === attempt.rootNodeId &&
+                      item.providerThreadId === attempt.providerThreadId &&
+                      item.providerTurnId === providerTurnId &&
+                      item.type === "error" &&
+                      item.failure.code === "provider_prompt_not_sent",
+                  );
+                });
               if (
-                previous === undefined ||
-                !["failed", "cancelled", "interrupted"].includes(previous.status)
+                !provenUnsent &&
+                (previous.startedAt !== null ||
+                  records.attempts.some(
+                    (attempt) => attempt.runId === previous.id && attempt.startedAt !== null,
+                  ))
               )
-                break;
-              // Only an explicitly unsent prompt may create a replacement turn.
-              if (contextStatus !== "pending")
                 return yield* new CutoverDeferred({
                   reason:
-                    "Native carry-on delivery is ambiguous; reconcile the claimed prompt before retrying.",
+                    "Native carry-on delivery is ambiguous; reconcile the prompt before retrying.",
                 });
               trial++;
             }
@@ -525,7 +525,7 @@ export const layer = Layer.effect(
                 threadId: id,
                 commandId: resumeCommand,
                 messageId: MessageId.make(`harness-cutover:v1:${item.key}:resume:${trial}`),
-                text: "Read the harness carry-on context, then continue the interrupted work exactly where it stopped. Do not announce the switch or repeat messages already sent.",
+                text: `Robob upgrade moved this thread to ${after.instanceId === "claudeAgent" ? "Claude Code" : "Codex"}. Carry on where you left off; do not redo finished work or resend messages.`,
                 attachments: [],
                 modelSelection: after,
                 mode: "queue",
@@ -533,10 +533,23 @@ export const layer = Layer.effect(
                 creationSource: "server",
               })
               .pipe(Effect.mapError(fail("resume")));
-            if (
-              (yield* pending.status(id).pipe(Effect.mapError(fail("context-status")))) !==
-              "accepted"
-            )
+            const delivered = yield* engine
+              .getThreadRecords(id, [
+                "runs",
+                "attempts",
+                "providerTurns",
+                "providerThreads",
+                "runtimeRequests",
+                "subagents",
+                "turnItems",
+              ])
+              .pipe(Effect.mapError(fail("native-acceptance")));
+            const sentRun = delivered.runs.find(
+              (run) =>
+                run.userMessageId ===
+                MessageId.make(`harness-cutover:v1:${item.key}:resume:${trial}`),
+            );
+            if (sentRun === undefined || !accepted(delivered, sentRun.id))
               return yield* new CutoverDeferred({
                 reason: "Carry-on turn dispatched; waiting for native prompt acceptance.",
               });
@@ -580,7 +593,6 @@ export const layer = Layer.effect(
                   })
                   .pipe(Effect.mapError(fail("rollback-queue")));
             }
-            yield* pending.remove(id).pipe(Effect.mapError(fail("remove-context")));
             yield* releaseCutoverThread(id).pipe(
               Effect.provideService(FileSystem.FileSystem, fs),
               Effect.provideService(Path.Path, path),
@@ -645,7 +657,7 @@ export const layer = Layer.effect(
                   reason: "The source provider still holds work or a buffered wake.",
                 });
             }
-          // The admission barrier prevents pre-install queued turns from starting during rebind/adoption.
+          // The admission barrier prevents queued turns from starting during selection migration.
           for (const run of records.runs)
             if (run.status === "queued") {
               const mapped = planSelection(run.modelSelection);
@@ -663,43 +675,13 @@ export const layer = Layer.effect(
                   })
                   .pipe(Effect.mapError(fail("rebind-queue")));
             }
-          const answers = yield* engine
-            .getThreadRecords(id, ["messages"], {
-              messageRunIds: records.runs
-                .filter(
-                  (run) => run.status === "queued" && run.userMessageId.startsWith("async-answer:"),
-                )
-                .map((run) => run.id),
-            })
-            .pipe(Effect.mapError(fail("owner-answers")));
-          const brief =
-            answers.messages.length > 0
-              ? renderCutoverBrief({
-                  threadId: id,
-                  targetInstance: after.instanceId,
-                  mode: "resume",
-                  recentTranscript: payload.brief ?? "",
-                  ownerAsks: answers.messages.map((message) => `Owner answered: ${message.text}`),
-                })
-              : (payload.brief ?? "");
-          yield* pending
-            .put({ threadId: id, targetInstance: after.instanceId, text: brief, refreshPending: true })
-            .pipe(Effect.mapError(fail("save-context")));
           yield* engine
             .dispatch({
-              type: "thread.adopt-native-history",
+              type: "provider.switch",
               commandId: command(item, "switch"),
               threadId: id,
               modelSelection: after,
-              expectedActiveProviderThreadId: records.thread.activeProviderThreadId,
-              target: {
-                kind: "new",
-                driver: ProviderDriverKind.make(
-                  after.instanceId === "claudeAgent" ? "claudeAgent" : "codex",
-                ),
-                nativeId: null,
-                headId: null,
-              },
+              ...(records.thread.settledAt === null ? { expectedModelSelection: before } : {}),
             })
             .pipe(Effect.mapError(fail("switch")));
           if (
@@ -871,7 +853,7 @@ export const layer = Layer.effect(
               ...currentSettings.ardudHarnessMigration,
               selections: "apply",
               cutoverComplete: true,
-              transcript: { enabled: true, lastTurns: 8 },
+              transcript: { enabled: false },
             },
           })
           .pipe(Effect.mapError(fail("finalize-settings")));
@@ -929,10 +911,19 @@ export const layer = Layer.effect(
       };
       for (const item of items) visit(item.payload);
       const checks = yield* readiness.check(targets);
+      const scriptChecks = [];
+      for (const board of yield* boards.boards.pipe(Effect.mapError(fail("boards")))) {
+        const refusals = yield* checkBoardScripts(
+          yield* store.scripts(board.id).pipe(Effect.mapError(fail("board-scripts"))),
+        ).pipe(Effect.provideService(FileSystem.FileSystem, fs));
+        scriptChecks.push(
+          ...refusals.map((row) => ({ id: row.ref, ready: false, reason: row.reason })),
+        );
+      }
       const input = yield* inputSource.read.pipe(Effect.result);
       return input._tag === "Failure"
-        ? [...checks, { id: "input", ready: false, reason: input.failure.message }]
-        : checks;
+        ? [...checks, ...scriptChecks, { id: "input", ready: false, reason: input.failure.message }]
+        : [...checks, ...scriptChecks];
     });
     return CutoverActions.of({ plan: plan(), apply, check });
   }),

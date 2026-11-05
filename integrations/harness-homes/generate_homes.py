@@ -10,6 +10,7 @@ Stdlib only. Never reads or writes the personal homes (~/.claude, ~/.codex,
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ HOOK_EVENTS = ("PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFail
 CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 HARNESSES = ("claude", "codex", "codex-cu")
 NODE_REPL = "node_repl"
+PARITY_MANIFEST = "parity-manifest.json"
 
 
 class HomeError(Exception):
@@ -332,6 +334,7 @@ def claude_settings_owned(manifest: dict, existing: dict | None = None) -> dict:
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
+            "BUN_INSPECT": "",
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:20128",
             "ANTHROPIC_CUSTOM_HEADERS": "x-9router-token-saver: off",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": c["autoCompactWindow"],
@@ -467,7 +470,7 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
             "log_user_prompt": False,
         },
         "agents": {"enabled": True, "max_depth": manifest["claude"]["subagentDepth"]},
-        "shell_environment_policy": {"inherit": "all", "set": {"PATH": path_value}},
+        "shell_environment_policy": {"inherit": "all", "set": {"PATH": path_value, "BUN_INSPECT": "", "OFFBOX_GATE": "1", "ROBOB_HARNESS": "codex"}},
         "mcp_servers": codex_mcp(manifest["mcpServers"]),
     }
     if harness == "codex-cu":
@@ -613,12 +616,77 @@ def build(manifest: dict, homes: dict[str, str]) -> dict:
     return files
 
 
+def source_digest(path: str) -> dict:
+    source = Path(path)
+    try:
+        return {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    except OSError as exc:
+        raise HomeError(f"parity source missing or unreadable: {source} ({exc})") from exc
+
+
+def parity_source(spec: str | dict) -> dict:
+    if isinstance(spec, str):
+        return source_digest(str((PKG / spec).resolve()))
+    source = (PKG / spec["source"]).resolve()
+    # The installed offbox skill is deployed to the shared skill root, unlike
+    # harness-hooks and memory-system, which are siblings of harness-homes.
+    return source_digest(str(source) if source.is_file() else expand(spec["installed"]))
+
+
+def claude_owned_json(content: bytes) -> bytes:
+    value = json.loads(content)
+    owned = {key: value[key] for key in ("mcpServers", "hasCompletedOnboarding")}
+    return json.dumps(owned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def artifact_digest(path: str, content: bytes) -> dict:
+    artifact = {"path": os.path.abspath(path)}
+    if os.path.basename(path) == ".claude.json":
+        content = claude_owned_json(content)
+        artifact["format"] = "claude-owned-json"
+    artifact["sha256"] = hashlib.sha256(content).hexdigest()
+    return artifact
+
+
+def parity_files(manifest: dict, homes: dict[str, str], skills: list[tuple[str, str]], expected_files: dict[str, bytes]) -> dict:
+    """Metadata only; executable guards and skills stay at their shared sources."""
+    canonical = source_digest(expand(manifest["instructions"]["canonical"]))
+    catalog = [{"name": name, "source": path,
+                "sha256": source_digest(str(Path(path) / "SKILL.md"))["sha256"]}
+               for name, path in skills]
+    guards = [{"id": name, "sources": [parity_source(path) for path in paths]}
+              for name, paths in sorted(manifest.get("paritySources", {}).items())]
+    files = {}
+    for harness, home in homes.items():
+        overlay_names = ["codex", "codex-cu"] if harness == "codex-cu" else [harness]
+        value = {
+            "schemaVersion": 1,
+            "harness": harness,
+            "generator": source_digest(str(PKG / "generate_homes.py")),
+            "manifestSha256": hashlib.sha256(json_bytes(manifest)).hexdigest(),
+            "artifacts": [artifact_digest(path, content)
+                          for path, content in sorted(expected_files.items())
+                          if os.path.dirname(path) == home],
+            "skills": catalog,
+            "mcpServers": manifest["mcpServers"],
+            "runtimeMcpServers": ["t3-code"],
+            "guards": guards,
+            "hooks": hooks_for_harness(manifest["hooks"], harness),
+            "instructions": {"canonical": canonical, "overlays": [
+                source_digest(str(PKG / manifest["instructions"]["overlays"][name])) for name in overlay_names]},
+            "compactSkillCatalog": {"required": False, "reason": "Native harnesses discover SKILL.md metadata from the shared skills symlink farm."},
+        }
+        files[os.path.join(home, PARITY_MANIFEST)] = json_bytes(value)
+    return files
+
+
 def plan_all(home_root: str | None) -> tuple[dict, dict, list, list, dict]:
     manifest = load_manifest()
     validate_manifest(manifest)
     homes = resolve_homes(manifest, home_root)
     skills, unreadable = discover_skills([expand(r) for r in manifest["skillRoots"]])
     files = build(manifest, homes)
+    files.update(parity_files(manifest, homes, skills, files))
     for path, data in files.items():
         if SECRET_RE.search(data.decode("utf-8", errors="replace")):
             raise HomeError(f"refusing: secret-looking value in planned content for {path}; nothing written")
@@ -706,7 +774,7 @@ def generate(home_root: str | None, dry_run: bool) -> int:
 
 # ---------- check ----------
 
-def check(home_root: str | None) -> int:
+def check(home_root: str | None, *, json_output: bool = False) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
@@ -760,11 +828,18 @@ def check(home_root: str | None) -> int:
             elif os.path.normpath(os.path.join(farm, os.readlink(link))) != path:
                 failures.append(f"{label} skills: link {name} points at the wrong directory")
 
-    for msg in failures:
-        print(f"FAIL {msg}")
+    if json_output:
+        print(json.dumps({"schemaVersion": 1, "ok": not failures, "failures": failures,
+                          "homes": [{"harness": name, "home": home,
+                                     "parityManifestPath": os.path.join(home, PARITY_MANIFEST)}
+                                    for name, home in homes.items()]}))
+    else:
+        for msg in failures:
+            print(f"FAIL {msg}")
     if failures:
         return 1
-    print("OK harness homes match the manifest")
+    if not json_output:
+        print("OK harness homes match the manifest")
     return 0
 
 
@@ -776,13 +851,17 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
     chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
+    chk.add_argument("--json", action="store_true", help="emit the existing check result as JSON")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
             return generate(args.home_root, args.dry_run)
-        return check(args.home_root)
+        return check(args.home_root, json_output=args.json)
     except HomeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if args.cmd == "check" and args.json:
+            print(json.dumps({"schemaVersion": 1, "ok": False, "failures": [str(exc)], "homes": []}))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 1
 
 

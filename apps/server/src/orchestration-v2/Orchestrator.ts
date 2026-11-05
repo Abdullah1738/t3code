@@ -865,7 +865,12 @@ function rootProviderThreadsForProvider(
 }
 
 function isHandoffSourceRun(run: OrchestrationV2Run): boolean {
-  return run.status === "completed" || run.status === "failed" || run.status === "interrupted";
+  return (
+    run.status === "completed" ||
+    run.status === "failed" ||
+    run.status === "interrupted" ||
+    (run.status === "cancelled" && run.startedAt !== null)
+  );
 }
 
 function lastDeliveredRunForProviderThread(
@@ -1559,16 +1564,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) => candidate.id === projection.thread.activeProviderThreadId,
       );
       const freshContext = queuedRun.contextReset === true;
-      // Cutover maps queues before the carry-on creates its native conversation.
-      // Resume that conversation instead of starting the untouched queue placeholder.
-      const resumeCutoverThread =
-        projection.thread.harnessMigrationFence === true &&
+      // A queue may have reserved an empty binding before another turn created
+      // the current conversation. Continue it instead of losing that history.
+      const resumeActiveThread =
         !freshContext &&
         storedQueuedProviderThread.nativeThreadRef === null &&
         storedQueuedProviderThread.firstRunOrdinal === null &&
         activeProviderThread?.providerInstanceId === queuedRun.providerInstanceId &&
         activeProviderThread.nativeThreadRef?.nativeId != null;
-      const queuedProviderThread = resumeCutoverThread
+      const queuedProviderThread = resumeActiveThread
         ? activeProviderThread
         : storedQueuedProviderThread;
       const providerThreadChanged = queuedProviderThread.id !== providerThreadId;
@@ -2077,15 +2081,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           })),
           ...checkpointEvents,
           ...(providerThreadChanged
-            ? [{
-                type: "run-attempt.updated" as const,
-                threadId,
-                runId: queuedRun.id,
-                nodeId: rootNodeId,
-                providerInstanceId: queuedRun.providerInstanceId,
-                occurredAt: now,
-                payload: { ...attempt, providerThreadId: queuedProviderThread.id },
-              }]
+            ? [
+                {
+                  type: "run-attempt.updated" as const,
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNodeId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: { ...attempt, providerThreadId: queuedProviderThread.id },
+                },
+              ]
             : []),
           {
             type: "provider-thread.updated",
@@ -5311,7 +5317,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       !command.commandId.startsWith("harness-cutover:v1:") &&
       (yield* admissionHeld(command.threadId, modelSelection));
     const queueBehindRun =
-      activeRun ?? worktreeMissingRun ?? (heldForCutover ? latestRun ?? undefined : undefined);
+      activeRun ?? worktreeMissingRun ?? (heldForCutover ? (latestRun ?? undefined) : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     // ardud: a pending fork or merge-back would carry another thread's context
     // into the run a context reset starts, so refuse and leave it pending.
@@ -7905,7 +7911,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           "providerThreads",
           "providerSessions",
           "runtimeRequests",
-          "subagents",
         ])
         .pipe(
           Effect.mapError(
@@ -7916,16 +7921,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (thread.deletedAt !== null || thread.archivedAt !== null) {
         return yield* reject(`Thread ${command.threadId} is not active.`);
       }
-      const promptCutover =
-        command.target.kind === "new" && command.target.seededHistory === undefined;
-      if (promptCutover && runningBackgroundWork(projection).length > 0) {
-        return yield* reject(`Thread ${command.threadId} still has background work.`);
-      }
-      if (
-        projection.runs.some(
-          (run) => isBlockingRun(run) || (run.status === "queued" && !promptCutover),
-        )
-      ) {
+      if (projection.runs.some((run) => run.status === "queued" || isBlockingRun(run))) {
         return yield* reject(`Thread ${command.threadId} has queued or active runs.`);
       }
       if (projection.runtimeRequests.some((request) => request.status === "pending")) {
@@ -7963,23 +7959,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           handoffIds: [],
           forkedFrom: null,
           contextUsage: null,
-          ...(seededHistory === undefined
-            ? {}
-            : {
-                nativeMetadata: {
-                  seededHistory: {
-                    ...seededHistory,
-                    ...(seededHistory.mode === "codex-inject"
-                      ? {
-                          snapshotRunOrdinal: projection.runs.reduce(
-                            (latest, run) => Math.max(latest, run.ordinal),
-                            0,
-                          ),
-                        }
-                      : {}),
-                  },
-                },
-              }),
+          nativeMetadata: {
+            seededHistory: {
+              ...seededHistory,
+              ...(seededHistory.mode === "codex-inject"
+                ? {
+                    snapshotRunOrdinal: projection.runs.reduce(
+                      (latest, run) => Math.max(latest, run.ordinal),
+                      0,
+                    ),
+                  }
+                : {}),
+            },
+          },
           createdAt: now,
           updatedAt: now,
         };
