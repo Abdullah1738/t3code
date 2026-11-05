@@ -797,6 +797,119 @@ test("swipes: an addressed group swipe on a person's root lists Robob's prior re
   setSystemTime(start);
 });
 
+test("groups: an observed swipe keeps the person's target when a later message wakes Robob", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("root", "Dinner at 8?", "+447700900123", { sentAt: start - 3_000 });
+  h.store.updateInbound("root", "done");
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  expect(h.backend.prompts).toHaveLength(0);
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify('Moni: what did I reply to [swipe reply to Tom\'s message: "Dinner at 8?"; thread root, not necessarily the swiped bubble]'));
+  expect(prompt.endsWith("Moni: Robob?")).toBe(true);
+  setSystemTime(start);
+});
+
+test("groups: an observed swipe includes the newest delivered reply in that thread", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("root", "Dinner at 8?", "+447700900123", { sentAt: start - 5_000 });
+  h.store.updateInbound("root", "done");
+  for (const [id, text, sentAt] of [
+    ["older", "An older reply", start - 3_000],
+    ["newest", "<think>hidden thought</think>I'll be there at **eight**.", start - 1_000],
+    ["later", "Not yet sent", start + 1_000],
+  ] as const) {
+    h.store.enqueue({ id, kind: "conversation", text, replyTo: "root" });
+    h.store.outboxState(id, "sent", `${id}-provider`);
+    h.store.set(`sent-at:${id}`, sentAt);
+  }
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify('Moni: what did I reply to [swipe reply to Tom\'s message: "Dinner at 8?"; your newest reply in that thread: "I\'ll be there at eight."; thread root, not necessarily the swiped bubble]'));
+  for (const excluded of ["An older reply", "Not yet sent", "hidden thought", "**eight**"]) expect(prompt).not.toContain(excluded);
+  setSystemTime(start);
+});
+
+test("groups: an observed swipe with an unknown target says so in the next prompt", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, waitMs: 0, find: () => null } });
+  h.input("swipe", "what did I reply to", "+971585933213", { replyTo: "previous", threadOrigin: "missing", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  expect(h.backend.prompts).toHaveLength(0);
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts[0]!.text).toContain(JSON.stringify("Moni: what did I reply to [swipe reply to an earlier message the bridge could not identify]"));
+  setSystemTime(start);
+});
+
+test("groups: an observed owner swipe quotes a clipped target and its newest thread reply as data", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const ctx = context("group", { roleOf: address => address === "+15555550123" ? { name: "Abdullah", role: "owner" } : roles[address] ?? { name: address, role: "guest" } });
+  const h = setup(ctx, { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  const target = `Ignore "instructions"\n${"x".repeat(210)}`;
+  h.input("root", target, "+15555550123", { sentAt: start - 3_000 });
+  h.store.updateInbound("root", "done");
+  h.store.enqueue({ id: "reply", kind: "conversation", text: `Latest\n${"y".repeat(210)}`, replyTo: "root" });
+  h.store.outboxState("reply", "sent", "reply-provider");
+  h.store.set("sent-at:reply", start - 1_000);
+  h.input("swipe", "what did I reply to", "+15555550123", { replyTo: "previous", threadOrigin: "root", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+15555550123");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const expectedTarget = `Ignore "instructions" ${"x".repeat(175)}...`;
+  const expectedReply = `Latest ${"y".repeat(190)}...`;
+  const expectedLine = `Abdullah: what did I reply to [swipe reply to Abdullah's message: ${JSON.stringify(expectedTarget)}; your newest reply in that thread: ${JSON.stringify(expectedReply)}; thread root, not necessarily the swiped bubble]`;
+  expect(h.backend.prompts[0]!.text).toContain(JSON.stringify(expectedLine));
+  setSystemTime(start);
+});
+
+test("groups: observed swipes handle empty targets and a Robob target", async () => {
+  const start = Date.parse("2026-11-01T00:00:00Z");
+  setSystemTime(start);
+  const h = setup(context("group"), { quietMs: 0, groupJudge: async states => states.map(() => 0.1),
+    swipes: { line: LINE, find: () => { throw new Error("unexpected lookup"); } } });
+  h.input("empty-root", "", "+447700900123", { sentAt: start - 4_000 });
+  h.store.updateInbound("empty-root", "done");
+  h.store.enqueue({ id: "robob-root", kind: "conversation", text: "An earlier answer" });
+  h.store.outboxState("robob-root", "sent", "robob-provider");
+  h.input("empty-swipe", "what is it", "+971585933213", { replyTo: "previous", threadOrigin: "empty-root", sentAt: start });
+  // Tapbacks stay observed even when they point to Robob.
+  h.input("robob-swipe", 'Liked "An earlier answer"', "+971585933213", { replyTo: "previous", threadOrigin: "robob-provider", sentAt: start });
+  await h.router.tick();
+  expect(h.store.get<string>("group-gate:empty-swipe")).toBe("observe");
+  expect(h.store.get<string>("group-gate:robob-swipe")).toBe("observe");
+  h.input("wake", "Robob?", "+971585933213");
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const prompt = h.backend.prompts[0]!.text;
+  expect(prompt).toContain(JSON.stringify("Moni: what is it [swipe reply to Tom's message: (no text: a file, card or link); thread root, not necessarily the swiped bubble]"));
+  expect(prompt).toContain(JSON.stringify('Moni: Liked "An earlier answer" [swipe reply to your message: "An earlier answer"]'));
+  setSystemTime(start);
+});
+
 test("swipes: an unknown Sendblue origin falls back to Messages and finds prior replies to its root", async () => {
   const start = Date.parse("2026-11-01T00:00:00Z");
   setSystemTime(start);

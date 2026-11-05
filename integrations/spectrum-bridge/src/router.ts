@@ -1966,12 +1966,22 @@ export class Router {
   }
 
   /** How a group line reads in a prompt: the sender's name, plus the address for guests. */
-  private groupLine(input: NormalizedInbound): string {
+  private groupLine(input: NormalizedInbound, swipe?: Swipe): string {
     const context = this.options.context!;
     const who = input.sender ? context.roleOf(input.sender) : undefined;
     const name = who ? `${who.name}${who.role === "guest" ? ` (${input.sender})` : ""}` : "Someone";
     const words = input.text.trim() || (input.attachments.length ? `[sent ${input.attachments.length === 1 ? "a file" : `${input.attachments.length} files`}]` : "");
-    return `${name}: ${words}`;
+    const line = `${name}: ${words}`;
+    if (!swipe) return line;
+    if (swipe.kind === "unknown") return `${line} [swipe reply to an earlier message the bridge could not identify]`;
+    const nameOf = (address: string) => speakerName(context.roleOf(address), address);
+    const target = swipe.kind === "robob" ? "your message" : `${nameOf(swipe.kind === "owner" ? this.options.owner : swipe.sender)}'s message`;
+    const text = clipQuote(swipe.text, 200);
+    const quote = text ? JSON.stringify(text) : "(no text: a file, card or link)";
+    const newest = swipe.kind !== "robob" ? swipe.thread?.at(-1) : undefined;
+    const thread = newest ? `; your newest reply in that thread: ${JSON.stringify(clipQuote(formatText(newest.text).text, 200))}` : "";
+    const root = swipe.kind !== "robob" ? "; thread root, not necessarily the swiped bubble" : "";
+    return `${line} [swipe reply to ${target}: ${quote}${thread}${root}]`;
   }
 
   /**
@@ -2049,14 +2059,14 @@ export class Router {
         }
       }
     }
-    for (const { row, input } of todo) {
+    for (const { row, input, swipe } of todo) {
       const gate = gates.get(row.id)!;
       const applied = this.store.db.transaction(() => {
         // The judge is awaited, so the row may have moved on (or been gated) meanwhile.
         const current = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (current?.state !== "pending" || this.store.get<string>(`group-gate:${row.id}`)) return false;
         if (gate.verdict === "observe") {
-          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input)]));
+          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input, swipe)]));
           this.store.updateInbound(row.id, "observed");
         }
         this.store.set(`group-gate:${row.id}`, gate.verdict);
