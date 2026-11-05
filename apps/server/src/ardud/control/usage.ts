@@ -10,7 +10,10 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+
 const MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
+const CANDIDATE_PAGE_SIZE = 400;
 const decodeSelection = Schema.decodeUnknownOption(Schema.fromJsonString(ModelSelection));
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -89,6 +92,8 @@ interface Row {
   readonly selection_json: string | null;
 }
 
+type CandidateRow = Omit<Row, "board_id" | "card_id">;
+
 const itemFromRow = (row: Row) => {
   const parsed: unknown = JSON.parse(row.turn_json);
   const turn = parsed as {
@@ -153,13 +158,14 @@ export class Usage extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   // Same fork-owned schema as KanbanStore; control can start without the board service.
-  yield* sql`
+  yield* BoardsDatabase.initialize(controlSql`
     CREATE TABLE IF NOT EXISTS ardud_kanban_threads (
       thread_id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT,
       ended INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL
     )
-  `;
+  `);
 
   const list = Effect.fn("Usage.list")(function* (query: UsageQuery) {
     const since = timestamp(query.since);
@@ -185,29 +191,37 @@ const make = Effect.gen(function* () {
       return yield* bad("limit must be a positive integer.");
     }
     const limit = Math.min(requestedLimit, 5000);
-    const afterTime = cursor?.time ?? "";
-    const afterId = cursor?.id ?? "";
+    let afterTime = cursor?.time ?? "";
+    let afterId = cursor?.id ?? "";
+    const candidateLimit =
+      boardId === null ? Math.min(limit + 1, CANDIDATE_PAGE_SIZE) : CANDIDATE_PAGE_SIZE;
+    const rows: Array<Row> = [];
 
-    // Separate indexed ranges avoid scanning all historical NULL completions.
-    const rows = yield* sql<Row>`
+    // Board links live in a separate database. Keep scanning bounded candidate
+    // pages until the filtered page has a lookahead row or the window is exhausted.
+    while (rows.length <= limit) {
+      const pageSince = afterTime > since ? afterTime : since;
+      // Separate indexed ranges avoid scanning all historical NULL completions.
+      const candidates = yield* sql<CandidateRow>`
       WITH candidates AS (
         SELECT provider_turn_id, thread_id, provider_thread_id, run_attempt_id,
           started_at, completed_at, status, payload_json, completed_at AS sort_at
         FROM orchestration_v2_projection_provider_turns INDEXED BY ardud_provider_turns_completed_idx
-        WHERE completed_at >= ${since} AND completed_at < ${until}
+        WHERE completed_at >= ${pageSince} AND completed_at < ${until}
           AND (completed_at > ${afterTime} OR (completed_at = ${afterTime} AND provider_turn_id > ${afterId}))
         UNION ALL
         SELECT provider_turn_id, thread_id, provider_thread_id, run_attempt_id,
           started_at, completed_at, status, payload_json, started_at AS sort_at
         FROM orchestration_v2_projection_provider_turns INDEXED BY ardud_provider_turns_running_started_idx
-        WHERE completed_at IS NULL AND status = 'running' AND started_at >= ${since} AND started_at < ${until}
+        WHERE completed_at IS NULL AND status = 'running' AND started_at >= ${pageSince} AND started_at < ${until}
           AND (started_at > ${afterTime} OR (started_at = ${afterTime} AND provider_turn_id > ${afterId}))
+        ORDER BY sort_at, provider_turn_id
+        LIMIT ${candidateLimit}
       )
       SELECT c.provider_turn_id, c.thread_id, c.sort_at, c.started_at, c.completed_at, c.status,
         c.payload_json AS turn_json,
         json_extract(t.payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
         COALESCE(json_extract(t.payload_json, '$.lineage.rootThreadId'), c.thread_id) AS root_thread_id,
-        k.board_id, k.card_id,
         COALESCE(json_extract(t.payload_json, '$.worktreePath'), p.workspace_root) AS workspace,
         COALESCE(a.provider_instance_id, pt.provider_instance_id,
           CASE WHEN c.run_attempt_id IS NULL THEN json_extract(t.payload_json, '$.providerInstanceId') END) AS provider_instance_id,
@@ -229,18 +243,45 @@ const make = Effect.gen(function* () {
       FROM candidates c
       LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = c.thread_id
       LEFT JOIN projection_projects p ON p.project_id = t.project_id
-      LEFT JOIN ardud_kanban_threads k ON k.thread_id = COALESCE(json_extract(t.payload_json, '$.lineage.rootThreadId'), c.thread_id)
       LEFT JOIN orchestration_v2_projection_run_attempts a ON a.attempt_id = c.run_attempt_id
         AND a.thread_id = c.thread_id AND a.provider_thread_id = c.provider_thread_id
       LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = a.run_id AND r.thread_id = c.thread_id
       LEFT JOIN orchestration_v2_projection_provider_threads pt ON pt.provider_thread_id = c.provider_thread_id
-      WHERE (${boardId} IS NULL OR k.board_id = ${boardId})
       ORDER BY c.sort_at, c.provider_turn_id
-      LIMIT ${limit + 1}
     `.pipe(
-      NodeSqliteClient.readOnly,
-      Effect.mapError((cause) => new UsageReadError({ cause })),
-    );
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new UsageReadError({ cause })),
+      );
+      if (candidates.length === 0) break;
+      const roots = [...new Set(candidates.map((row) => row.root_thread_id))];
+      const links = yield* controlSql<{
+        readonly thread_id: string;
+        readonly board_id: string;
+        readonly card_id: string | null;
+      }>`
+        SELECT thread_id, board_id, card_id FROM ardud_kanban_threads
+        WHERE thread_id IN ${controlSql.in(roots)}
+      `.pipe(
+        NodeSqliteClient.readOnly,
+        Effect.mapError((cause) => new UsageReadError({ cause })),
+      );
+      const linksByRoot = new Map(links.map((link) => [link.thread_id, link]));
+      for (const candidate of candidates) {
+        const link = linksByRoot.get(candidate.root_thread_id);
+        if (boardId !== null && link?.board_id !== boardId) continue;
+        rows.push({
+          ...candidate,
+          board_id: link?.board_id ?? null,
+          card_id: link?.card_id ?? null,
+        });
+        if (rows.length > limit) break;
+      }
+      if (candidates.length < candidateLimit) break;
+      const lastCandidate = candidates.at(-1)!;
+      afterTime = lastCandidate.sort_at;
+      afterId = lastCandidate.provider_turn_id;
+      if (rows.length <= limit) yield* Effect.yieldNow;
+    }
 
     const page = rows.slice(0, limit);
     const last = page.at(-1);

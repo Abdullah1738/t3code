@@ -1,4 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -24,6 +26,7 @@ import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 import * as Usage from "./usage.ts";
 
@@ -33,6 +36,7 @@ const at = (hour: number) => `2026-11-01T${String(hour).padStart(2, "0")}:00:00.
 
 const seed = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at)
     VALUES ('p', 'Project', '/project', '[]', ${since}, ${since})`;
   for (const thread of [
@@ -58,7 +62,7 @@ const seed = Effect.gen(function* () {
       }),
     })}`;
   }
-  yield* sql`INSERT INTO ardud_kanban_threads (thread_id, board_id, card_id, json)
+  yield* controlSql`INSERT INTO ardud_kanban_threads (thread_id, board_id, card_id, json)
     VALUES ('root', 'board-1', 'card-1', '{}')`;
 
   for (const source of [
@@ -237,6 +241,95 @@ const run = <A, E>(body: Effect.Effect<A, E, Usage.Usage | SqlClient.SqlClient |
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("usage feed", () => {
+  it.effect(
+    "hydrates separate board links and scans past sparse candidate pages without losing cursor ties",
+    () =>
+      Effect.gen(function* () {
+        const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+        const controlSql = Context.get(context, SqlClient.SqlClient);
+        yield* controlSql`CREATE TABLE ardud_kanban_threads (
+        thread_id TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT,
+        ended INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL
+      )`;
+        yield* run(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            const usage = yield* Usage.Usage;
+            yield* sql`DELETE FROM orchestration_v2_projection_provider_turns`;
+            const turns = Array.from({ length: 805 }, (_, index) => ({
+              provider_turn_id: `turn-${String(index).padStart(4, "0")}`,
+              thread_id: [401, 802, 804].includes(index) ? "child" : "other",
+              provider_thread_id: `pt-sparse-${index}`,
+              node_id: `node-sparse-${index}`,
+              run_attempt_id: null,
+              ordinal: 1,
+              status: index === 804 ? "running" : "completed",
+              started_at: at(0),
+              completed_at: index === 804 ? null : at(0),
+              payload_json: JSON.stringify({ turnTokenUsage: { inputTokens: index } }),
+            }));
+            for (let index = 0; index < turns.length; index += 100) {
+              yield* sql`INSERT INTO orchestration_v2_projection_provider_turns ${sql.insert(turns.slice(index, index + 100))}`;
+            }
+            const first = yield* usage.list({ since, until, boardId: "board-1", limit: "1" });
+            assert.deepStrictEqual(
+              first.items.map((item) => item.inputTokens),
+              [401],
+            );
+            assert.strictEqual(first.items[0]?.boardId, "board-1");
+            assert.strictEqual(first.items[0]?.cardId, "card-1");
+            assert.isNotNull(first.nextCursor);
+            const second = yield* usage.list({
+              since,
+              until,
+              boardId: "board-1",
+              limit: "1",
+              cursor: first.nextCursor,
+            });
+            assert.deepStrictEqual(
+              second.items.map((item) => item.inputTokens),
+              [802],
+            );
+            assert.isNotNull(second.nextCursor);
+            const third = yield* usage.list({
+              since,
+              until,
+              boardId: "board-1",
+              limit: "1",
+              cursor: second.nextCursor,
+            });
+            assert.deepStrictEqual(
+              third.items.map((item) => item.inputTokens),
+              [804],
+            );
+            assert.strictEqual(third.items[0]?.status, "running");
+            assert.isNull(third.nextCursor);
+            const absent = yield* usage.list({ since, until, boardId: "missing", limit: "1" });
+            assert.deepStrictEqual(absent.items, []);
+            assert.isNull(absent.nextCursor);
+            const unfiltered = yield* usage.list({ since, until, limit: "5000" });
+            assert.strictEqual(unfiltered.items.length, 805);
+            assert.isNull(unfiltered.items[0]?.boardId);
+            assert.strictEqual(unfiltered.items[401]?.cardId, "card-1");
+            assert.isNull(unfiltered.nextCursor);
+            assert.deepStrictEqual(
+              yield* sql`SELECT name FROM sqlite_schema WHERE name = 'ardud_kanban_threads'`,
+              [],
+            );
+          }),
+        ).pipe(
+          Effect.provideService(
+            BoardsDatabase.BoardsDatabase,
+            BoardsDatabase.BoardsDatabase.of({
+              sql: controlSql,
+              ready: Effect.void,
+              path: ":memory:",
+            }),
+          ),
+        );
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("attributes restarted turns to the selection and instance of each attempt", () =>
     run(
       Effect.gen(function* () {

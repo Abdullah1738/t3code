@@ -39,7 +39,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 /** The owner roots: the only sources a grant or claim can be written with. */
 export type MintedOwnerSource = "desktop" | "dev-token" | "paired-client";
@@ -130,11 +130,13 @@ const decodeOrigin = (row: {
 const CACHE_LIMIT = 5_000;
 
 export const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   const fail = (operation: string) => (cause: unknown) =>
     new SessionOriginsError({ operation, cause });
 
-  yield* sql`
+  yield* BoardsDatabase.initialize(
+    Effect.gen(function* () {
+      yield* sql`
     CREATE TABLE IF NOT EXISTS ardud_mission_session_origins (
       session_id TEXT PRIMARY KEY,
       origin TEXT NOT NULL,
@@ -142,20 +144,22 @@ export const make = Effect.gen(function* () {
       created_at TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-session-origins")));
-  yield* sql`
+      yield* sql`
     CREATE TABLE IF NOT EXISTS ardud_mission_owner_grants (
       credential_hash TEXT PRIMARY KEY,
       source TEXT NOT NULL,
       created_at TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-owner-grants")));
-  yield* sql`
+      yield* sql`
     CREATE TABLE IF NOT EXISTS ardud_mission_owner_claim (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       source TEXT NOT NULL,
       created_at TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-owner-claim")));
+    }),
+  );
 
   // Origins never change, so a cached answer (including "none") stays right.
   // The row is written before its token exists, so "none" is never premature.
@@ -167,14 +171,18 @@ export const make = Effect.gen(function* () {
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
-  const markOwnerGrant: SessionOriginsShape["markOwnerGrant"] = (credential, source) =>
-    Effect.gen(function* () {
+  const markOwnerGrant: SessionOriginsShape["markOwnerGrant"] = Effect.fn(
+    "SessionOrigins.markOwnerGrant",
+  )(
+    function* (credential, source) {
       const createdAt = yield* now;
       yield* sql`
         INSERT OR IGNORE INTO ardud_mission_owner_grants (credential_hash, source, created_at)
         VALUES (${hashCredential(credential)}, ${source}, ${createdAt})
       `;
-    }).pipe(Effect.mapError(fail("mark-owner-grant")));
+    },
+    Effect.mapError(fail("mark-owner-grant")),
+  );
 
   const ownerGrant: SessionOriginsShape["ownerGrant"] = (credential) =>
     sql<{ readonly source: string }>`
@@ -190,8 +198,8 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-owner-grant")),
     );
 
-  const record: SessionOriginsShape["record"] = (sessionId, origin) =>
-    Effect.gen(function* () {
+  const record: SessionOriginsShape["record"] = Effect.fn("SessionOrigins.record")(
+    function* (sessionId, origin) {
       const createdAt = yield* now;
       const detail = origin._tag === "owner" ? origin.source : origin.component;
       yield* sql`
@@ -199,7 +207,9 @@ export const make = Effect.gen(function* () {
         VALUES (${sessionId}, ${origin._tag}, ${detail}, ${createdAt})
       `;
       cache.delete(sessionId);
-    }).pipe(Effect.mapError(fail("record-session-origin")));
+    },
+    Effect.mapError(fail("record-session-origin")),
+  );
 
   const originOf: SessionOriginsShape["originOf"] = (sessionId) =>
     cache.has(sessionId)
@@ -218,8 +228,8 @@ export const make = Effect.gen(function* () {
 
   // One row, written by the first owner session ever. The insert is atomic,
   // so exactly one caller sees `true`. Not cached: pairing is rare.
-  const claimOwner: SessionOriginsShape["claimOwner"] = (source) =>
-    Effect.gen(function* () {
+  const claimOwner: SessionOriginsShape["claimOwner"] = Effect.fn("SessionOrigins.claimOwner")(
+    function* (source) {
       const createdAt = yield* now;
       const rows = yield* sql<{ readonly id: number }>`
         INSERT OR IGNORE INTO ardud_mission_owner_claim (id, source, created_at)
@@ -227,7 +237,9 @@ export const make = Effect.gen(function* () {
         RETURNING id
       `;
       return rows.length > 0;
-    }).pipe(Effect.mapError(fail("claim-owner")));
+    },
+    Effect.mapError(fail("claim-owner")),
+  );
 
   const ownerClaimed: SessionOriginsShape["ownerClaimed"] = () =>
     sql<{ readonly id: number }>`SELECT id FROM ardud_mission_owner_claim`.pipe(
