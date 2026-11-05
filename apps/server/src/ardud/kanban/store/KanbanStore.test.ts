@@ -124,6 +124,7 @@ it.live(
         const working = card(2, "working");
         const otherBoard = { ...board, id: KanbanBoardId.make("board-2"), slug: "other" };
         const discussionId = KanbanDiscussionId.make("discussion-1");
+        const noOwnerDiscussionId = KanbanDiscussionId.make("discussion-no-owner");
         const scriptId = KanbanScriptId.make("script-1");
         const goal = {
           id: KanbanGoalId.make("goal-1"),
@@ -170,6 +171,25 @@ it.live(
             answers: [],
             createdAt: at,
           }) satisfies KanbanMessage;
+        const ownerMessage = message(1);
+        const evaluatorMessage = {
+          ...message(2),
+          author: { _tag: "evaluator", threadId: ThreadId.make("evaluator-1") },
+          authorName: "Evaluator",
+          createdAt: "2026-10-25T13:01:00.000Z",
+        } satisfies KanbanMessage;
+        const noOwnerDiscussion = {
+          ...discussion,
+          id: noOwnerDiscussionId,
+          cardId: null,
+          evaluatorThreadId: null,
+          lastSeq: 1,
+        } satisfies KanbanDiscussion;
+        const noOwnerMessage = {
+          ...evaluatorMessage,
+          discussionId: noOwnerDiscussionId,
+          seq: 1,
+        } satisfies KanbanMessage;
         const script = {
           id: scriptId,
           boardId,
@@ -251,8 +271,10 @@ it.live(
         yield* store.putPool(boardId, pool);
         yield* store.putGroups(boardId, [group]);
         yield* store.putDiscussion(discussion);
-        yield* store.putMessage(message(1));
-        yield* store.putMessage(message(2));
+        yield* store.putDiscussion(noOwnerDiscussion);
+        yield* store.putMessage(ownerMessage);
+        yield* store.putMessage(evaluatorMessage);
+        yield* store.putMessage(noOwnerMessage);
         yield* store.putScript(script);
         yield* store.putScript(otherScript);
         const run = yield* store.addScriptRun({
@@ -294,6 +316,12 @@ it.live(
 
         yield* Effect.gen(function* () {
           yield* Deferred.await(held);
+          assert.deepStrictEqual(yield* store.ownerWait(discussionId), {
+            seq: ownerMessage.seq,
+            createdAt: ownerMessage.createdAt,
+            answered: true,
+          });
+          assert.isNull(yield* store.ownerWait(noOwnerDiscussionId));
           assert.deepStrictEqual(yield* store.boards, [board, otherBoard]);
           assert.deepStrictEqual(yield* store.cards(boardId), [todo, working]);
           assert.deepStrictEqual(yield* store.summaryCards(boardId), [
@@ -314,12 +342,20 @@ it.live(
           assert.deepStrictEqual(yield* store.goals(boardId), [goal]);
           assert.deepStrictEqual(yield* store.pools(boardId), [pool]);
           assert.deepStrictEqual(yield* store.groups(boardId), [group]);
-          assert.deepStrictEqual(yield* store.discussions(boardId), [discussion]);
+          assert.deepStrictEqual(yield* store.discussions(boardId), [
+            discussion,
+            noOwnerDiscussion,
+          ]);
           assert.deepStrictEqual(yield* store.discussion(discussionId), discussion);
           assert.deepStrictEqual(yield* store.discussionByEvaluator("evaluator-1"), discussion);
-          assert.deepStrictEqual(yield* store.messages(discussionId, { limit: 1 }), [message(2)]);
-          assert.deepStrictEqual(yield* store.allMessages(discussionId), [message(1), message(2)]);
-          assert.deepStrictEqual(yield* store.message(discussionId, 1), message(1));
+          assert.deepStrictEqual(yield* store.messages(discussionId, { limit: 1 }), [
+            evaluatorMessage,
+          ]);
+          assert.deepStrictEqual(yield* store.allMessages(discussionId), [
+            ownerMessage,
+            evaluatorMessage,
+          ]);
+          assert.deepStrictEqual(yield* store.message(discussionId, 1), ownerMessage);
           assert.deepStrictEqual(yield* store.scripts(boardId), [script]);
           assert.deepStrictEqual(yield* store.allScripts, [script, otherScript]);
           assert.deepStrictEqual(yield* store.script(scriptId), script);

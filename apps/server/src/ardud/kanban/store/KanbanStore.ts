@@ -734,7 +734,7 @@ const make = Effect.gen(function* () {
   // Walks the discussion's primary key newest first; json_extract stays in SQLite, so a
   // multi-MB history is never decoded.
   const ownerWait = (id: KanbanDiscussionId) =>
-    run(
+    runRead(
       "read owner wait",
       Effect.map(
         sql<{ readonly seq: number; readonly createdAt: string; readonly answered: number }>`
