@@ -31,14 +31,17 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from contextlib import closing
 from datetime import datetime, timezone
+
+import robob_readonly
 
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".local/share/memory-system")
 DATA = os.path.join(ROOT, "data")
 LOGS = os.path.join(ROOT, "logs")
 MEM_DB = os.path.join(DATA, "memory.db")
-OC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+OC_DB = robob_readonly.opencode_db()
 MUSE_SESSIONS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "muse/sessions")
 LIVE_REPO = "/Volumes/ExternalSSD/memory-system-backup/restic/live"
 DROPBOX_LIVE = "/Backups/memory-system/live"
@@ -68,7 +71,8 @@ DRY_RUN = False                 # --dry-run: checks report but keep no state
 
 
 def ro(path):
-    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    reader = robob_readonly.native_ro if path == OC_DB else robob_readonly.connect_ro
+    c = reader(path)
     c.execute("PRAGMA busy_timeout=30000")
     return c
 
@@ -107,27 +111,33 @@ def check_sync():
 
 
 def check_lag():
-    mem = ro(MEM_DB)
-    known = dict(mem.execute("SELECT session_id, time_updated FROM opencode_sync_sessions"))
-    src = ro(OC_DB)
-    cutoff = int(time.time() * 1000) - LAG_GRACE_MS
-    behind = []
-    for sid, tu, meta in src.execute("SELECT id, time_updated, metadata FROM session_v2 WHERE time_updated < ?", (cutoff,)):
-        try:
-            m = json.loads(meta) if meta else {}
-        except ValueError:
-            m = {}
-        if isinstance(m, dict) and m.get("migration"):
-            continue
-        # -1 = sync saw the session but it still has an in-flight (unsettled)
-        # message; session_v2.time_updated is not bumped by new messages, so
-        # active sessions would otherwise look "behind". Sync staleness is
-        # covered by check_sync.
-        if known.get(sid) not in (tu, -1):
-            behind.append(sid)
+    with closing(ro(MEM_DB)) as mem, closing(ro(OC_DB)) as src:
+        known = dict(mem.execute("SELECT session_id, time_updated FROM opencode_sync_sessions"))
+        cutoff = int(time.time() * 1000) - LAG_GRACE_MS
+        behind = []
+        deferred = 0
+        for sid, tu, meta, applied, dirty in src.execute(
+                "SELECT s.id,s.time_updated,s.metadata,e.applied_seq,e.dirty FROM session_v2 s"
+                " LEFT JOIN ardud_native_sessions e ON e.id=s.id WHERE s.time_updated < ?", (cutoff,)):
+            try:
+                m = json.loads(meta) if meta else {}
+            except ValueError:
+                m = {}
+            if isinstance(m, dict) and m.get("migration"):
+                continue
+            if applied is None or dirty != 0:
+                deferred += 1
+                continue
+            # -1 = sync saw the session but it still has an in-flight (unsettled)
+            # message; session_v2.time_updated is not bumped by new messages, so
+            # active sessions would otherwise look "behind". Sync staleness is
+            # covered by check_sync.
+            if known.get(sid) not in (tu, -1):
+                behind.append(sid)
+    suffix = f"; {deferred} sessions deferred by native export" if deferred else ""
     if len(behind) > LAG_MAX:
-        return False, f"{len(behind)} OpenCode sessions not synced into memory.db (e.g. {behind[0]})"
-    return True, f"{len(behind)} sessions behind"
+        return False, f"{len(behind)} OpenCode sessions not synced into memory.db (e.g. {behind[0]}){suffix}"
+    return True, f"{len(behind)} sessions behind{suffix}"
 
 
 def check_muse_lag():

@@ -196,7 +196,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       await ocStop(stall);
     } else {
       try {
-        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId });
+        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId ?? undefined });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           stall.runId = res.runId ?? stall.runId;

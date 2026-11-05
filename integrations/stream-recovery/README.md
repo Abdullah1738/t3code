@@ -13,7 +13,7 @@ block every later queued message.
 
 ## What a scan does
 
-1. Reads failed runs and failed subagents from `~/.robob/userdata/statev2.sqlite`
+1. Reads failed runs and failed subagents from the server-owned `~/.robob/userdata/readonly/state.sqlite`
    (read-only) and groups them into incidents: a cluster with a stream-lost
    error, or a burst of 3+ subagents failed within 2s with no result.
 2. Waits 90s after the last failure, then per affected thread (failed-run
@@ -34,6 +34,27 @@ block every later queued message.
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
 An incident that hit errors is retried on later scans, up to 3 attempts.
 
+`STREAM_RECOVERY_DB` overrides the shared `ROBOB_READONLY_DB`; otherwise the
+server's published snapshot above is used. Live writer paths and their symlink
+or hardlink aliases are rejected before SQLite connects. No missing-snapshot
+fallback exists. Key/value `ardud_readonly_meta` must have `ready='1'`,
+`schema_version='1'` and an ISO `updated_at`
+no older than 45 seconds (export every 15 seconds). A scan checks the opened
+snapshot's metadata and age again before every query and recovery mutation and stops without exhausting
+recovery retries if it expires. `BEGIN` precedes the metadata read, keeping data
+and readiness pinned to the same export. The next scan opens the next complete export.
+Before recovery actions, current control-API shell timestamps must not be newer
+than the export watermark; this also defers an idle Stop that kept the same run ID.
+Both Robob homes (`~/.robob`, `~/.t3`, configured `ROBOB_HOME`/`T3CODE_HOME`)
+and native OpenCode default/XDG database paths are protected, including aliases;
+an arbitrary fixture basename is not blocked.
+Stall detection itself continues to use existing live control/OpenCode APIs;
+interrupts include the expected run ID so a newer run is not stopped instead.
+Missing, not-ready or stale recovery exports do not disable that API-only stall
+pass. It keeps its independent once-a-minute cadence and saves its own progress;
+recovery's `lastScan` advances only on a successful recovery scan. A recovery
+error still produces a nonzero CLI exit and `recoveryError` in JSON output.
+
 ## Restart watch
 
 A Robob restart (app update, crash, install) runs startup recovery, which marks
@@ -42,7 +63,7 @@ result. Their wake-ups never come, so parents sit idle or start over. Each scan
 also looks for those:
 
 - Reads `cancelled` provider-native subagents and top-level `cancelled`/`failed`
-  runs (statev2, read-only), plus `interrupted` runs and native subagents whose turn has no
+  runs (replica, read-only), plus `interrupted` runs and native subagents whose turn has no
   `run_interrupt_request` item: an OpenCode crash leaves turns that way (31 Oct, SIGBUS),
   while every Stop writes that item first. Cancelled queued messages and user Stops are excluded. A cluster
   (rows <= 10s apart) is a restart when it has 3+ rows across 2+ top-level
@@ -70,7 +91,7 @@ also looks for those:
   turn), cut, or stale (idle 6h+ before the restart).
 - One note per affected idle thread, including crw and handed-off parents (control API, mode queue,
   `clientRequestId` = incident id) listing title, model, child session, start
-  time, and the original prompt (statev2 `payload.prompt`) or the finished
+  time, and the original prompt (replica `payload.prompt`) or the finished
   result, and asking it to resume each cut one by session id. Handled children
   are still listed so a parent can pass them to its replacement thread. Notes
   explain that macOS boot wipes `$TMPDIR`, including `$TMPDIR/opencode`.

@@ -1,6 +1,7 @@
 import { RpcSerialization } from "effect/rpc";
 
 import { LARGE_REPLY_BYTES, type LargeReplyRecorder, utf8BytesIfLarge } from "./LargeReplyLog.ts";
+import { jsonExceedsBudget, MAX_REPLY_BYTES, REPLY_TOO_LARGE } from "../ardud/http/replyBudget.ts";
 
 const protocolTags = new Set(["Exit", "Chunk", "Defect", "Request", "Pong", "ClientEnd"]);
 
@@ -43,6 +44,33 @@ export const wrap = (
           return messages;
         },
         encode: (response) => {
+          if (jsonExceedsBudget(response)) {
+            const requestId =
+              typeof response === "object" && response !== null && "requestId" in response
+                ? response.requestId
+                : undefined;
+            try {
+              log.record({
+                kind: "ws",
+                name:
+                  requestId === undefined
+                    ? "unknown"
+                    : (pending.get(requestId as string | number) ?? "unknown"),
+                bytes: MAX_REPLY_BYTES + 1,
+                rejected: true,
+              });
+            } catch {
+              /* Diagnostics cannot bypass the cap. */
+            }
+            if (requestId !== undefined) {
+              pending.delete(requestId as string | number);
+              throw new Error(REPLY_TOO_LARGE);
+            }
+            return parser.encode({
+              _tag: "Defect",
+              defect: { _tag: "ReplyTooLarge", message: REPLY_TOO_LARGE },
+            });
+          }
           const encoded = parser.encode(response);
           try {
             const envelope =
@@ -67,8 +95,7 @@ export const wrap = (
               log.record({
                 kind: "ws",
                 name:
-                  method ??
-                  (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
+                  method ?? (typeof tag === "string" && protocolTags.has(tag) ? tag : "unknown"),
                 bytes,
               });
             }

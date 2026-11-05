@@ -40,6 +40,7 @@ import * as Statement from "effect/sql/Statement";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
@@ -122,6 +123,57 @@ const traceSqlStatements = () => {
     },
   });
   return { statements, tracer };
+};
+
+const archiveTurnItems = Effect.fn("test.archiveTurnItems")(function* (
+  threadId: ThreadId,
+  throughOrdinal = Number.MAX_SAFE_INTEGER,
+  storage: "cold" | "base" = "cold",
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const columns = liveColumns("orchestration_v2_projection_turn_items");
+  if (storage === "base") {
+    yield* sql.unsafe(
+      `INSERT INTO ardud_base.orchestration_v2_projection_turn_items (${columns})
+        SELECT ${columns} FROM orchestration_v2_projection_turn_items WHERE thread_id = ?`,
+      [threadId],
+    );
+  }
+  yield* sql.unsafe(
+    `INSERT INTO ardud_archive.ardud_turn_items (${columns})
+      SELECT ${columns} FROM orchestration_v2_projection_turn_items WHERE thread_id = ?
+        ${storage === "base" ? "AND ordinal % 3 = 0" : ""}`,
+    [threadId],
+  );
+  yield* sql`DELETE FROM orchestration_v2_projection_turn_items
+    WHERE thread_id = ${threadId} AND ordinal <= ${throughOrdinal}`;
+  // Shadowed cold payloads must never be decoded or win a first-input lookup.
+  yield* sql`UPDATE ardud_archive.ardud_turn_items SET payload_json = '{}'
+    WHERE thread_id = ${threadId} AND ordinal > ${throughOrdinal}`;
+  if (storage === "base") {
+    yield* sql`UPDATE ardud_base.orchestration_v2_projection_turn_items AS item SET payload_json = '{}'
+      WHERE item.thread_id = ${threadId} AND (
+        EXISTS (SELECT 1 FROM main.orchestration_v2_projection_turn_items AS hot
+          WHERE hot.turn_item_id = item.turn_item_id)
+        OR EXISTS (SELECT 1 FROM ardud_archive.ardud_turn_items AS delta
+          WHERE delta.turn_item_id = item.turn_item_id)
+      )`;
+  }
+});
+
+const assertIndexedHistoryWindow = (details: readonly string[]) => {
+  for (const detail of details) {
+    assert.notMatch(
+      detail,
+      /^SCAN (?:(?:main|ardud_base)\.orchestration_v2_projection_turn_items|cold|base|item)(?:$| )/,
+      details.join("\n"),
+    );
+    assert.notMatch(
+      detail,
+      /SEARCH (?:(?:main|ardud_base)\.orchestration_v2_projection_turn_items|ardud_history_turn_items|cold|base|item|first_input) USING AUTOMATIC.*INDEX/,
+      details.join("\n"),
+    );
+  }
 };
 
 const addRolledBackRecoveryCandidate = Effect.fn("addRolledBackRecoveryCandidate")(function* (
@@ -538,7 +590,10 @@ it.effect("memory keeps rollback active against a late target, and allows a late
     });
     const rolledBack = yield* store.getThreadProjection(threadId);
     assert.equal(rolledBack.thread.activeProviderThreadId, sourceRow.id);
-    assert.deepEqual(rolledBack.providerThreads.find((row) => row.id === targetRow.id), late);
+    assert.deepEqual(
+      rolledBack.providerThreads.find((row) => row.id === targetRow.id),
+      late,
+    );
 
     yield* store.apply({
       id: EventId.make("event:seeded-history:rollback-real-switch"),
@@ -2292,176 +2347,189 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       }),
   );
 
-  it.effect("pages complete user turns through SQL regardless of tool count or payload size", () =>
-    Effect.gen(function* () {
-      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const sql = yield* SqlClient.SqlClient;
-      const now = yield* DateTime.now;
-      const nowIso = DateTime.formatIso(now);
-      const threadId = ThreadId.make("thread:user-turn-pages");
-      yield* projectionStore.apply({
-        id: EventId.make("event:user-turn-pages:thread"),
-        type: "thread.created",
-        threadId,
-        occurredAt: now,
-        payload: {
-          createdBy: "user",
-          creationSource: "web",
-          id: threadId,
-          projectId: ProjectId.make("project:user-turn-pages"),
-          title: "Bounded SQL history",
-          providerInstanceId,
-          modelSelection,
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          activeProviderThreadId: null,
-          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-          forkedFrom: null,
-          createdAt: now,
-          updatedAt: now,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          lastVisitedAt: null,
-          deletedAt: null,
-        },
-      });
+  it.effect.each(["hot", "cold", "base"] as const)(
+    "pages complete %s user turns through SQL regardless of tool count or payload size",
+    (storage) =>
+      Effect.gen(function* () {
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const nowIso = DateTime.formatIso(now);
+        const threadId = ThreadId.make(`thread:user-turn-pages:${storage}`);
+        yield* projectionStore.apply({
+          id: EventId.make("event:user-turn-pages:thread"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project:user-turn-pages"),
+            title: "Bounded SQL history",
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
 
-      const allIds: string[] = [];
-      let lastToolPayload = "";
-      for (let turn = 1; turn <= 45; turn += 1) {
-        const rows = Array.from({ length: 102 }, (_, offset) => {
-          const ordinal = (turn - 1) * 102 + offset + 1;
-          const id = `item:user-turn-pages:${ordinal}`;
-          allIds.push(id);
-          const base = {
-            id,
-            threadId,
-            runId: null,
-            nodeId: null,
-            providerThreadId: null,
-            providerTurnId: null,
-            nativeItemRef: null,
-            parentItemId: null,
-            ordinal,
-            status: "completed",
-            title: null,
-            startedAt: nowIso,
-            completedAt: nowIso,
-            updatedAt: nowIso,
-          };
-          const item =
-            offset < 2
-              ? {
-                  ...base,
-                  type: "user_message",
-                  createdBy: "user",
-                  creationSource: "web",
-                  messageId: `message:${id}`,
-                  inputIntent: offset === 0 ? "turn_start" : "steer",
-                  text: `Turn ${turn}`,
-                  attachments: [],
-                }
-              : {
-                  ...base,
-                  type: "command_execution",
-                  input: "command",
-                  output: "x".repeat(2048),
-                  exitCode: 0,
-                };
-          const payloadJson = encodeUnknownJsonString(item);
-          if (offset >= 2) lastToolPayload = payloadJson;
-          return {
-            turn_item_id: id,
-            thread_id: threadId,
-            run_id: null,
-            node_id: null,
-            provider_thread_id: null,
-            provider_turn_id: null,
-            parent_item_id: null,
-            ordinal,
-            type: item.type,
-            status: "completed",
-            updated_at: nowIso,
-            payload_json: payloadJson,
-          };
-        });
-        yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
-      }
-      const { statements, tracer } = traceSqlStatements();
-      const initial = yield* Effect.acquireUseRelease(
-        Effect.sync(() => vi.spyOn(JSON, "parse")),
-        (parse) =>
-          projectionStore
-            .getThreadSnapshotWindow(threadId, { rowLimit: 77, userTurnLimit: 10 })
-            .pipe(
-              Effect.withTracer(tracer),
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  assert.lengthOf(
-                    parse.mock.calls.filter(([input]) => input === lastToolPayload),
-                    1,
-                  );
-                }),
+        const allIds: string[] = [];
+        let lastToolPayload = "";
+        for (let turn = 1; turn <= 45; turn += 1) {
+          const rows = Array.from({ length: 102 }, (_, offset) => {
+            const ordinal = (turn - 1) * 102 + offset + 1;
+            const id = `item:user-turn-pages:${storage}:${ordinal}`;
+            allIds.push(id);
+            const base = {
+              id,
+              threadId,
+              runId: null,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal,
+              status: "completed",
+              title: null,
+              startedAt: nowIso,
+              completedAt: nowIso,
+              updatedAt: nowIso,
+            };
+            const item =
+              offset < 2
+                ? {
+                    ...base,
+                    type: "user_message",
+                    createdBy: "user",
+                    creationSource: "web",
+                    messageId: `message:${id}`,
+                    inputIntent: offset === 0 ? "turn_start" : "steer",
+                    text: `Turn ${turn}`,
+                    attachments: [],
+                  }
+                : {
+                    ...base,
+                    type: "command_execution",
+                    input: "command",
+                    output: "x".repeat(2048),
+                    exitCode: 0,
+                  };
+            const payloadJson = encodeUnknownJsonString(item);
+            if (offset >= 2) lastToolPayload = payloadJson;
+            return {
+              turn_item_id: id,
+              thread_id: threadId,
+              run_id: null,
+              node_id: null,
+              provider_thread_id: null,
+              provider_turn_id: null,
+              parent_item_id: null,
+              ordinal,
+              type: item.type,
+              status: "completed",
+              updated_at: nowIso,
+              payload_json: payloadJson,
+            };
+          });
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
+        }
+        if (storage !== "hot") yield* archiveTurnItems(threadId, 40 * 102, storage);
+        const { statements, tracer } = traceSqlStatements();
+        const initial = yield* Effect.acquireUseRelease(
+          Effect.sync(() => vi.spyOn(JSON, "parse")),
+          (parse) =>
+            projectionStore
+              .getThreadSnapshotWindow(threadId, { rowLimit: 77, userTurnLimit: 10 })
+              .pipe(
+                Effect.withTracer(tracer),
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    assert.lengthOf(
+                      parse.mock.calls.filter(([input]) => input === lastToolPayload),
+                      1,
+                    );
+                  }),
+                ),
               ),
-            ),
-        (parse) => Effect.sync(() => parse.mockRestore()),
-      );
-      const windowStatement = statements.find((statement) => statement.includes("turn_anchors"));
-      assert.isDefined(windowStatement);
-      const windowPlan = yield* sql.unsafe<{ readonly parent: number; readonly detail: string }>(
-        `EXPLAIN QUERY PLAN ${windowStatement}`,
-      );
-      assert.match(
-        windowPlan.map((row) => row.detail).join("\n"),
-        /SEARCH item USING INDEX orchestration_v2_projection_turn_items_user_message_idx \(thread_id=\? AND ordinal<\?\)/,
-      );
-      const topLevel = windowPlan.filter((row) => row.parent === 0).map((row) => row.detail);
-      assert.include(topLevel, "SEARCH item USING INTEGER PRIMARY KEY (rowid=?)");
-      assert.notInclude(topLevel, "USE TEMP B-TREE FOR ORDER BY");
-      const nodeStatement = statements.find((statement) =>
-        statement.includes("WITH RECURSIVE retained"),
-      );
-      assert.isDefined(nodeStatement);
-      const nodePlan = yield* sql.unsafe<{ readonly detail: string }>(
-        `EXPLAIN QUERY PLAN ${nodeStatement}`,
-      );
-      assert.include(
-        nodePlan.map((row) => row.detail),
-        "SEARCH orchestration_v2_projection_nodes USING INDEX orchestration_v2_projection_nodes_live_idx (thread_id=?)",
-      );
-      assert.lengthOf(initial.projection.turnItems, 12 * 102);
-      const bounded = buildBoundedThreadProjection({
-        projection: initial.projection,
-        snapshotSequence: 0,
-      });
-      assert.lengthOf(bounded.projection.visibleTurnItems, 10 * 102);
-      assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds[35 * 102]);
-      const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
-      let cursor = bounded.historyCursor;
-      for (const turns of [20, 15]) {
-        assert.isNotNull(cursor);
-        const anchor = decodeThreadHistoryCursor(cursor!);
-        const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
-          rowLimit: 77,
-          userTurnLimit: 20,
-          anchorItemId: TurnItemId.make(anchor.si),
-          anchorThreadId: ThreadId.make(anchor.st),
-        });
-        const page = selectHistoryPageFromCursor({
-          items: snapshot.projection.visibleTurnItems,
-          cursor: cursor!,
+          (parse) => Effect.sync(() => parse.mockRestore()),
+        );
+        const windowStatement = statements.find((statement) => statement.includes("turn_anchors"));
+        assert.isDefined(windowStatement);
+        const windowPlan = yield* sql.unsafe<{ readonly parent: number; readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${windowStatement}`,
+        );
+        assert.match(
+          windowPlan.map((row) => row.detail).join("\n"),
+          /SEARCH (?:item|main\.orchestration_v2_projection_turn_items) USING INDEX orchestration_v2_projection_turn_items_user_message_idx \(thread_id=\? AND ordinal<\?\)/,
+        );
+        assertIndexedHistoryWindow(windowPlan.map((row) => row.detail));
+        const topLevel = windowPlan.filter((row) => row.parent === 0).map((row) => row.detail);
+        assert.lengthOf(
+          windowPlan.filter(
+            (row) => row.detail === "SEARCH item USING INTEGER PRIMARY KEY (rowid=?)",
+          ),
+          2,
+        );
+        assert.match(
+          windowPlan.map((row) => row.detail).join("\n"),
+          /SEARCH item USING INDEX sqlite_autoindex_ardud_turn_items_1 \(ardud_locator=\?\)/,
+        );
+        assert.notInclude(topLevel, "USE TEMP B-TREE FOR ORDER BY");
+        const nodeStatement = statements.find((statement) =>
+          statement.includes("WITH RECURSIVE retained"),
+        );
+        assert.isDefined(nodeStatement);
+        const nodePlan = yield* sql.unsafe<{ readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${nodeStatement}`,
+        );
+        assert.include(
+          nodePlan.map((row) => row.detail),
+          "SEARCH orchestration_v2_projection_nodes USING INDEX orchestration_v2_projection_nodes_live_idx (thread_id=?)",
+        );
+        assert.lengthOf(initial.projection.turnItems, 12 * 102);
+        const bounded = buildBoundedThreadProjection({
+          projection: initial.projection,
           snapshotSequence: 0,
         });
-        assert.lengthOf(page.items, turns * 102);
-        loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
-        cursor = page.nextCursor;
-      }
-      assert.isNull(cursor);
-      assert.deepEqual(loaded, allIds);
-    }),
+        assert.lengthOf(bounded.projection.visibleTurnItems, 10 * 102);
+        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds[35 * 102]);
+        const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
+        let cursor = bounded.historyCursor;
+        for (const turns of [20, 15]) {
+          assert.isNotNull(cursor);
+          const anchor = decodeThreadHistoryCursor(cursor!);
+          const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+            rowLimit: 77,
+            userTurnLimit: 20,
+            anchorItemId: TurnItemId.make(anchor.si),
+            anchorThreadId: ThreadId.make(anchor.st),
+          });
+          const page = selectHistoryPageFromCursor({
+            items: snapshot.projection.visibleTurnItems,
+            cursor: cursor!,
+            snapshotSequence: 0,
+          });
+          assert.lengthOf(page.items, turns * 102);
+          loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
+          cursor = page.nextCursor;
+        }
+        assert.isNull(cursor);
+        assert.deepEqual(loaded, allIds);
+      }),
   );
 
   // ardud: - a bearer's prompt is a person's turn too.
@@ -2572,93 +2640,95 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
-  it.effect("caps a SQL window by runs that a notification started", () =>
-    Effect.gen(function* () {
-      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const sql = yield* SqlClient.SqlClient;
-      const now = yield* DateTime.now;
-      const nowIso = DateTime.formatIso(now);
-      const threadId = ThreadId.make("thread:notification-turn-pages");
-      yield* projectionStore.apply({
-        id: EventId.make("event:notification-turn-pages:thread"),
-        type: "thread.created",
-        threadId,
-        occurredAt: now,
-        payload: {
-          createdBy: "user",
-          creationSource: "web",
-          id: threadId,
-          projectId: ProjectId.make("project:notification-turn-pages"),
-          title: "Woken by notifications",
-          providerInstanceId,
-          modelSelection,
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          activeProviderThreadId: null,
-          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-          forkedFrom: null,
-          createdAt: now,
-          updatedAt: now,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          lastVisitedAt: null,
-          deletedAt: null,
-        },
-      });
+  it.effect.each(["hot", "cold", "base"] as const)(
+    "caps a %s SQL window by runs that a notification started",
+    (storage) =>
+      Effect.gen(function* () {
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const nowIso = DateTime.formatIso(now);
+        const threadId = ThreadId.make(`thread:notification-turn-pages:${storage}`);
+        yield* projectionStore.apply({
+          id: EventId.make("event:notification-turn-pages:thread"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project:notification-turn-pages"),
+            title: "Woken by notifications",
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
 
-      const startedRuns = 412;
-      const allIds: string[] = [];
-      const startIds: string[] = [];
-      let ordinal = 0;
-      const itemRow = (runId: string, item: Record<string, unknown>) => {
-        ordinal += 1;
-        const id = `turn-item:notification-turn-pages:${ordinal}`;
-        allIds.push(id);
-        return {
-          turn_item_id: id,
-          thread_id: threadId,
-          run_id: runId,
-          node_id: null,
-          provider_thread_id: null,
-          provider_turn_id: null,
-          parent_item_id: null,
-          ordinal,
-          type: String(item.type),
-          status: "completed",
-          updated_at: nowIso,
-          payload_json: encodeUnknownJsonString({
-            id,
-            threadId,
-            runId,
-            nodeId: null,
-            providerThreadId: null,
-            providerTurnId: null,
-            nativeItemRef: null,
-            parentItemId: null,
+        const startedRuns = 412;
+        const allIds: string[] = [];
+        const startIds: string[] = [];
+        let ordinal = 0;
+        const itemRow = (runId: string, item: Record<string, unknown>) => {
+          ordinal += 1;
+          const id = `turn-item:notification-turn-pages:${storage}:${ordinal}`;
+          allIds.push(id);
+          return {
+            turn_item_id: id,
+            thread_id: threadId,
+            run_id: runId,
+            node_id: null,
+            provider_thread_id: null,
+            provider_turn_id: null,
+            parent_item_id: null,
             ordinal,
+            type: String(item.type),
             status: "completed",
-            title: null,
-            startedAt: nowIso,
-            completedAt: nowIso,
-            updatedAt: nowIso,
-            ...item,
-          }),
+            updated_at: nowIso,
+            payload_json: encodeUnknownJsonString({
+              id,
+              threadId,
+              runId,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal,
+              status: "completed",
+              title: null,
+              startedAt: nowIso,
+              completedAt: nowIso,
+              updatedAt: nowIso,
+              ...item,
+            }),
+          };
         };
-      };
-      const command = { type: "command_execution", input: "command", output: "x", exitCode: 0 };
-      const notification = (summary: string) => ({
-        type: "notification",
-        source: { kind: "monitor" },
-        outcome: "completed",
-        summary,
-      });
-      for (let run = 1; run <= startedRuns + 1; run += 1) {
-        const runId = `run:notification-turn-pages:${run}`;
-        const status = run > startedRuns ? "queued" : "completed";
-        yield* sql`
+        const command = { type: "command_execution", input: "command", output: "x", exitCode: 0 };
+        const notification = (summary: string) => ({
+          type: "notification",
+          source: { kind: "monitor" },
+          outcome: "completed",
+          summary,
+        });
+        for (let run = 1; run <= startedRuns + 1; run += 1) {
+          const runId = `run:notification-turn-pages:${storage}:${run}`;
+          const status = run > startedRuns ? "queued" : "completed";
+          yield* sql`
           INSERT INTO orchestration_v2_projection_runs (
             run_id, thread_id, ordinal, provider, provider_thread_id, status,
             requested_at, completed_at, payload_json
@@ -2683,78 +2753,88 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             })}
           )
         `;
-        if (run > startedRuns) continue;
-        const start =
-          run <= 12 || run % 50 === 0
-            ? {
-                type: "user_message",
-                createdBy: "user",
-                creationSource: "web",
-                messageId: `message:notification-turn-pages:${run}`,
-                inputIntent: "turn_start",
-                text: `Turn ${run}`,
-                attachments: [],
-              }
-            : notification(`Wake ${run}`);
-        const rows = [
-          itemRow(runId, command),
-          itemRow(runId, start),
-          itemRow(runId, command),
-          itemRow(runId, notification(`Steer ${run}`)),
-        ];
-        startIds.push(rows[1]!.turn_item_id);
-        yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
-      }
+          if (run > startedRuns) continue;
+          const start =
+            run <= 12 || run % 50 === 0
+              ? {
+                  type: "user_message",
+                  createdBy: "user",
+                  creationSource: "web",
+                  messageId: `message:notification-turn-pages:${run}`,
+                  inputIntent: "turn_start",
+                  text: `Turn ${run}`,
+                  attachments: [],
+                }
+              : notification(`Wake ${run}`);
+          const rows = [
+            itemRow(runId, command),
+            itemRow(runId, start),
+            itemRow(runId, command),
+            itemRow(runId, notification(`Steer ${run}`)),
+          ];
+          startIds.push(rows[1]!.turn_item_id);
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
+        }
 
-      const { statements, tracer } = traceSqlStatements();
-      const initial = yield* projectionStore
-        .getThreadSnapshotWindow(threadId, { rowLimit: 77, userTurnLimit: 10 })
-        .pipe(Effect.withTracer(tracer));
-      assert.deepEqual(
-        initial.projection.turnItems.map((item) => String(item.id)),
-        allIds.slice(allIds.indexOf(startIds[260]!)),
-      );
-      const windowStatement = statements.find((statement) => statement.includes("run_starts"));
-      assert.isDefined(windowStatement);
-      const windowPlan = yield* sql.unsafe<{ readonly detail: string }>(
-        `EXPLAIN QUERY PLAN ${windowStatement}`,
-      );
-      const windowPlanDetails = windowPlan.map((row) => row.detail);
-      assert.include(
-        windowPlanDetails,
-        "SEARCH recent_run USING INDEX orchestration_v2_projection_runs_thread_ordinal_idx (thread_id=? AND ordinal<?)",
-      );
-      assert.include(
-        windowPlanDetails,
-        "SEARCH first_input USING INDEX orchestration_v2_projection_turn_items_run_ordinal_idx (run_id=?)",
-      );
-      const bounded = buildBoundedThreadProjection({
-        projection: initial.projection,
-        snapshotSequence: 0,
-      });
-      assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, startIds[262]);
-      const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
-      let cursor = bounded.historyCursor;
-      for (let pages = 0; cursor !== null; pages += 1) {
-        assert.isBelow(pages, 5);
-        const anchor = decodeThreadHistoryCursor(cursor);
-        const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
-          rowLimit: 77,
-          userTurnLimit: 20,
-          anchorItemId: TurnItemId.make(anchor.si),
-          anchorThreadId: ThreadId.make(anchor.st),
-        });
-        assert.isAtMost(snapshot.projection.turnItems.length, 152 * 4 + 1);
-        const page = selectHistoryPageFromCursor({
-          items: snapshot.projection.visibleTurnItems,
-          cursor,
+        if (storage !== "hot") yield* archiveTurnItems(threadId, 400 * 4, storage);
+        const { statements, tracer } = traceSqlStatements();
+        const initial = yield* projectionStore
+          .getThreadSnapshotWindow(threadId, { rowLimit: 77, userTurnLimit: 10 })
+          .pipe(Effect.withTracer(tracer));
+        assert.deepEqual(
+          initial.projection.turnItems.map((item) => String(item.id)),
+          allIds.slice(allIds.indexOf(startIds[260]!)),
+        );
+        const windowStatement = statements.find((statement) => statement.includes("run_starts"));
+        assert.isDefined(windowStatement);
+        const windowPlan = yield* sql.unsafe<{ readonly detail: string }>(
+          `EXPLAIN QUERY PLAN ${windowStatement}`,
+        );
+        const windowPlanDetails = windowPlan.map((row) => row.detail);
+        assert.include(
+          windowPlanDetails,
+          "SEARCH recent_run USING INDEX orchestration_v2_projection_runs_thread_ordinal_idx (thread_id=? AND ordinal<?)",
+        );
+        assert.lengthOf(
+          windowPlanDetails.filter(
+            (detail) =>
+              detail ===
+              "SEARCH item USING INDEX orchestration_v2_projection_turn_items_run_ordinal_idx (run_id=?)",
+          ),
+          2,
+        );
+        assert.include(
+          windowPlanDetails,
+          "SEARCH item USING INDEX ardud_turn_items_run_idx (run_id=?)",
+        );
+        assertIndexedHistoryWindow(windowPlanDetails);
+        const bounded = buildBoundedThreadProjection({
+          projection: initial.projection,
           snapshotSequence: 0,
         });
-        loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
-        cursor = page.nextCursor;
-      }
-      assert.deepEqual(loaded, allIds);
-    }),
+        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, startIds[262]);
+        const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
+        let cursor = bounded.historyCursor;
+        for (let pages = 0; cursor !== null; pages += 1) {
+          assert.isBelow(pages, 5);
+          const anchor = decodeThreadHistoryCursor(cursor);
+          const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+            rowLimit: 77,
+            userTurnLimit: 20,
+            anchorItemId: TurnItemId.make(anchor.si),
+            anchorThreadId: ThreadId.make(anchor.st),
+          });
+          assert.isAtMost(snapshot.projection.turnItems.length, 152 * 4 + 1);
+          const page = selectHistoryPageFromCursor({
+            items: snapshot.projection.visibleTurnItems,
+            cursor,
+            snapshotSequence: 0,
+          });
+          loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
+          cursor = page.nextCursor;
+        }
+        assert.deepEqual(loaded, allIds);
+      }),
   );
 
   it.effect(
@@ -4551,6 +4631,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect("selects only threads with runtime state that needs recovery", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
       const now = yield* DateTime.now;
       const settledThreadId = ThreadId.make("thread:recovery-candidates:settled");
       const runningThreadId = ThreadId.make("thread:recovery-candidates:running");
@@ -4702,13 +4783,36 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         });
       }
 
-      const recoveryThreadIds = yield* projectionStore.getRecoveryThreadIds("runtime");
+      const { statements, tracer } = traceSqlStatements();
+      const recoveryThreadIds = yield* projectionStore
+        .getRecoveryThreadIds("runtime")
+        .pipe(Effect.withTracer(tracer));
+      const recoveryStatement = statements.find((statement) =>
+        statement.includes("WITH pending_provider_threads"),
+      );
+      assert.isDefined(recoveryStatement);
+      const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${recoveryStatement}`,
+      );
+      assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
       assert.include(recoveryThreadIds, memberThreadId);
       assert.include(recoveryThreadIds, childThreadId);
       assert.notInclude(recoveryThreadIds, settledThreadId);
       assert.notInclude(recoveryThreadIds, rolledBackThreadId);
+      const shellStatements = traceSqlStatements();
+      yield* projectionStore.getShellSnapshot().pipe(Effect.withTracer(shellStatements.tracer));
+      const pendingStatement = shellStatements.statements.find((statement) =>
+        statement.includes("AS owning_provider_instance_id"),
+      );
+      assert.isDefined(pendingStatement);
+      const pendingPlan = yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${pendingStatement}`,
+      );
+      const pendingDetails = pendingPlan.map((row) => row.detail).join("\n");
+      assert.notMatch(pendingDetails, /ardud_|SCAN cold/);
+      assert.include(pendingDetails, "orchestration_v2_projection_turn_items_shell_pending_idx");
       const memberRecovery = yield* projectionStore.getRuntimeRecoveryProjection(memberThreadId);
       const childRecovery = yield* projectionStore.getRuntimeRecoveryProjection(childThreadId);
       assert.deepEqual(
@@ -5230,180 +5334,189 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
-  it.effect("looks up a thread's last provider error through its own session bindings", () =>
-    Effect.gen(function* () {
-      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const sql = yield* SqlClient.SqlClient;
-      const now = yield* DateTime.now;
-      const later = DateTime.add(now, { minutes: 1 });
-      const projectId = ProjectId.make("project:projection-session-error-lookup");
-      const attachErroredSession = Effect.fnUntraced(function* (
-        name: string,
-        lastError: string,
-        updatedAt: DateTime.Utc,
-      ) {
-        const threadId = ThreadId.make(`thread:projection-session-error-lookup:${name}`);
-        yield* projectionStore.apply({
-          id: EventId.make(`event:projection-session-error-lookup:${name}:thread`),
-          type: "thread.created",
-          threadId,
-          occurredAt: now,
-          payload: {
-            createdBy: "user",
-            creationSource: "web",
-            id: threadId,
-            projectId,
-            title: name,
-            providerInstanceId,
-            modelSelection,
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            activeProviderThreadId: null,
-            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-            forkedFrom: null,
-            createdAt: now,
-            updatedAt: now,
-            archivedAt: null,
-            settledOverride: null,
-            settledAt: null,
-            lastVisitedAt: null,
-            deletedAt: null,
-          },
-        });
-        yield* projectionStore.apply({
-          id: EventId.make(`event:projection-session-error-lookup:${name}:session`),
-          type: "provider-session.attached",
-          threadId,
-          driver,
-          providerInstanceId,
-          occurredAt: updatedAt,
-          payload: {
-            id: ProviderSessionId.make(`provider-session:projection-session-error-lookup:${name}`),
+  it.effect.each(["hot", "cold", "base"] as const)(
+    "looks up a thread's last %s provider error through its own session bindings",
+    (storage) =>
+      Effect.gen(function* () {
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const later = DateTime.add(now, { minutes: 1 });
+        const projectId = ProjectId.make("project:projection-session-error-lookup");
+        const attachErroredSession = Effect.fnUntraced(function* (
+          name: string,
+          lastError: string,
+          updatedAt: DateTime.Utc,
+        ) {
+          const threadId = ThreadId.make(
+            `thread:projection-session-error-lookup:${storage}:${name}`,
+          );
+          yield* projectionStore.apply({
+            id: EventId.make(`event:projection-session-error-lookup:${name}:thread`),
+            type: "thread.created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              createdBy: "user",
+              creationSource: "web",
+              id: threadId,
+              projectId,
+              title: name,
+              providerInstanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          });
+          yield* projectionStore.apply({
+            id: EventId.make(`event:projection-session-error-lookup:${name}:session`),
+            type: "provider-session.attached",
+            threadId,
             driver,
             providerInstanceId,
-            status: "error",
-            cwd: "/workspace",
-            model: modelSelection.model,
-            capabilities: CodexProviderCapabilitiesV2,
-            createdAt: updatedAt,
-            updatedAt,
-            lastError,
-          },
+            occurredAt: updatedAt,
+            payload: {
+              id: ProviderSessionId.make(
+                `provider-session:projection-session-error-lookup:${storage}:${name}`,
+              ),
+              driver,
+              providerInstanceId,
+              status: "error",
+              cwd: "/workspace",
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: updatedAt,
+              updatedAt,
+              lastError,
+            },
+          });
+          return threadId;
         });
-        return threadId;
-      });
 
-      const failure = {
-        class: "usage_limit" as const,
-        message: "Plan limit reached.",
-        resetAt: "2099-01-01T00:00:00.000Z",
-        code: "usageLimitExceeded",
-        retryable: null,
-      };
-      const threadId = yield* attachErroredSession("own", failure.message, now);
-      const runId = RunId.make("run:projection-session-error-lookup:own");
-      const rootNodeId = NodeId.make("node:projection-session-error-lookup:own");
-      yield* projectionStore.apply({
-        id: EventId.make("event:projection-session-error-lookup:own:run"),
-        type: "run.created",
-        threadId,
-        runId,
-        nodeId: rootNodeId,
-        driver,
-        providerInstanceId,
-        occurredAt: now,
-        payload: {
-          id: runId,
-          threadId,
-          ordinal: 1,
-          providerInstanceId,
-          modelSelection,
-          providerThreadId: null,
-          userMessageId: MessageId.make("message:projection-session-error-lookup:own"),
-          rootNodeId,
-          activeAttemptId: null,
-          status: "failed",
-          requestedAt: now,
-          startedAt: now,
-          completedAt: now,
-          checkpointId: null,
-          contextHandoffId: null,
-        },
-      });
-      yield* projectionStore.apply({
-        id: EventId.make("event:projection-session-error-lookup:own:error"),
-        type: "turn-item.updated",
-        threadId,
-        occurredAt: now,
-        payload: {
-          id: TurnItemId.make("projection-session-error-lookup:own:error"),
+        const failure = {
+          class: "usage_limit" as const,
+          message: "Plan limit reached.",
+          resetAt: "2099-01-01T00:00:00.000Z",
+          code: "usageLimitExceeded",
+          retryable: null,
+        };
+        const threadId = yield* attachErroredSession("own", failure.message, now);
+        const runId = RunId.make(`run:projection-session-error-lookup:${storage}:own`);
+        const rootNodeId = NodeId.make(`node:projection-session-error-lookup:${storage}:own`);
+        yield* projectionStore.apply({
+          id: EventId.make("event:projection-session-error-lookup:own:run"),
+          type: "run.created",
           threadId,
           runId,
           nodeId: rootNodeId,
-          providerThreadId: null,
-          providerTurnId: null,
-          nativeItemRef: null,
-          parentItemId: null,
-          ordinal: 1,
-          status: "failed",
-          title: "Usage limit reached",
-          startedAt: now,
-          completedAt: now,
-          updatedAt: now,
-          type: "error",
-          failure,
-        },
-      });
-      for (let index = 0; index < 24; index++) {
-        yield* attachErroredSession(`other-${index}`, "other session failed", later);
-      }
-
-      const { statements, tracer } = traceSqlStatements();
-      const shell = yield* projectionStore.getShellSnapshot().pipe(Effect.withTracer(tracer));
-      assert.equal(
-        shell.threads.find((thread) => thread.id === threadId)?.lastError,
-        failure.message,
-      );
-      const candidates = yield* projectionStore
-        .getLimitRecoveryCandidates({ now, autoResume: true, snooze: false })
-        .pipe(Effect.withTracer(tracer));
-      const candidate = candidates.find((row) => row.id === threadId);
-      assert.isDefined(candidate);
-      assert.include(candidate, {
-        status: "failed",
-        lastErrorClass: "usage_limit",
-        usageLimitResetAt: failure.resetAt,
-        latestRunId: runId,
-      });
-
-      for (const marker of ["AS blocking_failure_payload_json", "AS failure_payload_json"]) {
-        const statement = statements.find((query) => query.includes(marker));
-        assert.isDefined(statement, marker);
-        const plan = (yield* sql.unsafe<{ readonly detail: string }>(
-          `EXPLAIN QUERY PLAN ${statement}`,
-        )).map((row) => row.detail);
-        const bindingLookup = plan.findIndex((detail) => detail.startsWith("SEARCH binding "));
-        const sessionLookup = plan.findIndex((detail) => detail.startsWith("SEARCH session "));
-        assert.isAtLeast(bindingLookup, 0, marker);
-        assert.include(
-          plan[bindingLookup],
-          "orchestration_v2_projection_provider_session_bindings_thread_idx (thread_id=?)",
-        );
-        assert.isAbove(sessionLookup, bindingLookup, marker);
-        assert.include(plan[sessionLookup], "(provider_session_id=?)");
-        const errorLookups = plan.filter(
-          (detail) =>
-            /^SEARCH (?:item|error) /.test(detail) && !detail.includes("(turn_item_id=?)"),
-        );
-        assert.lengthOf(errorLookups, marker.includes("blocking") ? 2 : 1, marker);
-        for (const errorLookup of errorLookups) {
-          assert.include(errorLookup, "turn_items_failed_error_idx");
-          assert.include(errorLookup, "(thread_id=? AND run_id=? AND node_id=?)");
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId,
+            modelSelection,
+            providerThreadId: null,
+            userMessageId: MessageId.make("message:projection-session-error-lookup:own"),
+            rootNodeId,
+            activeAttemptId: null,
+            status: "failed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: now,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        });
+        yield* projectionStore.apply({
+          id: EventId.make("event:projection-session-error-lookup:own:error"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`projection-session-error-lookup:${storage}:own:error`),
+            threadId,
+            runId,
+            nodeId: rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "failed",
+            title: "Usage limit reached",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "error",
+            failure,
+          },
+        });
+        for (let index = 0; index < 24; index++) {
+          yield* attachErroredSession(`other-${index}`, "other session failed", later);
         }
-      }
-    }),
+
+        if (storage !== "hot") yield* archiveTurnItems(threadId, Number.MAX_SAFE_INTEGER, storage);
+
+        const { statements, tracer } = traceSqlStatements();
+        const shell = yield* projectionStore.getShellSnapshot().pipe(Effect.withTracer(tracer));
+        assert.equal(
+          shell.threads.find((thread) => thread.id === threadId)?.lastError,
+          failure.message,
+        );
+        const candidates = yield* projectionStore
+          .getLimitRecoveryCandidates({ now, autoResume: true, snooze: false })
+          .pipe(Effect.withTracer(tracer));
+        const candidate = candidates.find((row) => row.id === threadId);
+        assert.isDefined(candidate);
+        assert.include(candidate, {
+          status: "failed",
+          lastErrorClass: "usage_limit",
+          usageLimitResetAt: failure.resetAt,
+          latestRunId: runId,
+        });
+
+        for (const marker of ["AS blocking_failure_payload_json", "AS failure_payload_json"]) {
+          const statement = statements.find((query) => query.includes(marker));
+          assert.isDefined(statement, marker);
+          const plan = (yield* sql.unsafe<{ readonly detail: string }>(
+            `EXPLAIN QUERY PLAN ${statement}`,
+          )).map((row) => row.detail);
+          const bindingLookup = plan.findIndex((detail) => detail.startsWith("SEARCH binding "));
+          const sessionLookup = plan.findIndex((detail) => detail.startsWith("SEARCH session "));
+          assert.isAtLeast(bindingLookup, 0, marker);
+          assert.include(
+            plan[bindingLookup],
+            "orchestration_v2_projection_provider_session_bindings_thread_idx (thread_id=?)",
+          );
+          assert.isAbove(sessionLookup, bindingLookup, marker);
+          assert.include(plan[sessionLookup], "(provider_session_id=?)");
+          const errorLookups = plan.filter(
+            (detail) =>
+              /^SEARCH (?:item|error) /.test(detail) && !detail.includes("(turn_item_id=?)"),
+          );
+          assert.lengthOf(errorLookups, marker.includes("blocking") ? 6 : 3, marker);
+          for (const errorLookup of errorLookups) {
+            assert.include(errorLookup, "turn_items_failed_error_idx");
+            assert.include(errorLookup, "(thread_id=? AND run_id=? AND node_id=?)");
+          }
+          assert.notMatch(plan.join("\n"), /SEARCH (?:item|error) USING AUTOMATIC/);
+        }
+      }),
   );
 
   it.effect(

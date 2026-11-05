@@ -13,12 +13,18 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
-STATE_DB = Path(os.environ.get('MONEY_CASES_STATE_DB', '~/.robob/userdata/statev2.sqlite')).expanduser()
+# The installer puts the helper beside this check; the source tree shares helpers/.
+if not Path(__file__).with_name('robob_readonly.py').exists():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'helpers'))
+from robob_readonly import connect_replica, replica_path
+
+STATE_DB = replica_path('MONEY_CASES_STATE_DB')
 RECEIPT_BEFORE = dt.timedelta(hours=2)
 # Hits asked for per receipt search, and mails read from them: a receipt buried under usage notices
 # with the same amount is still found, without an unbounded number of reads.
@@ -226,7 +232,7 @@ def owner_texts(since, until, deadline=None):
     """What the owner typed in his own Robob threads (app or iMessage) between two times."""
     left(deadline, 5)
     try:
-        db = sqlite3.connect(f'file:{STATE_DB}?mode=ro', uri=True, timeout=2)
+        db = connect_replica(STATE_DB)
         try:
             rows = db.execute(
                 'SELECT m.created_at, m.payload_json, t.title FROM orchestration_v2_projection_threads t '
@@ -235,7 +241,7 @@ def owner_texts(since, until, deadline=None):
                 (iso(since), iso(until), iso(since), 'user')).fetchall()
         finally:
             db.close()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, OSError, ValueError) as e:
         raise Lookup(f'Robob state: {e}') from e
     out = []
     for created, payload, title in rows:

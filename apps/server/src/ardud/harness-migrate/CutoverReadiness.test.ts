@@ -22,6 +22,8 @@ import * as CutoverReadiness from "./CutoverReadiness.ts";
 import * as NodeCrypto from "node:crypto";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- exercises the real generator only against temporary fixtures.
 import * as NodeChildProcess from "node:child_process";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- source fixtures are independent of the test runner's cwd.
+import * as NodeURL from "node:url";
 import * as ConfigProvider from "effect/ConfigProvider";
 
 const BUILD = "0123456789abcdef";
@@ -1153,7 +1155,9 @@ describe("CutoverReadiness", () => {
       Effect.gen(function* () {
         const f = yield* fixture();
         const pkg = yield* f.fs.makeTempDirectoryScoped({ prefix: "readiness-generator-" });
-        const source = f.path.join(process.cwd(), "integrations", "harness-homes");
+        const source = NodeURL.fileURLToPath(
+          new URL("../../../../../integrations/harness-homes/", import.meta.url),
+        );
         const generator = f.path.join(pkg, "generate_homes.py");
         yield* f.fs.copyFile(f.path.join(source, "generate_homes.py"), generator);
         yield* f.fs.makeDirectory(f.path.join(pkg, "vendor"));

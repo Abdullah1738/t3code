@@ -10,17 +10,23 @@ import { initializeV2Database } from "./initializeV2Database.ts";
 import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import * as ServerConfig from "../config.ts";
 import { withStartupPhase } from "../ardud/observability/StartupPhaseLog.ts";
+import { initializeHistoryArchive } from "../ardud/persistence/HistoryArchive.ts";
+import { historyReaderSql, baseArchiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
+import { archiveCheckpointLayer } from "../ardud/persistence/archiveCheckpoint.ts";
+import { ArchiveSnapshotGate } from "../ardud/persistence/archiveSnapshotGate.ts";
+import * as Semaphore from "effect/Semaphore";
+// Reads only a tiny installation marker before constructing reader workers.
+import * as NodeSqlite from "node:sqlite";
 
 export const WAL_SIZE_LIMIT_BYTES = 32 * 1024 * 1024;
 
-export const runSqliteSetupPhases = <E1, R1, E2, R2>(
+export const runSqliteSetupPhases = Effect.fn("runSqliteSetupPhases")(function* <E1, R1, E2, R2>(
   migrations: Effect.Effect<void, E1, R1>,
   indexes: Effect.Effect<void, E2, R2>,
-) =>
-  Effect.gen(function* () {
-    yield* withStartupPhase("sqlite.migrations", migrations);
-    yield* withStartupPhase("sqlite.shell-indexes", indexes);
-  });
+) {
+  yield* withStartupPhase("sqlite.migrations", migrations);
+  yield* withStartupPhase("sqlite.shell-indexes", indexes);
+});
 
 const layerSetup = Layer.effectDiscard(
   withStartupPhase(
@@ -56,6 +62,26 @@ const layerSetup = Layer.effectDiscard(
       // The reader worker uses the same 64 MB.
       yield* sql`PRAGMA cache_size = -65536;`;
       yield* runSqliteSetupPhases(runMigrations(), ensureShellLookupIndexes());
+      const baseMarker =
+        yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'`;
+      const baseRows =
+        baseMarker.length === 0
+          ? []
+          : yield* sql<{
+              filename: string;
+            }>`SELECT filename FROM ardud_history_base_archive LIMIT 1`;
+      const mainRows = yield* sql<{ name: string; file: string }>`PRAGMA database_list`;
+      const mainFilename = mainRows.find((row) => row.name === "main")?.file ?? "";
+      const baseFilename =
+        baseRows[0] === undefined
+          ? undefined
+          : baseArchiveFilename(mainFilename, baseRows[0].filename);
+      yield* withStartupPhase(
+        "sqlite.history-archive",
+        initializeHistoryArchive(baseFilename).pipe(
+          Effect.catchTags({ HistoryArchiveMissing: Effect.die }),
+        ),
+      );
       // No planner statistics. Collecting them reads every page of the large
       // tables, and stats taken while a table was small make the planner scan it
       // once it grows. Without them SQLite assumes large tables and uses indexes;
@@ -75,9 +101,30 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
+  const snapshotGate = yield* Semaphore.make(1);
+  const baseFilename = yield* Effect.sync(() => {
+    const marker = new NodeSqlite.DatabaseSync(dbPath);
+    try {
+      const exists = marker
+        .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_base_archive'")
+        .get();
+      const row =
+        exists === undefined
+          ? undefined
+          : marker.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 1").get();
+      return typeof row?.filename === "string"
+        ? path.resolve(path.dirname(dbPath), row.filename)
+        : undefined;
+    } finally {
+      marker.close();
+    }
+  });
 
   return Layer.provideMerge(
-    layerSetup,
+    Layer.mergeAll(
+      Layer.provideMerge(archiveCheckpointLayer(dbPath), layerSetup),
+      Layer.succeed(ArchiveSnapshotGate, snapshotGate),
+    ),
     Layer.effectContext(
       withStartupPhase(
         "sqlite.open",
@@ -85,6 +132,13 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
           NodeSqliteClient.layer({
             filename: dbPath,
             readerWorker: true,
+            readerInitializationSql: historyReaderSql(dbPath, baseFilename),
+            readerSnapshotSql: [
+              "SELECT rootpage FROM main.sqlite_schema LIMIT 1",
+              "SELECT rootpage FROM ardud_archive.sqlite_schema LIMIT 1",
+              "SELECT rootpage FROM ardud_base.sqlite_schema LIMIT 1",
+            ],
+            readerSnapshotLock: snapshotGate,
             // Checkpoints sync the database, with F_FULLFSYNC on macOS. Run them off
             // the event loop so a slow flush cannot stall clients.
             checkpointWorker: true,

@@ -21,6 +21,7 @@ export type StartupPhase =
   | "sqlite.setup"
   | "sqlite.migrations"
   | "sqlite.shell-indexes"
+  | "sqlite.history-archive"
   | "projection.bootstrap"
   | "projection.rebuild"
   | "keybindings.start"

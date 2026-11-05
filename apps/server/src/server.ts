@@ -121,6 +121,7 @@ import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
+import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -196,6 +197,7 @@ import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -615,6 +617,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ArdudOpenCodeImportLive,
   // ardud: missions board
   ArdudKanbanLive,
+  ReadonlyReplica.layer,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
@@ -1088,6 +1091,7 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerHttpServer),
       Layer.provide(layerApplicationObservability),
       Layer.provide(LargeReplyLog.layer),
+      Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(AgentScopeLive.layer),

@@ -21,15 +21,15 @@ import os
 import sqlite3
 import sys
 import time
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_migrations  # noqa: E402
+import robob_readonly  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
-STATE_DB = os.environ.get("ROBOB_STATE_DB", os.path.join(HOME, ".robob/userdata/statev2.sqlite"))
+STATE_DB = robob_readonly.state_db("ROBOB_STATE_DB")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS thread_aliases(
@@ -67,9 +67,11 @@ def _str(v):
 def gather(state):
     """Read all source projections from the same SQLite snapshot."""
     if state.in_transaction:
+        robob_readonly.ready_generation(state)
         return _gather(state)
     state.execute("BEGIN")
     try:
+        robob_readonly.ready_generation(state)
         return _gather(state)
     finally:
         state.rollback()
@@ -369,21 +371,24 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
 
 
 def sync(mem_path=MEM_DB, state_path=STATE_DB):
-    if not os.path.isfile(state_path):
-        raise FileNotFoundError(f"Robob state DB {state_path} not found")
+    state = robob_readonly.connect_ro(state_path)
+    try:
+        robob_readonly.ready_generation(state)
+        return _sync(mem_path, state)
+    finally:
+        state.close()
+
+
+def _sync(mem_path, state):
     mem = sqlite3.connect(mem_path, timeout=600)
     mem.execute("PRAGMA busy_timeout=600000")
     try:
         schema_migrations.migrate(mem)
         mem.executescript(DDL)
-        state = sqlite3.connect(f"{Path(os.path.abspath(state_path)).as_uri()}?mode=ro", uri=True, timeout=30)
         state.execute("PRAGMA busy_timeout=30000")
-        try:
-            # Serialize the source snapshot too: a delayed older gather must not
-            # overwrite a newer ambiguity that another refresh already committed.
-            n = with_retry(mem, lambda: write(mem, gather(state), _inside_transaction=True))
-        finally:
-            state.close()
+        # Serialize the source snapshot too: a delayed older gather must not
+        # overwrite a newer ambiguity that another refresh already committed.
+        n = with_retry(mem, lambda: write(mem, gather(state), _inside_transaction=True))
     finally:
         mem.close()
     return n

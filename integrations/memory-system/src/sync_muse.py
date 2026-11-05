@@ -122,13 +122,13 @@ def allow_muse_source(con):
 def index_titles():
     """Muse's own session titles (session-index.db), when it has a real one."""
     try:
-        con = sqlite3.connect(f"file:{MUSE_INDEX}?mode=ro", uri=True, timeout=5)
+        con = backend.robob_readonly.connect_ro(MUSE_INDEX, timeout=5)
         rows = con.execute(
             "SELECT session_id, coalesce(nullif(msp_title,''), nullif(title,''), nullif(effective_long_title,''))"
             " FROM sessions"
         ).fetchall()
         con.close()
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         return {}
     return {sid: t for sid, t in rows if t and t.strip() not in ("New session", "Untitled")}
 

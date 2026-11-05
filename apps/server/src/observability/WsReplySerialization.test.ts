@@ -9,6 +9,25 @@ import * as LargeReplyLog from "./LargeReplyLog.ts";
 import * as WsReplySerialization from "./WsReplySerialization.ts";
 
 describe("WebSocket reply serialization", () => {
+  it("refuses encoding a giant snapshot as a final transport backstop", () => {
+    const entries: unknown[] = [];
+    const parser = WsReplySerialization.wrap(
+      RpcSerialization.json,
+      { record: (entry) => entries.push(entry) },
+      new Set(["kanban.subscribe"]),
+    ).makeUnsafe();
+    parser.decode(
+      JSON.stringify({ _tag: "Request", id: "big", tag: "kanban.subscribe", payload: {} }),
+    );
+    expect(() =>
+      parser.encode({
+        _tag: "Chunk",
+        requestId: "big",
+        values: [{ cards: Array(20).fill({ description: "x".repeat(1024 * 1024) }) }],
+      }),
+    ).toThrow("16 MiB limit");
+    expect(entries).toMatchObject([{ kind: "ws", name: "kanban.subscribe", rejected: true }]);
+  });
   it("records UTF-8 bytes without encoding a response twice", () => {
     const payload = { _tag: "Exit", body: "🔒".repeat(300_000), token: "private" };
     const original = RpcSerialization.json.makeUnsafe().encode(payload)!;
@@ -85,17 +104,23 @@ describe("WebSocket reply serialization", () => {
         new Set(["kanban.wiki", "discussion.get"]),
       ).makeUnsafe();
       const payloads = [
-        { threadId: "secret-thread-argument", discussionId: "secret-discussion-argument", token: "secret-token" },
+        {
+          threadId: "secret-thread-argument",
+          discussionId: "secret-discussion-argument",
+          token: "secret-token",
+        },
         { threadId: { value: "secret-nested-thread" }, discussionId: ["secret-nested-discussion"] },
         { threadId: "thread-1", discussionId: "disc-1", body: "secret-body" },
       ];
       const lengths = payloads.map((payload, index) => {
-        parser.decode(JSON.stringify({
-          _tag: "Request",
-          id: String(index),
-          tag: index === 2 ? "discussion.get" : "kanban.wiki",
-          payload,
-        }));
+        parser.decode(
+          JSON.stringify({
+            _tag: "Request",
+            id: String(index),
+            tag: index === 2 ? "discussion.get" : "kanban.wiki",
+            payload,
+          }),
+        );
         const encoded = parser.encode({
           _tag: "Exit",
           requestId: String(index),
@@ -107,7 +132,12 @@ describe("WebSocket reply serialization", () => {
       expect(text).not.toContain("secret");
       expect(text).not.toContain("thread-1");
       expect(text).not.toContain("disc-1");
-      expect(text.trim().split("\n").map((line) => JSON.parse(line))).toEqual(
+      expect(
+        text
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line)),
+      ).toEqual(
         lengths.map((bytes, index) => ({
           at: expect.any(String),
           kind: "ws",

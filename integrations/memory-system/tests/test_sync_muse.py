@@ -2,12 +2,14 @@
 
 import importlib
 import json
+from replica_fixture import ready
 import os
 import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, SRC)
@@ -209,12 +211,17 @@ class MuseSyncTest(unittest.TestCase):
     def test_file_error_is_isolated_and_reported(self):
         bad = os.path.join(self.sessions, "2026/10/14/A/session.jsonl")
         write(bad, main_log("A"))
-        os.chmod(bad, 0)  # unreadable
         write(self.main, main_log("S1"))
-        try:
+        real_open = open
+
+        def unreadable(path, *args, **kwargs):
+            if os.fspath(path) == bad:
+                raise PermissionError("unreadable fixture")
+            return real_open(path, *args, **kwargs)
+
+        # VM test runners may be root, where chmod(0) does not deny reads.
+        with patch("builtins.open", side_effect=unreadable):
             stats = self.sync()
-        finally:
-            os.chmod(bad, 0o644)
         self.assertEqual(stats["errors"], 1)
         self.assertEqual(len(self.rows("S1")), 5)
         st = json.load(open(self.status))
@@ -296,6 +303,7 @@ class MuseSyncTest(unittest.TestCase):
         write(self.main, main_log("S1"))
         self.sync()
         con = sqlite3.connect(self.robob_db)
+        ready(con)
         con.executescript("""
             CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT, provider TEXT, payload_json TEXT);
             CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, title TEXT, payload_json TEXT);

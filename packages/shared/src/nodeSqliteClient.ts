@@ -42,6 +42,11 @@ export interface SqliteClientConfig {
    */
   readonly readerWorker?: boolean | undefined;
   readonly readerStartupTimeout?: Duration.Input | undefined;
+  /** Connection-local attachments/views, repeated when a reader worker is replaced. */
+  readonly readerInitializationSql?: ReadonlyArray<string> | undefined;
+  /** Pin related WAL snapshots under writer exclusion before reading them. */
+  readonly readerSnapshotSql?: ReadonlyArray<string> | undefined;
+  readonly readerSnapshotLock?: Semaphore.Semaphore | undefined;
   /**
    * Ignored for in-memory databases.
    */
@@ -197,6 +202,7 @@ try {
   // Without WAL a reader's shared lock blocks the writer's commits, so refuse.
   const mode = String(next.prepare("PRAGMA journal_mode").get().journal_mode).toLowerCase();
   if (mode !== "wal") throw new Error("database uses journal_mode " + mode + ", not wal");
+  for (const sql of workerData.initializationSql) next.exec(sql);
   db = next;
   parentPort.postMessage({ type: "ready" });
 } catch (error) {
@@ -289,6 +295,7 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  * continuing outside the transaction on a replacement.
  */
 const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
+  const snapshotLock = options.readerSnapshotLock ?? (yield* Semaphore.make(1));
   let current:
     | {
         readonly worker: NodeWorkerThreads.Worker;
@@ -306,6 +313,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         filename: options.filename,
         allowExtension: options.allowExtension ?? false,
         prepareCacheSize: options.prepareCacheSize ?? 200,
+        initializationSql: options.readerInitializationSql ?? [],
       },
     });
     let announce: (startup: ReaderStartup) => void = () => {};
@@ -384,19 +392,60 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         });
       });
 
+    let snapshotTransaction = false;
+    const pinSnapshots = Effect.forEach(
+      options.readerSnapshotSql ?? [],
+      (sql) => request({ sql, params: [], cached: true, values: false, raw: false }),
+      { discard: true },
+    );
+    const withSnapshot = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
+      Effect.suspend(() => {
+        if (
+          snapshotTransaction ||
+          options.readerSnapshotSql === undefined ||
+          !/ardud_(?:archive|\w*history|turn_items)/i.test(sql)
+        )
+          return effect;
+        return Effect.uninterruptibleMask((restore) =>
+          snapshotLock
+            .withPermits(1)(
+              request({ sql: "BEGIN", params: [], cached: false, values: false, raw: false }).pipe(
+                Effect.andThen(pinSnapshots),
+              ),
+            )
+            .pipe(
+              Effect.andThen(restore(effect)),
+              Effect.ensuring(
+                request({
+                  sql: "ROLLBACK",
+                  params: [],
+                  cached: false,
+                  values: false,
+                  raw: false,
+                }).pipe(Effect.ignore),
+              ),
+            ),
+        );
+      });
     const connection = identity<Connection>({
       execute(sql, params, rowTransform) {
-        const effect = request({ sql, params, cached: true, values: false, raw: false });
+        const effect = withSnapshot(
+          sql,
+          request({ sql, params, cached: true, values: false, raw: false }),
+        );
         return rowTransform ? Effect.map(effect, rowTransform) : effect;
       },
       executeRaw(sql, params) {
-        return request({ sql, params, cached: true, values: false, raw: true });
+        return withSnapshot(sql, request({ sql, params, cached: true, values: false, raw: true }));
       },
       executeValues(sql, params) {
-        return request({ sql, params, cached: true, values: true, raw: false });
+        return withSnapshot(sql, request({ sql, params, cached: true, values: true, raw: false }));
       },
       executeValuesUnprepared(sql, params) {
-        return request({ sql, params: params ?? [], cached: false, values: true, raw: false });
+        return withSnapshot(
+          sql,
+          request({ sql, params: params ?? [], cached: false, values: true, raw: false }),
+        );
       },
       executeUnprepared(sql, params, rowTransform) {
         // A read-only connection rejects BEGIN IMMEDIATE and BEGIN EXCLUSIVE,
@@ -409,7 +458,44 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
           values: false,
           raw: false,
         });
-        return rowTransform ? Effect.map(effect, rowTransform) : effect;
+        if (/^\s*BEGIN\b/i.test(sql) && options.readerSnapshotSql !== undefined) {
+          // WAL snapshots are per attached DB. Pin both while no archive mover
+          // can replace a cold row between their snapshot acquisitions.
+          return Effect.uninterruptible(
+            snapshotLock.withPermits(1)(
+              effect.pipe(
+                Effect.andThen(pinSnapshots),
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    snapshotTransaction = true;
+                  }),
+                ),
+                Effect.as([]),
+              ),
+            ),
+          ).pipe(
+            Effect.onError(() =>
+              request({
+                sql: "ROLLBACK",
+                params: [],
+                cached: false,
+                values: false,
+                raw: false,
+              }).pipe(Effect.ignore),
+            ),
+          );
+        }
+        if (/^\s*(?:COMMIT|ROLLBACK)\s*;?\s*$/i.test(sql))
+          return effect.pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                snapshotTransaction = false;
+              }),
+            ),
+          );
+        if (/^\s*(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return effect;
+        const snapshot = withSnapshot(sql, effect);
+        return rowTransform ? Effect.map(snapshot, rowTransform) : snapshot;
       },
       executeStream(_sql, _params) {
         return Stream.die(new UnsupportedNodeSqliteOperationError());
@@ -510,9 +596,9 @@ const initialize = () => {
   if (mode !== "wal") throw new Error("database uses journal_mode " + mode + ", not wal");
   // macOS requires F_FULLFSYNC to flush the drive cache.
   db.exec("PRAGMA checkpoint_fullfsync = ON;");
-  frames = db.prepare("PRAGMA wal_checkpoint(NOOP)");
-  checkpoint = db.prepare("PRAGMA wal_checkpoint(PASSIVE)");
-  truncate = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+   frames = db.prepare("PRAGMA main.wal_checkpoint(NOOP)");
+   checkpoint = db.prepare("PRAGMA main.wal_checkpoint(PASSIVE)");
+   truncate = db.prepare("PRAGMA main.wal_checkpoint(TRUNCATE)");
 };
 const atCeiling = (state) => state.log >= workerData.backpressureFrames;
 const exceedsSizeLimit = () =>
@@ -626,7 +712,7 @@ const startCheckpointWorker = Effect.fnUntraced(function* (
     yield* warn(`SQLite ${version} has no NOOP checkpoint`);
     return undefined;
   }
-  const frames = writer.prepare("PRAGMA wal_checkpoint(NOOP)");
+  const frames = writer.prepare("PRAGMA main.wal_checkpoint(NOOP)");
   const sizeLimit = writer.prepare("PRAGMA journal_size_limit");
   let worker: NodeWorkerThreads.Worker;
   try {
