@@ -118,6 +118,18 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     );
     const eventSink = Context.get(services, EventSinkV2);
     yield* eventSink.write({
+      events: Array.from({ length: 505 }, (_, index) => {
+        const id = ThreadId.make(`paged-${String(index).padStart(4, "0")}`);
+        return {
+          id: EventId.make(`created-${id}`),
+          type: "thread.created" as const,
+          threadId: id,
+          occurredAt: now,
+          payload: { ...thread, id },
+        };
+      }),
+    });
+    yield* eventSink.write({
       events: [
         {
           id: EventId.make("create-source"),
@@ -171,6 +183,40 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     expect(
       (yield* decodeTranscript(yield* Effect.promise(() => emptyResponse.json()))).items,
     ).toEqual([]);
+    const shellRequest = (after?: string) =>
+      Effect.promise(() =>
+        handler(
+          new Request(
+            `http://localhost/api/orchestration/shell?paged=true${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`,
+            { headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT } },
+          ),
+        ),
+      );
+    const firstShell = yield* shellRequest();
+    expect(firstShell.status).toBe(200);
+    const firstPage = (yield* Effect.promise(() => firstShell.json())) as {
+      threads: Array<{ id: string }>;
+      page: { nextAfter: string | null };
+    };
+    expect(firstPage.threads).toHaveLength(500);
+    expect(firstPage.page.nextAfter).toBe(firstPage.threads.at(-1)!.id);
+    const lastShell = yield* shellRequest(firstPage.page.nextAfter!);
+    const lastPage = (yield* Effect.promise(() => lastShell.json())) as typeof firstPage;
+    expect(lastPage.threads).toHaveLength(6);
+    expect(lastPage.page.nextAfter).toBeNull();
+    expect(
+      new Set([...firstPage.threads, ...lastPage.threads].map((thread) => thread.id)).size,
+    ).toBe(506);
+    const legacyShell = yield* Effect.promise(() =>
+      handler(
+        new Request("http://localhost/api/orchestration/shell", {
+          headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
+        }),
+      ),
+    );
+    const legacyData = (yield* Effect.promise(() => legacyShell.json())) as typeof firstPage;
+    expect(legacyData.threads).toHaveLength(506);
+    expect(legacyData.page).toBeUndefined();
     yield* eventSink.write({
       events: items.map((item) => ({
         id: EventId.make(`create-${item.id}`),

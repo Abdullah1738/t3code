@@ -192,6 +192,37 @@ it("normalizes empty successful notification responses to accepted", () => {
   expect(resultResponse.status).toBe(200);
 });
 
+it.effect("returns a clear bounded tool error before serializing a giant result", () => {
+  const BigToolkit = Toolkit.make(
+    Tool.make("big_board", {
+      description: "Synthetic board.",
+      success: Schema.Struct({
+        cards: Schema.Array(Schema.Struct({ description: Schema.String })),
+      }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
+  );
+  const layer = McpHttpServer.toolkitRegistration(
+    BigToolkit,
+    McpToolAccess.toLayer(BigToolkit, {
+      big_board: McpToolAccess.reads(() =>
+        Effect.succeed({ cards: Array(40).fill({ description: "x".repeat(1024 * 1024) }) }),
+      ),
+    }),
+  ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+  return callTool("big_board", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result)).toContain("16 MiB limit");
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(1024);
+      }),
+    ),
+    Effect.provide(layer),
+  );
+});
+
 it.effect.each([{}, { includeImage: false }])(
   "returns bounded structural preview snapshot failures %#",
   (input) =>

@@ -552,6 +552,25 @@ it.effect(
       const snapshot = boardResult.structured.board as { cards: Array<{ prompt: string }> };
       assert.lengthOf(snapshot.cards, 3);
       assert.isTrue(snapshot.cards.every((card) => card.prompt === ""));
+      const firstPage = yield* call(thread, "board_get", { limit: 1 });
+      const page = firstPage.structured.board as {
+        cards: Array<{
+          number: number;
+          description?: string;
+          owner: string | null;
+          status: string;
+        }>;
+        page: { hasMore: boolean; nextAfter: number };
+      };
+      assert.lengthOf(page.cards, 1);
+      assert.isUndefined(page.cards[0]!.description);
+      assert.isString(page.cards[0]!.status);
+      assert.isTrue(page.page.hasMore);
+      const secondPage = yield* call(thread, "board_get", { limit: 1, after: page.page.nextAfter });
+      assert.strictEqual(
+        (secondPage.structured.board as typeof page).cards[0]!.number,
+        page.cards[0]!.number + 1,
+      );
 
       const unnamed = yield* call(thread, "discussion_post", { text: "hi" });
       assert.isTrue(unnamed.isError);

@@ -31,7 +31,7 @@ import { SummaryCard } from "./summaryCard.ts";
 
 /**
  * Fork tables for the Missions board. Rows keep the whole record as JSON plus
- * the few columns we filter on; the records are small and always read whole.
+ * the few columns we filter on. List reads project out large detail fields.
  * Never add these to persistence/Migrations.ts (upstream owns that list).
  */
 const DDL = [
@@ -184,6 +184,10 @@ export interface KanbanStoreShape {
   readonly cards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly feedCards: (
+    boardId: KanbanBoardId,
+    page?: { readonly after: number; readonly limit: number },
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   /** Only the fields the board list's badges read, for every card on the board, in number order. */
   readonly summaryCards: (
     boardId: KanbanBoardId,
@@ -208,6 +212,9 @@ export interface KanbanStoreShape {
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
 
   readonly goals: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanGoal>, KanbanStoreError>;
+  readonly feedGoals: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanGoal>, KanbanStoreError>;
   readonly putGoal: (goal: KanbanGoal) => Effect.Effect<void, KanbanStoreError>;
@@ -418,6 +425,34 @@ const make = Effect.gen(function* () {
       "read cards",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
+        (rows) => decodeAll(rows, Card.decode),
+      ),
+    );
+  const feedCards: KanbanStoreShape["feedCards"] = (boardId, page) =>
+    runRead(
+      "read feed cards",
+      Effect.flatMap(
+        sql<JsonRow>`
+          SELECT json_set(json,
+            '$.prompt', '', '$.description', '', '$.wakeNote', CASE WHEN json_extract(json, '$.wakeNote') IS NULL THEN NULL ELSE 'pending' END,
+            '$.title', substr(json_extract(json, '$.title'), 1, 512),
+            '$.question', substr(json_extract(json, '$.question'), 1, 512),
+            '$.stalled.reason', substr(json_extract(json, '$.stalled.reason'), 1, 512),
+            '$.asks', json(COALESCE((
+              SELECT json_group_array(json_set(ask.value, '$.text', substr(json_extract(ask.value, '$.text'), 1, 512)))
+              FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
+              WHERE json_extract(ask.value, '$.closedAt') IS NULL
+            ), '[]')),
+            '$.subtasks', json(COALESCE((
+              SELECT json_group_array(json_set(task.value,
+                '$.text', substr(json_extract(task.value, '$.text'), 1, 128), '$.note', NULL))
+              FROM json_each(ardud_kanban_cards.json, '$.subtasks') AS task
+            ), '[]'))
+          ) AS json
+          FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND number > ${page?.after ?? 0}
+          ORDER BY number LIMIT ${page?.limit ?? -1}
+        `,
         (rows) => decodeAll(rows, Card.decode),
       ),
     );
@@ -969,6 +1004,21 @@ const make = Effect.gen(function* () {
     putBoardWithPools,
     cards,
     summaryCards,
+    feedCards,
+    feedGoals: (boardId) =>
+      runRead(
+        "read feed goals",
+        Effect.flatMap(
+          sql<JsonRow>`SELECT json_set(json, '$.story', json(COALESCE((
+        SELECT json_group_array(json(entry)) FROM (
+          SELECT json_object('at', json_extract(story.value, '$.at'), 'text', substr(json_extract(story.value, '$.text'), 1, 512)) AS entry
+          FROM (SELECT value FROM json_each(ardud_kanban_goals.json, '$.story') ORDER BY CAST(key AS INTEGER) DESC LIMIT 20) AS story
+          ORDER BY json_extract(story.value, '$.at')
+        )
+      ), '[]'))) AS json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`,
+          (rows) => decodeAll(rows, Goal.decode),
+        ),
+      ),
     card,
     cardByNumber,
     cardsByThread,

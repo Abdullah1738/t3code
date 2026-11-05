@@ -147,7 +147,13 @@ describe("loadShellSnapshotParts", () => {
 });
 
 function shellFixture(overrides: Partial<OrchestrationV2ThreadShell>): OrchestrationV2ThreadShell {
-  return { id: "thread-a", archivedAt: null, ...overrides } as OrchestrationV2ThreadShell;
+  return {
+    id: "thread-a",
+    title: "Thread",
+    latestVisibleMessage: null,
+    archivedAt: null,
+    ...overrides,
+  } as OrchestrationV2ThreadShell;
 }
 
 describe("coalesceStoredThreadEvents", () => {

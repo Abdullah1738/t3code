@@ -595,6 +595,10 @@ const EnvironmentOrchestrationThreadHistoryErrors = [
 class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
   .add(
     HttpApiEndpoint.get("shellSnapshot", "/api/orchestration/shell", {
+      query: Schema.Struct({
+        after: Schema.optionalKey(Schema.String),
+        paged: Schema.optionalKey(Schema.String),
+      }),
       headers: OrchestrationProtocolHeaders,
       success: OrchestrationV2ShellSnapshot,
       error: EnvironmentOrchestrationSnapshotErrors,

@@ -29,6 +29,14 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
 import * as McpReplySize from "../observability/McpReplySize.ts";
+import {
+  jsonExceedsBudget,
+  MAX_REPLY_BYTES,
+  REPLY_TOO_LARGE,
+  ReplyTooLarge,
+} from "../ardud/http/replyBudget.ts";
+import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
+import { ReplyRejection } from "../ardud/http/ReplyRejection.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import {
   type AgentThread,
@@ -170,6 +178,16 @@ export const normalizeMcpHttpResponse = (
 
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
+const LARGE_READ_TOOLS = new Set([
+  "board_get",
+  "card_get",
+  "wiki_read",
+  "discussion_read",
+  "card_search",
+  "t3_thread_read",
+  "t3_thread_list",
+  "list_scheduled_tasks",
+]);
 
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
@@ -858,6 +876,7 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
+    const largeRepliesForTools = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
     const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
     const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
     const shellOf = (threadId: string) =>
@@ -969,7 +988,51 @@ const withToolAnalytics =
               const capture = yield* Effect.serviceOption(McpReplyCapture);
               if (Option.isSome(capture)) capture.value.name = options.tool.name;
               const startedAt = yield* Clock.currentTimeMillis;
-              return yield* options.handle(payload).pipe(
+              const rejection = { exceeded: false };
+              const result = options
+                .handle(payload)
+                .pipe(Effect.provideService(ReplyRejection, rejection));
+              return yield* (
+                LARGE_READ_TOOLS.has(options.tool.name) ? ReplyBuilders.bounded(result) : result
+              ).pipe(
+                Effect.catchCauseIf(
+                  (cause) =>
+                    cause.reasons.some(
+                      (reason) =>
+                        Cause.isDieReason(reason) && reason.defect instanceof ReplyTooLarge,
+                    ),
+                  () => {
+                    if (Option.isSome(largeRepliesForTools))
+                      largeRepliesForTools.value.record({
+                        kind: "mcp",
+                        name: options.tool.name,
+                        bytes: MAX_REPLY_BYTES + 1,
+                        rejected: true,
+                      });
+                    return Effect.succeed(
+                      new McpSchema.CallToolResult({
+                        isError: true,
+                        content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                      }),
+                    );
+                  },
+                ),
+                Effect.map((result) => {
+                  // MCP repeats the result as text and structuredContent; leave envelope headroom.
+                  if (!rejection.exceeded && !jsonExceedsBudget(result, MAX_REPLY_BYTES - 4096))
+                    return result;
+                  if (Option.isSome(largeRepliesForTools))
+                    largeRepliesForTools.value.record({
+                      kind: "mcp",
+                      name: options.tool.name,
+                      bytes: MAX_REPLY_BYTES + 1,
+                      rejected: true,
+                    });
+                  return new McpSchema.CallToolResult({
+                    isError: true,
+                    content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                  });
+                }),
                 Effect.onExit((exit) => {
                   const result = exit._tag === "Success" ? exit.value : undefined;
                   // A call that asks for input is retried with it, and that call is the one counted.

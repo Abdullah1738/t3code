@@ -1992,6 +1992,13 @@ export type OrchestrationV2ThreadShellSnapshot = typeof OrchestrationV2ThreadShe
 export const OrchestrationV2ShellSnapshot = Schema.Struct({
   ...OrchestrationV2ThreadShellSnapshot.fields,
   projects: Schema.Array(OrchestrationProjectShell),
+  /** Present on bounded shell snapshots; load the next page before subscribing from snapshotSequence. */
+  page: Schema.optionalKey(
+    Schema.Struct({
+      after: Schema.NullOr(Schema.String),
+      nextAfter: Schema.NullOr(Schema.String),
+    }),
+  ),
 });
 export type OrchestrationV2ShellSnapshot = typeof OrchestrationV2ShellSnapshot.Type;
 
@@ -3377,6 +3384,7 @@ export type OrchestrationV2GetThreadProjectionInput =
   typeof OrchestrationV2GetThreadProjectionInput.Type;
 
 export const OrchestrationV2SubscribeShellInput = Schema.Struct({
+  acceptShellPages: Schema.optionalKey(Schema.Boolean),
   afterSequence: Schema.optionalKey(NonNegativeInt),
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });
