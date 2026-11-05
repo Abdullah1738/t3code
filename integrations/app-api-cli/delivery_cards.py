@@ -533,7 +533,8 @@ def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
         if current:
             atomic(folder / 'preview-state.json', {'hash': fingerprint})
             atomic(folder / 'index.html', page(v, url))
-    return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count']}
+    return {'slug': folder.name, 'dir': str(folder), 'stage': v['stage'], 'items': v['count'],
+            'has_preview': bool(current)}
 
 
 def route():
@@ -852,7 +853,9 @@ def sync(cfg, data, *, send=False, recover=False):
                         published = bridge(['publish' if recipient == 'owner' else 'share', '--app', rendered['slug'],
                                             *(['--days', str(share_days(cfg))] if recipient != 'owner' else [])],
                                            timeout=65 if recipient != 'owner' else 12)
-                        if published.get('metadataWarnings'):
+                        warnings = published.get('metadataWarnings') or []
+                        # Missing imagery is expected only when both renderers failed.
+                        if any(w != 'missing og:image' or rendered['has_preview'] for w in warnings):
                             raise ValueError('card_metadata_incomplete')
                         url = published.get('url')
                         if not isinstance(url, str) or not url.startswith('https://'):

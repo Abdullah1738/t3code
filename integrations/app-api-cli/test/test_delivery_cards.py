@@ -31,6 +31,7 @@ class CardTests(unittest.TestCase):
         self.fail_err = '{"error":"Bridge request timed out"}'
         self.no_to = False
         self.ack_state = 'sent'
+        self.metadata_warnings = []
         self.bridge_dir = self.root / 'bridge'
         for chat in ('owner', 'moni', 'group-sb_gro'):
             self.store(chat, 'fixture-session', 1)
@@ -41,7 +42,8 @@ class CardTests(unittest.TestCase):
                 published=next((a for a in self.calls if a[0]=='share'),None)
                 return {'shares':[{'app':published[published.index('--app')+1],'live':True,'url':'https://cards.trycloudflare.com/'}] if published else []}
             if args[0] in ('share', 'publish'):
-                return {'url': 'https://cards.trycloudflare.com/' if args[0] == 'share' else 'https://host.ts.net:18400/card/'}
+                return {'url': 'https://cards.trycloudflare.com/' if args[0] == 'share' else 'https://host.ts.net:18400/card/',
+                        'metadataWarnings': self.metadata_warnings}
             if self.no_to and args[0] in ('send', 'app') and args[-2:] == ['--to', 'owner']:
                 raise c.BridgeError('{"error":"Invalid command arguments"}')  # an older bridge
             if self.fail_send:
@@ -302,6 +304,7 @@ class CardTests(unittest.TestCase):
         self.assertEqual(app[app.index('--to')+1],'owner','owner cards ride --to, which no rotation cancels')
 
     def test_missing_pillow_and_renderer_still_publishes_and_sends(self):
+        self.metadata_warnings = ['missing og:image']
         with patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
             result = c.sync(self.cfg, self.data, send=True)
         self.assertEqual(result['status'], 'sent')
@@ -310,6 +313,35 @@ class CardTests(unittest.TestCase):
         self.assertNotIn('property="og:image"', (folder / 'index.html').read_text())
         self.assertFalse((folder / 'preview.png').exists())
         self.assertEqual(sum(a[0] == 'send' for a in self.calls), 1)
+
+    def test_publish_metadata_warning_matrix_for_owner_and_public_cards(self):
+        cases = [
+            (False, None, 'sent'),
+            (False, [], 'sent'),
+            (False, ['missing og:image'], 'sent'),
+            (False, ['missing <title>'], 'failed:card_metadata_incomplete'),
+            (False, ['missing og:title'], 'failed:card_metadata_incomplete'),
+            (False, ['missing og:description'], 'failed:card_metadata_incomplete'),
+            (False, ['missing og:image', 'missing og:title'], 'failed:card_metadata_incomplete'),
+            (False, ['unknown warning'], 'failed:card_metadata_incomplete'),
+            (True, [], 'sent'),
+            (True, ['missing og:image'], 'failed:card_metadata_incomplete'),
+        ]
+        for recipient in ('owner', 'moni'):
+            for n, (has_preview, warnings, expected) in enumerate(cases):
+                with self.subTest(recipient=recipient, has_preview=has_preview, warnings=warnings):
+                    cfg = {**self.cfg, 'order': f'{recipient}-{n}', 'for': recipient,
+                           'watcher': f'order-talabat-{recipient}-{n}'}
+                    self.metadata_warnings = warnings
+                    self.calls.clear()
+                    with contextlib.ExitStack() as stack:
+                        if not has_preview:
+                            stack.enter_context(patch.dict(sys.modules, {'PIL': None}))
+                            stack.enter_context(patch.object(c, 'preview_chrome', return_value=False))
+                        result = c.sync(cfg, self.data, send=True)
+                    self.assertEqual(result['status'], expected)
+                    self.assertEqual(sum(a[0] in ('app', 'send') for a in self.calls), int(expected == 'sent'))
+                    self.assertEqual(bool(result['url']), expected == 'sent')
 
     def test_safe_sync_reports_exception_and_traceback(self):
         stderr = io.StringIO()
