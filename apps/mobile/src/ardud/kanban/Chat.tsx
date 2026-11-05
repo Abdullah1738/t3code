@@ -20,16 +20,15 @@ import { Image } from "expo-image";
 import {
   type ComponentRef,
   createContext,
-  Fragment,
-  type ReactNode,
   useCallback,
   useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
-import { Pressable, ScrollView, View } from "react-native";
+import { FlatList, Pressable, View } from "react-native";
 import { WebView, type WebViewNavigation } from "react-native-webview";
 
 import { FilePreviewModal } from "../../components/FilePreviewModal";
@@ -75,13 +74,22 @@ import { useServerConfigs } from "../../state/entities";
 import { useAssetUrl } from "../../state/assets";
 import * as Dialog from "../../components/ui/Dialog";
 import { Avatar, Glyph } from "./parts";
+import {
+  completeChoiceDraft,
+  createEarlierPageLoader,
+  createHistoryGesture,
+  createRowStateStore,
+  followingNewest,
+  invertedAnswerOffset,
+  nearHistoryEnd,
+  newestFirst,
+  type ChoiceDraft,
+} from "./chatState";
 
 // Agent posts fold past this many lines and open in place or in a reader.
 const MESSAGE_LINES = 24;
 const HTML_DEFAULT_HEIGHT = 240;
 const HTML_MAX_HEIGHT = 480;
-// How close to the end counts as reading the newest message.
-const FOLLOW_SLACK = 80;
 /** Space kept between a focused answer field and the list's bottom edge. */
 const ANSWER_CLEARANCE = 12;
 
@@ -103,9 +111,32 @@ interface AnswerScroll {
 type AnswerRow = ComponentRef<typeof View>;
 
 const AnswerScrollContext = createContext<AnswerScroll | null>(null);
+const ChoiceDraftContext = createContext<ReturnType<typeof createRowStateStore<ChoiceDraft>> | null>(
+  null,
+);
+const ExpandedBlocksContext = createContext<ReturnType<typeof createRowStateStore<boolean>> | null>(
+  null,
+);
+
+/** Keeps interactive row state when FlatList removes an off-screen message. */
+function useRowState<T>(store: ReturnType<typeof createRowStateStore<T>>, key: string) {
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(key, listener),
+    [store, key],
+  );
+  const get = useCallback(() => store.get(key), [store, key]);
+  const value = useSyncExternalStore(subscribe, get);
+  const set = useCallback((next: T | null) => store.set(key, next), [store, key]);
+  return [value, set] as const;
+}
+
+function useRowStore<T>(store: ReturnType<typeof createRowStateStore<T>> | null) {
+  const [fallback] = useState(createRowStateStore<T>);
+  return store ?? fallback;
+}
 
 /**
- * One discussion: messages oldest first, who has seen your last message, who
+ * One discussion: newest at the bottom, who has seen your last message, who
  * is typing, and the composer pinned at the foot. A null `discussionId` is a
  * discussion that starts with the first message; `ensureDiscussion` makes it.
  */
@@ -118,15 +149,12 @@ export function Chat(props: {
   readonly nowMs: number;
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
-  /** Scrolls with the messages, above them. */
-  readonly header?: ReactNode;
-  /** Opens at the newest message; otherwise at the header. */
-  readonly startAtEnd?: boolean;
 }) {
   const { boardId, discussionId, state } = props;
   const messages = useKanbanMessages(boardId, discussionId);
   const feed = useKanbanMessagesFeed(boardId, discussionId);
   const discussion = discussionId === null ? undefined : state.discussions.get(discussionId);
+  const discussionKey = `${boardId}\n${discussionId ?? ""}`;
   const clock = useTypingClock(discussion?.participants);
   const presence =
     discussion && messages
@@ -136,17 +164,59 @@ export function Chat(props: {
 
   useMarkRead(boardId, discussionId, state, messages);
 
-  const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
+  const scroll = useRef<FlatList<KanbanMessage>>(null);
   const frame = useRef<ComponentRef<typeof View>>(null);
-  const following = useRef(props.startAtEnd ?? true);
-  const placed = useRef(false);
+  const position = useRef({ key: discussionKey, following: true });
+  const needsPlacement = useRef(false);
   const scrollY = useRef(0);
+  const previousDiscussion = useRef({ boardId, discussionId });
+  const reversed = useMemo(() => newestFirst(messages), [messages]);
+  const historyGesture = useMemo(createHistoryGesture, [boardId, discussionId]);
+  const earlierAction = useBoardAction();
+  const readEarlier = useMemo(
+    () =>
+      createEarlierPageLoader(() => {
+        if (discussionId === null) return Promise.resolve(false);
+        return earlierAction.run("Couldn't load earlier messages", () =>
+          kanbanClient().loadEarlier(boardId, discussionId),
+        );
+      }),
+    [boardId, discussionId, earlierAction.run],
+  );
+  const choiceDrafts = useMemo(() => createRowStateStore<ChoiceDraft>(), [boardId, discussionId]);
+  const expandedBlocks = useMemo(() => createRowStateStore<boolean>(), [boardId, discussionId]);
+  useEffect(() => {
+    const previous = previousDiscussion.current;
+    previousDiscussion.current = { boardId, discussionId };
+    if (previous.boardId === boardId && previous.discussionId === discussionId) return;
+    position.current = { key: discussionKey, following: true };
+    scrollY.current = 0;
+    needsPlacement.current = true;
+  }, [boardId, discussionId, discussionKey]);
+  useEffect(() => {
+    if (!needsPlacement.current || messages === undefined) return;
+    scroll.current?.scrollToOffset({ offset: 0, animated: false });
+    needsPlacement.current = false;
+  }, [boardId, discussionId, messages]);
+  const oldest = messages?.[0]?.seq;
+  const hasEarlier = discussionId !== null && oldest !== undefined && oldest > 1;
+  // One user gesture authorizes one page; otherwise layout callbacks can cascade through history.
+  const requestEarlier = () => {
+    if (!hasEarlier || !historyGesture.consume()) return;
+    void readEarlier(oldest);
+  };
+  const loadEarlier = () => {
+    if (!hasEarlier) return;
+    historyGesture.cancel();
+    void readEarlier(oldest, true);
+  };
   // The one focused answer field's row, or null. Only a field's own focus sets
   // it, and only that same row clears it, so other questions can't move it.
   const answerRow = useRef<AnswerRow | null>(null);
   const followToEnd = () => {
-    following.current = true;
-    scroll.current?.scrollToEnd({ animated: true });
+    position.current = { key: discussionKey, following: true };
+    historyGesture.cancel();
+    scroll.current?.scrollToOffset({ offset: 0, animated: true });
   };
 
   // Scrolls only as far as the focused field's bottom edge needs, so the
@@ -159,9 +229,13 @@ export function Chat(props: {
       if (row === null || box === null) return;
       row.measureInWindow((_x, rowY, _width, rowHeight) => {
         box.measureInWindow((_bx, boxY, _boxWidth, boxHeight) => {
+          if (answerRow.current !== row) return;
           const overflow = rowY + rowHeight - (boxY + boxHeight) + ANSWER_CLEARANCE;
           if (overflow <= 0) return;
-          scroll.current?.scrollTo({ y: Math.max(0, scrollY.current + overflow), animated: true });
+          scroll.current?.scrollToOffset({
+            offset: invertedAnswerOffset(scrollY.current, overflow),
+            animated: true,
+          });
         });
       });
     };
@@ -181,82 +255,143 @@ export function Chat(props: {
   return (
     <View className="flex-1">
       <View ref={frame} className="flex-1" onLayout={answerScroll.reveal}>
-        <ScrollView
-          ref={scroll}
-          className="flex-1"
-          contentContainerClassName="gap-3 px-4 pb-4 pt-2"
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="interactive"
-          scrollEventThrottle={64}
-          onScroll={(event) => {
-            const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
-            scrollY.current = contentOffset.y;
-            following.current =
-              contentOffset.y + layoutMeasurement.height >= contentSize.height - FOLLOW_SLACK;
-          }}
-          onContentSizeChange={() => {
-            // A focused answer keeps its own place; following the newest message would push it out of view.
-            if (answerScroll.isFocused()) return answerScroll.reveal();
-            if (!following.current) return;
-            scroll.current?.scrollToEnd({ animated: placed.current });
-            placed.current = true;
-          }}
-          // The keyboard shrinks the list without changing its content; keep
-          // the newest message above the composer.
-          onLayout={() => {
-            if (following.current && placed.current && !answerScroll.isFocused()) {
-              scroll.current?.scrollToEnd({ animated: false });
-            }
-          }}
-        >
-          <AnswerScrollContext.Provider value={answerScroll}>
-            {props.header}
+        {feed.failure || (discussionId !== null && messages === undefined) ? (
+          <View className="px-4 pt-2">
             <FeedError what="the discussion" feed={feed} nowMs={props.nowMs} />
             {discussionId !== null && messages === undefined && !feed.failure ? (
               <LoadingLine />
             ) : null}
-            {discussionId !== null && messages !== undefined && (messages[0]?.seq ?? 1) > 1 ? (
-              <LoadEarlier boardId={boardId} discussionId={discussionId} />
-            ) : null}
-            {messages?.map((message) => (
-              <Fragment key={message.seq}>
-                <MessageView
-                  boardId={boardId}
-                  discussionId={discussionId}
-                  message={message}
-                  nowMs={props.nowMs}
-                  onOpenCard={props.onOpenCard}
-                />
-                {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
-                  <View
-                    accessible
-                    accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
-                    className="-mt-1.5 flex-row justify-end gap-[3px]"
-                  >
-                    {presence.seenBy.map((face) => (
-                      <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
-                    ))}
+          </View>
+        ) : null}
+        <AnswerScrollContext.Provider value={answerScroll}>
+          <ChoiceDraftContext.Provider value={choiceDrafts}>
+            <ExpandedBlocksContext.Provider value={expandedBlocks}>
+              <FlatList
+                ref={scroll}
+                className="flex-1"
+                contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 20 }}
+                data={reversed}
+                inverted
+                keyExtractor={(message) => String(message.seq)}
+                initialNumToRender={8}
+                maxToRenderPerBatch={8}
+                windowSize={7}
+                maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="interactive"
+                scrollEventThrottle={64}
+                onScrollBeginDrag={(event) => {
+                  position.current = { key: discussionKey, following: false };
+                  const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+                  scrollY.current = contentOffset.y;
+                  historyGesture.begin(
+                    nearHistoryEnd(
+                      contentOffset.y,
+                      contentSize.height,
+                      layoutMeasurement.height,
+                    ),
+                  );
+                  needsPlacement.current = false;
+                }}
+                onScrollEndDrag={(event) => {
+                  historyGesture.end();
+                  const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+                  position.current = {
+                    key: discussionKey,
+                    following: followingNewest(contentOffset.y, false),
+                  };
+                  if (
+                    nearHistoryEnd(contentOffset.y, contentSize.height, layoutMeasurement.height)
+                  ) {
+                    requestEarlier();
+                  }
+                }}
+                onScroll={(event) => {
+                  const { contentOffset } = event.nativeEvent;
+                  const previousOffset = scrollY.current;
+                  scrollY.current = contentOffset.y;
+                  historyGesture.scroll(previousOffset, contentOffset.y);
+                  position.current = {
+                    key: discussionKey,
+                    following: followingNewest(scrollY.current, historyGesture.isActive()),
+                  };
+                }}
+                onContentSizeChange={() => {
+                  if (answerScroll.isFocused()) return answerScroll.reveal();
+                  if (
+                    needsPlacement.current ||
+                    position.current.key !== discussionKey ||
+                    position.current.following
+                  ) {
+                    position.current = { key: discussionKey, following: true };
+                    needsPlacement.current = false;
+                    scroll.current?.scrollToOffset({ offset: 0, animated: false });
+                  }
+                }}
+                onEndReached={requestEarlier}
+                onEndReachedThreshold={0.3}
+                ListHeaderComponent={
+                  <View>
+                    {presence?.typing.length ? (
+                      <View className="gap-3 pb-3">
+                        {presence.typing.map((face) => (
+                          <View
+                            key={face.key}
+                            accessible
+                            accessibilityLabel={`${face.name} is typing`}
+                            className="flex-row items-center gap-2.5"
+                          >
+                            <Avatar kind={face.kind} letter={face.letter} />
+                            <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
+                              <View className="size-1.5 rounded-full bg-foreground-muted" />
+                              <View className="size-1.5 rounded-full bg-foreground-muted" />
+                              <View className="size-1.5 rounded-full bg-foreground-muted" />
+                            </View>
+                          </View>
+                        ))}
+                      </View>
+                    ) : null}
                   </View>
-                ) : null}
-              </Fragment>
-            ))}
-            {presence?.typing.map((face) => (
-              <View
-                key={face.key}
-                accessible
-                accessibilityLabel={`${face.name} is typing`}
-                className="flex-row items-center gap-2.5"
-              >
-                <Avatar kind={face.kind} letter={face.letter} />
-                <View className="h-[30px] flex-row items-center gap-1 rounded-full bg-card px-3">
-                  <View className="size-1.5 rounded-full bg-foreground-muted" />
-                  <View className="size-1.5 rounded-full bg-foreground-muted" />
-                  <View className="size-1.5 rounded-full bg-foreground-muted" />
-                </View>
-              </View>
-            ))}
-          </AnswerScrollContext.Provider>
-        </ScrollView>
+                }
+                ListFooterComponent={
+                  <View className="gap-3 pb-3">
+                    {hasEarlier ? (
+                      <View className="items-center">
+                        <QuietButton
+                          label={earlierAction.pending ? "Loading…" : "Load earlier messages"}
+                          disabled={earlierAction.pending}
+                          onPress={loadEarlier}
+                        />
+                      </View>
+                    ) : null}
+                  </View>
+                }
+                renderItem={({ item: message }) => (
+                  <View className="pb-3">
+                    <MessageView
+                      boardId={boardId}
+                      discussionId={discussionId}
+                      message={message}
+                      nowMs={props.nowMs}
+                      onOpenCard={props.onOpenCard}
+                    />
+                    {message.seq === lastOwnSeq && presence && presence.seenBy.length > 0 ? (
+                      <View
+                        accessible
+                        accessibilityLabel={`Seen by ${presence.seenBy.map((face) => face.name).join(", ")}`}
+                        className="-mt-1.5 flex-row justify-end gap-[3px]"
+                      >
+                        {presence.seenBy.map((face) => (
+                          <Avatar key={face.key} kind={face.kind} letter={face.letter} size="small" />
+                        ))}
+                      </View>
+                    ) : null}
+                  </View>
+                )}
+              />
+            </ExpandedBlocksContext.Provider>
+          </ChoiceDraftContext.Provider>
+        </AnswerScrollContext.Provider>
       </View>
       <Composer
         boardId={boardId}
@@ -383,6 +518,7 @@ function Blocks(props: {
         // oxlint-disable-next-line react/no-array-index-key -- a message's blocks never reorder
         key={run.index}
         block={run.block}
+        blockIndex={run.index}
         {...props}
       />
     ),
@@ -391,6 +527,7 @@ function Blocks(props: {
 
 function BlockView(props: {
   readonly block: KanbanBlock;
+  readonly blockIndex: number;
   readonly boardId: string;
   readonly resolveKanbanLink: ResolveKanbanLink;
   readonly discussionId: string | null;
@@ -398,6 +535,7 @@ function BlockView(props: {
   readonly onOpenCard: (cardId: string) => void;
 }) {
   const { block } = props;
+  const stateKey = `${props.message.seq}:${props.blockIndex}`;
   if (
     (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
     block.truncated &&
@@ -429,10 +567,13 @@ function BlockView(props: {
           title={block.title}
           text={block.text}
           resolveKanbanLink={props.resolveKanbanLink}
+          stateKey={stateKey}
         />
       );
     case "html":
-      return <HtmlBlock html={block.html} title={block.title} height={block.height} />;
+      return (
+        <HtmlBlock html={block.html} title={block.title} height={block.height} stateKey={stateKey} />
+      );
     case "choice":
       return (
         <ChoiceBlock
@@ -541,13 +682,16 @@ function Collapse(props: {
   readonly title: string;
   readonly text: string;
   readonly resolveKanbanLink: ResolveKanbanLink;
+  readonly stateKey: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const context = useContext(ExpandedBlocksContext);
+  const store = useRowStore(context);
+  const [open, setOpen] = useRowState(store, props.stateKey);
   return (
     <View className="rounded-[12px] bg-screen">
       <Pressable
         accessibilityRole="button"
-        accessibilityState={{ expanded: open }}
+        accessibilityState={{ expanded: !!open }}
         onPress={() => setOpen(!open)}
         className="min-h-9 flex-row items-center gap-2 px-3 py-2"
       >
@@ -586,24 +730,6 @@ function QuietButton(props: {
     >
       <Text className="text-[13px] font-t3-medium text-foreground">{props.label}</Text>
     </Pressable>
-  );
-}
-
-/** Reads the page before the oldest message shown. */
-function LoadEarlier(props: { readonly boardId: string; readonly discussionId: string }) {
-  const action = useBoardAction();
-  return (
-    <View className="items-center">
-      <QuietButton
-        label={action.pending ? "Loading…" : "Load earlier messages"}
-        disabled={action.pending}
-        onPress={() =>
-          void action.run("Couldn't load earlier messages", () =>
-            kanbanClient().loadEarlier(props.boardId, props.discussionId),
-          )
-        }
-      />
-    </View>
   );
 }
 
@@ -652,8 +778,11 @@ function HtmlBlock(props: {
   readonly html: string;
   readonly title: string | null;
   readonly height: number | null;
+  readonly stateKey: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const context = useContext(ExpandedBlocksContext);
+  const store = useRowStore(context);
+  const [open, setOpen] = useRowState(store, props.stateKey);
   if (!open) {
     return (
       <View className="gap-1.5">
@@ -726,7 +855,10 @@ function ChoiceBlock(props: {
   // A multi pick being put together, or an answer on its way. It holds until
   // the owner's own answer on this block changes, so re-reads and other
   // people's answers don't drop it, and it can't flicker back early.
-  const [draft, setDraft] = useState<ChoiceDraft | null>(null);
+  const draftContext = useContext(ChoiceDraftContext);
+  const draftStore = useRowStore(draftContext);
+  const draftKey = `${message.seq}:${block.id}`;
+  const [draft, setDraft] = useRowState(draftStore, draftKey);
   const view = choiceView(block, message.answers);
   const ownAt =
     message.answers.find((answer) => answer.blockId === block.id && answer.by._tag === "owner")
@@ -741,6 +873,8 @@ function ChoiceBlock(props: {
     !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
+  const pending = draft?.pending === true;
+  const sending = useRef(false);
   // Sending from the field removes it while ChoiceBlock stays mounted, and
   // React Native doesn't reliably deliver onBlur for a removed input.
   useEffect(() => {
@@ -752,9 +886,18 @@ function ChoiceBlock(props: {
 
   const send = (choice: ReadonlyArray<string>, words: string) => {
     const discussionId = props.discussionId;
-    if (discussionId === null || !canSendChoice(block, choice, words)) return;
+    if (
+      discussionId === null ||
+      sending.current ||
+      draftStore.get(draftKey)?.pending ||
+      !canSendChoice(block, choice, words)
+    ) {
+      return;
+    }
     const against = ownAt;
-    setDraft({ choice, text: words, against, sent: true });
+    const attempt: ChoiceDraft = { choice, text: words, against, sent: true, pending: true };
+    sending.current = true;
+    setDraft(attempt);
     void action
       .run("Couldn't send the answer", () =>
         kanbanClient().answer(
@@ -768,21 +911,19 @@ function ChoiceBlock(props: {
       )
       .then((ok) => {
         // A failed answer keeps what was ticked and typed so it can be sent again.
-        if (!ok) {
-          const keep = multiPick || words.trim() !== "";
-          setDraft(keep ? { choice, text: words, against, sent: false } : null);
-        }
+        sending.current = false;
+        completeChoiceDraft(draftStore, draftKey, attempt, ok, multiPick || words.trim() !== "");
       });
   };
 
   const setWords = (words: string) =>
-    setDraft({ choice: mine, text: words, against: ownAt, sent: false });
+    setDraft({ choice: mine, text: words, against: ownAt, sent: false, pending: false });
 
   const pick = (optionId: string) => {
-    if (locked) return;
+    if (locked || sending.current || draftStore.get(draftKey)?.pending) return;
     const next = toggleChoice(mine, optionId, block.multi);
     if (multiPick) {
-      setDraft({ choice: next, text, against: ownAt, sent: false });
+      setDraft({ choice: next, text, against: ownAt, sent: false, pending: false });
       return;
     }
     send(next, "");
@@ -798,9 +939,9 @@ function ChoiceBlock(props: {
             <Pressable
               key={option.id}
               accessibilityRole={block.multi ? "checkbox" : "radio"}
-              accessibilityState={{ checked: selected, disabled: action.pending || locked }}
+              accessibilityState={{ checked: selected, disabled: pending || locked }}
               accessibilityLabel={poll ? `${option.label}, ${option.percent}%` : option.label}
-              disabled={action.pending || locked}
+              disabled={pending || locked}
               onPress={() => pick(option.id)}
               className={cn(
                 "min-h-10 flex-row items-center gap-2.5 overflow-hidden rounded-[12px] border-[1.5px] bg-screen px-3 py-2",
@@ -860,7 +1001,7 @@ function ChoiceBlock(props: {
               if (row !== null) answerScroll?.blur(row);
             }}
             onContentSizeChange={() => answerScroll?.reveal()}
-            editable={!action.pending}
+            editable={!pending}
             placeholder="Your own answer"
             placeholderTextColorClassName="accent-foreground-muted"
             className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
@@ -869,19 +1010,19 @@ function ChoiceBlock(props: {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Send your answer"
-              accessibilityState={{ disabled: !canSend || action.pending }}
-              disabled={!canSend || action.pending}
+              accessibilityState={{ disabled: !canSend || pending }}
+              disabled={!canSend || pending}
               onPress={() => send([], text)}
               className={cn(
                 "size-8 items-center justify-center rounded-full",
-                !canSend || action.pending ? "bg-secondary" : "bg-foreground",
+                !canSend || pending ? "bg-secondary" : "bg-foreground",
               )}
             >
               <SymbolView
                 name="arrow.up"
                 size={15}
                 tintColorClassName={
-                  !canSend || action.pending ? "accent-icon-muted" : "accent-screen"
+                  !canSend || pending ? "accent-icon-muted" : "accent-screen"
                 }
                 type="monochrome"
               />
@@ -904,18 +1045,18 @@ function ChoiceBlock(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Send answer"
-          accessibilityState={{ disabled: !canSend || action.pending }}
-          disabled={!canSend || action.pending}
+          accessibilityState={{ disabled: !canSend || pending }}
+          disabled={!canSend || pending}
           onPress={() => send(mine, text)}
           className={cn(
             "h-9 self-start justify-center rounded-full px-4",
-            !canSend || action.pending ? "bg-secondary" : "bg-foreground",
+            !canSend || pending ? "bg-secondary" : "bg-foreground",
           )}
         >
           <Text
             className={cn(
               "text-[14px] font-t3-medium",
-              !canSend || action.pending ? "text-foreground-muted" : "text-screen",
+              !canSend || pending ? "text-foreground-muted" : "text-screen",
             )}
           >
             Send
@@ -924,13 +1065,6 @@ function ChoiceBlock(props: {
       ) : null}
     </View>
   );
-}
-
-interface ChoiceDraft {
-  readonly choice: ReadonlyArray<string>;
-  readonly text: string;
-  readonly against: string | null;
-  readonly sent: boolean;
 }
 
 function CardBlock(props: {
