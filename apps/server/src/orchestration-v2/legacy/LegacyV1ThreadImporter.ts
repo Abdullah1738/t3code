@@ -702,7 +702,7 @@ const make = Effect.gen(function* () {
         const messages = yield* listMessages(threadId);
         const existingRows = yield* sql<{ readonly event_id: string }>`
           SELECT event_id
-          FROM ardud_history_events
+          FROM ardud_thread_history_events
           WHERE application_event_version = 2
             AND aggregate_kind = 'thread'
             AND stream_id = ${threadId}

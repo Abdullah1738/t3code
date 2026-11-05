@@ -54,6 +54,65 @@ const runPass = Effect.gen(function* () {
   return yield* Fiber.join(fiber);
 });
 
+it.effect("finds V2 thread history through each tier's stream index without reviving shadowed rows", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < 2000)
+      INSERT INTO orchestration_events
+        (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+         actor_kind, payload_json, metadata_json, application_event_version)
+      SELECT n, 'v1:' || n, 'thread', 'legacy-thread', n, 'thread.message-sent', '2020-01-01',
+        'server', '{}', '{}', 1 FROM history
+    `;
+    for (const [sequence, eventId, version, kind] of [
+      [2001, "hot", 2, "thread"],
+      [2002, "delta", 2, "thread"],
+      [2003, "base", 2, "thread"],
+      [2004, "hot-shadow", 1, "thread"],
+      [2005, "delta-shadow", 2, "project"],
+    ] as const) {
+      yield* sql`INSERT INTO orchestration_events
+        (sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+         actor_kind, payload_json, metadata_json, application_event_version)
+        VALUES (${sequence}, ${eventId}, ${kind}, 'legacy-thread', ${sequence}, 'thread.message-sent',
+          '2020-01-01', 'server', '{}', '{}', ${version})`;
+    }
+    const columns = liveColumns("orchestration_events");
+    yield* sql.unsafe(`INSERT INTO ardud_archive.ardud_events (${columns})
+      SELECT ${columns} FROM main.orchestration_events WHERE sequence IN (2001,2002,2004,2005)`);
+    yield* sql.unsafe(`INSERT INTO ardud_base.orchestration_events (${columns})
+      SELECT ${columns} FROM main.orchestration_events`);
+    yield* sql`UPDATE ardud_archive.ardud_events SET event_id = 'stale-hot' WHERE sequence = 2001`;
+    yield* sql`UPDATE ardud_base.orchestration_events SET event_id = 'stale-base' WHERE sequence IN (2001,2002)`;
+    yield* sql`UPDATE ardud_archive.ardud_events SET application_event_version = 2 WHERE sequence = 2004`;
+    yield* sql`UPDATE ardud_base.orchestration_events SET application_event_version = 2 WHERE sequence = 2004`;
+    yield* sql`UPDATE ardud_base.orchestration_events SET aggregate_kind = 'thread' WHERE sequence = 2005`;
+    yield* sql`DELETE FROM main.orchestration_events WHERE sequence IN (2002,2003,2005)`;
+    assert.deepEqual(
+      yield* sql`SELECT sequence, event_id FROM ardud_thread_history_events
+        WHERE stream_id = 'legacy-thread' ORDER BY sequence`,
+      [
+        { sequence: 2001, event_id: "hot" },
+        { sequence: 2002, event_id: "delta" },
+        { sequence: 2003, event_id: "base" },
+      ],
+    );
+    const plan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+      SELECT event_id FROM ardud_thread_history_events
+      WHERE stream_id = 'legacy-thread' AND event_id LIKE 'migration:v1:message:%'`;
+    const lookups = plan.filter((row) => /USING INDEX (?:idx_orchestration_events_agent_stream_sequence|ardud_events_stream_idx) /.test(row.detail));
+    assert.deepEqual(lookups.map((row) => row.detail), [
+      "SEARCH main.orchestration_events USING INDEX idx_orchestration_events_agent_stream_sequence (stream_id=?)",
+      "SEARCH cold USING INDEX ardud_events_stream_idx (stream_id=?)",
+      "SEARCH base USING INDEX idx_orchestration_events_agent_stream_sequence (stream_id=?)",
+    ]);
+    for (const row of plan) {
+      assert.notMatch(row.detail, /^SCAN (?:main\.orchestration_events|orchestration_events|cold|base)(?:$| )/);
+    }
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
 it.effect("moves cold events and items without changing replay identities or cursors", () =>
   Effect.gen(function* () {
     yield* seed;

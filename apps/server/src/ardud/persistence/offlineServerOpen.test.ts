@@ -62,6 +62,26 @@ it.live("opens the install-time split with the real server SQL layer and reads c
           ),
           [{ event_id: "old:create" }, { event_id: "old:item" }, { event_id: "old:latest" }],
         );
+        assert.deepEqual(
+          yield* sql`SELECT event_id FROM ardud_thread_history_events
+            WHERE stream_id = 'old' ORDER BY sequence`.pipe(NodeSqliteClient.readOnly),
+          [{ event_id: "old:create" }, { event_id: "old:item" }, { event_id: "old:latest" }],
+        );
+        const plan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+          SELECT event_id FROM ardud_thread_history_events WHERE stream_id = 'old'`.pipe(
+          NodeSqliteClient.readOnly,
+        );
+        assert.deepEqual(
+          plan.filter((row) => /USING INDEX (?:idx_orchestration_events_agent_stream_sequence|ardud_events_stream_idx) /.test(row.detail)).map((row) => row.detail),
+          [
+            "SEARCH main.orchestration_events USING INDEX idx_orchestration_events_agent_stream_sequence (stream_id=?)",
+            "SEARCH cold USING INDEX ardud_events_stream_idx (stream_id=?)",
+            "SEARCH base USING INDEX idx_orchestration_events_agent_stream_sequence (stream_id=?)",
+          ],
+        );
+        for (const row of plan) {
+          assert.notMatch(row.detail, /^SCAN (?:main\.orchestration_events|orchestration_events|cold|base)(?:$| )/);
+        }
       }).pipe(Effect.provide(Sqlite.layerFromPath(filename))),
     );
   }).pipe(Effect.provide(NodeServices.layer)),

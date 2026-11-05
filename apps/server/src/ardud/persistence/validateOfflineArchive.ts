@@ -38,6 +38,7 @@ export function validateOfflineArchive(filename: string): void {
       "CREATE INDEX ardud_archive.ardud_events_command_idx ON ardud_events(command_id,sequence)",
     );
     db.exec("CREATE INDEX ardud_archive.ardud_events_sequence_idx ON ardud_events(sequence)");
+    db.exec("CREATE INDEX ardud_archive.ardud_events_stream_idx ON ardud_events(stream_id,sequence)");
     for (const view of eventHistoryLookupViews) db.exec(view);
     const thread = db
       .prepare(

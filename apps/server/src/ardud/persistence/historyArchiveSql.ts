@@ -52,23 +52,31 @@ export const eventHistoryLookupViews = [
     "idx_orchestration_events_application_high_water",
     "ardud_events_sequence_idx",
   ],
+  // The delta writer admits only V2 thread events; hot/base also contain V1 history.
+  [
+    "ardud_thread_history_events",
+    "idx_orchestration_events_agent_stream_sequence",
+    "ardud_events_stream_idx",
+    "application_event_version = 2 AND aggregate_kind = 'thread'",
+  ],
 ].map(
-  ([view, hotIndex, coldIndex]) => `CREATE TEMP VIEW IF NOT EXISTS ${view} AS
+  ([view, hotIndex, coldIndex, predicate]) => `CREATE TEMP VIEW IF NOT EXISTS ${view} AS
   SELECT rowid AS rowid, * FROM main.orchestration_events INDEXED BY ${hotIndex}
+  ${predicate === undefined ? "" : `WHERE ${predicate}`}
   UNION ALL
   SELECT ardud_locator AS rowid, ${liveColumns("orchestration_events")
     .split(", ")
     .map((column) => `cold.${column}`)
     .join(", ")}
   FROM ardud_archive.ardud_events AS cold INDEXED BY ${coldIndex}
-  WHERE NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hot WHERE hot.sequence = cold.sequence)
+   WHERE ${predicate === undefined ? "" : `${predicate} AND `}NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hot WHERE hot.sequence = cold.sequence)
   UNION ALL
   SELECT CAST(-base.rowid AS INTEGER) AS rowid, ${liveColumns("orchestration_events")
     .split(", ")
     .map((column) => `base.${column}`)
     .join(", ")}
   FROM ardud_base.orchestration_events AS base INDEXED BY ${hotIndex}
-  WHERE NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hot WHERE hot.sequence = base.sequence)
+   WHERE ${predicate === undefined ? "" : `${predicate} AND `}NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hot WHERE hot.sequence = base.sequence)
     AND NOT EXISTS (SELECT 1 FROM ardud_archive.ardud_events AS delta WHERE delta.sequence = base.sequence)`,
 );
 
@@ -107,6 +115,7 @@ export const emptyBaseSchemaSql = [
     .join(", ")})`,
   "CREATE INDEX ardud_base.idx_orch_events_command_id ON orchestration_events(command_id)",
   "CREATE INDEX ardud_base.idx_orchestration_events_application_high_water ON orchestration_events(sequence)",
+  "CREATE INDEX ardud_base.idx_orchestration_events_agent_stream_sequence ON orchestration_events(stream_id,sequence) WHERE application_event_version = 2 AND aggregate_kind = 'thread'",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_run_ordinal_idx ON orchestration_v2_projection_turn_items(run_id,ordinal)",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_thread_ordinal_idx ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id)",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_user_message_idx ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id) WHERE type='user_message'",
