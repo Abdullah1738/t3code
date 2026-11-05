@@ -14,13 +14,13 @@ keeps two things current:
 
 Messages mutate while streaming, so only settled messages are projected
 (user/system types, assistant with time.completed or error, or untouched for
-SETTLE_SECS). A message is re-projected when its time_updated changes; facts
-pointing at replaced rows are re-linked.
+SETTLE_SECS). A message is re-projected when its payload or time_updated changes,
+or its session export fence has not finished projecting.
 
-A session is rescanned when its time_updated changes OR its message count or max
-seq changes (session_v2.time_updated does not move when messages are appended,
-so the fingerprint in opencode_sync_progress is what catches them). That table
-starts empty, so the first runs rescan every session once. This is resumable:
+A session is rescanned when its time_updated, message count, max seq or applied
+export sequence changes. The export sequence catches same-millisecond payload
+rewrites that leave the other fingerprints unchanged. Progress tables start
+empty, so the first runs rescan every session once. This is resumable:
 each finished session is recorded as it completes, and --deadline still stops
 between sessions.
 
@@ -241,7 +241,7 @@ class Sync:
         self.args = args
         # OpenCode's session/message schema is separate from the Robob export.
         # Neither native OpenCode nor Robob live DB aliases are allowed here.
-        self.src = robob_readonly.connect_ro(SRC_DB, timeout=60)
+        self.src = robob_readonly.native_ro(SRC_DB, timeout=60)
         self.src.execute("PRAGMA busy_timeout=60000")
         self.raw = sqlite3.connect(RAW_DB, timeout=600)
         self.raw.execute("PRAGMA journal_mode=WAL")
@@ -270,6 +270,8 @@ class Sync:
             CREATE TABLE IF NOT EXISTS opencode_sync_progress(
               session_id TEXT PRIMARY KEY, max_seq INTEGER NOT NULL,
               msg_count INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS opencode_sync_export_progress(
+              session_id TEXT PRIMARY KEY, applied_seq INTEGER NOT NULL);
         """)
         self.mem.commit()
         self.att = Attachments(self.mem)
@@ -278,9 +280,11 @@ class Sync:
 
     # ------------------------------------------------------------ source reads
     def changed_sessions(self):
+        robob_readonly.refresh_native(self.src)
         cols = [r[1] for r in self.src.execute("PRAGMA table_info(session_v2)")]
-        rows = self.src.execute("SELECT * FROM session_v2").fetchall()
-        self.src.commit()
+        rows = self.src.execute(
+            "SELECT s.*,e.applied_seq FROM session_v2 s JOIN ardud_native_sessions e ON e.id=s.id"
+            " WHERE e.applied_seq IS NOT NULL AND e.dirty=0").fetchall()
         known = dict(self.mem.execute(
             "SELECT session_id, time_updated FROM opencode_sync_sessions").fetchall())
         # session_v2.time_updated does not move when messages are appended, so
@@ -291,21 +295,29 @@ class Sync:
         self.src.commit()
         have_fp = {sid: (mx, n) for sid, mx, n in self.mem.execute(
             "SELECT session_id, max_seq, msg_count FROM opencode_sync_progress").fetchall()}
+        have_export = dict(self.mem.execute(
+            "SELECT session_id,applied_seq FROM opencode_sync_export_progress").fetchall())
         out = []
         for r in rows:
-            d = dict(zip(cols, r))
+            d = dict(zip(cols + ["_export_seq"], r))
             fp = src_fp.get(d["id"], (0, 0))
             if (known.get(d["id"]) == d["time_updated"] and have_fp.get(d["id"]) == fp
+                    and have_export.get(d["id"]) == d["_export_seq"]
                     and not self.args.full):
                 continue
             d["_fp"] = fp
             out.append(d)
         return out
 
-    def session_messages(self, sid, page=300):
+    def session_messages(self, sid, page=300, export_seq=None):
         """Yield pages ordered by seq; some sessions carry 500+ MB of data."""
         last = -1
         while True:
+            robob_readonly.refresh_native(self.src)
+            current_seq = robob_readonly.native_capture_generation(self.src, sid)
+            if export_seq is not None and current_seq != export_seq:
+                raise robob_readonly.UnsafeStateDatabase("native session export changed during capture; retry next run")
+            export_seq = current_seq
             rows = self.src.execute(
                 "SELECT id, type, seq, time_created, time_updated, data FROM session_message"
                 " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
@@ -319,26 +331,37 @@ class Sync:
     # ------------------------------------------------------------ processing
     def sync_session(self, sess):
         sid = sess["id"]
+        robob_readonly.refresh_native(self.src)
+        export_seq = robob_readonly.native_capture_generation(self.src, sid)
+        if export_seq != sess.get("_export_seq", export_seq):
+            raise robob_readonly.UnsafeStateDatabase("native session export changed since planning; retry next run")
         native = is_native(sess.get("metadata"))
         fp = sess.get("_fp") or (0, 0)
         if not native:
-            with_retry(self.mem, lambda: self._stamp(sid, 0, sess["time_updated"], fp))
+            with_retry(self.mem, lambda: self._stamp(sid, 0, sess["time_updated"], fp, export_seq))
             return
         self.stats["sessions"] += 1
         ledger = dict((m, (tu, p, lg)) for m, tu, p, lg in self.mem.execute(
             "SELECT msg_id, time_updated, projected, legacy FROM opencode_sync_messages"
             " WHERE session_id=?", (sid,)).fetchall())
-        raw_have = dict(self.raw.execute(
-            "SELECT id, time_updated FROM raw_messages WHERE session_id=?", (sid,)).fetchall())
+        raw_have = {mid: (tu, digest) for mid, tu, digest in self.raw.execute(
+            "SELECT id,time_updated,sha256 FROM raw_messages WHERE session_id=?", (sid,)).fetchall()}
+        previous_export = self.mem.execute(
+            "SELECT applied_seq FROM opencode_sync_export_progress WHERE session_id=?", (sid,)).fetchone()
+        # Raw writes commit before projections. If a run stopped between them,
+        # matching raw hashes alone cannot prove an old projection is current.
+        reproject_revision = previous_export is None or previous_export[0] != export_seq
         all_settled = True
-        for msgs in self.session_messages(sid):
+        for msgs in self.session_messages(sid, export_seq=export_seq):
             # raw archive (every native message, settled or not)
             raw_batch = []
+            payload_hashes = {}
             for mid, mtype, seq, tc, tu, data in msgs:
-                if raw_have.get(mid) != tu:
-                    b = data.encode("utf-8")
+                b = data.encode("utf-8")
+                digest = payload_hashes[mid] = hashlib.sha256(b).hexdigest()
+                if raw_have.get(mid) != (tu, digest):
                     raw_batch.append((mid, sid, mtype, seq, tc, tu,
-                                      hashlib.sha256(b).hexdigest(), len(b),
+                                      digest, len(b),
                                       zlib.compress(b, 6)))
             if raw_batch:
                 with_retry(self.raw, lambda: self.raw.executemany(
@@ -349,7 +372,8 @@ class Sync:
             todo = []
             for mid, mtype, seq, tc, tu, data in msgs:
                 led = ledger.get(mid)
-                if led and led[0] == tu:
+                if (led and led[0] == tu and raw_have.get(mid) == (tu, payload_hashes[mid])
+                        and not reproject_revision):
                     continue
                 try:
                     d = json.loads(data)
@@ -363,14 +387,15 @@ class Sync:
             for i in range(0, len(todo), BATCH_MESSAGES):
                 chunk = todo[i:i + BATCH_MESSAGES]
                 with_retry(self.mem, lambda: self._project_chunk(sid, sess, chunk))
-        srow = json.dumps(sess, ensure_ascii=False).encode("utf-8")
+        srow = json.dumps({k: v for k, v in sess.items() if k not in ("_fp", "_export_seq")},
+                         ensure_ascii=False).encode("utf-8")
         with_retry(self.raw, lambda: self.raw.execute(
             "INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
             (sid, sess["time_updated"], zlib.compress(srow, 6))))
         stamp = sess["time_updated"] if all_settled else -1
-        with_retry(self.mem, lambda: self._stamp(sid, 1, stamp, fp))
+        with_retry(self.mem, lambda: self._stamp(sid, 1, stamp, fp, export_seq))
 
-    def _stamp(self, sid, native, stamp, fp):
+    def _stamp(self, sid, native, stamp, fp, export_seq):
         # Caller holds BEGIN IMMEDIATE. A -1 stamp (unsettled message) writes no
         # progress row, so the session is retried on the next run.
         self.mem.execute(
@@ -380,6 +405,8 @@ class Sync:
             self.mem.execute(
                 "INSERT OR REPLACE INTO opencode_sync_progress VALUES (?,?,?)",
                 (sid, fp[0], fp[1]))
+            self.mem.execute(
+                "INSERT OR REPLACE INTO opencode_sync_export_progress VALUES (?,?)", (sid, export_seq))
 
     def _project_chunk(self, sid, sess, chunk):
         m = self.mem

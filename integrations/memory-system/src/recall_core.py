@@ -87,14 +87,13 @@ class Deadline:
 def connect_ro(path: Path) -> sqlite3.Connection:
     # mode=ro without query_only: fts5vocab needs a writable temp schema.
     try:
-        con = robob_readonly.connect_ro(path, check_same_thread=False)
-        if path == STATE_DB:
-            try:
-                con.execute("BEGIN")
-                robob_readonly.ready_generation(con)
-            except Exception:
-                con.close()
-                raise
+        if path == OPENCODE_DB:
+            reader = robob_readonly.native_ro
+        elif path == STATE_DB:
+            reader = robob_readonly.state_ro
+        else:
+            reader = robob_readonly.connect_ro
+        con = reader(path, check_same_thread=False)
     except OSError as exc:
         raise sqlite3.OperationalError(str(exc)) from exc
     con.execute("PRAGMA temp_store=MEMORY")
@@ -129,19 +128,27 @@ def catalog(write: bool = False) -> sqlite3.Connection:
 
 def opencode_ro() -> sqlite3.Connection | None:
     con = getattr(_local, "opencode", None)
+    fresh = None
     try:
         path = robob_readonly.safe_path(OPENCODE_DB)
         info = path.stat()
-        generation = str(path), info.st_dev, info.st_ino
-        if con is not None and getattr(_local, "opencode_generation", None) != generation:
-            con.close()
-            con = _local.opencode = None
-        if con is None:
-            con = connect_ro(OPENCODE_DB)
-            con.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
-            _local.opencode = con
+        fresh = connect_ro(OPENCODE_DB)
+        updated = robob_readonly.native_generation(fresh)
+        generation = str(path), info.st_dev, info.st_ino, updated
+        if (con is not None and con.in_transaction
+                and getattr(_local, "opencode_generation", None) == generation
+                and robob_readonly.native_generation(con) == updated):
+            fresh.close()
+        else:
+            fresh.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
+            if con is not None:
+                con.close()
+            con = _local.opencode = fresh
             _local.opencode_generation = generation
+        fresh = None
     except (OSError, sqlite3.Error):
+        if fresh is not None:
+            fresh.close()
         if con is not None:
             con.close()
             _local.opencode = None

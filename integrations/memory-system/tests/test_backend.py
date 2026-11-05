@@ -20,7 +20,7 @@ sys.path.insert(0, SRC)
 
 import backend  # noqa: E402
 import session_reaper  # noqa: E402
-from replica_fixture import ready
+from replica_fixture import ready, native_ready
 
 ENV_KEYS = ("MEMORY_BACKEND", "OPENCHAMBER_URL", "OPENCODE_SERVICE_URL", "OPENCODE_SERVER_PASSWORD",
             "OPENCODE_PASSWORD_FILE", "T3_CONTROL_URL", "T3_CONTROL_TOKEN", "T3_CONTROL_TOKEN_FILE",
@@ -493,6 +493,8 @@ class ReaperProtection(unittest.TestCase):
             INSERT INTO session_v2 VALUES ('ses_root', NULL, 'root', '/test', 1, NULL, '{}');
             INSERT INTO session_v2 VALUES ('ses_child', 'ses_root', 'child', '/test', 1, NULL, '{}');
         """)
+        native_ready(con)
+        con.commit()
         con.close()
         logs = os.path.join(self.tmp.name, "logs")
         replica = os.path.join(self.tmp.name, "replica")
@@ -516,6 +518,7 @@ class ReaperProtection(unittest.TestCase):
 
         verifier = mock.Mock()
         verifier.check.return_value = None
+        verifier.verified_fences = {"ses_root": 1, "ses_child": 1}
         with clean_env(MEMORY_BACKEND="robob", ROBOB_STATE_DB=self.db), \
                 mock.patch.object(session_reaper, "OC_DB", ocdb), \
                 mock.patch.object(session_reaper, "LOGS", logs), \
@@ -706,7 +709,8 @@ class ReaperProtection(unittest.TestCase):
         os.makedirs(logs)
         status = os.path.join(logs, "session_reaper_last.json")
         oc_db = os.path.join(self.tmp.name, "oc.sqlite")
-        sqlite3.connect(oc_db).close()
+        with contextlib.closing(sqlite3.connect(oc_db)) as con, con:
+            ready(con)
         patches = [
             mock.patch.object(session_reaper, "LOGS", logs),
             mock.patch.object(session_reaper, "STATUS", status),

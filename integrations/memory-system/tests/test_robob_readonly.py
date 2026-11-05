@@ -14,9 +14,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import backend
+import health_check
+import location_reaper
 import native_session_reaper
 import recall_core
 import robob_readonly as ro
+import session_reaper
 import sync_opencode_v2
 import sync_thread_identity
 from replica_fixture import ready
@@ -174,20 +177,97 @@ class ReadonlyTest(unittest.TestCase):
                 with self.assertRaises(ro.UnsafeStateDatabase):
                     ro.state_ro(self.replica)
 
-    def test_stale_native_export_cannot_supply_reaper_evidence(self):
+    def test_native_freshness_uses_metadata_not_file_mtime(self):
         self.make_replica()
         old = time.time() - 121
         os.utime(self.replica, (old, old))
-        with patch.object(ro.sqlite3, "connect") as connect:
+        with closing(ro.native_ro(self.replica, check_same_thread=False)) as con:
+            self.assertTrue(con.in_transaction)
+            self.assertEqual(con.execute("SELECT value FROM marker").fetchone(), ("replica",))
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=121)).isoformat())
+        os.utime(self.replica, None)
+        with self.assertRaises(ro.UnsafeStateDatabase):
+            ro.native_ro(self.replica)
+
+    def test_native_missing_not_ready_and_unknown_schema_fail_closed(self):
+        self.make_replica()
+        for key, value in (("ready", "0"), ("schema_version", "2"), ("updated_at", "bad")):
+            with self.subTest(key=key), closing(sqlite3.connect(self.replica)) as con, con:
+                ready(con)
+                con.execute("UPDATE ardud_readonly_meta SET value=? WHERE key=?", (value, key))
             with self.assertRaises(ro.UnsafeStateDatabase):
                 ro.native_ro(self.replica)
-            connect.assert_not_called()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("DROP TABLE ardud_readonly_meta")
+        with self.assertRaises(ro.UnsafeStateDatabase):
+            ro.native_ro(self.replica)
+
+    def test_native_history_readiness_is_only_diagnostic(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("DELETE FROM ardud_readonly_meta WHERE key='history_ready'")
+        with closing(ro.native_ro(self.replica)) as con:
+            self.assertTrue(con.in_transaction)
+        with closing(ro.state_ro(self.replica)) as con:
+            self.assertTrue(con.in_transaction)
+
+    def test_destructive_refresh_rejects_raced_metadata(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            with closing(ro.native_ro(self.replica)) as reader:
+                writer.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='destructive_ready'")
+                writer.commit()
+                with self.assertRaises(ro.UnsafeStateDatabase):
+                    ro.refresh_native(reader, require_destructive=True)
+                self.assertFalse(reader.in_transaction)
+
+    def test_destructive_opens_require_explicit_unraced_metadata(self):
+        self.make_replica()
+        for value in ("0", None):
+            with closing(sqlite3.connect(self.replica)) as con, con:
+                con.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='destructive_ready'", (value,))
+            with closing(ro.native_ro(self.replica)) as con:
+                self.assertTrue(con.in_transaction)
+            with self.assertRaises(ro.UnsafeStateDatabase):
+                ro.native_ro(self.replica, require_destructive=True)
+            with patch.object(session_reaper, "OC_DB", self.replica), patch.object(location_reaper, "OC_DB", self.replica):
+                with self.assertRaises(ro.UnsafeStateDatabase):
+                    session_reaper.ro(self.replica)
+                with self.assertRaises(ro.UnsafeStateDatabase):
+                    location_reaper.last_activity_by_dir()
+
+    def test_native_ready_check_pins_reads_and_refresh_rejects_partial_cycle(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            with closing(ro.native_ro(self.replica)) as reader:
+                writer.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+                writer.execute("UPDATE marker SET value='partial'")
+                writer.commit()
+                self.assertEqual(reader.execute("SELECT value FROM marker").fetchone(), ("replica",))
+                with self.assertRaises(ro.UnsafeStateDatabase):
+                    ro.refresh_native(reader)
+                self.assertFalse(reader.in_transaction)
+
+    def test_health_and_reaper_native_opens_enforce_readiness(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as writer, writer:
+            writer.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+        with patch.object(health_check, "OC_DB", self.replica), patch.object(session_reaper, "OC_DB", self.replica), \
+                patch.object(location_reaper, "OC_DB", self.replica):
+            for call in (lambda: health_check.ro(self.replica), lambda: session_reaper.ro(self.replica),
+                         location_reaper.last_activity_by_dir):
+                with self.subTest(call=call), self.assertRaises(ro.UnsafeStateDatabase):
+                    call()
 
     def test_native_recall_reopens_replaced_export_and_never_falls_back(self):
         path = self.replica.with_name("opencode.sqlite")
 
         def native_fixture(target, sid):
             with closing(sqlite3.connect(target)) as con, con:
+                ready(con)
                 con.execute("CREATE TABLE session_v2(id TEXT PRIMARY KEY)")
                 con.execute("INSERT INTO session_v2 VALUES (?)", (sid,))
 
@@ -206,6 +286,61 @@ class ReadonlyTest(unittest.TestCase):
             with patch.object(ro.sqlite3, "connect") as connect:
                 self.assertIsNone(recall_core.opencode_ro())
                 connect.assert_not_called()
+
+    def native_recall_fixture(self, *, updated_at=None):
+        path = self.replica.with_name("opencode.sqlite")
+        with closing(sqlite3.connect(path)) as con, con:
+            con.execute("PRAGMA journal_mode=WAL")
+            ready(con, updated_at=updated_at)
+            con.execute("CREATE TABLE session_v2(id TEXT PRIMARY KEY)")
+            con.execute("INSERT INTO session_v2 VALUES ('old')")
+        return path
+
+    def test_cached_native_recall_rejects_not_ready_cycle(self):
+        path = self.native_recall_fixture()
+        with patch.object(recall_core, "OPENCODE_DB", path), patch.object(recall_core, "_local", threading.local()):
+            cached = recall_core.opencode_ro()
+            with closing(sqlite3.connect(path)) as writer, writer:
+                writer.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+                writer.execute("UPDATE session_v2 SET id='partial'")
+            self.assertIsNone(recall_core.opencode_ro())
+            with self.assertRaises(sqlite3.ProgrammingError):
+                cached.execute("SELECT 1")
+
+    def test_cached_native_recall_permits_incomplete_history(self):
+        path = self.native_recall_fixture()
+        with patch.object(recall_core, "OPENCODE_DB", path), patch.object(recall_core, "_local", threading.local()):
+            cached = recall_core.opencode_ro()
+            with closing(sqlite3.connect(path)) as writer, writer:
+                writer.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='history_ready'")
+            self.assertIs(recall_core.opencode_ro(), cached)
+            self.assertEqual(cached.execute("SELECT id FROM session_v2").fetchone(), ("old",))
+            cached.close()
+
+    def test_cached_native_recall_cannot_borrow_new_generation_freshness(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=110)).isoformat()
+        path = self.native_recall_fixture(updated_at=old)
+        with patch.object(recall_core, "OPENCODE_DB", path), patch.object(recall_core, "_local", threading.local()):
+            cached = recall_core.opencode_ro()
+            with closing(sqlite3.connect(path)) as writer, writer:
+                writer.execute("UPDATE session_v2 SET id='new'")
+                ready(writer)
+            fresh = recall_core.opencode_ro()
+            self.assertEqual(fresh.execute("SELECT id FROM session_v2").fetchone(), ("new",))
+            with self.assertRaises(sqlite3.ProgrammingError):
+                cached.execute("SELECT 1")
+            fresh.close()
+
+    def test_cached_native_recall_rejects_aged_snapshot_without_new_generation(self):
+        old = datetime.now(timezone.utc) - timedelta(seconds=110)
+        path = self.native_recall_fixture(updated_at=old.isoformat())
+        with patch.object(recall_core, "OPENCODE_DB", path), patch.object(recall_core, "_local", threading.local()):
+            cached = recall_core.opencode_ro()
+            with patch.object(ro, "datetime", wraps=datetime) as clock:
+                clock.now.return_value = old + timedelta(seconds=121)
+                self.assertIsNone(recall_core.opencode_ro())
+            with self.assertRaises(sqlite3.ProgrammingError):
+                cached.execute("SELECT 1")
 
 
 class RecallReplicaTest(unittest.TestCase):

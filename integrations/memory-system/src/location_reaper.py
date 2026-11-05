@@ -37,6 +37,7 @@ Status: logs/location_reaper_last.json. --dry-run prints the plan only.
 """
 import argparse, json, os, sqlite3, subprocess, sys, time, urllib.parse, urllib.request
 from pathlib import Path
+from contextlib import closing
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backend  # noqa: E402
@@ -65,11 +66,12 @@ def loc_q(d):
 
 
 def last_activity_by_dir():
-    con = backend.robob_readonly.native_ro(OC_DB, timeout=20)
-    rows = con.execute(
-        "SELECT directory, id, max(coalesce(time_updated,0), coalesce(time_viewed,0), "
-        "coalesce(time_created,0)) FROM session_v2").fetchall()
-    con.close()
+    with closing(backend.robob_readonly.native_ro(OC_DB, timeout=20, require_destructive=True)) as con:
+        rows = con.execute(
+            "SELECT directory, id, max(coalesce(time_updated,0), coalesce(time_viewed,0), "
+            "coalesce(time_created,0),CASE WHEN id IN (SELECT session_id FROM session_inbox"
+            " UNION SELECT session_id FROM session_pending) THEN ? ELSE 0 END) FROM session_v2",
+            (int(time.time() * 1000),)).fetchall()
     last, sid_dir = {}, {}
     for d, sid, t in rows:
         sid_dir[sid] = d
@@ -83,10 +85,9 @@ def running_dirs(sid_dir):
     ids = list((active or {}).get("data", {}).keys())
     unknown = [s for s in ids if s not in sid_dir]
     if unknown:
-        con = backend.robob_readonly.native_ro(OC_DB, timeout=20)
-        q = "SELECT id, directory FROM session_v2 WHERE id IN (%s)" % ",".join("?" * len(unknown))
-        sid_dir.update(dict(con.execute(q, unknown).fetchall()))
-        con.close()
+        with closing(backend.robob_readonly.native_ro(OC_DB, timeout=20, require_destructive=True)) as con:
+            q = "SELECT id, directory FROM session_v2 WHERE id IN (%s)" % ",".join("?" * len(unknown))
+            sid_dir.update(dict(con.execute(q, unknown).fetchall()))
     return {sid_dir.get(s) for s in ids} - {None}, [s for s in ids if s not in sid_dir]
 
 
@@ -195,6 +196,15 @@ def main():
                 rd, unknown = running_dirs(sid_dir)
                 if d in rd or unknown:
                     bump(st, "became_running")
+                    continue
+                with closing(backend.robob_readonly.native_ro(OC_DB, timeout=20, require_destructive=True)) as con:
+                    activity = con.execute(
+                        "SELECT max(max(coalesce(time_updated,0), coalesce(time_viewed,0), "
+                        "coalesce(time_created,0),CASE WHEN id IN (SELECT session_id FROM session_inbox"
+                        " UNION SELECT session_id FROM session_pending) THEN ? ELSE 0 END))"
+                        " FROM session_v2 WHERE directory=?", (int(time.time() * 1000), d)).fetchone()[0]
+                if activity is not None and int(time.time() * 1000) - activity < idle_ms:
+                    bump(st, "became_active")
                     continue
                 api("POST", f"/api/experimental/mcp/{SERVER}/disconnect?" + loc_q(d))
                 st["disconnected"].append(d)

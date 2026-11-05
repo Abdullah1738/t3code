@@ -95,6 +95,8 @@ def build_fixture(root: Path) -> Fixture:
     f.add("opencode", "ses_resume_new", "user", "risk lane continue", ts=NOW - 100, meta=rmeta)
     f.close()
     oc = sqlite3.connect(root / "opencode.db")
+    oc.execute("PRAGMA journal_mode=WAL")
+    ready(oc)
     oc.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, metadata TEXT)")
     oc.execute("INSERT INTO session_v2 VALUES ('ses_parent1', NULL, '/Users/ardud/crpko', 'Negative balance bug', NULL)")
     oc.execute("INSERT INTO session_v2 VALUES ('ses_child1', 'ses_parent1', '/Users/ardud/crpko', 'subagent', NULL)")

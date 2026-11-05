@@ -4,7 +4,6 @@ import os
 import sqlite3
 import stat
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,10 +82,14 @@ def connect_ro(path, *, timeout=30, check_same_thread=True):
                            check_same_thread=check_same_thread)
 
 
-def ready_generation(con, *, max_age=120):
+def ready_generation(con, *, max_age=120, source="Robob", schema_version=None, require_destructive=False):
     """The exporter clears ready while paging, then publishes a new watermark."""
     try:
         metadata = dict(con.execute("SELECT key,value FROM ardud_readonly_meta"))
+        if schema_version is not None and metadata.get("schema_version") != schema_version:
+            raise ValueError("unsupported export schema")
+        if require_destructive and metadata.get("destructive_ready") != "1":
+            raise ValueError("native metadata changed during validation")
         updated = metadata["updated_at"]
         if not isinstance(updated, str):
             raise ValueError("timestamp is not text")
@@ -97,7 +100,7 @@ def ready_generation(con, *, max_age=120):
         if metadata.get("ready") != "1" or not -30 <= age <= max_age:
             raise ValueError("not ready or stale")
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
-        raise UnsafeStateDatabase("Robob read-only replica missing readiness or stale (>120s); waiting for server export") from exc
+        raise UnsafeStateDatabase(f"{source} read-only replica missing readiness or stale (>{max_age}s); waiting for server export") from exc
     return updated
 
 
@@ -112,13 +115,36 @@ def state_ro(path, *, timeout=30, check_same_thread=True):
     return con
 
 
-def native_ro(path, *, timeout=30):
-    # Until OpenCode owns an export metadata contract, never reap against a
-    # native snapshot that stopped updating. Stat does not open the live DB.
-    path = safe_path(path)
-    if not -30 <= time.time() - path.stat().st_mtime <= 120:
-        raise UnsafeStateDatabase("OpenCode read-only export stale (>120s); refusing reaper evidence")
-    return connect_ro(path, timeout=timeout)
+def native_generation(con, *, require_destructive=False):
+    return ready_generation(con, source="OpenCode", schema_version="1", require_destructive=require_destructive)
+
+
+def refresh_native(con, *, require_destructive=False):
+    """End the previous read and pin readiness and data to one new snapshot."""
+    con.rollback()
+    try:
+        con.execute("BEGIN")
+        return native_generation(con, require_destructive=require_destructive)
+    except Exception:
+        con.rollback()
+        raise
+
+
+def native_ro(path, *, timeout=30, check_same_thread=True, require_destructive=False):
+    con = connect_ro(path, timeout=timeout, check_same_thread=check_same_thread)
+    try:
+        refresh_native(con, require_destructive=require_destructive)
+    except Exception:
+        con.close()
+        raise
+    return con
+
+
+def native_capture_generation(con, sid):
+    row = con.execute("SELECT applied_seq,dirty FROM ardud_native_sessions WHERE id=?", (sid,)).fetchone()
+    if row is None or row[0] is None or row[1] != 0:
+        raise UnsafeStateDatabase(f"OpenCode session {sid} export incomplete or deferred; retry next capture")
+    return row[0]
 
 
 def main():
