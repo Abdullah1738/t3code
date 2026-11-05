@@ -22,7 +22,6 @@ import * as CutoverReadiness from "./CutoverReadiness.ts";
 import * as NodeCrypto from "node:crypto";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- exercises the real generator only against temporary fixtures.
 import * as NodeChildProcess from "node:child_process";
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- source fixtures are independent of the test runner's cwd.
 import * as NodeURL from "node:url";
 import * as ConfigProvider from "effect/ConfigProvider";
 
