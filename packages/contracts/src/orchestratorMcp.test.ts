@@ -69,7 +69,9 @@ describe("orchestrator MCP contracts", () => {
     expect(result.pendingApproval).toBeNull();
     expect(result.startedAt).toBeUndefined();
     expect(result.startPending).toBeUndefined();
-    expect(decodeDelegateTaskResult({ ...result, startedAt: null, startPending: true })).toMatchObject({
+    expect(
+      decodeDelegateTaskResult({ ...result, startedAt: null, startPending: true }),
+    ).toMatchObject({
       startedAt: null,
       startPending: true,
     });

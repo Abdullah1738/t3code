@@ -202,7 +202,8 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childNodeId: NodeId,
   status: OrchestratorMcpDelegatedTaskStatus,
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
-    description: "The original child run's start time in ISO format, or null if it has not started.",
+    description:
+      "The original child run's start time in ISO format, or null if it has not started.",
   }),
   startPending: Schema.optional(Schema.Boolean).annotate({
     description:
