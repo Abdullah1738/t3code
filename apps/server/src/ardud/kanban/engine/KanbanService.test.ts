@@ -8652,6 +8652,49 @@ it.effect("an owner's channel gets a title from his first message, unless he nam
   }),
 );
 
+it.effect("an owner's channel title waits until its evaluator routing is attached", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const asked: Array<string> = [];
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) => KanbanThreads.of({
+        ...threads,
+        launch: (input) => Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(threads.launch(input)),
+        ),
+      })),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const channel = yield* kanban.createDiscussion(board.id, "Kafka", owner);
+      const titled = Stream.runHead(Stream.filter(
+        yield* kanban.changes,
+        ({ change }) => change._tag === "discussion" && change.discussion.title === "Kafka cert expiry",
+      ));
+      const posting = yield* kanban.post(channel.id, owner, [
+        { _tag: "md", text: "When do the Kafka certs expire?" },
+      ]).pipe(Effect.forkChild);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      assert.deepEqual(asked, []);
+      yield* Deferred.succeed(release, undefined);
+      const message = yield* Fiber.join(posting);
+      assert.strictEqual(message.seq, 1);
+      assert.isTrue(Option.isSome(yield* titled));
+      const discussion = yield* kanban.discussion(channel.id);
+      assert.strictEqual(discussion.title, "Kafka cert expiry");
+      assert.strictEqual(discussion.evaluatorThreadId, "thread-1");
+      assert.strictEqual(discussion.lastSeq, 1);
+      assert.deepEqual(asked, ["When do the Kafka certs expire?"]);
+      assert.strictEqual((yield* Ref.get(fake.threads)).size, 1);
+      assert.deepEqual(fake.interrupted, []);
+    }).pipe(Effect.scoped, Effect.provide(titledLayer(delayed, asked)));
+  }),
+);
+
 class ModelDown extends Data.TaggedError("ModelDown")<{}> {}
 
 const groupAsks = (asked: ReadonlyArray<string>) =>

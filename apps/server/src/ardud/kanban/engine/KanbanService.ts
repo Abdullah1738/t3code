@@ -2660,10 +2660,11 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(storedBlocks, attachments.pathOf);
-    if (author._tag === "owner" && (yield* wantsWrittenTitle(discussion))) {
-      yield* forkDiscussionTitle(discussion.id, text);
+    const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
+    if (!route) {
+      if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);
+      return message;
     }
-    if (!route) return message;
     if (author._tag === "owner") {
       yield* routeToOwnerAgent(posted, Briefs.ownerMessageText(posted.title, posted.id, text));
     } else if (author._tag === "script") {
@@ -2698,6 +2699,8 @@ const make = Effect.gen(function* () {
         ),
       );
     }
+    // A title write must not invalidate this post while routing releases the board lock.
+    if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);
     return message;
   });
 
