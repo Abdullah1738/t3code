@@ -62,6 +62,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
+import * as CutoverContext from "../ardud/harness-migrate/CutoverContext.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
@@ -1539,6 +1540,7 @@ it.effect(
               Layer.succeed(ProjectionStore.ProjectionStoreV2, f.projectionStore),
               Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, f.manager),
               Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+              Layer.mock(CutoverContext.CutoverContext)({ read: () => Effect.succeed(null) }),
               Layer.mock(GitWorkflow.GitWorkflowService)({}),
               Layer.mock(ProjectService.ProjectService)({}),
               Layer.mock(ProviderAuthService.ProviderAuthService)({}),

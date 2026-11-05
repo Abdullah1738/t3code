@@ -153,6 +153,8 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
+import { postCutoverSelectionProblem } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { cutoverAdmissionHeld } from "../ardud/harness-migrate/cutoverClaim.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
 // ardud: archive only while idle
 import {
@@ -165,6 +167,7 @@ import {
 import { countsAsUserTurn } from "../ardud/control/turns.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ServerConfig from "../config.ts";
 import {
   parseThreadSegmentFromAttachmentId,
   toSafeThreadAttachmentSegment,
@@ -510,6 +513,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "run.interrupt":
     case "queued-message.promote-to-steer":
     case "queue.resume":
+    case "queue.cutover-release":
     case "queued-run.reorder":
     case "queued-run.cancel":
     case "queued-run.edit":
@@ -906,6 +910,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const serverConfig = yield* ServerConfig.ServerConfig;
+  const admissionHeld = (threadId: string, selection: ModelSelection) =>
+    cutoverAdmissionHeld(threadId, selection).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.provideService(ServerConfig.ServerConfig, serverConfig),
+    );
   const providerAdapters = yield* ProviderAdapterRegistryV2;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
@@ -1418,6 +1429,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (nextRun === undefined) {
         return;
       }
+      if (yield* admissionHeld(threadId, nextRun.modelSelection)) return;
       // A message queued behind a worktree that was cancelled or never created
       // would run in the project checkout instead, so it waits for the user.
       const failedRun = latestExecutedRun(projection.runs);
@@ -1623,7 +1635,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 // ardud: adoption records the runs covered by its source snapshot.
                 (deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" ||
                   run.ordinal >
-                    (deliveryProviderThread.nativeMetadata.seededHistory.snapshotRunOrdinal ?? 0)) &&
+                    (deliveryProviderThread.nativeMetadata.seededHistory.snapshotRunOrdinal ??
+                      0)) &&
                 run.ordinal <= latestHandoffRun.ordinal,
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
@@ -2654,12 +2667,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ((command.type === "thread.model-selection.set" || command.type === "provider.switch") &&
         command.expectedModelSelection !== undefined &&
         (!modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection) ||
-         thread.archivedAt !== null || thread.settledAt !== null)) ||
+          thread.archivedAt !== null ||
+          thread.settledAt !== null)) ||
       (command.type === "thread.runtime-mode.set" &&
-        ((command.expectedRuntimeMode !== undefined && thread.runtimeMode !== command.expectedRuntimeMode) ||
-         (command.expectedModelSelection !== undefined && !modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection)) ||
-         (command.expectedInteractionMode !== undefined && thread.interactionMode !== command.expectedInteractionMode) ||
-         (command.expectedRuntimeMode !== undefined && (thread.archivedAt !== null || thread.settledAt !== null))))
+        ((command.expectedRuntimeMode !== undefined &&
+          thread.runtimeMode !== command.expectedRuntimeMode) ||
+          (command.expectedModelSelection !== undefined &&
+            !modelSelectionsEqual(thread.modelSelection, command.expectedModelSelection)) ||
+          (command.expectedInteractionMode !== undefined &&
+            thread.interactionMode !== command.expectedInteractionMode) ||
+          (command.expectedRuntimeMode !== undefined &&
+            (thread.archivedAt !== null || thread.settledAt !== null))))
     ) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
@@ -5256,7 +5274,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
-    const queueBehindRun = activeRun ?? worktreeMissingRun;
+    const heldForCutover =
+      !command.commandId.startsWith("harness-cutover:v1:") &&
+      (yield* admissionHeld(command.threadId, modelSelection));
+    const queueBehindRun =
+      activeRun ?? worktreeMissingRun ?? (heldForCutover ? latestRun : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     // ardud: a pending fork or merge-back would carry another thread's context
     // into the run a context reset starts, so refuse and leave it pending.
@@ -7850,6 +7872,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           "providerThreads",
           "providerSessions",
           "runtimeRequests",
+          "subagents",
         ])
         .pipe(
           Effect.mapError(
@@ -7860,7 +7883,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (thread.deletedAt !== null || thread.archivedAt !== null) {
         return yield* reject(`Thread ${command.threadId} is not active.`);
       }
-      if (projection.runs.some((run) => run.status === "queued" || isBlockingRun(run))) {
+      const promptCutover =
+        command.target.kind === "new" && command.target.seededHistory === undefined;
+      if (promptCutover && runningBackgroundWork(projection).length > 0) {
+        return yield* reject(`Thread ${command.threadId} still has background work.`);
+      }
+      if (
+        projection.runs.some(
+          (run) => isBlockingRun(run) || (run.status === "queued" && !promptCutover),
+        )
+      ) {
         return yield* reject(`Thread ${command.threadId} has queued or active runs.`);
       }
       if (projection.runtimeRequests.some((request) => request.status === "pending")) {
@@ -7898,19 +7930,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           handoffIds: [],
           forkedFrom: null,
           contextUsage: null,
-          nativeMetadata: {
-            seededHistory: {
-              ...seededHistory,
-              ...(seededHistory.mode === "codex-inject"
-                ? {
-                    snapshotRunOrdinal: projection.runs.reduce(
-                      (latest, run) => Math.max(latest, run.ordinal),
-                      0,
-                    ),
-                  }
-                : {}),
-            },
-          },
+          ...(seededHistory === undefined
+            ? {}
+            : {
+                nativeMetadata: {
+                  seededHistory: {
+                    ...seededHistory,
+                    ...(seededHistory.mode === "codex-inject"
+                      ? {
+                          snapshotRunOrdinal: projection.runs.reduce(
+                            (latest, run) => Math.max(latest, run.ordinal),
+                            0,
+                          ),
+                        }
+                      : {}),
+                  },
+                },
+              }),
           createdAt: now,
           updatedAt: now,
         };
@@ -8174,7 +8210,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } = yield* projectionStore
           .getRunningTurnContext(command.threadId)
           .pipe(mapDispatchError(command));
-        if (activeRun && activeProviderTurn && activeProviderThread?.providerSessionId) {
+        const answerThread = yield* projectionStore
+          .getThread(command.threadId)
+          .pipe(mapDispatchError(command));
+        const heldForCutover = yield* admissionHeld(command.threadId, answerThread.modelSelection);
+        if (
+          !heldForCutover &&
+          activeRun &&
+          activeProviderTurn &&
+          activeProviderThread?.providerSessionId
+        ) {
           const activeSession = yield* providerSessions
             .get(activeProviderThread.providerSessionId)
             .pipe(
@@ -8693,8 +8738,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Run ${command.runId} is not queued.`,
       });
     }
-    if (command.expectedModelSelection !== undefined && !modelSelectionsEqual(queuedRun.modelSelection, command.expectedModelSelection)) {
-      return yield* new OrchestratorDispatchError({ commandId: command.commandId, commandType: command.type, cause: `Queued run ${command.runId} changed selection.` });
+    if (
+      command.expectedModelSelection !== undefined &&
+      !modelSelectionsEqual(queuedRun.modelSelection, command.expectedModelSelection)
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Queued run ${command.runId} changed selection.`,
+      });
     }
     if (modelSelectionsEqual(queuedRun.modelSelection, command.modelSelection)) return;
     const now = yield* DateTime.now;
@@ -8703,19 +8755,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (queuedRun.providerInstanceId !== command.modelSelection.instanceId) {
       const attempt = projection.attempts.find((item) => item.id === queuedRun.activeAttemptId);
       const node = projection.nodes.find((item) => item.id === queuedRun.rootNodeId);
-      if (attempt === undefined || node === undefined || attempt.status !== "pending" || node.status !== "pending") {
+      if (
+        attempt === undefined ||
+        node === undefined ||
+        attempt.status !== "pending" ||
+        node.status !== "pending"
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
           cause: `Queued run ${queuedRun.id} is missing pending execution state.`,
         });
       }
-      const adapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(mapDispatchError(command));
-      const existing = queuedRun.contextReset === true
-        ? undefined
-        : rootProviderThreadsForProvider(projection, command.modelSelection.instanceId)[0];
+      const adapter = yield* providerAdapters
+        .get(command.modelSelection.instanceId)
+        .pipe(mapDispatchError(command));
+      const existing =
+        queuedRun.contextReset === true
+          ? undefined
+          : rootProviderThreadsForProvider(projection, command.modelSelection.instanceId)[0];
       const target: OrchestrationV2ProviderThread = existing ?? {
-        id: idAllocator.derive.providerThread({ driver: adapter.driver, nativeThreadId: `pending:${queuedRun.id}:${command.modelSelection.instanceId}:${command.commandId}` }),
+        id: idAllocator.derive.providerThread({
+          driver: adapter.driver,
+          nativeThreadId: `pending:${queuedRun.id}:${command.modelSelection.instanceId}:${command.commandId}`,
+        }),
         driver: adapter.driver,
         providerInstanceId: command.modelSelection.instanceId,
         providerSessionId: null,
@@ -8733,10 +8796,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       };
       providerThreadId = target.id;
       if (existing === undefined) {
-        yield* emitEvent({ type: "provider-thread.updated", threadId: command.threadId, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: target });
+        yield* emitEvent({
+          type: "provider-thread.updated",
+          threadId: command.threadId,
+          providerInstanceId: command.modelSelection.instanceId,
+          occurredAt: now,
+          payload: target,
+        });
       }
-      yield* emitEvent({ type: "run-attempt.updated", threadId: command.threadId, runId: queuedRun.id, nodeId: node.id, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: { ...attempt, providerInstanceId: command.modelSelection.instanceId, providerThreadId } });
-      yield* emitEvent({ type: "node.updated", threadId: command.threadId, runId: queuedRun.id, nodeId: node.id, providerInstanceId: command.modelSelection.instanceId, occurredAt: now, payload: { ...node, providerThreadId, checkpointScopeId: null } });
+      yield* emitEvent({
+        type: "run-attempt.updated",
+        threadId: command.threadId,
+        runId: queuedRun.id,
+        nodeId: node.id,
+        providerInstanceId: command.modelSelection.instanceId,
+        occurredAt: now,
+        payload: {
+          ...attempt,
+          providerInstanceId: command.modelSelection.instanceId,
+          providerThreadId,
+        },
+      });
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        runId: queuedRun.id,
+        nodeId: node.id,
+        providerInstanceId: command.modelSelection.instanceId,
+        occurredAt: now,
+        payload: { ...node, providerThreadId, checkpointScopeId: null },
+      });
     }
     yield* emitEvent({
       type: "run.updated",
@@ -11876,12 +11965,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "queued-message.promote-to-steer":
         yield* dispatchQueuedMessagePromoteToSteer(command, events, effects);
         break;
+      case "queue.cutover-release":
       case "queue.resume": {
-        const projection = yield* loadProjectionForCommand(
-          command,
-          ["runs", "turnItems", "providerSessions"],
-          { turnItemTypes: ["error"] },
-        );
+        const projection = yield* projectionStore
+          .getThreadRecords(command.threadId, ["runs", "turnItems", "providerSessions"], {
+            turnItemTypes: ["error"],
+          })
+          .pipe(mapDispatchError(command));
         if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
@@ -11898,7 +11988,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               (left, right) =>
                 DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
             )[0]?.lastError ?? null;
-        if (usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null) {
+        if (
+          command.type === "queue.resume" &&
+          usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null
+        ) {
           return yield* new OrchestratorDispatchError({
             commandId: command.commandId,
             commandType: command.type,
@@ -11906,7 +11999,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           });
         }
         const now = yield* DateTime.now;
-        const queued = projection.runs.filter((run) => run.status === "queued");
+        const queued =
+          command.type === "queue.cutover-release"
+            ? []
+            : projection.runs.filter((run) => run.status === "queued");
         for (const run of queued) {
           yield* emit(
             events,
@@ -12042,13 +12138,60 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-      if (command.type === "queue.resume") {
+      if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
         yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
       }
       return {
         sequence: receipt.resultSequence,
         storedEvents,
       } satisfies OrchestratorV2DispatchResult;
+    }
+
+    if (
+      command.type === "message.dispatch" ||
+      command.type === "thread.model-selection.set" ||
+      command.type === "provider.switch" ||
+      command.type === "thread.create" ||
+      command.type === "delegated_task.request"
+    ) {
+      const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+      if (
+        settings.ardudHarnessMigration?.cutoverComplete === true &&
+        command.modelSelection !== undefined
+      ) {
+        const reason = postCutoverSelectionProblem(command.modelSelection);
+        if (reason !== null)
+          return yield* new OrchestratorCommandRejectedError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: reason,
+          });
+      }
+    }
+
+    if (
+      (command.type === "message.dispatch" ||
+        command.type === "delegated_task.request" ||
+        command.type === "thread.create") &&
+      !command.commandId.startsWith("harness-cutover:v1:")
+    ) {
+      const selection =
+        command.modelSelection ??
+        (yield* projectionStore
+          .getThread(commandThreadId(command))
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorProjectionError({ threadId: commandThreadId(command), cause }),
+            ),
+          )).modelSelection;
+      if (yield* admissionHeld(commandThreadId(command), selection))
+        return yield* new OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Harness cutover is holding Claude/OpenAI turns. Keep this request and retry after cutover completes.",
+        });
     }
 
     // A limited sender checked these modes before dispatching; the thread's
@@ -12275,7 +12418,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         detail: committed.receipt.error ?? "Previously rejected.",
       });
     }
-    if (command.type === "queue.resume") {
+    if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
       yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
     }
     if (command.type === "notification.delivery.accept") {
@@ -12687,6 +12830,7 @@ export const layer: Layer.Layer<
   never,
   | CheckpointServiceV2
   | FileSystem.FileSystem
+  | ServerConfig.ServerConfig
   | Path.Path
   | CommandPolicyV2
   | CommandReceiptStoreV2

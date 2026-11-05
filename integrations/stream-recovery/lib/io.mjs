@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
 
 const HOME = process.env.HOME || homedir();
 export const PATHS = {
@@ -166,7 +167,7 @@ export function childNativeSession(db, childThreadId) {
     `select provider_thread_id from orchestration_v2_projection_runs
       where thread_id=? and provider_thread_id is not null order by ordinal desc limit 1`,
   ).get(childThreadId)?.provider_thread_id;
-  return /native-thread:(ses_[A-Za-z0-9]+)/.exec(providerThread ?? '')?.[1] ?? null;
+  return /^provider-thread:provider:opencode:.*:native-thread:(ses_[A-Za-z0-9]+)$/.exec(providerThread ?? '')?.[1] ?? null;
 }
 
 // A user_message turn item materializes when a queued turn starts, before
@@ -176,6 +177,7 @@ export function childNativeSession(db, childThreadId) {
 export function restartRunsSince(db, sinceIso) {
   return db.prepare(
     `select r.run_id, r.thread_id, r.ordinal, r.status, r.requested_at, r.completed_at,
+            json_extract(r.payload_json,'$.modelSelection.instanceId') instance_id,
             json_extract(r.payload_json,'$.startedAt') started_at,
             exists(select 1 from orchestration_v2_projection_turn_items i
               where i.run_id=r.run_id and i.type='user_message') dispatched,
@@ -374,6 +376,10 @@ export async function ctl(method, path, body) {
   return api(method, `/api/ardud/control${path}`, body);
 }
 
+export async function harnessCutoverStatus() {
+  return parseCutoverStatus(await ctl('GET', '/harness-cutover/status'));
+}
+
 async function api(method, path, body) {
   const { url, token } = control();
   const res = await fetch(`${url}${path}`, {
@@ -469,8 +475,8 @@ export async function threadByNative(ses) {
   }
 }
 
-export async function interruptThread(threadId, { clientRequestId, reason } = {}) {
-  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason });
+export async function interruptThread(threadId, { clientRequestId, reason, expectedRunId } = {}) {
+  return ctl("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, { clientRequestId, reason, expectedRunId });
 }
 
 // Live top-level threads (running, waiting, queued, needs-input).
@@ -519,6 +525,10 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
 
 let ocAuth;
 async function oc(path, init = {}) {
+  const session = /^\/api\/session\/([^/?]+)/.exec(path)?.[1];
+  if (session && session !== 'active' && !isOpenCodeSessionId(session)) {
+    throw new Error('refusing OpenCode request for a non-OpenCode session ID');
+  }
   ocAuth ??= "Basic " + Buffer.from(`opencode:${readFileSync(PATHS.ocPassword, "utf8").trim()}`).toString("base64");
   const res = await fetch(`${OC_URL}${path}`, {
     ...init,
@@ -531,7 +541,7 @@ async function oc(path, init = {}) {
 }
 
 export async function activeSessions() {
-  return new Set(Object.keys((await oc("/api/session/active"))?.data ?? {}));
+  return new Set(Object.keys((await oc("/api/session/active"))?.data ?? {}).filter(isOpenCodeSessionId));
 }
 
 export async function ocSession(ses) {
@@ -571,6 +581,7 @@ export async function ocTail(ses, limit = 2) {
 }
 
 export async function ocChildren(ses) {
+  if (!isOpenCodeSessionId(ses)) throw new Error('refusing OpenCode request for a non-OpenCode session ID');
   return ((await oc(`/api/session?parentID=${encodeURIComponent(ses)}&limit=200`))?.data ?? []).map((s) => s.id);
 }
 

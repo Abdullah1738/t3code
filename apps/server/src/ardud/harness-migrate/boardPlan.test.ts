@@ -77,10 +77,7 @@ it("maps a board's pools to Claude Code and keeps each slot count", () => {
   const pools = plan.next?.pools ?? [];
   assert.strictEqual(pools.length, 2);
   assert.isTrue(pools.every((entry) => entry.model.instanceId === "claudeAgent"));
-  assert.deepStrictEqual(
-    pools.map((entry) => entry.slots).sort(),
-    [1, 3].sort(),
-  );
+  assert.deepStrictEqual(pools.map((entry) => entry.slots).sort(), [1, 3].sort());
 });
 
 it("keeps a card's occupancy on the pool it runs in", () => {
@@ -129,9 +126,58 @@ it("blocks the whole board when two old pools land on one new key", () => {
 });
 
 it("review: a card-only conflict blocks the entire board", () => {
-  const plan = planBoard(snapshot({
-    cards: [card({ model: sel("opus/claude-opus-5-5#xhigh", "high") })],
-  }));
+  const plan = planBoard(
+    snapshot({
+      cards: [card({ model: sel("opus/claude-opus-5-5#xhigh", "high") })],
+    }),
+  );
   assert.strictEqual(plan.conflicts.length, 1);
   assert.isNull(plan.next, "allowConflicts must skip a conflicted board, not partially migrate it");
+});
+
+it("maps pinned models on done and settled cards without reopening them", () => {
+  const cards = [
+    card({ stage: "completed" }),
+    card({ stage: "verified", settledAt: "2026-11-05T00:00:00.000Z" }),
+    card({ stage: "deployed" }),
+  ].map((entry, index) => ({
+    ...entry,
+    id: KanbanCardId.make(`done-${index}`),
+    models: [
+      { model: sel("opus/claude-opus-5-5", "xhigh"), weight: 7 },
+      { model: sel("opus/cx/gpt-6.1-sol", "xhigh"), weight: 2 },
+    ],
+  }));
+  const plan = planBoard(snapshot({ cards }));
+  assert.isNotNull(plan.next);
+  for (const [index, migrated] of (plan.next?.cards ?? []).entries()) {
+    assert.strictEqual(migrated.model.instanceId, "claudeAgent");
+    assert.deepStrictEqual(
+      migrated.models.map((entry) => entry.model.instanceId),
+      ["claudeAgent", "codex"],
+    );
+    assert.deepStrictEqual(
+      migrated.models.map((entry) => entry.weight),
+      [7, 2],
+    );
+    assert.strictEqual(migrated.stage, cards[index]?.stage);
+    assert.strictEqual(migrated.settledAt, cards[index]?.settledAt);
+  }
+  assert.strictEqual(plan.changes.filter((change) => change.ref.startsWith("card:")).length, 3);
+});
+
+it("a conflicting pinned model on a settled card blocks the board", () => {
+  const plan = planBoard(
+    snapshot({
+      cards: [
+        card({
+          stage: "verified",
+          settledAt: "2026-11-05T00:00:00.000Z",
+          model: sel("opus/claude-opus-5-5#xhigh", "high"),
+        }),
+      ],
+    }),
+  );
+  assert.strictEqual(plan.conflicts.length, 1);
+  assert.isNull(plan.next);
 });

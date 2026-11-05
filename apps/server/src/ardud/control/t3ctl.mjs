@@ -39,6 +39,7 @@ const HELP = `t3ctl <command> [options]
   archive-if-idle THREAD [--session NATIVE_SESSION_ID]   exits 3 when refused (thread left alone)
   events [--thread ID] [--origin O] [--types a,b] [--after SEQ]
   desktop-lease status
+  harness-cutover plan|run|status       plan, start/resume the paced job, or inspect cutover
   desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
   desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
   desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
@@ -366,6 +367,18 @@ async function main() {
         seen.add(cursor);
         page = await client.usage({ ...filters, cursor });
       }
+    }
+    case "harness-cutover": {
+      const action = need(args[0], "harness-cutover action");
+      if (!["plan", "run", "status"].includes(action))
+        throw new Error(`unknown harness-cutover action ${action}`);
+      const result = await client.request(
+        action === "run" ? "POST" : "GET",
+        `/harness-cutover/${action}`,
+        action === "run" ? {} : undefined,
+      );
+      print(result);
+      return;
     }
     case "desktop-lease": {
       const action = need(args[0], "desktop-lease action");

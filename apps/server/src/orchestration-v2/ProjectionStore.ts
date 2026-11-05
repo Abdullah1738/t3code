@@ -445,6 +445,16 @@ export interface ProjectionStoreV2Shape {
   readonly getThread: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2AppThread, ProjectionStoreV2Error>;
+  readonly listCutoverCandidates: (input: {
+    readonly afterThreadId?: ThreadId;
+    readonly limit: number;
+  }) => Effect.Effect<
+    {
+      readonly threads: ReadonlyArray<OrchestrationV2AppThread>;
+      readonly nextThreadId: ThreadId | null;
+    },
+    ProjectionStoreV2Error
+  >;
   readonly getLimitRecoveryCandidates: (options: {
     readonly now: DateTime.Utc;
     readonly autoResume: boolean;
@@ -596,6 +606,8 @@ export class ProjectionStoreV2 extends Context.Service<ProjectionStoreV2, Projec
 ) {}
 
 export const ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION = 2;
+
+const cutoverCandidateLimit = (limit: number) => Math.min(100, Math.max(1, Math.floor(limit) || 1));
 
 function needsRecovery(
   projection: OrchestrationV2ThreadProjection,
@@ -4615,6 +4627,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
     );
 
+    const listCutoverCandidates: ProjectionStoreV2Shape["listCutoverCandidates"] = Effect.fn(
+      "ProjectionStore.listCutoverCandidates",
+    )(
+      function* (input) {
+        const limit = cutoverCandidateLimit(input.limit);
+        const rows = yield* sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_threads
+          WHERE deleted_at IS NULL
+            AND json_extract(payload_json, '$.archivedAt') IS NULL
+            ${input.afterThreadId === undefined ? sql`` : sql`AND thread_id > ${input.afterThreadId}`}
+          ORDER BY thread_id ASC
+          LIMIT ${limit + 1}
+        `;
+        const threads = yield* Effect.forEach(rows.slice(0, limit), (row) =>
+          decodeThreadPayload(row.payload_json),
+        );
+        return {
+          threads,
+          nextThreadId: rows.length > limit ? threads.at(-1)!.id : null,
+        };
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const requireThread = Effect.fn("ProjectionStore.requireThread")(function* (
       threadId: ThreadId,
     ) {
@@ -6484,6 +6520,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readShellSnapshot,
       getThreadShell,
       getThread,
+      listCutoverCandidates,
       getSettlementCandidates,
       getThreadsWithPullRequests,
       getThreadWorktreePaths,
@@ -6613,6 +6650,24 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           return yield* new ProjectionStoreThreadNotFoundError({ threadId });
         }
         return projection.thread;
+      }),
+      listCutoverCandidates: Effect.fn("ProjectionStore.listCutoverCandidates")(function* (input) {
+        const limit = cutoverCandidateLimit(input.limit);
+        const rows = [...(yield* Ref.get(replayState)).projections.values()]
+          .map(({ thread }) => thread)
+          .filter(
+            (thread) =>
+              thread.deletedAt === null &&
+              thread.archivedAt === null &&
+              (input.afterThreadId === undefined || thread.id > input.afterThreadId),
+          )
+          .toSorted((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+          .slice(0, limit + 1);
+        const threads = rows.slice(0, limit);
+        return {
+          threads,
+          nextThreadId: rows.length > limit ? threads.at(-1)!.id : null,
+        };
       }),
       getSettlementCandidates: Effect.fn("ProjectionStore.getSettlementCandidates")(
         function* (threadId) {

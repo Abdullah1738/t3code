@@ -3148,6 +3148,11 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("queue.cutover-release"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
   // ardud: the harness migration (SelectionMigration) rebinds a queued run's
   // stored selection. Only that path may change a queued run's model, so the
   // command is server-only. The run keeps its order, attachments and hold.
@@ -3242,7 +3247,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
         driver: ProviderDriverKind,
         nativeId: Schema.NullOr(TrimmedNonEmptyString),
         headId: Schema.NullOr(TrimmedNonEmptyString),
-        seededHistory: OrchestrationV2SeededHistory,
+        // Prompt-only cutover creates an empty native binding, never transplanted history.
+        seededHistory: Schema.optional(OrchestrationV2SeededHistory),
       }),
       Schema.Struct({
         kind: Schema.Literal("existing"),

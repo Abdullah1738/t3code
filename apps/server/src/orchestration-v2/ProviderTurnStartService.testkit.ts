@@ -4,8 +4,10 @@ import * as Option from "effect/Option";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as CutoverContext from "../ardud/harness-migrate/CutoverContext.ts";
 
-export const layer = Layer.merge(
+export const layer = Layer.mergeAll(
+  Layer.mock(CutoverContext.CutoverContext)({ read: () => Effect.succeed(null) }),
   Layer.mock(GitWorkflow.GitWorkflowService)({
     pruneWorktrees: () => Effect.void,
     createWorktree: () => Effect.succeed({} as never),

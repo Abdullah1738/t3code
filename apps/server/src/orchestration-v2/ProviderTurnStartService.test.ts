@@ -55,6 +55,11 @@ import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
+import * as CutoverContext from "../ardud/harness-migrate/CutoverContext.ts";
+
+const noCutoverContext = Layer.mock(CutoverContext.CutoverContext)({
+  read: () => Effect.succeed(null),
+});
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -134,6 +139,7 @@ function startWithMissingWorktree(
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        noCutoverContext,
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -302,6 +308,8 @@ function makeLocalCommandHarness(input: {
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
+  readonly cutoverContext?: CutoverContext.CutoverContext["Service"];
+  readonly nativeDelivery?: boolean;
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -544,7 +552,9 @@ function makeLocalCommandHarness(input: {
     ensureThread: resumeFallbackEnsure,
   };
   let failOnce = input.ensureThreadFailOnce === true;
-  const retryableEnsureThread = vi.fn(() => {
+  const retryableEnsureThread = vi.fn<
+    ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"]
+  >(() => {
     if (failOnce) {
       failOnce = false;
       return Effect.fail(
@@ -555,9 +565,25 @@ function makeLocalCommandHarness(input: {
         }),
       );
     }
-    return Effect.succeed(input.ensureThreadResult ?? providerThread);
+    return Effect.succeed(
+      input.ensureThreadResult ??
+        (input.nativeDelivery === true
+          ? {
+              ...providerThread,
+              nativeThreadRef: {
+                driver: providerThread.driver,
+                nativeId: "native-fresh-cutover",
+                strength: "strong" as const,
+              },
+            }
+          : providerThread),
+    );
   });
-  const open = vi.fn(() =>
+  const nativeStartTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(
+    () => Effect.void,
+  );
+  const injectHistory = vi.fn(() => Effect.succeed(true));
+  const open = vi.fn<ProviderSessionManager.ProviderSessionManagerV2["Service"]["open"]>(() =>
     input.interruptOpen === true
       ? Effect.interrupt
       : "historyReadFailureAfterFallback" in input
@@ -578,7 +604,7 @@ function makeLocalCommandHarness(input: {
                   ),
                 ),
               )
-            : input.failReadsAfterRunning === true
+            : input.failReadsAfterRunning === true || input.nativeDelivery === true
               ? Effect.succeed({
                   driver: providerThread.driver,
                   providerSession: {
@@ -594,13 +620,19 @@ function makeLocalCommandHarness(input: {
                     lastError: null,
                   },
                   ensureThread: retryableEnsureThread,
+                  resumeThread,
+                  startTurn: nativeStartTurn,
+                  compactThread: nativeStartTurn,
+                  injectHistory,
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true || input.resumeSuccess === true
+    input.failReadsAfterRunning === true ||
+    input.resumeSuccess === true ||
+    input.nativeDelivery === true
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -636,36 +668,37 @@ function makeLocalCommandHarness(input: {
       return { committed, storedEvents: [] };
     }),
   );
-  const writeIfRunCurrent = vi.fn(({ events: incoming, activeAttemptId, expectedStatus }) =>
-    "writeFailure" in input
-      ? Effect.fail(
-          new EventSink.EventSinkWriteError({
-            eventCount: incoming.length,
-            cause: input.writeFailure,
-          }),
-        )
-      : Effect.sync(() => {
-          const current = projection.runs.find((candidate) => candidate.id === runId);
-          const committed =
-            current !== undefined &&
-            current.activeAttemptId === activeAttemptId &&
-            current.status === expectedStatus &&
-            !(
-              input.loseRunningWrite === true &&
-              incoming.some(
-                (event: OrchestrationV2DomainEvent) =>
-                  event.type === "run.updated" && event.payload.status === "running",
-              )
-            );
-          if (committed) {
-            for (const event of incoming) {
-              expect(isDomainEvent(event)).toBe(true);
-              events.push(event);
-              projection = ProjectionStore.applyToProjection(projection, event);
+  const writeIfRunCurrent = vi.fn(
+    ({ events: incoming, activeAttemptId, expectedStatus, runId: requestedRunId }) =>
+      "writeFailure" in input
+        ? Effect.fail(
+            new EventSink.EventSinkWriteError({
+              eventCount: incoming.length,
+              cause: input.writeFailure,
+            }),
+          )
+        : Effect.sync(() => {
+            const current = projection.runs.find((candidate) => candidate.id === requestedRunId);
+            const committed =
+              current !== undefined &&
+              current.activeAttemptId === activeAttemptId &&
+              current.status === expectedStatus &&
+              !(
+                input.loseRunningWrite === true &&
+                incoming.some(
+                  (event: OrchestrationV2DomainEvent) =>
+                    event.type === "run.updated" && event.payload.status === "running",
+                )
+              );
+            if (committed) {
+              for (const event of incoming) {
+                expect(isDomainEvent(event)).toBe(true);
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
             }
-          }
-          return { committed, storedEvents: [] };
-        }),
+            return { committed, storedEvents: [] };
+          }),
   );
   const resolveRuntimePolicy = vi.fn(
     ({ thread }: Parameters<RuntimePolicy.RuntimePolicyV2Shape["resolve"]>[0]) =>
@@ -688,10 +721,23 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        input.cutoverContext === undefined
+          ? noCutoverContext
+          : Layer.succeed(CutoverContext.CutoverContext, input.cutoverContext),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent, writeIfProviderThreadUnchanged }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          writeIfProviderThreadUnchanged,
+          write: ({ events: incoming }) =>
+            Effect.sync(() => {
+              for (const event of incoming) {
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
+            }) as never,
+        }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
@@ -718,12 +764,14 @@ function makeLocalCommandHarness(input: {
               ),
             }),
           getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+            input.nativeDelivery === true
+              ? Effect.succeed(projection.turnItems)
+              : Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: input.historyReadFailureAfterFallback,
+                  }),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
@@ -748,6 +796,8 @@ function makeLocalCommandHarness(input: {
     writeIfRunCurrent,
     writeIfProviderThreadUnchanged,
     retryableEnsureThread,
+    nativeStartTurn,
+    injectHistory,
     startRootRun,
     tryHandlePromptCommand,
     events,
@@ -765,8 +815,233 @@ function makeLocalCommandHarness(input: {
         willRetry: true,
       });
     }).pipe(Effect.provide(layer)),
+    startForRun: (nextRunId: RunId) =>
+      Effect.gen(function* () {
+        yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({
+          threadId,
+          runId: nextRunId,
+        });
+      }).pipe(Effect.provide(layer)),
   };
 }
+
+const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2StartRootRunInput) =>
+  controls.session.startTurn({
+    appThread: controls.appThread,
+    threadId: controls.run.threadId,
+    runId: controls.run.id,
+    runOrdinal: controls.run.ordinal,
+    providerTurnOrdinal: controls.providerTurnOrdinal,
+    attemptId: controls.attemptId,
+    rootNodeId: controls.rootNode.id,
+    providerThread: controls.providerThread,
+    message: controls.message,
+    modelSelection: controls.modelSelection,
+    runtimePolicy: controls.runtimePolicy,
+  });
+
+effectIt.effect(
+  "starts cutover in a fresh native thread and accepts one brief without transcript injection",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "turn-start-cutover-" });
+      yield* Effect.gen(function* () {
+        const context = yield* CutoverContext.CutoverContext;
+        const harness = makeLocalCommandHarness({
+          text: "Continue interrupted work.",
+          nativeDelivery: true,
+          cutoverContext: context,
+          resumeSuccess: true,
+        });
+        const projection = harness.projection();
+        const run = projection.runs.at(-1)!;
+        const thread = projection.providerThreads.at(-1)!;
+        const brief =
+          "Read the same Robob thread; preserve the pending owner ask. Do not announce the switch.";
+        yield* context.put({
+          threadId: run.threadId,
+          targetInstance: run.providerInstanceId,
+          text: brief,
+        });
+        harness.setProjection({
+          ...projection,
+          providerThreads: [
+            {
+              ...thread,
+              nativeThreadRef: {
+                driver: thread.driver,
+                nativeId: "native-old-target",
+                strength: "strong",
+              },
+              nativeMetadata: {
+                seededHistory: {
+                  source: "opencode",
+                  sourceSessionId: "ses_old",
+                  digest: "old",
+                  mode: "codex-inject",
+                },
+              },
+            },
+          ],
+          contextHandoffs: [
+            {
+              id: ContextHandoffId.make("handoff:generic"),
+              threadId: run.threadId,
+              targetRunId: run.id,
+              fromProviderThreadIds: [],
+              toProviderThreadId: thread.id,
+              coveredRunOrdinals: { from: 1, to: 1 },
+              strategy: "full_thread_summary",
+              status: "ready",
+              summaryMessageId: null,
+              summaryText: "GENERIC_DUPLICATE_CARRY_ON",
+              createdByProviderInstanceId: null,
+              createdAt: run.requestedAt,
+              updatedAt: run.requestedAt,
+            },
+          ],
+        });
+        yield* harness.start;
+        expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+        expect(harness.resumeThread).not.toHaveBeenCalled();
+        expect(harness.open.mock.calls[0]?.[0]).not.toHaveProperty("initialNativeThreadId");
+        expect(harness.retryableEnsureThread.mock.calls[0]?.[0]).toMatchObject({
+          forceNewNativeThread: true,
+          existingProviderThread: { nativeThreadRef: null },
+        });
+        expect(
+          harness.retryableEnsureThread.mock.calls[0]?.[0]?.existingProviderThread?.nativeMetadata,
+        ).not.toHaveProperty("seededHistory");
+        const controls = harness.startRootRun.mock.calls[0]![0];
+        yield* startPreparedTurn(controls);
+        expect(harness.nativeStartTurn.mock.calls[0]?.[0].message.text).toBe(
+          `${brief}\n\nUser message:\nContinue interrupted work.`,
+        );
+        expect(harness.injectHistory).not.toHaveBeenCalled();
+        expect(harness.projection().contextHandoffs[0]?.status).toBe("superseded");
+        expect(
+          yield* context.read({
+            threadId: run.threadId,
+            targetInstance: run.providerInstanceId,
+            runId: "next-run",
+          }),
+        ).toBeNull();
+
+        const after = harness.projection();
+        const nextRunId = RunId.make("run:second-native");
+        harness.setProjection({
+          ...after,
+          runs: [
+            { ...after.runs.at(-1)!, status: "completed" },
+            { ...run, id: nextRunId, ordinal: run.ordinal + 1, status: "starting" },
+          ],
+          nodes: after.nodes.map((node) => ({ ...node, runId: nextRunId })),
+          attempts: after.attempts.map((attempt) => ({ ...attempt, runId: nextRunId })),
+          messages: after.messages.map((message) => ({ ...message, runId: nextRunId })),
+        });
+        yield* harness.startForRun(nextRunId);
+        expect(harness.retryableEnsureThread).toHaveBeenCalledOnce();
+        expect(harness.resumeThread).toHaveBeenCalledOnce();
+        expect(
+          harness.resumeThread.mock.calls[0]?.[0].providerThread.nativeThreadRef?.nativeId,
+        ).toBe("native-fresh-cutover");
+        yield* startPreparedTurn(harness.startRootRun.mock.calls[1]![0]);
+        expect(harness.nativeStartTurn.mock.calls[1]?.[0].message.text).toBe(
+          "Continue interrupted work.",
+        );
+      }).pipe(
+        Effect.provide(
+          CutoverContext.layer.pipe(
+            Layer.provide(
+              Layer.mock(ServerConfig.ServerConfig)({
+                stateDir: directory,
+              } as ServerConfig.ServerConfig["Service"]),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+effectIt.effect.each([true, false])(
+  "releases only a proven pre-prompt refusal, not an ambiguous send: %s",
+  (proven) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "turn-start-refusal-" });
+      yield* Effect.gen(function* () {
+        const context = yield* CutoverContext.CutoverContext;
+        const harness = makeLocalCommandHarness({
+          text: "Continue",
+          nativeDelivery: true,
+          cutoverContext: context,
+        });
+        const run = harness.projection().runs.at(-1)!;
+        yield* context.put({
+          threadId: run.threadId,
+          targetInstance: run.providerInstanceId,
+          text: "durable brief",
+        });
+        harness.nativeStartTurn.mockImplementation(() =>
+          Effect.fail(
+            new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: ProviderDriverKind.make("codex"),
+              threadId: run.threadId,
+              runId: run.id,
+              providerThreadId: run.providerThreadId!,
+              cause: proven
+                ? { _tag: "ClaudeBackgroundWorkBlocksQueryReplacementError" }
+                : "transport lost",
+            }),
+          ),
+        );
+        yield* harness.start;
+        yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]).pipe(Effect.flip);
+        const result = yield* context
+          .read({
+            threadId: run.threadId,
+            targetInstance: run.providerInstanceId,
+            runId: "run:next",
+          })
+          .pipe(Effect.result);
+        if (proven) expect(result).toMatchObject({ _tag: "Success", success: "durable brief" });
+        else expect(result).toMatchObject({ _tag: "Failure", failure: { reason: "ambiguous" } });
+      }).pipe(
+        Effect.provide(
+          CutoverContext.layer.pipe(
+            Layer.provide(
+              Layer.mock(ServerConfig.ServerConfig)({
+                stateDir: directory,
+              } as ServerConfig.ServerConfig["Service"]),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+effectIt.effect("does not claim pending cutover context for a compact command", () =>
+  Effect.gen(function* () {
+    const read = vi.fn(() => Effect.succeed("pending brief"));
+    const context = CutoverContext.CutoverContext.of({
+      put: () => Effect.void,
+      read,
+      accepted: () => Effect.void,
+      refused: () => Effect.void,
+      remove: () => Effect.void,
+      status: () => Effect.succeed("pending"),
+    });
+    const harness = makeLocalCommandHarness({
+      text: "/compact",
+      nativeDelivery: true,
+      previousMessages: ["Earlier request"],
+      cutoverContext: context,
+    });
+    yield* harness.start;
+    expect(read).not.toHaveBeenCalled();
+  }),
+);
 
 effectIt.effect.each(["cleanup-first", "startup-first"])(
   "coordinates provider startup with %s",
@@ -790,12 +1065,12 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
         fileSystem.makeDirectory(worktreePath).pipe(Effect.as({} as never), Effect.orDie),
       );
       const open = harness.open.getMockImplementation()!;
-      harness.open.mockImplementation(() =>
+      harness.open.mockImplementation((input) =>
         Effect.gen(function* () {
           expect(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie)).toBe(true);
           yield* Deferred.succeed(openEntered, undefined);
           if (order === "startup-first") yield* Deferred.await(release);
-          return yield* open();
+          return yield* open(input);
         }),
       );
       let cleanupEntered = false;

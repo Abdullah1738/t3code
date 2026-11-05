@@ -3,6 +3,7 @@
 // The caller loads and saves state.
 import * as realIo from "./io.mjs";
 import { createHash } from 'node:crypto';
+import { cutoverOwns, openCodeSession, recoveryOwned } from './harness.mjs';
 import {
   buildRestartNote, buildRestartSummary, childOutcome, findRedispatch, findRestartIncidents, hhmm,
   isNestedThreadId, planRestartThread, providerThreadFor, resultInHistory, sessionFromProviderThread, toMs,
@@ -33,7 +34,11 @@ async function safe(fn, fallback) {
 
 function topParent(io, db, threadId) {
   let t = threadId;
-  for (let i = 0; i < 5 && t && isNestedThreadId(t); i++) t = io.subagentParent(db, providerThreadFor(t));
+  const seen = new Set();
+  while (t && isNestedThreadId(t) && !seen.has(t)) {
+    seen.add(t);
+    t = io.subagentParent(db, providerThreadFor(t));
+  }
   return t && !isNestedThreadId(t) ? t : null;
 }
 
@@ -60,7 +65,7 @@ async function lostSubagent({ io, db, sub, active, incident }) {
   const later = io.subagentsStartedSince(db, sub.thread_id, isoOf(toMs(sub.completed_at) - 1_000));
   const redo = findRedispatch({ ...sub, sessionId }, later);
   if (redo) return { ...base, status: "redispatched", redo };
-  if (!sessionId) return { ...base, status: "cut" };
+  if (!sessionId) return { ...base, childThreadId: sub.child_thread_id ?? null, status: 'unknown' };
   if (active.has(sessionId)) return { ...base, status: "running" };
   const oc = await safe(() => io.ocMessages(sessionId, { limit: 6, maxPages: 1 }), null);
   const out = childOutcome(oc?.messages ?? [], { incidentMs: incident.startMs });
@@ -91,14 +96,26 @@ const resumeWindowStart = (incident) => Math.max(incident.endMs, toMs(incident.s
 
 const threadBusy = (thread, active) => Boolean(thread.activeRunId || thread.pendingRequest
   || ['preparing', 'starting', 'running', 'waiting'].includes(thread.status)
-  || active.has(thread.nativeSessionId));
+  || active.has(openCodeSession(thread)));
+
+const cutRunIds = (incident, threadId, subs = []) => [
+  ...incident.runs.filter((r) => r.thread_id === threadId).map((r) => r.run_id),
+  ...subs.map((s) => s.run_id),
+].filter(Boolean);
+
+const ownedResult = (threadId, thread = {}) => ({
+  plan: { threadId, title: thread.title ?? threadId, action: 'skip', resumeQueue: false, reason: 'harness cutover owns continuation' },
+  ok: true, lostSubs: [], error: null,
+});
 
 const incrementalId = (incidentId, taskId) =>
   `${incidentId}:delegated:${createHash('sha256').update(taskId).digest('hex')}`;
 
 // One stable receipt per task avoids duplicates if a send succeeds but state
 // saving fails, or more task rows arrive before the retry.
-async function handleLateDelegated({ io, db, incident, threadId, sub, active, dryRun, progress, save }) {
+async function handleLateDelegated({ io, db, incident, threadId, sub, dryRun, progress, save }) {
+  if (await recoveryOwned(io, threadId, cutRunIds(incident, threadId, [sub]))) return;
+  const active = new Set();
   const requestId = incrementalId(incident.id, sub.subagent_id);
   const delivered = [...(progress.deliveredDelegated ?? [])];
   const previous = progress.result
@@ -136,11 +153,14 @@ async function handleLateDelegated({ io, db, incident, threadId, sub, active, dr
     mark(null);
     return;
   }
+  if (await recoveryOwned(io, threadId, cutRunIds(incident, threadId, [sub]))) return;
   await io.sendToThread(threadId, note, { clientRequestId: requestId, mode: 'queue' });
   mark(lost);
 }
 
-async function handleThread({ io, db, incident, threadId, subs, active, dryRun, now, windowStart, progress, save }) {
+async function handleThread({ io, db, incident, threadId, subs, getActive, dryRun, now, windowStart, progress, save }) {
+  const sourceRuns = cutRunIds(incident, threadId, subs);
+  if (await recoveryOwned(io, threadId, sourceRuns)) return ownedResult(threadId);
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const info = { threadId, title: thread.title, origin: thread.origin, archived: thread.archived };
@@ -150,6 +170,8 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
   if (io.stoppedSince(db, threadId, isoOf(incident.startMs))) {
     return { plan: { ...planRestartThread({ thread: info }), action: 'skip', reason: 'stopped after the restart' }, ok: true, lostSubs: [], error: null };
   }
+  const active = openCodeSession(thread) || subs.some((s) => sessionFromProviderThread(s.provider_thread_id))
+    ? await getActive() : new Set();
   const noteRun = io.restartNoteRun(db, threadId, incident.id);
   const alreadySent = progress.noteSent || noteRun != null;
   const ownRecovery = noteRun != null && thread.activeRunId === noteRun;
@@ -194,7 +216,7 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
       res.deferred = true;
       return res;
     }
-    const freshActive = sending ? await io.activeSessions() : null;
+    const freshActive = sending && openCodeSession(fresh) ? await io.activeSessions() : new Set();
     if (sending && ((!(noteRun && fresh.activeRunId === noteRun) && threadBusy(fresh, freshActive))
       || fresh.latestRunId !== thread.latestRunId)) {
       res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'thread changed during recovery' };
@@ -210,6 +232,7 @@ async function handleThread({ io, db, incident, threadId, subs, active, dryRun, 
       res.deferred = true;
       return res;
     }
+    if (await recoveryOwned(io, threadId, sourceRuns)) return ownedResult(threadId, fresh);
     progress.staleHeld = staleHeld;
     if (sending) progress.initialDelegated = lost.filter((l) => l.kind === 'delegated').map((l) => l.subagentId);
     save();
@@ -300,6 +323,8 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
   // The stream-loss scan must not also recover these same failed turns,
   // including while a restart is settling or was already handled.
   report.runIds = new Set(incidents.flatMap((i) => i.runs.map((r) => r.run_id)));
+  // A missing or malformed status is not permission to send a second resume.
+  const cutover = !seed && incidents.length ? await io.harnessCutoverStatus() : null;
   let robobUp = null;
   for (const incident of incidents) {
     if (incident.serverStart) incident.serverStart.incidentId = incident.id;
@@ -326,11 +351,17 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       log(`${incident.id}: Robob is not reachable, retrying next scan`);
       continue;
     }
-    // Fail closed: if OpenCode cannot tell us what's active, retry later.
-    const active = await io.activeSessions();
+    let active;
+    const getActive = async () => active ??= await io.activeSessions();
     const byThread = new Map();
     for (const r of incident.runs) byThread.set(r.thread_id, []);
     for (const s of incident.subagents) byThread.set(s.parentThreadId, [...(byThread.get(s.parentThreadId) ?? []), s]);
+    // A later failure can share the restart window with an already briefed
+    // cut. Suppress the claimed rows, not that thread's unrelated newer run.
+    const recoveryIncident = { ...incident,
+      runs: incident.runs.filter((r) => !cutoverOwns(cutover, r.thread_id, [r.run_id])),
+      subagents: incident.subagents.filter((s) => !cutoverOwns(cutover, s.parentThreadId, [s.run_id])),
+    };
     const server = incident.serverStart ? `, server pid ${incident.serverStart.pid} ready ${hhmm(incident.serverStart.readyMs)}` : "";
     log(`${incident.id}: restart at ${hhmm(incident.startMs)} (${incident.reason}${server}), ${incident.runs.length} own turns, ${incident.subagents.length} subagents cancelled in ${byThread.size} threads${dryRun ? " (dry run)" : ""}`);
 
@@ -344,7 +375,17 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         io.saveState(state, now);
       }
     };
-    for (const [threadId, list] of byThread) {
+    for (const threadId of byThread.keys()) {
+      const list = recoveryIncident.subagents.filter((s) => s.parentThreadId === threadId);
+      if (!list.length && !recoveryIncident.runs.some((r) => r.thread_id === threadId)) {
+        const res = ownedResult(threadId);
+        if (!dryRun) {
+          entry.threads[threadId] = { done: true, result: summaryResult(res) };
+          save();
+        }
+        results.push(res); all.push(res);
+        continue;
+      }
       if (entry.threads[threadId]?.done || entry.threads[threadId]?.lateOnly) {
         const progress = entry.threads[threadId];
         if (progress.lateExhausted) {
@@ -364,7 +405,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
         let failedTask = null;
         for (const sub of pendingTasks) {
           try {
-            await handleLateDelegated({ io, db, incident, threadId, sub, active, dryRun, progress, save });
+            await handleLateDelegated({ io, db, incident: recoveryIncident, threadId, sub, dryRun, progress, save });
             if (!dryRun) progress.lateFailures = 0;
           } catch (err) {
             failed = errText(err);
@@ -403,7 +444,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
       let res;
       const progress = entry.threads[threadId] ??= {};
       try {
-        res = await handleThread({ io, db, incident, threadId, subs: list, active, dryRun, now, windowStart, progress, save });
+        res = await handleThread({ io, db, incident: recoveryIncident, threadId, subs: list, getActive, dryRun, now, windowStart, progress, save });
         if (res?.ok && !res.deferred && !dryRun) {
           progress.done = true;
           if (!progress.initialDelegated) {
@@ -454,7 +495,7 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
     const summary = buildRestartSummary({ incident, results: all });
     // Archiving several threads at once also cancels their subagents; that is
     // not worth a ping.
-    const quiet = all.length > 0 && all.every((r) => r.plan.reason === "archived");
+    const quiet = all.length > 0 && all.every((r) => ['archived', 'harness cutover owns continuation'].includes(r.plan.reason));
     // One summary per restart, sent once every thread is settled (held-back
     // threads settle within RESTART_RESUME_WINDOW_MS), so it names them all.
     const pending = dryRun ? [] : [...byThread.keys()].filter((id) => !entry.threads[id]?.done);
@@ -463,9 +504,9 @@ export async function restartScan({ db, state, now, sinceIso, floorMs, dryRun = 
     const windowOpen = !dryRun && Number.isFinite(incident.windowTo) && now < incident.windowTo + RESTART_SETTLE_MS;
     if (windowOpen && !pending.length) pending.push("(restart window still open)");
     if (dryRun) {
-      log(`summary (${quiet ? "not sent, all archived" : summary.severity}):\n${summary.text}`);
+      log(`summary (${quiet ? "not sent, no recovery action" : summary.severity}):\n${summary.text}`);
     } else if (quiet && !pending.length) {
-      state.handled[incident.id] = { at: isoOf(now), done: true, summary: "only archived threads, no action" };
+      state.handled[incident.id] = { at: isoOf(now), done: true, summary: 'only archived or cutover-owned threads, no action' };
     } else if (pending.length) {
       log(`${incident.id}: ${pending.length} thread(s) not settled yet, summary waits`);
       state.handled[incident.id] = { ...entry, at: isoOf(now), done: false };

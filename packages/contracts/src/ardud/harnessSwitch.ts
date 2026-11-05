@@ -7,3 +7,5 @@ export const HarnessSwitchTranscript = Schema.Struct({
 });
 
 export const HarnessSwitchThreadIds = Schema.Array(ThreadId);
+
+export const HarnessCutoverComplete = Schema.Boolean;

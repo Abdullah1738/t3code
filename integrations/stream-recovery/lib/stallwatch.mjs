@@ -3,6 +3,7 @@
 // up until they are clear, then reports once. The caller loads and saves state.
 import * as realIo from "./io.mjs";
 import { truncate } from "./detect.mjs";
+import { cutoverOwns, isOpenCodeSessionId, openCodeSession, recoveryOwned } from './harness.mjs';
 import {
   FALLBACK_MS, GHOST_LABEL, GHOST_RUN_MS, GIVE_UP_MS, buildStallNote, buildStallSummary, fingerprint,
   ghostCandidates, observe, observeGhosts, planGhost, planStall, quietSince, sessionLetGo, stallCleared,
@@ -24,7 +25,8 @@ const errText = (err) => String(err?.message || err).slice(0, 300);
 
 export async function stallScan({ state, now, dryRun = false, verbose = false, log }, io = realIo) {
   const iso = new Date(now).toISOString();
-  const active = await io.activeSessions();
+  const cutover = await io.harnessCutoverStatus();
+  const active = new Set([...(await io.activeSessions())].filter(isOpenCodeSessionId));
   const tails = new Map();
   await mapLimit([...active], 8, async (ses) => {
     try {
@@ -68,6 +70,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
   };
   // The OpenCode interrupt is retried on later scans when the call itself fails.
   const ocStop = async (stall) => {
+    if (stall.threadId && await recoveryOwned(io, stall.threadId, [stall.runId])) {
+      Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover owns continuation; no recovery action' });
+      return;
+    }
     stall.ocTries = (stall.ocTries ?? 0) + 1;
     try {
       stall.ocInterrupted = await io.ocInterrupt(stall.ses);
@@ -85,6 +91,10 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
 
   // Follow up on stalls interrupted by earlier scans.
   for (const [id, stall] of open) {
+    if (!isOpenCodeSessionId(stall.ses) || cutoverOwns(cutover, stall.threadId, [stall.runId])) {
+      Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover or native session; no recovery action' });
+      continue;
+    }
     const age = now - stall.interruptedAt;
     const ocDone = sessionLetGo({ stall, active: active.has(stall.ses), fp: fps.get(stall.ses) ?? null });
     let thread = null;
@@ -102,9 +112,14 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     }
     const c = stallCleared({ stall, active: active.has(stall.ses), fp: fps.get(stall.ses) ?? null, thread });
     if (c.cleared) {
+      if (thread && openCodeSession(thread) !== stall.ses) stall.note = false;
       if (stall.note && !stall.noted && thread && !dryRun) {
         try {
-          await io.sendToThread(stall.threadId, buildStallNote(stall), { clientRequestId: `${id}:note`, mode: "auto" });
+          if (await recoveryOwned(io, stall.threadId, [stall.runId])) {
+            Object.assign(stall, { done: true, note: false, outcome: 'superseded', summary: 'harness cutover owns continuation; no recovery action' });
+            continue;
+          }
+          await io.sendToThread(stall.threadId, buildStallNote(stall), { clientRequestId: `${id}:note`, mode: "queue" });
           stall.noted = true;
         } catch (err) {
           stall.errors.push(`note: ${errText(err)}`);
@@ -144,6 +159,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       const [forms, permissions] = await Promise.all([io.ocForms(ses), io.ocPermissions(ses)]);
       waiting = forms.length + permissions.length > 0;
       thread = await io.threadByNative(ses);
+      if (thread && cutoverOwns(cutover, thread.threadId, [thread.activeRunId])) continue;
       if (activity.kind === "subagent") childActive = (await io.ocChildren(ses)).some((c) => active.has(c));
       if (info?.parentID) parentTitle = (await io.ocSession(info.parentID).catch(() => null))?.title ?? null;
     } catch (err) {
@@ -172,6 +188,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     log(`stall ${id}: ${plan.action} | ${truncate(title, 60)} | quiet ${Math.round(quietMs / 60_000)}m | ${activity.label} | ${plan.reason}${dryRun ? " (dry run)" : ""}`);
     report.push({ id, ...stall });
     if (dryRun) continue;
+    if (thread && await recoveryOwned(io, thread.threadId, [thread.activeRunId])) continue;
     state.stalls[id] = stall;
     if (plan.action === "report") {
       finish(id, stall, "report");
@@ -179,7 +196,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
       await ocStop(stall);
     } else {
       try {
-        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}` });
+        const res = await io.interruptThread(stall.threadId, { clientRequestId: id, reason: `stall watch: ${activity.label}`, expectedRunId: stall.runId });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           stall.runId = res.runId ?? stall.runId;
@@ -204,7 +221,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
     if (verbose) log(`stall: thread list failed: ${errText(err)}`);
   }
   if (live) {
-    const ghosts = ghostCandidates(live, active);
+    const ghosts = ghostCandidates(live, active).filter((t) => !cutoverOwns(cutover, t.threadId, [t.activeRunId]));
     state.ghosts = observeGhosts(state.ghosts, ghosts, now);
     const installing = io.installerResumePendingMs() != null;
     // The tail read is awaited after the snapshots above, so the run may have moved
@@ -214,7 +231,8 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         const [fresh, freshActive] = await Promise.all([io.activeThreads(), io.activeSessions()]);
         const cur = fresh.find((x) => x.threadId === t.threadId);
         return cur !== undefined && ghostCandidates([cur], freshActive).length === 1
-          && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses;
+          && cur.activeRunId === g.runId && cur.nativeSessionId === g.ses
+          && !(await recoveryOwned(io, t.threadId, [g.runId]));
       } catch (err) {
         if (verbose) log(`stall: ghost re-check failed: ${errText(err)}`);
         return false;
@@ -259,7 +277,7 @@ export async function stallScan({ state, now, dryRun = false, verbose = false, l
         continue;
       }
       try {
-        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}` });
+        const res = await io.interruptThread(t.threadId, { clientRequestId: id, reason: `stall watch: ${GHOST_LABEL}`, expectedRunId: t.activeRunId });
         stall.robobResult = res.result ?? null;
         if (res.result === "interrupt_requested") {
           // Track the run we verified, not whatever run the server reports back.
