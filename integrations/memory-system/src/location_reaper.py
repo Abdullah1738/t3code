@@ -65,7 +65,7 @@ def loc_q(d):
 
 
 def last_activity_by_dir():
-    con = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True, timeout=20)
+    con = backend.robob_readonly.native_ro(OC_DB, timeout=20)
     rows = con.execute(
         "SELECT directory, id, max(coalesce(time_updated,0), coalesce(time_viewed,0), "
         "coalesce(time_created,0)) FROM session_v2").fetchall()
@@ -83,7 +83,7 @@ def running_dirs(sid_dir):
     ids = list((active or {}).get("data", {}).keys())
     unknown = [s for s in ids if s not in sid_dir]
     if unknown:
-        con = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True, timeout=20)
+        con = backend.robob_readonly.native_ro(OC_DB, timeout=20)
         q = "SELECT id, directory FROM session_v2 WHERE id IN (%s)" % ",".join("?" * len(unknown))
         sid_dir.update(dict(con.execute(q, unknown).fetchall()))
         con.close()

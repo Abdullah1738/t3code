@@ -85,6 +85,10 @@ def install(source=SOURCE, live=LIVE, data=DATA, link=BIN, cli='robob-watch'):
             take_lock(lock, 'check still running after 65s; deployment not started')
             for name in SOURCE_FILES:
                 atomic_copy(source / name, live / name, name in EXECUTABLE)
+            helper = source / 'robob_readonly.py'
+            if not helper.exists():
+                helper = source.parents[1] / 'helpers/robob_readonly.py'
+            atomic_copy(helper, live / 'robob_readonly.py')
             link_cli(live / 'cases.py', link)
             definition = json.loads((source / 'watcher.json').read_text())
             existing = live / 'watcher.json'

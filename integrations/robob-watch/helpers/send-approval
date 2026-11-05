@@ -35,10 +35,13 @@ Exit 0 and one "approved: ..." line, or exit 2 and "Refused: ..." on stderr.
 """
 import argparse, hashlib, json, math, os, re, shutil, sqlite3, subprocess, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from robob_readonly import connect_replica, replica_path
 
 HOME = os.path.expanduser("~")
 BRIDGE = os.environ.get("SEND_APPROVAL_BRIDGE_DIR") or os.path.join(HOME, ".config/spectrum-bridge")
-STATE_DB = os.environ.get("SEND_APPROVAL_STATE_DB") or os.path.join(HOME, ".robob/userdata/statev2.sqlite")
+STATE_DB = replica_path('SEND_APPROVAL_STATE_DB')
 LOG = os.environ.get("SEND_APPROVAL_LOG") or os.path.join(HOME, ".local/state/send-approval/decisions.jsonl")
 # The bridge's own formatter decides what the chat shows (deployed copy of spectrum-bridge/src/formatting.ts).
 FORMATTER = os.environ.get("SEND_APPROVAL_FORMATTER") or os.path.join(HOME, ".local/share/spectrum-bridge/src/formatting.ts")
@@ -641,12 +644,30 @@ def trimmed(lines):
 
 
 def app_messages(thread):
-    con = ro(STATE_DB)
+    # The API gives current vetoes too; a cached snapshot cannot revalidate them.
+    # Explicit snapshot overrides remain available for offline checks and fixtures.
+    if not (os.environ.get('SEND_APPROVAL_STATE_DB') or os.environ.get('ROBOB_READONLY_DB')):
+        cutoff = now_ms() - 2 * WINDOW_MS
+        query = urllib.parse.urlencode({'all': 'true', 'since': iso(cutoff - 1)})
+        status, body = control_get('/threads/' + urllib.parse.quote(thread, safe='') + '/messages?' + query)
+        if status != 200 or not isinstance(body, dict) or body.get('ok') is False or not isinstance(body.get('messages'), list):
+            refuse("can't read this thread's messages from the control API; nothing was approved")
+        try:
+            rows = [(m['role'], m['streaming'], m['createdAt'], m['updatedAt'], json.dumps(m)) for m in body['messages']
+                    if ms_of(m['createdAt']) >= cutoff]
+        except (KeyError, TypeError, ValueError):
+            refuse("control API returned unreadable messages; nothing was approved")
+    else:
+        con = connect_replica(STATE_DB, timeout=5)
+        try:
+            rows = con.execute(
+                "select role, streaming, created_at, updated_at, payload_json from orchestration_v2_projection_messages "
+                "where thread_id = ? and created_at >= ? order by created_at, message_id",
+                (thread, iso(now_ms() - 2 * WINDOW_MS))).fetchall()
+        finally:
+            con.close()
     msgs = []
-    for role, streaming, created, updated, payload in con.execute(
-            "select role, streaming, created_at, updated_at, payload_json from orchestration_v2_projection_messages "
-            "where thread_id = ? and created_at >= ? order by created_at, message_id",
-            (thread, iso(now_ms() - 2 * WINDOW_MS))):
+    for role, streaming, created, updated, payload in rows:
         try:
             p = json.loads(payload)
         except ValueError:
@@ -660,8 +681,26 @@ def app_messages(thread):
         elif role == "user" and p.get("createdBy") == "user" and p.get("creationSource") in APP_SOURCES \
                 and (text.strip() or p.get("attachments")):
             msgs.append({"who": "Abdullah", "t": ms_of(created), "text": text, "files": bool(p.get("attachments"))})
-    con.close()
     return msgs
+
+
+def revalidate_app_stream(thread, baseline, since):
+    # Snapshot overrides are useful for inspection, not authority to miss a veto.
+    query = urllib.parse.urlencode({'all': 'true', 'since': iso(since)})
+    status, body = control_get('/threads/' + urllib.parse.quote(thread, safe='') + '/messages?' + query)
+    if status != 200 or not isinstance(body, dict) or body.get('ok') is False or not isinstance(body.get('messages'), list):
+        refuse("can't revalidate his current messages from the control API; nothing was approved")
+    try:
+        current = [(ms_of(m['createdAt']), m.get('text') or '') for m in body['messages']
+                   if m['role'] == 'user' and m.get('createdBy') == 'user' and m.get('creationSource') in APP_SOURCES
+                   and ms_of(m['createdAt']) > since]
+        files = any(m.get('attachments') for m in body['messages'] if m['role'] == 'user'
+                    and m.get('createdBy') == 'user' and m.get('creationSource') in APP_SOURCES
+                    and ms_of(m['createdAt']) > since)
+    except (KeyError, TypeError, ValueError):
+        refuse("control API returned unreadable messages; nothing was approved")
+    if files or current != baseline:
+        refuse("he wrote again since the exported messages. Read the current thread; nothing was approved")
 
 
 # ---------------------------------------------------------------- identity (C1, control API)
@@ -683,16 +722,23 @@ def caller_native():
 
 def control_get(path):
     """(status, json) for a control API GET, or (0, reason) when the credential or the API is unusable."""
-    cfg_path = next((p for p in CONTROL_CFGS if os.path.exists(p)), None)
-    if cfg_path is None:
-        return 0, "no control credential file"
     try:
-        if os.stat(cfg_path).st_mode & 0o077:
-            return 0, f"{cfg_path} must be chmod 600"
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        req = urllib.request.Request(cfg["url"].rstrip("/") + "/api/ardud/control" + path,
-                                     headers={"Authorization": "Bearer " + cfg["token"]})
+        named = os.environ.get('T3_CONTROL_TOKEN_FILE')
+        cfg_path = named or next((p for p in CONTROL_CFGS if os.path.exists(p)), None)
+        cfg = {}
+        if not (os.environ.get('T3_CONTROL_TOKEN') and os.environ.get('T3_CONTROL_URL')):
+            if cfg_path is None:
+                return 0, "no control credential file"
+            if os.stat(cfg_path).st_mode & 0o077:
+                return 0, f"{cfg_path} must be chmod 600"
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        url = os.environ.get('T3_CONTROL_URL') or cfg.get('url') or 'http://127.0.0.1:3773'
+        token = os.environ.get('T3_CONTROL_TOKEN') or cfg.get('token')
+        if not token:
+            return 0, 'no control token'
+        req = urllib.request.Request(url.rstrip("/") + "/api/ardud/control" + path,
+                                     headers={"Authorization": "Bearer " + token})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.load(resp)
     except urllib.error.HTTPError as e:
@@ -793,6 +839,8 @@ def check_app(raw, drafted):
                      if m["who"] == "Abdullah" and m["t"] > msgs[s]["done_t"]]
             if after != before:
                 raise NotOk("he wrote again while his OK was being checked. Read it, then run the send again.")
+            if (os.environ.get('SEND_APPROVAL_STATE_DB') or os.environ.get('ROBOB_READONLY_DB')) and not IDENTITY_SEAM:
+                revalidate_app_stream(row[0], after, msgs[s]['done_t'])
             log({"decision": "approved", **verdict[1]})
             print(verdict[0])
             return
@@ -926,8 +974,8 @@ def main():
             check_app(a.preview, a.drafted_at * 1000)
         else:
             check_bridge(a.inbound.strip(), block, seen, a.file, a.drafted_at * 1000)
-    except sqlite3.Error as e:
-        refuse(f"sqlite error: {e}")
+    except (sqlite3.Error, OSError, ValueError) as e:
+        refuse(f"state read refused: {e}")
 
 
 if __name__ == "__main__":

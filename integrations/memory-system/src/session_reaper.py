@@ -47,6 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backend  # noqa: E402
@@ -81,7 +82,8 @@ def log(msg):
 
 
 def ro(path):
-    c = sqlite3.connect("file:{}?mode=ro".format(path), uri=True, timeout=60)
+    reader = backend.robob_readonly.native_ro if path == OC_DB else backend.robob_readonly.connect_ro
+    c = reader(path, timeout=60)
     c.execute("PRAGMA busy_timeout=60000")
     return c
 
@@ -537,7 +539,7 @@ def main():
                     os.path.getmtime(os.path.join(REPLICA, "memory.db")) > ev["backup_ts"] + 5:
                 st["stopped"] = "memory backup started; replica evidence no longer final"
                 break
-            live_now = running_ids() | backlog_ids()
+            live_now = running_ids() | protected_ids()
             if any(s["id"] in live_now for s in nodes):
                 st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
                 continue
@@ -559,6 +561,14 @@ def main():
             if any(s["id"] in rollback_now for s in nodes):
                 st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
                 continue
+            # Verification can take minutes; ask the native service again at
+            # the mutation boundary, not only before reading message hashes.
+            if any(s["id"] in running_ids() for s in nodes):
+                st["skipped"]["protected_before_delete"] = st["skipped"].get("protected_before_delete", 0) + 1
+                continue
+            # A long run must not outlive the native export's freshness proof.
+            with closing(backend.robob_readonly.native_ro(OC_DB)):
+                pass
             try:
                 t1 = time.time()
                 code, body = http("DELETE", "/api/session/" + urllib.parse.quote(root["id"]))

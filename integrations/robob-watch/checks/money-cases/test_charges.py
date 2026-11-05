@@ -17,6 +17,12 @@ spec.loader.exec_module(ch)
 TZ = ch.TZ
 
 
+def replica_meta(db):
+    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
+                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
+
+
 def at(text):
     return dt.datetime.fromisoformat(text).replace(tzinfo=TZ)
 
@@ -209,6 +215,7 @@ class Explain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')
@@ -515,6 +522,7 @@ class OwnerTexts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')
@@ -578,6 +586,7 @@ class OwnerTexts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
             db = sqlite3.connect(path)
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, title TEXT, updated_at TEXT)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, '
                        'payload_json TEXT)')

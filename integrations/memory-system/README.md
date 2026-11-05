@@ -17,8 +17,9 @@ runtime data.
   `opencode_sync_progress` starts empty, so the first runs rescan every session
   once; this is resumable (each finished session is recorded, `--deadline` stops
   between sessions). One failing session no longer stops the run: it is logged,
-  not stamped, retried next run, and the run exits 1. `OPENCODE_DB` overrides the
-  source db path (tests use a temp db).
+  not stamped, retried next run, and the run exits 1. `OPENCODE_READONLY_DB` selects
+  the source export (default `~/.robob/userdata/readonly/opencode.sqlite`);
+  legacy `OPENCODE_DB` overrides it but cannot point at the live database.
 - `src/sync_muse.py` - incremental Muse Code capture (source `muse`): tails each
   `~/.local/share/muse/sessions/**/session.jsonl` from its last byte offset
   (`muse_sync_files`), projects prompts, answers, reasoning summaries and tool
@@ -85,12 +86,32 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
   with `OPENCODE_SERVER_PASSWORD` or `~/.config/opencode-service/password`), the
   Robob control API (`T3_CONTROL_URL`/`T3_CONTROL_TOKEN`, else
   `T3_CONTROL_TOKEN_FILE`, else `~/.robob/components/memory.json`), and Robob's
-  state DB read-only (`ROBOB_STATE_DB`, default `~/.robob/userdata/statev2.sqlite`)
+  server-owned replica (`ROBOB_READONLY_DB`, default
+  `~/.robob/userdata/readonly/state.sqlite`; `ROBOB_STATE_DB` overrides it)
   for the board backlog. The reaper deletes nothing while the Robob board can't be read, and
   archives the Robob thread of each deleted root session.
 
+All Robob state readers, including recall (`RECALL_STATE_DB` overrides the shared
+setting), identity capture, native transcript reports and the backup table dump,
+refuse the live database and its filesystem aliases. They never fall back when
+the export is missing. State readers require `ardud_readonly_meta.ready=1` and an
+ISO `updated_at` within two minutes. The server must clear readiness while paging
+and publish a fresh timestamp only after catchup completes; recall rebuilds its
+lineage cache at that boundary or when the file is replaced. Backup coverage is limited to tables
+the server exports; missing tables are logged, not read from the live database.
+OpenCode capture and native lineage/activity readers use the separate native
+export (`session_v2`, `session_message`, inbox/pending tables), not Robob's
+`state.sqlite`. No native exporter is supplied here: until one is deployed,
+capture fails, native lineage is unavailable, health reports lag-check errors,
+and reapers fail closed. No live OpenCode fallback is permitted, even through
+`OPENCODE_DB` symlinks/hardlinks. An API capture/export lane is still needed.
+
 Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` and
 `bash tests/test_stages.sh`.
+Linux/offbox shell fixtures: `python3 tests/run_shell_fixtures.py` (requires
+sqlite3, restic and rsync; remaps macOS-only utilities in temporary copies).
+Python tests require SQLite >= 3.47 for the FTS schema and the recall server's
+MCP/Starlette dependencies.
 
 Deploy: `integrations/deploy.zsh memory-system`, then
 `launchctl kickstart -k gui/$(id -u)/com.abdullah.recall`.

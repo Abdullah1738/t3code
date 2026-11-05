@@ -33,12 +33,14 @@ import subprocess
 import time
 from datetime import datetime, timezone
 
+import robob_readonly
+
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".local/share/memory-system")
 DATA = os.path.join(ROOT, "data")
 LOGS = os.path.join(ROOT, "logs")
 MEM_DB = os.path.join(DATA, "memory.db")
-OC_DB = os.path.join(HOME, ".local/share/opencode/opencode.db")
+OC_DB = robob_readonly.opencode_db()
 MUSE_SESSIONS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "muse/sessions")
 LIVE_REPO = "/Volumes/ExternalSSD/memory-system-backup/restic/live"
 DROPBOX_LIVE = "/Backups/memory-system/live"
@@ -68,7 +70,7 @@ DRY_RUN = False                 # --dry-run: checks report but keep no state
 
 
 def ro(path):
-    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    c = robob_readonly.connect_ro(path)
     c.execute("PRAGMA busy_timeout=30000")
     return c
 

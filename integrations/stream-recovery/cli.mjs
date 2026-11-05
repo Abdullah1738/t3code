@@ -143,7 +143,7 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
   return { thread, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
 }
 
-async function act({ incident, g, dryRun }) {
+async function act({ db, incident, g, dryRun }) {
   const { plan } = g;
   const res = { plan, ok: true, queueOk: null, lost: g.lost, reply: g.reply, forms: g.forms, error: null };
   if (plan.action === 'skip' || plan.action === 'report') {
@@ -151,11 +151,20 @@ async function act({ incident, g, dryRun }) {
   }
   if (dryRun) return res;
   try {
+    io.assertReplicaFresh(db);
+    const fresh = await io.getThread(plan.threadId);
+    if (!fresh || fresh.archived || fresh.latestRunId !== g.thread.latestRunId
+      || fresh.nativeSessionId !== g.thread.nativeSessionId || fresh.pendingRequest) {
+      throw new Error('thread changed during recovery; retry next scan');
+    }
+    io.assertThreadInReplica(db, fresh);
     if (plan.resumeQueue || g.staleHeld.length) {
       for (const r of g.staleHeld) {
+        io.assertReplicaFresh(db);
         await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id });
       }
       if (g.held.length) {
+        io.assertReplicaFresh(db);
         await io.dispatchCommand({ type: 'queue.resume', commandId: `${incident.id}:resume:${plan.threadId}`, threadId: plan.threadId });
       }
       res.queueOk = true;
@@ -165,9 +174,11 @@ async function act({ incident, g, dryRun }) {
         incident, plan, lost: g.lost, reply: g.reply, orphans: g.orphans, forms: g.forms,
         held: g.held, recovered: g.recovered, ocUrl: io.OC_URL,
       });
-      await io.sendToThread(plan.threadId, text, { clientRequestId: incident.id, mode: 'auto' });
+      io.assertReplicaFresh(db);
+      await io.sendToThread(plan.threadId, text, { clientRequestId: incident.id, mode: 'queue' });
     }
   } catch (err) {
+    if (err.code === 'REPLICA_UNAVAILABLE') throw err;
     res.ok = false;
     res.error = String(err?.message || err).slice(0, 300);
     if (res.queueOk === null && (plan.resumeQueue || g.staleHeld.length)) res.queueOk = false;
@@ -175,17 +186,15 @@ async function act({ incident, g, dryRun }) {
   return res;
 }
 
-async function scan(opts) {
-  const now = Date.now();
-  const release = opts.dryRun ? () => {} : io.acquireLock(now);
-  if (!release) { log('another scan is running, skipping'); return; }
+async function recoveryScan({ opts, state, now }) {
+  let db;
   try {
-    const state = io.loadState();
+    const report = [];
     const floor = now - opts.maxAgeHours * 3600_000;
     const last = state.lastScan ? Date.parse(state.lastScan) - 60 * 60_000 : floor;
     const sinceMs = opts.since ? Date.parse(opts.since) : Math.max(floor, last);
     const sinceIso = new Date(sinceMs).toISOString();
-    const db = io.openDb(io.PATHS.db);
+    db = io.openDb(io.PATHS.db);
     // Restart recovery owns failures inside its window. Do it first so a
     // failed run cannot get both a stream-loss note and a restart note.
     const restartSince = opts.since ? sinceIso
@@ -201,7 +210,6 @@ async function scan(opts) {
     ];
     const incidents = findIncidents(signals);
     if (opts.verbose) log(`since ${sinceIso}: ${runs.length} failed runs, ${subs.length} failed subagents, ${incidents.length} incident(s)`);
-    const report = [];
     for (const incident of incidents) {
       const prev = state.handled[incident.id];
       if (prev?.done) { if (opts.verbose) log(`${incident.id}: already handled`); continue; }
@@ -228,12 +236,13 @@ async function scan(opts) {
         try {
           g = await gatherThread({ db, incident, threadId, active, now, verbose: opts.verbose });
         } catch (err) {
+          if (err.code === 'REPLICA_UNAVAILABLE') throw err;
           results.push({ plan: { threadId, title: threadId, action: 'skip', reason: 'error' }, ok: false, error: String(err?.message || err).slice(0, 300), lost: [], forms: [] });
           log(`  ${threadId}: gather failed: ${err?.message || err}`);
           continue;
         }
         if (!g) { if (opts.verbose) log(`  ${threadId}: not found in Robob`); continue; }
-        const res = await act({ incident, g, dryRun: opts.dryRun });
+        const res = await act({ db, incident, g, dryRun: opts.dryRun });
         results.push(res);
         const p = g.plan;
         log(`  ${p.action.padEnd(7)} ${threadId} | ${truncate(p.title || '', 60)} | ${p.reason}`
@@ -241,6 +250,7 @@ async function scan(opts) {
           + `${g.forms.length ? ` | forms ${g.forms.length}` : ''}${g.held.length ? ` | held ${g.held.length}` : ''}${g.staleHeld.length ? ` | stale held ${g.staleHeld.length}` : ''}`
           + `${g.reply ? ' | invisible reply' : ''}${res.error ? ` | ERROR ${res.error}` : ''}`);
       }
+      io.assertReplicaFresh(db);
       const summary = buildSummary({ incident, results });
       if (opts.dryRun) {
         log(`summary (${summary.severity}):\n${summary.text}`);
@@ -258,6 +268,26 @@ async function scan(opts) {
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
+    io.assertReplicaFresh(db);
+    return { incidents: report, restarts };
+  } finally {
+    db?.close();
+  }
+}
+
+async function scan(opts) {
+  const now = Date.now();
+  const release = opts.dryRun ? () => {} : io.acquireLock(now);
+  if (!release) { log('another scan is running, skipping'); return; }
+  try {
+    const state = io.loadState();
+    let recovery = { incidents: [], restarts: [] }, recoveryError = null;
+    try {
+      recovery = await recoveryScan({ opts, state, now });
+    } catch (err) {
+      recoveryError = err;
+      log(`recovery deferred: ${err?.message || err}`);
+    }
     let stalls = [];
     // Scans run every 15s so restarts are picked up fast; the stall watch reads
     // every active OpenCode session, so it keeps its once-a-minute pace.
@@ -270,8 +300,13 @@ async function scan(opts) {
         log(`stall watch failed: ${err?.message || err}`);
       }
     }
-    if (!opts.dryRun) { state.lastScan = new Date(now).toISOString(); io.saveState(state, now); }
-    if (opts.json) console.log(JSON.stringify({ incidents: report, restarts, stalls }, null, 2));
+    if (!opts.dryRun) {
+      if (!recoveryError) state.lastScan = new Date(now).toISOString();
+      io.saveState(state, now);
+    }
+    if (opts.json) console.log(JSON.stringify({ ...recovery, stalls,
+      ...(recoveryError ? { recoveryError: String(recoveryError?.message || recoveryError) } : {}) }, null, 2));
+    if (recoveryError) throw recoveryError;
   } finally {
     release();
   }

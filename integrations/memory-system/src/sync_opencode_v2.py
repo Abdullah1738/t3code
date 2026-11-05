@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Continuous importer for native OpenCode 2 sessions.
 
-Reads session_v2 / session_message from the live opencode.db (read-only) and
+Reads session_v2 / session_message from an OpenCode-owned export and
 keeps two things current:
 
 1. data/opencode_raw.db  - exact copy of every native session_message.data and
@@ -45,10 +45,12 @@ import time
 import traceback
 import zlib
 
+import robob_readonly
+
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
 RAW_DB = os.environ.get("OPENCODE_RAW_DB", os.path.join(HOME, ".local/share/memory-system/data/opencode_raw.db"))
-SRC_DB = os.environ.get("OPENCODE_DB", os.path.join(HOME, ".local/share/opencode/opencode.db"))
+SRC_DB = robob_readonly.opencode_db()
 SOURCE = "opencode"
 SETTLE_SECS = 600
 IMAGE_MIN_LEN = 256
@@ -237,7 +239,9 @@ def with_retry(db, fn, tries=120):
 class Sync:
     def __init__(self, args):
         self.args = args
-        self.src = sqlite3.connect("file:{}?mode=ro".format(SRC_DB), uri=True, timeout=60)
+        # OpenCode's session/message schema is separate from the Robob export.
+        # Neither native OpenCode nor Robob live DB aliases are allowed here.
+        self.src = robob_readonly.connect_ro(SRC_DB, timeout=60)
         self.src.execute("PRAGMA busy_timeout=60000")
         self.raw = sqlite3.connect(RAW_DB, timeout=600)
         self.raw.execute("PRAGMA journal_mode=WAL")

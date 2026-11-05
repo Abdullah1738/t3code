@@ -194,6 +194,7 @@ import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -611,6 +612,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ArdudOpenCodeImportLive,
   // ardud: missions board
   ArdudKanbanLive,
+  ReadonlyReplica.layer,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
