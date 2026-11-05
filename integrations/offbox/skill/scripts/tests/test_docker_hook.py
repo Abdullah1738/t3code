@@ -151,9 +151,9 @@ class DockerHookTests(unittest.TestCase):
 
     def test_g_repair_runs_before_wait_images(self):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'):
-            script = remote_script('w', '.', ['true'], None, 'r')
+            script = remote_script('w', '.', ['docker', 'info'], None, 'r', wait_images=True)
         self.assertIn(DOCKER_REPAIR, script)
-        self.assertLess(script.index(DOCKER_REPAIR), script.index('offbox-wait-images'))
+        self.assertLess(script.index(DOCKER_REPAIR), script.index(runs.IMAGE_WAIT))
         with tempfile.TemporaryDirectory() as home:
             p = subprocess.run(['bash', '-n', '-c', script], env={'HOME': home, 'PATH': os.environ['PATH']},
                                capture_output=True, text=True)

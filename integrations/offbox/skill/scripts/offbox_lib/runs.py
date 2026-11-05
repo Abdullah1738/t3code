@@ -30,6 +30,78 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
+# The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
+# itself so even boxes made before the fix use the bound. One timeout covers the lock and every Docker call.
+IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
+(
+  _offbox_archive=/home/user/.offbox/images/saved.tar.zst
+  [ -e /run/offbox-images-ready ] && exit 0
+  [ -s "$_offbox_archive" ] || exit 0
+  _offbox_seconds=${OFFBOX_IMAGE_WAIT_SECONDS:-180}
+  [[ $_offbox_seconds =~ ^[1-9][0-9]{0,3}$ ]] || _offbox_seconds=180
+  echo 'offbox: waiting for kept docker images' >&2
+  timeout -k 2s "${_offbox_seconds}s" sudo -n bash -s -- "$_offbox_seconds" <<'OFFBOX_IMAGE_RESTORE'
+set -u -o pipefail
+archive=/home/user/.offbox/images/saved.tar.zst
+exec 9>/run/offbox-image-restore.lock || exit 1
+flock -w "$1" 9 || exit 124
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
+until docker info >/dev/null 2>&1; do sleep 1; done
+missing=0
+if [ -s "$archive.tags" ]; then
+  while read -r tag; do
+    [ -n "$tag" ] || continue
+    docker image inspect "$tag" >/dev/null 2>&1 || { missing=1; break; }
+  done < "$archive.tags"
+else
+  missing=1
+fi
+if [ "$missing" = 1 ]; then
+  size=$(du -h "$archive" 2>/dev/null | cut -f1)
+  echo "offbox: loading kept docker images (${size:-unknown size})..." >&2
+  zstd -dc "$archive" | docker load > /var/tmp/offbox-image-restore.log 2>&1 || exit 1
+fi
+touch /run/offbox-images-ready
+OFFBOX_IMAGE_RESTORE
+  _offbox_rc=$?
+  case $_offbox_rc in
+    0) ;;
+    124|137) echo "offbox: kept docker images still loading after ${_offbox_seconds}s; continuing without waiting" >&2 ;;
+    *) echo 'offbox: could not restore kept docker images; continuing without waiting' >&2 ;;
+  esac
+  exit 0
+)'''
+
+
+def needs_image_wait(cmd: str, repo_root: str) -> bool:
+    """Skip only simple read-only commands which cannot start a container themselves.
+
+    Scripts, make targets, tests and unknown commands can invoke Docker without naming it in argv.
+    """
+    if re.search(r"[;&|<>$`\n(){}*?\[\]\\]", cmd) or re.search(r"(^|\s)#", cmd):
+        return True
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return True
+    if not words:
+        return True
+    if words[0] in ("true", "false", ":", "pwd"):
+        return len(words) != 1
+    if lease.uses_docker(cmd, repo_root):
+        return True
+    # Go commands can execute a GOFLAGS -toolexec/-exec from the box's persistent Go env. Version is safe.
+    if words == ["go", "version"]:
+        return False
+    return True
+
+
+def image_wait_seconds() -> int:
+    """The client sets the remote bound; it is not implicitly forwarded as command environment."""
+    value = os.environ.get("OFFBOX_IMAGE_WAIT_SECONDS") or "180"
+    return int(value) if re.fullmatch(r"[1-9][0-9]{0,3}", value) else 180
+
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
 (
@@ -479,7 +551,8 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None, node: str = "") -> str:
+                  steps: list[str] | None = None, node: str = "", wait_images: bool = False,
+                  image_wait: int = 180) -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -487,7 +560,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
              f'export OFFBOX_RUN_ID={run_id}',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
-              '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
+              (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
+               if wait_images else ':'),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               GO_REPAIR,
               node,
@@ -523,9 +597,10 @@ class Runner:
         con = db()
         steps = getattr(a, "steps", None) or []
         if steps:
-            cmd_text = " ; ".join(steps)[:4000]
+            cmd_text = " ; ".join(steps)
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        wait_images = needs_image_wait(cmd_text, me["repo_root"])
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
                        log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
@@ -546,7 +621,7 @@ class Runner:
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
-                        docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+                        docker=int(wait_images))
             try:
                 self._prepare_box(con, a, rdir, env_file, body)
                 break
@@ -567,7 +642,7 @@ class Runner:
         except Exception:
             node_block = ""
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block)
+                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds())
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
