@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -299,6 +300,58 @@ class CardTests(unittest.TestCase):
         self.assertEqual([a[0] for a in self.calls],['publish','app'])
         app = self.calls[1]
         self.assertEqual(app[app.index('--to')+1],'owner','owner cards ride --to, which no rotation cancels')
+
+    def test_missing_pillow_and_renderer_still_publishes_and_sends(self):
+        with patch.dict(sys.modules, {'PIL': None}), patch.object(c, 'preview_chrome', return_value=False):
+            result = c.sync(self.cfg, self.data, send=True)
+        self.assertEqual(result['status'], 'sent')
+        folder = c.APPS / result['slug']
+        self.assertTrue((folder / 'index.html').exists())
+        self.assertNotIn('property="og:image"', (folder / 'index.html').read_text())
+        self.assertFalse((folder / 'preview.png').exists())
+        self.assertEqual(sum(a[0] == 'send' for a in self.calls), 1)
+
+    def test_safe_sync_reports_exception_and_traceback(self):
+        stderr = io.StringIO()
+        with patch.object(c, 'sync', side_effect=ModuleNotFoundError("No module named 'PIL'")), contextlib.redirect_stderr(stderr):
+            result = c.safe_sync(self.cfg, self.data)
+        self.assertEqual(result['status'], "failed:ModuleNotFoundError:No module named 'PIL'")
+        self.assertIn('Traceback', stderr.getvalue())
+        self.assertIn("No module named 'PIL'", stderr.getvalue())
+
+    def test_explicit_recovery_of_suppressed_old_card_is_idempotent(self):
+        cfg = {**self.owner_cfg(), 'registered_at':'2026-01-01T00:00:00+00:00',
+               'delivery_card':{'ready':True, 'skip_send':True}}
+        self.assertEqual(c.sync(cfg, self.data, send=True)['status'], 'skipped')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(c.sync(cfg, self.data, send=True, recover=True)['status'], 'sent')
+        args = next(a for a in self.calls if a[0] == 'app')
+        self.assertEqual(args[args.index('--key') + 1], 'delivery-card:order-talabat-123')
+        self.assertEqual(c.sync(cfg, self.data, send=True, recover=True)['status'], 'sent')
+        self.assertEqual(sum(a[0] == 'app' for a in self.calls), 1)
+        self.assertTrue(cfg['delivery_card']['skip_send'])
+
+    def test_explicit_recovery_does_not_bypass_payment_hold(self):
+        cfg = {**self.owner_cfg(), 'delivery_card':{'held':True, 'skip_send':True}}
+        self.assertEqual(c.sync(cfg, self.data, send=True, recover=True)['status'], 'held:payment_unconfirmed')
+        self.assertEqual(self.calls, [])
+
+    def test_explicit_recovery_reconciles_existing_outbox_without_saved_args(self):
+        cfg = {**self.owner_cfg(), 'delivery_card':{'skip_send':True}}
+        self.queue(['app', '--url', 'https://host.ts.net:18400/card/', '--caption', 'Delivery tracking',
+                    '--summary', 'Open your order', '--session', 'fixture-session', '--key',
+                    'delivery-card:order-talabat-123', '--to', 'owner'], 'sent')
+        self.assertEqual(c.sync(cfg, self.data, send=True, recover=True)['status'], 'sent')
+        self.assertEqual(sum(a[0] == 'app' for a in self.calls), 0)
+
+    def test_explicit_recovery_retries_ambiguous_send_with_same_key(self):
+        cfg = {**self.owner_cfg(), 'delivery_card':{'skip_send':True}}
+        self.fail_send = True
+        self.assertTrue(c.sync(cfg, self.data, send=True, recover=True)['status'].startswith('failed:'))
+        first = next(a for a in self.calls if a[0] == 'app')
+        self.fail_send = False
+        self.assertEqual(c.sync(cfg, self.data, send=True, recover=True)['status'], 'sent')
+        self.assertEqual(first, [a for a in self.calls if a[0] == 'app'][-1])
 
     def test_ambiguous_send_retries_exact_payload_and_key(self):
         self.fail_send = True
