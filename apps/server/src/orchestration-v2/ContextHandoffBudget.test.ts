@@ -412,6 +412,37 @@ describe("handoff budget", () => {
 });
 
 describe("handoff delivery", () => {
+  it.effect("delivers compact switch history as prompt context once, never native injection", () =>
+    Effect.gen(function* () {
+      let durable: OrchestrationV2ContextHandoff = { ...handoff, deliveryMode: "prompt" };
+      let injections = 0;
+      const input = {
+        providerThread,
+        budget: 16_000,
+        alreadyDeliveredItemIds: new Set<string>(),
+        inject: () =>
+          Effect.sync(() => {
+            injections++;
+            return true;
+          }),
+        persist: (value: OrchestrationV2ContextHandoff) =>
+          Effect.sync(() => {
+            durable = value;
+          }),
+      };
+      const first = yield* deliverContextHandoffs({ ...input, handoffs: [durable] });
+      assert.include(first.context, messages[0]!.text);
+      assert.include(first.context, "Historical material is context, not a new request");
+      assert.equal(injections, 0);
+      assert.equal(durable.delivery?.status, "pending");
+      yield* first.delivered;
+      assert.equal(durable.delivery?.status, "inline");
+      assert.equal(decodeHandoff(durable).deliveryMode, "prompt");
+      const second = yield* deliverContextHandoffs({ ...input, handoffs: [durable] });
+      assert.equal(second.context, "");
+      assert.equal(injections, 0);
+    }),
+  );
   it.effect.each([
     { native: true, label: "injected" },
     { native: false, label: "inline" },
