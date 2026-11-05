@@ -214,6 +214,23 @@ export function setupBanner(board: KanbanBoard): SetupBannerView | null {
   return { discussionId: board.setup.discussionId, label: "Setup is ongoing · View setup" };
 }
 
+export interface PauseBannerView {
+  readonly label: string;
+}
+
+export function pauseBanner(
+  board: KanbanBoard,
+  cards: ReadonlyMap<string, KanbanCard>,
+): PauseBannerView | null {
+  if (board.pause == null) return null;
+  const kept = board.pause.keep.flatMap((id) => {
+    const card = cards.get(id);
+    return card === undefined ? [] : [`#${card.number}`];
+  });
+  const running = kept.length === 0 ? "nothing runs" : `only ${kept.join(", ")} run`;
+  return { label: `Paused: ${board.pause.reason} · ${running}` };
+}
+
 /**
  * A card the board's running setup holds: it would otherwise start (todo or
  * needs_review, not running, settled or backlog). Mirrors the waiting filter in

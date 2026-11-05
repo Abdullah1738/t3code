@@ -7,7 +7,7 @@ Checks that the whole pipeline is flowing, not just that processes exist:
   muse_lag  Muse capture ran cleanly; logs quiet for 10 min are fully captured
   recall    recall server answers on :18765 and its session catalog keeps up
   backup    last memory backup succeeded recently
-  backup_lock  no backup run is hung (>2 h) or died holding logs/backup.lock
+  backup_lock  no backup run is hung (>4 h) or died holding logs/backup.lock
   health_backup  health backup had a successful run in the last 13 h
   person_backup  every offbox-person (Moni) backup had a successful run in the last 13 h
   dropbox   Dropbox copy of the live backup repo is complete (name + size)
@@ -31,6 +31,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
 ROOT = os.path.join(HOME, ".local/share/memory-system")
@@ -53,7 +54,7 @@ MUSE_LAG_GRACE = 10 * 60        # a log may run ahead of memory.db this long
 RECALL_URL = "http://127.0.0.1:18765/api/health"
 RECALL_MAX_LAG = 20000          # events the session catalog may trail by
 BACKUP_MAX_AGE = 9 * 3600       # backup every 4 h
-BACKUP_LOCK_MAX_AGE = 2 * 3600  # runs take up to ~1.7 h
+BACKUP_LOCK_MAX_AGE = 4 * 3600  # replica limit 3 h plus restic; runs can take ~3.5 h
 HEALTH_BACKUP_STATUS = os.path.join(HOME, ".local/share/health-backup/backup_last.json")
 PERSON_BACKUP_DIR = os.path.join(HOME, ".local/share/offbox-person/state")
 OTHER_BACKUP_MAX_AGE = 13 * 3600  # these run every 6 h: two missed runs plus slack
@@ -178,6 +179,8 @@ ROBOB_SETTINGS = os.path.join(HOME, ".robob/userdata/settings.json")
 NATIVE_SEEN = os.path.join(LOGS, "native_capture_seen.json")
 CLAUDE_SETTINGS = os.path.join(HOME, ".robob/harness-homes/claude/settings.json")
 CLEANUP_MIN_DAYS = 3650
+NATIVE_ZSTD_MAX_OFFSET = 256 << 20
+NATIVE_ZSTD_LINE_LIMIT = 1 << 20
 # D1's representation offsets are uncompressed, including for .zst files.
 NATIVE_LEDGER_COLUMNS = {"rep_id", "path", "inode", "offset", "phys_size", "complete", "error_count", "retired"}
 
@@ -205,29 +208,132 @@ def _native_enabled(instance):
 
 
 def _load_native_ledger():
-    """(ledger rows by path, alias refresh epoch, problems). A missing, unreadable or
+    """(ledger rows by path, root passes, identity refresh epoch, problem). A missing, unreadable or
     wrong-shaped ledger is a problem, never an empty success."""
     if not os.path.isfile(NATIVE_LEDGER):
-        return {}, None, "native capture ledger missing (memory.db)"
+        return {}, {}, None, "native capture ledger missing (memory.db)"
     try:
         c = ro(NATIVE_LEDGER)
     except sqlite3.Error as e:
-        return {}, None, f"native capture ledger unreadable ({e})"
+        return {}, {}, None, f"native capture ledger unreadable ({e})"
     try:
         cols = [d[1] for d in c.execute("PRAGMA table_info(native_capture_files)")]
         if not NATIVE_LEDGER_COLUMNS <= set(cols):
-            return {}, None, f"native_capture_files lacks columns {sorted(NATIVE_LEDGER_COLUMNS - set(cols))}"
+            return {}, {}, None, f"native_capture_files lacks columns {sorted(NATIVE_LEDGER_COLUMNS - set(cols))}"
         rows = {os.path.realpath(row[cols.index("path")]): dict(zip(cols, row))
                 for row in c.execute("SELECT * FROM native_capture_files WHERE retired=0 ORDER BY rep_id")}
-        alias_cols = {r[1] for r in c.execute("PRAGMA table_info(thread_aliases)")}
-        if "last_seen" not in alias_cols:
-            return rows, None, "thread_aliases table or last_seen watermark missing"
-        alias_epoch = c.execute("SELECT max(last_seen) FROM thread_aliases").fetchone()[0]
-        return rows, alias_epoch, None
+        root_cols = {r[1] for r in c.execute("PRAGMA table_info(native_capture_roots)")}
+        passes = {}
+        if {"instance", "root", "last_pass_at"} <= root_cols:
+            passes = {(instance, os.path.realpath(root)): last_pass
+                      for instance, root, last_pass in c.execute(
+                          "SELECT instance, root, last_pass_at FROM native_capture_roots")
+                      if isinstance(instance, str) and isinstance(root, str)}
+
+        meta_cols = {r[1] for r in c.execute("PRAGMA table_info(harness_schema_meta)")}
+        if meta_cols and not {"key", "value"} <= meta_cols:
+            return rows, passes, None, "harness_schema_meta has no identity watermark columns"
+        identity = (c.execute("SELECT value FROM harness_schema_meta WHERE key='thread_identity_last_ok'").fetchone()
+                    if meta_cols else None)
+        if identity is not None:
+            alias_epoch = identity[0]
+        else:
+            alias_cols = {r[1] for r in c.execute("PRAGMA table_info(thread_aliases)")}
+            alias_epoch = (c.execute("SELECT max(last_seen) FROM thread_aliases").fetchone()[0]
+                           if "last_seen" in alias_cols else None)
+        return rows, passes, alias_epoch, None
     except sqlite3.Error as e:
-        return {}, None, f"native capture ledger read failed ({e})"
+        return {}, {}, None, f"native capture ledger read failed ({e})"
     finally:
         c.close()
+
+
+def _native_epoch(value, now):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and 0 <= value <= now else None
+
+
+def _native_first_line(path, offset, compressed):
+    """First complete unconsumed line, or None when it cannot be read within the bound."""
+    if not compressed:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            line = fh.readline()
+        return line if line.endswith(b"\n") else None
+
+    if offset > NATIVE_ZSTD_MAX_OFFSET:
+        return None
+    import transcript_capture
+    zstd = transcript_capture.zstd_bin()
+    if not zstd:
+        return None
+    try:
+        proc = subprocess.Popen([zstd, "-dc", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    except OSError:
+        return None
+    try:
+        remaining = offset
+        while remaining:
+            chunk = proc.stdout.read(min(65536, remaining))
+            if not chunk:
+                return None
+            remaining -= len(chunk)
+        line = bytearray()
+        while len(line) < NATIVE_ZSTD_LINE_LIMIT:
+            chunk = proc.stdout.read(min(65536, NATIVE_ZSTD_LINE_LIMIT - len(line)))
+            if not chunk:
+                return None
+            pos = chunk.find(b"\n")
+            if pos >= 0:
+                line.extend(chunk[:pos + 1])
+                return bytes(line)
+            line.extend(chunk)
+        return None
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def _native_line_epoch(path, offset, compressed, now):
+    line = _native_first_line(path, offset, compressed)
+    if line is None:
+        return None
+    try:
+        rec = json.loads(line)
+        value = rec.get("timestamp") if isinstance(rec, dict) else None
+        if not isinstance(value, str) or len(value) < 19:
+            return None
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return _native_epoch(dt.timestamp(), now)
+    except (ValueError, UnicodeDecodeError, OverflowError, OSError):
+        return None
+
+
+def _native_matching_plain_archive(path, root, instance, ledger):
+    """A redundant archive is covered only by a byte-identical plain checkpoint."""
+    import transcript_capture
+    if not path.endswith(".jsonl.zst") or not instance.startswith("codex"):
+        return None
+    parts = os.path.relpath(path[:-4], root).split(os.sep)
+    candidates = [os.path.join(root, *parts)]
+    if parts[0] in ("sessions", "archived_sessions"):
+        parts[0] = "archived_sessions" if parts[0] == "sessions" else "sessions"
+        candidates.append(os.path.join(root, *parts))
+    for candidate in candidates:
+        candidate = os.path.realpath(candidate)
+        row = ledger.get(candidate)
+        if row and os.path.isfile(candidate) and transcript_capture.compressed_equals_plain(path, candidate):
+            return row, candidate
+    return None
 
 
 def _complete_pending_bytes(path, offset, size):
@@ -252,9 +358,9 @@ def _complete_pending_bytes(path, offset, size):
 def native_roots_report(now=None, seen=None):
     """Report per root; update `seen` with observed backlog/error start times.
 
-    The capture ledger has no per-record arrival timestamps. Remember the first
-    observed complete backlog until its observed byte boundary is consumed; a
-    fresh mtime or a partial consumer checkpoint cannot reset the clock.
+    The first pending record's timestamp is preferred. When unavailable, keep
+    the first observation until its complete byte boundary is consumed; a fresh
+    mtime or a partial consumer checkpoint cannot reset the fallback clock.
     """
     import transcript_roots
     now = time.time() if now is None else now
@@ -263,7 +369,7 @@ def native_roots_report(now=None, seen=None):
     prior_roots = set(seen.get("roots", []))
     next_files = {}
     report, problems = [], []
-    ledger, alias_epoch, ledger_problem = _load_native_ledger()
+    ledger, root_passes, alias_epoch, ledger_problem = _load_native_ledger()
     root_rows = transcript_roots.resolve() if hasattr(transcript_roots, "resolve") else transcript_roots.roots()
     for r in root_rows:
         inst = r["instance"]
@@ -273,7 +379,7 @@ def native_roots_report(now=None, seen=None):
                  "backlog_bytes": 0, "oldest_lag_s": 0}
         report.append(entry)
         if not exists:
-            if _native_enabled(inst) is False and root not in prior_roots and not any(
+            if _native_enabled(inst) is False and root not in prior_roots and (inst, root) not in root_passes and not any(
                     p.startswith(root + os.sep) for p in ledger):
                 continue
             problems.append(f"{inst}: expected root missing ({root})")
@@ -281,16 +387,23 @@ def native_roots_report(now=None, seen=None):
         prior_roots.add(root)
         if ledger_problem:
             problems.append(f"{inst}: {ledger_problem}")
-        elif not any(p.startswith(root + os.sep) for p in ledger):
-            problems.append(f"{inst}: no capture ledger entries for root")
+        else:
+            pass_epoch = _native_epoch(root_passes.get((inst, root)), now)
+            if pass_epoch is None:
+                problems.append(f"{inst}: no recent successful capture pass for root (missing or invalid)")
+            elif now - pass_epoch > NATIVE_LAG_MAX:
+                problems.append(f"{inst}: no recent successful capture pass for root ({int(now - pass_epoch)} s old)")
+        identity_epoch = _native_epoch(alias_epoch, now)
         if alias_epoch is None:
-            problems.append(f"{inst}: no thread_aliases refresh watermark")
-        elif not isinstance(alias_epoch, (int, float)) or alias_epoch > now or now - alias_epoch > NATIVE_ALIAS_MAX:
-            problems.append(f"{inst}: thread_aliases refresh stale or invalid")
+            problems.append(f"{inst}: no thread identity refresh watermark")
+        elif identity_epoch is None or now - identity_epoch > NATIVE_ALIAS_MAX:
+            problems.append(f"{inst}: thread identity refresh stale or invalid")
         subdirs = ("projects",) if inst in ("claude", "claudeAgent") else ("sessions", "archived_sessions")
         for subdir in subdirs:
             directory = os.path.join(root, subdir)
             def walk_error(e):
+                if isinstance(e, FileNotFoundError) and e.filename == directory and os.path.isdir(root):
+                    return
                 problems.append(f"{inst}: cannot scan transcript directory: {e}")
             for dirpath, _, names in os.walk(directory, onerror=walk_error):
                 for name in names:
@@ -300,14 +413,25 @@ def native_roots_report(now=None, seen=None):
                     try:
                         st = os.stat(full)
                         row = ledger.get(full)
+                        if row is None and name.endswith(".jsonl.zst"):
+                            matching = _native_matching_plain_archive(full, root, inst, ledger)
+                            if matching:
+                                # The plain file is scanned independently with the same logical bytes.
+                                continue
                         offset = int(row["offset"]) if row else 0
                         compressed = name.endswith(".zst")
+                        if offset < 0:
+                            problems.append(f"{inst}: {name} capture checkpoint does not match file")
+                            offset = 0
                         if compressed:
-                            pending = not (row and row["inode"] == st.st_ino and
-                                           row["phys_size"] == st.st_size and row["complete"])
-                            complete_bytes = st.st_size if pending else 0
+                            matches = row and row["inode"] == st.st_ino and row["phys_size"] == st.st_size
+                            if row and not matches:
+                                problems.append(f"{inst}: {name} capture checkpoint does not match file")
+                                offset = 0
+                            pending = not (matches and row["complete"])
+                            complete_bytes = max(st.st_size, 1) if pending else 0
                         else:
-                            if offset < 0 or offset > st.st_size or (row and row["inode"] != st.st_ino):
+                            if offset > st.st_size or (row and row["inode"] != st.st_ino):
                                 problems.append(f"{inst}: {name} capture checkpoint does not match file")
                                 offset = 0
                             complete_bytes = _complete_pending_bytes(full, offset, st.st_size)
@@ -333,24 +457,41 @@ def native_roots_report(now=None, seen=None):
                         unknown = previous.get("unknown", False) if still_pending else not same or invalid_time
                         boundary = old_boundary if still_pending else (st.st_size if compressed else offset + complete_bytes)
                         record.update(pending_since=since, boundary=boundary, unknown=unknown)
-                        lag = max(0, now - since)
-                        entry["oldest_lag_s"] = max(entry["oldest_lag_s"], int(lag))
-                        if unknown or lag > NATIVE_LAG_MAX or not row:
+                        source_since = _native_line_epoch(full, offset, compressed, now)
+                        if compressed and offset > NATIVE_ZSTD_MAX_OFFSET:
+                            lag = max(0, now - since)
+                            age_unknown = True
+                        elif source_since is not None:
+                            # A known observation is a lower bound on the age even
+                            # when the source clock is newer or later moves forward.
+                            lag = now - min(source_since, since) if still_pending else now - source_since
+                            age_unknown = False
+                        else:
+                            lag = max(0, now - since)
+                            age_unknown = unknown
+                        if age_unknown:
+                            entry["oldest_lag_s"] = None
+                        elif entry["oldest_lag_s"] is not None:
+                            entry["oldest_lag_s"] = max(entry["oldest_lag_s"], int(lag))
+                        if age_unknown or lag > NATIVE_LAG_MAX:
+                            age = ("age unknown (compressed)" if age_unknown and compressed else
+                                   "oldest unknown" if age_unknown else f"oldest {int(lag)} s")
                             problems.append(f"{inst}: {name} has {complete_bytes} pending bytes, "
-                                            f"oldest {'unknown' if unknown else str(int(lag)) + ' s'}")
+                                            f"{age}")
                     if row and (row.get("error_count") or 0) > 0:
-                        error_since = previous.get("error_since", now) if same else now
-                        if (not isinstance(error_since, (int, float)) or isinstance(error_since, bool)
-                                or not math.isfinite(error_since) or error_since > now):
-                            error_since = now
-                            same = False
-                        record["error_since"] = error_since
-                        # The ledger has no first-error time. An error that was
-                        # already present at first observation has unknown age.
-                        error_unknown = previous.get("error_unknown", False) if same else True
-                        record["error_unknown"] = error_unknown
+                        if "error_since" in row:
+                            error_since = _native_epoch(row["error_since"], now)
+                            error_unknown = error_since is None
+                        else:
+                            error_since = _native_epoch(previous.get("error_since"), now) if same else None
+                            error_unknown = (previous.get("error_unknown", False) if error_since is not None
+                                             else not same or "error_since" in previous)
+                            if error_since is None:
+                                error_since = now
+                            record.update(error_since=error_since, error_unknown=error_unknown)
                         if error_unknown or now - error_since > NATIVE_ERROR_MAX:
-                            problems.append(f"{inst}: {name} capture errors for {int(now - error_since)} s")
+                            age = "unknown age" if error_unknown else f"{int(now - error_since)} s"
+                            problems.append(f"{inst}: {name} capture errors for {age}")
                     next_files[full] = record
     seen["roots"] = sorted(prior_roots)
     seen["files"] = next_files
@@ -375,7 +516,8 @@ def check_native_capture():
     except Exception as e:
         return False, f"native capture check crashed: {type(e).__name__}: {e}"
     summary = "; ".join(f"{r['instance']} {r['files']} files, {r['backlog_bytes']} B backlog, "
-                        f"oldest {r['oldest_lag_s']} s" if r["exists"] else f"{r['instance']} absent"
+                        f"oldest {str(r['oldest_lag_s']) + ' s' if r['oldest_lag_s'] is not None else 'unknown'}"
+                        if r["exists"] else f"{r['instance']} absent"
                         for r in report)
     if problems:
         return False, "; ".join(problems[:3]) + f" [{summary}]"

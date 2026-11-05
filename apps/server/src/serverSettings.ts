@@ -188,6 +188,10 @@ export class ServerSettingsService extends Context.Service<
       patch: ServerSettingsPatch,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
 
+    readonly updateSettingsIf: (
+      update: (settings: ServerSettings) => ServerSettingsPatch | null,
+    ) => Effect.Effect<boolean, ServerSettingsError>;
+
     readonly updateProviderInstance: (
       mutation: ProviderInstanceMutation,
       patch?: ServerSettingsPatch,
@@ -249,6 +253,15 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
       updateTestSettings((currentSettings) =>
         Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
       ),
+    updateSettingsIf: (update) =>
+      writeSemaphore.withPermits(1)(Effect.gen(function* () {
+        const current = yield* Ref.get(currentSettingsRef);
+        const patch = update(current);
+        if (patch === null) return false;
+        const next = yield* normalizeServerSettings(applyServerSettingsPatch(current, patch));
+        yield* Ref.set(currentSettingsRef, next);
+        return true;
+      })),
     updateProviderInstance: (mutation, patch = {}) =>
       updateTestSettings((currentSettings) =>
         Effect.gen(function* () {
@@ -1003,7 +1016,7 @@ const make = Effect.gen(function* () {
   };
 
   const updateAndPersistSettings = (
-    update: (current: ServerSettings) => Effect.Effect<ServerSettings, ServerSettingsError>,
+    update: (current: ServerSettings) => Effect.Effect<ServerSettings | null, ServerSettingsError>,
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Effect.gen(function* () {
@@ -1016,6 +1029,10 @@ const make = Effect.gen(function* () {
           });
         }
         const updated = yield* update(current);
+        if (updated === null) {
+          const materialized = yield* materializeSettingsSecrets(current);
+          return resolveTextGenerationProvider(materialized);
+        }
         const persisted = yield* persistSettingsSecrets(current, updated);
         const next = yield* normalizeServerSettings(persisted.settings);
         const materialized = yield* Effect.uninterruptibleMask(() =>
@@ -1174,6 +1191,14 @@ const make = Effect.gen(function* () {
       updateAndPersistSettings((current) =>
         Effect.succeed(applyServerSettingsPatch(current, patch)),
       ),
+    updateSettingsIf: (update) => Effect.suspend(() => {
+      let changed = false;
+      return updateAndPersistSettings((current) => {
+        const patch = update(current);
+        changed = patch !== null;
+        return Effect.succeed(patch === null ? null : applyServerSettingsPatch(current, patch));
+      }).pipe(Effect.asVoid, Effect.map(() => changed));
+    }),
     updateProviderInstance: (mutation, patch = {}) =>
       updateAndPersistSettings((current) =>
         Effect.gen(function* () {

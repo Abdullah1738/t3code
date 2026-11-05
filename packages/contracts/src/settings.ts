@@ -1095,6 +1095,7 @@ export const ArdudHarnessMigrationSettings = Schema.Struct({
   selections: Schema.optionalKey(Schema.Literals(["off", "dryrun", "apply"])),
   allowConflicts: Schema.optionalKey(Schema.Boolean),
 });
+export type ArdudHarnessMigrationSettings = typeof ArdudHarnessMigrationSettings.Type;
 
 export const ServerSettings = Schema.Struct({
   ardudHarnessMigration: Schema.optionalKey(ArdudHarnessMigrationSettings),

@@ -1,4 +1,4 @@
-"""Billing-period spend from one account meter request, $100 alerts and the $500 cap."""
+"""Billing-period spend from one account meter request, $100 alerts and the $750 cap."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .common import (CAP_PATH, OffboxError, atomic_write_json, db, event, file_l
                      now, read_json, say)
 from .identity import telegram
 
-CAP_DOLLARS = 500.0
+CAP_DOLLARS = 750.0
 STEP_DOLLARS = 100.0
 
 
@@ -128,14 +128,27 @@ def _check(con, quiet: bool) -> dict:
             kv_set(con, f"sent:{key}", now())
     if spend >= CAP_DOLLARS:
         was = read_json(CAP_PATH, {})
-        atomic_write_json(CAP_PATH, {"capped": True, "month": month, 'period_end': period, "spend": spend, "at": now()})
+        atomic_write_json(CAP_PATH, {"capped": True, "month": month, 'period_end': period, "spend": spend, "at": now(),
+                                     "cap": CAP_DOLLARS})
         if not (was.get("capped") and was.get("month") == month):
             event(con, None, "cap_hit", f"${spend:.2f}")
+            key = f"offbox-cap-{out['billing_month']}-{CAP_DOLLARS:.0f}"
+            if not kv_get(con, f"sent:{key}") and telegram(
+                    f"offbox: spend cap ${CAP_DOLLARS:.0f} hit (now ${spend:.2f}): new leases refused, all boxes stopped.",
+                    key, severity="attention"):
+                kv_set(con, f"sent:{key}", now())
         n = stop_all("spend cap")
         out["stopped"] = n
     else:
-        still_capped = bool(cap.get('capped') and cap.get('period_end', period) == period)
-        atomic_write_json(CAP_PATH, {"capped": still_capped, "month": month, 'period_end': period, "spend": spend})
+        # A cap tripped in this period stays tripped unless the cap has since been raised above spend.
+        # Records written before the cap was stored were all set at $500.
+        same_period = cap.get('period_end', period) == period
+        raised = float(cap.get('cap', 500.0)) < CAP_DOLLARS
+        still_capped = bool(cap.get('capped') and same_period and not raised)
+        if cap.get('capped') and same_period and raised:
+            event(con, None, "cap_cleared", f"cap raised to ${CAP_DOLLARS:.0f} at ${spend:.2f}")
+        atomic_write_json(CAP_PATH, {"capped": still_capped, "month": month, 'period_end': period, "spend": spend,
+                                     "cap": float(cap.get('cap', 500.0)) if still_capped else CAP_DOLLARS})
     out["cap_state"] = read_json(CAP_PATH, {})
     return out
 

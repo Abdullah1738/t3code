@@ -39,6 +39,7 @@ Keep list (one id, name or cwd per line): `~/.config/opencode/dev-janitor-keep.t
 - the container logged non-healthcheck lines in the last 60 min
 - Docker Desktop: any container still running
 - running sessions unreadable (OpenCode service `127.0.0.1:49374` `/api/session/active`, `scripts/active_sessions.py`) -> keep everything
+- Robob's active set is two complete control-API queries, unioned by threadId: every non-idle thread (`active=true`), and provider-native or MCP-delegated children updated in the last 48 h (`creationSource=provider,mcp`). If either is truncated or fails, the set is incomplete and everything is kept. Until the server's `creationSource` filter ships, the second query comes back truncated, so this stays fail-closed.
 - keep file
 
 Sessions whose prompt contains `DEV-RESOURCE-JANITOR-RUN` (the scheduled run
@@ -47,7 +48,10 @@ itself) and sessions titled "Dev resource janitor..." are not counted as usage.
 ## Scheduled agent flow
 
 (nightly 2026-10-15) Now a robob-watch watcher `dev-janitor` (mode notify, hourly), not an LLM run. Check script
-`scripts/janitor_watch.sh` runs scan, then apply --ids for candidates only. Silent on success; prints one line only if a scan or apply step fails. The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
+`scripts/janitor_watch.sh` starts a detached, locked worker for scan and apply --ids. The worker re-scans before
+each action, can run beyond the watcher's 60-second check deadline, and records its result for the next check.
+An overlapping check doesn't start a second worker. A failed, interrupted, or four-hour-overdue worker is reported
+on the next check. The old scheduled task "Dev resource janitor (hourly)" (cron `17 * * * *`, Asia/Dubai) is retired and should be disabled.
 
 ## $TMPDIR prune (hourly, same watcher, 2026-10-22)
 

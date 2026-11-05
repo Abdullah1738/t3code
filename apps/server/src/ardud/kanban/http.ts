@@ -6,7 +6,7 @@
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
-  KanbanBlock,
+  KanbanBlockInput,
   type KanbanBoard,
   KanbanBoardIcon,
   KanbanBoardIconImage,
@@ -34,6 +34,7 @@ import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
+import { textProblem } from "./engine/text.ts";
 
 export const KANBAN_ROUTE_PREFIX = "/api/ardud/kanban";
 
@@ -117,7 +118,10 @@ const CreateCardBody = Schema.Struct({
 
 const MoveBody = Schema.Struct({ to: KanbanStage, note: Text, question: Text });
 
-const PostBody = Schema.Struct({ text: Text, blocks: Schema.optional(Schema.Array(KanbanBlock)) });
+const PostBody = Schema.Struct({
+  text: Text,
+  blocks: Schema.optional(Schema.Array(KanbanBlockInput)),
+});
 
 const TitleBody = Schema.Struct({ title: Schema.String });
 
@@ -411,11 +415,28 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     const listMessages = read(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
-        const after = Number(yield* query("afterSeq"));
-        return yield* service.messages(
-          id,
-          Number.isInteger(after) && after > 0 ? { afterSeq: after } : {},
-        );
+        const cursor = (value: string | null) => {
+          const number = Number(value);
+          return value !== null && Number.isInteger(number) && number > 0 ? number : undefined;
+        };
+        const afterSeq = cursor(yield* query("afterSeq"));
+        const beforeSeq = cursor(yield* query("beforeSeq"));
+        const limit = cursor(yield* query("limit"));
+        return yield* service.messages(id, {
+          ...(afterSeq === undefined ? {} : { afterSeq }),
+          ...(beforeSeq === undefined ? {} : { beforeSeq }),
+          ...(limit === undefined ? {} : { limit }),
+        });
+      }),
+    );
+
+    const getMessage = read(
+      Effect.gen(function* () {
+        const id = KanbanDiscussionId.make(yield* param("discussion"));
+        const seq = Number(yield* param("seq"));
+        if (!Number.isInteger(seq) || seq <= 0)
+          return yield* fail("invalid", "seq must be a positive whole number.");
+        return yield* service.message(id, seq);
       }),
     );
 
@@ -423,6 +444,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
         const input = yield* body(PostBody);
+        const problem = textProblem([["message", input.text]]);
+        if (problem) return yield* fail("invalid", problem);
         const blocks = [
           ...(input.text?.trim() ? [{ _tag: "md" as const, text: input.text }] : []),
           ...(input.blocks ?? []),
@@ -436,7 +459,14 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
         const input = yield* body(AnswerBody);
-        return yield* service.answer(id, input.seq, input.blockId, input.choice, OWNER, input.text ?? null);
+        return yield* service.answer(
+          id,
+          input.seq,
+          input.blockId,
+          input.choice,
+          OWNER,
+          input.text ?? null,
+        );
       }),
     );
 
@@ -449,7 +479,8 @@ export const kanbanRouteLayer = HttpRouter.addAll(
             ? { kind: input.kind, text: input.text ?? "" }
             : { kind: input.kind };
         // setup/request already carry their text in purpose; only sweeps pass it separately.
-        const sweepText = input.kind === "setup" || input.kind === "request" ? undefined : input.text;
+        const sweepText =
+          input.kind === "setup" || input.kind === "request" ? undefined : input.text;
         const threadId = yield* service.startEvaluator(board.id, purpose, sweepText);
         return { threadId };
       }),
@@ -519,6 +550,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("PATCH", `${p}/discussions/:discussion`, handle(updateDiscussion)),
       HttpRouter.route("GET", `${p}/discussions/:discussion/messages`, handle(listMessages)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/messages`, handle(postMessage)),
+      HttpRouter.route("GET", `${p}/discussions/:discussion/messages/:seq`, handle(getMessage)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/answer`, handle(answer)),
     ];
   }),

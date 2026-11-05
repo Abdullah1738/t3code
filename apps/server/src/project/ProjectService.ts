@@ -42,6 +42,7 @@ export interface ProjectCreateInput extends ProjectCreatePayload {
 export interface ProjectUpdateInput extends ProjectUpdatePayload {
   readonly commandId: CommandId;
   readonly projectId: ProjectId;
+  readonly expectedDefaultModelSelection?: import("@t3tools/contracts").ModelSelection | null;
 }
 
 export interface ProjectBootstrapInput extends ProjectCreateInput {}
@@ -368,6 +369,9 @@ export const make = Effect.gen(function* () {
         ...(input.defaultModelSelection === undefined
           ? {}
           : { defaultModelSelection: input.defaultModelSelection }),
+        ...(input.expectedDefaultModelSelection === undefined
+          ? {}
+          : { expectedDefaultModelSelection: input.expectedDefaultModelSelection }),
         ...(input.autoPull === undefined ? {} : { autoPull: input.autoPull }),
         ...(input.projectIcon === undefined ? {} : { projectIcon: input.projectIcon }),
         ...(input.faviconPath === undefined ? {} : { faviconPath: input.faviconPath }),

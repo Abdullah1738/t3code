@@ -1,5 +1,5 @@
 import { ImageUpIcon, MinusIcon, PlusIcon, RepeatIcon, Trash2Icon } from "lucide-react";
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 
 import {
@@ -48,8 +48,14 @@ import {
   currentSlots,
   editedSlots,
   failedSlot,
+  observePoolLevels,
   observeSlots,
+  poolLevelPending,
+  poolSlotsVersion,
+  sendPoolLevel,
+  sendPoolSlots,
   sentSlots,
+  subscribePoolSlots,
   type SlotWrites,
 } from "./slotCount";
 import { ProviderModelPicker } from "../../components/chat/ProviderModelPicker";
@@ -257,8 +263,17 @@ export function SettingsView(props: { state: KanbanBoardState }) {
 
 function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardState }) {
   const { environmentId, state } = props;
+  const poolVersion = useSyncExternalStore(subscribePoolSlots, poolSlotsVersion);
   const board = state.board;
   const pools = poolViews(state);
+  useEffect(() => {
+    observePoolLevels(
+      board.id,
+      pools.map((pool) => pool.key),
+    );
+    // A rename response can arrive after its feed update, so observe that transition too.
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [board.id, pools, poolVersion]);
   const providers =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
   const settings = useEnvironmentSettings(environmentId);
@@ -289,6 +304,7 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
       </Section>
       <Section title="Pools">
         {pools.map((pool) => {
+          const changingLevel = poolLevelPending(board.id, pool.key);
           const listed = poolListed(pool.model, providers, settings);
           const unlisted = listed === false;
           const blocked = !canPool || unlisted;
@@ -325,8 +341,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                     modelOptions={pool.model.options ?? []}
                     allowPromptInjectedEffort={false}
                     planModeEnabled={settings.planModeEnabled}
-                    disabled={blocked}
+                    disabled={blocked || changingLevel}
                     onModelOptionsChange={(options) => {
+                      if (poolLevelPending(board.id, pool.key)) return;
                       const level = selectionEffort(
                         createModelSelection(pool.model.instanceId, pool.model.model, options),
                       );
@@ -335,12 +352,9 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                         ? reportSelectionConflict(boardPoolLevelChange(pool.model, level, instanceEntries))
                         : boardModelSelection({ instanceId: pool.model.instanceId, model: pool.model.model, variant: level });
                       if (!next) return;
-                      void runAction("Couldn't change the pool's level", () =>
-                        kanban.setPool(
-                          board.id,
-                          next,
-                          undefined,
-                          { replaces: pool.key },
+                      sendPoolLevel(board.id, pool.key, () =>
+                        runAction("Couldn't change the pool's level", () =>
+                          kanban.setPool(board.id, next, undefined, { replaces: pool.key }),
                         ),
                       );
                     }}
@@ -373,11 +387,18 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 value={pool.slots}
                 min={0}
                 max={unlisted ? 0 : undefined}
-                disabled={blocked}
+                disabled={blocked || changingLevel}
                 disabledReason={blockedReason}
-                onChange={(slots) =>
-                  runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, slots, { replaces: pool.key }),
+                onChange={(slots, dropped) =>
+                  sendPoolSlots(
+                    board.id,
+                    pool.key,
+                    slots,
+                    (value) =>
+                      runAction("Couldn't change the pool", () =>
+                        kanban.setPool(board.id, pool.model, value, { replaces: pool.key }),
+                      ),
+                    dropped,
                   )
                 }
               />
@@ -385,20 +406,21 @@ function SettingsBody(props: { environmentId: EnvironmentId; state: KanbanBoardS
                 size="sm"
                 checked={pool.slots > 0}
                 // An unlisted pool can always be paused (switch off); switching it on is refused.
-                disabled={!canPool || (unlisted && pool.slots === 0)}
+                disabled={!canPool || changingLevel || (unlisted && pool.slots === 0)}
                 title={blockedReason}
                 aria-label={`${pool.name} pool on`}
                 onCheckedChange={(on) =>
-                  void runAction("Couldn't change the pool", () =>
-                    kanban.setPool(board.id, pool.model, on ? Math.max(1, pool.busy) : 0, {
-                      replaces: pool.key,
-                    }),
+                  sendPoolSlots(board.id, pool.key, on ? Math.max(1, pool.busy) : 0, (value) =>
+                    runAction("Couldn't change the pool", () =>
+                      kanban.setPool(board.id, pool.model, value, { replaces: pool.key }),
+                    ),
                   )
                 }
               />
               {pool.slots === 0 && pool.busy === 0 && canPool ? (
                 <button
                   type="button"
+                  disabled={changingLevel}
                   aria-label={`Remove ${pool.name} pool`}
                   title="Remove pool"
                   onClick={() =>
@@ -738,7 +760,7 @@ function Stepper(props: {
   max?: number | undefined;
   disabled?: boolean;
   disabledReason?: string | undefined;
-  onChange: (value: number) => Promise<boolean> | void;
+  onChange: (value: number, dropped: () => void) => void;
 }) {
   // Typing keeps a draft; it commits on blur or Enter, Escape drops it.
   const [draft, setDraft] = useState<string | null>(null);
@@ -755,9 +777,7 @@ function Stepper(props: {
   const send = (next: number) => {
     const id = ++nextId.current;
     setWrites((state) => sentSlots(observeSlots(state, props.value), { id, value: next }));
-    void Promise.resolve(props.onChange(next)).then((ok) => {
-      if (ok === false) setWrites((state) => failedSlot(state, id));
-    });
+    props.onChange(next, () => setWrites((state) => failedSlot(state, id)));
   };
   // While typing, the buttons step the draft, so a click never races the typed number.
   const step = (by: number) => {

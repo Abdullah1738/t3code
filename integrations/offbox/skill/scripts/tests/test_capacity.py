@@ -553,11 +553,26 @@ class SpendTests(Isolated):
             self.assertEqual(spend.compute()['spend'],0.05)
 
     def test_cap_trips_and_keeps_alert_key_shape(self):
-        with patch.object(api,'limits',return_value=self.limits(50100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
+        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
             out=spend.check()
             self.assertTrue(out['cap_state']['capped'])
             self.assertEqual(out['stopped'],2)
             self.assertTrue(any(c.args[1]=='offbox-spend-2026-10-500' for c in self.tg.call_args_list))
+
+    def test_cap_is_750_and_a_500_trip_clears_after_the_raise(self):
+        self.assertEqual(spend.CAP_DOLLARS,750.0)
+        common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':500.25})
+        with patch.object(api,'limits',return_value=self.limits(50025000,remaining=0)), patch.object(spend,'stop_all') as stop:
+            out=spend.check()
+            self.assertFalse(out['cap_state']['capped'])
+            stop.assert_not_called()
+
+    def test_trip_at_the_current_cap_stays_until_the_period_ends(self):
+        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+            self.assertTrue(spend.check()['cap_state']['capped'])
+        with patch.object(api,'limits',return_value=self.limits(75100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+            self.assertTrue(spend.check()['cap_state']['capped'])
+            self.assertTrue(any(c.args[1]=='offbox-cap-2026-10-750' for c in self.tg.call_args_list))
 
 
 if __name__ == '__main__':

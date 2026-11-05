@@ -1,7 +1,7 @@
 // Minimal Chrome DevTools Protocol client over --remote-debugging-pipe (fd 3 in, fd 4 out,
 // NUL-delimited JSON). One headless browser, many pages. No npm dependencies.
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,26 +9,24 @@ const newest = (dir, leaf) => {
   if (!existsSync(dir)) return null;
   const hits = readdirSync(dir)
     .map((d) => join(dir, d, leaf))
-    .filter(existsSync)
+    .filter((path) => {
+      try {
+        accessSync(path, constants.X_OK);
+        return statSync(path).isFile();
+      } catch {
+        return false;
+      }
+    })
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   return hits.at(-1) || null;
 };
 
-// Same order the taste wrapper uses: Robob's bundled shell, then Playwright's.
+// Playwright's bundled Chromium was removed under the CVE rule; use Robob's shell.
 export function findChrome(env = process.env) {
   if (env.CARD_CHECK_CHROME) return env.CARD_CHECK_CHROME;
   const home = homedir();
   const robob = newest(join(home, ".robob/tools/chrome-headless-shell/mac-arm64"), "chrome-headless-shell");
   if (robob) return robob;
-  const cache = join(home, "Library/Caches/ms-playwright");
-  if (existsSync(cache)) {
-    const dirs = readdirSync(cache).filter((d) => d.startsWith("chromium_headless_shell-"));
-    const hits = dirs
-      .map((d) => join(cache, d, "chrome-headless-shell-mac-arm64/chrome-headless-shell"))
-      .filter(existsSync)
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    if (hits.length) return hits.at(-1);
-  }
   return null;
 }
 

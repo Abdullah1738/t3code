@@ -92,6 +92,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                  |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                      |
 | GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                |
+| GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                             |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                            |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                             |
 | GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.                                                                                                                                       |
@@ -114,11 +115,42 @@ All paths are under `/api/ardud/control`.
 returns `already_terminal` without interrupting. Run and attempt checks happen before
 dispatch, not atomically with it; changes after the checks can still race with interruption.
 
+### GET /usage
+
+Query: `since` (required; ISO time or epoch ms), `until` (ISO time or epoch ms),
+`boardId`, `limit` (per page), and `cursor` (the opaque `nextCursor` from a
+previous page with the same filters). The window is at most 72 hours; `until`
+defaults to the time of the first request and stays fixed across its pages.
+`limit` defaults to 1,000 and is capped at 5,000. Returns
+`{ ok: true, items: [...], nextCursor: string | null }`;
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
+fetches one page.
+
+Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
+`workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
+`completedAt`, `status`, `usageStatus`, `inputTokens`, `cachedInputTokens`,
+`cacheCreationTokens`, `outputTokens`, `reasoningTokens`, and `hasSubagents`.
+The window includes completed turns by completion time and currently running
+turns by start time. Unknown counts are `null`, not zero; missing usage has
+`usageStatus: "unavailable"`. Input includes cached tokens; output includes
+reasoning. Turns with an attempt use the selection in that attempt's first
+running event; missing historical evidence yields a null model and effort.
+Native subagent turns without an attempt use their current thread selection.
+
+Pages are live reads, not a snapshot. A running turn may complete or move in the
+ordering while paging; consumers should periodically re-read overlapping windows
+and must not treat a partially paged result as a complete accounting snapshot.
+
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+prints one JSON page by default. `--all-pages` follows every cursor and prints one
+JSON object with all `items` and `nextCursor: null`.
+
 ### GET /threads
 
 Query: `origin` (a value, or `none` for threads without one), `active=true|false`
 (not idle / idle), `state=running,needs-input,...`, `updatedSince` (ISO time or
-epoch ms), `projectId`, `parentThreadId`, `ids=a,b`, `includeSubagents=true`,
+epoch ms), `projectId`, `creationSource=provider,web,...` (exact match on the thread's creation source;
+`provider` is a provider-native child), `parentThreadId`, `ids=a,b`, `includeSubagents=true`,
 `archived=true` (the archive instead of active threads), `limit` (default 50,
 max 500). Newest first. Each item is a thread summary: `threadId`, `projectId`,
 `title`, `state`, `status`, `origin`, `nativeSessionId`, `model`, `runtimeMode`,

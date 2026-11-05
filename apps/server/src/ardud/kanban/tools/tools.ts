@@ -4,7 +4,7 @@
  * card; an evaluator acts on the whole board. The service enforces the moves.
  */
 import {
-  KanbanBlock,
+  KanbanBlockInput,
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
@@ -32,6 +32,7 @@ const dependencies = [
 
 const Record = Schema.Unknown;
 const Records = Schema.Array(Schema.Unknown);
+const RawBoardText = Schema.toType(TrimmedNonEmptyString);
 
 const describe = <S extends Schema.Top>(schema: S, description: string) =>
   schema.annotate({ description });
@@ -55,7 +56,7 @@ const ModelInputFields = {
   variant: Schema.optional(
     describe(
       TrimmedNonEmptyString,
-      'Legacy name for effort. If both are supplied, they must agree.',
+      "Legacy name for effort. If both are supplied, they must agree.",
     ),
   ),
   options: Schema.optional(
@@ -93,7 +94,7 @@ const SubtasksInput = describe(
           "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
         ),
       ),
-      text: TrimmedNonEmptyString,
+      text: RawBoardText,
       owner: describe(
         Schema.Literals(["work", "review", "evaluator", "script"]),
         "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
@@ -118,7 +119,7 @@ const BlocksInput = {
   text: Schema.optional(describe(Schema.String, "Markdown message (shortcut for one md block).")),
   blocks: Schema.optional(
     describe(
-      Schema.Array(KanbanBlock),
+      Schema.Array(KanbanBlockInput),
       'Rich blocks, each with _tag: md {text}, collapse {title, text}, html {html, title, height}, choice {id, style "poll"|"pick", question, options [{id,label}], multi}, card {cardId}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (the id comes from t3_attachment_prepare_upload).',
     ),
   ),
@@ -188,7 +189,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card.",
+  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     card: Schema.optional(CardRef),
     description: Schema.optional(Schema.String),
@@ -284,7 +285,7 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies.",
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
@@ -297,13 +298,25 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion (latest 200, or those after afterSeq), with answers to polls and picks. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
+    beforeSeq: Schema.optional(NonNegativeInt),
+    seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
   },
-  { discussion: Record, messages: Records },
+  {
+    discussion: Record,
+    messages: Records,
+    earlierBefore: Schema.optional(
+      describe(
+        NonNegativeInt,
+        "Older messages were left out; pass this as beforeSeq to read them.",
+      ),
+    ),
+    note: Schema.optional(Schema.String),
+  },
   { readonly: true },
 );
 
@@ -479,7 +492,7 @@ const GroupSet = tool(
     groups: Schema.Array(
       Schema.Struct({
         id: TrimmedNonEmptyString,
-        name: TrimmedNonEmptyString,
+        name: RawBoardText,
         summary: Schema.String,
         cards: Schema.Array(CardRef),
       }),
@@ -493,7 +506,7 @@ const DiscussionCreate = tool(
   "discussion_create",
   "Open a discussion",
   "Evaluators: open a new discussion channel with the owner, then post into it with discussion_post.",
-  { title: TrimmedNonEmptyString, ...BlocksInput },
+  { title: RawBoardText, ...BlocksInput },
   { discussion: Record },
   { readonly: false },
 );
@@ -502,7 +515,7 @@ const WikiWrite = tool(
   "wiki_write",
   "Write a wiki page",
   "Evaluators: create or replace a wiki page of lessons future threads should know.",
-  { slug: TrimmedNonEmptyString, title: TrimmedNonEmptyString, body: Schema.String },
+  { slug: TrimmedNonEmptyString, title: RawBoardText, body: Schema.String },
   { page: Record },
   { readonly: false },
 );
@@ -513,7 +526,7 @@ const BoardOpen = tool(
   "Create a board (or return the existing one with this slug). projectId is the T3 project its threads run in. icon is shown beside its name; it is set only while the board has none, so the owner's pick stays.",
   {
     slug: TrimmedNonEmptyString,
-    name: TrimmedNonEmptyString,
+    name: RawBoardText,
     projectId: Schema.optional(TrimmedNonEmptyString),
     icon: Schema.optional(KanbanBoardIcon),
   },

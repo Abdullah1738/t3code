@@ -34,6 +34,162 @@ export interface SlotWrites {
   readonly sent: ReadonlyArray<SlotWrite>;
 }
 
+type SlotWriteRequest = {
+  write: () => Promise<boolean | void> | boolean | void;
+  dropped: () => void;
+  kind: "count" | "level";
+};
+
+function serialQueue(onIdle: () => void = () => {}) {
+  let inFlight = false;
+  const queued: SlotWriteRequest[] = [];
+
+  const run = async (request: SlotWriteRequest) => {
+    inFlight = true;
+    let result: boolean | void;
+    try {
+      result = await Promise.resolve(request.write());
+    } catch {
+      result = false;
+    }
+    if (result === false) request.dropped();
+    const next = queued.shift();
+    if (next !== undefined) {
+      void run(next);
+    } else {
+      inFlight = false;
+      onIdle();
+    }
+  };
+
+  return (request: SlotWriteRequest) => {
+    if (!inFlight) {
+      void run(request);
+      return;
+    }
+    const previous = queued.at(-1);
+    if (request.kind === "count" && previous?.kind === "count") {
+      queued[queued.length - 1] = request;
+      previous.dropped();
+    } else {
+      queued.push(request);
+    }
+  };
+}
+
+/** Serialize writes and discard superseded or failed pending IDs. */
+export function serialSender(
+  write: (value: number) => Promise<boolean | void> | boolean | void,
+  dropped: (id: number) => void,
+): (id: number, value: number) => void {
+  const send = serialQueue();
+  return (id, value) =>
+    send({ kind: "count", write: () => write(value), dropped: () => dropped(id) });
+}
+
+// A Settings view can unmount while its RPC is pending. Share the queue until it drains.
+const poolQueues = new Map<string, ReturnType<typeof serialQueue>>();
+const poolLevels = new Map<
+  string,
+  { boardId: string; poolKey: string; saved: boolean; acked: boolean }
+>();
+const poolQueueListeners = new Set<() => void>();
+let poolQueueVersion = 0;
+
+function poolQueueChanged() {
+  poolQueueVersion++;
+  for (const listener of poolQueueListeners) listener();
+}
+
+export function subscribePoolSlots(listener: () => void): () => void {
+  poolQueueListeners.add(listener);
+  return () => poolQueueListeners.delete(listener);
+}
+
+export const poolSlotsVersion = () => poolQueueVersion;
+
+export function poolSlotsPending(boardId: string, poolKey: string): boolean {
+  return poolQueues.has(JSON.stringify([boardId, poolKey]));
+}
+
+export function poolLevelPending(boardId: string, poolKey: string): boolean {
+  return poolLevels.has(JSON.stringify([boardId, poolKey]));
+}
+
+// Keep the old row locked until its rename reaches the board feed, not merely the RPC response.
+export function observePoolLevels(boardId: string, poolKeys: ReadonlyArray<string>): void {
+  let changed = false;
+  for (const [key, level] of poolLevels) {
+    if (level.boardId === boardId && !poolKeys.includes(level.poolKey)) {
+      level.acked = true;
+      if (level.saved) {
+        poolLevels.delete(key);
+        changed = true;
+      }
+    }
+  }
+  if (changed) poolQueueChanged();
+}
+
+function sendPoolRequest(boardId: string, poolKey: string, request: SlotWriteRequest): void {
+  const key = JSON.stringify([boardId, poolKey]);
+  let send = poolQueues.get(key);
+  if (send === undefined) {
+    send = serialQueue(() => {
+      poolQueues.delete(key);
+      poolQueueChanged();
+    });
+    poolQueues.set(key, send);
+    poolQueueChanged();
+  }
+  send(request);
+}
+
+export function sendPoolSlots(
+  boardId: string,
+  poolKey: string,
+  value: number,
+  write: (value: number) => Promise<boolean | void> | boolean | void,
+  dropped: () => void = () => {},
+): void {
+  if (poolLevelPending(boardId, poolKey)) {
+    dropped();
+    return;
+  }
+  sendPoolRequest(boardId, poolKey, { kind: "count", write: () => write(value), dropped });
+}
+
+export function sendPoolLevel(
+  boardId: string,
+  poolKey: string,
+  write: () => Promise<boolean>,
+): void {
+  const key = JSON.stringify([boardId, poolKey]);
+  if (poolLevels.has(key)) return;
+  const level = { boardId, poolKey, saved: false, acked: false };
+  poolLevels.set(key, level);
+  poolQueueChanged();
+  const drop = () => {
+    if (poolLevels.get(key) === level) {
+      poolLevels.delete(key);
+      poolQueueChanged();
+    }
+  };
+  sendPoolRequest(boardId, poolKey, {
+    kind: "level",
+    write: async () => {
+      const ok = await write();
+      if (ok) {
+        level.saved = true;
+        if (level.acked && poolLevels.get(key) === level) poolLevels.delete(key);
+        poolQueueChanged();
+      }
+      return ok;
+    },
+    dropped: drop,
+  });
+}
+
 /**
  * Reconcile local writes with intermediate pool snapshots, preserving newer edits.
  * Matching the last equal write makes a coalesced feed (12, 13, 12 seen only as 12) retire all

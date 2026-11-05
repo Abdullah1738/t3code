@@ -21,7 +21,7 @@ import {
 } from "../baseSchemas.ts";
 import { ModelSelection } from "../modelSelection.ts";
 import {
-  KanbanBlock,
+  KanbanBlockInput,
   KanbanBoard,
   KanbanBoardIcon,
   KanbanBoardIconImage,
@@ -58,6 +58,7 @@ export const KANBAN_WS_METHODS = {
   threads: "kanban.threads",
   owner: "kanban.owner",
   messages: "kanban.messages",
+  message: "kanban.message",
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
@@ -168,14 +169,27 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.discussions, BoardRef, Schema.Array(KanbanDiscussion)),
   call(M.threads, BoardRef, Schema.Array(KanbanThreadRow)),
   call(M.owner, Schema.Struct({ threadId: ThreadId }), Schema.NullOr(KanbanThreadLink)),
+  /**
+   * The newest messages after `afterSeq` and before `beforeSeq`, oldest first. A page is cut
+   * by count and by size (always at least one message), and big blocks come as stubs
+   * (`truncated`); seqs have no holes, so a page whose first seq is past the one asked for
+   * means more are left.
+   */
   call(
     M.messages,
     Schema.Struct({
       discussionId: KanbanDiscussionId,
       afterSeq: Schema.optional(NonNegativeInt),
+      beforeSeq: Schema.optional(NonNegativeInt),
       limit: Schema.optional(NonNegativeInt),
     }),
     Schema.Array(KanbanMessage),
+  ),
+  /** One message with every block in full. */
+  call(
+    M.message,
+    Schema.Struct({ discussionId: KanbanDiscussionId, seq: NonNegativeInt }),
+    KanbanMessage,
   ),
   call(M.wiki, BoardRef, Schema.Array(KanbanWikiPage)),
   call(
@@ -261,7 +275,7 @@ export const KanbanRpcs = RpcGroup.make(
   call(M.discussionUpdate, KanbanDiscussionUpdateInput, KanbanDiscussion),
   call(
     M.messagePost,
-    Schema.Struct({ discussionId: KanbanDiscussionId, blocks: Schema.Array(KanbanBlock) }),
+    Schema.Struct({ discussionId: KanbanDiscussionId, blocks: Schema.Array(KanbanBlockInput) }),
     KanbanMessage,
   ),
   call(
@@ -299,6 +313,7 @@ export const KANBAN_READ_SCOPES = {
   [M.threads]: AuthOrchestrationReadScope,
   [M.owner]: AuthOrchestrationReadScope,
   [M.messages]: AuthOrchestrationReadScope,
+  [M.message]: AuthOrchestrationReadScope,
   [M.wiki]: AuthOrchestrationReadScope,
   [M.scripts]: AuthOrchestrationReadScope,
   [M.scriptRuns]: AuthOrchestrationReadScope,

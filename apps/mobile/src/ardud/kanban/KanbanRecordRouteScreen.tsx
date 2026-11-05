@@ -2,6 +2,7 @@ import { type StaticScreenProps, useNavigation } from "@react-navigation/native"
 import {
   cardSteps,
   discussionSnoozed,
+  pauseBanner,
   type KanbanBoardState,
   setupBanner,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -20,7 +21,7 @@ import { useBoardAction, useHeaderInset, useNowMs } from "../common/hooks";
 import { CardDetail } from "./CardDetail";
 import { useBoardFilter } from "./boardFilterStore";
 import { copyLinkAction } from "./copyLink";
-import { SetupStrip } from "./BoardView";
+import { PauseStrip, SetupStrip } from "./BoardView";
 import { Chat } from "./Chat";
 import { CustomSnoozeSheet } from "../../features/threads/CustomSnoozeSheet";
 import {
@@ -177,6 +178,7 @@ function Shell(props: {
 }) {
   const headerInset = useHeaderInset();
   const setup = props.state ? setupBanner(props.state.board) : null;
+  const pause = props.state ? pauseBanner(props.state.board, props.state.cards) : null;
   const navSetup = useKanbanNav(props.boardId ?? "");
   const action = useBoardAction();
   return (
@@ -196,6 +198,18 @@ function Shell(props: {
             onEndSetup={() =>
               void action.run("Couldn't end setup", () =>
                 kanbanClient().endSetup(props.boardId ?? ""),
+              )
+            }
+          />
+        </View>
+      ) : null}
+      {pause && props.boardId ? (
+        <View className="px-4 pt-2">
+          <PauseStrip
+            pause={pause}
+            onLiftPause={() =>
+              void action.run("Couldn't lift the pause", () =>
+                kanbanClient().liftPause(props.boardId ?? ""),
               )
             }
           />

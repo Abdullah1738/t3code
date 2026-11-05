@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
+import { randomUUID } from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
@@ -19,6 +20,7 @@ const HELP = `t3ctl <command> [options]
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
   models                               default model and available models
+  usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
   threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
@@ -28,7 +30,7 @@ const HELP = `t3ctl <command> [options]
   identity NATIVE_ID [--driver D] [--instance I] [--agent A]
                                        resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
-  send THREAD TEXT [--mode auto|queue|steer|restart] [--model M] [--instance I] [--variant V] [--option K=V ...] [--wait]
+  send THREAD TEXT [--request-id ID] [--mode auto|queue|steer|restart] [--model M] [--instance I] [--variant V] [--option K=V ...] [--wait]
   wait THREAD [--timeout SECONDS] [--drain]
   interrupt THREAD [--expect-run RUN] [--expect-attempt ATTEMPT] [--reason TEXT]
   respond THREAD REQUEST (--approve | --deny | --always | --answer KEY=VALUE ... | --dismiss)
@@ -40,6 +42,16 @@ const HELP = `t3ctl <command> [options]
   desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
   desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
   desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
+
+Global: --request-timeout SECONDS      HTTP request deadline (default 30s for ordinary requests)
+Send uses a new request ID unless --request-id is supplied. On a send timeout or
+abort it exits 4 and prints a safe retry with the same ID and send options.
+It also prints that retry after a connection drops before the response.
+Keep the same credentials when retrying; an explicit --token is never printed.
+For a URL containing credentials or a query, set T3CTL_RETRY_URL before retrying.
+Use -- before a thread or text beginning with -.
+--request-timeout also limits wait requests and event streams when supplied;
+--timeout separately controls how long the server waits for a thread.
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
@@ -123,6 +135,67 @@ export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
   return { commit, buildCommit, live: null, reason: "git ancestry check failed" };
 }
 
+const shellQuote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
+const shellOption = (name, value) =>
+  value.startsWith("-") ? `--${name}=${shellQuote(value)}` : `--${name} ${shellQuote(value)}`;
+
+function sendRetry(flags, threadId, text, requestId, token) {
+  const retry = ["t3ctl", "send"];
+  const threadNeedsSeparator = threadId.startsWith("-");
+  if (!threadNeedsSeparator) retry.push(shellQuote(threadId));
+  retry.push(shellOption("request-id", requestId));
+  if (flags.url !== undefined) {
+    let sensitiveUrl;
+    try {
+      const url = new URL(flags.url);
+      sensitiveUrl = Boolean(url.username || url.password || url.search || url.hash);
+    } catch {
+      sensitiveUrl = true;
+    }
+    if (token && (flags.url.includes(token) || flags.url.includes(encodeURIComponent(token)))) {
+      sensitiveUrl = true;
+    }
+    retry.push(
+      sensitiveUrl
+        ? '--url "${T3CTL_RETRY_URL:?set T3CTL_RETRY_URL to the original control URL}"'
+        : shellOption("url", flags.url),
+    );
+  }
+  for (const name of ["request-timeout", "mode", "model", "instance", "variant", "timeout"]) {
+    if (flags[name] !== undefined) retry.push(shellOption(name, flags[name]));
+  }
+  for (const option of flags.option ?? []) retry.push(shellOption("option", option));
+  if (flags.wait) retry.push("--wait");
+  if (flags.text) retry.push("--text");
+  retry.push("--");
+  if (threadNeedsSeparator) retry.push(shellQuote(threadId));
+  retry.push(shellQuote(text));
+  return retry.join(" ");
+}
+
+function transportRetry(error) {
+  for (let cause = error; cause; cause = cause.cause) {
+    if (
+      cause.name === "AbortError" ||
+      cause.name === "TimeoutError" ||
+      cause.code === "UND_ERR_ABORTED" ||
+      cause.code === "UND_ERR_CONNECT_TIMEOUT" ||
+      cause.code === "UND_ERR_HEADERS_TIMEOUT" ||
+      cause.code === "UND_ERR_BODY_TIMEOUT"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function transportDisconnected(error) {
+  for (let cause = error; cause; cause = cause.cause) {
+    if (["ECONNRESET", "EPIPE", "UND_ERR_SOCKET"].includes(cause.code)) return true;
+  }
+  return false;
+}
+
 async function main() {
   const { values: flags, positionals } = NodeUtil.parseArgs({
     allowPositionals: true,
@@ -146,10 +219,15 @@ async function main() {
       wait: { type: "boolean" },
       drain: { type: "boolean" },
       timeout: { type: "string" },
+      "request-timeout": { type: "string" },
+      "request-id": { type: "string" },
       active: { type: "boolean" },
       state: { type: "string" },
       since: { type: "string" },
+      until: { type: "string" },
+      board: { type: "string" },
       limit: { type: "string" },
+      "all-pages": { type: "boolean" },
       "all-kinds": { type: "boolean" },
       last: { type: "boolean" },
       role: { type: "string" },
@@ -227,7 +305,31 @@ async function main() {
     process.exitCode = result.live === true ? 0 : result.live === false ? 3 : 2;
     return;
   }
-  const client = new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" });
+  let requestTimeoutMs;
+  if (flags["request-timeout"] !== undefined) {
+    const seconds = Number(flags["request-timeout"]);
+    if (
+      flags["request-timeout"].trim() === "" ||
+      !Number.isFinite(seconds) ||
+      seconds <= 0 ||
+      seconds * 1000 > 2_147_483_647
+    ) {
+      throw new Error("--request-timeout must be a positive number of seconds");
+    }
+    requestTimeoutMs = Math.max(1, Math.round(seconds * 1000));
+  }
+  const client = new ControlClient({
+    url: flags.url,
+    token: flags.token,
+    component: "t3ctl",
+    timeoutMs: requestTimeoutMs,
+  });
+  if (requestTimeoutMs !== undefined) {
+    // wait() normally gives its long-poll an extra 30s; an explicit deadline wins.
+    const request = client.request.bind(client);
+    client.request = (method, path, body, options = {}) =>
+      request(method, path, body, { ...options, timeoutMs: requestTimeoutMs });
+  }
   switch (command) {
     case "health":
       return print(await client.health());
@@ -237,6 +339,34 @@ async function main() {
       return print(await client.projects());
     case "models":
       return print(await client.models());
+    case "usage": {
+      const filters = {
+        since: need(flags.since, "--since"),
+        until: flags.until,
+        boardId: flags.board,
+        limit: flags.limit,
+      };
+      const first = await client.usage(filters);
+      if (!flags["all-pages"]) return print(first);
+      const items = [];
+      const seen = new Set();
+      let page = first;
+      while (true) {
+        if (
+          !page ||
+          !Array.isArray(page.items) ||
+          (page.nextCursor !== null && typeof page.nextCursor !== "string")
+        ) {
+          throw new Error("invalid usage page");
+        }
+        for (const item of page.items) items.push(item);
+        const cursor = page.nextCursor;
+        if (cursor === null) return print({ ...first, items, nextCursor: null });
+        if (seen.has(cursor)) throw new Error("usage pagination returned a repeated cursor");
+        seen.add(cursor);
+        page = await client.usage({ ...filters, cursor });
+      }
+    }
     case "desktop-lease": {
       const action = need(args[0], "desktop-lease action");
       const path = "/desktop-lease";
@@ -347,13 +477,43 @@ async function main() {
     }
     case "send": {
       const threadId = need(args[0], "THREAD");
-      const sent = await client.send(threadId, need(args.slice(1).join(" "), "TEXT"), {
-        mode: flags.mode,
-        model: flags.model,
-        variant: flags.variant,
-        providerInstanceId: flags.instance,
-        options: modelOptions(),
-      });
+      const text = need(args.slice(1).join(" "), "TEXT");
+      const requestId =
+        flags["request-id"] === undefined
+          ? randomUUID()
+          : need(flags["request-id"], "--request-id");
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const request = client.request.bind(client);
+      client.request = (method, path, body, options = {}) =>
+        request(method, path, body, { ...options, signal: controller.signal });
+      process.once("SIGINT", abort);
+      process.once("SIGTERM", abort);
+      let sent;
+      try {
+        sent = await client.send(threadId, text, {
+          mode: flags.mode,
+          model: flags.model,
+          variant: flags.variant,
+          providerInstanceId: flags.instance,
+          options: modelOptions(),
+          clientRequestId: requestId,
+        });
+      } catch (error) {
+        const timedOut = controller.signal.aborted || transportRetry(error);
+        if (timedOut || transportDisconnected(error)) {
+          console.error(
+            `send ${timedOut ? "timed out" : "connection dropped"}; it may or may not have been delivered. Retry safely with: ${sendRetry(flags, threadId, text, requestId, client.token)}`,
+          );
+          process.exitCode = 4;
+          return;
+        }
+        throw error;
+      } finally {
+        process.removeListener("SIGINT", abort);
+        process.removeListener("SIGTERM", abort);
+        client.request = request;
+      }
       if (!flags.wait) return print(sent);
       const waited = await client.wait(threadId, { timeoutMs: timeoutMs(), runId: sent.runId });
       if (flags.text) return console.log(waited.lastAssistant?.text ?? "");
@@ -436,8 +596,10 @@ async function main() {
       const controller = new AbortController();
       process.once("SIGINT", () => controller.abort());
       process.once("SIGTERM", () => controller.abort());
+      const timeout =
+        requestTimeoutMs === undefined ? undefined : AbortSignal.timeout(requestTimeoutMs);
       for await (const event of client.events({
-        signal: controller.signal,
+        signal: timeout ? AbortSignal.any([controller.signal, timeout]) : controller.signal,
         threadId: flags.thread,
         origin: flags.origin,
         types: flags.types?.split(","),
@@ -446,6 +608,7 @@ async function main() {
       })) {
         console.log(JSON.stringify(event));
       }
+      if (timeout?.aborted && !controller.signal.aborted) throw timeout.reason;
       return;
     }
     default:

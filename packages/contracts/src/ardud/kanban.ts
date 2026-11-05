@@ -91,7 +91,8 @@ export type KanbanReviewChain = typeof KanbanReviewChain.Type;
 export const KanbanThreadPause = Schema.Struct({
   at: IsoDateTime,
   message: Schema.String,
-  runId: Schema.optional(Schema.NullOr(Schema.String)),
+  /** The failed run this pause is for; a different run is a new outage. */
+  runId: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanThreadPause = typeof KanbanThreadPause.Type;
 
@@ -566,13 +567,29 @@ export const kanbanBoardIcon = (board: KanbanBoard): KanbanBoardIcon | null =>
 const BlockId = TrimmedNonEmptyString;
 const ChoiceOption = Schema.Struct({ id: TrimmedNonEmptyString, label: TrimmedNonEmptyString });
 
+/**
+ * Set on a big md, collapse or html block in a list read: the text field holds a short preview
+ * and the full block comes from the message read by seq. Optional, so older decoders drop them
+ * and show the preview as the block.
+ */
+const KanbanBlockStub = {
+  truncated: Schema.optional(Schema.Boolean),
+  /** UTF-8 size of the full text or html. */
+  fullBytes: Schema.optional(NonNegativeInt),
+};
+
 export const KanbanBlock = Schema.Union([
-  Schema.TaggedStruct("md", { text: Schema.String }),
-  Schema.TaggedStruct("collapse", { title: TrimmedNonEmptyString, text: Schema.String }),
+  Schema.TaggedStruct("md", { text: Schema.String, ...KanbanBlockStub }),
+  Schema.TaggedStruct("collapse", {
+    title: TrimmedNonEmptyString,
+    text: Schema.String,
+    ...KanbanBlockStub,
+  }),
   Schema.TaggedStruct("html", {
     html: Schema.String,
     title: Schema.NullOr(Schema.String),
     height: Schema.NullOr(PositiveInt),
+    ...KanbanBlockStub,
   }),
   /** Poll and pick render the same way; poll shows everyone's answers, pick is a decision. */
   Schema.TaggedStruct("choice", {
@@ -590,6 +607,31 @@ export const KanbanBlock = Schema.Union([
   }),
 ]);
 export type KanbanBlock = typeof KanbanBlock.Type;
+
+// Preserve poster text until the board service has checked it, rather than
+// letting TrimmedNonEmptyString erase control characters during decoding.
+const RawBoardText = Schema.toType(TrimmedNonEmptyString);
+export const KanbanBlockInput = Schema.Union([
+  Schema.TaggedStruct("md", { text: Schema.String }),
+  Schema.TaggedStruct("collapse", { title: RawBoardText, text: Schema.String }),
+  Schema.TaggedStruct("html", {
+    html: Schema.String,
+    title: Schema.NullOr(Schema.String),
+    height: Schema.NullOr(PositiveInt),
+  }),
+  Schema.TaggedStruct("choice", {
+    id: BlockId,
+    style: Schema.Literals(["poll", "pick"]),
+    question: RawBoardText,
+    options: Schema.Array(Schema.Struct({ id: TrimmedNonEmptyString, label: RawBoardText })),
+    multi: Schema.Boolean,
+  }),
+  Schema.TaggedStruct("card", { cardId: KanbanCardId }),
+  Schema.TaggedStruct("image", { url: TrimmedNonEmptyString, alt: Schema.NullOr(Schema.String) }),
+  Schema.TaggedStruct("attachment", {
+    attachment: Schema.Union([ChatImageAttachment, ChatFileAttachment]),
+  }),
+]);
 
 export const KanbanAnswer = Schema.Struct({
   blockId: TrimmedNonEmptyString,

@@ -56,6 +56,8 @@ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ArdudOpenCodeImporter from "../ardud/opencode-import/OpenCodeImporter.ts";
+// ardud: only external OpenCode sessions outlive this server.
+import * as StaleRuns from "../ardud/opencode-import/StaleRuns.ts";
 import { withOpenCodeTranscripts } from "../ardud/opencode-import/layer.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
@@ -343,6 +345,7 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
       layerEventSinkProvided,
       IdAllocator.layer,
       ProjectionStore.layer,
+      StaleRuns.layer,
     ),
   ),
 );

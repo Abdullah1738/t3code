@@ -8,6 +8,7 @@ import {
   clampColumnWidth,
   clearFilters,
   filterFacets,
+  pauseBanner,
   sanitizeBoardColumnPrefs,
   sanitizeBoardFilterPrefs,
   setupBanner,
@@ -17,13 +18,14 @@ import {
   type BoardColumnPrefs,
   type BoardFilterPrefs,
   type CardView,
+  type PauseBannerView,
   type SetupBannerView,
   type GoalSummary,
   type KanbanBoardState,
   type StageBoard,
   type StageColumn,
 } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanThreadRow } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS, type KanbanThreadRow } from "@t3tools/contracts";
 import { ageView } from "@t3tools/client-runtime/ardud/common";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, type TextInputInstance, View } from "react-native";
@@ -54,7 +56,7 @@ import {
   parseFilterAction,
   type FilterAction,
 } from "./logic";
-import { useKanbanBoardThreads } from "./kanbanStore";
+import { useKanbanBoardThreads, useKanbanPermission } from "./kanbanStore";
 import { publishBoardFilter } from "./boardFilterStore";
 import { CardTile, GoalBar, ShippedRow, StageHead, UnderlineTabs } from "./parts";
 
@@ -106,6 +108,45 @@ export function SetupStrip(props: {
   );
 }
 
+export function PauseStrip(props: {
+  readonly pause: PauseBannerView;
+  readonly onLiftPause: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const canLift = useKanbanPermission(KANBAN_WS_METHODS.boardPause);
+  return (
+    <View className="flex-row items-center gap-2 rounded-2xl bg-grouped-card px-4 py-3">
+      <Text className="min-w-0 flex-1 text-[13px] font-t3-semibold text-foreground">
+        {props.pause.label}
+      </Text>
+      {canLift ? (
+        <LinkButton
+          label="Pause actions"
+          accessibilityLabel="Pause actions"
+          expanded={menuOpen}
+          onPress={() => setMenuOpen((open) => !open)}
+        />
+      ) : null}
+      {canLift && menuOpen ? (
+        <LinkButton
+          label="Lift pause"
+          accessibilityLabel="Lift pause"
+          onPress={() => {
+            setMenuOpen(false);
+            confirmAction({
+              title: "Lift pause?",
+              message: "Card work and review resume on this board.",
+              confirmLabel: "Lift pause",
+              destructive: true,
+              onConfirm: props.onLiftPause,
+            });
+          }}
+        />
+      ) : null}
+    </View>
+  );
+}
+
 /**
  * The board: Needs Owner first, then the stages. A phone shows one stage at a
  * time behind tabs; a wide screen shows them side by side with Needs Owner
@@ -124,6 +165,7 @@ export function BoardView(props: {
   /** Opens the board's Setup discussion; shown only while setup runs. */
   readonly onViewSetup: (discussionId: string) => void;
   readonly onEndSetup: () => void;
+  readonly onLiftPause: () => void;
 }) {
   const goals = activeGoals(props.state);
   const boardId = props.state.board.id;
@@ -150,6 +192,7 @@ export function BoardView(props: {
       }),
     });
   const setup = setupBanner(props.state.board);
+  const pause = pauseBanner(props.state.board, props.state.cards);
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<BoardMode>("stages");
   const searchRef = useRef<TextInputInstance | null>(null);
@@ -176,6 +219,7 @@ export function BoardView(props: {
           onEndSetup={props.onEndSetup}
         />
       ) : null}
+      {pause ? <PauseStrip pause={pause} onLiftPause={props.onLiftPause} /> : null}
       <View className="flex-row items-center gap-2">
         <SearchField
           inputRef={searchRef}

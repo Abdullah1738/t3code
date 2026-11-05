@@ -20,7 +20,7 @@ from . import capacity
 API = os.environ.get("OFFBOX_BOAT_API", "https://boat.dev/api/v1")
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
-STARTING_STATES = ("init", "provisioning", "provisioned", "cloning")
+STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
 REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 
@@ -456,7 +456,7 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 
 
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
-               stale_error: str | None = None) -> dict:
+               stale_error: str | None = None, on_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
     if _DEADLINE is not None:
         timeout = max(0.0, min(timeout, _DEADLINE - time.time()))
@@ -474,6 +474,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
             raise SupplyOut(m.group(1).lower(), box_id, s["error"])
         if st in ("error", "cancelled"):
             raise OffboxError(f"box {box_id} went to {st}: {s.get('error')}")
+        if on_state is not None:
+            on_state(s)
         if time.time() > deadline:
             raise OffboxError(f"box {box_id} stuck in {st} after {int(timeout)}s")
         time.sleep(poll)

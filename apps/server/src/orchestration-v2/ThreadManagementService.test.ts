@@ -12,6 +12,7 @@ import {
   ProviderThreadId,
   ProviderDriverKind,
   ProviderSessionId,
+  ProviderTurnId,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
@@ -308,6 +309,133 @@ const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettin
     Layer.provide(settingsLayer),
     Layer.provide(layerReceiptsTest),
   );
+
+// ardud: an accepted steer/restart can be retried after the run or thread changes state.
+it.effect.each(["steer", "restart"] as const)(
+  "replays an accepted %s after its run completes or its thread is archived",
+  (mode) => {
+    const projectId = ProjectId.make(`project:receipt:${mode}`);
+    const threadId = ThreadId.make(`thread:receipt:${mode}`);
+    const runId = RunId.make(`run:receipt:${mode}`);
+    const attemptId = RunAttemptId.make(`attempt:receipt:${mode}`);
+    const messageId = MessageId.make(`message:receipt:${mode}`);
+    const commandId = CommandId.make(`command:receipt:${mode}`);
+    const commands: OrchestrationV2ServerCommand[] = [];
+    const messages: Array<{ id: MessageId; runId: RunId }> = [];
+    let completed = false;
+    let archived = false;
+    let accepted = false;
+    const now = DateTime.makeUnsafe("2026-11-03T00:00:00.000Z");
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () =>
+            Effect.sync(
+              () =>
+                ({
+                  thread: {
+                    id: threadId,
+                    projectId,
+                    deletedAt: null,
+                    archivedAt: archived ? now : null,
+                    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+                  },
+                  runs: [
+                    {
+                      id: runId,
+                      ordinal: 1,
+                      status: completed ? "completed" : "running",
+                      activeAttemptId: attemptId,
+                    },
+                  ],
+                  providerTurns: [
+                    {
+                      id: ProviderTurnId.make(`turn:${mode}`),
+                      runAttemptId: attemptId,
+                      status: "running",
+                    },
+                  ],
+                  messages,
+                  turnItems: messages.map((message) => ({
+                    type: "user_message",
+                    messageId: message.id,
+                    inputIntent: "steering",
+                  })),
+                }) as unknown as OrchestrationV2ThreadProjection,
+            ),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              commands.push(command);
+              if (!accepted && command.type === "message.dispatch") {
+                accepted = true;
+                messages.push({ id: command.messageId, runId });
+              }
+              return { sequence: 1, storedEvents: [] };
+            }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+          getByCommandId: (id) =>
+            Effect.succeed(
+              accepted && id === commandId
+                ? Option.some({
+                    commandId,
+                    threadId,
+                    commandType: "message.dispatch",
+                    status: "accepted",
+                    acceptedAt: now,
+                    resultSequence: 1,
+                    error: null,
+                  })
+                : Option.none(),
+            ),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+    );
+    return Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const input = {
+        projectId,
+        threadId,
+        runId,
+        messageId,
+        commandId,
+        mode,
+        text: "steer",
+        attachments: [],
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+      };
+      const first = yield* service.sendToThread(input);
+      completed = true;
+      const retry = yield* service.sendToThread(input);
+      expect(retry.message).toEqual(first.message);
+      expect(messages).toHaveLength(1);
+      expect(retry.run.id).toBe(runId);
+      expect(commands.at(-1)).toMatchObject({
+        commandId,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const fresh = yield* Effect.flip(
+        service.sendToThread({ ...input, commandId: CommandId.make(`fresh:${mode}`) }),
+      );
+      expect(fresh).toBeInstanceOf(ThreadManagementService.ThreadManagementNoSteerableRunError);
+      archived = true;
+      const archivedRetry = yield* service.sendToThread(input);
+      expect(archivedRetry.message).toEqual(first.message);
+      expect(messages).toHaveLength(1);
+      const archivedFresh = yield* Effect.flip(
+        service.sendToThread({ ...input, commandId: CommandId.make(`fresh-archived:${mode}`) }),
+      );
+      expect(archivedFresh).toBeInstanceOf(
+        ThreadManagementService.ThreadManagementThreadArchivedError,
+      );
+    }).pipe(Effect.provide(layerTest));
+  },
+);
 
 it.effect("fences explicit run interrupts and forwards the expected attempt only for them", () => {
   const projectId = ProjectId.make("project:interrupt-fence");

@@ -62,9 +62,13 @@ class BackupLock(unittest.TestCase):
         self.make_lock(self.fake_backup(), 30 * 60)
         self.assertTrue(hc.check_backup_lock()[0])
 
+    def test_live_run_between_old_and_new_limits_ok(self):
+        self.make_lock(self.fake_backup(), 3 * 3600 + 30 * 60)
+        self.assertTrue(hc.check_backup_lock()[0])
+
     def test_live_run_over_limit_fails_and_is_not_killed(self):
         pid = self.fake_backup()
-        self.make_lock(pid, 3 * 3600)
+        self.make_lock(pid, 5 * 3600)
         ok, msg = hc.check_backup_lock()
         self.assertFalse(ok)
         self.assertIn(f"PID {pid} still running", msg)
@@ -91,7 +95,7 @@ class BackupLock(unittest.TestCase):
         self.assertTrue(hc.check_backup_lock()[0])
 
     def test_alerts_once_per_day_while_stuck(self):
-        self.make_lock(self.fake_backup(), 3 * 3600)
+        self.make_lock(self.fake_backup(), 5 * 3600)
         with mock.patch.object(hc, "CHECKS", [("backup_lock", hc.check_backup_lock)]), \
                 mock.patch.object(hc, "notify", return_value=True) as notify, \
                 mock.patch.object(sys, "argv", ["health_check.py"]):

@@ -1,16 +1,23 @@
 """The set of work that is running right now, from both harnesses.
 
 Two sources, unioned:
-  - Robob's control API: GET /api/ardud/control/threads over the full list (not active=true, which misses a native
-    child with no run or pending request). Each thread is judged by in_use(), and its workspace is its worktree
-    path or, on the root workspace, its project's workspaceRoot. Claude and Codex threads (and OpenCode threads
-    Robob drives) come from here.
+  - Robob's control API, read in two queries that are each complete on their own, merged by threadId:
+      a. GET /threads?active=true&includeSubagents=true: every non-idle thread (runs and pending requests). The
+         server builds this from its live ids, so it is small (about 100 on a 26k-thread server).
+      b. GET /threads?creationSource=provider,mcp&includeSubagents=true&updatedSince=<now - 48 h>: recent
+         provider-native and delegated children. A child with no run or pending request is idle, and (a) misses
+         it, but it can still own a checkout between turns. A child idle for 2 days owns nothing live, so the
+         window bounds the list. The janitor's own idle threshold is 60 min.
+    Each thread is judged by in_use(), and its workspace is its worktree path or, on the root workspace, its
+    project's workspaceRoot. Claude and Codex threads (and OpenCode threads Robob drives) come from here.
   - The shared OpenCode service: GET /api/session/active, for OpenCode sessions Robob does not front.
 
 The snapshot is "complete" only when both sources answered in full. A source that is down, returns something
 unreadable, or is truncated (the control API caps a page at 500 and reports the full count in `total`) makes
 the snapshot incomplete. The reapers keep everything when it is incomplete: a missing source means "unknown",
-never "idle".
+never "idle". Query (b) needs the server's creationSource filter. An older Robob ignores the parameter and
+returns the unfiltered list, which is truncated, so the snapshot stays incomplete until that server ships.
+That is the intended fail-closed behaviour.
 
 The control credential is the rcsim component's file. Robob has no janitor component yet; adding one is a server
 change (apps/server/src/ardud/auth/components.ts) that needs a deploy. rcsim is the closest existing read-only
@@ -21,6 +28,7 @@ OPENCODE_SERVICE_URL (default http://127.0.0.1:49374). Password: OPENCODE_SERVER
 import base64
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +43,12 @@ CONTROL_CFGS = tuple(
 )
 # The control API's page cap. A full page is not proof of completeness, so we check `total` too.
 CONTROL_PAGE = 500
+# How far back a provider-native or delegated child still counts as possibly holding a checkout. The janitor's idle
+# threshold is 60 min; a child idle for two days owns nothing live.
+NATIVE_WINDOW_MS = 48 * 60 * 60 * 1000
+# The native query scans the full thread shell table server-side (7-46 s on the 26k-thread server), so it gets a
+# longer timeout than the default 20 s.
+NATIVE_TIMEOUT = 60
 
 
 class Snapshot(dict):
@@ -97,25 +111,48 @@ def _control_get(path, timeout=20):
         return 0, str(e)
 
 
-def robob_active(timeout=20):
-    """Every active Robob thread, or (None, error). Pages past the 500 cap by widening nothing: the API has
-    no cursor, so a result larger than one page is reported incomplete and the caller keeps everything."""
-    # The full list, not active=true: that filter is built from runs and pending requests, so a native child with
-    # neither is absent from it. includeSubagents keeps subagent threads in the list (the API hides them by
-    # default). The janitor decides activity from each thread with in_use().
-    query = "/threads?" + urllib.parse.urlencode({"includeSubagents": "true", "limit": CONTROL_PAGE})
+def _control_threads(query, timeout, label):
+    """One thread query as {threadId: summary}, or (None, error). The API has no cursor and caps a page at 500,
+    so a result larger than one page is reported incomplete rather than read partly."""
     status, body = _control_get(query, timeout)
     if status == 0 and isinstance(body, str):
-        return None, f"control api: {body}"
+        return None, f"control api {label}: {body}"
     if status != 200 or not isinstance(body, dict) or body.get("ok") is not True:
-        return None, f"control api: status {status}"
+        return None, f"control api {label}: status {status}"
     threads = body.get("threads")
     total = body.get("total")
     if not isinstance(threads, list) or not isinstance(total, int):
-        return None, "control api: unreadable thread list"
+        return None, f"control api {label}: unreadable thread list"
     if total > len(threads):
-        return None, f"control api: {total} active threads, only {len(threads)} returned (truncated)"
+        return None, f"control api {label}: {total} threads, only {len(threads)} returned (truncated)"
     return {t["threadId"]: t for t in threads if isinstance(t, dict) and t.get("threadId")}, None
+
+
+def robob_active(timeout=20, now_ms=None):
+    """Every active Robob thread, or (None, error). The union of two complete queries (see the module docstring).
+    Either query failing or truncating makes the whole result incomplete, so a caller keeps everything."""
+    # (a) Every non-idle thread. The server builds this from its live ids, so it is small. A null `now_ms` means
+    # the wall clock; tests pass one so the window is exact.
+    live, err = _control_threads(
+        "/threads?" + urllib.parse.urlencode({"active": "true", "includeSubagents": "true", "limit": CONTROL_PAGE}),
+        timeout, "active")
+    if err:
+        return None, err
+    # (b) Provider-native and MCP-delegated children updated in the window. Idle children have no run or pending
+    # request, so (a) doesn't list them, but they can still own their checkout between turns. An older Robob ignores
+    # creationSource; if the resulting unfiltered list is truncated, the snapshot remains incomplete.
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    native, err = _control_threads(
+        "/threads?" + urllib.parse.urlencode({
+            "creationSource": "provider,mcp",
+            "includeSubagents": "true",
+            "updatedSince": str(now - NATIVE_WINDOW_MS),
+            "limit": CONTROL_PAGE,
+        }),
+        NATIVE_TIMEOUT, "native")
+    if err:
+        return None, err
+    return {**native, **live}, None
 
 
 def in_use(thread):

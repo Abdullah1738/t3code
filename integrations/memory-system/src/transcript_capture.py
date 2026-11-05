@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS native_capture_files(
   last_ok_at INTEGER,
   error TEXT,
   error_count INTEGER NOT NULL DEFAULT 0,
+  error_since INTEGER,
+  instance TEXT,
+  session_key TEXT,
   quarantined_until INTEGER NOT NULL DEFAULT 0,
   retired INTEGER NOT NULL DEFAULT 0
 );
@@ -64,6 +67,14 @@ CREATE TABLE IF NOT EXISTS native_capture_raw(
   raw BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS native_capture_raw_rep ON native_capture_raw(rep_id, line_no);
+CREATE TABLE IF NOT EXISTS native_capture_roots(
+  instance TEXT NOT NULL,
+  root TEXT NOT NULL,
+  last_pass_at INTEGER NOT NULL,
+  files INTEGER NOT NULL,
+  errors INTEGER NOT NULL,
+  PRIMARY KEY(instance, root)
+);
 """
 
 
@@ -161,10 +172,13 @@ def ensure_schema(con):
     # checkpoint from a killed pass has complete = 0 and must not take the unchanged shortcut.
     if "complete" not in cols:
         con.execute("ALTER TABLE native_capture_files ADD COLUMN complete INTEGER NOT NULL DEFAULT 0")
+    for name, sql_type in (("error_since", "INTEGER"), ("instance", "TEXT"), ("session_key", "TEXT")):
+        if name not in cols:
+            con.execute(f"ALTER TABLE native_capture_files ADD COLUMN {name} {sql_type}")
 
 
-_COLS = ("rep_id", "head_len", "head_sha1", "tail_sha1", "complete", "offset", "phys_size", "mtime", "lines", "last_ok_at",
-         "error", "error_count", "quarantined_until", "inode")
+_COLS = ("rep_id", "path", "head_len", "head_sha1", "tail_sha1", "complete", "offset", "phys_size", "mtime", "lines", "last_ok_at",
+         "error", "error_count", "error_since", "quarantined_until", "inode", "instance", "session_key")
 
 
 def _same_representation(row, path, st):
@@ -176,7 +190,7 @@ def _same_representation(row, path, st):
     changes the head or the consumed tail (equal size included).
     A rewrite that changes only bytes outside both windows is not detected by this
     check; the head/tail windows bound the cost to O(1) per tick for each file.
-    .zst files are immutable once written, so size and head are enough.
+    A .zst conversion must match the consumed tail as well as the logical head.
     """
     if not path.endswith(ZST):
         if row["inode"] is not None and row["inode"] != st.st_ino:
@@ -187,6 +201,12 @@ def _same_representation(row, path, st):
                     return False  # consumed bytes changed in place (equal size or not)
             except OSError:
                 return False
+    elif row.get("offset") and row.get("tail_sha1"):
+        try:
+            if compressed_tail_sha1(path, row["offset"]) != row["tail_sha1"]:
+                return False
+        except OSError:
+            return False
     return _matches(row, path, st)
 
 
@@ -196,6 +216,65 @@ def tail_sha1(path, offset):
     with open(path, "rb") as f:
         f.seek(start)
         return hashlib.sha1(f.read(offset - start)).hexdigest()
+
+
+def compressed_tail_sha1(path, offset):
+    """Hash the consumed tail of a compressed stream; None if the checkpoint is past EOF."""
+    import subprocess
+
+    zstd = zstd_bin()
+    if not zstd:
+        raise FileNotFoundError("zstd missing")
+    proc = subprocess.Popen([zstd, "-dc", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    tail, remaining = b"", offset
+    try:
+        while remaining:
+            block = proc.stdout.read(min(65536, remaining))
+            if not block:
+                return None
+            remaining -= len(block)
+            tail = (tail + block)[-TAIL_BYTES:]
+        return hashlib.sha1(tail).hexdigest()
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def compressed_equals_plain(compressed, plain):
+    """True only when both simultaneously readable representations have the same bytes."""
+    import subprocess
+
+    zstd = zstd_bin()
+    if not zstd:
+        return False
+    proc = None
+    try:
+        with open(plain, "rb") as f:
+            before = os.fstat(f.fileno())
+            compressed_before = os.stat(compressed)
+            proc = subprocess.Popen([zstd, "-dc", compressed], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            while True:
+                block = proc.stdout.read(65536)
+                if not block:
+                    break
+                if block != f.read(len(block)):
+                    return False
+            if f.read(1) or proc.wait() != 0:
+                return False
+            after = os.fstat(f.fileno())
+            compressed_after = os.stat(compressed)
+            signature = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            return signature(before) == signature(after) and signature(compressed_before) == signature(compressed_after)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if proc:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 def _matches(row, path, st):
@@ -216,7 +295,7 @@ def _logical_bytes(path, st):
     return st.st_size if not path.endswith(ZST) else 1 << 62
 
 
-def open_representation(con, path, st, now=None, key=None):
+def open_representation(con, path, st, now=None, key=None, instance=None):
     """Return the live ledger row (dict) for this transcript's current representation.
 
     The row is keyed by the logical transcript (see logical_name). A plain file
@@ -232,18 +311,25 @@ def open_representation(con, path, st, now=None, key=None):
     for r in rows:
         row = dict(zip(_COLS, r))
         if _same_representation(row, path, st):
+            if row["path"] != path or (instance is not None and row["instance"] != instance):
+                con.execute("UPDATE native_capture_files SET path=?, instance=coalesce(?,instance) WHERE rep_id=?",
+                            (path, instance, row["rep_id"]))
+                row["path"] = path
+                if instance is not None:
+                    row["instance"] = instance
             return row
     if rows:
         con.execute("UPDATE native_capture_files SET retired=1 WHERE logical=? AND retired=0", (logical,))
     head_len = min(st.st_size, HEAD_BYTES) if not path.endswith(ZST) else HEAD_BYTES
     head = head_sha1(path, head_len)
     cur = con.execute(
-        "INSERT INTO native_capture_files(path, logical, inode, head_len, head_sha1, offset, phys_size, mtime)"
-        " VALUES(?,?,?,?,?,0,?,?)",
-        (path, logical, st.st_ino, head_len, head, st.st_size, st.st_mtime),
+        "INSERT INTO native_capture_files(path, logical, inode, head_len, head_sha1, offset, phys_size, mtime, instance)"
+        " VALUES(?,?,?,?,?,0,?,?,?)",
+        (path, logical, st.st_ino, head_len, head, st.st_size, st.st_mtime, instance),
     )
-    return dict(rep_id=cur.lastrowid, head_len=head_len, head_sha1=head, offset=0, phys_size=None, mtime=None,
-                lines=0, last_ok_at=None, error=None, error_count=0, quarantined_until=0, inode=st.st_ino)
+    return dict(rep_id=cur.lastrowid, path=path, head_len=head_len, head_sha1=head, offset=0, phys_size=None, mtime=None,
+                lines=0, last_ok_at=None, error=None, error_count=0, error_since=None, quarantined_until=0,
+                inode=st.st_ino, instance=instance, session_key=None)
 
 
 def read_complete_lines(path, offset, max_bytes=BATCH_BYTES):
@@ -276,17 +362,28 @@ def quarantined(con, logical, now=None):
     return bool(row and row[0] and row[0] > now)
 
 
+def follow_quarantined_move(con, path, logical, instance):
+    """Move error evidence with a disappeared pathname, without touching its checkpoint."""
+    rows = con.execute("SELECT rep_id,path FROM native_capture_files WHERE logical=? AND retired=0", (logical,)).fetchall()
+    if len(rows) == 1 and rows[0][1] != path and not os.path.exists(rows[0][1]):
+        con.execute("UPDATE native_capture_files SET path=?, instance=coalesce(instance,?) WHERE rep_id=?",
+                    (path, instance, rows[0][0]))
+
+
 def record_error(con, rep_id, message, now=None):
     """Durable per-file failure: error text, count, and the 10-minute quarantine."""
     now = int(time.time()) if now is None else now
+    # Pre-migration error rows have unknown onset; another failure cannot make them younger.
     con.execute(
-        "UPDATE native_capture_files SET error=?, error_count=error_count+1, quarantined_until=?"
+        "UPDATE native_capture_files SET error=?, error_since=CASE WHEN error_count>0 AND error_since IS NULL"
+        " THEN NULL ELSE coalesce(error_since,?) END, error_count=error_count+1, quarantined_until=?"
         " WHERE rep_id=?",
-        (str(message)[:500], now + QUARANTINE_SECS, rep_id),
+        (str(message)[:500], now, now + QUARANTINE_SECS, rep_id),
     )
 
 
-def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None, complete=False, inode=None):
+def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None, complete=False, inode=None,
+              instance=None, session_key=None, clear_error=True):
     """Commit one batch: the offset consumed, the physical identity it was read from, and the checksums.
 
     `tail` is the tail checksum at `offset` (plain files), the value the next pass verifies.
@@ -296,8 +393,33 @@ def record_ok(con, rep_id, offset, phys_size, mtime, lines, now=None, tail=None,
     """
     now = int(time.time()) if now is None else now
     con.execute(
-        "UPDATE native_capture_files SET offset=?, phys_size=?, mtime=?, lines=?, last_ok_at=?, error=NULL,"
-        " error_count=0, quarantined_until=0, tail_sha1=coalesce(?, tail_sha1), inode=coalesce(?, inode),"
+        "UPDATE native_capture_files SET offset=?, phys_size=?, mtime=?, lines=?, last_ok_at=?,"
+        " error=CASE WHEN ? THEN NULL ELSE error END,"
+        " error_count=CASE WHEN ? THEN 0 ELSE error_count END,"
+        " error_since=CASE WHEN ? THEN NULL ELSE error_since END,"
+        " quarantined_until=CASE WHEN ? THEN 0 ELSE quarantined_until END,"
+        " tail_sha1=coalesce(?, tail_sha1), inode=coalesce(?, inode),"
+        " instance=coalesce(?,instance), session_key=coalesce(?,session_key),"
         " complete=CASE WHEN ? THEN 1 ELSE 0 END WHERE rep_id=?",
-        (offset, phys_size, mtime, lines, now, tail, inode, 1 if complete else 0, rep_id),
+        (offset, phys_size, mtime, lines, now, clear_error, clear_error, clear_error, clear_error,
+         tail, inode, instance, session_key, 1 if complete else 0, rep_id),
+    )
+
+
+def merge_session_key(current, observed):
+    """An empty key marks conflicting identities and is never a resolvable session."""
+    if not isinstance(observed, str) or not observed:
+        return current
+    if current is None:
+        return observed
+    return current if current == observed else ""
+
+
+def record_root_pass(con, instance, root, files, errors, now=None):
+    now = int(time.time()) if now is None else now
+    con.execute(
+        "INSERT INTO native_capture_roots(instance,root,last_pass_at,files,errors) VALUES(?,?,?,?,?)"
+        " ON CONFLICT(instance,root) DO UPDATE SET last_pass_at=excluded.last_pass_at,"
+        " files=excluded.files, errors=excluded.errors",
+        (instance, os.path.realpath(root), now, files, errors),
     )

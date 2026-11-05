@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 
 import type { BoardPatch, KanbanServiceShape } from "./engine/KanbanService.ts";
 import type { KanbanScriptsShape } from "./engine/ScriptService.ts";
+import { stubMessage } from "./engine/messagePages.ts";
 
 const OWNER = { _tag: "owner" } as const;
 
@@ -56,12 +57,17 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.messages]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["messages"]>[0];
       readonly afterSeq?: number | undefined;
+      readonly beforeSeq?: number | undefined;
       readonly limit?: number | undefined;
     }) =>
       service.messages(
         input.discussionId,
-        definedOnly({ afterSeq: input.afterSeq, limit: input.limit }),
+        definedOnly({ afterSeq: input.afterSeq, beforeSeq: input.beforeSeq, limit: input.limit }),
       ),
+    [M.message]: (input: {
+      readonly discussionId: Parameters<KanbanServiceShape["message"]>[0];
+      readonly seq: number;
+    }) => service.message(input.discussionId, input.seq),
     [M.wiki]: (input: { readonly boardId: Parameters<KanbanServiceShape["wiki"]>[0] }) =>
       service.wiki(input.boardId),
     // The owner's create never reuses a board: a taken slug fails with conflict, checked
@@ -73,7 +79,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
       readonly evaluatorModel: Parameters<KanbanServiceShape["startSetup"]>[1]["evaluatorModel"];
       readonly text?: string | undefined;
-    }) => service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
+    }) =>
+      service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
     [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
       service.endSetup(input.boardId, OWNER),
     [M.boardPause]: (input: {
@@ -124,14 +131,24 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.messagePost]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["post"]>[0];
       readonly blocks: Parameters<KanbanServiceShape["post"]>[2];
-    }) => service.post(input.discussionId, OWNER, input.blocks),
+    }) => service.post(input.discussionId, OWNER, input.blocks).pipe(Effect.map(stubMessage)),
     [M.answer]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["answer"]>[0];
       readonly seq: number;
       readonly blockId: string;
       readonly choice: ReadonlyArray<string>;
       readonly text?: string | null | undefined;
-    }) => service.answer(input.discussionId, input.seq, input.blockId, input.choice, OWNER, input.text ?? null),
+    }) =>
+      service
+        .answer(
+          input.discussionId,
+          input.seq,
+          input.blockId,
+          input.choice,
+          OWNER,
+          input.text ?? null,
+        )
+        .pipe(Effect.map(stubMessage)),
     [M.scripts]: (input: { readonly boardId: Parameters<KanbanScriptsShape["scripts"]>[0] }) =>
       scripts.scripts(input.boardId),
     [M.scriptRuns]: (input: { readonly scriptId: ScriptId; readonly limit?: number | undefined }) =>

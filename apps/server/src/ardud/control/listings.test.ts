@@ -13,8 +13,13 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
@@ -28,6 +33,7 @@ import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.t
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
@@ -190,8 +196,11 @@ const seedRows = Effect.gen(function* () {
 
 // Shaped like the real snapshot: the location picks which threads are read,
 // and archived ones always come back under archivedThreads.
-const snapshotFor = (location: "active" | "archive") => {
-  const read = shells.filter(
+const snapshotFor = (
+  location: "active" | "archive",
+  extra: ReadonlyArray<OrchestrationV2ThreadShell>,
+) => {
+  const read = [...shells, ...extra].filter(
     (candidate) => (candidate.archivedAt !== null) === (location === "archive"),
   );
   return {
@@ -202,9 +211,13 @@ const snapshotFor = (location: "active" | "archive") => {
   };
 };
 
-const makeHarness = (buildCommit?: string) =>
+const makeHarness = (
+  buildCommit?: string,
+  extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const projects = yield* ProjectStore.make;
     yield* seedRows;
     const snapshotReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
@@ -217,10 +230,12 @@ const makeHarness = (buildCommit?: string) =>
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
       getShellSnapshot: (options) =>
         Ref.update(snapshotReads, (count) => count + 1).pipe(
-          Effect.as(snapshotFor(options?.location ?? "active")),
+          Effect.as(snapshotFor(options?.location ?? "active", extraShells)),
         ),
       getThreadShell: (threadId) =>
-        Effect.succeed(shells.find((candidate) => candidate.id === threadId) ?? null),
+        Effect.succeed(
+          [...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null,
+        ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
     const web = yield* Effect.acquireRelease(
@@ -241,9 +256,21 @@ const makeHarness = (buildCommit?: string) =>
                 threads,
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                 Layer.mock(Orchestrator.OrchestratorV2)({}),
-                Layer.mock(ProjectService.ProjectService)({}),
+                Layer.mock(ProjectService.ProjectService)({
+                  listShells: (options) =>
+                    projects.listShells(options).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProjectService.ProjectOperationError({
+                            operation: "list-projects",
+                            cause,
+                          }),
+                      ),
+                    ),
+                }),
                 Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
                   namedProjectsRoot: "/tmp/named",
+                  scratchRoot: Effect.succeed(Option.none()),
                 }),
                 Layer.mock(ProviderRegistry.ProviderRegistry)({}),
                 ServerSettings.layerTest(),
@@ -295,11 +322,15 @@ const makeHarness = (buildCommit?: string) =>
     return { get, threadIds, snapshotReads };
   });
 
+type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
+
+// `buildCommit` is main's startup-commit fixture; `extraShells` adds threads to the snapshot for one test.
 const run = <A, E>(
-  body: (h: Effect.Success<ReturnType<typeof makeHarness>>) => Effect.Effect<A, E>,
+  body: (h: Harness) => Effect.Effect<A, E>,
   buildCommit?: string,
+  extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(buildCommit), body)).pipe(
+  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells), body)).pipe(
     Effect.provide(Sqlite.layerMemory),
   );
 
@@ -330,6 +361,46 @@ describe("control listings", () => {
         );
       }
     }),
+  );
+  it.live("lists projects from the reader while the writer is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-projects-reader-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        yield* sql`INSERT INTO projection_projects
+          (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+          VALUES ('reader-project', 'Reader project', '/workspace/reader', '[]',
+            '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`;
+        // Initialize route layers and their DDL before testing a request.
+        assert.strictEqual((yield* harness.get("/projects")).status, 200);
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        yield* Deferred.await(held);
+        const response = yield* harness.get("/projects").pipe(
+          Effect.timeout("5 seconds"),
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(writer);
+        assert.strictEqual(response.status, 200);
+        assert.deepStrictEqual(response.body.projects, [
+          {
+            projectId: "reader-project",
+            title: "Reader project",
+            workspaceRoot: "/workspace/reader",
+            defaultModel: null,
+            scratch: false,
+          },
+        ]);
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("lists active threads from live rows without the shell snapshot", () =>
     run(({ threadIds, snapshotReads }) =>
@@ -379,6 +450,80 @@ describe("control listings", () => {
       }),
     ),
   );
+
+  it.effect("filters /threads by creationSource, with includeSubagents and updatedSince", () => {
+    // A provider-native child (idle, subagent lineage) and an app thread. Their updatedAt values differ so
+    // updatedSince actually splits them.
+    const nativeChild = shell("native-child", {
+      creationSource: "provider",
+      createdBy: "agent",
+      updatedAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
+      lineage: {
+        rootThreadId: ThreadId.make("live-running"),
+        parentThreadId: ThreadId.make("live-running"),
+        relationshipToParent: "subagent",
+      },
+      ...idle,
+    });
+    // Not web: every harness shell defaults to web, so a mobile match is this thread alone.
+    const appThread = shell("app-thread", {
+      creationSource: "mobile",
+      updatedAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
+      ...idle,
+    });
+    const oldNative = shell("old-native-child", {
+      creationSource: "provider",
+      createdBy: "agent",
+      updatedAt: DateTime.makeUnsafe("2025-12-01T00:00:00.000Z"),
+      lineage: {
+        rootThreadId: ThreadId.make("live-running"),
+        parentThreadId: ThreadId.make("live-running"),
+        relationshipToParent: "subagent",
+      },
+      ...idle,
+    });
+    return run(
+      ({ threadIds }) =>
+        Effect.gen(function* () {
+          // Only the provider-native children, whatever the lineage.
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=provider&includeSubagents=true&limit=500"),
+            ["native-child", "old-native-child"],
+          );
+          // Exact match on the one non-web thread.
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=mobile&includeSubagents=true&limit=500"),
+            ["app-thread"],
+          );
+          // A comma list matches any of its values.
+          assert.deepStrictEqual(
+            yield* threadIds(
+              "/threads?creationSource=mobile,provider&includeSubagents=true&limit=500",
+            ),
+            ["app-thread", "native-child", "old-native-child"],
+          );
+          // updatedSince narrows the same filter: the 2025 child drops out, the 2026 child stays.
+          assert.deepStrictEqual(
+            yield* threadIds(
+              `/threads?creationSource=provider&includeSubagents=true&updatedSince=${Date.parse("2025-12-31T00:00:00.000Z")}&limit=500`,
+            ),
+            ["native-child"],
+          );
+          // Without includeSubagents the child is hidden even when it matches creationSource.
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?creationSource=provider&limit=500"),
+            [],
+          );
+          // The active=true fast path is untouched: an idle child is not active.
+          assert.deepStrictEqual(
+            yield* threadIds("/threads?active=true&includeSubagents=true&limit=500"),
+            ["asks-waiting", "live-queued", "live-running", "live-subagent"],
+          );
+        }),
+      undefined,
+      [nativeChild, appThread, oldNative],
+    );
+  });
 
   it.effect("lists pending requests from pending rows without the shell snapshot", () =>
     run(({ get, snapshotReads }) =>

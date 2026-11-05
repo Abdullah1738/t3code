@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
   KanbanAutomation,
@@ -231,6 +232,18 @@ export interface KanbanStoreShape {
     pools: ReadonlyArray<{ readonly from: string; readonly pool: KanbanPool }>,
     cards: ReadonlyArray<KanbanCard>,
   ) => Effect.Effect<void, KanbanStoreError>;
+  /**
+   * Writes a board migration: the board record, its pools (old keys removed, new ones put),
+   * the cards and the open thread links, in one transaction. A failure leaves the board
+   * untouched. Unlike rekeyBoard, it also rewrites models, not only keys.
+   */
+  readonly migrateBoardSelections: (input: {
+    readonly board: KanbanBoard;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly oldPoolKeys: ReadonlyArray<string>;
+    readonly cards: ReadonlyArray<KanbanCard>;
+    readonly threadLinks: ReadonlyArray<KanbanThreadLink>;
+  }) => Effect.Effect<void, KanbanStoreError>;
 
   readonly groups: (
     boardId: KanbanBoardId,
@@ -250,12 +263,25 @@ export interface KanbanStoreShape {
     threadId: string,
   ) => Effect.Effect<KanbanDiscussion | null, KanbanStoreError>;
   readonly putDiscussion: (discussion: KanbanDiscussion) => Effect.Effect<void, KanbanStoreError>;
+  /** The newest `limit` (default 200) after `afterSeq` and before `beforeSeq`, oldest first. */
   readonly messages: (
     id: KanbanDiscussionId,
-    options?: { readonly afterSeq?: number; readonly limit?: number },
+    options?: { readonly afterSeq?: number; readonly beforeSeq?: number; readonly limit?: number },
   ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
+  /**
+   * The owner's latest message and whether an evaluator spoke after it, without decoding the
+   * history. Null when the owner never wrote.
+   */
+  readonly ownerWait: (
+    id: KanbanDiscussionId,
+  ) => Effect.Effect<
+    { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
+    KanbanStoreError
+  >;
   /** Every message of a discussion, oldest first. */
-  readonly allMessages: (id: KanbanDiscussionId) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
+  readonly allMessages: (
+    id: KanbanDiscussionId,
+  ) => Effect.Effect<ReadonlyArray<KanbanMessage>, KanbanStoreError>;
   readonly message: (
     id: KanbanDiscussionId,
     seq: number,
@@ -344,7 +370,11 @@ const make = Effect.gen(function* () {
   const run = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
     effect.pipe(Effect.mapError(fail(operation)));
 
-  const boards = run(
+  // Reads inside a write transaction stay on the writer for read-your-writes.
+  const runRead = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
+    run(operation, NodeSqliteClient.readOnly(effect));
+
+  const boards = runRead(
     "read boards",
     Effect.flatMap(sql<JsonRow>`SELECT json FROM ardud_kanban_boards ORDER BY rowid`, (rows) =>
       decodeAll(rows, Board.decode),
@@ -384,7 +414,7 @@ const make = Effect.gen(function* () {
     );
 
   const cards = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read cards",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} ORDER BY number`,
@@ -392,7 +422,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const summaryCards = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read summary cards",
       Effect.flatMap(
         sql<JsonRow>`
@@ -414,7 +444,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const card = (cardId: KanbanCardId) =>
-    run(
+    runRead(
       "read card",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE id = ${cardId}`,
@@ -422,7 +452,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const cardByNumber = (boardId: KanbanBoardId, number: number) =>
-    run(
+    runRead(
       "read card by number",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
@@ -430,7 +460,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const cardsByThread = (threadId: string) =>
-    run(
+    runRead(
       "read cards by thread",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE active_thread_id = ${threadId} ORDER BY number`,
@@ -438,7 +468,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const cardsInStage = (stage: KanbanStage) =>
-    run(
+    runRead(
       "read cards in stage",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_cards WHERE stage = ${stage} ORDER BY board_id, number`,
@@ -483,7 +513,7 @@ const make = Effect.gen(function* () {
       }),
     );
   const cardEvents = (cardId: KanbanCardId) =>
-    run(
+    runRead(
       "read card events",
       Effect.flatMap(
         sql<IdJsonRow>`SELECT id, json FROM ardud_kanban_card_events WHERE card_id = ${cardId} ORDER BY id`,
@@ -498,7 +528,7 @@ const make = Effect.gen(function* () {
     );
 
   const goals = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read goals",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_goals WHERE board_id = ${boardId} ORDER BY rowid`,
@@ -518,7 +548,7 @@ const make = Effect.gen(function* () {
     );
 
   const pools = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read pools",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_pools WHERE board_id = ${boardId} ORDER BY rowid`,
@@ -559,6 +589,61 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+  const migrateBoardSelections = (input: {
+    readonly board: KanbanBoard;
+    readonly pools: ReadonlyArray<KanbanPool>;
+    readonly oldPoolKeys: ReadonlyArray<string>;
+    readonly cards: ReadonlyArray<KanbanCard>;
+    readonly threadLinks: ReadonlyArray<KanbanThreadLink>;
+  }) =>
+    run(
+      "migrate board selections",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const boardJson = yield* Board.encode(input.board);
+          yield* sql`
+            INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${input.board.id}, ${input.board.slug}, ${boardJson})
+            ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
+          `;
+          // The board reads its pools in insertion order (ORDER BY rowid), so a migrated pool keeps its row
+          // and its place: a key change is an in-place UPDATE, never a delete and re-insert. Only a key
+          // that leaves the board is deleted. `oldPoolKeys` and `pools` are paired by position.
+          // Re-keyed pools move first, so their rows are never deleted in the way; the removal pass that
+          // follows only sees keys that genuinely left the board.
+          const survivingKeys = new Set(input.pools.map((pool) => pool.key));
+          for (const [index, pool] of input.pools.entries()) {
+            const poolJson = yield* Pool.encode(pool);
+            const oldKey = input.oldPoolKeys[index];
+            if (oldKey !== undefined && oldKey !== pool.key) {
+              yield* sql`
+                UPDATE ardud_kanban_pools SET key = ${pool.key}, json = ${poolJson}
+                WHERE board_id = ${input.board.id} AND key = ${oldKey}
+              `;
+              continue;
+            }
+            yield* sql`
+              INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${input.board.id}, ${pool.key}, ${poolJson})
+              ON CONFLICT (board_id, key) DO UPDATE SET json = excluded.json
+            `;
+          }
+          for (const key of input.oldPoolKeys) {
+            if (survivingKeys.has(key)) continue;
+            yield* sql`DELETE FROM ardud_kanban_pools WHERE board_id = ${input.board.id} AND key = ${key}`;
+          }
+          for (const card of input.cards) {
+            const json = yield* Card.encode(card);
+            yield* sql`
+              UPDATE ardud_kanban_cards SET json = ${json}, active_thread_id = ${card.activeThreadId}, stage = ${card.stage}
+              WHERE id = ${card.id}
+            `;
+          }
+          for (const link of input.threadLinks) {
+            const json = yield* ThreadLink.encode(link);
+            yield* sql`UPDATE ardud_kanban_threads SET json = ${json} WHERE thread_id = ${link.threadId}`;
+          }
+        }),
+      ),
+    );
   const removePool = (boardId: KanbanBoardId, key: string) =>
     run(
       "remove pool",
@@ -568,7 +653,7 @@ const make = Effect.gen(function* () {
     );
 
   const groups = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read groups",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_groups WHERE board_id = ${boardId}`,
@@ -588,7 +673,7 @@ const make = Effect.gen(function* () {
     );
 
   const discussions = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read discussions",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_discussions WHERE board_id = ${boardId} ORDER BY rowid`,
@@ -596,7 +681,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const discussion = (id: KanbanDiscussionId) =>
-    run(
+    runRead(
       "read discussion",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_discussions WHERE id = ${id}`,
@@ -604,7 +689,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const discussionByEvaluator = (threadId: string) =>
-    run(
+    runRead(
       "read discussion by evaluator",
       Effect.flatMap(
         sql<JsonRow>`
@@ -630,23 +715,54 @@ const make = Effect.gen(function* () {
     );
   const messages = (
     id: KanbanDiscussionId,
-    options?: { readonly afterSeq?: number; readonly limit?: number },
+    options?: { readonly afterSeq?: number; readonly beforeSeq?: number; readonly limit?: number },
   ) =>
-    run(
+    runRead(
       "read messages",
       Effect.flatMap(
         sql<JsonRow>`
           SELECT json FROM (
             SELECT seq, json FROM ardud_kanban_messages
             WHERE discussion_id = ${id} AND seq > ${options?.afterSeq ?? 0}
+              AND seq < ${options?.beforeSeq ?? Number.MAX_SAFE_INTEGER}
             ORDER BY seq DESC LIMIT ${options?.limit ?? 200}
           ) ORDER BY seq
         `,
         (rows) => decodeAll(rows, Message.decode),
       ),
     );
+  // Walks the discussion's primary key newest first; json_extract stays in SQLite, so a
+  // multi-MB history is never decoded.
+  const ownerWait = (id: KanbanDiscussionId) =>
+    runRead(
+      "read owner wait",
+      Effect.map(
+        sql<{ readonly seq: number; readonly createdAt: string; readonly answered: number }>`
+          SELECT m.seq AS seq,
+            json_extract(m.json, '$.createdAt') AS createdAt,
+            EXISTS (
+              SELECT 1 FROM ardud_kanban_messages e
+              WHERE e.discussion_id = m.discussion_id AND e.seq > m.seq
+                AND json_extract(e.json, '$.author._tag') = 'evaluator'
+            ) AS answered
+          FROM ardud_kanban_messages m
+          WHERE m.discussion_id = ${id} AND json_extract(m.json, '$.author._tag') = 'owner'
+          ORDER BY m.seq DESC LIMIT 1
+        `,
+        (rows) => {
+          const row = rows[0];
+          return row
+            ? {
+                seq: Number(row.seq),
+                createdAt: String(row.createdAt),
+                answered: Number(row.answered) === 1,
+              }
+            : null;
+        },
+      ),
+    );
   const allMessages = (id: KanbanDiscussionId) =>
-    run(
+    runRead(
       "read all messages",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_messages WHERE discussion_id = ${id} ORDER BY seq`,
@@ -654,7 +770,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const message = (id: KanbanDiscussionId, seq: number) =>
-    run(
+    runRead(
       "read message",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_messages WHERE discussion_id = ${id} AND seq = ${seq}`,
@@ -675,21 +791,21 @@ const make = Effect.gen(function* () {
     );
 
   const scripts = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read scripts",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_scripts WHERE board_id = ${boardId} ORDER BY rowid`,
         (rows) => decodeAll(rows, Script.decode),
       ),
     );
-  const allScripts = run(
+  const allScripts = runRead(
     "read all scripts",
     Effect.flatMap(sql<JsonRow>`SELECT json FROM ardud_kanban_scripts ORDER BY rowid`, (rows) =>
       decodeAll(rows, Script.decode),
     ),
   );
   const script = (id: KanbanScriptId) =>
-    run(
+    runRead(
       "read script",
       Effect.flatMap(sql<JsonRow>`SELECT json FROM ardud_kanban_scripts WHERE id = ${id}`, (rows) =>
         Effect.map(decodeAll(rows, Script.decode), first),
@@ -728,7 +844,7 @@ const make = Effect.gen(function* () {
       }),
     );
   const scriptRuns = (id: KanbanScriptId, limit: number) =>
-    run(
+    runRead(
       "read script runs",
       Effect.flatMap(
         sql<IdJsonRow>`
@@ -745,7 +861,7 @@ const make = Effect.gen(function* () {
     );
 
   const automations = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read automations",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_automations WHERE board_id = ${boardId} ORDER BY rowid`,
@@ -765,7 +881,7 @@ const make = Effect.gen(function* () {
     );
 
   const wiki = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "read wiki",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_wiki WHERE board_id = ${boardId} ORDER BY slug`,
@@ -785,7 +901,7 @@ const make = Effect.gen(function* () {
     );
 
   const threadLink = (threadId: string) =>
-    run(
+    runRead(
       "read thread link",
       Effect.flatMap(
         sql<JsonRow>`SELECT json FROM ardud_kanban_threads WHERE thread_id = ${threadId}`,
@@ -793,7 +909,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const threadLinks: KanbanStoreShape["threadLinks"] = (filter) =>
-    run(
+    runRead(
       "read thread links",
       Effect.flatMap(
         "cardId" in filter
@@ -836,7 +952,7 @@ const make = Effect.gen(function* () {
       `.pipe(Effect.asVoid),
     );
   const threadCards = (threadId: string) =>
-    run(
+    runRead(
       "read thread cards",
       Effect.map(
         sql<{ readonly card_id: string }>`
@@ -867,6 +983,7 @@ const make = Effect.gen(function* () {
     putPool,
     removePool,
     rekeyBoard,
+    migrateBoardSelections,
     groups,
     putGroups,
     discussions,
@@ -874,6 +991,7 @@ const make = Effect.gen(function* () {
     discussionByEvaluator,
     putDiscussion,
     messages,
+    ownerWait,
     allMessages,
     message,
     putMessage,

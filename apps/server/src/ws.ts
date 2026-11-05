@@ -110,6 +110,8 @@ import { RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
+import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
+import * as WsReplySerialization from "./observability/WsReplySerialization.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
@@ -3186,6 +3188,7 @@ export const layer = Layer.unwrap(
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
+    const largeReplyLog = yield* LargeReplyLog.LargeReplyLog;
     const sql = yield* SqlClient.SqlClient;
     return HttpRouter.add(
       "GET",
@@ -3262,7 +3265,16 @@ export const layer = Layer.unwrap(
               // ardud: missions board
               layerWsKanbanRpc,
             ).pipe(
-              Layer.provideMerge(RpcSerialization.layerJson),
+              Layer.provideMerge(
+                Layer.succeed(
+                  RpcSerialization.RpcSerialization,
+                  WsReplySerialization.wrap(
+                    RpcSerialization.json,
+                    largeReplyLog,
+                    new Set(ServerWsRpcGroup.requests.keys()),
+                  ),
+                ),
+              ),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.
               Layer.provide(DefectReporter.layer),

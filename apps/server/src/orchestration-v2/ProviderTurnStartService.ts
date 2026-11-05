@@ -33,6 +33,8 @@ import * as ServerSettings from "../serverSettings.ts";
 // ardud: the restart note checks OpenCode children before it says they were cancelled.
 import { restartNoteText } from "../ardud/opencode-import/ChildSessions.ts";
 import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
+// ardud: unconfirmed native history must not be replaced by a lossy handoff.
+import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -900,7 +902,23 @@ export const layer: Layer.Layer<
       let resumedRetryHandoff: ReadonlyArray<OrchestrationV2ContextHandoff> | undefined;
       let resumedHandoffContext: ReturnType<typeof handoffContextForThread> | undefined;
       const loadedProviderThread = yield* Effect.gen(function* () {
+        // ardud: a moved session is not safe to replace until it completes a turn.
+        const seededGuard = seededUnconfirmed(providerThread, projection.providerTurns);
+        const failSeededResume = () =>
+          loadFromProvider(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId,
+                cause:
+                  "This thread's moved history could not be resumed, so the turn stopped instead of starting without it. Roll the move back with t3ctl harness-migrate rollback <thread>, or retry.",
+              }),
+            ),
+          );
         if (nativeForkTransfer !== undefined) {
+          if (seededGuard) return yield* failSeededResume();
           const sourceProjection = yield* projectionStore.getThreadRecords(
             nativeForkTransfer.sourceThreadId,
             ["runs", "providerThreads", "attempts", "providerTurns"],
@@ -938,7 +956,14 @@ export const layer: Layer.Layer<
             }),
           );
         }
-        if (providerThread.nativeThreadRef === null) {
+        if (providerThread.nativeThreadRef?.nativeId == null) {
+          // Codex stages an injection without a native id; Claude requires its transcript id.
+          if (
+            seededGuard &&
+            (isClaudeSeeded(providerThread) ||
+              providerThread.nativeMetadata?.seededHistory?.injectedNativeId !== undefined)
+          )
+            return yield* failSeededResume();
           // ardud: claim staged injection before any native side effect. An
           // interrupted claim is ambiguous and requires explicit reconciliation.
           const seeded = providerThread.nativeMetadata?.seededHistory;
@@ -1084,6 +1109,7 @@ export const layer: Layer.Layer<
             Effect.catchTags({ ContextHandoffBudgetError: () => Effect.succeed(false) }),
           );
           if (fits) return resumed.success;
+          if (seededGuard) return yield* failSeededResume();
           const freshThread = { ...resumed.success, nativeThreadRef: null };
           const freshContext = handoffContextForThread(freshThread);
           const { handoff } = yield* recoveryHandoff;
@@ -1119,6 +1145,7 @@ export const layer: Layer.Layer<
             );
           }
         }
+        if (seededGuard) return yield* failSeededResume();
         resumedHandoffContext = undefined;
         resumedRetryHandoff = [];
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
@@ -1209,6 +1236,9 @@ export const layer: Layer.Layer<
         budget,
       } = handoffContext;
       const retryHandoff = resumedRetryHandoff ?? (yield* prepareRetryHandoff(handoffContext));
+      // ardud: the marker belongs to the adopted native id, not a later replacement.
+      const { seededHistory: _oldSeed, ...replacementMetadata } =
+        loadedProviderThread.nativeMetadata ?? {};
       const runningProviderThread: OrchestrationV2ProviderThread = {
         ...loadedProviderThread,
         contextUsage: handoffUsage,
@@ -1222,11 +1252,17 @@ export const layer: Layer.Layer<
         lastRunOrdinal: run.ordinal,
         handoffIds: providerThread.handoffIds,
         forkedFrom: providerThread.forkedFrom,
-        // ardud: retain the adopted marker, including delivery updates from the adapter.
-        nativeMetadata: {
-          ...providerThread.nativeMetadata,
-          ...loadedProviderThread.nativeMetadata,
-        },
+        // ardud: a fallback replacement drops the adopted marker; otherwise keep it,
+        // including delivery updates the adapter returns.
+        nativeMetadata:
+          resumeFellBack && providerThread.nativeMetadata?.seededHistory !== undefined
+            ? replacementMetadata
+            : providerThread.nativeMetadata?.seededHistory === undefined
+              ? loadedProviderThread.nativeMetadata
+              : {
+                  ...providerThread.nativeMetadata,
+                  ...loadedProviderThread.nativeMetadata,
+                },
         status: "active",
         createdAt: providerThread.createdAt,
         updatedAt: now,
@@ -1460,6 +1496,8 @@ export const layer: Layer.Layer<
               .map((turn) => turn.ordinal),
           ) + 1,
         nativeThreadHasTurns:
+          // ardud: a staged Claude transcript already has native history.
+          isClaudeSeeded(runningProviderThread) ||
           nativeInputRunIds.size > 0 ||
           (legacyInputRunIds.size > 0 &&
             sameNativeThread &&

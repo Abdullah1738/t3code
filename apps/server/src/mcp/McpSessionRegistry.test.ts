@@ -11,7 +11,9 @@ import * as Layer from "effect/Layer";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 
@@ -394,6 +396,7 @@ it.effect("coalesces request liveness writes and makes trusted touch durable", (
     now = 61_000;
     yield* first.resolve(token);
     yield* first.resolve(token);
+    yield* TestClock.adjust("1 minute");
     expect(writes).toBe(1);
     expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(61_000);
     now = 61_001;
@@ -409,16 +412,17 @@ it.effect("serializes a delayed trusted touch against revocation without resurre
     const base = yield* CredentialStore.CredentialStore;
     const started = yield* Deferred.make<void>();
     const resume = yield* Deferred.make<void>();
+    let now = 1_000;
     const delayed = CredentialStore.CredentialStore.of({
       ...base,
-      touchThread: (...args) =>
+      updateLiveness: (...args) =>
         Deferred.succeed(started, undefined).pipe(
           Effect.andThen(Deferred.await(resume)),
-          Effect.andThen(base.touchThread(...args)),
+          Effect.andThen(base.updateLiveness(...args)),
         ),
     });
     const registry = yield* McpSessionRegistry.__testing
-      .make({ now: () => 1_000 })
+      .make({ now: () => now })
       .pipe(
         Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
         Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
@@ -428,6 +432,7 @@ it.effect("serializes a delayed trusted touch against revocation without resurre
       threadId: ThreadId.make("race"),
       providerInstanceId: ProviderInstanceId.make("codex"),
     });
+    now = 2_000;
     const touch = yield* registry.touch(issued.config.threadId).pipe(Effect.forkChild);
     yield* Deferred.await(started);
     const revoke = yield* registry.revokeThread(issued.config.threadId).pipe(Effect.forkChild);
@@ -436,6 +441,449 @@ it.effect("serializes a delayed trusted touch against revocation without resurre
     yield* Fiber.join(revoke);
     expect(yield* base.load(environmentId)).toEqual([]);
     expect(yield* registry.resolve(issued.config.authorizationHeader.slice(7))).toBeUndefined();
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("resolves all tokens while a dirty liveness write is blocked", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let now = 1_000;
+    const delayed = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(base.updateLiveness(...args)),
+        ),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, delayed),
+      );
+    const credentials = yield* Effect.forEach(["one", "two", "three"], (id) =>
+      registry.issue({
+        threadId: ThreadId.make(id),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      }),
+    );
+    const tokens = credentials.map((credential) => credential.config.authorizationHeader.slice(7));
+    now = 61_000;
+    const first = yield* registry.resolve(tokens[0]!).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("1 minute");
+    yield* Effect.yieldNow;
+    const second = yield* registry.resolve(tokens[1]!).pipe(Effect.forkChild);
+    const third = yield* registry.resolve(tokens[2]!).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    const startedBeforeRelease = yield* Deferred.isDone(started);
+    const beforeRelease = [first.pollUnsafe(), second.pollUnsafe(), third.pollUnsafe()];
+    yield* Deferred.succeed(resume, undefined);
+    const scopes = yield* Effect.all([Fiber.join(first), Fiber.join(second), Fiber.join(third)]);
+    expect(startedBeforeRelease).toBe(true);
+    expect(beforeRelease.every((exit) => exit !== undefined && Exit.isSuccess(exit))).toBe(true);
+    expect(scopes.map((scope) => scope?.thread.threadId)).toEqual(["one", "two", "three"]);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("revokes another thread while a liveness flush is blocked", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let now = 1_000;
+    const delayed = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(base.updateLiveness(...args)),
+        ),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, delayed),
+      );
+    const first = yield* registry.issue({
+      threadId: ThreadId.make("flush"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const other = yield* registry.issue({
+      threadId: ThreadId.make("revoke"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    now = 61_000;
+    const resolving = yield* registry
+      .resolve(first.config.authorizationHeader.slice(7))
+      .pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("1 minute");
+    yield* Effect.yieldNow;
+    const revoking = yield* registry.revokeThread(other.config.threadId).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    const startedBeforeRelease = yield* Deferred.isDone(started);
+    const revokeBeforeRelease = revoking.pollUnsafe();
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(resolving);
+    yield* Fiber.join(revoking);
+    expect(startedBeforeRelease).toBe(true);
+    expect(revokeBeforeRelease && Exit.isSuccess(revokeBeforeRelease)).toBe(true);
+    expect(yield* registry.resolve(other.config.authorizationHeader.slice(7))).toBeUndefined();
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("flushes dirty liveness once and retries a failed flush on the next interval", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    let attempts = 0;
+    let now = 1_000;
+    const failingOnce = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Effect.suspend(() => {
+          attempts += 1;
+          return attempts === 1
+            ? Effect.fail(
+                new CredentialStore.CredentialStoreError({ operation: "update-liveness" }),
+              )
+            : base.updateLiveness(...args);
+        }),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, failingOnce),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("retry"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    now = 61_000;
+    const result = yield* Effect.exit(registry.resolve(issued.config.authorizationHeader.slice(7)));
+    expect(Exit.isSuccess(result)).toBe(true);
+    expect(attempts).toBe(0);
+    yield* TestClock.adjust("1 minute");
+    expect(attempts).toBe(1);
+    expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(1_000);
+    yield* TestClock.adjust("1 minute");
+    expect(attempts).toBe(2);
+    expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(61_000);
+    yield* TestClock.adjust("1 minute");
+    expect(attempts).toBe(2);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("does not resurrect a revoked token when its delayed flush completes", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const finished = yield* Deferred.make<void>();
+    let now = 1_000;
+    const delayed = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(base.updateLiveness(...args)),
+          Effect.tap(() => Deferred.succeed(finished, undefined)),
+        ),
+    });
+    const create = McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, delayed),
+      );
+    const registry = yield* create;
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("revoke-flush"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.slice(7);
+    now = 61_000;
+    const resolving = yield* registry.resolve(token).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("1 minute");
+    yield* Effect.yieldNow;
+    const revoking = yield* registry.revokeThread(issued.config.threadId).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    const startedBeforeRelease = yield* Deferred.isDone(started);
+    const revokeBeforeRelease = revoking.pollUnsafe();
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(resolving);
+    yield* Fiber.join(revoking);
+    yield* Deferred.await(finished);
+    const restored = yield* create;
+    expect(startedBeforeRelease).toBe(true);
+    expect(revokeBeforeRelease && Exit.isSuccess(revokeBeforeRelease)).toBe(true);
+    expect(yield* restored.resolve(token)).toBeUndefined();
+    expect(yield* base.load(environmentId)).toEqual([]);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("makes touch durable without blocking a concurrent resolve", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let now = 1_000;
+    const delayed = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(base.updateLiveness(...args)),
+        ),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, delayed),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("touch"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    now = 2_000;
+    const touching = yield* registry.touch(issued.config.threadId).pipe(Effect.forkChild);
+    yield* Deferred.await(started);
+    const resolving = yield* registry
+      .resolve(issued.config.authorizationHeader.slice(7))
+      .pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    const resolveBeforeRelease = resolving.pollUnsafe();
+    expect(touching.pollUnsafe()).toBeUndefined();
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(touching);
+    expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(2_000);
+    expect((yield* Fiber.join(resolving))?.thread.threadId).toBe(issued.config.threadId);
+    expect(resolveBeforeRelease && Exit.isSuccess(resolveBeforeRelease)).toBe(true);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("rechecks a queued flush after a different thread's trusted touch", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const lastWritten = yield* Deferred.make<void>();
+    let writes = 0;
+    let now = 1_000;
+    const wrapped = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Effect.gen(function* () {
+          writes += 1;
+          if (writes === 1) {
+            yield* Deferred.succeed(started, undefined);
+            yield* Deferred.await(resume);
+          }
+          yield* base.updateLiveness(...args);
+          const records = yield* base.load(environmentId);
+          if (
+            records.find((record) => record.tokenHash === args[1])?.scope.thread.threadId === "last"
+          ) {
+            yield* Deferred.succeed(lastWritten, undefined);
+          }
+        }),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, wrapped),
+      );
+    const credentials = yield* Effect.forEach(["first", "second", "last"], (id) =>
+      registry.issue({
+        threadId: ThreadId.make(id),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      }),
+    );
+    now = 61_000;
+    for (const credential of credentials)
+      yield* registry.resolve(credential.config.authorizationHeader.slice(7));
+    yield* TestClock.adjust("1 minute");
+    yield* Deferred.await(started);
+    now = 100_000;
+    yield* registry.touch(ThreadId.make("second"));
+    yield* Deferred.succeed(resume, undefined);
+    yield* Deferred.await(lastWritten);
+    expect(
+      (yield* base.load(environmentId)).find((record) => record.scope.thread.threadId === "second")
+        ?.lastAliveAt,
+    ).toBe(100_000);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("concurrent trusted touches cannot backdate durable liveness", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let now = 1_000;
+    const wrapped = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        args[2] === 2_000
+          ? Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Deferred.await(resume)),
+              Effect.andThen(base.updateLiveness(...args)),
+            )
+          : base.updateLiveness(...args),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, wrapped),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("touch-race"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    now = 2_000;
+    const old = yield* registry.touch(issued.config.threadId).pipe(Effect.forkChild);
+    yield* Deferred.await(started);
+    now = 3_000;
+    const newer = yield* registry.touch(issued.config.threadId).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(old);
+    yield* Fiber.join(newer);
+    expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(3_000);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("a delayed trusted touch cannot backdate a newly issued credential", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let now = 1_000;
+    const wrapped = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(base.updateLiveness(...args)),
+        ),
+    });
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provideService(CredentialStore.CredentialStore, wrapped),
+      );
+    const request = {
+      threadId: ThreadId.make("issue-race"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    };
+    yield* registry.issue(request);
+    now = 2_000;
+    const touching = yield* registry.touch(request.threadId).pipe(Effect.forkChild);
+    yield* Deferred.await(started);
+    now = 100_000;
+    const issuing = yield* registry.issue(request).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(touching);
+    const newer = yield* Fiber.join(issuing);
+    expect(
+      (yield* base.load(environmentId)).find(
+        (record) => record.scope.thread.providerSessionId === newer.config.providerSessionId,
+      )?.lastAliveAt,
+    ).toBe(100_000);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("flushes active liveness within one interval despite phase offsets", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    let now = 1_000;
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ now: () => now, livenessWindowMs: 180_000 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("phase"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.slice(7);
+    now = 60_999;
+    yield* TestClock.adjust(59_999);
+    yield* registry.resolve(token);
+    now = 61_000;
+    yield* TestClock.adjust(1);
+    now = 61_001;
+    yield* TestClock.adjust(1);
+    yield* registry.resolve(token);
+    now = 120_999;
+    yield* TestClock.adjust(59_998);
+    yield* registry.resolve(token);
+    expect(now - (yield* base.load(environmentId))[0]!.lastAliveAt).toBeLessThanOrEqual(60_000);
+  }).pipe(Effect.provide(persistentMemory)),
+);
+
+it.effect("scope closure interrupts a blocked liveness flusher", () =>
+  Effect.gen(function* () {
+    const base = yield* CredentialStore.CredentialStore;
+    const started = yield* Deferred.make<void>();
+    const neverResume = yield* Deferred.make<void>();
+    let writes = 0;
+    let now = 1_000;
+    const wrapped = CredentialStore.CredentialStore.of({
+      ...base,
+      updateLiveness: (...args) =>
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(neverResume)),
+          Effect.andThen(base.updateLiveness(...args)),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              writes += 1;
+            }),
+          ),
+        ),
+    });
+    const scope = yield* Scope.make();
+    const registry = yield* Scope.provide(scope)(
+      McpSessionRegistry.__testing
+        .make({ now: () => now })
+        .pipe(
+          Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+          Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+          Effect.provideService(CredentialStore.CredentialStore, wrapped),
+        ),
+    );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("scope"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    now = 61_000;
+    yield* registry.resolve(issued.config.authorizationHeader.slice(7));
+    yield* TestClock.adjust("1 minute");
+    yield* Deferred.await(started);
+    yield* Scope.close(scope, Exit.void);
+    yield* TestClock.adjust("5 minutes");
+    expect(writes).toBe(0);
+    expect((yield* base.load(environmentId))[0]?.lastAliveAt).toBe(1_000);
   }).pipe(Effect.provide(persistentMemory)),
 );
 

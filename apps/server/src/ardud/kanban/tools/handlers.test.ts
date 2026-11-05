@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
   KanbanCardId,
+  KanbanDiscussionId,
   KanbanError,
   ProjectId,
   ProviderInstanceId,
@@ -184,6 +185,166 @@ const fakeThreads = (
 
 const owner: KanbanActor = { _tag: "owner" };
 
+it.effect("card_edit reports control characters to an evaluator", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "text-guard",
+      name: "Text guard",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_edit", {
+      card: card.id,
+      comment: "ok\u0000\u0000",
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, "control character U+0000");
+    assert.isFalse((yield* kanban.card(card.id)).events.some((event) => event.kind === "comment"));
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion tools refuse corrupted text before creating a discussion", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "post-guard",
+      name: "Post guard",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const evaluator = ThreadId.make("thread-evaluator");
+    const before = yield* kanban.discussions(board.id);
+    const posted = yield* call(evaluator, "discussion_post", { card: card.id, text: "bad\u0000" });
+    assert.isTrue(posted.isError);
+    assert.include(posted.text, "message has a control character U+0000 at offset 3");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), before);
+    assert.isNull((yield* kanban.card(card.id)).card.discussionId);
+    const created = yield* call(evaluator, "discussion_create", {
+      title: "New discussion",
+      text: "bad\u0000",
+    });
+    assert.isTrue(created.isError);
+    assert.include(created.text, "message has a control character U+0000 at offset 3");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "raw-text",
+      name: "Raw text",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Fix it", title: "Fix it", description: "Explicit" },
+      owner,
+    );
+    const evaluator = ThreadId.make("thread-evaluator");
+    const discussionsBefore = yield* kanban.discussions(board.id);
+    const tests = [
+      { _tag: "collapse", title: "\u000bReport\u000c", text: "text" },
+      {
+        _tag: "choice",
+        id: "x",
+        style: "pick",
+        question: "\u000bQuestion",
+        options: [],
+        multi: false,
+      },
+      {
+        _tag: "choice",
+        id: "x",
+        style: "pick",
+        question: "Question",
+        options: [{ id: "a", label: "\u000bLabel" }],
+        multi: false,
+      },
+    ];
+    for (const block of tests) {
+      const result = yield* call(evaluator, "discussion_create", {
+        title: "Test",
+        blocks: [block],
+      });
+      assert.isTrue(result.isError, result.text);
+      assert.include(result.text, "message has a control character U+000B at offset 0");
+      assert.deepStrictEqual(yield* kanban.discussions(board.id), discussionsBefore);
+    }
+    const title = yield* call(evaluator, "discussion_create", { title: "\u000bTitle\u000c" });
+    assert.isTrue(title.isError, title.text);
+    assert.include(title.text, "title has a control character U+000B at offset 0 (2 in all)");
+    assert.deepStrictEqual(yield* kanban.discussions(board.id), discussionsBefore);
+
+    const wikiBefore = yield* kanban.wiki(board.id);
+    const wiki = yield* call(evaluator, "wiki_write", {
+      slug: "test",
+      title: "\u000bTitle\u000c",
+      body: "body",
+    });
+    assert.isTrue(wiki.isError, wiki.text);
+    assert.include(wiki.text, "title has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.wiki(board.id), wikiBefore);
+
+    const before = yield* kanban.card(card.id);
+    const edit = yield* call(evaluator, "card_edit", {
+      card: card.id,
+      subtasks: [{ text: "\u000bSubtask\u000c", owner: "work" }],
+    });
+    assert.isTrue(edit.isError, edit.text);
+    assert.include(edit.text, "subtask text has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+
+    const cardsBefore = yield* kanban.cards(board.id);
+    const createdCard = yield* call(evaluator, "card_create", {
+      prompt: "New card",
+      title: "New card",
+      description: "Explicit",
+      subtasks: [{ text: "\u000bSubtask\u000c", owner: "work" }],
+    });
+    assert.isTrue(createdCard.isError, createdCard.text);
+    assert.include(createdCard.text, "subtask text has a control character U+000B at offset 0");
+    assert.deepStrictEqual(yield* kanban.cards(board.id), cardsBefore);
+
+    const clean = yield* call(evaluator, "discussion_create", {
+      title: "  Clean  ",
+      blocks: [
+        {
+          _tag: "choice",
+          id: "pick",
+          style: "pick",
+          question: "  Question  ",
+          options: [{ id: "a", label: "  Answer  " }],
+          multi: false,
+        },
+      ],
+    });
+    assert.isFalse(clean.isError, clean.text);
+    const discussion = clean.structured.discussion as { id: string; title: string };
+    assert.strictEqual(discussion.title, "Clean");
+    const messages = yield* kanban.messages(KanbanDiscussionId.make(discussion.id));
+    const block = messages[0]!.blocks[0]!;
+    assert.strictEqual(block._tag, "choice");
+    if (block._tag === "choice") {
+      assert.strictEqual(block.question, "Question");
+      assert.strictEqual(block.options[0]?.label, "Answer");
+    }
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a work thread with nothing active defaults to the cards still its own", () => {
   const { running, layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -277,6 +438,81 @@ it.effect("discussion_post to a card leaves no discussion when the write is refu
     assert.include(result.text, error.message);
     assert.deepStrictEqual(yield* kanban.card(card.id), before);
     assert.lengthOf(yield* kanban.discussions(board.id), 0);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("card_update with an unchanged description returns ok and adds no event", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "retry-edit",
+      name: "Retry",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+    running.add(thread);
+    const first = yield* call(thread, "card_update", {
+      card: card.id,
+      description: "New description",
+    });
+    assert.isFalse(first.isError, first.text);
+    const before = yield* kanban.card(card.id);
+    assert.lengthOf(
+      before.events.filter((event) => event.kind === "edited"),
+      1,
+    );
+    const repeat = yield* call(thread, "card_update", {
+      card: card.id,
+      description: "New description",
+    });
+    assert.isFalse(repeat.isError, repeat.text);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    const comment = { card: card.id, comment: "Same comment" };
+    const firstComment = yield* call(thread, "card_update", comment);
+    assert.isFalse(firstComment.isError, firstComment.text);
+    const beforeRepeatComment = yield* kanban.card(card.id);
+    const repeatComment = yield* call(thread, "card_update", comment);
+    assert.isFalse(repeatComment.isError, repeatComment.text);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).events, beforeRepeatComment.events);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion_post repeated returns the same message", () => {
+  const { running, layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "retry-post",
+      name: "Retry",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+    running.add(thread);
+    const first = yield* call(thread, "discussion_post", { card: card.id, text: "Status update" });
+    assert.isFalse(first.isError, first.text);
+    const second = yield* call(thread, "discussion_post", { card: card.id, text: "Status update" });
+    assert.isFalse(second.isError, second.text);
+    const firstMessage = first.structured.message as {
+      discussionId: KanbanDiscussionId;
+      seq: number;
+    };
+    const secondMessage = second.structured.message as {
+      discussionId: KanbanDiscussionId;
+      seq: number;
+    };
+    assert.deepStrictEqual(secondMessage, firstMessage);
+    assert.lengthOf(yield* kanban.messages(firstMessage.discussionId), 1);
+    assert.lengthOf(
+      (yield* kanban.discussions(board.id)).filter((entry) => entry.cardId === card.id),
+      1,
+    );
   }).pipe(Effect.provide(layer));
 });
 
@@ -923,5 +1159,65 @@ it.effect("card_search finds cards by words or number and hides settled ones by 
       limit: 1,
     });
     assert.deepStrictEqual(numbers(exact), [kafka.number]);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion_read keeps blocks whole, caps a reply near 1 MB and reads one by seq", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "big-read",
+      name: "Big read",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const discussion = yield* kanban.createDiscussion(board.id, "Big", owner);
+    const scribe: KanbanActor = { _tag: "system", component: "scribe" };
+    const big = "b".repeat(400 * 1024);
+    const huge = "h".repeat(1200 * 1024);
+    for (let index = 0; index < 4; index++) {
+      yield* kanban.post(discussion.id, scribe, [{ _tag: "md", text: big }]);
+    }
+    yield* kanban.post(discussion.id, scribe, [{ _tag: "md", text: huge }]);
+    const reader = ThreadId.make("thread-reader");
+
+    const latest = yield* call(reader, "discussion_read", { discussionId: discussion.id });
+    assert.isFalse(latest.isError, latest.text);
+    const latestMessages = latest.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string; truncated?: boolean }>;
+    }>;
+    // The newest alone is past the cap: it comes as a stub with a pointer to the seq read.
+    assert.deepStrictEqual(
+      latestMessages.map((message) => message.seq),
+      [5],
+    );
+    assert.isTrue(latestMessages[0]!.blocks[0]!.truncated);
+    assert.include(String(latest.structured.note), "seq: 5");
+    assert.strictEqual(latest.structured.earlierBefore, 5);
+
+    const earlier = yield* call(reader, "discussion_read", {
+      discussionId: discussion.id,
+      beforeSeq: 5,
+    });
+    const earlierMessages = earlier.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string; truncated?: boolean }>;
+    }>;
+    // Whole blocks, about 1 MB at most: two of the four 400 KB messages.
+    assert.deepStrictEqual(
+      earlierMessages.map((message) => message.seq),
+      [3, 4],
+    );
+    assert.strictEqual(earlierMessages[0]!.blocks[0]!.text, big);
+    assert.strictEqual(earlier.structured.earlierBefore, 3);
+
+    const one = yield* call(reader, "discussion_read", { discussionId: discussion.id, seq: 5 });
+    const oneMessages = one.structured.messages as Array<{
+      seq: number;
+      blocks: Array<{ text: string }>;
+    }>;
+    assert.strictEqual(oneMessages[0]!.blocks[0]!.text, huge);
+    assert.isUndefined(one.structured.earlierBefore);
   }).pipe(Effect.provide(layer));
 });

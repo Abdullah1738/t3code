@@ -144,6 +144,16 @@ const vote = {
 } as never;
 
 describe("createKanbanClient", () => {
+  it("lifts the requested board pause", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const lifted = client.liftPause("board-toy");
+    const request = fake.take("kanban.board.pause");
+    expect(request.input).toEqual({ boardId: "board-toy", clear: true });
+    request.resolve({});
+    await lifted;
+  });
+
   it("reports a denied grant as false, so its control is disabled", () => {
     const fake = fakeTransport(new Set(["kanban.pool.set"]));
     const client = createKanbanClient(fake.transport);
@@ -276,6 +286,117 @@ describe("createKanbanClient", () => {
     expect(seqs[0]).toBe(201);
     expect(seqs.at(-1)).toBe(401);
     expect(seqs).toHaveLength(201);
+    stop();
+    stopBoard();
+  });
+
+  it("reads only past the newest held message on a snapshot, without losing or repeating any", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stopBoard = client.board("board-toy").subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.messages("board-toy", "disc-1");
+    const stop = store.subscribe(() => {});
+    const first = fake.take("kanban.messages");
+    expect(first.input).toEqual({ discussionId: "disc-1", limit: 50 });
+    first.resolve([message(3), message(4), message(5)]);
+    await settle();
+
+    fake.push({ _tag: "change", change: { _tag: "message", message: message(6) } } as never);
+    fake.push(snapshotEvent(0));
+    await settle();
+    const again = fake.take("kanban.messages");
+    expect(again.input).toEqual({ discussionId: "disc-1", afterSeq: 6, limit: 50 });
+    // Lands while the read is out, and the read has it too.
+    fake.push({ _tag: "change", change: { _tag: "message", message: message(8) } } as never);
+    again.resolve([message(7), message(8)]);
+    await settle();
+    expect(store.get()?.map((entry) => entry.seq)).toEqual([3, 4, 5, 6, 7, 8]);
+    stop();
+    stopBoard();
+  });
+
+  it("re-reads from the newest poll on a snapshot, so answers made while away show", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stopBoard = client.board("board-toy").subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.messages("board-toy", "disc-1");
+    const stop = store.subscribe(() => {});
+    const poll = {
+      ...message(2),
+      blocks: [
+        { _tag: "choice", id: "b1", style: "pick", question: "Q", options: [], multi: false },
+      ],
+    } as never as KanbanMessage;
+    fake.take("kanban.messages").resolve([message(1), poll, message(3)]);
+    await settle();
+    fake.push(snapshotEvent(0));
+    await settle();
+    const read = fake.take("kanban.messages");
+    expect(read.input).toEqual({ discussionId: "disc-1", afterSeq: 1, limit: 50 });
+    read.resolve([{ ...poll, answers: [vote] }, message(3)]);
+    await settle();
+    expect(store.get()?.map((entry) => entry.seq)).toEqual([1, 2, 3]);
+    expect(store.get()?.[1]?.answers).toHaveLength(1);
+    stop();
+    stopBoard();
+  });
+
+  it("loads earlier pages before the oldest held, and keeps live messages", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stopBoard = client.board("board-toy").subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.messages("board-toy", "disc-1");
+    const stop = store.subscribe(() => {});
+    fake.take("kanban.messages").resolve([message(51), message(52)]);
+    await settle();
+    const loading = client.loadEarlier("board-toy", "disc-1");
+    // A second call while one is out joins it.
+    void client.loadEarlier("board-toy", "disc-1");
+    const read = fake.take("kanban.messages");
+    expect(read.input).toEqual({ discussionId: "disc-1", beforeSeq: 51, limit: 50 });
+    expect(fake.pending.filter((entry) => entry.tag === "kanban.messages")).toHaveLength(0);
+    fake.push({ _tag: "change", change: { _tag: "message", message: message(53) } } as never);
+    read.resolve([message(49), message(50)]);
+    await loading;
+    expect(store.get()?.map((entry) => entry.seq)).toEqual([49, 50, 51, 52, 53]);
+    // A page that doesn't join the held list (an older server ignoring beforeSeq) is dropped.
+    const stale = client.loadEarlier("board-toy", "disc-1");
+    fake.take("kanban.messages").resolve([message(52), message(53)]);
+    await stale;
+    expect(store.get()?.map((entry) => entry.seq)).toEqual([49, 50, 51, 52, 53]);
+    stop();
+    stopBoard();
+  });
+
+  it("shows a truncated block in full once expanded, and keeps later answers", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stopBoard = client.board("board-toy").subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const store = client.messages("board-toy", "disc-1");
+    const stop = store.subscribe(() => {});
+    const stub = {
+      ...message(1),
+      blocks: [{ _tag: "md", text: "prev", truncated: true, fullBytes: 100_000 }],
+    } as never as KanbanMessage;
+    fake.take("kanban.messages").resolve([stub]);
+    await settle();
+    const expanding = client.expandMessage("board-toy", "disc-1", 1);
+    const read = fake.take("kanban.message");
+    expect(read.input).toEqual({ discussionId: "disc-1", seq: 1 });
+    read.resolve({ ...message(1), blocks: [{ _tag: "md", text: "full text" }] });
+    await expanding;
+    expect(store.get()?.[0]?.blocks[0]).toEqual({ _tag: "md", text: "full text" });
+    // A live answer comes with the stub again; the full blocks stay.
+    fake.push({
+      _tag: "change",
+      change: { _tag: "message", message: { ...stub, answers: [vote] } },
+    } as never);
+    expect(store.get()?.[0]?.blocks[0]).toEqual({ _tag: "md", text: "full text" });
+    expect(store.get()?.[0]?.answers).toHaveLength(1);
     stop();
     stopBoard();
   });
@@ -447,7 +568,13 @@ describe("createKanbanClient", () => {
     const client = createKanbanClient(fake.transport);
     const sent = client.answer("board-toy", "disc-1", 4, "q1", [], "Wait");
     const withWords = fake.take("kanban.answer");
-    expect(withWords.input).toEqual({ discussionId: "disc-1", seq: 4, blockId: "q1", choice: [], text: "Wait" });
+    expect(withWords.input).toEqual({
+      discussionId: "disc-1",
+      seq: 4,
+      blockId: "q1",
+      choice: [],
+      text: "Wait",
+    });
     withWords.resolve(message(4));
     await sent;
 

@@ -12,8 +12,8 @@ Sources (read-only; never write statev2):
   ardud_opencode_import                          OpenCode native id -> imported thread
 
 Refreshed every tick, independently of transcript growth, so a late rename or
-a late thread binding reaches recall without new messages. Rows are upserted;
-revision counts the changes to a row.
+a late thread binding reaches recall without new messages. Previously proved
+aliases survive recovery unless current evidence contradicts them.
 """
 
 import json
@@ -21,6 +21,7 @@ import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_migrations  # noqa: E402
@@ -64,6 +65,23 @@ def _str(v):
 
 
 def gather(state):
+    """Read all source projections from the same SQLite snapshot."""
+    if state.in_transaction:
+        return _gather(state)
+    state.execute("BEGIN")
+    try:
+        return _gather(state)
+    finally:
+        state.rollback()
+
+
+class AliasRows(list):
+    def __init__(self):
+        super().__init__()
+        self.unresolved = []
+
+
+def _gather(state):
     """Alias rows from statev2 (read-only). Field names follow the live payload_json shapes.
 
     Thread: title, worktreePath (cwd), lineage.parentThreadId / rootThreadId,
@@ -86,7 +104,7 @@ def gather(state):
     # subagent is keyed by its PARENT's native session plus its own native agent id, so the
     # parent is resolved through the owning provider thread, never through providerThreadId
     # (an internal projection id, null for native Claude tasks) or the app thread id.
-    out = []
+    out = AliasRows()
     for tid, payload, driver, instance in state.execute(
         "SELECT thread_id, payload_json, driver, provider_instance_id FROM orchestration_v2_projection_provider_threads"
         " WHERE thread_id IS NOT NULL"
@@ -117,30 +135,44 @@ def gather(state):
         ):
             turn_owner.setdefault(node_id, set()).add(provider_thread_id)
     task_parent = {}  # a subagent's own task node id -> its parentNodeId
+    task_parent_ambiguous = set()
     subagent_rows = list(state.execute(
         "SELECT child_thread_id, thread_id, payload_json, driver, provider_instance_id"
         " FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"))
     for _c, _p, payload, _d, _i in subagent_rows:
         pj = _j(payload)
-        if _str(pj.get("id")) and _str(pj.get("parentNodeId")):
-            task_parent[_str(pj.get("id"))] = _str(pj.get("parentNodeId"))
+        node, parent_node = _str(pj.get("id")), _str(pj.get("parentNodeId"))
+        if node:
+            if node in task_parent and task_parent[node] != parent_node:
+                task_parent_ambiguous.add(node)
+            task_parent[node] = parent_node
+    for node in task_parent_ambiguous:
+        task_parent[node] = None
+        turn_owner[node] = set()
     unresolved = {}  # reason -> child thread ids left without an alias this tick
     for child_tid, parent_tid, payload, driver, instance in subagent_rows:
         p = _j(payload)
+        if p.get("origin") == "app_owned":
+            continue  # Its child has its own provider thread, not a native task alias.
         ref = p.get("nativeTaskRef") if isinstance(p.get("nativeTaskRef"), dict) else {}
         task = _str(ref.get("nativeId"))
+        scope = (child_tid, driver or _str(ref.get("driver")), instance, task)
         if not task:
-            continue  # no native task id: nothing native to key this child by
+            out.unresolved.append(scope)
+            continue
         owners = resolve_owner(_str(p.get("parentNodeId")), turn_owner, task_parent)
         if owners is None:
             note_unresolved(unresolved, child_tid, "no provider turn in the parent chain")
+            out.unresolved.append(scope)
             continue
         if len(owners) != 1:
             note_unresolved(unresolved, child_tid, f"{len(owners)} provider threads claim the parent chain")
+            out.unresolved.append(scope)
             continue
         pt = next(iter(owners))
         if pt not in by_provider or not by_provider[pt][0]:
             note_unresolved(unresolved, child_tid, "owning provider thread has no native session")
+            out.unresolved.append(scope)
             continue
         parent_native, parent_driver, parent_instance = by_provider[pt]
         out.append(dict(canonical=child_tid, native=parent_native, agent=task,
@@ -211,13 +243,107 @@ def _root_of(tid, threads, limit=200):
     return cur
 
 
-def write(mem, rows, now=None):
+def _lookup_key(driver, instance, native, agent):
+    if not all(isinstance(v, str) and v for v in (driver, instance, native)):
+        return None
+    if agent is not None and (not isinstance(agent, str) or not agent):
+        return None
+    if driver == "codex":
+        key = native if agent is None else agent
+    elif driver == "claudeAgent":
+        key = native if agent is None else f"{native}:agent:{agent}"
+    else:
+        return None
+    return driver, instance, key
+
+
+def _blocked_by_unresolved(row, unresolved):
+    driver, instance, native, agent = row["driver"], row["instance"], row["native"], row.get("agent")
+    if driver not in ("codex", "claudeAgent"):
+        return False
+    for _child, scope_driver, scope_instance, task in unresolved:
+        if scope_driver in ("codex", "claudeAgent") and scope_driver != driver:
+            continue
+        if isinstance(scope_instance, str) and scope_instance and scope_instance != instance:
+            continue
+        if task is None:
+            return True
+        if driver == "codex" and (agent == task or (agent is None and native == task)):
+            return True
+        if driver == "claudeAgent" and (agent == task or (agent is None and isinstance(native, str)
+                                                          and native.endswith(":agent:" + task))):
+            return True
+    return False
+
+
+def write(mem, rows, now=None, *, _inside_transaction=False):
     now = int(time.time()) if now is None else now
+    claims = {}
+    conflicts = set()
+    lookup_claimants = {}
+    for row in rows:
+        parts = (row["driver"], row["instance"], row["native"], row.get("agent"))
+        key = f"{parts[0] or ''}|{parts[1] or ''}|{parts[2]}|{parts[3] or ''}"
+        if (not all(isinstance(p, str) and p and "|" not in p for p in parts[:3])
+                or (parts[3] is not None and (not isinstance(parts[3], str) or not parts[3] or "|" in parts[3]))
+                or not isinstance(row["canonical"], str) or not row["canonical"]):
+            conflicts.add(key)
+            continue
+        if key in claims and claims[key]["canonical"] != row["canonical"]:
+            conflicts.add(key)
+        else:
+            claims[key] = row
+        lookup = _lookup_key(*parts)
+        if lookup is not None:
+            lookup_claimants.setdefault(lookup, set()).add(row["canonical"])
+    blocked = {lookup for lookup, canonicals in lookup_claimants.items() if len(canonicals) > 1}
+    unresolved = list(getattr(rows, "unresolved", ()))
+    for row in rows:
+        parts = (row["driver"], row["instance"], row["native"], row.get("agent"))
+        key = f"{parts[0] or ''}|{parts[1] or ''}|{parts[2]}|{parts[3] or ''}"
+        if key in conflicts:
+            lookup = _lookup_key(*parts)
+            if lookup is not None:
+                blocked.add(lookup)
+            elif parts[0] in ("codex", "claudeAgent"):
+                unresolved.append((row["canonical"], parts[0], parts[1], parts[3]))
 
     def txn():
-        n = 0
-        for r in rows:
-            key = f"{r['driver'] or ''}|{r['instance'] or ''}|{r['native']}|{r.get('agent') or ''}"
+        # A skipped child can have had a different task in the previous snapshot.
+        blocked_now = set(blocked)
+        unresolved_children = {child for child, _driver, _instance, _task in unresolved}
+        for child, _driver, _instance, _task in unresolved:
+            for driver, instance, native, agent in mem.execute(
+                    "SELECT driver,instance,native_id,agent_id FROM thread_aliases WHERE canonical_thread_id=?", (child,)):
+                lookup = _lookup_key(driver, instance, native, agent)
+                if lookup is not None:
+                    blocked_now.add(lookup)
+        # Each historical child was proved against its then-current parent native id.
+        # Recovery replaces that id in place, so do not invent a child alias for the
+        # new parent; preserve the old one only while the current child is unambiguous.
+        historical_children = {row[0] for row in mem.execute(
+            "SELECT DISTINCT canonical_thread_id FROM thread_aliases WHERE agent_id IS NOT NULL")}
+        def invalid_historical(record):
+            key, canonical, driver, instance, native, agent = record
+            lookup = _lookup_key(driver, instance, native, agent)
+            row = {"driver": driver, "instance": instance, "native": native, "agent": agent}
+            if canonical in unresolved_children or key in conflicts or lookup in blocked_now or _blocked_by_unresolved(row, unresolved):
+                return True
+            current = claims.get(key)
+            if current is not None and current["canonical"] != canonical:
+                return True
+            return bool(lookup is not None and lookup_claimants.get(lookup, set()) - {canonical})
+        for record in list(mem.execute("SELECT alias_key,canonical_thread_id,driver,instance,native_id,agent_id FROM thread_aliases")):
+            if invalid_historical(record):
+                mem.execute("DELETE FROM thread_aliases WHERE alias_key=?", (record[0],))
+        for key, r in claims.items():
+            lookup = _lookup_key(r["driver"], r["instance"], r["native"], r.get("agent"))
+            if key in conflicts or lookup in blocked_now or _blocked_by_unresolved(r, unresolved):
+                continue
+            if r.get("agent") is not None and r["canonical"] in historical_children:
+                existing = mem.execute("SELECT 1 FROM thread_aliases WHERE alias_key=?", (key,)).fetchone()
+                if not existing:
+                    continue
             mem.execute(
                 "INSERT INTO thread_aliases(alias_key, canonical_thread_id, root_thread_id, driver, instance,"
                 " native_id, agent_id, title, cwd, model, first_seen, last_seen, revision)"
@@ -232,27 +358,32 @@ def write(mem, rows, now=None):
                 (key, r["canonical"], r["root"], r["driver"], r["instance"], r["native"], r.get("agent"),
                  r.get("title"), r.get("cwd"), r.get("model"), now, now),
             )
-            n += 1
-        return n
+        mem.execute(
+            "INSERT INTO harness_schema_meta(key, value) VALUES('thread_identity_last_ok', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(now),),
+        )
+        return len(rows)
 
-    return with_retry(mem, txn)
+    return txn() if _inside_transaction else with_retry(mem, txn)
 
 
 def sync(mem_path=MEM_DB, state_path=STATE_DB):
     if not os.path.isfile(state_path):
         raise FileNotFoundError(f"Robob state DB {state_path} not found")
-    state = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True, timeout=30)
-    state.execute("PRAGMA busy_timeout=30000")
-    try:
-        rows = gather(state)
-    finally:
-        state.close()
     mem = sqlite3.connect(mem_path, timeout=600)
     mem.execute("PRAGMA busy_timeout=600000")
     try:
         schema_migrations.migrate(mem)
         mem.executescript(DDL)
-        n = write(mem, rows)
+        state = sqlite3.connect(f"{Path(os.path.abspath(state_path)).as_uri()}?mode=ro", uri=True, timeout=30)
+        state.execute("PRAGMA busy_timeout=30000")
+        try:
+            # Serialize the source snapshot too: a delayed older gather must not
+            # overwrite a newer ambiguity that another refresh already committed.
+            n = with_retry(mem, lambda: write(mem, gather(state), _inside_transaction=True))
+        finally:
+            state.close()
     finally:
         mem.close()
     return n

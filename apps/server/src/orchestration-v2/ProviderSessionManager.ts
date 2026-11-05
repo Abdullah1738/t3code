@@ -1,5 +1,6 @@
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   isOrchestrationV2WorkActive,
@@ -447,6 +448,7 @@ export const layerWithOptions = (
           const records = yield* projectionStore
             .getThreadRecords(threadId, ["providerSessions"])
             .pipe(
+              NodeSqliteClient.readOnly,
               Effect.catchIf(Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError), () =>
                 Effect.succeed(undefined),
               ),

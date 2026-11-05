@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -22,6 +23,11 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
+// ardud: stop the old root turn before committing a restart continuation.
+import {
+  StaleOpenCodeSessions,
+  type StaleOpenCodeSession,
+} from "../ardud/opencode-import/StaleRuns.ts";
 import { withStartupPhase } from "../ardud/observability/StartupPhaseLog.ts";
 // ardud: startup logs one bounded summary of continuation decisions.
 import {
@@ -61,6 +67,8 @@ export interface ProviderRuntimeRecoverySummary {
   readonly closedRequests: number;
   readonly retiredEffects: number;
   readonly requeuedEffects: number;
+  readonly staleOpenCodeAborted: number;
+  readonly staleOpenCodeAbortFailed: number;
 }
 
 export interface ProviderRuntimeReconciliationSummary {
@@ -69,6 +77,8 @@ export interface ProviderRuntimeReconciliationSummary {
   readonly closedRequests: number;
   readonly retiredEffects: number;
   readonly requeuedEffects: number;
+  readonly staleOpenCodeAborted: number;
+  readonly staleOpenCodeAbortFailed: number;
 }
 
 export class ProviderRuntimeRecoveryService extends Context.Service<
@@ -180,6 +190,8 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  // ardud: old test and standalone layers need not provide the optional service.
+  const staleOpenCode = yield* Effect.serviceOption(StaleOpenCodeSessions);
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
   /**
    * A session shared by several threads (one Codex app server) is stopped by the
@@ -560,9 +572,28 @@ export const make = Effect.gen(function* () {
           allocateEventId,
         })),
       );
+      // ardud: only root provider threads whose running work is being cut qualify.
+      const staleSessions: Array<StaleOpenCodeSession> = [];
       for (const providerThread of projection.providerThreads ?? []) {
         const needsIdle = providerThread.status === "active";
         const needsRosterClear = providerThreadHasPendingBackgroundTasks(providerThread);
+        const nativeId = providerThread.nativeThreadRef?.nativeId;
+        if (
+          trigger === "startup" &&
+          needsIdle &&
+          providerThread.ownerNodeId === null &&
+          providerThread.driver === "opencode" &&
+          nativeId != null &&
+          nativeId.startsWith("ses_") &&
+          runs.some((run) => run.providerThreadId === providerThread.id && run.status !== "queued")
+        ) {
+          staleSessions.push({
+            sessionId: nativeId,
+            providerInstanceId: providerThread.providerInstanceId,
+            // This projection has no project record; don't add a separate read during recovery.
+            directory: projection.thread.worktreePath ?? null,
+          });
+        }
         if (!needsIdle && !needsRosterClear) {
           continue;
         }
@@ -661,6 +692,17 @@ export const make = Effect.gen(function* () {
       let retiredEffects: number;
       // ardud: count only continuation effects submitted with a committed reconciliation.
       let continuationsQueued = 0;
+      // ardud: an outbox continuation can begin as soon as commitCommand returns.
+      // Keep failures (including defects from a test implementation) out of recovery.
+      const staleResult =
+        trigger === "startup" && staleSessions.length > 0 && Option.isSome(staleOpenCode)
+          ? yield* staleOpenCode.value.abort(staleSessions).pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterruptsOnly(cause),
+                () => Effect.succeed({ aborted: 0, failed: staleSessions.length }),
+              ),
+            )
+          : { aborted: 0, failed: 0 };
       if (events.length === 0) {
         const retiredEffectIds = yield* outbox
           .cancelUnsettled({
@@ -713,6 +755,8 @@ export const make = Effect.gen(function* () {
         closedRequests: requests.length,
         retiredEffects,
         continuationsQueued,
+        staleOpenCodeAborted: staleResult.aborted,
+        staleOpenCodeAbortFailed: staleResult.failed,
         continuationSkip:
           continuationDecision && "skip" in continuationDecision
             ? continuationDecision.skip
@@ -742,6 +786,8 @@ export const make = Effect.gen(function* () {
     let stoppedSessions = 0;
     let closedRequests = 0;
     let retiredEffects = 0;
+    let staleOpenCodeAborted = 0;
+    let staleOpenCodeAbortFailed = 0;
     // ardud: these counts are per recovery projection, not per emitted event.
     let continuationsQueued = 0;
     const skipped: Record<
@@ -794,6 +840,8 @@ export const make = Effect.gen(function* () {
       closedRequests += result.closedRequests;
       retiredEffects += result.retiredEffects;
       continuationsQueued += result.continuationsQueued;
+      staleOpenCodeAborted += result.staleOpenCodeAborted;
+      staleOpenCodeAbortFailed += result.staleOpenCodeAbortFailed;
       if (result.continuationSkip !== undefined) skipped[result.continuationSkip]++;
     }
     const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
@@ -816,6 +864,8 @@ export const make = Effect.gen(function* () {
       closedRequests,
       retiredEffects: retiredEffects + outboxReconciliation.cancelled,
       requeuedEffects: outboxReconciliation.requeued,
+      staleOpenCodeAborted,
+      staleOpenCodeAbortFailed,
       recoveryIds: threadIds.length,
     } satisfies ProviderRuntimeReconciliationSummary & { readonly recoveryIds: number };
   });

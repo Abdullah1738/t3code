@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - only node:perf_hooks exposes the event loop delay histogram.
 import * as NodePerfHooks from "node:perf_hooks";
+import * as NodeV8 from "node:v8";
 
 import { RotatingFileSink } from "@t3tools/shared/logging";
 import * as DateTime from "effect/DateTime";
@@ -21,6 +22,9 @@ const RESOLUTION_MS = 1000;
 const STALL_THRESHOLD_MS = 2000;
 const SAMPLE_INTERVAL = "30 seconds";
 const STALL_LOG_MAX_BYTES = 256 * 1024;
+// Heap space stats are logged past this share of V8's limit, so an OOM
+// leaves a record of which space was filling.
+const HIGH_HEAP_RATIO = 0.75;
 
 /** Delay in ns, active time in ms, CPU in µs. */
 export interface EventLoopReadings {
@@ -119,6 +123,8 @@ export interface StallLogOptions {
 export const layerWith = (
   makeSampler: Effect.Effect<Effect.Effect<EventLoopReadings>, never, Scope.Scope>,
   stallLog: StallLogOptions,
+  readHeapSpaces: typeof NodeV8.getHeapSpaceStatistics = NodeV8.getHeapSpaceStatistics,
+  heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -141,6 +147,31 @@ export const layerWith = (
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
         yield* recordGauges(readings);
+        if (readings.heapUsedBytes > heapLimitBytes * HIGH_HEAP_RATIO && stallSink !== undefined) {
+          const at = DateTime.formatIso(yield* DateTime.now);
+          yield* Effect.try(() => {
+            return {
+              at,
+              kind: "heap-spaces",
+              heapUsedMb: Math.round(readings.heapUsedBytes / 1024 / 1024),
+              heapLimitMb: Math.round(heapLimitBytes / 1024 / 1024),
+              rssMb: Math.round(readings.rssBytes / 1024 / 1024),
+              spaces: readHeapSpaces().map((space) => ({
+                name: space.space_name,
+                usedMb: Math.round(space.space_used_size / 1024 / 1024),
+                sizeMb: Math.round(space.space_size / 1024 / 1024),
+              })),
+            };
+          }).pipe(
+            Effect.flatMap(encodeStallLine),
+            Effect.flatMap((line) => Effect.try(() => stallSink.write(`${line}\n`))),
+            Effect.catch(() =>
+              Effect.logWarning("event loop heap spaces log write failed", {
+                filePath: stallLog.filePath,
+              }),
+            ),
+          );
+        }
         const delayMaxMs = stallMs(readings);
         if (delayMaxMs === undefined) return;
         const { utilization, usage, rssBytes } = readings;

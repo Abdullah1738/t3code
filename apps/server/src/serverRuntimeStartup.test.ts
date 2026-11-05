@@ -85,6 +85,8 @@ it.effect.each([
       const recovery = {
         terminalizedRuns: 0,
         stoppedSessions: 0,
+        staleOpenCodeAborted: 0,
+        staleOpenCodeAbortFailed: 0,
         closedRequests: 0,
         retiredEffects: 0,
         requeuedEffects: 0,

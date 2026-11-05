@@ -66,6 +66,28 @@ def make_tgz(path: Path, members: dict[str, bytes], modes: dict[str, int] | None
             tar.addfile(info, io.BytesIO(data))
 
 
+def passing_codex_home(models: list[str]) -> dict:
+    window = hc.CODEX_OBSERVATION_SECONDS
+    return {"memoryCanaryChecked": True, "memoryPipelineRan": False, "memorySentinelSeen": False,
+            "memoryPipelineEvidence": [], "memoryPipelineRequests": 0,
+            "positiveControlEvidence": ["memories_1.sqlite:stage1_outputs:content"],
+            "memoryPromptSeen": False, "positiveControlFired": True, "readControlFired": True,
+            "positiveElapsedSeconds": window / 2, "observationComplete": True,
+            "observationWindowSeconds": window, "observedSeconds": [window] * len(models),
+            "requests": len(models) + 1, "recorderViolations": 0,
+            "models": {model: {"ok": True, "requests": 1} for model in models}}
+
+
+def passing_codex_result() -> dict:
+    return {**passing_codex_home(hc.MODEL_CANARIES["codex"]), "cu": passing_codex_home(hc.CODEX_CU_MODELS)}
+
+
+def passing_claude_result() -> dict:
+    return {"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
+            "thinkingReplayed": True, "inputTransformationsEmpty": True, "requests": 3,
+            "recorderViolations": 0, **{model: {"ok": True} for model in hc.MODEL_CANARIES["claude"]}}
+
+
 class FakeCliTestCase(unittest.TestCase):
     """Sets up a sandbox: fake npm, fake tarballs, a throwaway ROOT and environment."""
 
@@ -100,11 +122,22 @@ class FakeCliTestCase(unittest.TestCase):
             keychain.touch()
         self.home_patch = mock.patch.object(hc, "prepare_isolated_home", side_effect=fake_home)
         self.home_patch.start()
+        # Fake scripts use an interpreter; real-binary containment is tested separately.
+        def fake_run_cli(binary, args, *, env, timeout=300, cwd=None, hold_complete=None, **_):
+            hc.require_isolated_home(env)
+            result = subprocess.run([str(binary), *args], env=env, cwd=cwd, capture_output=True,
+                                    text=True, timeout=timeout)
+            if hold_complete is not None and not hold_complete():
+                raise hc.HarnessError("Codex exited before its memory observation window completed")
+            return result
+        self.run_patch = mock.patch.object(hc, "run_cli", side_effect=fake_run_cli)
+        self.run_patch.start()
         self.write_fake_npm()
         self.write_notify_stub()
         self.write_plist()
 
     def tearDown(self) -> None:
+        self.run_patch.stop()
         self.home_patch.stop()
         self.env_patch.stop()
         # Staged version trees are read-only; restore write bits so the sandbox always goes.
@@ -185,26 +218,34 @@ print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
 
     def fake_codex_binary(self, version: str, body_extra: str = "", *, leak_read: bool = False) -> bytes:
         script = r'''#!/opt/homebrew/bin/python3
-import json, os, sys, tomllib, urllib.request
+import json, os, sys, tomllib, urllib.request, sqlite3
 from pathlib import Path
 if "--version" in sys.argv:
     print("codex-cli VERSION"); sys.exit(0)
 home = Path(os.environ["CODEX_HOME"])
 config = tomllib.loads((home / "config.toml").read_text())
 assert "--ephemeral" not in sys.argv
-assert list((home / "sessions").rglob("rollout-*.jsonl"))
 if "gpt-6.1-terra" in sys.argv:
     assert config.get("model") == "gpt-6.1-terra"
     assert config.get("features", {}).get("computer_use") is True
     assert config.get("model_context_window") == 1050000
     assert (home / "models.json").is_file() and (home / "AGENTS.md").is_file()
-if config.get("features", {}).get("memories") or LEAK:
+if (config.get("features", {}).get("memories") and (home / "fixture-id").exists()) or LEAK:
     (home / "memories" / "phase2-output").write_text("pipeline ran")
+    conn = sqlite3.connect(home / "memories_1.sqlite")
+    conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)")
+    conn.execute("INSERT INTO stage1_outputs VALUES (?, 'extracted preference', '')", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.commit(); conn.close()
 enabled = config.get("features", {}).get("memories")
 input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"
 if LEAK_READ:
     input_text = "<memory>loaded prior memory</memory>"
-body = {"input": [{"role": "developer", "content": [{"type": "input_text", "text": input_text}]}]}
+body = {"input": [{"role": "developer", "content": [{"type": "input_text", "text": input_text}]},
+                  {"role": "user", "content": [{"type": "input_text", "text": sys.argv[-1]}]}]}
+if enabled and (home / "fixture-id").exists():
+    pipeline = {"text":{"format":{"schema":{"properties":{"raw_memory":{}}}}}}
+    urllib.request.urlopen(urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=json.dumps(pipeline).encode()), timeout=10).read()
 req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=json.dumps(body).encode(), method="POST")
 urllib.request.urlopen(req, timeout=10).read()
 print("OK")
@@ -300,14 +341,11 @@ class PromoteRollbackTests(FakeCliTestCase):
         (bin_dir / name).chmod(0o555)
 
     def record_canary(self, tool: str, version: str, *, passed: bool = True, memory_ok: bool = True) -> None:
-        canary = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": not memory_ok,
-                   "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True}
-                  if tool == "claude" else {"memoryCanaryChecked": True, "memoryPipelineRan": not memory_ok,
-                    "positiveControlFired": True, "readControlFired": True,
-                    "cu": {"memoryCanaryChecked": True, "positiveControlFired": True, "readControlFired": True}})
+        canary = ({**passing_claude_result(), "memoryCanaryLeaked": not memory_ok}
+                  if tool == "claude" else {**passing_codex_result(), "memoryPipelineRan": not memory_ok})
         binary = self.root / tool / version / "bin" / tool
         hc.write_record("canary", tool, version, "passed" if passed else "failed",
-                        binarySha256=hc.sha256_file(binary), canary=canary)
+                        binarySha256=hc.sha256_file(binary), canary=canary, canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
 
     def test_promote_swaps_current_and_records_last_known_good(self) -> None:
         self.install_version("claude", "2.1.316")
@@ -340,6 +378,16 @@ class PromoteRollbackTests(FakeCliTestCase):
             hc.promote("claude", "2.1.316")
         self.assertIn("no passing canary", str(ctx.exception))
         self.assertFalse((self.root / "claude" / "current").is_symlink())
+
+    def test_legacy_pass_record_cannot_promote(self) -> None:
+        self.install_version("claude", "2.1.316")
+        binary = self.root / "claude" / "2.1.316" / "bin" / "claude"
+        hc.write_record("canary", "claude", "2.1.316", "passed", binarySha256=hc.sha256_file(binary),
+                        canary={"memoryCanaryChecked": True, "thinkingCheckChecked": True,
+                                "thinkingReplayed": True, "inputTransformationsEmpty": True})
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
 
     def test_promote_refused_when_memory_check_failed(self) -> None:
         self.install_version("claude", "2.1.316")
@@ -426,6 +474,13 @@ class PromoteRollbackTests(FakeCliTestCase):
 
 
 class CodexRotationTests(FakeCliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Rotation tests exercise behavior after an independently verified canary.
+        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def install_codex(self, version: str) -> None:
         bin_dir = self.root / "codex" / version / "bin"
         bin_dir.mkdir(parents=True)
@@ -435,9 +490,35 @@ class CodexRotationTests(FakeCliTestCase):
     def record_codex_canary(self, version: str) -> None:
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
-                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
-                                "readControlFired": True, "cu": {"memoryCanaryChecked": True,
-                                "positiveControlFired": True, "readControlFired": True}})
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
+                        canary=passing_codex_result())
+
+    def test_incomplete_or_corrupt_codex_proof_cannot_promote(self) -> None:
+        self.install_codex("0.166.0")
+        for target in ("plain", "cu"):
+            for field in ("memorySentinelSeen", "memoryPipelineRan", "memoryPromptSeen", "models",
+                          "observedSeconds", "positiveElapsedSeconds", "recorderViolations"):
+                with self.subTest(target=target, field=field):
+                    proof = passing_codex_result()
+                    home = proof if target == "plain" else proof["cu"]
+                    del home[field]
+                    hc.write_record("canary", "codex", "0.166.0", "passed", canary=proof,
+                                    binarySha256=hc.sha256_file(self.root / "codex" / "0.166.0" / "bin" / "codex"),
+                                    canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
+                    self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
+                    with self.assertRaises(hc.HarnessError):
+                        hc.promote("codex", "0.166.0")
+
+        for target in ("plain", "cu"):
+            for field, value in (("memoryPipelineRequests", 1),
+                                 ("memoryPipelineEvidence", ["recorded-pipeline-request"]),
+                                 ("positiveControlEvidence", [])):
+                with self.subTest(target=target, field=field):
+                    proof = passing_codex_result()
+                    (proof if target == "plain" else proof["cu"])[field] = value
+                    self.assertFalse(hc.valid_codex_canary_home(
+                        proof if target == "plain" else proof["cu"],
+                        hc.MODEL_CANARIES["codex"] if target == "plain" else hc.CODEX_CU_MODELS))
 
     def test_codex_promote_leaves_rotation_pending(self) -> None:
         self.install_codex("0.166.0")
@@ -525,8 +606,8 @@ class CodexRotationTests(FakeCliTestCase):
     def record_claude(self) -> None:
         hc.write_record("canary", "claude", "2.1.316", "passed",
                         binarySha256=hc.sha256_file(self.root / "claude" / "2.1.316" / "bin" / "claude"),
-                        canary={"memoryCanaryChecked": True, "memoryCanaryLeaked": False,
-                                "thinkingCheckChecked": True, "thinkingReplayed": True, "inputTransformationsEmpty": True})
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
+                        canary=passing_claude_result())
 
 
 class CanaryTests(FakeCliTestCase):
@@ -567,6 +648,15 @@ class CanaryTests(FakeCliTestCase):
         self.router_patch = mock.patch.dict(os.environ, {"HARNESS_CLI_9ROUTER": f"http://127.0.0.1:{self.upstream.server_address[1]}"})
         self.router_patch.start()
         self.addCleanup(self.router_patch.stop)
+        def fake_seed(chome, work, version):
+            (chome / "fixture-id").write_text("fixture")
+            return "fixture"
+        self.seed_patch = mock.patch.object(hc, "seed_codex_rollout", side_effect=fake_seed)
+        self.seed_mock = self.seed_patch.start()
+        self.addCleanup(self.seed_patch.stop)
+        self.observation_patch = mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 0.10)
+        self.observation_patch.start()
+        self.addCleanup(self.observation_patch.stop)
 
     def install_binary(self, tool: str, version: str, body: bytes) -> Path:
         bin_dir = self.root / tool / version / "bin"
@@ -613,25 +703,61 @@ class CanaryTests(FakeCliTestCase):
                                                   {**request, "response_transformations": [[{"type": "dropped"}]]}])
         self.assertFalse(result["inputTransformationsEmpty"])
 
+    def test_signed_empty_thinking_replay_is_detected(self) -> None:
+        payload = b'{"content":[{"type":"thinking","thinking":"","signature":"signature"}]}'
+        record = {}
+        hc.Recorder("http://127.0.0.1:20128", "dummy").capture_response(payload, record)
+        req = {"body": {"messages": [{"role": "assistant", "content": [{"type": "thinking",
+                "thinking": "", "signature": "signature"}]}]}, "response_transformations": [[]]}
+        result = hc.thinking_replay_check([record], [req])
+        self.assertTrue(result["thinkingReplayed"])
+        self.assertEqual(result["turn1SignedBlocks"], 1)
+        self.assertTrue(result["inputTransformationsEmpty"])
+
+    def test_all_thinking_blocks_must_replay_in_order(self) -> None:
+        first = [{"response_thinking": [{"type": "thinking", "thinking": "a", "signature": "one"},
+                                       {"type": "redacted_thinking", "data": "opaque"}]}]
+        def request(blocks):
+            return {"body": {"messages": [{"role": "assistant", "content": blocks}]}, "response_transformations": [[]]}
+        a = {"type": "thinking", "thinking": "a", "signature": "one"}
+        b = {"type": "redacted_thinking", "data": "opaque"}
+        self.assertFalse(hc.thinking_replay_check(first, [request([a])])["thinkingReplayed"])
+        self.assertFalse(hc.thinking_replay_check(first, [request([b, a])])["thinkingReplayed"])
+        self.assertTrue(hc.thinking_replay_check(first, [request([a, b])])["thinkingReplayed"])
+        dropped = {**request([]), "response_transformations": [[{"type": "dropped_thinking"}]]}
+        self.assertFalse(hc.thinking_replay_check(first, [request([a, b]), dropped])["inputTransformationsEmpty"])
+        self.assertFalse(hc.thinking_replay_check([{"response_thinking": [b]}], [request([b])])["thinkingReplayed"])
+
     def test_nested_tool_input_is_not_transformation_evidence(self) -> None:
         record = {}
-        hc.Recorder("http://127.0.0.1", "dummy").capture_response(
+        hc.Recorder("http://127.0.0.1:20128", "dummy").capture_response(
             b'{"content":[{"type":"tool_use","input":{"input_transformations":[]}}]}', record)
         self.assertEqual(record["response_transformations"], [])
 
     def test_codex_uses_generated_cu_home_and_memory_positive_control(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         verdict = self.run_canary("codex", "0.166.0")
-        self.assertTrue(verdict["passed"], verdict)
+        self.assertFalse(verdict["passed"], verdict)
         self.assertTrue(verdict["result"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["models"]["gpt-6.1-terra"]["ok"])
         for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertFalse(result["memoryCanaryChecked"])
+            self.assertIn("transient jobs", result["memoryObservationLimitation"])
             self.assertTrue(result["readControlFired"])
             self.assertFalse(result["memorySentinelSeen"])
             self.assertFalse(result["memoryPromptSeen"])
             self.assertIn("memories/MEMORY.md", result["memoryBaseline"])
             self.assertEqual(result["memoryArtifacts"], [])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_synthetic_clean_codex_record_cannot_bypass_observation_limit(self) -> None:
+        self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        passing_canary("codex", "0.166.0")
+        self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
 
     def test_codex_disabled_memory_read_leaks_block_promotion_on_both_homes(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0", leak_read=True))
@@ -647,6 +773,237 @@ class CanaryTests(FakeCliTestCase):
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
 
+    def test_codex_bootstrap_only_read_leak_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"',
+            b'input_text = (home / "memories" / "MEMORY.md").read_text() if enabled or not (home / "fixture-id").exists() else "hello"')
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertTrue(result["memorySentinelSeen"])
+            self.assertTrue(all(not m["memorySentinelInRequest"] for m in result["models"].values()))
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_each_home_independently_blocks_promotion_on_bootstrap_leak(self) -> None:
+        for target in ("plain", "cu"):
+            with self.subTest(target=target):
+                condition = (b'config.get("features", {}).get("computer_use")' if target == "cu"
+                             else b'not config.get("features", {}).get("computer_use")')
+                body = self.fake_codex_binary("0.166.0").replace(
+                    b'input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"',
+                    b'input_text = (home / "memories" / "MEMORY.md").read_text() if enabled or '
+                    b'(not (home / "fixture-id").exists() and ' + condition + b') else "hello"')
+                binary = self.root / "codex" / "0.166.0" / "bin" / "codex"
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(body)
+                binary.chmod(0o755)
+                verdict = self.run_canary("codex", "0.166.0")
+                self.assertFalse(verdict["passed"], verdict)
+                self.assertEqual(verdict["result"]["memorySentinelSeen"], target == "plain")
+                self.assertEqual(verdict["result"]["cu"]["memorySentinelSeen"], target == "cu")
+                with self.assertRaises(hc.HarnessError):
+                    hc.promote("codex", "0.166.0")
+
+    def test_delayed_disabled_extraction_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0")
+        body = body.replace(b'import json, os, sys, tomllib, urllib.request, sqlite3',
+                            b'import json, os, sys, tomllib, urllib.request, sqlite3, threading, time')
+        body = body.replace(b'if (config.get("features", {}).get("memories") and (home / "fixture-id").exists()) or False:',
+                            b'if (home / "fixture-id").exists():')
+        start = body.index(b'    (home / "memories" / "phase2-output").write_text')
+        end = body.index(b'enabled = config.get', start)
+        block = body[start:end]
+        delayed = b'    def extract():\n' + b''.join(b'    ' + line for line in block.splitlines(keepends=True))
+        delayed += (b'    if not config.get("features", {}).get("memories"):\n'
+                    b'        timer = threading.Timer(0.20, extract); timer.daemon = True; timer.start()\n'
+                    b'    else: extract()\n')
+        body = body[:start] + delayed + body[end:]
+        # The daemon is killed with its process if the primary response is not held.
+        # Keep the scaled delay comfortably inside the hold even on a busy machine.
+        self.install_binary("codex", "0.166.0", body)
+        with mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 1.0):
+            verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertTrue(result["positiveControlFired"])
+            self.assertTrue(result["memoryPipelineRan"], result)
+            self.assertTrue(result["observationComplete"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_each_home_independently_blocks_promotion_on_delayed_pipeline(self) -> None:
+        for target in ("plain", "cu"):
+            with self.subTest(target=target):
+                condition = (b'config.get("features", {}).get("computer_use")' if target == "cu"
+                             else b'not config.get("features", {}).get("computer_use")')
+                body = self.fake_codex_binary("0.166.0").replace(
+                    b'import json, os, sys, tomllib, urllib.request, sqlite3',
+                    b'import json, os, sys, tomllib, urllib.request, sqlite3, threading')
+                body = body.replace(b'body = {"input":',
+                    b'if not enabled and (home / "fixture-id").exists() and ' + condition + b':\n'
+                    b'    timer = threading.Timer(0.20, lambda: (home / "memories" / "phase2-output").write_text("pipeline")); timer.daemon = True; timer.start()\n'
+                    b'body = {"input":')
+                binary = self.root / "codex" / "0.166.0" / "bin" / "codex"
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(body)
+                binary.chmod(0o755)
+                with mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 1.0):
+                    verdict = self.run_canary("codex", "0.166.0")
+                self.assertFalse(verdict["passed"], verdict)
+                self.assertEqual(verdict["result"]["memoryPipelineRan"], target == "plain")
+                self.assertEqual(verdict["result"]["cu"]["memoryPipelineRan"], target == "cu")
+                with self.assertRaises(hc.HarnessError):
+                    hc.promote("codex", "0.166.0")
+
+    def test_control_must_validate_pipeline_detector_and_primary_read(self) -> None:
+        for change in ("unrecognized-pipeline", "bootstrap-only-read", "no-during-hold-output"):
+            with self.subTest(change=change):
+                body = self.fake_codex_binary("0.166.0")
+                if change == "unrecognized-pipeline":
+                    body = body.replace(b'"raw_memory":{}', b'"unrecognized":{}')
+                elif change == "bootstrap-only-read":
+                    body = body.replace(
+                        b'input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"',
+                        b'input_text = (home / "memories" / "MEMORY.md").read_text() if not (home / "fixture-id").exists() else "hello"')
+                binary = self.root / "codex" / "0.166.0" / "bin" / "codex"
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(body)
+                binary.chmod(0o755)
+                if change == "no-during-hold-output":
+                    with mock.patch.object(hc, "wait_for_codex_fixture", return_value=False):
+                        verdict = self.run_canary("codex", "0.166.0")
+                else:
+                    verdict = self.run_canary("codex", "0.166.0")
+                self.assertFalse(verdict["passed"], verdict)
+                for result in (verdict["result"], verdict["result"]["cu"]):
+                    self.assertFalse(result["memoryCanaryChecked"])
+                    if change == "bootstrap-only-read":
+                        self.assertFalse(result["readControlFired"])
+                    else:
+                        self.assertFalse(result["positiveControlFired"])
+                with self.assertRaises(hc.HarnessError):
+                    hc.promote("codex", "0.166.0")
+
+    def test_bad_pipeline_schema_supersedes_a_passing_record(self) -> None:
+        for target in ("plain", "cu"):
+            with self.subTest(target=target):
+                binary = self.root / "codex" / "0.166.0" / "bin" / "codex"
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_bytes(self.fake_codex_binary("0.166.0").replace(
+                    b'body = {"input":',
+                    b'if (home / "fixture-id").exists() and '
+                    + (b'config.get("features", {}).get("computer_use")' if target == "cu"
+                       else b'not config.get("features", {}).get("computer_use")')
+                    + b':\n    urllib.request.urlopen(urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=b\'{"text":{"format":"plain"}}\'), timeout=10).read()\n'
+                    b'body = {"input":'))
+                binary.chmod(0o755)
+                passing_canary("codex", "0.166.0")
+                verdict = self.run_canary("codex", "0.166.0")
+                self.assertFalse(verdict["passed"], verdict)
+                self.assertTrue(any("cannot inspect Codex request format" in r for r in verdict["reasons"]))
+                self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
+                with self.assertRaises(hc.HarnessError):
+                    hc.promote("codex", "0.166.0")
+
+    def test_pipeline_request_without_artifact_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'body = {"input":',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    pipeline = {"text":{"format":{"schema":{"properties":{"raw_memory":{}}}}}}\n'
+            b'    urllib.request.urlopen(urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=json.dumps(pipeline).encode()), timeout=10).read()\n'
+            b'body = {"input":')
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertIn("recorded-pipeline-request", result["memoryPipelineEvidence"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_unknown_pipeline_request_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'body = {"input":',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    pipeline = {"text":{"format":{"schema":{"properties":{"memory_text":{}}}}}}\n'
+            b'    urllib.request.urlopen(urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=json.dumps(pipeline).encode()), timeout=10).read()\n'
+            b'body = {"input":')
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertIn("unaccounted-request", result["memoryPipelineEvidence"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_recorder_stop_drains_partially_received_pipeline_request(self) -> None:
+        import http.client
+        import socket
+        import threading
+        recorder = hc.Recorder(hc.nine_router_url(), "dummy")
+        port = int(recorder.start().rsplit(":", 1)[1])
+        handler_entered = threading.Event()
+        original_get_request = recorder.server.get_request
+        def get_request():
+            result = original_get_request()
+            handler_entered.set()
+            return result
+        recorder.server.get_request = get_request
+        client = socket.create_connection(("127.0.0.1", port))
+        self.addCleanup(client.close)
+        payload = json.dumps({"text": {"format": {"schema": {"properties": {"raw_memory": {}}}}}}).encode()
+        client.sendall(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
+                       + str(len(payload)).encode() + b"\r\nConnection: close\r\n\r\n" + payload[:1])
+        self.assertTrue(handler_entered.wait(3))
+        accepted = threading.Event()
+        finished = threading.Event()
+        original_shutdown = recorder.server.shutdown
+        def shutdown():
+            original_shutdown()
+            accepted.set()
+        recorder.server.shutdown = shutdown
+        def stop():
+            recorder.stop()
+            finished.set()
+        worker = threading.Thread(target=stop)
+        worker.start()
+        self.assertTrue(accepted.wait(3))
+        self.assertFalse(finished.is_set())
+        client.sendall(payload[1:])
+        response = http.client.HTTPResponse(client)
+        response.begin(); response.read()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(finished.is_set())
+        self.assertTrue(any(hc.codex_pipeline_request(r["body"]) for r in recorder.requests))
+
+    def test_delayed_memory_job_without_artifact_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0")
+        body = body.replace(b'import json, os, sys, tomllib, urllib.request, sqlite3',
+                            b'import json, os, sys, tomllib, urllib.request, sqlite3, threading')
+        body = body.replace(b'body = {"input":',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    def queue_job():\n'
+            b'        conn = sqlite3.connect(home / "memories_1.sqlite"); conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")\n'
+            b'        conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)"); conn.execute("INSERT INTO jobs VALUES (\'queued\')"); conn.commit(); conn.close()\n'
+            b'    timer = threading.Timer(0.20, queue_job); timer.daemon = True; timer.start()\n'
+            b'body = {"input":')
+        self.install_binary("codex", "0.166.0", body)
+        with mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 1.0):
+            verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertIn("memories_1.sqlite:jobs", result["memoryPipelineEvidence"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_disabled_memory_probe_seeds_indexed_rollout(self) -> None:
+        self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertEqual(self.seed_mock.call_count, 4)
+
     def test_codex_memory_sentinel_detects_decoded_nested_text(self) -> None:
         sentinel = "ROBOB-CODEX-MEMORY-test"
         body = json.loads('{"input":[{"role":"system","content":[{"text":"ROBOB-CODEX-\\u004dEMORY-test"}]}]}')
@@ -656,6 +1013,16 @@ class CanaryTests(FakeCliTestCase):
         self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
             "old memory: the user prefers short replies"}]}, sentinel), (False, True))
 
+    def test_codex_canonical_instructions_do_not_count_as_loaded_memory(self) -> None:
+        instructions = "# AGENTS.md instructions\nThe old memory MCP is retired."
+        body = {"input": [{"role": "user", "content": [{"type": "input_text",
+                "text": instructions}]}]}
+        self.assertEqual(hc.codex_memory_in_body(body, "unrelated-sentinel", instructions), (False, False))
+        self.assertEqual(hc.codex_memory_in_body(body, "old memory", instructions), (True, False))
+        self.assertEqual(hc.codex_memory_in_body({"input": [{"role": "developer", "content":
+            instructions + "\nPrior memories include the user's preference for blue."}]},
+            "unrelated-sentinel", instructions), (False, True))
+
     def test_codex_memory_baseline_detects_top_level_phase2_files(self) -> None:
         home = self.tmp / "codex-snapshot"
         home.mkdir()
@@ -664,6 +1031,71 @@ class CanaryTests(FakeCliTestCase):
         (home / "raw_memories.md").write_text("new")
         after = hc.codex_memory_snapshot(home)
         self.assertEqual(set(after) - set(before), {"phase2-output", "raw_memories.md"})
+
+    def test_empty_codex_database_does_not_count_as_pipeline_work(self) -> None:
+        body = self.fake_codex_binary("0.166.0")
+        start = body.index(b'    (home / "memories" / "phase2-output").write_text')
+        end = body.index(b'enabled = config.get', start)
+        body = body[:start] + b'    (home / "memories_1.sqlite").touch()\n' + body[end:]
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertFalse(verdict["result"]["positiveControlFired"])
+        self.assertFalse(verdict["result"]["cu"]["positiveControlFired"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
+    def test_initialized_codex_database_is_not_memory_pipeline_work(self) -> None:
+        import sqlite3
+        home = self.tmp / "codex-memory-init"
+        home.mkdir()
+        before = hc.codex_memory_snapshot(home)
+        from contextlib import closing
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("CREATE TABLE stage1_outputs (raw_memory TEXT)")
+            conn.execute("CREATE TABLE jobs (status TEXT)")
+            conn.execute("CREATE TABLE consolidation_progress (singleton INTEGER)")
+            conn.execute("INSERT INTO consolidation_progress VALUES (1)")
+            conn.commit()
+        after = hc.codex_memory_snapshot(home)
+        self.assertEqual(hc.codex_memory_pipeline_evidence(home, before, after), [])
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("INSERT INTO stage1_outputs VALUES ('content')")
+            conn.commit()
+        after = hc.codex_memory_snapshot(home)
+        self.assertIn("memories_1.sqlite:stage1_outputs", hc.codex_memory_pipeline_evidence(home, before, after))
+
+    def test_jobs_or_consolidation_initialization_is_not_positive_extraction(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        home = self.tmp / "codex-no-extraction"
+        home.mkdir()
+        with closing(sqlite3.connect(home / "memories_1.sqlite")) as conn:
+            conn.execute("CREATE TABLE stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
+            conn.execute("CREATE TABLE jobs (status TEXT)")
+            conn.execute("INSERT INTO jobs VALUES ('pending')")
+            conn.commit()
+        self.assertEqual(hc.codex_memory_positive_evidence(home, "fixture"), [])
+
+    def test_codex_memory_fixture_is_indexed_and_old_enough(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        home = self.tmp / "indexed"
+        home.mkdir()
+        with closing(sqlite3.connect(home / "state_5.sqlite")) as conn:
+            conn.execute('''CREATE TABLE threads (id TEXT, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+                source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT,
+                preview TEXT, memory_mode TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, recency_at INTEGER,
+                recency_at_ms INTEGER, first_user_message TEXT, cli_version TEXT)''')
+            conn.commit()
+        self.seed_patch.stop()
+        fixture = hc.seed_codex_rollout(home, self.tmp, "0.166.0")
+        with closing(sqlite3.connect(home / "state_5.sqlite")) as conn:
+            row = conn.execute("SELECT rollout_path, source, preview, memory_mode, updated_at FROM threads WHERE id=?", (fixture,)).fetchone()
+        self.assertTrue(Path(row[0]).is_file())
+        self.assertEqual((row[1], row[3]), ("cli", "enabled"))
+        self.assertTrue(row[2])
+        self.assertGreaterEqual(__import__("time").time() - row[4], 7200)
 
     def test_canary_fails_when_claude_request_body_contains_memory_canary(self) -> None:
         # A fake CLI that echoes the memory canary into its outgoing request body, as built-in memory would.
@@ -675,6 +1107,17 @@ class CanaryTests(FakeCliTestCase):
         verdict = self.run_canary("claude", "2.1.316", fake_proxy_body=None)
         self.assertFalse(verdict["passed"])
         self.assertTrue(any("memory-off canary failed" in r for r in verdict["reasons"]), verdict)
+
+    def test_escaped_claude_sentinel_blocks_promotion(self) -> None:
+        body = self.fake_claude_binary("2.1.316", body_extra="ROBOB-MEMCANARY")
+        body = body.replace(b'data=json.dumps(body).encode(),',
+                            b'data=json.dumps(body).replace("ROBOB-MEMCANARY", "ROBOB-\\\\u004dEMCANARY").encode(),')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["result"]["memoryCanaryLeaked"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
 
     def test_canary_fails_when_codex_run_creates_memories_dir(self) -> None:
         leaky = self.fake_codex_binary("0.166.0", body_extra='mkdir -p "$CODEX_HOME/memories"\n')
@@ -695,6 +1138,74 @@ class CanaryTests(FakeCliTestCase):
     def test_canary_proxy_refuses_non_loopback_upstream(self) -> None:
         with self.assertRaises(hc.HarnessError):
             hc.Recorder("https://api.example.com", "k")
+
+    def test_recorder_blocks_other_methods_and_paths(self) -> None:
+        import urllib.error
+        import urllib.request
+        recorder = hc.Recorder(f"http://127.0.0.1:{self.upstream.server_address[1]}", "k")
+        base = recorder.start()
+        self.addCleanup(recorder.stop)
+        for method, path in (("POST", "/api/admin"), ("POST", "/v1/responses/../admin"),
+                             ("POST", "/v1/messages?beta=true&other=1"), ("GET", "/v1/messages")):
+            req = urllib.request.Request(base + path, data=b'{}' if method == 'POST' else None, method=method)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(error.exception.code, 403)
+            error.exception.close()
+        self.assertEqual(len(recorder.violations), 4)
+        self.assertEqual(len(recorder.requests), 0)
+
+    def test_recorder_records_unsupported_and_malformed_http(self) -> None:
+        import socket
+        import urllib.error
+        import urllib.request
+        recorder = hc.Recorder(hc.nine_router_url(), "dummy")
+        base = recorder.start()
+        with self.assertRaises(urllib.error.HTTPError) as trace:
+            urllib.request.urlopen(urllib.request.Request(base + "/v1/responses", method="TRACE"))
+        trace.exception.close()
+        with self.assertRaises(urllib.error.HTTPError) as malformed:
+            urllib.request.urlopen(urllib.request.Request(base + "/v1/messages", data=b'{"messages":null}'))
+        malformed.exception.close()
+        port = int(base.rsplit(":", 1)[1])
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            client.sendall(b"BAD HTTP REQUEST EXTRA\r\n\r\n")
+            client.recv(4096)
+        recorder.stop()
+        self.assertGreaterEqual(len(recorder.errors), 3)
+
+    def test_handler_exception_is_recorded(self) -> None:
+        import socket
+        recorder = hc.Recorder(hc.nine_router_url(), "dummy")
+        port = int(recorder.start().rsplit(":", 1)[1])
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            client.sendall(b"POST /vv HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            client.recv(4096)
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            client.sendall(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999999999999999999999999999999\r\n\r\n")
+            client.recv(4096)
+        recorder.stop()
+        self.assertIn("uncaught HTTP handler error", recorder.errors)
+
+    def test_incomplete_canary_must_not_report_success(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        result = passing_claude_result()
+        result["requests"] = 2
+        with mock.patch.object(hc, "canary_claude", return_value=result):
+            verdict = hc.canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+
+    def test_canary_preemptively_supersedes_previous_pass(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        passing_canary("claude", "2.1.316")
+        def interrupted(*args, **kwargs):
+            self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+            raise KeyboardInterrupt()
+        with mock.patch.object(hc, "canary_claude", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                hc.canary("claude", "2.1.316")
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
 
     def test_stale_pass_cannot_promote_after_a_later_failed_canary(self) -> None:
         # Reviewer's reproduction: a pass is recorded, then the next check fails, and promote must
@@ -718,6 +1229,58 @@ class CanaryTests(FakeCliTestCase):
         self.assertFalse(verdict["passed"])
         self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
 
+    def test_unexpected_exception_supersedes_claude_pass(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        passing_canary("claude", "2.1.316")
+        with mock.patch.object(hc, "canary_claude", side_effect=TypeError("bad shape")):
+            verdict = hc.canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
+
+    def test_incomplete_claude_pass_cannot_promote(self) -> None:
+        binary = self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        for field in ("memoryCanaryLeaked", "recorderViolations", "requests", "claude-haiku-5-5"):
+            with self.subTest(field=field):
+                proof = passing_claude_result()
+                del proof[field]
+                hc.write_record("canary", "claude", "2.1.316", "passed", canary=proof,
+                                binarySha256=hc.sha256_file(binary), canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
+                self.assertFalse(hc.latest_canary("claude", "2.1.316")["passed"])
+                with self.assertRaises(hc.HarnessError):
+                    hc.promote("claude", "2.1.316")
+
+    def test_claude_verdict_includes_late_drained_memory_request(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        original = hc.Recorder.stop
+        def stop_with_late_leak(recorder):
+            recorder.bodies.append(hc.CLAUDE_MEMORY_CANARY.encode())
+            original(recorder)
+        with mock.patch.object(hc.Recorder, "stop", stop_with_late_leak):
+            verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["result"]["memoryCanaryLeaked"])
+
+    def test_codex_exiting_before_hold_blocks_promotion(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'import json, os, sys, tomllib, urllib.request, sqlite3',
+            b'import json, os, sys, tomllib, urllib.request, sqlite3, socket, time')
+        body = body.replace(b'if enabled and (home / "fixture-id").exists():\n    pipeline',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    payload = json.dumps(body).encode(); port = int(os.environ["NINEROUTER_BASE"].rsplit(":",1)[1]); s = socket.create_connection(("127.0.0.1",port))\n'
+            b'    s.sendall(b"POST /v1/responses HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Length: " + str(len(payload)).encode() + b"\\r\\n\\r\\n" + payload)\n'
+            b'    time.sleep(0.1); print("OK", flush=True); os._exit(0)\n'
+            b'if enabled and (home / "fixture-id").exists():\n    pipeline')
+        self.install_binary("codex", "0.166.0", body)
+        passing_canary("codex", "0.166.0")
+        with mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 1.0):
+            verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        self.assertIn("Codex exited before its memory observation window completed", verdict["reasons"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
     def run_canary(self, tool: str, version: str, fake_proxy_body=None) -> dict:
         """Run the real canary: the real generator (with the real manifest) builds the homes from
         copies of the live instruction sources, and only the CLI binaries are fake."""
@@ -729,17 +1292,21 @@ class CanaryTests(FakeCliTestCase):
 def passing_canary(tool: str, version: str) -> dict:
     """Stands in for canary(): writes the same durable record the real canary writes, so promote()
     checks what it would check in production (a passing record with the memory-off result)."""
-    body = ({"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
-             "thinkingReplayed": True, "inputTransformationsEmpty": True} if tool == "claude"
-            else {"memoryCanaryChecked": True, "memoryPipelineRan": False, "positiveControlFired": True,
-                  "readControlFired": True, "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
-                                                      "readControlFired": True}})
+    body = (passing_claude_result() if tool == "claude"
+            else passing_codex_result())
     binary = hc.version_dir(tool, version) / "bin" / tool
-    hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body)
+    hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body,
+                    canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
     return {"passed": True, "reasons": [], "result": body}
 
 
 class AutoTests(FakeCliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def publish_both(self, claude_latest: str, codex_latest: str) -> None:
         """Answer npm the way the registry does: the wrapper package's `version` (what discover asks)
         and the native darwin package's dist.integrity and tarball (what stage fetches)."""
@@ -917,6 +1484,12 @@ class RefreshTests(FakeCliTestCase):
 
 
 class RotationGateTests(FakeCliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     """The standing OK, the snapshot's fail-closed rule, and the rotation path end to end."""
 
     def install_codex(self, version: str = "0.166.0") -> None:
@@ -929,10 +1502,8 @@ class RotationGateTests(FakeCliTestCase):
         self.install_codex(version)
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
-                        canary={"memoryCanaryChecked": True, "memoryPipelineRan": False, "memoryPromptSeen": False,
-                                "positiveControlFired": True, "readControlFired": True,
-                                "cu": {"memoryCanaryChecked": True, "positiveControlFired": True,
-                                       "readControlFired": True}})
+                        canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
+                        canary=passing_codex_result())
         hc.promote("codex", version)
 
     def test_rotation_refused_without_standing_ok_even_without_when_idle_flag(self) -> None:
@@ -1069,6 +1640,97 @@ class StatusAndNotifyTests(FakeCliTestCase):
         with mock.patch.object(hc.sys, "platform", "darwin"):
             with self.assertRaises(hc.HarnessError):
                 hc.run_cli(Path("/not/executed"), [], env={"HOME": str(self.tmp / "missing")})
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_cli_fences_second_loopback_subprocess_and_outside_writes(self) -> None:
+        self.run_patch.stop()
+        import http.server
+        import threading
+        class Sink(http.server.BaseHTTPRequestHandler):
+            hits = 0
+            def log_message(self, *args): pass
+            def do_POST(self):
+                type(self).hits += 1
+                self.send_response(200)
+                self.send_header("content-length", "0")
+                self.end_headers()
+        allowed = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        self.addCleanup(allowed.server_close)
+        self.addCleanup(other.server_close)
+        self.addCleanup(allowed.shutdown)
+        self.addCleanup(other.shutdown)
+        for server in (allowed, other):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        work = self.tmp / "sandbox"
+        home = work / "home"
+        hc.prepare_isolated_home(home)
+        outside = self.tmp / "outside"
+        code = '''import os,sys,urllib.request,subprocess,socket,signal
+def post(url):
+ try: urllib.request.urlopen(urllib.request.Request(url,data=b'x'),timeout=3).read(); return 'allowed'
+ except Exception: return 'denied'
+print('recorder',post(sys.argv[1]))
+print('bypass',post(sys.argv[2]))
+try: open(sys.argv[3],'w').write('bad'); print('write allowed')
+except OSError: print('write denied')
+try: subprocess.run(['/bin/echo','bad'],check=True); print('exec allowed')
+except (OSError,subprocess.SubprocessError): print('exec denied')
+try: socket.socket(socket.AF_UNIX).connect(sys.argv[4]); print('unix allowed')
+except OSError: print('unix denied')
+try: open(sys.argv[5]).read(); print('read allowed')
+except OSError: print('read denied')
+try: os.kill(int(sys.argv[6]),signal.SIGCONT); print('signal allowed')
+except OSError: print('signal denied')
+'''
+        base = f"http://127.0.0.1:{allowed.server_port}"
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "ANTHROPIC_BASE_URL": base}
+        py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        python_root = Path(sys.executable).resolve().parent.parent
+        sockpath = str(self.tmp / 'local-sock')
+        listener = __import__('socket').socket(__import__('socket').AF_UNIX)
+        listener.bind(sockpath); listener.listen()
+        self.addCleanup(listener.close)
+        protected = self.tmp / "personal-secret"
+        protected.write_text("not accessible")
+        with mock.patch.object(hc, "SANDBOX_SYSTEM_READ_ROOTS", hc.SANDBOX_SYSTEM_READ_ROOTS + (str(python_root),)):
+            result = hc.run_cli(py, ["-c", code, base, f"http://127.0.0.1:{other.server_port}", str(outside), sockpath,
+                                     str(protected), str(os.getpid())],
+                                env=env, cwd=work, sandbox_root=work, recorder_url=base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recorder allowed", result.stdout)
+        self.assertIn("bypass denied", result.stdout)
+        self.assertIn("write denied", result.stdout)
+        self.assertIn("exec denied", result.stdout)
+        self.assertIn("unix denied", result.stdout)
+        self.assertIn("read denied", result.stdout)
+        self.assertIn("signal denied", result.stdout)
+        self.assertEqual(Sink.hits, 1)
+        self.assertFalse(outside.exists())
+
+    def test_cli_rejects_missing_or_untrusted_recorder(self) -> None:
+        self.run_patch.stop()
+        work = self.tmp / "isolated"
+        home = work / "home"
+        hc.prepare_isolated_home(home)
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+        for url in ("http://127.0.0.1:22/other", "http://localhost:22", "http://example.com:22", "http://127.0.0.1:22@evil.com"):
+            with self.subTest(url=url), self.assertRaises(hc.HarnessError):
+                hc.run_cli(Path("/bin/echo"), [], env=env, cwd=work, sandbox_root=work, recorder_url=url)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_version_probe_is_offline(self) -> None:
+        self.run_patch.stop()
+        home = self.tmp / "version" / "home"
+        hc.prepare_isolated_home(home)
+        work = home.parent
+        py = Path(sys.executable).resolve().parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        python_root = Path(sys.executable).resolve().parent.parent
+        code = "import socket; s=socket.socket(); print(s.connect_ex(('127.0.0.1',20128)))"
+        with mock.patch.object(hc, "SANDBOX_SYSTEM_READ_ROOTS", hc.SANDBOX_SYSTEM_READ_ROOTS + (str(python_root),)):
+            proc = hc.run_cli(py, ["-c", code], env={"HOME": str(home)}, cwd=work, sandbox_root=work)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "1")
 
     def test_prepare_home_creates_keychain_before_spawn(self) -> None:
         self.home_patch.stop()

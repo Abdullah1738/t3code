@@ -2490,7 +2490,11 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
 });
 
 describe("ClaudeAdapterV2 native session identity", () => {
-  const openTurnWithOrdinal = (providerTurnOrdinal: number, nativeThreadHasTurns?: boolean) =>
+  const openTurnWithOrdinal = (
+    providerTurnOrdinal: number,
+    nativeThreadHasTurns?: boolean,
+    seededHead?: string | null,
+  ) =>
     Effect.scoped(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -2538,11 +2542,38 @@ describe("ClaudeAdapterV2 native session identity", () => {
           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
         });
-        const providerThread = yield* runtime.ensureThread({
+        const newProviderThread = yield* runtime.ensureThread({
           threadId,
           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
         });
+        const providerThread: OrchestrationV2ProviderThread =
+          seededHead === undefined
+            ? newProviderThread
+            : {
+                ...newProviderThread,
+                nativeThreadRef: {
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  nativeId: "00000000-0000-4000-8000-000000000001",
+                  strength: "strong",
+                },
+                nativeConversationHeadRef:
+                  seededHead === null
+                    ? null
+                    : {
+                        driver: ProviderDriverKind.make("claudeAgent"),
+                        nativeId: seededHead,
+                        strength: "strong",
+                      },
+                nativeMetadata: {
+                  seededHistory: {
+                    source: "opencode",
+                    sourceSessionId: "ses_source",
+                    digest: "sha256:seed",
+                    mode: "claude-transcript",
+                  },
+                },
+              };
         const now = yield* DateTime.now;
         yield* runtime.startTurn(
           makeClaudeTestTurnInput({
@@ -2589,6 +2620,27 @@ describe("ClaudeAdapterV2 native session identity", () => {
       const openedQueries = yield* openTurnWithOrdinal(4, false);
       assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
       assert.equal(openedQueries[0]?.options.resume, undefined);
+    }),
+  );
+
+  it.effect.each([
+    { label: "with a head", head: "00000000-0000-4000-8000-000000000002" },
+    { label: "without a head", head: null },
+  ])("resumes a seeded first turn $label", ({ head }) =>
+    Effect.gen(function* () {
+      const openedQueries = yield* openTurnWithOrdinal(1, undefined, head);
+      assert.equal(openedQueries.length, 1);
+      assert.equal(openedQueries[0]?.options.resume, "00000000-0000-4000-8000-000000000001");
+      assert.equal(openedQueries[0]?.options.resumeSessionAt, head ?? undefined);
+      assert.isUndefined(openedQueries[0]?.options.sessionId);
+    }),
+  );
+
+  it.effect("resumes a seeded first turn even if an input says it has no turns", () =>
+    Effect.gen(function* () {
+      const openedQueries = yield* openTurnWithOrdinal(1, false, null);
+      assert.equal(openedQueries[0]?.options.resume, "00000000-0000-4000-8000-000000000001");
+      assert.isUndefined(openedQueries[0]?.options.sessionId);
     }),
   );
 });
