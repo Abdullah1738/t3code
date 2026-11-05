@@ -1589,10 +1589,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               (run) =>
                 isHandoffSourceRun(run) &&
                 run.ordinal > (targetLastCompletedRun?.ordinal ?? 0) &&
-                // ardud: adoption's snapshot covers source runs at its creation,
-                // even if the first target run is cancelled before native start.
+                // ardud: adoption records the runs covered by its source snapshot.
                 (deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" ||
-                  run.ordinal >= (deliveryProviderThread.firstRunOrdinal ?? queuedRun.ordinal)) &&
+                  run.ordinal >
+                    (deliveryProviderThread.nativeMetadata.seededHistory.snapshotRunOrdinal ?? 0)) &&
                 run.ordinal <= latestHandoffRun.ordinal,
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
@@ -7829,7 +7829,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           handoffIds: [],
           forkedFrom: null,
           contextUsage: null,
-          nativeMetadata: { seededHistory },
+          nativeMetadata: {
+            seededHistory: {
+              ...seededHistory,
+              ...(seededHistory.mode === "codex-inject"
+                ? {
+                    snapshotRunOrdinal: projection.runs.reduce(
+                      (latest, run) => Math.max(latest, run.ordinal),
+                      0,
+                    ),
+                  }
+                : {}),
+            },
+          },
           createdAt: now,
           updatedAt: now,
         };
