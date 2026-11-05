@@ -468,6 +468,7 @@ export function layerWithRegistry<Error>(
         layerRunExecutionServiceProvided,
         layerServerSettings,
         layerDatabase,
+        layerServerConfig,
         ThreadForkService.layer,
       ),
     ),

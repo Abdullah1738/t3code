@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -476,6 +477,23 @@ class EngineTests(unittest.TestCase):
         event["tool_name"] = "mcp__test_server__apply_patch"
         self.assertEqual(engine.decide(event, "claude")["decision"], "allow")
 
+    def test_native_and_mcp_shell_aliases_enforce_offbox_and_coord(self):
+        self.actor()
+        self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")
+        tools = ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__test__shell", "mcp__test__bash")
+        for harness in ("claude", "codex"):
+            for tool in tools:
+                for field in ("command", "cmd"):
+                    for command, reason in (("npm ci", "offbox gate:"), ("psql", engine.COORD_REASON)):
+                        with self.subTest(harness=harness, tool=tool, field=field, command=command):
+                            event = self.event(command, tool_name=tool, tool_input={field: command})
+                            if harness == "codex":
+                                event.update(session_id="codex-child")
+                                event.pop("agent_id", None)
+                            response = self.run_adapter(harness, event)["hookSpecificOutput"]
+                            self.assertEqual(response["permissionDecision"], "deny")
+                            self.assertIn(reason, response["permissionDecisionReason"])
+
     def test_mcp_shell_rewrites_original_field_and_propagates_child_to_shim(self):
         self.actor()
         self.add_identity("session", "parent", model="claude-opus-5-5")
@@ -506,7 +524,7 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("updatedInput", engine.decide(event, "claude")["context"])
 
     def test_mcp_rewrite_activates_raw_send_shims_without_native_env(self):
-        offbox = SRC.parents[1] / "offbox/skill/scripts/blockers"
+        offbox = self.offbox_fixture() / "scripts/blockers"
         self.add_identity("agent-child", "child", parent="parent", model="gpt-6-astra")
         real = self.root / "mcp-bin"
         real.mkdir()
@@ -685,9 +703,30 @@ class EngineTests(unittest.TestCase):
         for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ROBOB_HARNESS", "AGENT_GUARD_SESSION",
                      "AGENT_GUARD_APPROVED", "HARNESS_COORD_APPROVED", engine.COMMAND_IDENTITY_ENV):
             env.pop(name, None)
-        env.update({"PATH": os.pathsep.join([str(SRC.parent / "coord-blockers"), str(bin_dir), "/usr/bin", "/bin"]),
+        blockers = self.root / "harness-hooks/coord-blockers"
+        if not blockers.exists():
+            shutil.copytree(SRC.parent / "coord-blockers", blockers)
+            source = blockers.parent / "src"
+            source.mkdir()
+            shutil.copy2(SRC / "coord_shim.py", source / "coord_shim.py")
+            for shim in blockers.iterdir():
+                shim.write_text(shim.read_text().replace("/opt/homebrew/bin/python3", shlex.quote(sys.executable)))
+        env.update({"PATH": os.pathsep.join([str(blockers), str(bin_dir), "/usr/bin", "/bin"]),
                     "HARNESS_HOOKS_SRC": str(SRC), **values})
         return env
+
+    def offbox_fixture(self):
+        source = SRC.parents[1] / "offbox/skill"
+        fixture = self.root / "offbox-skill"
+        if not fixture.exists():
+            shutil.copytree(source / "scripts/blockers", fixture / "scripts/blockers")
+            shutil.copy2(source / "heavy-rules.json", fixture / "heavy-rules.json")
+            for name in ("classify.py", "monitor_support.py"):
+                shutil.copy2(source / "scripts" / name, fixture / "scripts" / name)
+            for shim in (fixture / "scripts/blockers").iterdir():
+                if shim.is_file():
+                    shim.write_text(shim.read_text().replace("/opt/homebrew/bin/python3", shlex.quote(sys.executable)))
+        return fixture
 
     def run_shell(self, command, env, shell="/bin/bash"):
         return subprocess.run([shell, "-c", command], cwd=self.root, env=env,
@@ -1125,7 +1164,7 @@ printf done | cat"""
     def test_docker_wrapper_uses_command_child_and_not_exempt_parent(self):
         self.actor()
         self.add_identity("session", "parent", model="claude-opus-5-5")
-        offbox = SRC.parents[1] / "offbox/skill"
+        offbox = self.offbox_fixture()
         blocker = offbox / "scripts/blockers"
         env = self.shell_environment(CLAUDE_CODE_SESSION_ID="session", ROBOB_HARNESS="claude",
                                      OFFBOX_RULES=str(offbox / "heavy-rules.json"))

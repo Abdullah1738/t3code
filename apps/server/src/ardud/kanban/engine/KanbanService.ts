@@ -88,6 +88,7 @@ import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
+import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
 import * as BoardLocks from "./boardLocks.ts";
 import * as LockedStore from "./lockedStore.ts";
 
@@ -303,6 +304,8 @@ export interface KanbanServiceShape {
     reason: string | null,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** Reattaches an existing thread without starting a turn or lifting the board pause. */
+  readonly restoreCutoverCard: (input: RestoreCutoverCardInput) => Effect.Effect<void, KanbanError>;
   readonly settleCard: (cardId: KanbanCard["id"]) => Effect.Effect<KanbanCard, KanbanError>;
   /**
    * Asks the owner a question on a card. A blocking ask holds the card in
@@ -823,6 +826,7 @@ const make = Effect.gen(function* () {
       : result.selection;
   });
   const rawStore = yield* KanbanStore;
+  const boardSql = yield* BoardsDatabase.client;
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
@@ -3701,6 +3705,30 @@ const make = Effect.gen(function* () {
     let card = link.cardId ? yield* store.card(link.cardId) : null;
     const carriedIds = link.role === "work" ? yield* store.threadCards(threadId) : [];
 
+    if (link.role !== "evaluator") {
+      const board = yield* boardOf(link.boardId);
+      const carried = board.pause !== null ? yield* store.cardsByThread(threadId) : [];
+      if (board.pause !== null && carried.some((entry) => !board.pause!.keep.includes(entry.id))) {
+        // A stopped run's delayed event must not undo a cutover restore before its wake lands.
+        yield* Ref.update(deferredNudges, (all) => new Set(all).add(threadId));
+        for (const discussion of yield* store.discussions(board.id)) {
+          const participant = discussion.participants.find(
+            (entry) => entry.actor._tag === "thread" && entry.actor.threadId === threadId,
+          );
+          if (!participant || (participant.typingUntil === null && participant.owes === null))
+            continue;
+          const deferred =
+            participant.owes === "asked" && !participant.deferred
+              ? deferParticipant(discussion, participant)
+              : discussion;
+          yield* saveDiscussion(
+            withParticipant(deferred, participant.actor, participant.name, { typingUntil: null }),
+          );
+        }
+        return;
+      }
+    }
+
     const discussionIds = new Set<string>();
     if (link.discussionId) discussionIds.add(link.discussionId);
     if (card?.discussionId) discussionIds.add(card.discussionId);
@@ -4374,6 +4402,7 @@ const make = Effect.gen(function* () {
               }
               // A card whose thread was deleted goes back to its queue for a new one.
               for (const card of yield* cardsForPlan) {
+                if (board.pause !== null && !board.pause.keep.includes(card.id)) continue;
                 const threadId = card.activeThreadId;
                 if (threadId === null) continue;
                 const planned = yield* planFind(threadId);
@@ -5879,6 +5908,50 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const restoreCutoverCard: KanbanServiceShape["restoreCutoverCard"] = Effect.fn(
+    "KanbanService.restoreCutoverCard",
+  )(function* (input: RestoreCutoverCardInput) {
+    const view = yield* read(threads.find(input.threadId));
+    if (view === null || view.archived) {
+      return yield* failWith("not-found", `existing thread ${input.threadId} is missing or archived`);
+    }
+    yield* guard(
+      Effect.gen(function* () {
+        // Take the card's board permit before acquiring its SQLite writer.
+        yield* cardOf(input.cardId);
+        const restored = yield* boardSql.withTransaction(
+          Effect.gen(function* () {
+            const card = yield* cardOf(input.cardId);
+            const board = yield* boardOf(card.boardId);
+            const plan = planCutoverCardRestore({
+              restore: input,
+              board,
+              card,
+              link: yield* store.threadLink(input.threadId),
+              threadCards: yield* store.threadCards(input.threadId),
+              cards: yield* store.cards(board.id),
+              pools: yield* store.pools(board.id),
+              holds: yield* boardHolds(board.id),
+              at: yield* nowIso,
+            });
+            if (!plan.ok) return yield* Effect.fail(plan.error);
+            if (!plan.changed) return null;
+            yield* store.putCard(plan.card);
+            yield* store.putThreadLink(plan.link);
+            yield* logEvent(plan.card, { _tag: "system", component: "harness-cutover" }, "thread", {
+              fromStage: card.stage,
+              toStage: plan.card.stage,
+              body: `Restored existing ${plan.link.role} thread after cutover`,
+            });
+            return plan.card;
+          }),
+        );
+        if (restored !== null) yield* publish(restored.boardId, { _tag: "card", card: restored });
+      }),
+      input.cardId,
+    );
+  });
+
   /** Posts an ask in the card's discussion (never routed: it's for the owner) and keeps its seq. */
   const postAsk = Effect.fn("KanbanService.postAsk")(function* (
     card: KanbanCard,
@@ -7177,6 +7250,7 @@ const make = Effect.gen(function* () {
     createCard,
     editCard,
     moveCard,
+    restoreCutoverCard,
     flagCard,
     settleCard,
     markSubtask,

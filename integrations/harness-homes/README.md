@@ -14,7 +14,8 @@ instance's environment, and OAuth state stays in the home it was created in.
 ## Files
 
 - `manifest.json`: the single source. Homes, skill roots, canonical AGENTS.md,
-  the seven MCP servers, PATH, hooks, Codex model extension, Claude knobs.
+  shared MCP servers (including recall's canonical `http://127.0.0.1:18765/mcp`
+  service), PATH, hooks, Codex model extension, Claude knobs.
 - `generate_homes.py`: `generate [--home-root DIR] [--dry-run]` writes all homes
   idempotently (atomic writes, one line per changed file). `check [--home-root DIR]`
   compares their owned contents with the manifest and catalog.
@@ -29,6 +30,46 @@ instance's environment, and OAuth state stays in the home it was created in.
 - `launchd/com.ardud.harness-homes.plist`: runs `generate` every 5 minutes so
   new skills and AGENTS.md edits reach the homes.
 - `tests/test_generate_homes.py`: temp-dir tests only.
+
+## Source parity checks
+
+`generate` also writes `parity-manifest.json` in each home. This is metadata,
+not another copy of the skills or guards. Skills remain symlinks into every
+`skillRoots` entry; hook implementations remain in the shared integrations.
+The native harnesses discover skill metadata themselves, so the OpenCode-only
+compact-skill-catalog plugin does not need a native port. No skill count is pinned.
+
+`check --json [--home-root DIR]` runs the same read-only check as `check` and
+returns `{schemaVersion: 1, ok: boolean, failures: string[], homes: [...]}`.
+Each home entry is `{harness, home, parityManifestPath}`. Exit 0 means all
+owned files, skill links, and parity metadata match current sources; exit 1
+means drift or an unreadable required source. Check never refreshes metadata.
+
+Each parity manifest has schema version 1 and these fields:
+
+- `harness`, `manifestSha256`, `generator: {path, sha256}`.
+- `artifacts: [{path, sha256}]`: absolute paths and SHA-256 of expected bytes
+  for every owned generated file except this parity manifest. Claude covers
+  `settings.json`, `.claude.json`, `CLAUDE.md`, `overlay.md`; each Codex home
+  covers `config.toml`, `hooks.json`, `AGENTS.md`, `models.json`. Hashes come
+  from the generator's plan, never from potentially edited output files.
+  Only `.claude.json` has `format: "claude-owned-json"`: hash the projection
+  `{mcpServers, hasCompletedOnboarding}` as recursively key-sorted compact JSON
+  (`separators=(",", ":")`, UTF-8, `ensure_ascii=False`, no trailing newline).
+  CLI-managed projects/counters remain preserved and do not invalidate parity.
+  All other artifacts omit `format` and retain raw-byte SHA-256.
+- `skills: [{name, source, sha256}]`, hashing the source `SKILL.md`.
+- `mcpServers`: the manifest's shared non-secret server specifications.
+- `runtimeMcpServers: ["t3-code"]`: injected per thread, not proven by home generation.
+- `guards: [{id, sources: [{path, sha256}]}]` and harness-filtered `hooks`.
+- `instructions: {canonical: {path, sha256}, overlays: [{path, sha256}]}`.
+- `compactSkillCatalog: {required: false, reason}`.
+
+Readiness consumers should run the existing generator check, not trust a
+standalone `ok` flag in an old artifact. These checks prove config/source
+parity only; they do not prove hook trust, MCP authentication, injected T3
+tools, or a native turn's runtime behavior. Recall can be overridden with
+thread-scoped headers by the provider adapter.
 
 ## Run
 

@@ -60,8 +60,8 @@ class RecallHomeTests(unittest.TestCase):
             rc = gh.main([*args, "--home-root", str(self.root)])
         return rc, output.getvalue(), error.getvalue()
 
-    def test_unscoped_recall_is_not_generated_or_kept(self):
-        self.assertNotIn("recall", {s["id"] for s in self.manifest["mcpServers"]})
+    def test_shared_recall_is_generated_and_stale_endpoints_are_replaced(self):
+        self.assertIn("recall", {s["id"] for s in self.manifest["mcpServers"]})
         for name in ("codex", "codex-cu"):
             home = self.root / name
             home.mkdir(parents=True, exist_ok=True)
@@ -72,8 +72,11 @@ class RecallHomeTests(unittest.TestCase):
         self.assertEqual(self.invoke("generate")[0], 0)
         for name in ("codex", "codex-cu"):
             cfg = tomllib.loads((self.root / name / "config.toml").read_text())
-            self.assertNotIn("recall", cfg.get("mcp_servers", {}))
-        self.assertNotIn("recall", json.loads((claude / ".claude.json").read_text()).get("mcpServers", {}))
+            self.assertEqual(cfg["mcp_servers"]["recall"]["url"], "http://127.0.0.1:18765/mcp")
+        recall = json.loads((claude / ".claude.json").read_text())["mcpServers"]["recall"]
+        self.assertEqual(recall["type"], "http")
+        self.assertEqual(recall["url"], "http://127.0.0.1:18765/mcp")
+        self.assertEqual(self.invoke("check")[0], 0)
 
     def test_recall_hooks_reach_every_home_by_harness(self):
         self.assertEqual(self.invoke("generate")[0], 0)

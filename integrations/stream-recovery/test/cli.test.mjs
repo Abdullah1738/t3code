@@ -39,6 +39,7 @@ for (const unavailable of ['missing', 'not-ready', 'stale', 'live-override']) {
       requests.push(req.url);
       res.setHeader('content-type', 'application/json');
       if (req.url === '/api/session/active') res.end(JSON.stringify({ data: {} }));
+      else if (req.url === '/api/ardud/control/harness-cutover/status') res.end(JSON.stringify({ ok: true, cutover: { active: false, completed: false, claimedThreadIds: [], claimedRuns: [] } }));
       else if (req.url.startsWith('/api/ardud/control/threads?')) res.end(JSON.stringify({ threads: [] }));
       else { res.statusCode = 500; res.end(JSON.stringify({ error: 'unexpected fixture request' })); }
     });

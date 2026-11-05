@@ -6,9 +6,12 @@ import {
   assistantText, orphanStatus, sessionFromProviderThread, isNestedThreadId,
   providerThreadFor, robobNativeMessageId, truncate, toMs, hhmm,
 } from './lib/detect.mjs';
-import * as io from './lib/io.mjs';
+import * as realIo from './lib/io.mjs';
+import { pathToFileURL } from 'node:url';
+import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
 import { restartScan } from './lib/restartwatch.mjs';
+const io = realIo;
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
@@ -41,7 +44,11 @@ const log = (...parts) => (logToStderr ? console.error : console.log)(new Date()
 
 function topParent(db, threadId) {
   let t = threadId;
-  for (let i = 0; i < 5 && t && isNestedThreadId(t); i++) t = io.subagentParent(db, providerThreadFor(t));
+  const seen = new Set();
+  while (t && isNestedThreadId(t) && !seen.has(t)) {
+    seen.add(t);
+    t = io.subagentParent(db, providerThreadFor(t));
+  }
   return t && !isNestedThreadId(t) ? t : null;
 }
 
@@ -49,15 +56,24 @@ async function safe(fn, fallback) {
   try { return await fn(); } catch { return fallback; }
 }
 
-async function gatherThread({ db, incident, threadId, active, now, verbose }) {
+export async function gatherThread({ db, incident, threadId, active, now, verbose }, io = realIo) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const failed = incident.runs.filter((r) => r.thread_id === threadId);
+  const sourceRuns = [...failed, ...incident.subagents.filter((s) => s.parentThreadId === threadId)].map((r) => r.run_id);
+  const owned = await recoveryOwned(io, threadId, sourceRuns);
+  if (owned || !openCodeSession(thread)) {
+    return { thread, sourceRuns, plan: { threadId, title: thread.title, action: 'skip', resumeQueue: false,
+      reason: owned ? 'harness cutover owns continuation' : 'not a current OpenCode session' },
+    lost: [], reply: null, forms: [], orphans: [], held: [], staleHeld: [] };
+  }
   const maxOrdinal = failed.reduce((m, r) => Math.max(m, r.ordinal), -1);
   const recovered = failed.length > 0
     && io.laterRuns(db, threadId, maxOrdinal).some((r) => r.status === 'running' || r.status === 'completed');
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held);
-  const staleHeld = queued.filter((r) => toMs(r.requested_at) < incident.startMs - STALE_HELD_MS);
+  const staleHeld = queued.filter((r) => toMs(r.requested_at) < incident.startMs - STALE_HELD_MS
+    && r.user_message_id?.startsWith(`ardud-control:send:${threadId}:coord%3A`)
+    && /^\[coord[\] ]/.test(io.messageText(db, r.user_message_id) ?? ''));
   const held = queued.filter((r) => !staleHeld.includes(r))
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
 
@@ -71,7 +87,7 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
     return { thread, plan, failed, recovered, held, staleHeld, lost: [], reply: null, orphans: [], forms: [] };
   }
 
-  const ses = thread.nativeSessionId || null;
+  const ses = openCodeSession(thread);
   let session = null;
   let lost = [];
   let reply = null;
@@ -140,10 +156,10 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
     failedRuns: failed.map((r) => ({ completedAt: r.completed_at })),
     recovered, session, lost, reply, orphans, forms, held,
   });
-  return { thread, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
+  return { thread, sourceRuns, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
 }
 
-async function act({ db, incident, g, dryRun }) {
+export async function act({ db, incident, g, dryRun }, io = realIo) {
   const { plan } = g;
   const res = { plan, ok: true, queueOk: null, lost: g.lost, reply: g.reply, forms: g.forms, error: null };
   if (plan.action === 'skip' || plan.action === 'report') {
@@ -151,13 +167,25 @@ async function act({ db, incident, g, dryRun }) {
   }
   if (dryRun) return res;
   try {
+    if (await recoveryOwned(io, plan.threadId, g.sourceRuns)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'harness cutover owns continuation' };
+      return res;
+    }
     io.assertReplicaFresh(db);
     const fresh = await io.getThread(plan.threadId);
-    if (!fresh || fresh.archived || fresh.latestRunId !== g.thread.latestRunId
+    if (!fresh || openCodeSession(fresh) !== openCodeSession(g.thread)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'provider changed during recovery' };
+      return res;
+    }
+    if (fresh.archived || fresh.latestRunId !== g.thread.latestRunId
       || fresh.nativeSessionId !== g.thread.nativeSessionId || fresh.pendingRequest) {
       throw new Error('thread changed during recovery; retry next scan');
     }
     io.assertThreadInReplica(db, fresh);
+    if (await recoveryOwned(io, plan.threadId, g.sourceRuns)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'harness cutover owns continuation' };
+      return res;
+    }
     if (plan.resumeQueue || g.staleHeld.length) {
       for (const r of g.staleHeld) {
         io.assertReplicaFresh(db);
@@ -326,7 +354,7 @@ function status() {
 const HELP = `usage: stream-recovery scan [--dry-run] [--since ISO] [--max-age-hours N] [--seed] [--json] [--verbose]
        stream-recovery status`;
 
-try {
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) try {
   const opts = parseArgs(process.argv.slice(2));
   logToStderr = opts.json;
   if (opts.cmd === 'scan') await scan(opts);

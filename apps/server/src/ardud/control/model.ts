@@ -17,6 +17,7 @@ import * as DateTime from "effect/DateTime";
 
 import {
   mergeSelection,
+  postCutoverSelectionProblem,
   resolveSelection,
   selectionEffort,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
@@ -120,7 +121,7 @@ export function formatModel(selection: ModelSelection) {
 }
 
 /**
- * Off and dry-run keep the old variant behavior. Apply canonicalizes both sides
+ * Off and dry-run keep the old variant behavior until cutover. Apply canonicalizes both sides
  * before merging so an explicit canonical model inherits only its own options.
  */
 export function modelSelectionFrom(input: {
@@ -172,13 +173,30 @@ export function modelSelectionFrom(input: {
     };
   }
 
+  if (
+    input.settings?.ardudHarnessMigration?.cutoverComplete === true &&
+    (input.instanceId === "opencode" ||
+      (input.instanceId === undefined && input.model?.includes("/")))
+  ) {
+    const requested = input.model ?? input.base.model;
+    const reason = postCutoverSelectionProblem({
+      instanceId: "opencode",
+      model: requested,
+    } as ModelSelection);
+    if (reason !== null) return { kind: "conflict", reason };
+  }
+
   // Resolve the identity before the options: an explicit replacement or a
   // different target must be able to repair obsolete stored options.
   const identityBase = resolveSelection({ ...input.base, options: [] });
-  if (identityBase.kind === "conflict") return identityBase;
+  if (identityBase.kind === "conflict" && input.model === undefined) return identityBase;
   const inferredInstance =
     input.instanceId ??
-    (input.model?.includes("/") ? "opencode" : identityBase.selection.instanceId);
+    (input.model?.includes("/")
+      ? "opencode"
+      : identityBase.kind === "conflict"
+        ? input.base.instanceId
+        : identityBase.selection.instanceId);
   const target =
     input.model === undefined && input.instanceId === undefined
       ? identityBase
@@ -188,10 +206,13 @@ export function modelSelectionFrom(input: {
             input.model ??
             (input.instanceId === input.base.instanceId
               ? input.base.model
-              : identityBase.selection.model),
+              : identityBase.kind === "conflict"
+                ? input.base.model
+                : identityBase.selection.model),
         } as ModelSelection);
   if (target.kind === "conflict") return target;
   const sameTarget =
+    identityBase.kind !== "conflict" &&
     target.selection.instanceId === identityBase.selection.instanceId &&
     target.selection.model === identityBase.selection.model;
   const inherit = input.options === undefined && sameTarget;
@@ -209,7 +230,7 @@ export function modelSelectionFrom(input: {
             (option) => !["variant", "effort", "reasoningEffort"].includes(option.id),
           ),
         }
-    : { ...input.base, options: [] };
+    : { ...target.selection, options: [] };
   const foldedBase = mergeSelection(baseToMerge, {});
   if (foldedBase.kind === "conflict") return foldedBase;
   const routedBase = resolveSelection(foldedBase.selection);
@@ -246,7 +267,9 @@ export function modelSelectionFrom(input: {
 
 export const selectionMigrationApplies = (
   settings: Pick<ServerSettings, "ardudHarnessMigration"> | undefined,
-) => settings?.ardudHarnessMigration?.selections === "apply";
+) =>
+  settings?.ardudHarnessMigration?.selections === "apply" ||
+  settings?.ardudHarnessMigration?.cutoverComplete === true;
 
 /** Fail closed when a selected option cannot be checked against the current catalog. */
 export function selectionProblem(

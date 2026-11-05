@@ -777,6 +777,7 @@ const migrationMessage = (
 // actual flag, receipt store, resolver and management dispatch remain real.
 const migrationHarness = (input: {
   readonly mode?: "off" | "dryrun" | "apply";
+  readonly cutoverComplete?: boolean;
   readonly threadIds?: ReadonlyArray<ThreadId>;
   readonly allowConflicts?: boolean;
   readonly stored?: ModelSelection;
@@ -852,11 +853,16 @@ const migrationHarness = (input: {
     ),
     Layer.provide(
       ServerSettings.layerTest({
-        ...(input.mode === undefined && input.threadIds === undefined
+        ...(input.mode === undefined &&
+        input.threadIds === undefined &&
+        input.cutoverComplete === undefined
           ? {}
           : {
               ardudHarnessMigration: {
                 ...(input.mode === undefined ? {} : { selections: input.mode }),
+                ...(input.cutoverComplete === undefined
+                  ? {}
+                  : { cutoverComplete: input.cutoverComplete }),
                 ...(input.threadIds === undefined ? {} : { threadIds: input.threadIds }),
                 ...(input.allowConflicts === undefined
                   ? {}
@@ -896,6 +902,28 @@ it.effect("migrates a dormant stored selection once before multiple inherited se
     expect(harness.getStored()).toEqual(mappedSelection);
   }).pipe(Effect.provide(harness.layerTest));
 });
+
+it.effect.each(["apply", "off"] as const)(
+  "rejects explicit legacy sends before canonicalization after cutover with migration %s",
+  (mode) => {
+    const harness = migrationHarness({ mode, cutoverComplete: true, stored: mappedSelection });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(
+        threads.dispatch(migrationMessage(`legacy-${mode}`, legacySelection)),
+      );
+      expect(error._tag).toBe("OrchestratorCommandRejectedError");
+      expect(harness.calls).toEqual([]);
+      yield* threads.dispatch(migrationMessage(`native-${mode}`, mappedSelection));
+      yield* threads.dispatch(migrationMessage(`inherited-${mode}`));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "message.dispatch",
+        "message.dispatch",
+      ]);
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
 
 it.effect("routes only allowlisted threads while global selection routing stays off", () => {
   const harness = migrationHarness({ mode: "off", threadIds: [migrationThreadId] });
@@ -1135,8 +1163,12 @@ it.effect("does not repeat a successful selection update if the send fails and i
 it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
   "leaves %s receipt replay and conflicts to the orchestrator without migrating",
   (kind) => {
-    const harness = migrationHarness({ mode: "apply", targetEnabled: false });
-    const message = migrationMessage(`receipt-${kind}`);
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      targetEnabled: false,
+    });
+    const message = migrationMessage(`receipt-${kind}`, legacySelection);
     return Effect.gen(function* () {
       const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
       yield* receipts.insertIfAbsent({

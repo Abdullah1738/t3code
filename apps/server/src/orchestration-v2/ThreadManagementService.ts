@@ -2,6 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   mergeSelection,
+  postCutoverSelectionProblem,
   resolveSelection,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import type {
@@ -704,6 +705,7 @@ const make = Effect.gen(function* () {
     "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
   )(function* (
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
+    options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
   ) {
     yield* ensureCommandTranscripts(command);
 
@@ -726,6 +728,18 @@ const make = Effect.gen(function* () {
     if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
     const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
     if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    if (options.cutoverComplete && command.modelSelection !== undefined) {
+      const reason = postCutoverSelectionProblem(command.modelSelection);
+      if (reason !== null) {
+        return yield* new Orchestrator.OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: reason,
+        });
+      }
+    }
+    if (!options.migrate) return yield* dispatchUnchanged(command);
 
     const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
     const stored = projection.thread.modelSelection;
@@ -853,16 +867,17 @@ const make = Effect.gen(function* () {
     return serverSettings.getSettings.pipe(
       Effect.orDie,
       Effect.flatMap((settings) => {
-        if (
-          settings.ardudHarnessMigration?.selections !== "apply" &&
-          !settings.ardudHarnessMigration?.threadIds?.includes(command.threadId)
-        ) {
+        const migrate =
+          settings.ardudHarnessMigration?.selections === "apply" ||
+          settings.ardudHarnessMigration?.threadIds?.includes(command.threadId) === true;
+        const cutoverComplete = settings.ardudHarnessMigration?.cutoverComplete === true;
+        if (!migrate && !cutoverComplete) {
           return dispatchUnchanged(command);
         }
         return selectionDispatchLock.withLock(
           command.threadId,
           command.type === "message.dispatch"
-            ? dispatchWithSelectionMigration(command)
+            ? dispatchWithSelectionMigration(command, { migrate, cutoverComplete })
             : dispatchUnchanged(command),
         );
       }),

@@ -24,4 +24,15 @@ describe("compact harness switch settings", () => {
   it.each([0, -1, 1.5, 33])("refuses an unbounded/invalid lastTurns %s", (lastTurns) => {
     expect(() => decode({ transcript: { enabled: true, lastTurns } })).toThrow();
   });
+
+  it.each([true, false])("accepts an explicit cutoverComplete %s", (cutoverComplete) => {
+    expect(decode({ cutoverComplete })).toEqual({ cutoverComplete });
+  });
+
+  it.each(["true", "false", 1, null])(
+    "rejects non-boolean cutoverComplete %s",
+    (cutoverComplete) => {
+      expect(() => decode({ cutoverComplete })).toThrow();
+    },
+  );
 });

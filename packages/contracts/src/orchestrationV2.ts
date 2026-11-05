@@ -1022,6 +1022,8 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
+  /** Native acknowledgement of this prompt, not a local start or queue offer. */
+  promptAcceptedAt: Schema.optional(Schema.DateTimeUtc),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
   /** The provider's native finish reason (e.g. Claude stop_reason); null when not reported. */
   finish: Schema.optional(Schema.NullOr(Schema.String)).pipe(
@@ -2167,6 +2169,7 @@ export const OrchestrationV2ProviderTurnJson = OrchestrationV2ProviderTurn.mapFi
   ...fields,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  promptAcceptedAt: Schema.optional(Schema.DateTimeUtcFromString),
 }));
 export type OrchestrationV2ProviderTurnJson = typeof OrchestrationV2ProviderTurnJson.Type;
 
@@ -3155,6 +3158,11 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("queue.cutover-release"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
   // ardud: the harness migration (SelectionMigration) rebinds a queued run's
   // stored selection. Only that path may change a queued run's model, so the
   // command is server-only. The run keeps its order, attachments and hold.

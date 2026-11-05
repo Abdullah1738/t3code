@@ -9,6 +9,7 @@ const MIN = 60_000;
 const SES = 'ses_g';
 const STALL_ID = `st-${SES}-20261029T193739Z`;
 const ghostThread = (over = {}) => ({
+  model: { instanceId: 'opencode' },
   threadId: 'thread:433', title: '#433 External PR', state: 'running', activeRunId: 'run:8',
   nativeSessionId: SES, pendingRequest: null, archived: false, origin: null, ...over,
 });
@@ -19,6 +20,7 @@ function fakeIo({ threads = [ghostThread()], active = [], tails = { [SES]: idleT
   const calls = { interruptThread: [], sendToThread: [], telegram: [], unexpected: [] };
   const byId = () => getThreads ?? Object.fromEntries(liveThreads.map((t) => [t.threadId, t]));
   const io = {
+    harnessCutoverStatus: async () => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [] }),
     activeSessions: async () => new Set(active),
     ocTail: async (ses) => tails[ses] ?? null,
     activeThreads: async () => {
@@ -65,6 +67,33 @@ test('ghostCandidates keeps only a running ses_ thread with no pending request, 
   ];
   const got = ghostCandidates(threads, new Set(['ses_busy'])).map((t) => t.threadId);
   assert.deepEqual(got, ['thread:433']);
+});
+
+test('native threads and stale OpenCode aliases never become ghost candidates or receive old stall notes', async () => {
+  for (const instanceId of ['claudeAgent', 'codex', 'codex-cu']) {
+    const native = ghostThread({ model: { instanceId } });
+    const fake = fakeIo({ threads: [native] });
+    const state = freshState();
+    state.ghosts[native.threadId] = { ses: SES, runId: 'run:8', since: T0 - 60 * MIN };
+    state.stalls[STALL_ID] = { ses: SES, threadId: native.threadId, runId: 'run:old', interruptedAt: T0 - MIN,
+      errors: [], note: true, fp: null, quietMs: 60 * MIN, quietSince: T0 - 60 * MIN, title: 'Old stall', label: 'waiting', action: 'robob' };
+    await stallScan({ state, now: T0 + 60 * MIN, log: () => {} }, fake.io);
+    assert.deepEqual(state.ghosts, {});
+    assert.deepEqual(fake.calls.interruptThread, []);
+    assert.deepEqual(fake.calls.sendToThread, []);
+  }
+});
+
+test('cutover-owned OpenCode ghosts and interrupted stalls do not interrupt, fall back or resume', async () => {
+  const fake = fakeIo();
+  fake.io.harnessCutoverStatus = async () => ({ active: true, completed: false, claimedThreadIds: ['thread:433'] });
+  const state = freshState();
+  state.stalls[STALL_ID] = { ses: SES, threadId: 'thread:433', runId: 'run:8', interruptedAt: T0 - MIN, note: true };
+  await stallScan({ state, now: T0, log: () => {} }, fake.io);
+  await stallScan({ state, now: T0 + 60 * MIN, log: () => {} }, fake.io);
+  assert.deepEqual(fake.calls.interruptThread, []);
+  assert.deepEqual(fake.calls.sendToThread, []);
+  assert.deepEqual(fake.calls.unexpected, []);
 });
 
 test('observeGhosts keeps since for the same run, resets it on a new run, drops threads no longer listed', () => {
@@ -270,6 +299,7 @@ test('a run that starts OpenCode-active during the tail read is not interrupted'
   let liveThreads = [ghostThread()];
   const calls = { interruptThread: [], unexpected: [] };
   const io = {
+    harnessCutoverStatus: async () => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [] }),
     activeSessions: async () => new Set(activeSet),
     ocTail: async (ses) => {
       // Run 9 begins and OpenCode picks the session up while the tail is being read.
