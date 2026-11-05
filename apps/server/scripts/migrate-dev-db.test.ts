@@ -88,6 +88,82 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
 });
 
 it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
+  it.effect.each(["zero-byte", "no tables"] as const)(
+    "rejects a %s source without replacing the destination",
+    (kind) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-empty-" });
+        const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-empty-dest-" });
+        const source = path.join(sourceDir, "statev2.sqlite");
+        if (kind === "zero-byte") {
+          yield* fs.writeFileString(source, "");
+        } else {
+          yield* withDatabase(
+            source,
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`PRAGMA user_version = 1`;
+            }),
+          );
+          assert.isAbove(Number((yield* fs.stat(source)).size), 0);
+        }
+        const databasePath = yield* createFixtureSource(destDir);
+        const destinationBefore = yield* fs.readFile(databasePath);
+
+        const error = yield* runMigrateDevDb(
+          { baseDir: destDir, source, projects: 5, threadsPerProject: 10 },
+          { sharedHome: sourceDir },
+        ).pipe(Effect.flip);
+
+        assert.equal(error._tag, "MigrateDevDbSourceEmptyError");
+        if (error._tag === "MigrateDevDbSourceEmptyError") {
+          assert.equal(error.sourcePath, source);
+          assert.equal(
+            error.message,
+            `Source database '${source}' is empty (no tables). Pass --source <path to a real statev2.sqlite>, or skip migrate-dev-db and let the dev server create a fresh database in the worktree .t3.`,
+          );
+        }
+        assert.deepStrictEqual(yield* fs.readFile(databasePath), destinationBefore);
+      }),
+  );
+
+  it.effect("copies a source without AUTOINCREMENT tables", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-no-seq-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-no-seq-dest-" });
+      const source = path.join(sourceDir, "statev2.sqlite");
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TABLE example (id INTEGER PRIMARY KEY, value TEXT NOT NULL)`;
+          yield* sql`INSERT INTO example VALUES (1, 'copied')`;
+          const sequenceTables = yield* sql`
+            SELECT name FROM sqlite_master WHERE name = 'sqlite_sequence'`;
+          assert.equal(sequenceTables.length, 0);
+        }),
+      );
+
+      const result = yield* runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 10 },
+        { sharedHome: sourceDir },
+      );
+
+      const copied = yield* withDatabase(
+        result.databasePath,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          return yield* sql<{ id: number; value: string }>`SELECT id, value FROM example`;
+        }),
+      );
+      assert.deepStrictEqual(copied, [{ id: 1, value: "copied" }]);
+    }),
+  );
+
   it.effect("keeps stopped thread families from live projects and clears pending work", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
