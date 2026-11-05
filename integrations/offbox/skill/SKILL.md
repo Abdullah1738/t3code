@@ -79,6 +79,8 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 
 ## Your box (lease)
 
+A new worktree’s first run on a box can take minutes; it is seeded from a sibling when available. For long first syncs, use `--bg` and `offbox wait` instead of a short shell timeout.
+
 - Up to **four pooled boxes per repository key** (default raised from 2 on 2026-10-17 for the PR factory ramp), shared by threads and worktrees. An idle running box is preferred,
   then an existing stopped box; legacy boxes are adopted without deleting their disks. Each box runs one command
   at a time, including sync and artifact pulls. Background runs reserve their slot until completion. Checkout
