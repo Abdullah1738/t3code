@@ -40,7 +40,9 @@ function fixture(batchSize = 2) {
     INSERT INTO orchestration_v2_projection_threads VALUES ('c','{}');
     INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,type,payload_json) VALUES ('tool','command_execution','{"text":"large tool output"}');
     INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,type,payload_json) VALUES ('stop','run_interrupt_request','{}');`);
-  cleanups.push(() => source.close());
+  cleanups.push(() => {
+    if (source.isOpen) source.close();
+  });
   const options = { sourcePath, replicaPath, batchSize };
   let exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
   cleanups.push(() => exporter.close());
@@ -330,6 +332,184 @@ test("dirty item target paging uses its own index without a temporary sort", () 
   expect(plan.map((row) => row.detail).join("\n")).not.toContain("TEMP");
 });
 
+test("catchup merges main then delta then immutable original-table base in bounded pages", () => {
+  const f = fixture(1);
+  f.finish();
+  f.exporter.close();
+  const dir = NodePath.dirname(f.options.sourcePath);
+  const baseName = "statev2.pre-shrink-fixture.sqlite";
+  const base = new NodeSqlite.DatabaseSync(NodePath.join(dir, baseName));
+  cleanups.push(() => base.close());
+  base.exec(`CREATE TABLE orchestration_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_turn_items(turn_item_id TEXT PRIMARY KEY,type TEXT,payload_json TEXT);
+    INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{"base":2}');
+    INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{"base":3}');
+    INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{"base":4}');
+    INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{"base":5}');
+    INSERT INTO orchestration_v2_projection_turn_items VALUES ('cold-only','user_message','{"cold":true}');`);
+  const archivePath = NodePath.join(dir, "archive.sqlite");
+  const delta = new NodeSqlite.DatabaseSync(archivePath);
+  cleanups.push(() => delta.close());
+  delta.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE ardud_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_identity VALUES ('test');
+    CREATE TABLE ardud_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT);
+    INSERT INTO ardud_events VALUES (3,'thread.metadata-updated','a','{"delta":3}');
+    INSERT INTO ardud_events VALUES (4,'thread.metadata-updated','a','{"delta":4}');`);
+  f.source.exec(`CREATE TABLE ardud_history_base_archive(filename TEXT);
+    INSERT INTO ardud_history_base_archive VALUES ('${baseName}');
+    CREATE TABLE ardud_history_archive_identity(identity TEXT PRIMARY KEY);
+    INSERT INTO ardud_history_archive_identity VALUES ('test');
+    INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{"main":4}');`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+    ...f.options,
+    archivePath,
+  });
+  cleanups.push(() => exporter.close());
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw Error("base catchup did not converge");
+  }
+  const out = f.connect();
+  expect(
+    out
+      .prepare(
+        "SELECT sequence,payload_json FROM orchestration_events WHERE sequence BETWEEN 2 AND 5 ORDER BY sequence",
+      )
+      .all(),
+  ).toEqual([
+    { sequence: 2, payload_json: '{"base":2}' },
+    { sequence: 3, payload_json: '{"delta":3}' },
+    { sequence: 4, payload_json: '{"main":4}' },
+    { sequence: 5, payload_json: '{"base":5}' },
+  ]);
+  expect(
+    out
+      .prepare(
+        "SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id='cold-only'",
+      )
+      .get(),
+  ).toBeUndefined();
+});
+
+test("immutable base is optional, but a missing or unsafe referenced base fails closed", () => {
+  const f = fixture();
+  f.finish();
+  f.exporter.close();
+  f.source.exec(
+    "CREATE TABLE ardud_history_base_archive(filename TEXT); INSERT INTO ardud_history_base_archive VALUES ('statev2.pre-shrink-missing.sqlite')",
+  );
+  expect(() => createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options)).toThrow(
+    "base unavailable",
+  );
+  f.source.exec(
+    "UPDATE ardud_history_base_archive SET filename='../statev2.pre-shrink-outside.sqlite'",
+  );
+  expect(() => createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options)).toThrow(
+    "base filename",
+  );
+});
+
+test("base appearance invalidates an in-flight export rather than omitting its events", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(
+    "CREATE TABLE ardud_history_base_archive(filename TEXT); INSERT INTO ardud_history_base_archive VALUES ('statev2.pre-shrink-new.sqlite')",
+  );
+  expect(() => f.exporter.step()).toThrow("History base changed");
+  expect(
+    f.connect().prepare("SELECT value FROM ardud_readonly_meta WHERE key='ready'").get()?.value,
+  ).toBe("0");
+});
+
+test("first bootstrap uses live projections and skips replaying immutable base history", () => {
+  const f = fixture();
+  f.exporter.close();
+  NodeFS.rmSync(f.options.replicaPath);
+  const baseName = "statev2.pre-shrink-bootstrap.sqlite";
+  const base = new NodeSqlite.DatabaseSync(
+    NodePath.join(NodePath.dirname(f.options.sourcePath), baseName),
+  );
+  base.exec(`CREATE TABLE orchestration_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT);
+    INSERT INTO orchestration_events VALUES (50,'thread.metadata-updated','a','{"base":true}');
+    CREATE TABLE orchestration_v2_projection_turn_items(turn_item_id TEXT PRIMARY KEY,type TEXT,payload_json TEXT);
+    INSERT INTO orchestration_v2_projection_turn_items VALUES ('cold-only','user_message','{}');`);
+  base.close();
+  f.source.exec(`CREATE TABLE ardud_history_base_archive(filename TEXT);
+    INSERT INTO ardud_history_base_archive VALUES ('${baseName}');`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
+  cleanups.push(() => exporter.close());
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw Error("base bootstrap did not converge");
+  }
+  const out = f.connect();
+  expect(
+    out.prepare("SELECT value FROM ardud_readonly_meta WHERE key='sequence'").get()?.value,
+  ).toBe("50");
+  expect(
+    out.prepare("SELECT event_type FROM orchestration_events WHERE sequence=50").get()?.event_type,
+  ).toBe("readonly.watermark");
+  expect(
+    out.prepare("SELECT turn_item_id FROM orchestration_v2_projection_turn_items").all(),
+  ).toEqual([{ turn_item_id: "stop" }]);
+});
+
+test.each(["base", "delta"])(
+  "a newer %s event fences live items against an older deletion journal",
+  (location) => {
+    const f = fixture();
+    f.exporter.close();
+    NodeFS.rmSync(f.options.replicaPath);
+    f.source.exec(`DELETE FROM orchestration_events;
+    CREATE TABLE ardud_history_archive_deletions(sequence INTEGER PRIMARY KEY,table_name TEXT,row_key TEXT,through_event_sequence INTEGER,archived_at TEXT);
+    INSERT INTO ardud_history_archive_deletions VALUES (1,'orchestration_v2_projection_turn_items','stop',1,'now');`);
+    const dir = NodePath.dirname(f.options.sourcePath);
+    let archivePath: string | undefined;
+    if (location === "base") {
+      const filename = "statev2.pre-shrink-fence.sqlite";
+      const base = new NodeSqlite.DatabaseSync(NodePath.join(dir, filename));
+      base.exec(`CREATE TABLE orchestration_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT,application_event_version INTEGER,aggregate_kind TEXT);
+      CREATE INDEX thread_events ON orchestration_events(stream_id,sequence);
+      INSERT INTO orchestration_events VALUES (2,'turn-item.updated','a','{}',2,'thread');`);
+      base.close();
+      f.source.exec(
+        `CREATE TABLE ardud_history_base_archive(filename TEXT); INSERT INTO ardud_history_base_archive VALUES ('${filename}')`,
+      );
+    } else {
+      archivePath = NodePath.join(dir, "archive.sqlite");
+      const delta = new NodeSqlite.DatabaseSync(archivePath);
+      delta.exec(`PRAGMA journal_mode=WAL;
+      CREATE TABLE ardud_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_identity VALUES ('test');
+      CREATE TABLE ardud_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT,application_event_version INTEGER,aggregate_kind TEXT);
+      CREATE INDEX thread_events ON ardud_events(stream_id,sequence);
+      INSERT INTO ardud_events VALUES (2,'turn-item.updated','a','{}',2,'thread');`);
+      delta.close();
+      f.source.exec(
+        "CREATE TABLE ardud_history_archive_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_history_archive_identity VALUES ('test')",
+      );
+    }
+    const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...f.options,
+      ...(archivePath ? { archivePath } : {}),
+    });
+    cleanups.push(() => exporter.close());
+    for (let i = 0; exporter.step(); i++) {
+      if (i > 500) throw Error("archived item fence did not converge");
+    }
+    const out = f.connect();
+    expect(
+      out.prepare("SELECT turn_item_id FROM orchestration_v2_projection_turn_items").all(),
+    ).toEqual([{ turn_item_id: "stop" }]);
+    expect(
+      out.prepare("SELECT sequence FROM ardud_readonly_item_fences WHERE item_id='stop'").get()
+        ?.sequence,
+    ).toBe(2);
+    expect(
+      out
+        .prepare("SELECT value FROM ardud_readonly_meta WHERE key='archive_deletion_sequence'")
+        .get()?.value,
+    ).toBe("1");
+  },
+);
+
 test("incomplete boards export legacy data then reopens at completed split", () => {
   const f = fixture();
   f.exporter.close();
@@ -349,6 +529,24 @@ test("incomplete boards export legacy data then reopens at completed split", () 
   expect(
     f.connect().prepare("SELECT value FROM ardud_readonly_meta WHERE key='ready'").get()?.value,
   ).toBe("0");
+});
+
+test("replacing main requires discarding the old replica before rebootstrap", () => {
+  const f = fixture();
+  f.finish();
+  f.exporter.close();
+  const oldPath = NodePath.join(NodePath.dirname(f.options.sourcePath), "old-main.sqlite");
+  f.source.close();
+  // Keep the original inode allocated so this models the preserved offline base.
+  NodeFS.renameSync(f.options.sourcePath, oldPath);
+  const replacement = new NodeSqlite.DatabaseSync(f.options.sourcePath);
+  replacement.exec(
+    "PRAGMA journal_mode=WAL; CREATE TABLE orchestration_events(sequence INTEGER PRIMARY KEY)",
+  );
+  replacement.close();
+  expect(() => createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options)).toThrow(
+    "source changed",
+  );
 });
 
 test("slow catchup cannot make old auxiliary rows look fresh", () => {

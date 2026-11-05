@@ -50,15 +50,48 @@ export function createReadonlyReplica(
   const source = new sqlite.DatabaseSync(options.sourcePath, { readOnly: true });
   let boards: NodeSqlite.DatabaseSync | undefined;
   let archive: NodeSqlite.DatabaseSync | undefined;
+  let baseArchive: NodeSqlite.DatabaseSync | undefined;
   let boardsReady = false;
   let target: NodeSqlite.DatabaseSync | undefined;
   try {
-    const setupReader = (db: NodeSqlite.DatabaseSync) => {
-      db.exec("PRAGMA busy_timeout=0; PRAGMA cache_size=-8192;");
-      if (db.prepare("PRAGMA journal_mode").get()?.journal_mode !== "wal")
+    const setupReader = (db: NodeSqlite.DatabaseSync, requireWal = true) => {
+      db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=0; PRAGMA cache_size=-8192;");
+      if (requireWal && db.prepare("PRAGMA journal_mode").get()?.journal_mode !== "wal")
         throw new Error("Readonly export requires a WAL source");
     };
     setupReader(source);
+    const baseFilename = () => {
+      if (
+        !source.prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_base_archive'").get()
+      )
+        return undefined;
+      const rows = source.prepare("SELECT filename FROM ardud_history_base_archive LIMIT 2").all();
+      if (rows.length === 0) return undefined;
+      const filename = rows[0]!.filename;
+      if (
+        rows.length !== 1 ||
+        typeof filename !== "string" ||
+        !/^statev2\.pre-shrink-[^/\\]+\.sqlite$/.test(filename) ||
+        path.basename(filename) !== filename
+      )
+        throw new Error("Invalid readonly history base filename");
+      return filename;
+    };
+    const baseName = baseFilename();
+    const basePath = baseName ? path.join(path.dirname(options.sourcePath), baseName) : undefined;
+    if (basePath) {
+      if (!fs.existsSync(basePath)) throw new Error("Readonly history base unavailable");
+      baseArchive = new sqlite.DatabaseSync(basePath, { readOnly: true });
+      // The offline installer checkpoints the original before preserving it;
+      // this immutable base need not retain WAL journal mode or sidecars.
+      setupReader(baseArchive, false);
+      if (
+        !baseArchive
+          .prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='orchestration_events'")
+          .get()
+      )
+        throw new Error("Readonly history base events unavailable");
+    }
     if (options.archivePath && fs.existsSync(options.archivePath)) {
       archive = new sqlite.DatabaseSync(options.archivePath, { readOnly: true });
       setupReader(archive);
@@ -81,9 +114,12 @@ export function createReadonlyReplica(
       }
     }
     fs.mkdirSync(path.dirname(options.replicaPath), { recursive: true, mode: 0o700 });
-    for (const candidate of [options.sourcePath, options.boardPath, options.archivePath].filter(
-      (p): p is string => Boolean(p),
-    )) {
+    for (const candidate of [
+      options.sourcePath,
+      options.boardPath,
+      options.archivePath,
+      basePath,
+    ].filter((p): p is string => Boolean(p))) {
       if (!fs.existsSync(options.replicaPath) || !fs.existsSync(candidate)) continue;
       const a = fs.statSync(candidate),
         b = fs.statSync(options.replicaPath);
@@ -122,7 +158,13 @@ export function createReadonlyReplica(
       return n;
     };
     const sequence = () =>
-      Number(source.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n ?? 0);
+      Math.max(
+        Number(source.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n ?? 0),
+        Number(archive?.prepare("SELECT max(sequence) AS n FROM ardud_events").get()?.n ?? 0),
+        Number(
+          baseArchive?.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n ?? 0,
+        ),
+      );
     const checkpoint = (name: string, value: object) =>
       out
         .prepare(
@@ -155,7 +197,8 @@ export function createReadonlyReplica(
         throw error;
       }
     };
-    const identity = `${fs.realpathSync(options.sourcePath)}:${fs.statSync(options.sourcePath).ino}`;
+    const sourceStat = fs.statSync(options.sourcePath);
+    const identity = `${fs.realpathSync(options.sourcePath)}:${sourceStat.dev}:${sourceStat.ino}`;
     if (getMeta("source") && getMeta("source") !== identity)
       throw new Error("Readonly source changed; rebuild exported replica");
     if (!getMeta("sequence"))
@@ -192,18 +235,22 @@ export function createReadonlyReplica(
         WHEN event_type='run.background-work-cancelled' THEN json_extract(payload_json,'$.runId') END AS entity_id
       FROM ${q(table)} WHERE sequence>? AND sequence<=? ORDER BY sequence LIMIT ?`)
         .all(cursor, through, batchSize);
-    const versionedEvents = source
-      .prepare("PRAGMA table_info(orchestration_events)")
-      .all()
-      .some((row) => row.name === "application_event_version");
-    const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
-      Number(
-        source
-          .prepare(
-            `SELECT max(sequence) AS n FROM orchestration_events WHERE stream_id=? ${versionedEvents ? "AND application_event_version=2 AND aggregate_kind='thread'" : ""}`,
-          )
-          .get(threadId)?.n ?? 0,
+    const threadEventSources = [
+      { db: source, table: "orchestration_events" },
+      ...(archive ? [{ db: archive, table: "ardud_events" }] : []),
+      ...(baseArchive ? [{ db: baseArchive, table: "orchestration_events" }] : []),
+    ].map(({ db, table }) => {
+      const versioned = db
+        .prepare(`PRAGMA table_info(${q(table)})`)
+        .all()
+        .some((row) => row.name === "application_event_version");
+      return db.prepare(
+        `SELECT max(sequence) AS n FROM ${q(table)} WHERE stream_id=? ${versioned ? "AND application_event_version=2 AND aggregate_kind='thread'" : ""}`,
       );
+    });
+    const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
+      // Journal fences must include events already moved out of main, too.
+      Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
     for (const name of [...projections, ...auxiliary]) {
       const db =
         boards &&
@@ -366,6 +413,8 @@ export function createReadonlyReplica(
           meta("ready", "0");
           cycleStarted = true;
         }
+        if (baseFilename() !== baseName)
+          throw new Error("History base changed; reopen readonly sources");
         if (options.archivePath && !archive && fs.existsSync(options.archivePath))
           throw new Error("History archive appeared; reopen readonly sources");
         if (
@@ -455,22 +504,37 @@ export function createReadonlyReplica(
         if (cursor < cycleTarget) {
           source.exec("BEGIN");
           let archiveTransaction = false;
+          let baseTransaction = false;
           try {
             // Pin main first: if it sees a deletion, the copy-first archive
             // commit is already visible to the later archive snapshot.
             sequence();
             const liveRows = eventPage(source, "orchestration_events", cursor, cycleTarget);
-            let rows = liveRows;
+            const merged = new Map<number, Record<string, NodeSqlite.SQLOutputValue>>();
             if (archive) {
               archive.exec("BEGIN");
               archiveTransaction = true;
               const coldRows = eventPage(archive, "ardud_events", cursor, cycleTarget);
-              const merged = new Map(coldRows.map((row) => [Number(row.sequence), row]));
-              for (const row of liveRows) merged.set(Number(row.sequence), row);
-              rows = [...merged.values()]
-                .sort((a, b) => Number(a.sequence) - Number(b.sequence))
-                .slice(0, batchSize);
+              for (const row of coldRows) merged.set(Number(row.sequence), row);
             }
+            if (baseArchive) {
+              baseArchive.exec("BEGIN");
+              baseTransaction = true;
+              for (const row of eventPage(
+                baseArchive,
+                "orchestration_events",
+                cursor,
+                cycleTarget,
+              )) {
+                if (!merged.has(Number(row.sequence))) merged.set(Number(row.sequence), row);
+              }
+            }
+            // Immutable base events never change; delta shadows base and main
+            // shadows both. No cold mutable projection values are exported.
+            for (const row of liveRows) merged.set(Number(row.sequence), row);
+            const rows = [...merged.values()]
+              .sort((a, b) => Number(a.sequence) - Number(b.sequence))
+              .slice(0, batchSize);
             // Compaction may have removed changes while bootstrap was in flight.
             // Revisit the paged projections at a fresh watermark, failing closed.
             if (
@@ -522,6 +586,7 @@ export function createReadonlyReplica(
               meta("sequence", String(rows.at(-1)!.sequence));
             });
           } finally {
+            if (baseTransaction) baseArchive!.exec("ROLLBACK");
             if (archiveTransaction) archive!.exec("ROLLBACK");
             source.exec("ROLLBACK");
           }
@@ -721,6 +786,7 @@ export function createReadonlyReplica(
           out.close();
           boards?.close();
           archive?.close();
+          baseArchive?.close();
           source.close();
         }
       },
@@ -729,6 +795,7 @@ export function createReadonlyReplica(
     target?.close();
     boards?.close();
     archive?.close();
+    baseArchive?.close();
     source.close();
     throw error;
   }
