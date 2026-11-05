@@ -6,7 +6,7 @@ import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { HttpClient } from "effect/http";
+import { HttpClient, HttpClientError } from "effect/http";
 import { AsyncResult, Atom } from "effect/reactivity";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
@@ -39,13 +39,8 @@ function initialConfigOption<E>(
 
 const DEFAULT_SESSION_STATE_TIMEOUT_MS = 6_000;
 
-/**
- * A busy server (a reload fetching every open thread at once) can answer the
- * session read after the timeout. Grants gate every write control and nothing
- * re-reads a failed session, so a single slow read used to leave the client
- * without grants until a remount. Transient failures retry with backoff while
- * the atom is mounted; credential and scope answers do not.
- */
+// Session reads can time out behind reload traffic; write controls need recovery
+// without remounting, but credential rejections must still revoke cached grants.
 const SESSION_STATE_RETRY_SCHEDULE = Schedule.exponential("1 second").pipe(
   Schedule.modifyDelay(({ duration }) =>
     Effect.succeed(Duration.min(duration, Duration.seconds(15))),
@@ -57,11 +52,14 @@ export function isTransientSessionStateError(error: {
   readonly cause?: unknown;
 }): boolean {
   if (error._tag === "RemoteEnvironmentAuthTimeoutError") return true;
-  // A fetch error carrying a session answer is a rejected renewal, not transport.
-  return (
-    error._tag === "RemoteEnvironmentAuthFetchError" &&
-    !(typeof error.cause === "object" && error.cause !== null && "authenticated" in error.cause)
-  );
+  if (error._tag !== "RemoteEnvironmentAuthFetchError") return false;
+  // The HTTP helper also wraps renewal rejections and missing relay services.
+  const cause = error.cause;
+  if (HttpClientError.isHttpClientError(cause)) return cause.reason._tag === "TransportError";
+  if (typeof cause === "object" && cause !== null && "_tag" in cause) {
+    return cause._tag === "ConnectionTransientError";
+  }
+  return cause instanceof Error;
 }
 
 export const fetchEnvironmentSessionState = Effect.fn(
@@ -135,7 +133,6 @@ function makeEnvironmentSessionAtoms<R, E>(
           ),
         ),
       ),
-      { initialValue: Option.none<PreparedConnection>() },
     ),
   );
 
@@ -147,39 +144,84 @@ function makeEnvironmentSessionAtoms<R, E>(
     ).pipe(Atom.withLabel(`environment-prepared-connection:${environmentId}`)),
   );
 
-  const sessionStateAtom = Atom.family((environmentId: EnvironmentId) =>
-    runtime
-      .atom((get) => {
-        const prepared = Option.getOrNull(get(preparedConnectionValueAtom(environmentId)));
-        if (prepared === null) {
-          return Effect.never;
+  const sessionStateAtom = Atom.family((environmentId: EnvironmentId) => {
+    const refreshSignal = Atom.make(() => ({})).pipe(Atom.setIdleTTL(0));
+    const connection = Atom.make((get) => {
+      const prepared = Option.getOrNull(get(preparedConnectionValueAtom(environmentId)));
+      const previous = get.self<{ readonly prepared: PreparedConnection | null }>();
+      return Option.isSome(previous) && previous.value.prepared === prepared
+        ? previous.value
+        : { prepared };
+    }).pipe(Atom.setIdleTTL(0));
+    // Each connection boundary gets its own async state, including A -> None -> A.
+    const request = Atom.family((binding: Atom.Type<typeof connection>) =>
+      runtime
+        .atom((get) => {
+          get(refreshSignal);
+          const prepared = binding.prepared;
+          if (prepared === null) return Effect.never;
+          return Effect.gen(function* () {
+            const signer = yield* Effect.serviceOption(ManagedRelay.ManagedRelayDpopSigner);
+            const remoteAuthorization = yield* Effect.serviceOption(
+              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+            );
+            const client = yield* Effect.serviceOption(HttpClient.HttpClient);
+            if (Option.isNone(client)) return yield* new SessionHttpClientUnavailable();
+            return yield* fetchEnvironmentSessionState({
+              prepared,
+              signer,
+              remoteAuthorization,
+            }).pipe(
+              Effect.retry({
+                while: isTransientSessionStateError,
+                schedule: SESSION_STATE_RETRY_SCHEDULE,
+              }),
+              Effect.provideService(HttpClient.HttpClient, client.value),
+            );
+          });
+        })
+        .pipe(Atom.setIdleTTL(0)),
+    );
+    type SessionResult = Atom.Type<ReturnType<typeof request>>;
+    // Only data is retained while idle, never a subscription or retry fiber.
+    const cached = Atom.make<
+      Option.Option<{
+        readonly prepared: PreparedConnection | null;
+        readonly result: SessionResult;
+      }>
+    >(Option.none()).pipe(Atom.setIdleTTL(5 * 60_000));
+
+    return Atom.readable(
+      (get): SessionResult => {
+        get.mount(cached);
+        // An uninitialized stream is not an explicit disconnect. Do not erase
+        // cached data until the supervisor has answered on a remount.
+        const preparedState = get(preparedConnectionAtom(environmentId));
+        if (preparedState._tag !== "Success") {
+          if (preparedState._tag === "Failure") get.set(cached, Option.none());
+          return AsyncResult.initial();
         }
-        return Effect.gen(function* () {
-          const signer = yield* Effect.serviceOption(ManagedRelay.ManagedRelayDpopSigner);
-          const remoteAuthorization = yield* Effect.serviceOption(
-            RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
-          );
-          const client = yield* Effect.serviceOption(HttpClient.HttpClient);
-          if (Option.isNone(client)) return yield* new SessionHttpClientUnavailable();
-          return yield* fetchEnvironmentSessionState({
-            prepared,
-            signer,
-            remoteAuthorization,
-          }).pipe(
-            Effect.retry({
-              while: isTransientSessionStateError,
-              schedule: SESSION_STATE_RETRY_SCHEDULE,
-            }),
-            Effect.provideService(HttpClient.HttpClient, client.value),
-          );
-        });
-      })
-      .pipe(
-        Atom.swr({ staleTime: 30_000, revalidateOnMount: true }),
-        Atom.setIdleTTL(5 * 60_000),
-        Atom.withLabel(`environment-session-state:${environmentId}`),
-      ),
-  );
+        const binding = get(connection);
+        const current =
+          binding.prepared === null
+            ? AsyncResult.initial<AuthSessionState>()
+            : get(request(binding));
+        const previous = get.once(cached);
+        const result: SessionResult =
+          current._tag === "Failure"
+            ? AsyncResult.failure(current.cause, { waiting: current.waiting })
+            : current._tag === "Initial" &&
+                binding.prepared !== null &&
+                Option.isSome(previous) &&
+                previous.value.prepared === binding.prepared
+              ? AsyncResult.waiting(previous.value.result)
+              : current;
+        get.set(cached, Option.some({ prepared: binding.prepared, result }));
+        return result;
+      },
+      (refresh) => refresh(refreshSignal),
+    ).pipe(Atom.setIdleTTL(0), Atom.withLabel(`environment-session-state:${environmentId}`));
+  });
 
   const sessionStateValueAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make(
