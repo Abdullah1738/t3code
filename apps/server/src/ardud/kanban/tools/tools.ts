@@ -284,7 +284,7 @@ const CardReviewResult = tool(
       }),
     ),
   },
-  { card: Record },
+  { card: Record, recorded: Schema.Boolean, note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 

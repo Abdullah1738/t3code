@@ -345,6 +345,46 @@ it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("#566 review replies distinguish a recorded verdict from an exact replay", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "review-reply",
+      name: "Review reply",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+    const card = yield* kanban.createCard(board.id, { title: "Review", prompt: "Review" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+    yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+      _tag: "thread",
+      threadId: worker,
+    });
+    yield* kanban.dispatchNow;
+    const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+    const first = yield* call(reviewer, "card_review_result", {
+      verdict: "clear",
+      head: "abc1234",
+    });
+    assert.isFalse(first.isError, first.text);
+    assert.strictEqual(first.structured.recorded, true);
+    const replay = yield* call(reviewer, "card_review_result", {
+      verdict: "clear",
+      head: "abc1234",
+    });
+    assert.isFalse(replay.isError, replay.text);
+    assert.strictEqual(replay.structured.recorded, false);
+    assert.include(String(replay.structured.note), "nothing new written");
+    assert.deepStrictEqual(replay.structured.card, first.structured.card);
+    assert.lengthOf(
+      (yield* kanban.card(card.id)).events.filter((event) => event.kind === "review"),
+      1,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("a work thread with nothing active defaults to the cards still its own", () => {
   const { running, layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -798,7 +838,10 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
       yield* TestClock.adjust(KanbanService.BOARD_WRITE_START_DEADLINE_MS + 1);
       const created = yield* Fiber.join(create);
       assert.isFalse(created.isError, created.text);
-      const discussion = created.structured.discussion as { id: KanbanDiscussionId; lastSeq: number };
+      const discussion = created.structured.discussion as {
+        id: KanbanDiscussionId;
+        lastSeq: number;
+      };
       assert.strictEqual(discussion.lastSeq, 1);
 
       // Resolve the implicit discussion board before opening a second board.
@@ -827,18 +870,16 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
       yield* Fiber.join(dispatch);
       assert.lengthOf(launches, 1);
       const after = yield* kanban.card(card.id);
-      assert.deepStrictEqual(after.card, before.card);
-      assert.deepStrictEqual(after.events, before.events);
+      assert.strictEqual(after.card.stage, "working");
+      assert.strictEqual(after.card.activeThreadId, "thread-1");
+      assert.deepStrictEqual(after.events.slice(0, before.events.length), before.events);
       assert.lengthOf(after.threads, 1);
       assert.strictEqual(after.threads[0]!.threadId, ThreadId.make("thread-1"));
-      assert.isNotNull(after.threads[0]!.endedAt);
+      assert.isNull(after.threads[0]!.endedAt);
       assert.deepStrictEqual(yield* kanban.discussions(board.id), discussions);
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
       assert.deepStrictEqual(yield* kanban.boards, boards);
-    }).pipe(
-      Effect.ensuring(Deferred.succeed(release, undefined)),
-      Effect.provide(layer),
-    );
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(layer));
   }),
 );
 

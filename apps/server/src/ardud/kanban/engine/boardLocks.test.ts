@@ -3,10 +3,74 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Cause from "effect/Cause";
 import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as BoardLocks from "./boardLocks.ts";
+
+it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finishCall = yield* Deferred.make<void>();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finishCall))),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const writer = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    yield* Deferred.succeed(finishCall, undefined);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS + 1);
+    const result = yield* Fiber.join(first);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const message = String(Cause.squash(result.cause));
+      assert.include(message, "may have been applied");
+      assert.notInclude(message, "Safe to retry");
+    }
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(writer);
+  }),
+);
+
+it.effect("#566 reconciliation still fences a migration during the external call", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            undefined,
+            Effect.succeed(true),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.exclusive(Effect.void);
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(first)));
+  }),
+);
 
 it.effect("unrelated boards and single-card writes do not share a permit", () =>
   Effect.gen(function* () {

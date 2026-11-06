@@ -9,6 +9,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  MessageId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
@@ -444,3 +445,95 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(dependencies));
 });
+
+it.effect.each(["preparing", "queued"] as const)(
+  "#566 stopping an abandoned %s launch prevents its pending turn from starting",
+  (state) => {
+    const db = Sqlite.layerMemory;
+    const instanceId = ProviderInstanceId.make("codex");
+    const projectId = ProjectId.make("project:abandoned");
+    const threadId = ThreadId.make("thread:abandoned");
+    const modelSelection = { instanceId, model: "gpt-5.1-codex" };
+    const adapter = {
+      instanceId,
+      driver: ProviderDriverKind.make("codex"),
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+      openSession: () => Effect.die("Provider execution is disabled in this test"),
+    } as ProviderAdapter.ProviderAdapterV2["Service"];
+    const registry = Layer.succeed(
+      ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+      ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+        get: () => Effect.succeed(adapter),
+        list: () => Effect.succeed([instanceId]),
+      }),
+    );
+    const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+    const runtime = ProviderReplayHarness.layerWithRegistry(
+      { name: "kanban-abandoned" },
+      registry,
+      { databaseLayer: db, runEffectWorker: false },
+    );
+    const management = ThreadManagementService.layer.pipe(
+      Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    );
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("abandon:create"),
+        threadId,
+        projectId,
+        title: "Abandoned",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      const count = state === "queued" ? 2 : 1;
+      for (let i = 0; i < count; i++)
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`abandon:message:${i}`),
+          threadId,
+          messageId: MessageId.make(`abandon:message:${i}`),
+          text: "Run",
+          attachments: [],
+          modelSelection,
+          dispatchMode:
+            state === "preparing"
+              ? { type: "defer_start", workspaceStrategy: { type: "root" } }
+              : i === 0
+                ? { type: "start_immediately" }
+                : { type: "queue_after_active" },
+          createdBy: "system",
+          creationSource: "server",
+        });
+      expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)?.status).toBe(
+        state,
+      );
+      const threads = yield* KanbanThreads;
+      yield* threads.interrupt(threadId, "Abandoned launch", true);
+      const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+      expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("abandon:resume"),
+        threadId,
+      });
+      expect(
+        (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.map((run) => run.status),
+      ).toEqual(after.map((run) => run.status));
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provideMerge(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  },
+);

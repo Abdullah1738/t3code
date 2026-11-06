@@ -127,8 +127,16 @@ export interface KanbanThreadsShape {
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
-  readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
-  readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
+  readonly setModel: (
+    threadId: ThreadId,
+    model: ModelSelection,
+  ) => Effect.Effect<void, KanbanThreadError>;
+  /** Abandoned new launches also cancel queued turns instead of only interrupting the active run. */
+  readonly interrupt: (
+    threadId: ThreadId,
+    reason: string,
+    cancelQueued?: boolean,
+  ) => Effect.Effect<void>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -147,11 +155,7 @@ const detailOf = (error: unknown) =>
 export const viewStateOf = (
   shell: Pick<
     OrchestrationV2ThreadShell,
-    | "pendingRuntimeRequest"
-    | "activityRunStatus"
-    | "status"
-    | "updatedAt"
-    | "latestRunCompletedAt"
+    "pendingRuntimeRequest" | "activityRunStatus" | "status" | "updatedAt" | "latestRunCompletedAt"
   >,
 ): { readonly state: ControlThreadState; readonly quietSince: DateTime.Utc } => {
   const request = shell.pendingRuntimeRequest;
@@ -388,15 +392,36 @@ const make = Effect.gen(function* () {
   );
 
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
-    function* (threadId, reason) {
+    function* (threadId, reason, cancelQueued = false) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null) return;
-      yield* threads.interruptThread({
-        projectId: shell.projectId,
+      if (!cancelQueued) {
+        yield* threads.interruptThread({
+          projectId: shell.projectId,
+          commandId: commandId("stop"),
+          threadId,
+          reason,
+        });
+        return;
+      }
+      // Stop holds the queue atomically with the interrupt. interruptThread alone
+      // ignores queued runs, allowing an abandoned launch to start afterwards.
+      yield* threads.dispatch({
+        type: "thread.stop",
         commandId: commandId("stop"),
         threadId,
         reason,
       });
+      const stopped = yield* threads.getThreadRecords(threadId, ["runs"]);
+      for (const run of stopped.runs) {
+        if (run.status !== "queued") continue;
+        yield* threads.dispatch({
+          type: "queued-run.cancel",
+          commandId: commandId("cancel"),
+          threadId,
+          runId: run.id,
+        });
+      }
     },
     Effect.catchCause(() => Effect.void),
   );
