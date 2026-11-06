@@ -406,7 +406,7 @@ class ResumeTests(Isolated):
             got = lease._reuse(self.con, row, None)
         self.assertEqual(got["box_id"], "cold")
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(self.con.execute("SELECT outcome FROM start_requests").fetchone()[0], "uncertain")
+        self.assertEqual(self.con.execute("SELECT outcome FROM start_requests").fetchone()[0], "settled")
 
     def test_cloudflare_ambiguous_responses_are_checked_like_network_timeout(self):
         for status in (520, 524):
@@ -502,8 +502,11 @@ class ResumeTests(Isolated):
                         patch.object(lease, "time", clock.time), patch.object(api, "get", side_effect=get), \
                         patch.object(api, "resume", side_effect=api.NetworkError("timeout")) as resume, \
                         contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaises(lease.ResumeUnresolved):
-                        lease._reuse(self.con, row, None)
+                    if scenario == 'missing':
+                        self.assertIsNone(lease._reuse(self.con, row, None))
+                    else:
+                        with self.assertRaises(lease.ResumeUnresolved):
+                            lease._reuse(self.con, row, None)
                 resume.assert_called_once()
 
 
@@ -527,7 +530,7 @@ class IntegratedCapacityTests(Isolated):
         self.assertEqual(resumed, ['one'])
         self.assertEqual(self.clock.t, 1004)
         self.assertIn('stayed provisioning for 4s', err)
-        self.assertTrue(create.call_args.args[4])
+        self.assertFalse(create.call_args.args[4])
         self.assertEqual([r[0] for r in self.con.execute("SELECT state FROM leases ORDER BY box_id")],
                          ['resume_stalled','resume_stalled'])
         up.assert_not_called()

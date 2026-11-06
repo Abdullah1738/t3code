@@ -96,7 +96,7 @@ class ResumeStuckTests(Isolated):
             self.assertEqual(got['box_id'], 'new')
             self.assertEqual([r[0] for r in self.resumes], ['cold', 'cold'])
             self.assertAlmostEqual(self.clock.t - self.resumes[1][3], 4)
-            self.assertTrue(create.call_args.args[4])
+            self.assertFalse(create.call_args.args[4])
             self.assertEqual(self.row('cold')['state'], 'resume_stalled')
             self.assertEqual(self.row('sibling')['state'], 'resume_stalled')
             delete.assert_not_called()

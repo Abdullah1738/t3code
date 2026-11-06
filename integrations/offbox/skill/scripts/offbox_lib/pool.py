@@ -176,6 +176,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     lease.cap_check()
     capacity.schema(con)
     key = me["repo_key"]
+    allocation.recover_resumes(con, key)
     source = ("fresh" if fresh else f"base:{base if ':' in base else key+':'+base}" if base else
               f"template:{template}" if template else None)
     wait = wait_seconds()
@@ -193,14 +194,16 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     while True:
         lease.cap_check()
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                              "WHERE l.repo_key=? LIMIT 1", (key,)).fetchone()
+                              "WHERE l.repo_key=? AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+        if create_first:
+            pending = None
         if pending:
             bid = pending["box_id"]
             guard = file_lock("box-" + bid, timeout=0)
             guard.__enter__()
             try:
                 pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                                      "WHERE l.box_id=?", (bid,)).fetchone()
+                                      "WHERE l.box_id=? AND l.state IN ('running','stopped')", (bid,)).fetchone()
                 if not pending:
                     guard.__exit__(None, None, None)
                     continue
@@ -214,6 +217,9 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     resume_stall, create_first = e, True
                     guard.__exit__(None, None, None)
                     say(str(e))
+                    continue
+                if got is None:
+                    guard.__exit__(None, None, None)
                     continue
                 if source and (pending["source"] or "").replace("recipe:", "template:", 1) != source:
                     raise lease.ResumeUnresolved(f"{bid} had an unanswered resume; it was checked, "
@@ -243,21 +249,24 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             # (31 Oct: a 900 s resume under this lock failed every other edge-api run with exit 90).
             row = guard = token = None
             with _pool_lock(key, deadline, wait):
-                pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
-                                      "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
-                                      "LIMIT 1", (key,)).fetchone()
-                if pending:
-                    raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
-                                                 "retry once it has been checked; nothing ran")
                 rows, can_create = candidates(con, key, size, source, me)
                 if create_first:
-                    # One stuck unanswered resume is enough: do not spend the same cap on a sibling.
-                    for sibling in rows:
-                        if sibling['state'] == 'stopped':
+                    # Retain unanswered markers on excluded boxes, without letting them block a replacement.
+                    siblings, _ = candidates(con, key, None, None, me)
+                    for sibling in siblings:
+                        pending_sibling = con.execute("SELECT 1 FROM kv WHERE k=?",
+                                                     (f"resume_unanswered:{sibling['box_id']}",)).fetchone()
+                        if sibling['state'] == 'stopped' or pending_sibling:
                             con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
                                         ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
                     con.commit()
                     rows, can_create = [], True
+                pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
+                                      "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
+                                      "AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+                if pending:
+                    raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
+                                                 "retry once it has been checked; nothing ran")
                 if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
                     # Replaying the retained key resolves the old allocation; it is not a new pool slot.
                     rows, can_create = [], True
@@ -401,7 +410,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     shared = dict(me, owner="pool:"+key, thread=None, session=None, title="repository pool", manager=None)
                     creator = getattr(lease, 'acquire_private', lease.acquire)
                     try:
-                        got = creator(shared, size, template, base, True if create_first else fresh)
+                        got = creator(shared, size, template, base, fresh)
                     except capacity.CapacityError as e:
                         if resume_stall is not None:
                             e.args = (f"{e} Earlier cause: {resume_stall}",)

@@ -580,7 +580,8 @@ def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
     say(f"lease {box_id} expired ({why}); starting a new box")
     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    con.commit()
+    from . import allocation
+    allocation.clear_resume(con, box_id)
     event(con, box_id, "lease_expired", why)
 
 
@@ -636,6 +637,10 @@ def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
 class ResumeUnresolved(OffboxError):
     """A resume may have been accepted, but its box could not be confirmed."""
 
+    def __init__(self, message, cause=None):
+        super().__init__(message, started=bool(cause and cause.started), outage=bool(cause and cause.outage))
+        self.status = getattr(cause, 'status', None)
+
 
 class ResumeProvisionStalled(OffboxError):
     """An unanswered resume was accepted, but never became usable within its provisioning cap."""
@@ -650,29 +655,32 @@ def _wait_unanswered_resume(con, box_id):
     if not saved:
         con.execute('INSERT INTO kv VALUES (?,?,?)', (key, str(end), time.time()))
         con.commit()
-    def settled():
-        con.execute('DELETE FROM kv WHERE k IN (?,?)', (key, f'resume_unanswered:{box_id}'))
-        con.commit()
     with outage.accepted_machine():
         while True:
             left = end - time.time()
             if left <= 0:
-                settled()
+                con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
+                con.commit()
                 raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
                                              "nothing ran; set aside and trying a new box")
             try:
                 state = api.get(box_id, deadline=time.time() + left)
             except OffboxError:
                 state = None
+            else:
+                if state is None or state.get('dataExpiredAt'):
+                    _forget_expired(con, box_id, 'confirmed missing or expired during resume provisioning')
+                    raise _ResumeExpired
             if state and state.get("state") in api.LIVE_STATES:
-                settled()
+                from . import allocation
+                allocation.clear_resume(con, box_id)
                 return
             time.sleep(min(2, max(0, end - time.time())))
 
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True):
     from . import allocation
-    with allocation.guard(box_id):
+    with allocation.guard(box_id, reconcile=pending):
         return _resume_under_guard(con, box_id, ttl, size, pending, retry)
 
 
@@ -711,6 +719,10 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                 last = None
                 observed = False
                 unreadable = True
+            else:
+                if last is None or last.get('dataExpiredAt'):
+                    _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
+                    raise _ResumeExpired
             if last is None:
                 unreadable = True
             read_at = time.monotonic()
@@ -719,9 +731,8 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             previous_read = read_at
             if last and last.get("state") in api.STARTING_STATES + api.LIVE_STATES:
                 if last.get('state') in api.LIVE_STATES:
-                    clear_pending()
-                    con.execute('DELETE FROM kv WHERE k=?', (f'resume_provision:{box_id}',))
-                    con.commit()
+                    from . import allocation
+                    allocation.clear_resume(con, box_id)
                 return last
             if last and last.get("state") not in api.STOPPED_STATES:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
@@ -750,6 +761,12 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
     def send():
         # The persistent marker is written before sending: a killed client cannot forget an ambiguous resume.
         from . import outage
+        from . import allocation
+        other = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+                            "WHERE l.repo_key=(SELECT repo_key FROM leases WHERE box_id=?) "
+                            "AND l.box_id<>? AND l.state IN ('running','stopped') LIMIT 1", (box_id, box_id)).fetchone()
+        if other:
+            raise allocation.Unresolved(f"{other[0]} has an unanswered resume; reconcile before sending another")
         if outage.allocation_left() == 0:
             from .pool import PoolBusyError
             raise PoolBusyError("allocation wait expired before resume; nothing ran")
@@ -784,16 +801,21 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
+    from . import allocation
+    allocation.recover_resumes(con, row['repo_key'])
     pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
     if pending:
         pending_size = pending[0] if pending[0] in SIZES else None
-        confirmed, _ = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
-        if confirmed and confirmed.get('state') in api.STARTING_STATES:
-            _wait_unanswered_resume(con, box_id)
+        try:
+            confirmed, _ = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
+            if confirmed and confirmed.get('state') in api.STARTING_STATES:
+                _wait_unanswered_resume(con, box_id)
+        except _ResumeExpired:
+            return None
         try:
             up = _bring_up(box_id)
         except OffboxError as e:
-            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran") from e
+            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
         want = up.get("type") if isinstance(up, dict) else None
         want = want if want in SIZES else row["size"]
         con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
@@ -810,7 +832,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     s = api.get(box_id)
     if s is None or s.get("state") in ("error", "cancelled"):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        con.commit()
+        allocation.clear_resume(con, box_id)
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     if s.get("dataExpiredAt"):
@@ -954,7 +976,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
             except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
                 raise
             except OffboxError as e:
-                raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}") from e
+                raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
         except _ResumeExpired:
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:
@@ -964,7 +986,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
         try:
             _bring_up(box_id)
         except OffboxError as e:
-            raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran") from e
+            raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)
     else:
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
@@ -1063,6 +1085,8 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
+            from . import allocation
+            allocation.clear_resume(con, box_id)
             # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
@@ -1087,7 +1111,8 @@ def delete_box(con, box_id: str, reason: str) -> bool:
     d = api.delete(box_id)
     op = (d.get("operation") or {}).get("id")
     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    con.commit()
+    from . import allocation
+    allocation.clear_resume(con, box_id)
     clear_prune_hold(con, box_id)  # deleted: no remote process survives
     event(con, box_id, "delete", f"{reason} op={op}")
     return True
