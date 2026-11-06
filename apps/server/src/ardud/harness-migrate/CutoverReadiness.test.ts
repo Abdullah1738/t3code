@@ -848,6 +848,10 @@ describe("CutoverReadiness", () => {
       failed(yield* f.check(), "home:codex");
       yield* f.fs.remove(f.path.join(farm, "extra"));
       assert.isTrue((yield* f.check()).every((row) => row.ready));
+      // Codex's own bundled skills live in skills/.system and are not canonical.
+      yield* f.fs.makeDirectory(f.path.join(farm, ".system"));
+      assert.isTrue((yield* f.check()).every((row) => row.ready));
+      yield* f.fs.remove(f.path.join(farm, ".system"), { recursive: true });
       yield* f.fs.writeFileString(
         f.path.join(f.skill, "SKILL.md"),
         "---\nname: renamed-skill\n---\nChanged.\n",

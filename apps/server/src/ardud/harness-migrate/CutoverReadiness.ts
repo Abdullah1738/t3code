@@ -542,9 +542,12 @@ const make = Effect.gen(function* () {
       .pipe(Effect.mapError(() => "Native skill farm is missing."));
     if (realFarm !== path.join(realDirectory, "skills"))
       return yield* Effect.fail("Native skill farm must not be redirected.");
-    const links = yield* fs
+    // Codex keeps its bundled skills in skills/.system; canonical names never start with ".".
+    const links = (yield* fs
       .readDirectory(farm)
-      .pipe(Effect.mapError(() => "Native skill farm is unreadable."));
+      .pipe(Effect.mapError(() => "Native skill farm is unreadable."))).filter(
+      (name) => !name.startsWith("."),
+    );
     if (links.length !== source.skills.size || links.some((name) => !source.skills.has(name)))
       return yield* Effect.fail("Native skill names differ from canonical roots.");
     for (const name of links) {
