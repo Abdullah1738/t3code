@@ -151,6 +151,8 @@ MEMORY_ROOT="$TICK" bash "$TICK/scripts/tick.sh" >/dev/null 2>&1
 grep -q "claude capture failed rc=3" "$TICK/logs/capture-$(date +%Y%m%d).log" && pass "failing claude stage is logged" || fail "claude failure not logged"
 grep -q "sync_codex.py" "$MEMORY_ROOT/ran.log" 2>/dev/null || grep -q "sync_codex.py" "$TICK/ran.log" && pass "codex stage still runs after claude fails" || fail "codex skipped after claude failed"
 grep -q "sync_thread_identity.py" "$TICK/ran.log" && pass "identity stage runs" || fail "identity stage did not run"
+tail -1 "$TICK/ran.log" | grep -q "wal_truncate.py" && pass "wal truncate runs last" || fail "wal truncate not run last: $(tail -1 "$TICK/ran.log")"
+grep -q "wal=0" "$TICK/logs/capture-$(date +%Y%m%d).log" && pass "wal rc logged" || fail "wal rc not logged"
 [ "$(sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' "$TICK/logs/capture_last.json")" = failed ] && pass "aggregate capture status is failed" || fail "aggregate status not failed: $(cat "$TICK/logs/capture_last.json" 2>/dev/null)"
 
 rm -rf "$T"

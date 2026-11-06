@@ -17,9 +17,11 @@ MUSE_HARD="${MEMORY_MUSE_HARD_SECS:-240}"
 CLAUDE_HARD_STAGE="${MEMORY_CLAUDE_HARD_SECS:-240}"
 CODEX_HARD_STAGE="${MEMORY_CODEX_HARD_SECS:-240}"
 
+WAL_HARD="${MEMORY_WAL_HARD_SECS:-120}"
+
 bash "$ROOT/scripts/memory_stall_watch.sh" >> "$STAGE_LOG" 2>&1
 
-stage_begin capture "$((HARD + MUSE_HARD + 2 * CLAUDE_HARD_STAGE + 60))" || exit 0
+stage_begin capture "$((HARD + MUSE_HARD + 2 * CLAUDE_HARD_STAGE + 60 + WAL_HARD))" || exit 0
 stage_log "start"
 # Every stage runs even when an earlier one fails; the aggregate status below
 # is failed if any of them failed (the stage's own status only reflects the
@@ -44,5 +46,12 @@ stage_run "$HARD" $PY -u src/sync_opencode_v2.py --deadline "$SOFT" \
   --progress "$STAGE_STATE/capture.progress.json" >> "$STAGE_LOG" 2>&1
 opencode_rc=$?
 [ "$opencode_rc" = 0 ] || { stage_log "opencode capture failed rc=$opencode_rc"; agg=1; }
-stage_log "rc muse=$muse_rc claude=$claude_rc codex=$codex_rc identity=$identity_rc opencode=$opencode_rc"
+# Writers run with auto-checkpoints off, so reset the WALs here with a
+# zero-wait PASSIVE then TRUNCATE checkpoint. A busy reader only means "next
+# tick"; it never fails the tick. Without this the memory.db WAL grew to 9 GB
+# and the sqlite3_rsync replica backup timed out on every run (Nov 2026).
+stage_run "$WAL_HARD" $PY -u src/wal_truncate.py >> "$STAGE_LOG" 2>&1
+wal_rc=$?
+[ "$wal_rc" = 0 ] || stage_log "wal truncate rc=$wal_rc (ignored)"
+stage_log "rc muse=$muse_rc claude=$claude_rc codex=$codex_rc identity=$identity_rc opencode=$opencode_rc wal=$wal_rc"
 if [ "$agg" = 0 ]; then stage_end 0; else stage_end 1; fi
