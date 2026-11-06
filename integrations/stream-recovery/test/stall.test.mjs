@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { stallScan } from '../lib/stallwatch.mjs';
 import {
   LLM_QUIET_MS, TOOL_QUIET_MS, NO_TIMEOUT_MS, SHELL_MARGIN_MS, SHELL_DEFAULT_TIMEOUT_MS, MAX_PER_DAY,
   tailActivity, toolLimit, observe, quietSince,
@@ -37,12 +38,65 @@ test('limits: model 30 min, shells their own timeout plus a margin, other tools 
   assert.equal(limit(tool('shell', 'running', undefined, { command: 'ls' })), SHELL_DEFAULT_TIMEOUT_MS + SHELL_MARGIN_MS);
   assert.equal(limit(tool('shell', 'running', undefined, { command: 'x', timeout: 3_600_000 })), 3_600_000 + SHELL_MARGIN_MS);
   assert.equal(limit(tool('shell', 'running', undefined, { command: 'x', timeout: 0 })), NO_TIMEOUT_MS);
-  assert.equal(limit(tool('execute', 'running')), TOOL_QUIET_MS);
+  assert.equal(limit(tool('execute', 'running')), 20 * 60_000);
+  assert.equal(limit(tool('read', 'running')), TOOL_QUIET_MS);
   assert.equal(limit(tool('subagent', 'running')), TOOL_QUIET_MS);
   assert.equal(limit(tool('question', 'running')), Infinity);
+  assert.equal(limit(tool('question', 'running'), tool('execute', 'running', undefined, { code: 'new Promise(r=>r)' })), Infinity);
+  assert.equal(limit(tool('subagent', 'running'), tool('execute', 'running', undefined, { code: 'new Promise(r=>r)' })), TOOL_QUIET_MS);
   // The longest running tool wins.
-  assert.equal(limit(tool('shell', 'running', undefined, { command: 'x' }), tool('execute', 'running')), TOOL_QUIET_MS);
+  assert.equal(limit(tool('shell', 'running', undefined, { command: 'x' }), tool('execute', 'running')), SHELL_DEFAULT_TIMEOUT_MS + SHELL_MARGIN_MS);
   assert.equal(toolLimit({ name: 'shell', state: { input: { timeout: 'junk' } } }), SHELL_DEFAULT_TIMEOUT_MS + SHELL_MARGIN_MS);
+});
+
+test('execute waits with a never-settling promise get three minutes and name the cause', () => {
+  for (const code of ['await new Promise(r=>r)', 'await new Promise(()=>{})', 'await tools.dia.dia_navigate({}); await new Promise(r => r)']) {
+    const part = tool('execute', 'running', undefined, { code });
+    const activity = tailActivity([{ content: [part] }]);
+    assert.equal(toolLimit(part), 3 * 60_000);
+    assert.equal(activity.limitMs, 3 * 60_000);
+    assert.equal(activity.label, 'running execute (code awaits a promise that never resolves)');
+    assert.equal(planStall({ ...base, ...activity, quietMs: 3 * 60_000 - 1, thread: thread() }).action, 'skip');
+    assert.equal(planStall({ ...base, ...activity, quietMs: 3 * 60_000, thread: thread() }).action, 'robob');
+    const stall = { ...activity, quietSince: T0, quietMs: 3 * 60_000, outcome: 'cleared', action: 'robob' };
+    assert.match(buildStallNote(stall), /execute \(code awaits a promise that never resolves\)/);
+    assert.match(buildStallSummary(stall).text, /execute \(code awaits a promise that never resolves\)/);
+  }
+});
+
+test('normal execute calls get twenty minutes, including missing or malformed input', () => {
+  for (const input of [undefined, {}, { code: null }, { code: 3 }, { code: 'return await tools.perplexity.perplexity_research({});' }, { code: 'new Promise(r => setTimeout(r, 10))' }]) {
+    const part = tool('execute', 'running', undefined, input);
+    assert.equal(toolLimit(part), 20 * 60_000);
+    assert.equal(tailActivity([{ content: [part] }]).label, 'running execute');
+  }
+});
+
+test('stallScan interrupts a child stuck in execute at three minutes, not before, and reports the cause', async () => {
+  let active = new Set(['ses_child']);
+  const calls = { interrupts: [], summaries: [] };
+  const state = { watch: {}, stalls: {}, ghosts: {} };
+  const log = () => {};
+  const messages = [{ type: 'assistant', time: { created: T0 }, content: [tool('execute', 'running', undefined, { code: 'await new Promise(r=>r)' })] }];
+  const io = {
+    activeSessions: async () => active,
+    ocTail: async () => messages,
+    ocSession: async (ses) => ({ title: ses, ...(ses === 'ses_child' ? { parentID: 'ses_parent' } : {}) }),
+    ocForms: async () => [], ocPermissions: async () => [], threadByNative: async () => null,
+    ocInterrupt: async ses => { calls.interrupts.push(ses); },
+    activeThreads: async () => [], installerResumePendingMs: () => null,
+    telegram: value => { calls.summaries.push(value); },
+  };
+  await stallScan({ state, now: T0, log }, io);
+  await stallScan({ state, now: T0 + 3 * 60_000 - 1, log }, io);
+  assert.deepEqual(calls.interrupts, []);
+  await stallScan({ state, now: T0 + 3 * 60_000, log }, io);
+  assert.deepEqual(calls.interrupts, ['ses_child']);
+  active = new Set();
+  await stallScan({ state, now: T0 + 4 * 60_000, log }, io);
+  assert.equal(calls.summaries.length, 1);
+  assert.match(calls.summaries[0].text, /execute \(code awaits a promise that never resolves\)/);
+  assert.equal(Object.values(state.stalls)[0].outcome, 'cleared');
 });
 
 test('tailActivity sees a running tool behind a newer message', () => {
