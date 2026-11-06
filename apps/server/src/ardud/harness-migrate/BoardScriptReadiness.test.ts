@@ -23,6 +23,21 @@ it.each([
   'subprocess.run(["crw", "tick"])',
   "node /Volumes/x/crw.mjs tick",
   "crw review PR-1",
+  "if true; then\n    crw tick\nfi",
+  'subprocess.Popen(["crw", "tick"])',
+  'subprocess.check_call(["crw", "tick"])',
+  'await asyncio.create_subprocess_exec("crw", "tick")',
+  'execFileSync("crw", ["tick"])',
+  'await execa("crw", ["tick"])',
+  "await $`crw tick`",
+  'bash -lc "crw tick"',
+  "timeout 60 crw tick",
+  "nohup crw tick &",
+  "/usr/bin/env crw tick",
+  'cmd = ["crw", "tick"]; subprocess.run(cmd)',
+  "zsh ~/.local/share/crw/tick.zsh",
+  "launchctl kickstart -k gui/501/com.crpko.review-workflow",
+  "out=$(crw status)",
 ])("refuses a concrete unverified dependency: %s", (text) => {
   assert.isNotNull(boardScriptDependencyProblem(text));
 });
@@ -38,6 +53,12 @@ it.each([
   'CRW_HOLD = re.compile(r"(?m)^FAIL\\s+crw hold\\b.*$")',
   "For PR review asks, check crw state first (crpko-review-workflow skill).",
   "node /Volumes/ExternalSSD/crpko-review-workflow/reader.mjs pr Equicom-Crypto/x 1",
+  "(crw review loop is retired)",
+  "Do not call crw anymore",
+  "never run crw tick here",
+  "crw rules apply to external PRs only.",
+  "| crw state | retired |",
+  "See crpko-review-workflow/lib/review.mjs for the old prompt.",
 ])("does not mistake generic agent documentation for a named selector: %s", (text) => {
   assert.isNull(boardScriptDependencyProblem(text));
 });

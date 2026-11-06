@@ -6,11 +6,64 @@ import * as Stream from "effect/Stream";
 export const BOARD_SCRIPT_BYTE_LIMIT = 2 * 1024 * 1024;
 
 // Only running crw counts. Reading its database or naming it in prose/prompts does not.
+// The crw binary as an argv[0]: bare, or a path ending in /crw, optionally quoted.
+const CRW_BIN = String.raw`["'\`]?(?:[\w./~-]*\/)?crw["'\`]?`;
+// crw's own subcommands (crw.mjs `commands`), plus tick/status/review from its
+// launcher and older docs. Prose like "crw rules apply" or "| crw state |" names
+// no subcommand, so it does not read as a call.
+const CRW_SUBCOMMANDS = [
+  "sync",
+  "dispatch",
+  "candidates",
+  "ingest",
+  "remind",
+  "titles",
+  "exec",
+  "models",
+  "missions",
+  "hold",
+  "release",
+  "retry",
+  "cancel",
+  "events",
+  "pending",
+  "merit",
+  "unlock-pacing",
+  "prioritize",
+  "pace-skip",
+  "mark-deployed",
+  "gate-evidence",
+  "redeploy",
+  "dispatch-reconcile",
+  "release-unblock",
+  "tick",
+  "status",
+  "review",
+].join("|");
+// A subcommand after it, either as a shell word or the next (quoted) argv element.
+const CRW_ARGS = String.raw`(?:\s+|["'\`]?\s*,\s*\[?\s*["'\`])(?:${CRW_SUBCOMMANDS})\b`;
 const CRW_INVOCATION: ReadonlyArray<RegExp> = [
   /\bcrw\.mjs\b/,
-  // reader.mjs is crw's read-only GitHub/architecture reader; it starts no agents.
-  /crpko-review-workflow\/(?!reader\.mjs\b)[\w./-]*\.(?:mjs|ts|py|sh)\b/,
-  /(?:^|[;&|(]\s*|\b(?:exec|execSync|execFile|spawn|spawnSync|system|run|popen|check_output|call)\s*\(?\s*\[?\s*["'`]?)(?:[\w./~-]*\/)?crw\s*["'`]?\s*,?\s*["'`]?[a-z][\w-]*/m,
+  // crw's launcher and LaunchAgent.
+  /\bcrw\/tick\.zsh\b/,
+  /\bcom\.crpko\.review-workflow\b/,
+  // reader.mjs is crw's read-only GitHub/architecture reader; it starts no agents. Paths into
+  // the repo only count when something executes them, not when prose names a file.
+  /(?:\b(?:node|bun|deno|python3?|bash|zsh|sh|tsx|npx)\s+|\b(?:import|require)\s*\(?\s*["'`])[\w./~-]*crpko-review-workflow\/(?!reader\.mjs\b)[\w./-]*\.(?:mjs|ts|py|sh|js)\b/,
+  // Shell: a line or pipeline segment that starts with crw, allowing leading
+  // whitespace and command prefixes (exec, timeout N, nohup, env, sudo).
+  new RegExp(
+    String.raw`(?:^|[;&|]|\$\(|\s-l?c\s+["'])[ \t]*(?:(?:exec|nohup|sudo|command|time|(?:\/usr\/bin\/)?env|timeout\s+\d+[smh]?)\s+)*${CRW_BIN}${CRW_ARGS}`,
+    "m",
+  ),
+  // Process APIs: the call must open a paren (or Bun's $ template) right before crw.
+  new RegExp(
+    String.raw`(?:\b(?:exec|execSync|execFile|execFileSync|execa|execaSync|spawn|spawnSync|system|run|popen|Popen|check_output|check_call|call|create_subprocess_exec|create_subprocess_shell)\s*\(\s*\[?\s*|\$\`\s*)${CRW_BIN}${CRW_ARGS}`,
+  ),
+  // argv lists built first and run later: ["crw", "tick"].
+  new RegExp(
+    String.raw`\[\s*["'\`](?:[\w./~-]*\/)?crw["'\`]\s*,\s*["'\`](?:${CRW_SUBCOMMANDS})["'\`]`,
+  ),
 ];
 
 export const boardScriptDependencyProblem = (text: string): string | null => {
