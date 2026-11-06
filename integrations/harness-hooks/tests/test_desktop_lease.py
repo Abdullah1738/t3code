@@ -150,6 +150,34 @@ class DesktopLeaseTests(unittest.TestCase):
         self.assertEqual(rows[-2]["rule"], "desktop-end")
         self.assertEqual(rows[-1]["rule"], "desktop-end-error")
 
+    def test_codex_turn_end_closes_calls_that_never_got_post_tool_use(self):
+        # Codex sends no PostToolUse when an MCP call fails, which used to leave the lease stuck in `stopping`.
+        self.assertIsNone(self.invoke({**self.event(), "tool_use_id": "call-a"}, "codex"))
+        self.assertIsNone(self.invoke({**self.event(), "tool_use_id": "call-b"}, "codex"))
+        self.assertIsNone(self.invoke({**self.event(kind="PostToolUse"), "tool_use_id": "call-b"}, "codex"))
+        before = len(self.calls())
+        stop = {"hook_event_name": "Stop", "session_id": "parent-session", "agent_id": "child-id"}
+        self.assertIsNone(self.invoke(stop, "codex"))
+        self.assertEqual(self.calls()[before:], [("/api/ardud/control/desktop-lease/call-end",
+                                                  {"toolUseId": "call-a", "outcome": "failed"})])
+        # Already flushed: a second turn end sends nothing.
+        self.assertIsNone(self.invoke(stop, "codex"))
+        self.assertEqual(len(self.calls()), before + 1)
+
+    def test_turn_end_keeps_calls_the_server_could_not_close_and_ignores_other_callers(self):
+        self.assertIsNone(self.invoke({**self.event(), "tool_use_id": "call-x"}, "codex"))
+        other = {"hook_event_name": "Stop", "session_id": "parent-session", "agent_id": "other-child"}
+        before = len(self.calls())
+        self.assertIsNone(self.invoke(other, "codex"))
+        self.assertEqual(len(self.calls()), before)
+        self.server.state.update(status=500, body=b'{}')
+        mine = {"hook_event_name": "SubagentStop", "session_id": "parent-session", "agent_id": "child-id"}
+        self.assertIsNone(self.invoke(mine, "codex"))
+        self.server.state.update(status=200, body=b'{}')
+        self.assertIsNone(self.invoke({**mine, "hook_event_name": "SessionEnd"}, "codex"))
+        self.assertEqual(self.calls()[-1], ("/api/ardud/control/desktop-lease/call-end",
+                                            {"toolUseId": "call-x", "outcome": "failed"}))
+
     def test_read_only_completion_has_no_requests(self):
         self.assertIsNone(self.invoke(self.event("mcp__node_repl__js", {"code": "1+1"}, "PostToolUse"), "codex"))
         self.assertEqual(self.calls(), [])

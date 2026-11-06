@@ -469,7 +469,9 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
             "metrics_exporter": "none",
             "log_user_prompt": False,
         },
-        "agents": {"enabled": True, "max_depth": manifest["claude"]["subagentDepth"]},
+        # No `enabled` key: Codex 0.166 has none, and the Computer Use service reads any other [agents]
+        # key as a named role (AgentRoleToml), so `enabled = true` broke every native CU call.
+        "agents": {"max_depth": manifest["claude"]["subagentDepth"]},
         "shell_environment_policy": {"inherit": "all", "set": {"PATH": path_value, "BUN_INSPECT": "", "OFFBOX_GATE": "1", "ROBOB_HARNESS": "codex"}},
         "mcp_servers": codex_mcp(manifest["mcpServers"]),
     }
@@ -536,6 +538,13 @@ def models_json(vendor_path: Path, manifest: dict, *, cu: bool = False) -> bytes
                     model[key] = cu_spec["contextWindow"]
                 model["auto_compact_token_limit"] = cu_spec["autoCompactTokenLimit"]
         data["models"].append(upstream_terra)
+        # The Computer Use service bundles an older Codex config parser that requires base_instructions on
+        # every catalog model (0.166 also accepts model_messages.instructions_template). Mirror the template
+        # so native CU starts; Codex 0.166 still prefers the model_messages template when both are present.
+        for model in data["models"]:
+            template = (model.get("model_messages") or {}).get("instructions_template")
+            if "base_instructions" not in model and isinstance(template, str) and template:
+                model["base_instructions"] = template
     return json_bytes(data)
 
 

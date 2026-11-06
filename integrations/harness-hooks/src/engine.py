@@ -53,8 +53,8 @@ def _state():
 
 # The JSONL file is an audit trail, not a transcript. Untrusted event, tool,
 # identity and classifier fields can themselves contain an entire command.
-_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim"}
-_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl"}
+_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim", "Stop", "SubagentStop", "SessionEnd"}
+_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl", "desktop-flush"}
 _LOG_RULES = {
     "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
@@ -65,7 +65,7 @@ _LOG_RULES = {
     "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
     "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
-    "desktop-unavailable", "desktop-end", "desktop-end-error",
+    "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
 }
 _LOG_ERRORS = {
@@ -1047,9 +1047,9 @@ def decide(event, harness):
             # This policy must not enter the general engine's fail-open identity path.
             try:
                 if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control)
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state())
                 else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control)
+                    rule, error_type = desktop_lease.finish(event, harness, _control, _state())
                     decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
@@ -1057,6 +1057,11 @@ def decide(event, harness):
                 result = {"decision": "deny" if kind == "PreToolUse" else "allow",
                           "reason": desktop_lease.UNAVAILABLE if kind == "PreToolUse" else "",
                           "context": {"rule": "desktop-unavailable"}}
+            return result
+        if kind in desktop_lease.TURN_END:
+            log_tool = "desktop-flush"
+            rule, error_type = desktop_lease.flush(event, harness, _control, _state())
+            result = {"decision": "allow", "reason": "", "context": {"rule": rule}}
             return result
         command = _command(event) if kind == "PreToolUse" else None
         if command:

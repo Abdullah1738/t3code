@@ -153,6 +153,8 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["shell_environment_policy"]["set"]["BUN_INSPECT"], "")
         self.assertEqual(cfg["shell_environment_policy"]["set"]["OFFBOX_GATE"], "1")
         self.assertEqual(cfg["agents"]["max_depth"], 1000000)
+        # Computer Use parses every other [agents] key as a role table; a boolean there breaks it.
+        self.assertEqual(set(cfg["agents"]), {"max_depth"})
         self.assertEqual(cfg["history"], {"persistence": "none"})
 
         hooks = json.loads((self.codex / "hooks.json").read_text())
@@ -588,7 +590,8 @@ class GenerateTests(HarnessTestCase):
 
         claude_hooks, codex_hooks = split(all_claude, False), split(all_codex, False)
         self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
-        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse"})
+        # Codex has no PostToolUseFailure; turn-end hooks close desktop calls that failed without PostToolUse.
+        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse", "Stop", "SubagentStop", "SessionEnd"})
         claude_recall, codex_recall = split(all_claude, True), split(all_codex, True)
         self.assertEqual(set(claude_recall), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
                                               "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
@@ -718,6 +721,15 @@ class GenerateTests(HarnessTestCase):
         rc, output = self.run_check(m)
         self.assertEqual(rc, 0, output)
 
+    def test_cu_catalog_carries_base_instructions_for_the_computer_use_service(self) -> None:
+        self.run_gen(self.manifest())
+        models = json.loads((self.codex_cu / "models.json").read_text())["models"]
+        self.assertTrue(models)
+        for model in models:
+            template = (model.get("model_messages") or {}).get("instructions_template")
+            if template:
+                self.assertEqual(model["base_instructions"], template)
+
     def test_cu_catalog_extends_original_terra_without_losing_metadata(self) -> None:
         self.run_gen()
         upstream = json.loads((PKG / "vendor/codex-models-0.166.0.json").read_text())
@@ -726,13 +738,16 @@ class GenerateTests(HarnessTestCase):
         cu_models = {m["slug"]: m for m in cu["models"]}
         original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
         expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
-                              max_context_window=1050000, auto_compact_token_limit=450000)
+                              max_context_window=1050000, auto_compact_token_limit=450000,
+                              base_instructions=original["model_messages"]["instructions_template"])
         self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)
         self.assertEqual(cu_models.pop("gpt-6.1-terra"), dict(expected_terra, slug="gpt-6.1-terra"))
-        self.assertEqual(cu_models, {m["slug"]: m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"})
+        with_base = lambda m: dict(m, base_instructions=m["model_messages"]["instructions_template"])
+        self.assertEqual(cu_models, {m["slug"]: with_base(m) for m in plain["models"] if m["slug"] != "gpt-6.1-terra"})
         self.assertNotIn("cx/gpt-6.1-terra", {m["slug"] for m in plain["models"]})
         self.assertEqual([m for m in cu["models"] if m["slug"] not in {"gpt-6.1-terra", "cx/gpt-6.1-terra"}],
-                         [m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"])
+                         [with_base(m) for m in plain["models"] if m["slug"] != "gpt-6.1-terra"])
+        self.assertTrue(all("base_instructions" not in m for m in plain["models"]))
 
     def test_check_detects_parity_isolation_analytics_and_catalog_drift(self) -> None:
         cases = (
