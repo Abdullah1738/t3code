@@ -3,6 +3,7 @@
 
 generate  writes the homes; prints one line per file or link that changed.
 check     verifies the homes against the manifest; exit 1 lists each failure.
+mcp-diff  compares the manifest's mcpServers with OpenCode's "mcp" config.
 
 Stdlib only. Never reads or writes the personal homes (~/.claude, ~/.codex,
 /Volumes/ExternalSSD/codex). Auth lives in the instance environment, not here.
@@ -31,6 +32,7 @@ CODEX_MODEL_KEYS = ("context_window", "max_context_window")
 HARNESSES = ("claude", "codex", "codex-cu")
 NODE_REPL = "node_repl"
 PARITY_MANIFEST = "parity-manifest.json"
+DEFAULT_OPENCODE_CONFIG = "~/.config/opencode/opencode.jsonc"
 
 
 class HomeError(Exception):
@@ -574,6 +576,189 @@ def validate_manifest(manifest: dict) -> None:
             raise HomeError("PostToolUseFailure is only supported by Claude")
         if not os.path.isabs(h["command"]):
             raise HomeError(f"hook command must be an absolute path: {h['command']}")
+    if "mcpParity" in manifest:
+        parity = manifest["mcpParity"]
+        if not isinstance(parity, dict) or not isinstance(parity.get("opencodeConfig", ""), str):
+            raise HomeError("mcpParity must be an object with a string opencodeConfig")
+        ignore = parity.get("ignore", [])
+        if not isinstance(ignore, list) or not all(isinstance(i, str) for i in ignore):
+            raise HomeError("mcpParity.ignore must be a list of MCP ids")
+
+
+# ---------- MCP parity with OpenCode ----------
+
+def strip_jsonc(text: str) -> str:
+    """Turn JSONC into JSON: drop // and /* */ comments and trailing commas, never inside strings."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    if text.startswith("\ufeff"):
+        i = 1
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise ValueError(f"unterminated string starting at offset {i}")
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j  # keep the newline so line numbers in errors still match
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError(f"unterminated /* comment starting at offset {i}")
+            out.append("\n" * text.count("\n", i, j))
+            i = j + 2
+        else:
+            out.append(c)
+            i += 1
+    stripped = "".join(out)
+    # Second pass: comments are gone, so a comma followed only by whitespace and } or ] is trailing.
+    result: list[str] = []
+    i, n = 0, len(stripped)
+    while i < n:
+        c = stripped[i]
+        if c == '"':
+            j = i + 1
+            while j < n and stripped[j] != '"':
+                j += 2 if stripped[j] == "\\" else 1
+            result.append(stripped[i:j + 1])
+            i = j + 1
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and stripped[j] in " \t\r\n":
+                j += 1
+            if j < n and stripped[j] in "}]":
+                i += 1
+                continue
+        result.append(c)
+        i += 1
+    return "".join(result)
+
+
+def loads_jsonc(text: str):
+    return json.loads(strip_jsonc(text))
+
+
+def redact(value: str) -> str:
+    return SECRET_RE.sub("[redacted]", value)
+
+
+def native_mcp_view(server: dict) -> dict:
+    if "url" in server:
+        return {"kind": "url", "url": server["url"]}
+    return {"kind": "command", "command": server["command"], "args": list(server.get("args", [])),
+            "envKeys": sorted(server.get("env") or {})}
+
+
+def opencode_mcp_view(entry) -> dict:
+    """Normalise one OpenCode `mcp` entry. OpenCode treats a missing `enabled` as enabled."""
+    if not isinstance(entry, dict):
+        return {"kind": "invalid", "enabled": True, "error": "entry is not an object"}
+    enabled = entry.get("enabled", True) is not False
+    if "url" in entry and "command" not in entry:
+        return {"kind": "url", "url": entry["url"], "enabled": enabled}
+    command = entry.get("command")
+    if "url" not in entry and isinstance(command, list) and command and all(isinstance(p, str) for p in command):
+        return {"kind": "command", "command": command[0], "args": command[1:],
+                "envKeys": sorted(entry.get("environment") or {}), "enabled": enabled}
+    return {"kind": "invalid", "enabled": enabled,
+            "error": "needs exactly one of url or a non-empty string command list"}
+
+
+def opencode_config_path(manifest: dict, override: str | None) -> str:
+    if override:
+        return expand(override)
+    return expand((manifest.get("mcpParity") or {}).get("opencodeConfig") or DEFAULT_OPENCODE_CONFIG)
+
+
+def load_opencode_mcp(path: str) -> dict[str, dict]:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HomeError(f"cannot read opencode config {path} ({exc.strerror or exc})") from exc
+    except UnicodeDecodeError as exc:
+        raise HomeError(f"cannot read opencode config {path} (not UTF-8: {exc})") from exc
+    try:
+        config = loads_jsonc(text)
+    except ValueError as exc:
+        raise HomeError(f"cannot parse opencode config {path} ({exc})") from exc
+    if not isinstance(config, dict):
+        raise HomeError(f"opencode config {path} must hold a JSON object")
+    mcp = config.get("mcp", {})
+    if not isinstance(mcp, dict):
+        raise HomeError(f"opencode config {path}: \"mcp\" must be an object")
+    return {key: opencode_mcp_view(value) for key, value in mcp.items()}
+
+
+def compare_mcp(manifest: dict, opencode: dict[str, dict]) -> tuple[list[dict], list[str]]:
+    """Per-id rows and failure strings. Disabled OpenCode entries count as absent."""
+    ignore = set((manifest.get("mcpParity") or {}).get("ignore", []))
+    native = {s["id"]: native_mcp_view(s) for s in manifest["mcpServers"]}
+    rows: list[dict] = []
+    failures: list[str] = []
+    for mcp_id in sorted(native.keys() | opencode.keys()):
+        oc, nat = opencode.get(mcp_id), native.get(mcp_id)
+        problems: list[str] = []
+        oc_on = oc is not None and oc["enabled"]
+        if mcp_id in ignore:
+            status = "ignored"
+        elif oc_on and nat is None:
+            status = "opencode-only"
+            problems.append(f"opencode has {mcp_id}, native manifest lacks it")
+        elif nat is not None and not oc_on:
+            status = "native-only"
+            why = " (disabled in opencode)" if oc is not None else ""
+            problems.append(f"native manifest has {mcp_id}, opencode lacks it{why}")
+        elif nat is None:
+            status = "disabled"  # only a disabled OpenCode entry: absent on both sides
+        else:
+            if oc["kind"] == "invalid":
+                problems.append(f"{mcp_id} opencode entry is invalid: {oc['error']}")
+            elif oc["kind"] != nat["kind"]:
+                problems.append(f"{mcp_id} transport differs (opencode {oc['kind']}, native {nat['kind']})")
+            elif nat["kind"] == "url":
+                if oc["url"] != nat["url"]:
+                    problems.append(f"{mcp_id} url differs (opencode {oc['url']}, native {nat['url']})")
+            else:
+                if oc["command"] != nat["command"]:
+                    problems.append(f"{mcp_id} command differs (opencode {oc['command']}, native {nat['command']})")
+                if oc["args"] != nat["args"]:
+                    problems.append(f"{mcp_id} args differ (opencode {json.dumps(oc['args'])}, "
+                                    f"native {json.dumps(nat['args'])})")
+                if oc["envKeys"] != nat["envKeys"]:
+                    problems.append(f"{mcp_id} env keys differ (opencode {oc['envKeys']}, native {nat['envKeys']})")
+            status = "mismatch" if problems else "ok"
+        problems = [redact(p) for p in problems]
+        failures.extend(f"mcp parity: {p}" for p in problems)
+        rows.append({"id": mcp_id, "status": status, "opencode": oc, "native": nat, "problems": problems})
+    return rows, failures
+
+
+def mcp_parity(manifest: dict, override: str | None) -> tuple[str, list[dict], list[str]]:
+    """Return (config path, rows, failures). An unreadable config is one failure (fail closed)."""
+    path = opencode_config_path(manifest, override)
+    try:
+        opencode = load_opencode_mcp(path)
+    except HomeError as exc:
+        return path, [], [f"mcp parity: {exc}"]
+    rows, failures = compare_mcp(manifest, opencode)
+    return path, rows, failures
+
+
+def parity_applies(manifest: dict, home_root: str | None, override: str | None) -> bool:
+    """Parity is about the live OpenCode config, so it runs for the configured homes.
+
+    A --home-root run (tests, the harness-cli canary in a throwaway HOME) skips it unless
+    --opencode-config names the config to compare against.
+    """
+    if override:
+        return True
+    return "mcpParity" in manifest and not home_root
 
 
 def build(manifest: dict, homes: dict[str, str]) -> dict:
@@ -762,7 +947,19 @@ class Writer:
             os.unlink(path)
 
 
-def generate(home_root: str | None, dry_run: bool) -> int:
+def warn_mcp_parity(manifest: dict, home_root: str | None, override: str | None) -> None:
+    """generate never fails because of parity; drift is a stderr warning only."""
+    if not parity_applies(manifest, home_root, override):
+        return
+    try:
+        _, _, failures = mcp_parity(manifest, override)
+    except Exception as exc:  # noqa: BLE001 - a parity bug must never block generation
+        failures = [f"mcp parity: comparison failed ({exc})"]
+    for msg in failures:
+        print(f"warning: {msg}", file=sys.stderr)
+
+
+def generate(home_root: str | None, dry_run: bool, opencode_config: str | None = None) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     farms = [os.path.join(home, "skills") for home in homes.values()]
     guard_outputs([*homes.values(), *farms, *files])
@@ -782,17 +979,20 @@ def generate(home_root: str | None, dry_run: bool) -> int:
                 writer.unlink(op[1])
             else:
                 writer.link(op[1], op[2])
+    warn_mcp_parity(manifest, home_root, opencode_config)
     return 0
 
 
 # ---------- check ----------
 
-def check(home_root: str | None, *, json_output: bool = False) -> int:
+def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
     if unreadable:
         failures.append("skills: could not inspect " + ", ".join(unreadable))
+    if parity_applies(manifest, home_root, opencode_config):
+        failures.extend(mcp_parity(manifest, opencode_config)[2])
 
     # Compare complete owned structures, not just MCP IDs or the extended slugs.
     # build() incorporates the Claude foreign keys and each Codex trust state.
@@ -856,23 +1056,80 @@ def check(home_root: str | None, *, json_output: bool = False) -> int:
     return 0
 
 
+def describe_side(view: dict | None) -> str:
+    if view is None:
+        return "absent"
+    if view["kind"] == "invalid":
+        text = f"invalid: {view['error']}"
+    elif view["kind"] == "url":
+        text = f"url {view['url']}"
+    else:
+        text = "command " + " ".join([view["command"], *view["args"]])
+        if view["envKeys"]:
+            text += f" env[{', '.join(view['envKeys'])}]"
+    if view.get("enabled") is False:
+        text += " (disabled)"
+    return redact(text)
+
+
+def mcp_diff(*, json_output: bool, opencode_config: str | None) -> int:
+    """Read-only: print both sides per id. Exit 0 in parity, 1 on any drift or unreadable config."""
+    manifest = load_manifest()
+    validate_manifest(manifest)
+    path, rows, failures = mcp_parity(manifest, opencode_config)
+    ignore = sorted((manifest.get("mcpParity") or {}).get("ignore", []))
+    if json_output:
+        print(json.dumps({"schemaVersion": 1, "ok": not failures, "opencodeConfig": path,
+                          "ignore": ignore, "servers": rows, "failures": failures}))
+        return 1 if failures else 0
+    print(f"opencode: {path}")
+    print("native:   manifest.json mcpServers (claude, codex, codex-cu)")
+    if ignore:
+        print(f"ignore:   {', '.join(ignore)}")
+    for row in rows:
+        print(f"{row['status'].upper():<13} {row['id']}")
+        print(f"    opencode  {describe_side(row['opencode'])}")
+        print(f"    native    {describe_side(row['native'])}")
+        for problem in row["problems"]:
+            print(f"    FAIL      {problem}")
+    if not rows and failures:
+        for msg in failures:
+            print(f"FAIL {msg}")
+    if failures:
+        print(f"DRIFT {len(failures)} mcp parity failure(s)")
+        return 1
+    print(f"OK {sum(r['status'] == 'ok' for r in rows)} MCP servers in parity")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
+    oc_help = ("OpenCode config to compare MCPs against (default: manifest mcpParity.opencodeConfig); "
+               "with --home-root, parity runs only when this is given")
     gen = sub.add_parser("generate", help="write the homes")
     gen.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     gen.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
+    gen.add_argument("--opencode-config", help=oc_help)
     chk = sub.add_parser("check", help="verify the homes; exit 1 on failure")
     chk.add_argument("--home-root", help="replaces ~/.robob/harness-homes (tests use this)")
     chk.add_argument("--json", action="store_true", help="emit the existing check result as JSON")
+    chk.add_argument("--opencode-config", help=oc_help)
+    diff = sub.add_parser("mcp-diff", help="compare manifest mcpServers with OpenCode's mcp config")
+    diff.add_argument("--json", action="store_true", help="emit the comparison as JSON")
+    diff.add_argument("--opencode-config", help="OpenCode config path (default: manifest mcpParity.opencodeConfig)")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "generate":
-            return generate(args.home_root, args.dry_run)
-        return check(args.home_root, json_output=args.json)
+            return generate(args.home_root, args.dry_run, args.opencode_config)
+        if args.cmd == "mcp-diff":
+            return mcp_diff(json_output=args.json, opencode_config=args.opencode_config)
+        return check(args.home_root, json_output=args.json, opencode_config=args.opencode_config)
     except HomeError as exc:
         if args.cmd == "check" and args.json:
             print(json.dumps({"schemaVersion": 1, "ok": False, "failures": [str(exc)], "homes": []}))
+        elif args.cmd == "mcp-diff" and args.json:
+            print(json.dumps({"schemaVersion": 1, "ok": False, "failures": [str(exc)], "servers": []}))
         else:
             print(f"error: {exc}", file=sys.stderr)
         return 1

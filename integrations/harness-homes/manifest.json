@@ -22,6 +22,10 @@
     {"id": "cua-driver", "command": "/Users/ardud/.local/bin/cua-driver", "args": ["mcp"], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},
     {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
   ],
+  "mcpParity": {
+    "opencodeConfig": "~/.config/opencode/opencode.jsonc",
+    "ignore": []
+  },
   "shellPathPrefix": [
     "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
     "/Users/ardud/.local/share/harness-hooks/coord-blockers"

@@ -1074,5 +1074,262 @@ class ParityTests(HarnessTestCase):
         self.assertFalse(self.root.exists())
 
 
+def opencode_entry(server: dict) -> dict:
+    """The OpenCode `mcp` form of a manifest server."""
+    if "url" in server:
+        return {"type": "remote", "url": server["url"], "enabled": True}
+    entry = {"type": "local", "command": [server["command"], *server["args"]], "enabled": True}
+    if server.get("env"):
+        entry["environment"] = dict(server["env"])
+    return entry
+
+
+class McpParityTests(HarnessTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.oc_path = self.home / ".config/opencode/opencode.jsonc"
+        self.mcp = {s["id"]: opencode_entry(s) for s in self.manifest()["mcpServers"]}
+        self.write_oc()
+
+    def write_oc(self, mcp: dict | None = None, *, raw: str | None = None) -> None:
+        if raw is None:
+            body = json.dumps({"$schema": "https://opencode.ai/config.json",
+                               "mcp": self.mcp if mcp is None else mcp}, indent=2)
+            # Real-world JSONC: comments everywhere and trailing commas.
+            body = body.replace('"mcp": {', '// MCP servers live here\n  "mcp": { /* block\n comment */', 1)
+            body = body.replace("\n  }\n}", ",\n  },\n}\n// trailing comment")
+            raw = body
+        write(self.oc_path, raw)
+
+    def check(self, manifest: dict | None = None, json_output: bool = False) -> tuple[int, str]:
+        args = ["check", "--home-root", str(self.root), "--opencode-config", str(self.oc_path)]
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(args + (["--json"] if json_output else []))
+        return rc, out.getvalue()
+
+    def diff(self, manifest: dict | None = None) -> tuple[int, dict]:
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["mcp-diff", "--json", "--opencode-config", str(self.oc_path)])
+        return rc, json.loads(out.getvalue())
+
+    def gen(self) -> tuple[str, str]:
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gh.main(["generate", "--home-root", str(self.root), "--opencode-config", str(self.oc_path)])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue(), err.getvalue()
+
+    def test_manifest_declares_parity_against_opencode_config(self) -> None:
+        manifest = self.manifest()
+        self.assertEqual(manifest["mcpParity"], {"opencodeConfig": "~/.config/opencode/opencode.jsonc", "ignore": []})
+        gh.validate_manifest(manifest)
+
+    def test_matching_sets_pass_check_and_diff(self) -> None:
+        _, err = self.gen()
+        self.assertEqual(err, "")
+        rc, out = self.check()
+        self.assertEqual(rc, 0, out)
+        rc, result = self.check(json_output=True)
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(json.loads(result)["failures"], [])
+        rc, diff = self.diff()
+        self.assertEqual(rc, 0, diff)
+        self.assertEqual({row["id"] for row in diff["servers"]}, set(self.mcp))
+        self.assertTrue(all(row["status"] == "ok" for row in diff["servers"]))
+
+    def test_opencode_only_server_fails_check(self) -> None:
+        self.mcp["newthing"] = {"type": "local", "command": ["/bin/newthing"], "enabled": True}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: opencode has newthing, native manifest lacks it", out)
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        self.assertEqual(next(r for r in diff["servers"] if r["id"] == "newthing")["status"], "opencode-only")
+
+    def test_native_only_server_fails_check_json(self) -> None:
+        del self.mcp["inbody"]
+        self.write_oc()
+        self.gen()
+        rc, out = self.check(json_output=True)
+        result = json.loads(out)
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("mcp parity: native manifest has inbody, opencode lacks it", result["failures"])
+
+    def test_disabled_opencode_entry_counts_as_absent(self) -> None:
+        self.mcp["inbody"]["enabled"] = False
+        self.mcp["oldthing"] = {"type": "remote", "url": "https://old.example/mcp", "enabled": False}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("native manifest has inbody, opencode lacks it (disabled in opencode)", out)
+        self.assertNotIn("oldthing", out)
+        manifest = self.manifest()
+        manifest["mcpServers"] = [s for s in manifest["mcpServers"] if s["id"] != "inbody"]
+        self.run_gen(manifest)
+        self.assertEqual(self.check(manifest)[0], 0)
+
+    def test_missing_enabled_key_means_enabled(self) -> None:
+        self.mcp["recall"].pop("enabled")
+        self.mcp["extra"] = {"type": "remote", "url": "https://x.example/mcp"}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("opencode has extra", out)
+        self.assertNotIn("recall", out)
+
+    def test_ignore_list_is_honored_on_both_sides(self) -> None:
+        self.mcp["opencode-only-tool"] = {"type": "local", "command": ["/bin/tool"], "enabled": True}
+        del self.mcp["flighty"]
+        self.write_oc()
+        manifest = self.manifest()
+        manifest["mcpParity"]["ignore"] = ["opencode-only-tool", "flighty"]
+        self.run_gen(manifest)
+        rc, out = self.check(manifest)
+        self.assertEqual(rc, 0, out)
+        rc, diff = self.diff(manifest)
+        self.assertEqual(rc, 0, diff)
+        statuses = {row["id"]: row["status"] for row in diff["servers"]}
+        self.assertEqual(statuses["opencode-only-tool"], "ignored")
+        self.assertEqual(statuses["flighty"], "ignored")
+
+    def test_url_transport_command_and_args_mismatches_are_reported(self) -> None:
+        self.mcp["recall"]["url"] = "http://127.0.0.1:9999/mcp"
+        self.mcp["betterstack"] = {"type": "local", "command": ["/bin/betterstack"], "enabled": True}
+        self.mcp["inbody"]["command"] = ["/usr/local/bin/inbody-mcp"]
+        self.mcp["cua-driver"]["command"] = [self.mcp["cua-driver"]["command"][0], "serve"]
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: recall url differs (opencode http://127.0.0.1:9999/mcp, "
+                      "native http://127.0.0.1:18765/mcp)", out)
+        self.assertIn("mcp parity: betterstack transport differs (opencode command, native url)", out)
+        self.assertIn("mcp parity: inbody command differs (opencode /usr/local/bin/inbody-mcp, "
+                      "native /Users/ardud/bin/inbody-mcp)", out)
+        self.assertIn('cua-driver args differ (opencode ["serve"], native ["mcp"])', out)
+        rc, diff = self.diff()
+        self.assertEqual(next(r for r in diff["servers"] if r["id"] == "recall")["status"], "mismatch")
+
+    def test_env_key_drift_is_reported_without_values(self) -> None:
+        self.mcp["dia"]["environment"] = {"OTHER": "sk-abcdefghijklmnop"}
+        self.write_oc()
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        text = json.dumps(diff)
+        self.assertIn("dia env keys differ", text)
+        self.assertNotIn("sk-abcdefghijklmnop", text)
+
+    def test_unparseable_config_fails_check_but_not_generate(self) -> None:
+        self.write_oc(raw='{"mcp": {"recall": {"url": "http://x" "oops"}}}')
+        out, err = self.gen()
+        self.assertIn("warning: mcp parity: cannot parse opencode config", err)
+        self.assertTrue((self.claude / ".claude.json").exists())
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: cannot parse opencode config", out)
+        rc, result = self.check(json_output=True)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("cannot parse" in f for f in json.loads(result)["failures"]))
+
+    def test_missing_config_fails_closed(self) -> None:
+        self.oc_path.unlink()
+        _, err = self.gen()
+        self.assertIn("warning: mcp parity: cannot read opencode config", err)
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: cannot read opencode config", out)
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        self.assertFalse(diff["ok"])
+
+    def test_generate_warns_on_drift_and_still_writes(self) -> None:
+        del self.mcp["dia"]
+        self.write_oc()
+        _, err = self.gen()
+        self.assertIn("warning: mcp parity: native manifest has dia, opencode lacks it", err)
+        self.assertIn("dia", json.loads((self.claude / ".claude.json").read_text())["mcpServers"])
+
+    def test_configured_homes_use_manifest_path_and_home_root_runs_skip_parity(self) -> None:
+        # A --home-root run without --opencode-config (tests, harness-cli canary) never compares.
+        self.oc_path.unlink()
+        self.run_gen()
+        self.assertEqual(self.run_check()[0], 0)
+        # The configured homes use mcpParity.opencodeConfig, expanded under HOME.
+        manifest = self.manifest()
+        self.write_oc()
+        self.assertEqual(gh.opencode_config_path(manifest, None), str(self.oc_path))
+        self.assertTrue(gh.parity_applies(manifest, None, None))
+        self.assertFalse(gh.parity_applies(manifest, str(self.root), None))
+        del manifest["mcpParity"]
+        self.assertFalse(gh.parity_applies(manifest, None, None))
+
+    def test_human_diff_lists_both_sides(self) -> None:
+        self.mcp["recall"]["url"] = "http://127.0.0.1:1/mcp"
+        self.write_oc()
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["mcp-diff", "--opencode-config", str(self.oc_path)])
+        text = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH      recall", text)
+        self.assertIn("opencode  url http://127.0.0.1:1/mcp", text)
+        self.assertIn("native    url http://127.0.0.1:18765/mcp", text)
+        self.assertIn("DRIFT 1 mcp parity failure(s)", text)
+
+    def test_invalid_parity_block_is_refused(self) -> None:
+        manifest = self.manifest()
+        manifest["mcpParity"]["ignore"] = "recall"
+        with self.assertRaises(gh.HomeError):
+            gh.validate_manifest(manifest)
+
+
+class JsoncTests(unittest.TestCase):
+    def test_slashes_inside_strings_are_kept(self) -> None:
+        text = '''{
+          // a comment with "quotes" and https://x
+          "url": "https://mcp.example.com//path", /* inline */ "glob": "a/*b*/c",
+          "esc": "quote \\" // not a comment",
+          "list": [1, 2, 3,],
+          "obj": {"a": 1,
+            // trailing comment before brace
+          },
+        }'''
+        self.assertEqual(gh.loads_jsonc(text), {
+            "url": "https://mcp.example.com//path", "glob": "a/*b*/c",
+            "esc": 'quote " // not a comment', "list": [1, 2, 3], "obj": {"a": 1}})
+
+    def test_comma_inside_string_before_brace_is_kept(self) -> None:
+        self.assertEqual(gh.loads_jsonc('{"a": ",}", "b": [",]"],}'), {"a": ",}", "b": [",]"]})
+
+    def test_bom_and_trailing_backslash_escape(self) -> None:
+        self.assertEqual(gh.loads_jsonc('\ufeff{"p": "C:\\\\dir\\\\", // c\n}'), {"p": "C:\\dir\\"})
+
+    def test_errors(self) -> None:
+        for bad in ('{"a": 1 /* never closed', '{"a": "never closed', '{"a" 1}', ""):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gh.loads_jsonc(bad)
+
+    def test_live_style_opencode_block_parses(self) -> None:
+        text = '''{
+          "$schema": "https://opencode.ai/config.json",
+          "mcp": {
+            // Recall: search over past sessions
+            "recall": {"type": "remote", "url": "http://127.0.0.1:18765/mcp", "enabled": true},
+            "dia": {"type": "local", "command": ["/node", "/srv.js"], "environment": {"K": "v"}, "enabled": true},
+          },
+        }'''
+        mcp = gh.loads_jsonc(text)["mcp"]
+        self.assertEqual(gh.opencode_mcp_view(mcp["recall"]), {"kind": "url", "url": "http://127.0.0.1:18765/mcp", "enabled": True})
+        self.assertEqual(gh.opencode_mcp_view(mcp["dia"]), {"kind": "command", "command": "/node", "args": ["/srv.js"],
+                                                            "envKeys": ["K"], "enabled": True})
+
+
 if __name__ == "__main__":
     unittest.main()

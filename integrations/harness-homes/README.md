@@ -18,7 +18,8 @@ instance's environment, and OAuth state stays in the home it was created in.
   service), PATH, hooks, Codex model extension, Claude knobs.
 - `generate_homes.py`: `generate [--home-root DIR] [--dry-run]` writes all homes
   idempotently (atomic writes, one line per changed file). `check [--home-root DIR]`
-  compares their owned contents with the manifest and catalog.
+  compares their owned contents with the manifest and catalog. `mcp-diff`
+  compares the manifest's MCPs with OpenCode's (see "MCP parity with OpenCode").
 - `vendor/codex-models-0.166.0.json`: Codex's model catalog at rust-v0.166.0
   (Apache-2.0). `vendor/README.md` has the URL and sha256.
 - `overlays/claude.md`, `overlays/codex.md`, `overlays/codex-cu.md`:
@@ -64,6 +65,32 @@ Each parity manifest has schema version 1 and these fields:
 - `guards: [{id, sources: [{path, sha256}]}]` and harness-filtered `hooks`.
 - `instructions: {canonical: {path, sha256}, overlays: [{path, sha256}]}`.
 - `compactSkillCatalog: {required: false, reason}`.
+
+## MCP parity with OpenCode
+
+OpenCode keeps its MCPs in `~/.config/opencode/opencode.jsonc` (top-level
+`mcp`); the native homes get theirs from `mcpServers` here. The manifest's
+`mcpParity` block (`{"opencodeConfig": "...", "ignore": []}`) makes `check`
+and `check --json` fail until both sides list the same servers, so an MCP
+added in one place cannot quietly miss the other harnesses.
+
+- Ids are compared as sets. An OpenCode entry with `"enabled": false` counts
+  as absent (a missing `enabled` means enabled). Ids in `ignore` are skipped on
+  both sides; use it only for servers meant to live in one place.
+- For shared ids it also compares transport (`url` vs `command`), the url or
+  command path, args, and env key names (never values).
+- A missing or unparseable OpenCode config is a check failure (fail closed).
+  `generate` never fails on parity; it prints `warning: mcp parity: ...` on stderr.
+- `mcp-diff [--json] [--opencode-config PATH]` prints both sides per id with a
+  status (`ok`, `mismatch`, `opencode-only`, `native-only`, `ignored`,
+  `disabled`); exit 1 on drift. It is read-only.
+- Parity follows the configured homes. A `--home-root` run (tests, the
+  harness-cli canary) skips it unless `--opencode-config PATH` is given.
+- The JSONC reader is stdlib-only: it strips `//` and `/* */` comments outside
+  strings and trailing commas, then uses `json`.
+
+To fix drift, add the server to whichever side lacks it (or to `ignore`), then
+run `generate` so the homes pick it up.
 
 Readiness consumers should run the existing generator check, not trust a
 standalone `ok` flag in an old artifact. These checks prove config/source
