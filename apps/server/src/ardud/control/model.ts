@@ -150,7 +150,13 @@ export function modelSelectionFrom(input: {
     };
   }
   if (!selectionMigrationApplies(input.settings)) {
-    const instanceId = (input.instanceId ?? input.base.instanceId) as ModelSelection["instanceId"];
+    // A "provider/model" id only exists on OpenCode. Without this, a native
+    // default instance (claudeAgent since 6 Nov) paired with an OpenCode id and
+    // every turn failed (card #586). Same rule as the migration branch below.
+    const instanceId = (input.instanceId ??
+      (input.model?.includes("/")
+        ? "opencode"
+        : input.base.instanceId)) as ModelSelection["instanceId"];
     const model = input.model ?? input.base.model;
     const same = instanceId === input.base.instanceId && model === input.base.model;
     const source = input.options ?? (same ? (input.base.options ?? []) : []);

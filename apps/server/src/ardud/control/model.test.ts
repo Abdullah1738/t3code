@@ -297,6 +297,35 @@ describe("effort compatibility", () => {
     expect(result.kind).toBe("conflict");
   });
 
+  it("routes a provider/model id to OpenCode on the old path when the default is native (#586)", () => {
+    const nativeDefault: ModelSelection = {
+      instanceId: "claudeAgent",
+      model: "claude-opus-5-5",
+    } as ModelSelection;
+    expect(
+      selectionOf(
+        modelSelectionFrom({ base: nativeDefault, model: "opus/claude-opus-5-5", variant: "high" }),
+      ),
+    ).toEqual({
+      instanceId: "opencode",
+      model: "opus/claude-opus-5-5",
+      options: [{ id: "variant", value: "high" }],
+    });
+    expect(
+      selectionOf(
+        modelSelectionFrom({
+          base: nativeDefault,
+          model: "opus/claude-opus-5-5",
+          instanceId: "claudeAgent",
+        }),
+      ).instanceId,
+    ).toBe("claudeAgent");
+    expect(
+      selectionOf(modelSelectionFrom({ base: nativeDefault, model: "claude-sonnet-5-5" }))
+        .instanceId,
+    ).toBe("claudeAgent");
+  });
+
   it("uses the typed flag, keeping absent, off and dryrun on the old path", () => {
     for (const legacySettings of [
       undefined,
