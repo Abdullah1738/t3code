@@ -99,9 +99,12 @@ All Robob state readers, including recall (`RECALL_STATE_DB` overrides the share
 setting), identity capture, native transcript reports and the backup table dump,
 refuse the live database and its filesystem aliases. They never fall back when
 the export is missing. State readers require `ardud_readonly_meta.ready=1` and an
-ISO `updated_at` within two minutes. The server must clear readiness while paging
-and publish a fresh timestamp only after catchup completes; recall rebuilds its
-lineage cache at that boundary or when the file is replaced. Backup coverage is limited to tables
+ISO `updated_at` within two minutes. The server clears readiness during the first
+bootstrap, event resets and source/schema changes. A routine refresh of a ready
+export runs in one replica transaction, so readers keep seeing the previous
+complete generation (`ready=1`, old `updated_at`) until it commits. `updated_at`
+advances only when a cycle completes, so a stalled exporter still goes stale.
+Recall rebuilds its lineage cache at each new `updated_at` or when the file is replaced. Backup coverage is limited to tables
 the server exports; missing tables are logged, not read from the live database.
 OpenCode capture and native lineage/activity readers use the separate native
 export (`session_v2`, `session_message`, inbox/pending tables), not Robob's

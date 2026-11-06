@@ -139,7 +139,7 @@ test("a Stop committed during a sweep is included before publishing readiness", 
   ).toBe("2");
 });
 
-test("a published reader snapshot stays fixed while the next generation is unavailable", () => {
+test("a published reader snapshot stays fixed while the next generation is in flight", () => {
   const f = fixture();
   f.finish();
   const reader = f.connect();
@@ -150,13 +150,136 @@ test("a published reader snapshot stays fixed while the next generation is unava
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
   f.exporter.step();
   const next = f.connect();
+  // A routine cycle is invisible until it completes: still the old generation.
   expect(next.prepare("SELECT value FROM ardud_readonly_meta WHERE key='ready'").get()?.value).toBe(
-    "0",
+    "1",
   );
+  expect(next.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
   f.finish();
   expect(reader.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
   expect(next.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
   reader.exec("ROLLBACK");
+});
+
+const metaValue = (db: NodeSqlite.DatabaseSync, key: string) =>
+  db.prepare("SELECT value FROM ardud_readonly_meta WHERE key=?").get(key)?.value;
+
+test("first bootstrap stays unready until every projection is exported", () => {
+  const f = fixture();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "updated_at")).toBeUndefined();
+  let steps = 0;
+  while (f.exporter.step()) {
+    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "updated_at")).toBeUndefined();
+    if (++steps > 500) throw new Error("export did not converge");
+  }
+  expect(steps).toBeGreaterThan(1);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBeDefined();
+});
+
+test("routine refresh cycles keep ready=1 and only advance updated_at at cycle end", () => {
+  const f = fixture();
+  let now = Date.parse("2026-11-06T10:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const published = metaValue(out, "updated_at");
+  expect(published).toBe("2026-11-06T10:00:00.000Z");
+  const generation = Number(metaValue(out, "generation"));
+  now += 15_000;
+  f.source.exec(`INSERT INTO scheduled_tasks VALUES ('task','a');
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"new"}' WHERE thread_id='a';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{"id":"a"}');`);
+  let steps = 0;
+  while (f.exporter.step()) {
+    steps++;
+    // Every mid-cycle read sees the previous, complete generation.
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "updated_at")).toBe(published);
+    expect(metaValue(out, "sequence")).toBe("1");
+    expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
+    expect(
+      out
+        .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+        .get()?.payload_json,
+    ).toBe('{"title":"old"}');
+    if (steps > 500) throw new Error("export did not converge");
+  }
+  expect(steps).toBeGreaterThan(1);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:15.000Z");
+  expect(metaValue(out, "sequence")).toBe("2");
+  expect(Number(metaValue(out, "generation"))).toBeGreaterThan(generation);
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
+  // An idle cycle still publishes a newer generation stamp.
+  now += 15_000;
+  f.finish();
+  expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:30.000Z");
+});
+
+test("a compacted event gap clears readiness until the reset and rebuild finish", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  const published = metaValue(out, "updated_at");
+  f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','a','{}')");
+  expect(f.exporter.step()).toBe(true);
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "resetting_events")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe(published);
+  // A worker restart in the middle of the reset must not republish it.
+  f.restart();
+  expect(metaValue(out, "ready")).toBe("0");
+  let steps = 0;
+  while (f.exporter.step()) {
+    expect(metaValue(out, "ready")).toBe("0");
+    if (++steps > 500) throw new Error("export did not converge");
+  }
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "resetting_events")).toBe("0");
+  expect(metaValue(out, "sequence")).toBe("4");
+});
+
+test("reopening a published replica keeps it ready; an abandoned cycle is discarded", () => {
+  const f = fixture();
+  let now = Date.parse("2026-11-06T10:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  f.restart();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:00.000Z");
+  now += 15_000;
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  expect(f.exporter.step()).toBe(true);
+  // Worker dies mid-cycle: readers keep the last generation, which only ages.
+  f.restart();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:00.000Z");
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
+  now += 15_000;
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:30.000Z");
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
+});
+
+test("a source schema change mid-cycle discards the cycle and clears readiness", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  expect(f.exporter.step()).toBe(true);
+  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  expect(() => f.exporter.step()).toThrow("schema changed");
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
+  expect(() => f.exporter.step()).toThrow("schema changed");
+  expect(() => f.restart()).toThrow("schema changed");
+  expect(metaValue(out, "ready")).toBe("0");
 });
 
 test("small table deletions and a compacted event gap converge without publishing partial data", () => {
