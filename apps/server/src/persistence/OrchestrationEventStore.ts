@@ -299,9 +299,19 @@ const makeEventStore = Effect.gen(function* () {
     THEN json_set(
       json_remove(orchestration_events.payload_json, '$.promptSequence'),
       '$.prompt',
-      (SELECT json_extract(anchor.payload_json, '$.prompt')
-       FROM ardud_history_events AS anchor
-       WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence'))
+      -- Probe each store by key. Correlating against the history view makes
+      -- SQLite materialise the whole union (90s+ per replay on a split DB).
+      COALESCE(
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM main.orchestration_events AS anchor
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence')),
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM ardud_archive.ardud_events AS anchor INDEXED BY ardud_events_sequence_idx
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence')),
+        (SELECT json_extract(anchor.payload_json, '$.prompt')
+         FROM ardud_base.orchestration_events AS anchor
+         WHERE anchor.sequence = json_extract(orchestration_events.payload_json, '$.promptSequence'))
+      )
     )
     ELSE orchestration_events.payload_json
   END`;
