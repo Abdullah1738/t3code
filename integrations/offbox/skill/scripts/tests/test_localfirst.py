@@ -322,9 +322,10 @@ class DecideTests(Isolated):
             self.assertIn("load", localfirst.decide(a, self.me, self.cwd))
         busy = REAL_CPU_BUSY(0.05)
         self.assertTrue(busy is None or 0.0 <= busy <= 1.0)
-        # a long Docker run that started 3 h ago but ended a minute ago still counts
-        self.con.execute("""INSERT INTO runs(run_id,repo_root,mode,status,start_at,end_at,cmd)
-            VALUES ('d',?,'fg','done',strftime('%s','now')-10800,strftime('%s','now')-60,'docker run -d pg')""",
+        # a long Docker run that started 3 h ago but ended a minute ago still counts (docker=1: it started a
+        # container; runs.finish clears the flag for runs that didn't)
+        self.con.execute("""INSERT INTO runs(run_id,repo_root,mode,status,start_at,end_at,cmd,docker)
+            VALUES ('d',?,'fg','done',strftime('%s','now')-10800,strftime('%s','now')-60,'docker run -d pg',1)""",
                          (self.cwd,))
         self.con.commit()
         self.assertIn("docker", localfirst.decide(a, self.me, self.cwd))

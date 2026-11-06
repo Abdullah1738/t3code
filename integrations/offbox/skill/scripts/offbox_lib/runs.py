@@ -395,12 +395,26 @@ def exit_recording_command(script: str, run_id: str) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
+    dk = f'"$HOME/.offbox/exit/{run_id}.dk"'
     outer = "\n".join([
         'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
-        'find "$HOME/.offbox/exit" -name "*.rc" -mtime +2 -delete 2>/dev/null',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" \\) -mtime +2 -delete 2>/dev/null',
+        '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
         f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        # Whether a container started during the run (events, since testcontainers removes its own): only then
+        # does the box get the longer Docker idle window. <run>.dk holds "1" (a container started) or "0" (the query
+        # answered, or dockerd is plainly inactive: none did). No file = unknown (failed/odd dockerd state, timeout,
+        # error): offbox keeps the Docker window.
+        # dockerd is only asked while it runs: the docker CLI would socket-activate it on every run otherwise.
+        'if systemctl is-active --quiet docker 2>/dev/null; then',
+        '  __offbox_ev=$(timeout 5 docker events --since "$__offbox_t0" --until "$(( $(date +%s) + 1 ))" '
+        '--filter type=container --filter event=start --format x 2>/dev/null) && '
+        f'{{ [ -n "$__offbox_ev" ] && echo 1 || echo 0; }} > {dk} 2>/dev/null',
+        'elif [ "$(systemctl is-active docker 2>/dev/null)" = inactive ]; then',
+        f'  echo 0 > {dk} 2>/dev/null',
+        'fi',
         'exit "$__offbox_rc"',
     ])
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
@@ -428,6 +442,24 @@ def steps_exit(log_path: Path | None, planned: int) -> int | None:
     if not all(n in res for n in range(1, planned + 1)):
         return None
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
+
+
+def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
+    """False only when the run's wrapper got an answer from dockerd and no container started during the run."""
+    try:
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.dk" 2>/dev/null || echo unknown', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return True
+    return not (p.returncode == 0 and p.stdout.decode(errors="replace").strip() == "0")
+
+
+def settle_docker(con, run, status: str) -> None:
+    """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
+    box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    if run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(run["box_id"],
+                                                                                                 run["run_id"]):
+        con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
+        con.commit()
 
 
 def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
@@ -986,6 +1018,7 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
+        settle_docker(con, r, st)
         # Extend auto-stop as well as the reaper threshold when the start budget is tight.
         lease.touch(r["box_id"])
         lease.idle_ttl(r['box_id'])
