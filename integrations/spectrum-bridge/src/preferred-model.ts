@@ -12,8 +12,14 @@ import { join } from "node:path";
  *
  * The optional `prompt` replaces the router's built-in iMessage guidance so the
  * texting context and formatting rules can be reworded without a code change.
+ *
+ * The optional `instanceId` names the Robob provider instance that runs the
+ * model. A `provider/model` ref without one runs on OpenCode ("opencode").
+ * Any other instance ("claudeAgent", "codex") takes its own model id as is,
+ * without a slash: `{ "instanceId": "claudeAgent", "model": "claude-opus-5-5" }`.
+ * `providerID` is empty for such an id, and the id goes to Robob verbatim.
  */
-export type PreferredModel = { providerID: string; modelID: string; variant?: string };
+export type PreferredModel = { providerID: string; modelID: string; variant?: string; instanceId?: string };
 export type IMessagePreferences = { model?: PreferredModel; prompt?: string };
 
 /** Longest accepted replacement guidance; keeps the config a small prompt, not a system prompt. */
@@ -90,19 +96,31 @@ export function stripJsonc(text: string): string {
   return result;
 }
 
+/** The OpenCode provider instance, the one that takes `provider/model` refs. */
+export const OPENCODE_INSTANCE = "opencode";
+
+const MODEL_ID = /^[a-z0-9][a-z0-9_.-]{0,127}$/i;
+
 function readPreferred(imessage: object): PreferredModel | undefined {
-  const { model, variant } = imessage as { model?: unknown; variant?: unknown };
+  const { model, variant, instanceId } = imessage as { model?: unknown; variant?: unknown; instanceId?: unknown };
   if (typeof model !== "string") return undefined;
-  const slash = model.indexOf("/");
-  if (slash <= 0 || slash !== model.lastIndexOf("/") || slash === model.length - 1) return undefined;
-  const providerID = model.slice(0, slash);
-  const modelID = model.slice(slash + 1);
-  if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(providerID)) return undefined;
-  if (!/^[a-z0-9][a-z0-9_.-]{0,127}$/i.test(modelID)) return undefined;
+  if (instanceId !== undefined && (typeof instanceId !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/i.test(instanceId))) return undefined;
+  const instance = instanceId ?? OPENCODE_INSTANCE;
+  let providerID = "";
+  let modelID = model;
+  // OpenCode needs `provider/model`; another instance's own id has no slash and is kept whole.
+  if (instance === OPENCODE_INSTANCE || model.includes("/")) {
+    const slash = model.indexOf("/");
+    if (slash <= 0 || slash !== model.lastIndexOf("/") || slash === model.length - 1) return undefined;
+    providerID = model.slice(0, slash);
+    modelID = model.slice(slash + 1);
+    if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(providerID)) return undefined;
+  }
+  if (!MODEL_ID.test(modelID)) return undefined;
   if (variant !== undefined) {
     if (typeof variant !== "string" || !variant.length || variant.length > 64 || /[\x00-\x1f\x7f]/.test(variant)) return undefined;
   }
-  return variant === undefined ? { providerID, modelID } : { providerID, modelID, variant };
+  return { providerID, modelID, ...(variant === undefined ? {} : { variant }), instanceId: instance };
 }
 
 /**
@@ -151,6 +169,19 @@ export async function imessagePreferences(configRoot = openCodeConfigRoot): Prom
     return { model: readPreferred(imessage), prompt: readPrompt(imessage) };
   }
   return {};
+}
+
+/**
+ * The control API's model fields for a preference. The instance always goes
+ * with the model: without it Robob keeps the default's instance (say
+ * claudeAgent), which can't run an OpenCode `provider/model` ref.
+ */
+export function controlModelFields(model: PreferredModel): { model: string; variant?: string; providerInstanceId: string } {
+  return {
+    model: model.providerID ? `${model.providerID}/${model.modelID}` : model.modelID,
+    ...(model.variant ? { variant: model.variant } : {}),
+    providerInstanceId: model.instanceId ?? OPENCODE_INSTANCE,
+  };
 }
 
 /** Backward-compatible model-only view of the iMessage preferences. */

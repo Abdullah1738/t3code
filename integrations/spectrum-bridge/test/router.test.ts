@@ -14,7 +14,7 @@ import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP
 import { Store } from "../src/store.ts";
 import type { SttInput } from "../src/stt.ts";
 
-type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string }; owner?: OwnerWords };
+type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
 // The config root points at a nonexistent directory so router tests never
 // read the machine's real OpenCode config and stay deterministic.
 const options = { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/notification-skill/SKILL.md", alertSkillPath: "/private/test/telegram-skill/SKILL.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config", quietMs: 0 };
@@ -65,7 +65,7 @@ class Backend extends OpenChamber {
   accept(call: Prompt) {
     this.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
   }
-  override async prompt(id: string, directory: string, messageId: string, text: string, system?: string, files: readonly FilePart[] = [], model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords) {
+  override async prompt(id: string, directory: string, messageId: string, text: string, system?: string, files: readonly FilePart[] = [], model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords) {
     const call = { id, directory, messageId, text, system, files, model, ...(owner ? { owner } : {}) };
     this.prompts.push(call);
     if (this.promptBehavior) await this.promptBehavior(call);
@@ -206,7 +206,7 @@ test("prompts carry the OpenCode-config preferred model, and fall back when it i
   setSystemTime(10_000 + 15_000 + 1);
   await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
   expect(h.backend.prompts.map(prompt => prompt.model)).toEqual([
-    { providerID: "surplus", modelID: "glm-5.3", variant: "max" },
+    { providerID: "surplus", modelID: "glm-5.3", variant: "max", instanceId: "opencode" },
   ]);
   // A garbage config resolves to no preference and OpenCode's default applies.
   writeFileSync(join(configRoot, "opencode.jsonc"), "{not json}");
@@ -233,7 +233,7 @@ test("a configured imessage prompt replaces the built-in iMessage guidance", asy
   expect(system.startsWith("Custom texting guidance: KEEP IT SHORT.\n")).toBe(true);
   expect(system).not.toContain("Never use Markdown tables");
   expect(system).not.toContain("You are the owner's personal assistant");
-  expect(h.backend.prompts[0]!.model).toEqual({ providerID: "surplus", modelID: "kimi-k3" });
+  expect(h.backend.prompts[0]!.model).toEqual({ providerID: "surplus", modelID: "kimi-k3", instanceId: "opencode" });
   // A malformed prompt falls back to the built-in guidance on the next batch.
   writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "model": "surplus/kimi-k3", "prompt": "   " } }`);
   const second = setup(":memory:", { openCodeConfigRoot: configRoot });
@@ -242,7 +242,7 @@ test("a configured imessage prompt replaces the built-in iMessage guidance", asy
   setSystemTime(10_000 + 2 * (15_000 + 1));
   await new Router(second.store, second.backend, second.transport, second.routerOptions).tick();
   expect(second.backend.prompts[0]!.system!.startsWith(`${imessageGuidance()}\n`)).toBe(true);
-  expect(second.backend.prompts[0]!.model).toEqual({ providerID: "surplus", modelID: "kimi-k3" });
+  expect(second.backend.prompts[0]!.model).toEqual({ providerID: "surplus", modelID: "kimi-k3", instanceId: "opencode" });
 });
 
 test("interactive permission alerts recheck auto-accept and pending state before sending", async () => {

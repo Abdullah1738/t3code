@@ -1,6 +1,7 @@
-import { backendConnection, imessageChatRoot } from "./config.ts";
+import { backendConnection, imessageChatRoot, telegramBridgeSocket } from "./config.ts";
 import { OpenChamber, type ChatBackend } from "./openchamber.ts";
 import { RobobBackend } from "./robob.ts";
+import { socketPost } from "./telegram-fallback.ts";
 
 export type BackendKind = "openchamber" | "robob";
 
@@ -19,7 +20,11 @@ export async function createBackend(kind: BackendKind, config: { robobChatRoot?:
   if (kind === "robob") {
     const chatRoot = env.ROBOB_IMESSAGE_CHAT_ROOT?.trim()
       || (typeof config.robobChatRoot === "string" ? config.robobChatRoot : "") || imessageChatRoot;
-    return new RobobBackend({ chatRoot, env });
+    const post = socketPost(telegramBridgeSocket);
+    // A new thread whose first turn fails pages the owner once, through the telegram bridge's socket.
+    const alert = (threadId: string, text: string) =>
+      post("/notify", { source: "iMessage bridge", severity: "error", text, dedupeKey: `imessage-first-turn:${threadId}` });
+    return new RobobBackend({ chatRoot, env, alert });
   }
   const connection = await backendConnection();
   return new OpenChamber(connection.baseUrl, connection.headers, { chatRoot: imessageChatRoot });

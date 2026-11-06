@@ -4,7 +4,7 @@ import {
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
 } from "./control.ts";
 import { nativeMessageId, opencodeFinishes, opencodeRunEvidence, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
-import { imessagePreferences, type PreferredModel } from "./preferred-model.ts";
+import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 
 /**
@@ -124,7 +124,15 @@ export interface RobobBackendOptions extends ControlConfigOptions {
   finishes?: StepFinishes;
   /** Whether a native run called tools (see opencode-steps.ts opencodeRunEvidence). */
   runEvidence?: RunEvidence;
+  /**
+   * Raises one alert when a thread this backend created fails its first turn (see `checkFirstTurn`).
+   * Unset means no alerts; only the running bridge wires it to Telegram.
+   */
+  alert?: (threadId: string, text: string) => Promise<unknown>;
 }
+
+/** What a thread on the wrong provider instance answers on every turn. */
+export const SELECTED_MODEL_ISSUE = /issue with the selected model/i;
 
 const CHATS_DIR = "chats";
 
@@ -144,6 +152,8 @@ export class RobobBackend implements ChatBackend {
    * an `unknown` can still resolve, so it is always asked again. A settled run's proof never changes.
    */
   private readonly settledEvidence = new Map<string, "ran" | "none">();
+  /** Threads createChat made whose first turn has not been judged yet. */
+  private readonly firstTurns = new Set<string>();
 
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
@@ -214,10 +224,32 @@ export class RobobBackend implements ChatBackend {
     const created = await this.client.request<{ threadId: string; directory: string | null }>("POST", "/threads", {
       directory, origin: IMESSAGE_ORIGIN, runtimeMode: "full-access",
       title: title ?? this.options.title ?? `iMessage ${date} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
-      ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
+      ...(model ? controlModelFields(model) : {}),
     });
     if (typeof created.threadId !== "string" || !created.threadId) throw new Error("Invalid Robob thread response");
+    if (this.options.alert) this.firstTurns.add(created.threadId);
     return { id: created.threadId, directory: created.directory ?? directory };
+  }
+
+  /**
+   * A new chat whose first turn fails usually fails every turn after it (a model its provider
+   * instance can't run), and the owner only sees "something went wrong". So once the first run
+   * settles, a failure, a lastError or the selected-model complaint raises one alert. Each
+   * thread is judged once: a good first turn, or any later turn, never alerts.
+   */
+  private checkFirstTurn(thread: ThreadDetail, messages: ControlMessage[]): void {
+    if (!this.firstTurns.has(thread.threadId) || !this.options.alert) return;
+    const first = [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])].find(run => run.ordinal === 1);
+    if (!first || !TERMINAL.has(first.status)) return;
+    this.firstTurns.delete(thread.threadId);
+    const latest = (thread.run ?? thread.recentRuns?.[0])?.runId === first.runId;
+    const text = messages.find(message => message.runId === first.runId && message.role === "assistant")?.text ?? "";
+    const error = latest && thread.lastError ? thread.lastError : "";
+    if (first.status !== "failed" && !error && !SELECTED_MODEL_ISSUE.test(text)) return;
+    const model = thread.model ? `${thread.model.instanceId} / ${thread.model.model}` : "unknown model";
+    const detail = (error || text || first.status).replace(/\s+/g, " ").trim().slice(0, 200);
+    void this.options.alert(thread.threadId, `New iMessage thread "${thread.title}" failed its first turn (${model}): ${detail}. Later turns there will likely fail too; check the imessage model and instance.`)
+      .catch(() => {});
   }
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
@@ -291,6 +323,7 @@ export class RobobBackend implements ChatBackend {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid message limit");
     const threadId = await this.resolve(id);
     const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
+    this.checkFirstTurn(thread, messages);
     const records = recordsFromThread(thread, messages);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
@@ -405,7 +438,7 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: { providerID: string; modelID: string; variant?: string }, owner?: OwnerWords): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords): Promise<void> {
     const threadId = await this.resolve(id);
     const attachments = [];
     for (const [index, file] of files.entries()) {
@@ -419,7 +452,7 @@ export class RobobBackend implements ChatBackend {
       text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
       ...(guidance ? { guidance } : {}),
       ...(words ? { inboundId: words.inboundId } : {}),
-      ...(model ? { model: `${model.providerID}/${model.modelID}`, ...(model.variant ? { variant: model.variant } : {}) } : {}),
+      ...(model ? controlModelFields(model) : {}),
       ...(attachments.length ? { attachments } : {}),
     }, { timeoutMs: 60_000 });
   }

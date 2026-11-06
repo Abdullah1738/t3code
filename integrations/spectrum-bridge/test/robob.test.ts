@@ -8,6 +8,7 @@ import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, typ
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
+import { imessagePreferences } from "../src/preferred-model.ts";
 import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
 
@@ -143,7 +144,8 @@ function fakeControl() {
   };
   const finishes = new Map<string, string>();
   const lookups: string[][] = [];
-  const backend = (chatRoot = "/chats") => new RobobBackend({ chatRoot, url, token: "test-token", model: async () => ({ providerID: "opus", modelID: "claude-opus-5-5", variant: "high" }),
+  const backend = (chatRoot = "/chats", extra: Partial<ConstructorParameters<typeof RobobBackend>[0]> = {}) => new RobobBackend({ chatRoot, url, token: "test-token", model: async () => ({ providerID: "opus", modelID: "claude-opus-5-5", variant: "high" }),
+    ...extra,
     finishes: ids => { lookups.push([...ids]); return new Map(ids.flatMap(id => finishes.has(id) ? [[id, finishes.get(id)!] as const] : [])); } });
   return { url, threads, natives, calls, projects, flags, reply, backend, finishes, lookups };
 }
@@ -192,8 +194,92 @@ test("createChat makes an imessage-origin full-access thread in a dated folder u
   expect(created.id).toBe("thread-1");
   expect(created.directory).toMatch(/^\/chats\/\d{4}-\d{2}-\d{2}\/session-[0-9a-f-]{36}$/);
   const post = control.calls.find(call => call.method === "POST" && call.path === "/threads")!;
-  expect(post.body).toMatchObject({ directory: created.directory, origin: "imessage", runtimeMode: "full-access", model: "opus/claude-opus-5-5", variant: "high" });
+  expect(post.body).toMatchObject({ directory: created.directory, origin: "imessage", runtimeMode: "full-access", model: "opus/claude-opus-5-5", variant: "high", providerInstanceId: "opencode" });
   expect(post.auth).toBe("Bearer test-token");
+});
+
+test("createChat and prompt name the OpenCode instance for the current provider/model config", async () => {
+  // Robob's default may sit on another instance (claudeAgent); without the instance the thread lands there and fails.
+  const configRoot = mkdtempSync(join(tmpdir(), "robob-pref-"));
+  dirs.push(configRoot);
+  writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "model": "opus/claude-opus-5-5", "variant": "high" } }`);
+  const control = fakeControl();
+  const backend = control.backend("/chats", { model: async () => (await imessagePreferences(configRoot)).model });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"b".repeat(64)}`, "hello", "", [], (await imessagePreferences(configRoot)).model);
+  const create = control.calls.find(call => call.method === "POST" && call.path === "/threads")!;
+  const send = control.calls.find(call => call.path.endsWith("/send"))!;
+  for (const body of [create.body, send.body]) {
+    expect(body).toMatchObject({ model: "opus/claude-opus-5-5", variant: "high", providerInstanceId: "opencode" });
+  }
+});
+
+test("an explicit claudeAgent preference sends its instance and the slashless model id", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "robob-pref-"));
+  dirs.push(configRoot);
+  writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "instanceId": "claudeAgent", "model": "claude-opus-5-5", "variant": "high" } }`);
+  const control = fakeControl();
+  const model = (await imessagePreferences(configRoot)).model;
+  const backend = control.backend("/chats", { model: async () => model });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"c".repeat(64)}`, "hello", "", [], model);
+  const create = control.calls.find(call => call.method === "POST" && call.path === "/threads")!;
+  const send = control.calls.find(call => call.path.endsWith("/send"))!;
+  for (const body of [create.body, send.body]) {
+    expect(body).toMatchObject({ model: "claude-opus-5-5", variant: "high", providerInstanceId: "claudeAgent" });
+  }
+});
+
+test("a new thread's failed first turn raises one alert, never again and never for a later turn", async () => {
+  const control = fakeControl();
+  const alerts: Array<[string, string]> = [];
+  const backend = control.backend("/chats", { alert: async (threadId, text) => { alerts.push([threadId, text]); } });
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"d".repeat(64)}`, "hello", "", []);
+  // Still running: nothing to judge yet.
+  await backend.messages(id, directory);
+  expect(alerts).toEqual([]);
+  control.reply(id, "There's an issue with the selected model (opus/claude-opus-5-5). It may not exist or you may not have access to it.", "completed");
+  await backend.messages(id, directory);
+  await backend.messages(id, directory);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]![0]).toBe(id);
+  expect(alerts[0]![1]).toContain("failed its first turn");
+  expect(alerts[0]![1]).toContain("issue with the selected model");
+  // A later failed turn on the same thread stays quiet.
+  await backend.prompt(id, directory, `msg_${"e".repeat(64)}`, "again", "", []);
+  control.threads.get(id)!.lastError = "model returned 400";
+  control.reply(id, "", "failed");
+  await backend.messages(id, directory);
+  expect(alerts).toHaveLength(1);
+});
+
+test("a failed first run with lastError alerts once; a good first turn never alerts", async () => {
+  const control = fakeControl();
+  const alerts: string[] = [];
+  const backend = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); } });
+  const bad = await backend.createChat();
+  await backend.prompt(bad.id, bad.directory, `msg_${"f".repeat(64)}`, "hello", "", []);
+  const thread = control.threads.get(bad.id)!;
+  thread.runs.at(-1)!.status = "failed";
+  thread.lastError = "model returned 400";
+  await backend.messages(bad.id, bad.directory);
+  await backend.messages(bad.id, bad.directory);
+  expect(alerts).toEqual([bad.id]);
+  const good = await backend.createChat();
+  await backend.prompt(good.id, good.directory, `msg_${"0".repeat(64)}`, "hello", "", []);
+  control.reply(good.id, "Morning. All set.");
+  await backend.messages(good.id, good.directory);
+  // Its second turn fails, but only a first turn is judged.
+  await backend.prompt(good.id, good.directory, `msg_${"1".repeat(64)}`, "again", "", []);
+  control.threads.get(good.id)!.lastError = "model returned 400";
+  control.reply(good.id, "", "failed");
+  await backend.messages(good.id, good.directory);
+  expect(alerts).toEqual([bad.id]);
+  // A thread the backend did not create (a stored route from before a restart) is never judged.
+  const other = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); } });
+  await other.messages(bad.id, bad.directory);
+  expect(alerts).toEqual([bad.id]);
 });
 
 test("createChat refuses a chat root that is not a registered project", async () => {
@@ -210,7 +296,9 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   await backend.prompt(id, directory, prompt, "hello", "Be brief.", [], { providerID: "opus", modelID: "claude-opus-5-5", variant: "high" });
   await backend.prompt(id, directory, prompt, "hello", "Be brief.");
   const sends = control.calls.filter(call => call.path.endsWith("/send"));
-  expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: prompt, model: "opus/claude-opus-5-5", variant: "high" });
+  expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: prompt, model: "opus/claude-opus-5-5", variant: "high", providerInstanceId: "opencode" });
+  // No preference on the turn sends no model fields at all, so the thread keeps its own.
+  expect(sends[1]!.body).not.toHaveProperty("providerInstanceId");
   // The message text is never mixed with the bridge's words (guard r3).
   expect(sends[0]!.body.text).toBe("hello");
   expect(sends[0]!.body.guidance).toBe("Be brief.");

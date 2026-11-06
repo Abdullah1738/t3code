@@ -55,7 +55,7 @@ type Turn = Route & {
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
 type ResendBody = {
-  inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string };
+  inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
   owner?: OwnerWords;
 };
 type Pending = {
