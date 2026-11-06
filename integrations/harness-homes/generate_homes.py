@@ -482,6 +482,10 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
         config["model_auto_compact_token_limit"] = spec["autoCompactTokenLimit"]
         config["model_reasoning_effort"] = "low"
         config["features"]["computer_use"] = True
+        # Owner, 6 Nov: Codex computer use may drive any app. Without this the CU service only
+        # admits apps approved before (approvals never reach a Robob thread: approval_policy=never),
+        # so TextEdit timed out while Calculator worked. macOS TCC stays the outer gate.
+        config["computer_use"] = {"default_app_access": "allow"}
         config["mcp_servers"][NODE_REPL] = {
             "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
             "startup_timeout_sec": 30,

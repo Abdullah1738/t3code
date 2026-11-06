@@ -698,6 +698,7 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(base.pop("model_catalog_json"), str(self.codex / "models.json"))
         self.assertIs(base["features"].pop("computer_use"), False)
         self.assertNotIn("node_repl", base["mcp_servers"])
+        self.assertEqual(cu.pop("computer_use"), {"default_app_access": "allow"})
         self.assertEqual(cu, base)
         self.assertEqual(cu["notify"], [])
         self.assertEqual(cu["analytics"], {"enabled": False})
@@ -720,6 +721,13 @@ class GenerateTests(HarnessTestCase):
                          + b"\n\n" + self.cu_overlay.read_bytes())
         rc, output = self.run_check(m)
         self.assertEqual(rc, 0, output)
+
+    def test_only_cu_home_allows_every_app_for_computer_use(self) -> None:
+        self.run_gen(self.manifest())
+        cu = tomllib.loads((self.codex_cu / "config.toml").read_text())
+        plain = tomllib.loads((self.codex / "config.toml").read_text())
+        self.assertEqual(cu["computer_use"], {"default_app_access": "allow"})
+        self.assertNotIn("computer_use", plain)
 
     def test_cu_catalog_carries_base_instructions_for_the_computer_use_service(self) -> None:
         self.run_gen(self.manifest())
