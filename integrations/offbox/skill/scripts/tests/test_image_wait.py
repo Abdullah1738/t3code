@@ -4,6 +4,7 @@ import contextlib
 import io
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import tempfile
 import time
@@ -61,7 +62,7 @@ class ImageWaitFixture:
         self.tool('zstd', '#!/bin/bash\necho zstd >> "$CALLS"\n'
                           '[ "$HANG" = zstd ] && exec sleep 30\nprintf image\n')
         self.env = dict(os.environ, PATH=f'{self.bins}:/usr/bin:/bin', CALLS=str(self.calls),
-                        HANG=hang, PRESENT='0', FLOCK_TIMEOUT='0', OFFBOX_IMAGE_WAIT_SECONDS='1')
+                        HANG=hang, PRESENT='0', FLOCK_TIMEOUT='0', OFFBOX_IMAGE_WAIT_SECONDS='1' if hang else '5')
 
     def tool(self, name, script):
         path = self.bins / name
@@ -95,6 +96,34 @@ class ImageWaitTests(unittest.TestCase):
                 self.assertIn('kept docker images still loading after 1s; continuing without waiting', result.stderr)
                 self.assertFalse(fx.ready.exists(), stage)
 
+    def test_deadline_does_not_wait_for_a_restore_it_cannot_kill(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d)
+            fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '1'
+            pid_file = fx.root / 'stuck.pid'
+            fx.env['STUCK_PID'] = str(pid_file)
+            fx.tool('timeout', '#!/bin/bash\necho $$ > "$STUCK_PID"\ntrap "" TERM\nexec sleep 30\n')
+            try:
+                start = time.monotonic()
+                # Model root-owned/uninterruptible children: the cleanup signal cannot stop them.
+                script = fx.script().replace('os.killpg(child.pid, signal.SIGKILL)',
+                                             'raise PermissionError("root-owned restore")')
+                result = subprocess.run(['bash', '-c', script + '\necho USER_COMMAND\nexit 7\n'],
+                                        env=fx.env, capture_output=True, text=True, timeout=8)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(result.returncode, 7)
+                self.assertIn('USER_COMMAND', result.stdout)
+                self.assertIn('kept docker images still loading after 1s; continuing without waiting', result.stderr)
+                self.assertFalse(fx.ready.exists())
+                self.assertTrue(pid_file.exists())
+                os.kill(int(pid_file.read_text()), 0)
+            finally:
+                if pid_file.exists():
+                    try:
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_fast_missing_image_loads_before_user_command(self):
         with tempfile.TemporaryDirectory() as d:
             fx = ImageWaitFixture(d)
@@ -117,7 +146,32 @@ class ImageWaitTests(unittest.TestCase):
                 result = fx.run()
                 self.assertEqual(result.returncode, 7)
                 self.assertEqual(fx.invoked(), [])
-                self.assertEqual(result.stderr, '')
+                self.assertNotIn('loading kept docker images', result.stderr)
+                self.assertNotIn('continuing without waiting', result.stderr)
+
+    def test_filesystem_probes_are_inside_nonwaiting_supervisor(self):
+        # Every filesystem boundary in the image worker must be behind the same deadline.
+        probes = ('[ -e /run/offbox-images-ready ]', '[ -s "$archive" ]',
+                  'exec 9>/run/offbox-image-restore.lock', '[ -s "$archive.tags" ]',
+                  'while read -r tag; do', 'size=$(du -h',
+                  'zstd -dc "$archive" | docker load', 'touch /run/offbox-images-ready')
+        for probe in probes:
+            with self.subTest(probe=probe), tempfile.TemporaryDirectory() as d:
+                fx = ImageWaitFixture(d)
+                fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '1'
+                # A wedged filesystem call blocks before it can answer, just like this injected sleep.
+                script = runs.IMAGE_WAIT.replace(probe, 'sleep 30; ' + probe)
+                script = script.replace('/home/user/.offbox/images/saved.tar.zst', str(fx.archive))
+                script = script.replace('/run/offbox-images-ready', str(fx.ready))
+                script = script.replace('/run/offbox-image-restore.lock', str(fx.root / 'lock'))
+                script = script.replace('/var/tmp/offbox-image-restore.log', str(fx.root / 'restore.log'))
+                start = time.monotonic()
+                result = subprocess.run(['bash', '-c', script + '\necho USER_COMMAND\nexit 7\n'],
+                                        env=fx.env, capture_output=True, text=True, timeout=8)
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual(result.returncode, 7)
+                self.assertIn('USER_COMMAND', result.stdout)
+                self.assertIn('kept docker images still loading after 1s; continuing without waiting', result.stderr)
 
     def test_existing_tags_and_absent_tags(self):
         with tempfile.TemporaryDirectory() as d:
@@ -148,6 +202,7 @@ class ImageWaitTests(unittest.TestCase):
     def test_busy_boot_restore_times_out_without_running_load(self):
         with tempfile.TemporaryDirectory() as d:
             fx = ImageWaitFixture(d)
+            fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '1'
             fx.env['FLOCK_TIMEOUT'] = '1'
             result = fx.run()
             self.assertEqual(result.returncode, 7)
@@ -228,15 +283,17 @@ class RunnerImageSelectionTests(Isolated):
         root = Path(self.tmp.name) / 'repo'
         root.mkdir()
         self.me['repo_root'] = str(root)
-        cases = [(['--', 'true'], False), (['--', 'make', 'check'], True),
-                 (['--', 'docker', 'ps'], True),
-                 (['--step', 'true', '--step', 'echo ' + 'x' * 4000 + '; docker ps'], True)]
+        # Image waits may be conservative; Docker usage controls billing/local-first and must stay separate.
+        cases = [(['--', 'true'], False, False), (['--', 'echo', 'hello'], True, False),
+                 (['--', 'make', 'check'], True, False), (['--', 'go', 'vet', './pkg'], True, False),
+                 (['--', 'docker', 'ps'], True, True),
+                 (['--step', 'true', '--step', 'echo ' + 'x' * 4000 + '; docker ps'], True, True)]
         with contextlib.redirect_stderr(io.StringIO()), \
              patch.object(runs.pool, 'acquire', return_value=row), \
              patch.object(runs.Runner, '_prepare_box'), \
              patch.object(runs.api, 'cmd_start', return_value={'processId': 7}), \
              patch.object(runs.lease, 'touch'), patch.object(runs.node_version, 'want', return_value=None):
-            for argv, expected in cases:
+            for argv, expected, docker_used in cases:
                 with self.subTest(argv=argv[0:3]):
                     args = cli.build_parser().parse_args(['run', *argv])
                     args.steps = getattr(args, 'step', None)
@@ -247,7 +304,7 @@ class RunnerImageSelectionTests(Isolated):
                         runner.start()
                     self.assertEqual(build.call_args.kwargs['wait_images'], expected)
                     self.assertEqual(self.con.execute('SELECT docker FROM runs WHERE run_id=?',
-                                                       (runner.run_id,)).fetchone()[0], int(expected))
+                                                       (runner.run_id,)).fetchone()[0], int(docker_used))
 
 
 if __name__ == '__main__':

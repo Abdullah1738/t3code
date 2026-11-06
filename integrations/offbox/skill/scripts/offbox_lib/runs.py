@@ -31,18 +31,20 @@ DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
 # The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
-# itself so even boxes made before the fix use the bound. One timeout covers the lock and every Docker call.
+# itself so even boxes made before the fix use the bound. The supervisor never waits for a wedged root child.
 IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
 (
-  _offbox_archive=/home/user/.offbox/images/saved.tar.zst
-  [ -e /run/offbox-images-ready ] && exit 0
-  [ -s "$_offbox_archive" ] || exit 0
   _offbox_seconds=${OFFBOX_IMAGE_WAIT_SECONDS:-180}
   [[ $_offbox_seconds =~ ^[1-9][0-9]{0,3}$ ]] || _offbox_seconds=180
   echo 'offbox: waiting for kept docker images' >&2
-  timeout -k 2s "${_offbox_seconds}s" sudo -n bash -s -- "$_offbox_seconds" <<'OFFBOX_IMAGE_RESTORE'
+  python3 - "$_offbox_seconds" <<'OFFBOX_IMAGE_WAIT'
+import os, selectors, signal, subprocess, sys, time
+seconds = int(sys.argv[1])
+script = r"""
 set -u -o pipefail
 archive=/home/user/.offbox/images/saved.tar.zst
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
 exec 9>/run/offbox-image-restore.lock || exit 1
 flock -w "$1" 9 || exit 124
 [ -e /run/offbox-images-ready ] && exit 0
@@ -63,7 +65,41 @@ if [ "$missing" = 1 ]; then
   zstd -dc "$archive" | docker load > /var/tmp/offbox-image-restore.log 2>&1 || exit 1
 fi
 touch /run/offbox-images-ready
-OFFBOX_IMAGE_RESTORE
+"""
+# Root timeout can signal Docker; the unprivileged supervisor still returns if sudo/timeout is stuck in D state.
+# Capture and relay output so an abandoned child cannot keep the run's SSH output descriptors open.
+try:
+    child = subprocess.Popen(['sudo', '-n', 'timeout', '-k', '2s', f'{seconds}s', 'bash', '-c', script,
+                              'offbox-image-restore', str(seconds)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+except OSError:
+    sys.exit(1)
+selector = selectors.DefaultSelector()
+selector.register(child.stdout, selectors.EVENT_READ)
+deadline = time.monotonic() + seconds
+while True:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        # No wait/communicate here: SIGKILL cannot reap a process blocked in uninterruptible kernel I/O.
+        child.stdout.close()
+        selector.close()
+        sys.exit(124)
+    for key, _ in selector.select(min(left, 0.1)):
+        data = os.read(key.fd, 65536)
+        if data:
+            os.write(2, data)
+        else:
+            selector.unregister(key.fileobj)
+    rc = child.poll()
+    if rc is not None and not selector.get_map():
+        child.stdout.close()
+        selector.close()
+        sys.exit(rc if rc >= 0 else 128 - rc)
+OFFBOX_IMAGE_WAIT
   _offbox_rc=$?
   case $_offbox_rc in
     0) ;;
@@ -621,7 +657,7 @@ class Runner:
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
-                        docker=int(wait_images))
+                        docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             try:
                 self._prepare_box(con, a, rdir, env_file, body)
                 break
