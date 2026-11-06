@@ -54,6 +54,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import { CodexHistoryNotSentError } from "../ardud/harness-migrate/CodexHistoryDeliveryError.ts";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -292,6 +293,9 @@ function makeLocalCommandHarness(input: {
   readonly logoutFailure?: string;
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
+  readonly ensureThreadResult?: OrchestrationV2ThreadProjection["providerThreads"][number];
+  readonly ensureThreadFailOnce?: boolean;
+  readonly loseRunningWrite?: boolean;
   readonly historyReadFailureAfterFallback?: unknown;
   readonly resumeSuccess?: boolean;
   readonly interruptOpen?: boolean;
@@ -539,6 +543,20 @@ function makeLocalCommandHarness(input: {
     resumeThread,
     ensureThread: resumeFallbackEnsure,
   };
+  let failOnce = input.ensureThreadFailOnce === true;
+  const retryableEnsureThread = vi.fn(() => {
+    if (failOnce) {
+      failOnce = false;
+      return Effect.fail(
+        new ProviderAdapter.ProviderAdapterEnsureThreadError({
+          driver: providerThread.driver,
+          threadId,
+          cause: new CodexHistoryNotSentError({ cause: "missing staged file" }),
+        }),
+      );
+    }
+    return Effect.succeed(input.ensureThreadResult ?? providerThread);
+  });
   const open = vi.fn(() =>
     input.interruptOpen === true
       ? Effect.interrupt
@@ -575,7 +593,7 @@ function makeLocalCommandHarness(input: {
                     updatedAt: now,
                     lastError: null,
                   },
-                  ensureThread: () => Effect.succeed(providerThread),
+                  ensureThread: retryableEnsureThread,
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
@@ -605,6 +623,19 @@ function makeLocalCommandHarness(input: {
           }),
         ),
   );
+  const writeIfProviderThreadUnchanged = vi.fn(({ expected, events: incoming }) =>
+    Effect.sync(() => {
+      const committed = projection.providerThreads.some((thread) => thread === expected);
+      if (committed) {
+        for (const event of incoming) {
+          expect(isDomainEvent(event)).toBe(true);
+          events.push(event);
+          projection = ProjectionStore.applyToProjection(projection, event);
+        }
+      }
+      return { committed, storedEvents: [] };
+    }),
+  );
   const writeIfRunCurrent = vi.fn(({ events: incoming, activeAttemptId, expectedStatus }) =>
     "writeFailure" in input
       ? Effect.fail(
@@ -618,7 +649,14 @@ function makeLocalCommandHarness(input: {
           const committed =
             current !== undefined &&
             current.activeAttemptId === activeAttemptId &&
-            current.status === expectedStatus;
+            current.status === expectedStatus &&
+            !(
+              input.loseRunningWrite === true &&
+              incoming.some(
+                (event: OrchestrationV2DomainEvent) =>
+                  event.type === "run.updated" && event.payload.status === "running",
+              )
+            );
           if (committed) {
             for (const event of incoming) {
               expect(isDomainEvent(event)).toBe(true);
@@ -653,7 +691,7 @@ function makeLocalCommandHarness(input: {
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent, writeIfProviderThreadUnchanged }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
@@ -708,6 +746,8 @@ function makeLocalCommandHarness(input: {
     resumeThread,
     resumeFallbackEnsure,
     writeIfRunCurrent,
+    writeIfProviderThreadUnchanged,
+    retryableEnsureThread,
     startRootRun,
     tryHandlePromptCommand,
     events,
@@ -1504,11 +1544,201 @@ effectIt.effect("keeps seeded history when a new Codex native thread is loaded",
 
     yield* harness.start;
 
-    const updated = harness.events.find((event) => event.type === "provider-thread.updated");
+    const updated = harness.events.findLast((event) => event.type === "provider-thread.updated");
     expect(updated?.type).toBe("provider-thread.updated");
     if (updated?.type === "provider-thread.updated") {
       expect(updated.payload.nativeMetadata?.seededHistory).toEqual(history);
     }
+  }),
+);
+
+effectIt.effect("persists the injected native id returned by the adapter", () =>
+  Effect.gen(function* () {
+    const history = {
+      source: "opencode" as const,
+      sourceSessionId: "ses_x",
+      digest: "sha256:seed",
+      mode: "codex-inject" as const,
+      stagedPath: "/staged/input",
+    };
+    const baseline = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
+    const row = baseline.projection().providerThreads[0]!;
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      failReadsAfterRunning: true,
+      ensureThreadResult: {
+        ...row,
+        nativeThreadRef: { driver: row.driver, nativeId: "native-injected", strength: "strong" },
+        nativeMetadata: {
+          title: "adapter title",
+          seededHistory: { ...history, injectedNativeId: "native-injected" },
+        },
+      },
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: { title: "original title", seededHistory: history },
+      })),
+    });
+    yield* harness.start;
+    const updated = harness.events.findLast((event) => event.type === "provider-thread.updated");
+    expect(updated?.type).toBe("provider-thread.updated");
+    if (updated?.type === "provider-thread.updated") {
+      expect(updated.payload.id).toBe(row.id);
+      expect(updated.payload.nativeThreadRef?.nativeId).toBe("native-injected");
+      expect(updated.payload.nativeMetadata).toEqual({
+        title: "adapter title",
+        seededHistory: { ...history, injectedNativeId: "native-injected" },
+      });
+    }
+  }),
+);
+
+effectIt.effect("fences ambiguous staged-history delivery before starting a native thread", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_x",
+            digest: "digest",
+            mode: "codex-inject",
+            stagedPath: "/staged/input",
+            injectionPending: true,
+          },
+        },
+      })),
+    });
+    yield* harness.start;
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.writeIfProviderThreadUnchanged).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(
+      harness.projection().providerThreads[0]?.nativeMetadata?.seededHistory?.injectionPending,
+    ).toBe(true);
+  }),
+);
+
+effectIt.effect("clears a proven unsent claim and retries delivery", () =>
+  Effect.gen(function* () {
+    const baseline = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
+    const row = baseline.projection().providerThreads[0]!;
+    const history = {
+      source: "opencode" as const,
+      sourceSessionId: "ses_x",
+      digest: "digest",
+      mode: "codex-inject" as const,
+      stagedPath: "/staged/input",
+    };
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      failReadsAfterRunning: true,
+      ensureThreadFailOnce: true,
+      ensureThreadResult: {
+        ...row,
+        nativeThreadRef: { driver: row.driver, nativeId: "native-injected", strength: "strong" },
+        nativeMetadata: { seededHistory: { ...history, injectedNativeId: "native-injected" } },
+      },
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: { seededHistory: history },
+      })),
+    });
+    const failure = yield* harness.startWithRetry.pipe(Effect.flip);
+    expect(failure._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().providerThreads[0]?.nativeMetadata?.seededHistory).toEqual(history);
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    yield* harness.start;
+    expect(harness.retryableEnsureThread).toHaveBeenCalledTimes(2);
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(
+      harness.projection().providerThreads[0]?.nativeMetadata?.seededHistory?.injectedNativeId,
+    ).toBe("native-injected");
+  }),
+);
+
+effectIt.effect("keeps the claim after an ambiguous injection failure", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      ensureThreadFailure: new Error("lost injection acknowledgement"),
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: {
+          seededHistory: {
+            source: "opencode",
+            sourceSessionId: "ses_x",
+            digest: "digest",
+            mode: "codex-inject",
+            stagedPath: "/staged/input",
+          },
+        },
+      })),
+    });
+    yield* harness.startWithRetry.pipe(Effect.flip);
+    expect(
+      harness.projection().providerThreads[0]?.nativeMetadata?.seededHistory?.injectionPending,
+    ).toBe(true);
+    expect(harness.writeIfProviderThreadUnchanged).toHaveBeenCalledOnce();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+  }),
+);
+
+effectIt.effect("does not inject again if the row update is lost after native delivery", () =>
+  Effect.gen(function* () {
+    const baseline = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
+    const row = baseline.projection().providerThreads[0]!;
+    const history = {
+      source: "opencode" as const,
+      sourceSessionId: "ses_x",
+      digest: "digest",
+      mode: "codex-inject" as const,
+      stagedPath: "/staged/input",
+    };
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      failReadsAfterRunning: true,
+      loseRunningWrite: true,
+      ensureThreadResult: {
+        ...row,
+        nativeThreadRef: { driver: row.driver, nativeId: "native-injected", strength: "strong" },
+        nativeMetadata: { seededHistory: { ...history, injectedNativeId: "native-injected" } },
+      },
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      providerThreads: projection.providerThreads.map((thread) => ({
+        ...thread,
+        nativeMetadata: { seededHistory: history },
+      })),
+    });
+    yield* harness.start;
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(
+      harness.projection().providerThreads[0]?.nativeMetadata?.seededHistory?.injectionPending,
+    ).toBe(true);
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    yield* harness.start;
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(harness.writeIfProviderThreadUnchanged).toHaveBeenCalledOnce();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
   }),
 );
 

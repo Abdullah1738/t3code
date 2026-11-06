@@ -574,9 +574,15 @@ const isOrchestrationEffectWorkerError = Schema.is(OrchestrationEffectWorkerErro
 
 export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
+  readonly awaitControlWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
+    Option.Option<DateTime.Utc>,
+    OrchestrationEffectWorkerError
+  >;
+  readonly nextControlClaimableAt: Effect.Effect<
     Option.Option<DateTime.Utc>,
     OrchestrationEffectWorkerError
   >;
@@ -701,9 +707,14 @@ export const layerWithOptions = (
 
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
-        function* (excludeRestartContinuations = false) {
+        function* (excludeRestartContinuations = false, controlLane = false) {
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({ workerId, leaseDurationMs, excludeRestartContinuations }),
+            outbox.claimNext({
+              workerId,
+              leaseDurationMs,
+              excludeRestartContinuations,
+              ...(controlLane ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES } : {}),
+            }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             result: Exit.isFailure(claimExit)
@@ -809,7 +820,7 @@ export const layerWithOptions = (
           }
           return true;
         },
-        (effect, _excludeRestartContinuations?: boolean) =>
+        (effect, _excludeRestartContinuations?: boolean, _controlLane?: boolean) =>
           effect.pipe(
             Effect.mapError((cause) =>
               isOrchestrationEffectWorkerError(cause)
@@ -821,8 +832,10 @@ export const layerWithOptions = (
 
       return OrchestrationEffectWorkerV2.of({
         awaitWork: outbox.awaitAvailable,
+        awaitControlWork: outbox.awaitControlAvailable,
         runOnce: runOnce(),
         runRecoveryOnce: runOnce(true),
+        runControlOnce: runOnce(false, true),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
           Effect.mapError(
             (cause) =>
@@ -830,6 +843,11 @@ export const layerWithOptions = (
                 operation: "next-claimable",
                 cause,
               }),
+          ),
+        ),
+        nextControlClaimableAt: outbox.nextControlClaimableAt.pipe(
+          Effect.mapError(
+            (cause) => new OrchestrationEffectWorkerError({ operation: "next-claimable", cause }),
           ),
         ),
         drain: Effect.fn("EffectWorker.drain")(function* (maxEffects = Number.MAX_SAFE_INTEGER) {
@@ -847,10 +865,12 @@ export const layer = layerWithOptions();
 
 export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
+  readonly controlLaneConcurrency?: number;
   readonly livenessPollIntervalMs?: number;
 }
 
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
+const DEFAULT_CONTROL_LANE_CONCURRENCY = 1;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
@@ -861,6 +881,11 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       const concurrency = Number.isFinite(requestedConcurrency)
         ? Math.max(1, Math.floor(requestedConcurrency))
         : DEFAULT_EFFECT_WORKER_CONCURRENCY;
+      const requestedControlConcurrency =
+        options.controlLaneConcurrency ?? DEFAULT_CONTROL_LANE_CONCURRENCY;
+      const controlLaneConcurrency = Number.isFinite(requestedControlConcurrency)
+        ? Math.max(0, Math.floor(requestedControlConcurrency))
+        : DEFAULT_CONTROL_LANE_CONCURRENCY;
       const requestedLivenessPollIntervalMs =
         options.livenessPollIntervalMs ?? DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS;
       const livenessPollIntervalMs = Number.isFinite(requestedLivenessPollIntervalMs)
@@ -869,9 +894,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Post-commit notifications are the low-latency path. `availableAt` is the
       // durable retry schedule, and the long liveness poll only recovers from a
       // missed in-process notification or work inserted by another process.
-      const runWorker = Effect.gen(function* () {
+      const runWorker = (controlLane: boolean) => Effect.gen(function* () {
         while (true) {
-          const outcome = yield* worker.runOnce.pipe(
+          const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
             Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
             Effect.catchCause((cause) =>
               Effect.logWarning("Orchestration effect worker failed", cause).pipe(
@@ -891,7 +916,7 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          const nextClaimableAt = yield* worker.nextClaimableAt.pipe(
+          const nextClaimableAt = yield* (controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
                 "Failed to read the next orchestration effect deadline",
@@ -908,14 +933,19 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             },
           });
           yield* Effect.raceFirst(
-            worker.awaitWork.pipe(Effect.as("notified" as const)),
+            (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
+              Effect.as("notified" as const),
+            ),
             Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
           );
         }
       });
 
       return yield* Effect.all(
-        Array.from({ length: concurrency }, () => runWorker),
+        [
+          ...Array.from({ length: concurrency }, () => runWorker(false)),
+          ...Array.from({ length: controlLaneConcurrency }, () => runWorker(true)),
+        ],
         {
           concurrency: "unbounded",
           discard: true,

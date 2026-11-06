@@ -196,7 +196,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
 
 $100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and the plan's 50
 included saved snapshots are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
-at every $100. At $500 the cap trips: new leases are refused and all boxes stop. Heavy work returns 91.
+at every $100. At $750 the cap trips (raised from $500 by Abdullah, 5 Nov 2026): new leases are refused and all boxes stop. Heavy work returns 91.
 
 Create, fork and resume each consume a start. Offbox reserves starts atomically against rolling **25/minute,
 180/hour, 760/day** budgets; `OFFBOX_STARTS_PER_MINUTE`, `OFFBOX_STARTS_PER_HOUR`, `OFFBOX_STARTS_PER_DAY` can lower

@@ -3950,8 +3950,11 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           EffectWorker.OrchestrationEffectWorkerV2,
           EffectWorker.OrchestrationEffectWorkerV2.of({
             awaitWork: Effect.void,
+            awaitControlWork: Effect.void,
             runRecoveryOnce: Effect.succeed(false),
             runOnce: Effect.succeed(false),
+            runControlOnce: Effect.succeed(false),
+            nextControlClaimableAt: Effect.succeed(Option.none()),
             nextClaimableAt: Effect.succeed(Option.none()),
             drain: () => Effect.succeed(0),
           }),
@@ -4167,8 +4170,11 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           EffectWorker.OrchestrationEffectWorkerV2,
           EffectWorker.OrchestrationEffectWorkerV2.of({
             awaitWork: Effect.void,
+            awaitControlWork: Effect.void,
             runRecoveryOnce: Effect.succeed(false),
             runOnce: Effect.succeed(false),
+            runControlOnce: Effect.succeed(false),
+            nextControlClaimableAt: Effect.succeed(Option.none()),
             nextClaimableAt: Effect.succeed(Option.none()),
             drain: () => Effect.succeed(0),
           }),

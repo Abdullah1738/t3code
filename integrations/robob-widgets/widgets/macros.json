@@ -1,0 +1,18 @@
+{
+  "id": "macros",
+  "title": "Macros left",
+  "families": [
+    "systemSmall",
+    "systemMedium",
+    "systemLarge",
+    "accessoryCircular",
+    "accessoryRectangular",
+    "accessoryInline"
+  ],
+  "refreshMinutes": 15,
+  "source": {
+    "command": ["/usr/bin/python3", "/Users/ardud/.local/share/robob-widgets/sources/macros.py"],
+    "timeoutSec": 20
+  },
+  "actions": [{"id": "refresh", "label": "Refresh", "symbol": "arrow.clockwise"}]
+}

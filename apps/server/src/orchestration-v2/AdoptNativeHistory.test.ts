@@ -315,13 +315,19 @@ it.effect("adopts native Claude history once, preserves the source, and can rest
     };
     const memory = ProjectionStore.applyToProjection(restored, event);
     assert.equal(memory.thread.activeProviderThreadId, source.id);
-    assert.deepEqual(memory.providerThreads.find((row) => row.id === targetId), lateTarget);
+    assert.deepEqual(
+      memory.providerThreads.find((row) => row.id === targetId),
+      lateTarget,
+    );
     yield* sink.write({ events: [event] });
     const afterRollbackLate = yield* orchestrator.getThreadProjection(threadId);
     assert.equal(afterRollbackLate.thread.activeProviderThreadId, source.id);
     assert.equal(afterRollbackLate.thread.providerInstanceId, openCodeInstance);
     assert.deepEqual(afterRollbackLate.thread.modelSelection, openCodeSelection);
-    assert.deepEqual(afterRollbackLate.providerThreads.find((row) => row.id === targetId), lateTarget);
+    assert.deepEqual(
+      afterRollbackLate.providerThreads.find((row) => row.id === targetId),
+      lateTarget,
+    );
     assert.isTrue((yield* maintenance.rebuild).valid);
     const replayedLate = yield* orchestrator.getThreadProjection(threadId);
     assert.equal(replayedLate.thread.activeProviderThreadId, source.id);
@@ -440,7 +446,7 @@ it.effect("activates codex injection before a native session ID exists", () =>
     assert.equal(target!.providerInstanceId, codexInstance);
     assert.isNull(target!.nativeThreadRef);
     assert.isNull(target!.nativeConversationHeadRef);
-    assert.deepEqual(target!.nativeMetadata?.seededHistory, codexHistory);
+    assert.deepEqual(target!.nativeMetadata?.seededHistory, { ...codexHistory, snapshotRunOrdinal: 0 });
     assert.deepEqual(
       adopted.providerThreads.find((row) => row.id === source.id),
       source,
@@ -456,6 +462,196 @@ it.effect("activates codex injection before a native session ID exists", () =>
       rebuilt.providerThreads.find((row) => row.id === targetId),
       target,
     );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("does not reissue imported context when dispatching onto an adopted Codex row", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:adopt-codex-imported");
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const source = yield* createSource(threadId);
+    const before = yield* orchestrator.getThreadProjection(threadId);
+    const now = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:mark-imported"),
+          type: "thread.model-selection-updated",
+          threadId,
+          providerInstanceId: openCodeInstance,
+          occurredAt: now,
+          payload: { ...before.thread, historyOrigin: "v1_import", updatedAt: now },
+        },
+      ],
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.adopt-native-history",
+      commandId: CommandId.make("adopt:codex-imported"),
+      threadId,
+      modelSelection: codexSelection,
+      expectedActiveProviderThreadId: source.id,
+      target: {
+        kind: "new",
+        driver: codexDriver,
+        nativeId: null,
+        headId: null,
+        seededHistory: codexHistory,
+      },
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("send:codex-imported"),
+      threadId,
+      messageId: MessageId.make("message:codex-imported"),
+      text: "continue",
+      attachments: [],
+      modelSelection: codexSelection,
+      createdBy: "user",
+      creationSource: "web",
+      dispatchMode: { type: "start_immediately" },
+    });
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    assert.equal(projection.thread.historyOrigin, "v1_import");
+    assert.equal(projection.runs.at(-1)?.contextHandoffId, null);
+    assert.deepEqual(projection.contextHandoffs, []);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("does not hand off pre-adoption source runs to a queued Codex continuation", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:adopt-codex-queued");
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const source = yield* createSource(threadId);
+    const send = (
+      id: string,
+      selection: typeof openCodeSelection,
+      mode: "defer_start" | "queue_after_active",
+    ) =>
+      orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`send:${id}`),
+        threadId,
+        messageId: MessageId.make(`message:${id}`),
+        text: id,
+        attachments: [],
+        modelSelection: selection,
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: mode },
+      });
+    yield* send("source-before-adoption", openCodeSelection, "defer_start");
+    const initial = yield* orchestrator.getThreadProjection(threadId);
+    const sourceRun = initial.runs[0]!;
+    const old = DateTime.add(yield* DateTime.now, { seconds: -60 });
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:source-completed"),
+          type: "run.updated",
+          threadId,
+          runId: sourceRun.id,
+          providerInstanceId: openCodeInstance,
+          occurredAt: old,
+          payload: {
+            ...sourceRun,
+            status: "completed",
+            requestedAt: old,
+            startedAt: old,
+            completedAt: old,
+          },
+        },
+      ],
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.adopt-native-history",
+      commandId: CommandId.make("adopt:queued-codex"),
+      threadId,
+      modelSelection: codexSelection,
+      expectedActiveProviderThreadId: source.id,
+      target: {
+        kind: "new",
+        driver: codexDriver,
+        nativeId: null,
+        headId: null,
+        seededHistory: codexHistory,
+      },
+    });
+    yield* send("target-before-native", codexSelection, "defer_start");
+    yield* send("target-queued", codexSelection, "queue_after_active");
+    const before = yield* orchestrator.getThreadProjection(threadId);
+    const firstTarget = before.runs[1]!;
+    const queued = before.runs[2]!;
+    assert.equal(queued.status, "queued");
+    const now = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:target-cancelled"),
+          type: "run.updated",
+          threadId,
+          runId: firstTarget.id,
+          providerInstanceId: codexInstance,
+          occurredAt: now,
+          payload: { ...firstTarget, status: "cancelled", completedAt: now },
+        },
+      ],
+    });
+    yield* orchestrator.dispatch({
+      type: "queue.resume",
+      commandId: CommandId.make("resume:codex-queue"),
+      threadId,
+    });
+    const after = yield* orchestrator.getThreadProjection(threadId);
+    assert.notEqual(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+    assert.equal(after.runs.find((run) => run.id === queued.id)?.contextHandoffId, null);
+    assert.isFalse(after.contextHandoffs.some((handoff) => handoff.targetRunId === queued.id));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("hands off work done after adoption when Codex has not started yet", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:adopt-codex-post-snapshot");
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const source = yield* createSource(threadId);
+    yield* orchestrator.dispatch({
+      type: "thread.adopt-native-history",
+      commandId: CommandId.make("adopt:post-snapshot"),
+      threadId,
+      modelSelection: codexSelection,
+      expectedActiveProviderThreadId: source.id,
+      target: { kind: "new", driver: codexDriver, nativeId: null, headId: null, seededHistory: codexHistory },
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch", commandId: CommandId.make("send:post-snapshot-source"), threadId,
+      messageId: MessageId.make("message:post-snapshot-source"), text: "Work after snapshot: tangerine",
+      attachments: [], modelSelection: openCodeSelection, createdBy: "user", creationSource: "web",
+      dispatchMode: { type: "defer_start" },
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch", commandId: CommandId.make("send:post-snapshot-target"), threadId,
+      messageId: MessageId.make("message:post-snapshot-target"), text: "Continue on Codex",
+      attachments: [], modelSelection: codexSelection, createdBy: "user", creationSource: "web",
+      dispatchMode: { type: "queue_after_active" },
+    });
+    const before = yield* orchestrator.getThreadProjection(threadId);
+    const sourceRun = before.runs[0]!;
+    const queued = before.runs[1]!;
+    assert.equal(queued.status, "queued");
+    const now = yield* DateTime.now;
+    yield* sink.write({ events: [{
+      id: EventId.make("event:post-snapshot-source-completed"), type: "run.updated", threadId,
+      runId: sourceRun.id, providerInstanceId: openCodeInstance, occurredAt: now,
+      payload: { ...sourceRun, status: "completed", startedAt: now, completedAt: now },
+    }] });
+    yield* orchestrator.dispatch({ type: "queue.resume", commandId: CommandId.make("resume:post-snapshot"), threadId });
+    const after = yield* orchestrator.getThreadProjection(threadId);
+    const handoff = after.contextHandoffs.find((entry) => entry.targetRunId === queued.id);
+    assert.isDefined(handoff);
+    assert.equal(handoff?.coveredRunOrdinals.from, sourceRun.ordinal);
+    assert.include(handoff?.history?.messages.map((message) => message.text).join("\n") ?? "", "tangerine");
   }).pipe(Effect.provide(layerTest)),
 );
 

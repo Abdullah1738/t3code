@@ -189,6 +189,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     next_progress = 0
     create_first = False
     resume_stall = None
+    resume_stuck = set()
     while True:
         lease.cap_check()
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
@@ -230,7 +231,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             # Outside the pool lock: it asks boat about every detached run.
             _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
-        tried = set()
+        tried = set(resume_stuck)
         stopped_tries = 0
         stopped_error = None
         capacity_outage = None
@@ -359,6 +360,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     except capacity.CapacityError:
                         raise
                     except lease.ArchivingSkip as e:
+                        if isinstance(e, lease.ResumeStuck):
+                            resume_stuck.add(row['box_id'])
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':

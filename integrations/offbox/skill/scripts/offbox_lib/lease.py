@@ -17,6 +17,7 @@ from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
+RESUME_STUCK_S = 90
 SHRINK_REFUSED = (400, 409, 422)  # boat's answers to "data does not fit the smaller size"
 SHRINK_TEXT = re.compile(r"\b(disk|fits?|shrink\w*|smaller|too small|size)\b", re.I)  # ...and what that answer talks about
 DISK_TOO_BIG = re.compile(r"needs\s+([\d.]+)\s*GiB of disk but the largest '([\w-]+)' machine holds\s+([\d.]+)\s*GiB",
@@ -136,7 +137,7 @@ def idle_for(con, box_id: str, size: str | None, snap: dict | None = None) -> in
 def cap_check() -> None:
     cap = read_json(CAP_PATH, {})
     if cap.get("capped"):
-        raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap $500). New leases are refused.",
+        raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap ${cap.get('cap', 500):.0f}). New leases are refused.",
                           code=EXIT_CAP)
 
 
@@ -430,10 +431,11 @@ _FOLLOW_STOP_S = 160
 
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
-              since: float | None = None, stale_error: str | None = None) -> dict:
+              since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
     from . import outage
+    options = {"on_state": on_state} if on_state is not None else {}
     with outage.accepted_machine():
-        s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error)
+        s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
         ssh_sync.setup(box_id)
         ssh_sync.wait_ssh(box_id)
         if recipe:
@@ -563,7 +565,15 @@ def _bigger(a: str | None, b: str | None) -> bool:
 
 
 class ArchivingSkip(OffboxError):
-    """The box is still archiving. Pool callers skip it (like a busy box) instead of waiting under the pool lock."""
+    """A box that cannot be resumed yet is skipped by pool callers like a busy box."""
+
+
+class ResumeStuck(ArchivingSkip):
+    """The archived retry was spent; this caller must not resume the box again."""
+
+
+class _ResumeExpired(Exception):
+    """The stopped box's data expired while a resume was being requested."""
 
 
 def _forget_expired(con, box_id: str, why: str) -> None:
@@ -660,13 +670,13 @@ def _wait_unanswered_resume(con, box_id):
             time.sleep(min(2, max(0, end - time.time())))
 
 
-def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False):
+def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True):
     from . import allocation
     with allocation.guard(box_id):
-        return _resume_under_guard(con, box_id, ttl, size, pending)
+        return _resume_under_guard(con, box_id, ttl, size, pending, retry)
 
 
-def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False):
+def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True):
     key = f"resume_unanswered:{box_id}"
 
     def mark_pending():
@@ -758,14 +768,18 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
     if pending or unanswered is not None:
         confirmed = confirm(unanswered)
         if confirmed:
-            return confirmed
+            return confirmed, False
+        if not retry:
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered after its archived retry; "
+                                   "nothing ran. Retry later") from unanswered
         unanswered = send()
         if unanswered is not None:
             confirmed = confirm(unanswered)
             if confirmed:
-                return confirmed
+                return confirmed, True
             raise ResumeUnresolved(f"resume of {box_id} was unanswered twice; nothing ran. Retry later") from unanswered
-    return False
+        return None, True
+    return None, False
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
@@ -773,7 +787,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
     if pending:
         pending_size = pending[0] if pending[0] in SIZES else None
-        confirmed = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
+        confirmed, _ = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
         if confirmed and confirmed.get('state') in api.STARTING_STATES:
             _wait_unanswered_resume(con, box_id)
         try:
@@ -874,38 +888,75 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
-        try:
-            unanswered = _resume_confirmed(con, box_id, RUN_TTL_S, want if want != s.get("type") else None)
-        except api.ApiError as e:
-            if e.api_code in api.DATA_GONE:
-                _forget_expired(con, box_id, str(e))
-                return None
-            # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
-            if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
-                    or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
-                tb = _too_big(con, box_id, e)
-                if tb:
-                    raise tb from e
-                raise
-            if capacity.supply_until(s.get("type")):
-                raise api.SupplyOut(s.get("type"), box_id, str(e), tried=True) from e
-            say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
-            want = s.get("type")
+        resent = False
+        left_stopped = False
+
+        def request_resume():
+            nonlocal want, resent, left_stopped
             try:
-                unanswered = _resume_confirmed(con, box_id, RUN_TTL_S, None)
-            except api.ApiError as e2:
-                tb = _too_big(con, box_id, e2)
-                if tb:
-                    raise tb from e2
-                raise
-        if unanswered and unanswered.get('state') in api.STARTING_STATES:
-            _wait_unanswered_resume(con, box_id)
+                confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S,
+                                                       want if want != s.get("type") else None, retry=not resent)
+            except api.ApiError as e:
+                if e.api_code in api.DATA_GONE:
+                    _forget_expired(con, box_id, str(e))
+                    raise _ResumeExpired from e
+                # boat refuses to shrink a box whose disk no longer fits the smaller size; keep its size then.
+                if not s.get("type") or not _bigger(s.get("type"), want) or (e.status or 0) not in SHRINK_REFUSED \
+                        or not SHRINK_TEXT.search(f"{e.api_code} {e}"):
+                    tb = _too_big(con, box_id, e)
+                    if tb:
+                        raise tb from e
+                    raise
+                if capacity.supply_until(s.get("type")):
+                    raise api.SupplyOut(s.get("type"), box_id, str(e), tried=True) from e
+                say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
+                want = s.get("type")
+                try:
+                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=not resent)
+                except api.ApiError as e2:
+                    tb = _too_big(con, box_id, e2)
+                    if tb:
+                        raise tb from e2
+                    raise
+            # Confirmation may already have used the one archived retry; the state callback must not send a third.
+            resent = resent or retried
+            if confirmed:
+                left_stopped = True
+                if confirmed.get("state") in api.STARTING_STATES:
+                    _wait_unanswered_resume(con, box_id)
+
         try:
-            up = _bring_up(box_id, since=t, stale_error=s.get("error"))
-        except api.SupplyOut:
-            raise
-        except OffboxError as e:
-            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran") from e
+            request_resume()
+            sent_at = now()
+
+            def check_resume(state):
+                nonlocal sent_at, resent, left_stopped
+                if state.get("state") not in api.STOPPED_STATES:
+                    left_stopped = True
+                if left_stopped or now() - sent_at < RESUME_STUCK_S:
+                    return
+                if not resent:
+                    resent = True
+                    request_resume()
+                    sent_at = now()
+                    event(con, box_id, "resume_resent", f"still archived after {RESUME_STUCK_S}s")
+                    return
+                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+                con.commit()
+                event(con, box_id, "resume_stuck", f"still archived after two resumes, {RESUME_STUCK_S}s each")
+                message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
+                if skip_archiving:
+                    raise ResumeStuck(message, code=EXIT_BUSY)
+                raise OffboxError(message)
+
+            try:
+                up = _bring_up(box_id, since=t, stale_error=s.get("error"), on_state=check_resume)
+            except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+                raise
+            except OffboxError as e:
+                raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}") from e
+        except _ResumeExpired:
+            return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
         event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")

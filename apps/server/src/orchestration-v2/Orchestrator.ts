@@ -1591,11 +1591,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               (run) =>
                 isHandoffSourceRun(run) &&
                 run.ordinal > (targetLastCompletedRun?.ordinal ?? 0) &&
+                // ardud: adoption records the runs covered by its source snapshot.
+                (deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" ||
+                  run.ordinal >
+                    (deliveryProviderThread.nativeMetadata.seededHistory.snapshotRunOrdinal ?? 0)) &&
                 run.ordinal <= latestHandoffRun.ordinal,
             );
       const needsFullContext = deliveryProviderThread.nativeThreadRef === null;
       const legacyImportItems =
-        !freshContext && projection.thread.historyOrigin === "v1_import"
+        !freshContext &&
+        deliveryProviderThread.nativeMetadata?.seededHistory?.mode !== "codex-inject" &&
+        projection.thread.historyOrigin === "v1_import"
           ? yield* readHandoffItems(threadId, [null])
           : [];
       const handoffStrategy = needsFullContext
@@ -5602,7 +5608,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
     // ardud: a context reset's only context is its note, so no imported history either.
     const legacyImportItems =
-      command.contextReset !== true && projection.thread.historyOrigin === "v1_import"
+      command.contextReset !== true &&
+      !(
+        activeProviderThread?.nativeMetadata?.seededHistory?.mode === "codex-inject" &&
+        activeProviderThread.providerInstanceId === modelSelection.instanceId
+      ) &&
+      projection.thread.historyOrigin === "v1_import"
         ? yield* readHandoffItems(command.threadId, [null])
         : [];
     const isProviderSwitch =
@@ -7837,7 +7848,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           handoffIds: [],
           forkedFrom: null,
           contextUsage: null,
-          nativeMetadata: { seededHistory },
+          nativeMetadata: {
+            seededHistory: {
+              ...seededHistory,
+              ...(seededHistory.mode === "codex-inject"
+                ? {
+                    snapshotRunOrdinal: projection.runs.reduce(
+                      (latest, run) => Math.max(latest, run.ordinal),
+                      0,
+                    ),
+                  }
+                : {}),
+            },
+          },
           createdAt: now,
           updatedAt: now,
         };
@@ -12011,11 +12034,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // changed before its transaction. Destination identity is checked there too.
     const adoptionSequence =
       command.type === "thread.adopt-native-history"
-        ? yield* eventSink.latestSequence({ threadId: command.threadId }).pipe(
-            Effect.mapError(
-              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
-            ),
-          )
+        ? yield* eventSink
+            .latestSequence({ threadId: command.threadId })
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+              ),
+            )
         : undefined;
 
     const plan = yield* dispatchOnce(command).pipe(

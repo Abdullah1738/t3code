@@ -1177,6 +1177,18 @@ describe("OrchestratorMcpService provider resolution", () => {
     () =>
       Effect.gen(function* () {
         let delegated = false;
+        let currentChild = {
+          ...childProjection,
+          runs: [
+            {
+              id: RunId.make("run:mcp-providers-child"),
+              delegatedTaskId: taskId,
+              ordinal: 1,
+              status: "starting",
+              startedAt: null,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
         const task = {
           id: taskId,
           threadId: parentThreadId,
@@ -1207,7 +1219,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               Effect.succeed(
                 threadId === parentThreadId
                   ? parentProjection(delegated ? [task] : [])
-                  : childProjection,
+                  : currentChild,
               ),
             dispatch: (command) =>
               Ref.update(dispatched, (commands) => [...commands, command]).pipe(
@@ -1258,7 +1270,39 @@ describe("OrchestratorMcpService provider resolution", () => {
             clientRequestId: "delegate-antigravity-1",
           });
           assert.equal(result.status, "running");
+          assert.isTrue(result.startPending);
+          assert.isNull(result.startedAt);
           assert.equal(result.providerInstanceId, antigravityInstanceId);
+          const originalRun = currentChild.runs[0]!;
+          currentChild = {
+            ...currentChild,
+            runs: [
+              {
+                ...originalRun,
+                status: "running",
+                startedAt: DateTime.makeUnsafe("2026-11-04T12:00:00Z"),
+              },
+            ],
+          };
+          const started = yield* service.taskStatus(scope, taskId);
+          assert.equal(started.status, "running");
+          assert.isFalse(started.startPending);
+          assert.equal(started.startedAt, "2026-11-04T12:00:00.000Z");
+          for (const [status, expected] of [
+            ["preparing", true],
+            ["starting", true],
+            ["queued", false],
+            ["running", false],
+            ["waiting", false],
+          ] as const) {
+            currentChild = {
+              ...currentChild,
+              runs: [{ ...originalRun, status, startedAt: null }],
+            };
+            const pending = yield* service.taskStatus(scope, taskId);
+            assert.equal(pending.startPending, expected, status);
+            assert.isNull(pending.startedAt);
+          }
           const commands = yield* Ref.get(dispatched);
           assert.equal(commands.length, 1);
           const request = commands[0] as {
