@@ -555,5 +555,62 @@ class ExplicitIdEntryPointTests(unittest.TestCase):
         tunnel.assert_not_called()
 
 
+class ClaudeCommandIdentityTests(IdentityTests):
+    """The harness hook signs {session, agent_id} into each rewritten Bash call. With it, a Claude parent and its
+    child resolve to their own threads; without it, or with a damaged token, the caller stays unresolved."""
+
+    HOOKS = Path(__file__).resolve().parents[4] / "harness-hooks/src"
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        sys.path.insert(0, str(self.HOOKS))
+        import engine
+        self.engine = engine
+        state = Path(self.tmp.name) / "hooks-state"
+        self.hook_env = patch.dict(os.environ, {"HARNESS_HOOKS_STATE_DIR": str(state),
+                                                "HARNESS_HOOKS_SRC": str(self.HOOKS),
+                                                "HARNESS_HOOKS_PROVIDER_INSTANCE": ""})
+        self.hook_env.start()
+        self.addCleanup(self.hook_env.stop)
+
+    def token(self, agent=None):
+        return self.engine._command_identity({"session_id": CLAUDE_UUID, "agent_id": agent}, "claude")
+
+    def resolve(self, child_thread):
+        def fake(event, harness, fresh=False):
+            if event.get("agent_id"):
+                return resolved(child_thread, parent=PARENT, kind="subagent")
+            return resolved(PARENT)
+        return patch.object(self.engine, "resolve_identity", side_effect=fake)
+
+    def test_parent_shell_with_signed_token_owns_its_own_thread(self):
+        with self.resolve(OTHER):
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token())
+        self.assertEqual(me["resolution"], "resolved")
+        self.assertEqual(me["owner"], PARENT)
+        self.assertTrue(me["proven"])
+
+    def test_child_shell_with_signed_token_owns_the_child_not_the_parent(self):
+        with self.resolve(OTHER):
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token("agent-1"))
+        self.assertEqual(me["owner"], OTHER)
+        self.assertEqual(me["manager"], PARENT)
+        self.assertTrue(me["proven"])
+
+    def test_tampered_token_stays_unresolved(self):
+        bad = self.token()[:-2] + "00"
+        with self.resolve(OTHER):
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=bad)
+        self.assertEqual(me["resolution"], "unresolved")
+        self.assertFalse(me["proven"])
+
+    def test_token_for_another_session_stays_unresolved(self):
+        with self.resolve(OTHER):
+            me = self.who(CLAUDE_CODE_SESSION_ID="another-session", HARNESS_HOOKS_COMMAND_IDENTITY=self.token())
+        self.assertEqual(me["resolution"], "unresolved")
+        self.assertFalse(me["proven"])
+
+
 if __name__ == "__main__":
     unittest.main()

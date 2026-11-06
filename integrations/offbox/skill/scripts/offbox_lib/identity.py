@@ -150,6 +150,36 @@ def identity_for(native: str, driver: str) -> dict:
     return ident
 
 
+HOOKS_SRC = HOME / ".local/share/harness-hooks/src"
+
+
+def claude_command_identity() -> dict | None:
+    """The exact execution behind this Claude shell, from the harness hook's signed per-command context.
+
+    The PreToolUse hook signs {session, agent_id} into HARNESS_HOOKS_COMMAND_IDENTITY for every Bash call it
+    rewrites, so a native child (agent_id set) is told apart from its parent (no agent_id) even though they share
+    CLAUDE_CODE_SESSION_ID. A missing, damaged or foreign token gives None, and the caller stays unresolved.
+    """
+    if not os.environ.get("HARNESS_HOOKS_COMMAND_IDENTITY"):
+        return None
+    import sys
+    src = os.environ.get("HARNESS_HOOKS_SRC") or str(HOOKS_SRC)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        import engine  # type: ignore[import-not-found]
+        parsed = engine.command_identity_from_env()
+        if not parsed or parsed[0] != "claude":
+            return None
+        ident = engine.resolve_identity(parsed[1], "claude")
+    except Exception as error:  # noqa: BLE001
+        log(f"claude command identity unavailable: {type(error).__name__}")
+        return None
+    if not isinstance(ident, dict) or ident.get("resolution") != "resolved" or not ident.get("robobThreadId"):
+        return None
+    return ident
+
+
 def _lookup_thread(ses: str) -> dict:
     """OpenCode session -> thread info, cached 1 h in kv (whoami costs ~1.5 s otherwise).
 
@@ -272,8 +302,17 @@ def whoami(cwd: str | None = None) -> dict:
         # bare Claude id with the parent's identity, so taking that answer would let a child own the parent's
         # leases. Claude callers therefore never take a resolved owner; they keep their own unresolved owner.
         if driver == "claudeAgent":
-            log(f"claude caller {native[:8]}: no per-agent id in the shell, so no resolved owner is taken")
-            me["resolution"] = "unresolved"
+            exact = claude_command_identity()
+            if exact is not None:
+                me["resolution"] = "resolved"
+                me["executionKind"] = exact.get("executionKind")
+                me["acceptsMessages"] = exact.get("acceptsMessages")
+                me["thread"] = exact.get("robobThreadId")
+                me["manager"] = exact.get("parentThreadId")
+                me["parent"] = exact.get("parentThreadId")
+            else:
+                log(f"claude caller {native[:8]}: no signed per-command identity, so no resolved owner is taken")
+                me["resolution"] = "unresolved"
         elif ident.get("resolution") == "resolved":
             me["thread"] = ident.get("robobThreadId")
             me["manager"] = ident.get("parentThreadId")
@@ -308,8 +347,8 @@ def require_proven(me: dict, action: str) -> None:
     if not me.get("proven", True):
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
-            f"(resolution={me.get('resolution') or 'none'}). A Claude shell shares its session id with its native "
-            f"children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
+            f"(resolution={me.get('resolution') or 'none'}). A Claude shell without the hook's signed per-command "
+            f"identity can't be told apart from its native children, and a pending thread isn't mapped yet. Use a resolved Codex or OpenCode thread, or retry in "
             f"a few seconds. Nothing was changed.", code=2)
 
 
