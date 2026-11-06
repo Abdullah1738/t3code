@@ -5772,9 +5772,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       sql<ShellThreadRow>`
             -- Unpaged full snapshots revisit runs for every thread; one sequential
             -- read avoids thrashing the disk cache on the fragmented live database.
-            -- A page (limit) or a single thread must not copy the whole runs table:
-            -- clients fetch ~60 pages, and materializing per page cost 8s each.
-            WITH shell_runs AS ${threadId === undefined && limit === undefined ? sql`MATERIALIZED` : sql`NOT MATERIALIZED`} (
+            -- A page (limit), a single thread or a filtered snapshot (the PR sync's
+            -- unsettled candidates, one project) must not copy the whole runs table:
+            -- clients fetch ~60 pages at 8s each, and the PR sync stalled every 30s.
+            WITH shell_runs AS ${
+              threadId === undefined &&
+              limit === undefined &&
+              projectId === undefined &&
+              !unsettledOnly &&
+              !pullRequestCandidatesOnly
+                ? sql`MATERIALIZED`
+                : sql`NOT MATERIALIZED`
+            } (
               SELECT * FROM orchestration_v2_projection_runs
               ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}
             )
