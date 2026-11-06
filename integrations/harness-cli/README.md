@@ -19,6 +19,7 @@ harness_cli.py promote <tool> <version>  # canary-gated atomic switch of current
 harness_cli.py rollback <tool>           # current -> lastKnownGood
 harness_cli.py rotate-codex [--when-idle]
 harness_cli.py status
+harness_cli.py repair-companions <tool> <version>  # old flat bin/rg tree -> codex-path/rg (idempotent)
 harness_cli.py auto                      # the daily job (launchd 06:00 Dubai)
 harness_cli.py --before-release          # flag: discover + stage + canary both; prints the pins
 ```
@@ -39,6 +40,17 @@ config hashes, result). State lives in `~/.robob/harness-cli/state.json`.
 - A staged version must report exactly the version it was staged as.
 - Claude uses the native `@anthropic-ai/claude-code-darwin-arm64` binary, and Codex uses
   `@openai/codex@<v>-darwin-arm64`.
+- Codex is staged in its package layout, the same paths `CodexInstallation.ts` checks:
+  `bin/codex`, `bin/codex-code-mode-host` (required: code mode spawns it for every tool call)
+  and `codex-path/rg` (optional: codex falls back to `rg` on PATH, so a package without it
+  stages with a warning and records `rg: null`). Companion hashes go into the stage record.
+- canary, promote and rollback check each recorded companion hash next to the binary hash
+  and refuse on a missing or changed file. promote also requires the canary record to carry
+  the same companion hashes, so a canary from before the companions existed can't promote.
+- `repair-companions` fixes trees staged with the old flat layout (`bin/rg`): it checks the
+  binary and companions against the record, moves `bin/rg` to `codex-path/rg`, restores the
+  read-only modes and appends a `repair-companions` record. A tree that already verifies is
+  left alone.
 
 ## Canary (every promotion)
 

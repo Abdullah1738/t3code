@@ -93,10 +93,17 @@ TOOLS = {
         "native": "@openai/codex",  # darwin build is published as <v>-darwin-arm64
         "native_suffix": "-darwin-arm64",
         "binary_in_native": "package/vendor/aarch64-apple-darwin/bin/codex",
-        # Codex runs every tool call through code mode, which spawns this sibling of
-        # its own executable; without it no tool can run. `rg` backs file search.
-        # Paths are relative to the binary's directory in the package -> staged bin/.
-        "companions": {"codex-code-mode-host": "codex-code-mode-host", "../codex-path/rg": "rg"},
+        # Staged with the package's own layout (CodexInstallation.ts checks the same three
+        # paths): bin/codex, bin/codex-code-mode-host, codex-path/rg. Codex runs every tool
+        # call through code mode, which spawns the host as a sibling of its executable, so the
+        # host is required. Codex looks for its bundled ripgrep under codex-path/ and falls
+        # back to rg on PATH, so a package without it still stages (warned, recorded as null).
+        # `source` is relative to the binary's directory in the package; `dest` to <version>/.
+        "companions": [
+            {"name": "codex-code-mode-host", "source": "codex-code-mode-host",
+             "dest": "bin/codex-code-mode-host", "required": True},
+            {"name": "rg", "source": "../codex-path/rg", "dest": "codex-path/rg", "required": False},
+        ],
         "version_flag": ["--version"],
         "version_regex": r"codex-cli\s+(\d+\.\d+\.\d+)",
         "minimum_model_key": "codex",
@@ -427,13 +434,26 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         bin_dir.mkdir(parents=True)
         final_bin = bin_dir / ("claude" if tool == "claude" else "codex")
         shutil.copy2(binary, final_bin)
-        companions = {}
-        for rel, name in TOOLS[tool].get("companions", {}).items():
-            source = (binary.parent / rel).resolve()
-            if not source.is_file() or extract.resolve() not in source.parents:
-                raise HarnessError(f"{tool}: companion {rel} not in the package")
-            shutil.copy2(source, bin_dir / name)
-            companions[name] = sha256_file(bin_dir / name)
+        executables = {final_bin}
+        companions: dict[str, str | None] = {}
+        warnings: list[str] = []
+        for spec in companion_specs(tool):
+            source = (binary.parent / spec["source"]).resolve()
+            if extract.resolve() not in source.parents:
+                raise HarnessError(f"{tool}: companion {spec['source']} resolves outside the package")
+            if not source.is_file():
+                if spec["required"]:
+                    raise HarnessError(f"{tool}: companion {spec['source']} not in the package")
+                warning = f"{tool} {version}: optional companion {spec['name']} not in the package; recorded as null"
+                print(f"warning: {warning}", file=sys.stderr)
+                warnings.append(warning)
+                companions[spec["name"]] = None
+                continue
+            dest = final / spec["dest"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+            executables.add(dest)
+            companions[spec["name"]] = sha256_file(dest)
         digest = sha256_file(final_bin)
         tool_dir(tool).mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -441,10 +461,11 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         # Rename while still writable (macOS needs write on the directory being moved), then lock
         # the tree read-only at its final place. The version dir never appears half-written.
         os.rename(final, target)
+        executable_rel = {p.relative_to(final) for p in executables}
         for dirpath, dirs, files in os.walk(target, topdown=False):
             for name in files:
                 full = Path(dirpath) / name
-                executable = full.parent == target / "bin"
+                executable = full.relative_to(target) in executable_rel
                 os.chmod(full, 0o555 if executable else 0o444)
             for name in dirs:
                 os.chmod(Path(dirpath) / name, 0o555)
@@ -455,12 +476,177 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         result = {"tool": tool, "version": version, "dir": str(target),
                   "binary": str(target / "bin" / final_bin.name), "sha512": actual, "binarySha256": digest,
                   "companions": companions}
+        extra = {"warnings": warnings} if warnings else {}
         write_record("stage", tool, version, "staged", binarySha256=digest, integrity=actual,
                      companions=companions,
-                     harnessHomes=harness_home_hashes())
+                     harnessHomes=harness_home_hashes(), **extra)
         return result
     finally:
         remove_tree(temp_root)
+
+
+def companion_specs(tool: str) -> list[dict]:
+    return list(TOOLS[tool].get("companions", []))
+
+
+def tool_records(tool: str, version: str) -> list[dict]:
+    if not records_path().exists():
+        return []
+    out = []
+    for line in records_path().read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("tool") == tool and record.get("version") == version:
+            out.append(record)
+    return out
+
+
+def recorded_companions(tool: str, version: str) -> dict | None:
+    """The companion hashes from the latest stage or repair record for this version, or None."""
+    found = None
+    for record in tool_records(tool, version):
+        if record.get("action") in ("stage", "repair-companions") and isinstance(record.get("companions"), dict):
+            found = record["companions"]
+    return found
+
+
+def recorded_binary_sha(tool: str, version: str) -> str | None:
+    """The latest binary sha256 any step recorded for this version (stage, repair, canary, promote)."""
+    found = None
+    for record in tool_records(tool, version):
+        if record.get("action") in ("stage", "repair-companions", "canary", "promote") \
+                and isinstance(record.get("binarySha256"), str):
+            found = record["binarySha256"]
+    return found
+
+
+def verify_companions(tool: str, version: str) -> dict:
+    """Check each companion on disk against the recorded hashes. Returns the verified hashes.
+
+    A required companion must be recorded and present with its hash. An optional one recorded as
+    null is accepted; recorded with a hash, it must be present at its package path and match.
+    """
+    specs = companion_specs(tool)
+    if not specs:
+        return {}
+    recorded = recorded_companions(tool, version)
+    if recorded is None:
+        raise HarnessError(f"{tool} {version}: no companion hashes recorded; re-stage this version")
+    target = version_dir(tool, version)
+    verified: dict[str, str | None] = {}
+    for spec in specs:
+        name = spec["name"]
+        if name not in recorded:
+            raise HarnessError(f"{tool} {version}: companion {name} is not in the record; "
+                               f"run `harness_cli.py repair-companions {tool} {version}` or re-stage")
+        expected = recorded[name]
+        path = target / spec["dest"]
+        if expected is None:
+            if spec["required"]:
+                raise HarnessError(f"{tool} {version}: required companion {name} is recorded as missing")
+            verified[name] = None
+            continue
+        if not path.is_file():
+            hint = (f"; run `harness_cli.py repair-companions {tool} {version}`"
+                    if (target / "bin" / name).is_file() and spec["dest"] != f"bin/{name}" else "")
+            raise HarnessError(f"{tool} {version}: companion {name} missing at {spec['dest']}{hint}")
+        if sha256_file(path) != expected:
+            raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+        verified[name] = expected
+    return verified
+
+
+def _restore_read_only(target: Path, executables: set[Path]) -> None:
+    for dirpath, dirs, files in os.walk(target, topdown=False):
+        for name in files:
+            full = Path(dirpath) / name
+            os.chmod(full, 0o555 if full in executables or full.parent == target / "bin" else 0o444)
+        for name in dirs:
+            os.chmod(Path(dirpath) / name, 0o555)
+    os.chmod(target, 0o555)
+
+
+def repair_companions(tool: str, version: str) -> dict:
+    """Move companions staged by the old flat layout (bin/<name>) to their package paths.
+
+    Idempotent: a tree that already verifies is left alone and gets no new record. Refuses when
+    the binary or any companion differs from its record, so it can only rearrange recorded bytes.
+    """
+    if tool not in TOOLS:
+        raise HarnessError(f"unknown tool {tool}")
+    specs = companion_specs(tool)
+    if not specs:
+        raise HarnessError(f"{tool} has no companions to repair")
+    target = version_dir(tool, version)
+    binary = target / "bin" / ("claude" if tool == "claude" else "codex")
+    if not binary.is_file():
+        raise HarnessError(f"{version} is not staged")
+    expected_bin = recorded_binary_sha(tool, version)
+    if not expected_bin or sha256_file(binary) != expected_bin:
+        raise HarnessError(f"{tool} {version}: staged binary differs from its record; refusing to repair")
+    recorded = recorded_companions(tool, version)
+    if recorded is None:
+        raise HarnessError(f"{tool} {version}: no companion hashes recorded; re-stage this version")
+    moves: list[tuple[Path, Path]] = []
+    for spec in specs:
+        name = spec["name"]
+        expected = recorded.get(name)
+        dest = target / spec["dest"]
+        legacy = target / "bin" / name
+        if dest.is_file():
+            if expected is None or sha256_file(dest) != expected:
+                raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+            continue
+        if expected is None:
+            if spec["required"]:
+                raise HarnessError(f"{tool} {version}: required companion {name} is missing and unrecorded")
+            continue
+        if legacy == dest or not legacy.is_file():
+            raise HarnessError(f"{tool} {version}: companion {name} missing at {spec['dest']} and "
+                               f"bin/{name}; re-stage this version")
+        if sha256_file(legacy) != expected:
+            raise HarnessError(f"{tool} {version}: bin/{name} differs from its recorded sha256")
+        moves.append((legacy, dest))
+    if not moves:
+        return {"tool": tool, "version": version, "status": "already-ok", "companions": verify_companions(tool, version)}
+    executables = {binary}
+    try:
+        os.chmod(target, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        os.chmod(target / "bin", stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        for legacy, dest in moves:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(dest.parent, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            os.rename(legacy, dest)  # same filesystem: atomic, bytes unchanged
+            executables.add(dest)
+        for spec in specs:
+            path = target / spec["dest"]
+            if path.is_file():
+                executables.add(path)
+    finally:
+        _restore_read_only(target, executables)
+    companions = verify_companions_on_disk(tool, version, recorded)
+    write_record("repair-companions", tool, version, "companions-repaired", binarySha256=expected_bin,
+                 companions=companions, moved=[str(d.relative_to(target)) for _, d in moves],
+                 harnessHomes=harness_home_hashes())
+    verify_companions(tool, version)
+    return {"tool": tool, "version": version, "status": "repaired",
+            "moved": [str(d.relative_to(target)) for _, d in moves], "companions": companions}
+
+
+def verify_companions_on_disk(tool: str, version: str, recorded: dict) -> dict:
+    target = version_dir(tool, version)
+    out: dict[str, str | None] = {}
+    for spec in companion_specs(tool):
+        path = target / spec["dest"]
+        expected = recorded.get(spec["name"])
+        if expected is None:
+            out[spec["name"]] = None
+            continue
+        if not path.is_file() or sha256_file(path) != expected:
+            raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+        out[spec["name"]] = expected
+    return out
 
 
 def remove_tree(path: Path) -> None:
@@ -1638,6 +1824,7 @@ def canary(tool: str, version: str) -> dict:
     reasons: list[str] = []
     result: dict = {}
     digest = None
+    companions = None
     # Supersede any older pass before executing untrusted candidates, even if a run hangs.
     write_record("canary", tool, version, "failed", binarySha256=None, canary={},
                  reasons=["canary run did not complete"], canarySchemaVersion=CANARY_SCHEMA_VERSION)
@@ -1646,6 +1833,8 @@ def canary(tool: str, version: str) -> dict:
         if not binary.is_file():
             raise HarnessError(f"{binary} not staged")
         digest = sha256_file(binary)
+        # The canary must run with the exact companions that were staged, so a pass proves them too.
+        companions = verify_companions(tool, version)
         if binary_version(binary, tool) != version:
             raise HarnessError(f"{binary} does not report {version}")
         key_present = bool(os.environ.get("NINEROUTER_KEY"))
@@ -1720,10 +1909,17 @@ def canary(tool: str, version: str) -> dict:
         reasons.append(str(exc))
     except Exception as exc:
         reasons.append(f"canary error: {type(exc).__name__}")
+    if not reasons and digest is not None:
+        # Nothing may change under the canary: re-check binary and companions after the run.
+        try:
+            if sha256_file(binary) != digest or verify_companions(tool, version) != companions:
+                reasons.append("staged binary or companions changed during the canary")
+        except (HarnessError, OSError) as exc:
+            reasons.append(str(exc))
     passed = not reasons
     outcome = "passed" if passed else "inconclusive" if result.get("thinkingInconclusive") else "failed"
     write_record("canary", tool, version, outcome,
-                 binarySha256=digest, canary=result, reasons=reasons,
+                 binarySha256=digest, companions=companions, canary=result, reasons=reasons,
                  harnessHomes=harness_home_hashes(), keyPresent=bool(os.environ.get("NINEROUTER_KEY")),
                  canarySchemaVersion=CANARY_SCHEMA_VERSION)
     return {"passed": passed, "reasons": reasons, "result": result}
@@ -1839,6 +2035,10 @@ def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     binary = version_dir(tool, version) / "bin" / ("claude" if tool == "claude" else "codex")
     if not binary.is_file() or not verdict.get("binarySha256") or sha256_file(binary) != verdict["binarySha256"]:
         raise HarnessError("staged binary differs from the canary record")
+    companions = verify_companions(tool, version)
+    if companion_specs(tool) and verdict.get("companions") != companions:
+        raise HarnessError(f"{tool} {version}: companions differ from the canary record "
+                           "(or the canary predates them); run a fresh canary")
     if tool == "codex":
         status = "promoted, rotation pending"
     else:
@@ -1851,7 +2051,7 @@ def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     transition_current(state, {"op": "promote", "tool": tool, "from": previous, "to": version,
                                "lastKnownGood": previous, "notice": notice, "promotedAt": now_iso()})
     digest = verdict.get("binarySha256")
-    write_record("promote", tool, version, status, binarySha256=digest,
+    write_record("promote", tool, version, status, binarySha256=digest, companions=companions,
                  previous=previous, harnessHomes=harness_home_hashes())
     return {"tool": tool, "version": version, "previous": previous, "status": status}
 
@@ -1864,6 +2064,12 @@ def rollback(tool: str) -> dict:
         raise HarnessError(f"{tool} has no lastKnownGood to roll back to")
     if not version_dir(tool, target).is_dir():
         raise HarnessError(f"lastKnownGood {target} is no longer on disk")
+    # Roll back only onto the bytes that were recorded for that version: binary and companions.
+    binary = version_dir(tool, target) / "bin" / ("claude" if tool == "claude" else "codex")
+    expected = recorded_binary_sha(tool, target)
+    if not binary.is_file() or not expected or sha256_file(binary) != expected:
+        raise HarnessError(f"lastKnownGood {target} binary differs from its record; refusing to roll back")
+    verify_companions(tool, target)
     previous = slot.get("current")
     transition_current(state, {"op": "rollback", "tool": tool, "from": previous, "to": target,
                                "lastKnownGood": previous, "notice": None})
@@ -1998,6 +2204,7 @@ def latest_canary(tool: str, version: str) -> dict | None:
     return {
         "passed": passed,
         "binarySha256": found.get("binarySha256"),
+        "companions": found.get("companions"),
         "memoryCheckedAt": found.get("at") if passed else None,
     }
 
@@ -2370,6 +2577,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rollback")
     p.add_argument("tool", choices=sorted(TOOLS))
     sub.add_parser("status")
+    p = sub.add_parser("repair-companions",
+                       help="move companions from the old flat bin/ layout to their package paths")
+    p.add_argument("tool", choices=sorted(TOOLS))
+    p.add_argument("version")
     p = sub.add_parser("rotate-codex")
     p.add_argument("--when-idle", action="store_true")
     sub.add_parser("auto")
@@ -2378,7 +2589,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-LOCKED_COMMANDS = {"discover", "stage", "canary", "promote", "rollback", "rotate-codex", "auto"}
+LOCKED_COMMANDS = {"discover", "stage", "canary", "promote", "rollback", "rotate-codex", "auto",
+                   "repair-companions"}
 
 
 class StateLock:
@@ -2448,6 +2660,8 @@ def _dispatch(args) -> int:
             print(json.dumps(rollback(args.tool), indent=2, sort_keys=True))
         elif args.cmd == "status":
             print(json.dumps(status(), indent=2, sort_keys=True))
+        elif args.cmd == "repair-companions":
+            print(json.dumps(repair_companions(args.tool, args.version), indent=2, sort_keys=True))
         elif args.cmd == "rotate-codex":
             print(rotate_codex(when_idle=args.when_idle))
         elif args.cmd == "auto":
