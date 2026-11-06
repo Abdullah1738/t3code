@@ -13,7 +13,10 @@ function tokens(code) {
     if (t[0] === '`') { out.push('<template>'); continue; }
     // A regexp literal can contain fake constructors. Skip its text, including
     // character classes; uncertain slash contexts are left to the 20 min bound.
-    if (t === '/' && (!out.length || /^(?:[=(:,!&|?;{\[]|return|throw|=>)$/.test(out.at(-1)))) {
+    if (t === '/') {
+      // After e.g. `if (...)` or a block, slash can start a regexp or divide.
+      // Without a full parser, skip the call rather than scan regexp text as JS.
+      if (out.length && !/^(?:[=(:,!&|?;{\[]|return|throw|=>)$/.test(out.at(-1))) return null;
       let cls = false;
       let i = lex.lastIndex;
       for (; i < code.length; i++) {
@@ -48,6 +51,7 @@ function endGroup(ts, start) {
 export function neverSettles(code) {
   if (typeof code !== 'string') return false;
   const ts = tokens(code);
+  if (!ts) return false;
   for (let i = 0; i < ts.length; i++) {
     if (ts[i] !== 'new' || ts[i + 1] !== 'Promise' || ts[i + 2] !== '(') continue;
     const end = endGroup(ts, i + 2);
@@ -79,9 +83,9 @@ export function neverSettles(code) {
       body = ts.slice(at + 1, bodyEnd);
     } else if (!fn) body = ts.slice(at, end);
     else continue;
-    // A throw rejects a synchronous executor. Templates may reference a
-    // resolver inside interpolation, so don't classify their opaque contents.
-    if (body.includes('throw') || body.includes('<template>') || body.includes('/')) continue;
+    // `arguments` can access the callbacks without naming the parameters.
+    // Throws reject; templates can call a resolver inside opaque interpolation.
+    if (body.includes('arguments') || body.includes('throw') || body.includes('<template>')) continue;
     let bare = body;
     while (bare.at(-1) === ';') bare = bare.slice(0, -1);
     if (bare[0] === 'return') bare = bare.slice(1);

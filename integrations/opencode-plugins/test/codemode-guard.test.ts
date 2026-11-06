@@ -41,12 +41,40 @@ const allowed = [
   "await new Promise(resolve => { listeners.push(resolve); })",
 ];
 
+const implicitCallbackForms = [
+  ["resolve index", "return await new Promise(function() { arguments[0](42); });"],
+  ["reject index", "return await new Promise(function() { arguments[1]('no'); });"],
+  ["unused formal", "return await new Promise(function(res) { arguments[0](42); });"],
+  ["named executor", "return await new Promise(function done() { arguments[0](42); });"],
+  ["string index", "return await new Promise(function() { arguments['0'](42); });"],
+  ["alias", "return await new Promise(function() { const resolve = arguments[0]; resolve(42); });"],
+  ["callback handoff", "return await new Promise(function() { cb(arguments[0]); });"],
+  ["lexical arguments", "return await new Promise(function() { (() => arguments[0](42))(); });"],
+];
+const slashContexts = [
+  ["if", 'if (true) /new Promise(r=>r)/.test("test"); return 1;'],
+  ["nested condition", 'if ((true)) /new Promise(r=>r)/.test("test"); return 1;'],
+  ["while", 'while (false) /new Promise(r=>r)/.test("test"); return 1;'],
+  ["for", 'for (; false;) /new Promise(r=>r)/.test("test"); return 1;'],
+  ["for of", 'for (const x of []) /new Promise(r=>r)/.test(x); return 1;'],
+  ["block", 'if (true) {} /new Promise(r=>r)/.test("test"); return 1;'],
+  ["else", 'if (false) {} else /new Promise(r=>r)/.test("test"); return 1;'],
+  ["do", 'do /new Promise(r=>r)/.test("test"); while (false); return 1;'],
+  ["label", 'label: /new Promise(r=>r)/.test("test"); return 1;'],
+  ["escaped slash and class", 'if (true) /[/]new Promise(r=>r)\\//.test("test"); return 1;'],
+  ["division ambiguity", 'const half = value / 2; return await new Promise(r=>r);'],
+];
+
 describe("neverSettles", () => {
   for (const code of blocked) test(`blocks ${code}`, () => {
     expect(neverSettles(code)).toBe(true);
     expect(stallNeverSettles(code)).toBe(true);
   });
   for (const code of allowed) test(`allows ${code}`, () => {
+    expect(neverSettles(code)).toBe(false);
+    expect(stallNeverSettles(code)).toBe(false);
+  });
+  for (const [shape, code] of [...implicitCallbackForms, ...slashContexts]) test(`allows uncertain ${shape}`, () => {
     expect(neverSettles(code)).toBe(false);
     expect(stallNeverSettles(code)).toBe(false);
   });
@@ -92,6 +120,18 @@ test("off mode leaves invalid waits alone", async () => {
   const e: Event = { tool: "execute", input: { code: "new Promise(()=>{})" } };
   await createGuardHook({ mode: () => "off", log: () => { throw new Error("should not log"); } })(e);
   expect(e.input.code).toBe("new Promise(()=>{})");
+});
+
+test("implicit callbacks and ambiguous regexp contexts are not rewritten", async () => {
+  const records: Record<string, unknown>[] = [];
+  const hook = createGuardHook({ mode: () => "enforce", log: record => { records.push(record); } });
+  for (const [, code] of [...implicitCallbackForms, ...slashContexts]) {
+    const input = { code };
+    const e = { tool: "execute", input };
+    await hook(e);
+    expect(e.input).toBe(input);
+  }
+  expect(records).toHaveLength(0);
 });
 
 test("missing or non-string code inputs stay untouched", async () => {

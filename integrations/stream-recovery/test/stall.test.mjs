@@ -65,7 +65,10 @@ test('execute waits with a never-settling promise get three minutes and name the
 });
 
 test('normal execute calls get twenty minutes, including missing or malformed input', () => {
-  for (const input of [undefined, {}, { code: null }, { code: 3 }, { code: 'return await tools.perplexity.perplexity_research({});' }, { code: 'new Promise(r => setTimeout(r, 10))' }]) {
+  for (const input of [undefined, {}, { code: null }, { code: 3 }, { code: 'return await tools.perplexity.perplexity_research({});' }, { code: 'new Promise(r => setTimeout(r, 10))' },
+    { code: 'return await new Promise(function() { arguments[0](42); });' },
+    { code: 'return await new Promise(function() { arguments[1]("no"); });' },
+    { code: 'if (true) /new Promise(r=>r)/.test("test"); return 1;' }]) {
     const part = tool('execute', 'running', undefined, input);
     assert.equal(toolLimit(part), 20 * 60_000);
     assert.equal(tailActivity([{ content: [part] }]).label, 'running execute');

@@ -5,3 +5,5 @@
 Tests: `bun test integrations/opencode-plugins` and `node --test integrations/stream-recovery/test/*.test.mjs` from the repo root.
 
 This targets OpenCode 2.0.22's `ctx.tool.hook("execute.before", ...)` API and legacy global `plugin/` discovery, like the offbox gate. The watcher limits use its existing unchanged-tail clock (first observation or newest timestamp, whichever is later), once-a-minute scan, person/subagent exclusions, and two-minute direct-interrupt fallback; they are not a hard execution deadline.
+
+Executors referencing `arguments` are left alone because they can access resolve/reject without formal parameter names. A slash in an ambiguous regexp/division context makes detection fail open for that call; it keeps the normal 20-minute watcher limit rather than risking a false denial.
