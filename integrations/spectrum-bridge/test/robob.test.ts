@@ -6,11 +6,12 @@ import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
 import { discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
-import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
+import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
 import { imessagePreferences } from "../src/preferred-model.ts";
 import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
+import { firstTurnAlert } from "../src/telegram-fallback.ts";
 
 const inbounds = (store: Store) => store.db.query<{ id: string; state: string }, []>("SELECT id, state FROM inbound ORDER BY rowid").all();
 const wakeBody = (title = "Daily board") => `[Watcher event from robob-watch daily-backlog, not typed by the owner. Handle it; reply only if the owner needs to know or act now, otherwise log it to the activity log and end with NO_REPLY.]\n${title}\n\nEvent:\nWORKING #5`;
@@ -42,7 +43,7 @@ function fakeControl() {
   const natives = new Map<string, string>();
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
-  const flags = { ignoreSettled: false };
+  const flags = { ignoreSettled: false, recentRunsLimit: Infinity };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
@@ -57,7 +58,7 @@ function fakeControl() {
     pendingRequest: thread.pending[0] ? { requestId: thread.pending[0].requestId, kind: thread.pending[0].kind, requestKind: thread.pending[0].requestKind } : null,
     lastError: thread.lastError, settled: thread.settled ?? false, createdAt: now(), updatedAt: now(),
   });
-  const detail = (thread: Thread) => ({ ...summary(thread), run: thread.runs.at(-1) ?? null, recentRuns: [...thread.runs].reverse(), pendingRequests: thread.pending });
+  const detail = (thread: Thread) => ({ ...summary(thread), run: thread.runs.at(-1) ?? null, recentRuns: [...thread.runs].reverse().slice(0, flags.recentRunsLimit), pendingRequests: thread.pending });
   const ok = (body: object, status = 200) => Response.json({ ok: true, ...body }, { status });
   const notFound = () => Response.json({ ok: false, error: { code: "not_found", message: "nope" } }, { status: 404 });
   const url = (() => {
@@ -233,7 +234,7 @@ test("an explicit claudeAgent preference sends its instance and the slashless mo
 test("a new thread's failed first turn raises one alert, never again and never for a later turn", async () => {
   const control = fakeControl();
   const alerts: Array<[string, string]> = [];
-  const backend = control.backend("/chats", { alert: async (threadId, text) => { alerts.push([threadId, text]); } });
+  const backend = control.backend("/chats", { alert: async (threadId, text) => { alerts.push([threadId, text]); return true; } });
   const { id, directory } = await backend.createChat();
   await backend.prompt(id, directory, `msg_${"d".repeat(64)}`, "hello", "", []);
   // Still running: nothing to judge yet.
@@ -257,7 +258,7 @@ test("a new thread's failed first turn raises one alert, never again and never f
 test("a failed first run with lastError alerts once; a good first turn never alerts", async () => {
   const control = fakeControl();
   const alerts: string[] = [];
-  const backend = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); } });
+  const backend = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); return true; } });
   const bad = await backend.createChat();
   await backend.prompt(bad.id, bad.directory, `msg_${"f".repeat(64)}`, "hello", "", []);
   const thread = control.threads.get(bad.id)!;
@@ -277,9 +278,202 @@ test("a failed first run with lastError alerts once; a good first turn never ale
   await backend.messages(good.id, good.directory);
   expect(alerts).toEqual([bad.id]);
   // A thread the backend did not create (a stored route from before a restart) is never judged.
-  const other = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); } });
+  const other = control.backend("/chats", { alert: async threadId => { alerts.push(threadId); return true; } });
   await other.messages(bad.id, bad.directory);
   expect(alerts).toEqual([bad.id]);
+});
+
+test.each(["owner", "forChat"])("%s first-turn failures send one attention alert and one honest chat notice", async routeKind => {
+  const control = fakeControl();
+  const posts: Array<{ path: string; body: Record<string, string> }> = [];
+  const root = control.backend("/chats", { alert: firstTurnAlert(async (path, body) => { posts.push({ path, body }); return 202; }) });
+  const backend = routeKind === "forChat" ? root.forChat("chats/test-person", "Test person") : root;
+  const store = new Store(":memory:");
+  stores.push(store);
+  backend.trackFirstTurns(store);
+  const router = new Router(store, backend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+  });
+  store.acceptInbound("first", { id: "first", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const { id } = store.get<{ id: string }>("route")!;
+  const thread = control.threads.get(id)!;
+  thread.driver = { instanceId: "claudeAgent", model: "opus/claude-opus-5-5" };
+  control.reply(id, "Starting up", "running");
+  control.reply(id, "There's an issue with the selected model (opus/claude-opus-5-5).", "completed");
+  thread.lastError = "Claude gave up after repeated API errors.";
+  await router.tick();
+  await router.tick();
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).toMatchObject({ path: "/notify", body: { source: "iMessage bridge", severity: "attention", dedupeKey: `${id}:first-turn-failed` } });
+  for (const value of [thread.title, id, thread.driver.model, thread.driver.instanceId, thread.lastError]) expect(posts[0]!.body.text).toContain(value);
+  expect(store.pendingOutbox().filter(item => item.kind === "conversation")).toEqual([]);
+  expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
+    "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
+  ]);
+  expect(inbounds(store)).toEqual([{ id: "first", state: "failed" }]);
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
+});
+
+test.each([
+  { status: "failed", error: null, text: "" },
+  { status: "completed", error: "Provider failed", text: "" },
+  { status: "completed", error: null, text: "There's an issue with the selected model (bad)." },
+])("first-turn error form %j is failed evidence even without assistant text", async failure => {
+  const control = fakeControl();
+  const alerts: string[] = [];
+  const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"2".repeat(64)}`, "hi");
+  const thread = control.threads.get(chat.id)!;
+  thread.runs[0]!.status = failure.status;
+  thread.lastError = failure.error;
+  if (failure.text) control.reply(chat.id, failure.text, failure.status);
+  const records = await backend.messages(chat.id, chat.directory);
+  expect(alerts).toHaveLength(1);
+  expect(records.at(-1)).toMatchObject({ type: "idle", outcome: "failed", firstTurnFailure: true });
+  await backend.messages(chat.id, chat.directory);
+  expect(alerts).toHaveLength(1);
+});
+
+test("first-turn checks survive restart, and a Telegram transport retry keeps the same key without replaying the turn", async () => {
+  const control = fakeControl();
+  const store = new Store(":memory:");
+  stores.push(store);
+  const keys: string[] = [];
+  const alert = firstTurnAlert(async (_path, body) => { keys.push(body.dedupeKey); return keys.length === 1 ? 503 : 200; });
+  const before = control.backend("/chats", { alert });
+  before.trackFirstTurns(store);
+  const chat = await before.createChat();
+  await before.prompt(chat.id, chat.directory, `msg_${"3".repeat(64)}`, "hi");
+  control.threads.get(chat.id)!.lastError = "bad model";
+  control.reply(chat.id, "", "failed");
+  const after = control.backend("/chats", { alert });
+  after.trackFirstTurns(store);
+  await after.messages(chat.id, chat.directory);
+  expect(store.get("firstTurns")).toMatchObject([{ id: chat.id, alert: expect.stringContaining("bad model") }]);
+  await after.prompt(chat.id, chat.directory, `msg_${"7".repeat(64)}`, "repaired");
+  control.threads.get(chat.id)!.lastError = null;
+  control.reply(chat.id, "All set", "completed");
+  await after.messages(chat.id, chat.directory);
+  await after.messages(chat.id, chat.directory);
+  expect(keys).toEqual([`${chat.id}:first-turn-failed`, `${chat.id}:first-turn-failed`]);
+  expect(store.get<string[]>("firstTurns")).toEqual([]);
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
+});
+
+test("overlapping first-turn reads share one in-flight alert", async () => {
+  const control = fakeControl();
+  let finish!: (accepted: boolean) => void;
+  const pending = new Promise<boolean>(resolve => { finish = resolve; });
+  let started!: () => void;
+  const sending = new Promise<void>(resolve => { started = resolve; });
+  let alerts = 0;
+  const backend = control.backend("/chats", { alert: async () => { alerts++; started(); return pending; } });
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"8".repeat(64)}`, "hi");
+  control.reply(chat.id, "", "failed");
+  const first = backend.messages(chat.id, chat.directory);
+  await sending;
+  await backend.messages(chat.id, chat.directory);
+  expect(alerts).toBe(1);
+  finish(true);
+  await first;
+  await backend.messages(chat.id, chat.directory);
+  expect(alerts).toBe(1);
+});
+
+test.each([
+  ["There's an issue with the selected model (bad). It may not exist.", true],
+  ["There’s an issue with the selected model (bad).", true],
+  ["There is an issue with the selected model (bad).", true],
+  ["I fixed the issue with the selected model; everything is working now.", false],
+  ['The error was "There\'s an issue with the selected model (bad)." It is fixed.', false],
+  ['"There\'s an issue with the selected model (bad)."', false],
+  ["No issue with the selected model now.", false],
+])("selected-model diagnostic form %s matches %s", (text, expected) => {
+  expect(SELECTED_MODEL_ISSUE.test(text as string)).toBe(expected);
+});
+
+test.each([200, 202, 400, 409, 500, 503, undefined])("first-turn alert accepts only durable Telegram acceptance (%s)", async status => {
+  expect(await firstTurnAlert(async () => status)("thread", "failed")).toBe(status === 200 || status === 202);
+});
+
+test("an alert held during an outage drains after route replacement and restart", async () => {
+  const control = fakeControl();
+  const store = new Store(":memory:");
+  stores.push(store);
+  const posted: string[] = [];
+  const before = control.backend("/chats", { alert: firstTurnAlert(async () => 503) });
+  before.trackFirstTurns(store);
+  const old = await before.createChat();
+  await before.prompt(old.id, old.directory, `msg_${"9".repeat(64)}`, "hi");
+  control.reply(old.id, "", "failed");
+  await before.messages(old.id);
+  const current = await before.createChat();
+  const after = control.backend("/chats", { alert: firstTurnAlert(async (_path, body) => { posted.push(body.dedupeKey); return 202; }) });
+  after.trackFirstTurns(store);
+  await after.messages(current.id);
+  await after.messages(current.id);
+  expect(posted).toEqual([`${old.id}:first-turn-failed`]);
+  expect(store.get("firstTurns")).toMatchObject([{ id: current.id, alert: null }]);
+});
+
+test.each([
+  { status: "completed", laterRuns: 1 },
+  { status: "failed", laterRuns: 1 },
+  { status: "completed", laterRuns: 5 },
+])("a first-turn model complaint before queued steers (%j) is replaced with one notice, not forwarded", async ({ status, laterRuns }) => {
+  const control = fakeControl();
+  control.flags.recentRunsLimit = 5;
+  const alerts: string[] = [];
+  const backend = control.backend("/chats", { alert: async (id, text) => { alerts.push(text); return true; } });
+  const store = new Store(":memory:");
+  stores.push(store);
+  const router = new Router(store, backend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+  });
+  store.acceptInbound("first", { id: "first", text: "hi", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const chat = store.get<{ id: string; directory: string }>("route")!;
+  control.reply(chat.id, "There's an issue with the selected model (bad).", "completed");
+  const steered: string[] = [];
+  for (let i = 0; i < laterRuns; i++) {
+    const steer = `msg_${String(i).repeat(64)}`;
+    steered.push(steer);
+    await backend.prompt(chat.id, chat.directory, steer, "second");
+    control.reply(chat.id, "This reply worked", i === laterRuns - 1 ? status : "completed");
+  }
+  store.set("activeTurn", { ...store.get<object>("activeTurn"), steered, steeredAt: Date.now() });
+  await router.tick();
+  await router.tick();
+  expect(store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text)).toEqual(status === "completed" ? Array(laterRuns).fill("This reply worked") : []);
+  expect(store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
+    "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this.",
+  ]);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain("failed its first turn");
+});
+
+test("a successful first turn stays successful when an unobserved later turn fails", async () => {
+  const control = fakeControl();
+  const alerts: string[] = [];
+  const backend = control.backend("/chats", { alert: async id => { alerts.push(id); return true; } });
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"4".repeat(64)}`, "hi");
+  control.reply(chat.id, "All set", "completed");
+  await backend.prompt(chat.id, chat.directory, `msg_${"5".repeat(64)}`, "again");
+  control.threads.get(chat.id)!.lastError = "later failure";
+  control.reply(chat.id, "", "failed");
+  const records = await backend.messages(chat.id, chat.directory);
+  expect(alerts).toEqual([]);
+  expect(records.filter(record => record.type === "idle").map(record => record.outcome)).toEqual(["succeeded", "failed"]);
 });
 
 test("createChat refuses a chat root that is not a registered project", async () => {
@@ -874,19 +1068,21 @@ test("an unfinished native step is never retried, even when that run later compl
   expect(first.sends()).toBe(1);
 });
 
-test("a first-call error that emitted text but ran no tool is retried, end to end", async () => {
+test("a new chat's first-call error with text is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_text_400", [["msg_text", { finish: "error", content: [{ type: "text", text: "partial" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_text_400", base, [120_000]);
-  // Retried: the failure left it pending, and the +2 min tick sent it again (in flight, so `processing`).
-  expect(run.states).toEqual(["pending", "processing"]);
-  expect(run.sends()).toBe(2);
+  expect(run.states).toEqual(["failed", "failed"]);
+  expect(run.sends()).toBe(1);
+  expect(run.store.pendingOutbox().filter(item => item.kind === "control").map(item => item.text)).toEqual([
+    "I couldn't process that message because this chat hit a system error. Please don't resend it yet.",
+  ]);
 });
 
-test("a first-call error that emitted reasoning but ran no tool is retried, end to end", async () => {
+test("a new chat's first-call error with reasoning is reported without replaying the wake", async () => {
   const { path, base } = nativeDb("ses_reason_400", [["msg_reason", { finish: "error", content: [{ type: "reasoning", text: "thinking" }], error: { type: "aborted" } }]]);
   const run = await failedWake(path, "ses_reason_400", base, [120_000]);
-  expect(run.states).toEqual(["pending", "processing"]);
-  expect(run.sends()).toBe(2);
+  expect(run.states).toEqual(["failed", "failed"]);
+  expect(run.sends()).toBe(1);
 });
 
 test("a run whose tool call sits past a truncated scan is never retried, through the real router and OpenCode's run rows", async () => {
@@ -930,7 +1126,7 @@ test("a run whose tool call sits past a truncated scan is never retried, through
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
 });
 
-test("a first-call provider 400 on Robob is retried after 2 minutes, through the real router and OpenCode's run rows", async () => {
+test("a later provider 400 keeps the existing tool-free retry behavior", async () => {
   const dirPath = mkdtempSync(join(tmpdir(), "robob-first-call-"));
   dirs.push(dirPath);
   const path = join(dirPath, "opencode.db");
@@ -956,6 +1152,11 @@ test("a first-call provider 400 on Robob is retried after 2 minutes, through the
   });
   const start = Date.parse("2026-10-29T07:00:11Z");
   setSystemTime(start);
+  const prior = await backend.createChat();
+  await backend.prompt(prior.id, prior.directory, `msg_${"6".repeat(64)}`, "hi");
+  control.reply(prior.id, "All set", "completed");
+  store.set("route", { ...prior, generation: 1, createdAt: start, threadAt: start });
+  const sendsBefore = control.calls.filter(call => call.path.endsWith("/send")).length;
   const wake = `wake:${"m".repeat(64)}`;
   store.acceptInbound(wake, { id: wake, text: wakeBody(), attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
   await router.tick();
@@ -967,10 +1168,10 @@ test("a first-call provider 400 on Robob is retried after 2 minutes, through the
   thread.runs.at(-1)!.status = "failed";
   await router.tick();
   expect(inbounds(store).find(row => row.id === wake)?.state).toBe("pending");
-  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(sendsBefore + 1);
   setSystemTime(start + 120_000);
   await router.tick();
-  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(sendsBefore + 2);
 });
 
 test("a background run's answer before two steered texts reaches the chat along with the last one", async () => {

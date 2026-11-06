@@ -45,7 +45,7 @@ export type MessageRecord =
       time: { created: number; completed?: number };
       [key: string]: unknown;
     }
-  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; time: { created: number }; [key: string]: unknown }
+  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; time: { created: number }; [key: string]: unknown }
   | { id: string; type: "agent-switched" | "model-switched" | "location-switched" | "synthetic" | "system" | "skill" | "shell" | "compaction"; time: { created: number }; [key: string]: unknown };
 
 /** A native attachment the router prepared; sent as an OpenCode 2 prompt file (`uri` data URL). */

@@ -27,6 +27,15 @@ const outcome = (status: string): "succeeded" | "failed" | "interrupted" =>
 /** States that mean the conversation is still busy. `waiting` is not: the reply is out, only background work drains. */
 const BUSY = new Set(["running", "needs-input", "queued"]);
 
+/** Some providers return the selected-model complaint as a completed assistant message. */
+export const SELECTED_MODEL_ISSUE = /^\s*(?:there['’]s|there is) an issue with the selected model\s*\([^\r\n)]+\)(?:[.!:]|$)/i;
+
+function runFailure(thread: Pick<ThreadDetail, "lastError">, run: RunSummary, messages: ControlMessage[], latest: boolean): string | undefined {
+  if (!TERMINAL.has(run.status)) return;
+  const complaint = messages.find(message => message.runId === run.runId && message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text))?.text;
+  return (latest && thread.lastError) || complaint || (run.status === "failed" ? "Run failed without error details" : undefined);
+}
+
 /** The send route derives the message id from `clientRequestId`; this maps it back to the bridge's prompt id. */
 export const sentMessagePrefix = (threadId: string) => `ardud-control:send:${threadId}:`;
 
@@ -38,6 +47,7 @@ function promptId(threadId: string, message: ControlMessage): string {
 
 /** The router's prompt ids (`msg_` plus a sha256), which it sends as `clientRequestId`. */
 const BRIDGE_PROMPT = /^msg_[0-9a-f]{64}$/;
+const runOrdinal = (runId: string) => Number(/:ordinal:(\d+)$/.exec(runId)?.[1] ?? 0);
 
 /**
  * Rebuilds OpenCode-2-style session records from Robob runs and messages, the
@@ -51,7 +61,7 @@ const BRIDGE_PROMPT = /^msg_[0-9a-f]{64}$/;
 export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recentRuns" | "run" | "lastError">, messages: ControlMessage[]): MessageRecord[] {
   const runs = new Map<string, RunSummary>();
   for (const run of [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])]) runs.set(run.runId, run);
-  const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? Number(/:ordinal:(\d+)$/.exec(runId)?.[1] ?? 0);
+  const ordinal = (runId: string) => runs.get(runId)?.ordinal ?? runOrdinal(runId);
   const byRun = new Map<string, ControlMessage[]>();
   for (const message of messages) {
     if (message.runId === null || message.role === "system") continue;
@@ -85,14 +95,19 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       records.push(last);
     }
     if (!settled) continue;
-    const result = outcome(status);
-    if (result === "failed" && runId === latest && thread.lastError) {
+    const run = runs.get(runId) ?? { runId, ordinal: ordinal(runId), status };
+    const failure = runFailure(thread, run, group, runId === latest);
+    const result = failure ? "failed" : outcome(status);
+    if (failure) {
       // Carries the provider's error text, which is how a refusal is recognised.
-      const error = { type: "provider", message: thread.lastError };
+      const error = { type: "provider", message: failure };
       if (last) last.error = error;
       else records.push({ id: `${runId}:error`, type: "assistant", content: [], runId, finish: "error", error, time: { created: epoch(group.at(-1)?.updatedAt ?? null), completed: epoch(group.at(-1)?.updatedAt ?? null) } });
     }
-    records.push({ id: `idle:${runId}`, type: "idle", outcome: result, time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
+    records.push({ id: `idle:${runId}`, type: "idle", outcome: result,
+      ...(failure && run.ordinal === 1 ? { firstTurnFailure: true } : {}),
+      ...(group.some(message => message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text)) ? { modelError: true } : {}),
+      time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
   }
   return records;
 }
@@ -128,11 +143,8 @@ export interface RobobBackendOptions extends ControlConfigOptions {
    * Raises one alert when a thread this backend created fails its first turn (see `checkFirstTurn`).
    * Unset means no alerts; only the running bridge wires it to Telegram.
    */
-  alert?: (threadId: string, text: string) => Promise<unknown>;
+  alert?: (threadId: string, text: string) => Promise<boolean>;
 }
-
-/** What a thread on the wrong provider instance answers on every turn. */
-export const SELECTED_MODEL_ISSUE = /issue with the selected model/i;
 
 const CHATS_DIR = "chats";
 
@@ -153,7 +165,23 @@ export class RobobBackend implements ChatBackend {
    */
   private readonly settledEvidence = new Map<string, "ran" | "none">();
   /** Threads createChat made whose first turn has not been judged yet. */
-  private readonly firstTurns = new Set<string>();
+  private readonly firstTurns = new Map<string, string | null>();
+  private readonly checkingFirstTurns = new Set<string>();
+  private firstTurnStore?: Pick<Store, "get" | "set">;
+
+  /** Each chat's store keeps pending first-turn checks across a bridge restart. */
+  trackFirstTurns(store: Pick<Store, "get" | "set">): void {
+    this.firstTurnStore = store;
+    const pending = store.get<unknown>("firstTurns");
+    if (Array.isArray(pending)) for (const entry of pending as unknown[]) {
+      if (!entry || typeof entry !== "object" || !("id" in entry) || !("alert" in entry)) continue;
+      if (typeof entry.id === "string" && (entry.alert === null || typeof entry.alert === "string")) this.firstTurns.set(entry.id, entry.alert);
+    }
+  }
+
+  private saveFirstTurns(): void {
+    this.firstTurnStore?.set("firstTurns", [...this.firstTurns].map(([id, alert]) => ({ id, alert })));
+  }
 
   constructor(private readonly options: RobobBackendOptions) {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
@@ -227,7 +255,10 @@ export class RobobBackend implements ChatBackend {
       ...(model ? controlModelFields(model) : {}),
     });
     if (typeof created.threadId !== "string" || !created.threadId) throw new Error("Invalid Robob thread response");
-    if (this.options.alert) this.firstTurns.add(created.threadId);
+    if (this.options.alert) {
+      this.firstTurns.set(created.threadId, null);
+      this.saveFirstTurns();
+    }
     return { id: created.threadId, directory: created.directory ?? directory };
   }
 
@@ -237,19 +268,53 @@ export class RobobBackend implements ChatBackend {
    * settles, a failure, a lastError or the selected-model complaint raises one alert. Each
    * thread is judged once: a good first turn, or any later turn, never alerts.
    */
-  private checkFirstTurn(thread: ThreadDetail, messages: ControlMessage[]): void {
-    if (!this.firstTurns.has(thread.threadId) || !this.options.alert) return;
-    const first = [...thread.recentRuns ?? [], ...(thread.run ? [thread.run] : [])].find(run => run.ordinal === 1);
-    if (!first || !TERMINAL.has(first.status)) return;
-    this.firstTurns.delete(thread.threadId);
-    const latest = (thread.run ?? thread.recentRuns?.[0])?.runId === first.runId;
-    const text = messages.find(message => message.runId === first.runId && message.role === "assistant")?.text ?? "";
-    const error = latest && thread.lastError ? thread.lastError : "";
-    if (first.status !== "failed" && !error && !SELECTED_MODEL_ISSUE.test(text)) return;
-    const model = thread.model ? `${thread.model.instanceId} / ${thread.model.model}` : "unknown model";
-    const detail = (error || text || first.status).replace(/\s+/g, " ").trim().slice(0, 200);
-    void this.options.alert(thread.threadId, `New iMessage thread "${thread.title}" failed its first turn (${model}): ${detail}. Later turns there will likely fail too; check the imessage model and instance.`)
-      .catch(() => {});
+  private async checkFirstTurn(thread: ThreadDetail, messages: ControlMessage[]): Promise<void> {
+    if (!this.firstTurns.has(thread.threadId) || !this.options.alert || this.checkingFirstTurns.has(thread.threadId)) return;
+    let alert = this.firstTurns.get(thread.threadId);
+    if (!alert) {
+      const runs = [...thread.recentRuns, ...(thread.run ? [thread.run] : [])];
+      const firstId = messages.find(message => message.runId !== null && runOrdinal(message.runId) === 1)?.runId;
+      // Messages outlive the five-run detail window; their diagnostic still proves failure.
+      const first = runs.find(run => run.ordinal === 1) ?? (firstId && runs.some(run => run.ordinal > 1)
+        ? { runId: firstId, ordinal: 1, status: "completed", model: undefined }
+        : undefined);
+      // The bounded recent-runs window no longer contains the first turn. Never mistake a later failure for it.
+      if (!first && runs.some(run => run.ordinal > 1)) {
+        this.firstTurns.delete(thread.threadId);
+        this.saveFirstTurns();
+        return;
+      }
+      if (!first || !TERMINAL.has(first.status)) return;
+      const error = runFailure(thread, first, messages, !runs.some(run => run.ordinal > first.ordinal));
+      if (!error) {
+        this.firstTurns.delete(thread.threadId);
+        this.saveFirstTurns();
+        return;
+      }
+      const selection = first.model ?? thread.model;
+      const model = selection ? `model=${selection.model}, instanceId=${selection.instanceId}` : "model and instanceId unknown";
+      const detail = error.replace(/\s+/g, " ").trim().slice(0, 500);
+      alert = `New iMessage thread "${thread.title}" (${thread.threadId}) failed its first turn: ${model}. Error: ${detail}`;
+      // Keep the verdict before sending: a later run may clear lastError while Telegram is down.
+      this.firstTurns.set(thread.threadId, alert);
+      this.saveFirstTurns();
+    }
+  }
+
+  /** A route can rotate while Telegram is down; already-recorded alerts belong to the chat, not its current route. */
+  private async flushFirstTurnAlert(): Promise<void> {
+    if (!this.options.alert) return;
+    const pending = [...this.firstTurns].find(([id, text]) => text !== null && !this.checkingFirstTurns.has(id));
+    if (!pending || pending[1] === null) return;
+    const [id, text] = pending;
+    this.checkingFirstTurns.add(id);
+    try {
+      if (await this.options.alert(id, text)) {
+        this.firstTurns.delete(id);
+        this.saveFirstTurns();
+      }
+    } catch { /* The durable payload is attempted on the next read. */ }
+    finally { this.checkingFirstTurns.delete(id); }
   }
 
   /** Backend for one non-owner Sendblue chat: same server and client, its own folder and thread title. */
@@ -322,8 +387,12 @@ export class RobobBackend implements ChatBackend {
   async messages(id: string, _directory?: string, { until, limit = 100 }: { until?: string; since?: number; limit?: number } = {}): Promise<MessageRecord[]> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid message limit");
     const threadId = await this.resolve(id);
-    const [{ thread }, { messages }] = await Promise.all([this.client.thread(threadId), this.client.messages(threadId)]);
-    this.checkFirstTurn(thread, messages);
+    // Read messages after the run state: an earlier page must not make a just-completed
+    // first turn look successful before its selected-model error text has arrived.
+    const { thread } = await this.client.thread(threadId);
+    const { messages } = await this.client.messages(threadId);
+    await this.checkFirstTurn(thread, messages);
+    await this.flushFirstTurnAlert();
     const records = recordsFromThread(thread, messages);
     const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.

@@ -81,6 +81,9 @@ type Pending = {
   unsupported?: boolean;
 };
 type Watermark = { sessionId: string; id: string };
+const firstFailureText = (modelError?: boolean) => modelError
+  ? "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this."
+  : "I couldn't process that message because this chat hit a system error. Please don't resend it yet.";
 /** An answer-like text that turned out not to answer anything stays queued as conversation. */
 type Detachable = NormalizedInbound & { detached?: boolean };
 type Options = {
@@ -2794,6 +2797,17 @@ export class Router {
       // at its end keeps every block of it out of the chat.
       const scope = end < 0 ? [] : after.slice(0, end);
       const quiet = quietMessages(scope);
+      const failedReplies = new Set<string>();
+      let priorFailure: Extract<MessageRecord, { type: "idle" }> | undefined;
+      let runReplies: string[] = [];
+      for (const record of scope) {
+        if (record.type === "assistant") runReplies.push(record.id);
+        if (record.type === "idle") {
+          if (record.outcome !== "succeeded" || record.modelError) for (const id of runReplies) failedReplies.add(id);
+          if (record.firstTurnFailure || record.modelError) priorFailure ??= record;
+          runReplies = [];
+        }
+      }
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
       for (const m of scope) {
@@ -2803,7 +2817,7 @@ export class Router {
         if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
-      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id)) earlier.splice(i, 1);
+      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id) || failedReplies.has(earlier[i]!.id)) earlier.splice(i, 1);
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);
@@ -2811,6 +2825,10 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
+        if (idle.firstTurnFailure || idle.modelError || priorFailure) {
+          this.fail(turn, firstFailureText(idle.modelError || priorFailure?.modelError), idle.id, "failed", true);
+          return;
+        }
         // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
         // A backend without run evidence (none declared) leaves the reply list as the only proof.
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
@@ -2867,6 +2885,7 @@ export class Router {
       const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
         .find(tokens => typeof tokens?.input === "number");
       this.store.db.transaction(() => {
+        if (priorFailure) this.notice(turn!, "failed", firstFailureText(priorFailure.modelError));
         for (const reply of earlier) {
           const words = replyText(assistantText(reply));
           if (words) this.store.enqueue({
@@ -2986,10 +3005,15 @@ export class Router {
     }
   }
 
-  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed"): void {
+  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
     this.store.db.transaction(() => {
+      if (immediate) {
+        // A broken new chat or model needs repair, not automatic replay of a watcher wake.
+        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.store.updateInbound(id, "failed");
+        this.notice(turn, "failed", text);
+      }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
-      if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
+      else if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);

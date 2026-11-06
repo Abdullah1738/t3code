@@ -149,7 +149,10 @@ export function modelSelectionFrom(input: {
     };
   }
   if (!selectionMigrationApplies(input.settings)) {
-    const instanceId = (input.instanceId ?? input.base.instanceId) as ModelSelection["instanceId"];
+    const instanceId = (input.instanceId ??
+      (input.model?.includes("/")
+        ? "opencode"
+        : input.base.instanceId)) as ModelSelection["instanceId"];
     const model = input.model ?? input.base.model;
     const same = instanceId === input.base.instanceId && model === input.base.model;
     const source = input.options ?? (same ? (input.base.options ?? []) : []);

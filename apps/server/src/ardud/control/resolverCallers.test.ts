@@ -69,13 +69,13 @@ const catalog = [
   },
 ] as unknown as ReadonlyArray<ServerProvider>;
 
-const makeHarness = (mode: "off" | "dryrun" | "apply") =>
+const makeHarness = (mode: "off" | "dryrun" | "apply" | "absent", base: ModelSelection = legacy) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const shell = {
       ...liveThreadShell(ThreadId.make("thread")),
-      providerInstanceId: legacy.instanceId,
-      modelSelection: legacy,
+      providerInstanceId: base.instanceId,
+      modelSelection: base,
     };
     const projection = idleThreadProjection(shell);
     const calls = yield* Ref.make<Array<{ kind: string; value: unknown }>>([]);
@@ -142,8 +142,8 @@ const makeHarness = (mode: "off" | "dryrun" | "apply") =>
                   getProviders: Effect.succeed(catalog),
                 }),
                 ServerSettings.layerTest({
-                  ardudHarnessMigration: { selections: mode },
-                  defaultModelSelection: legacy,
+                  ...(mode === "absent" ? {} : { ardudHarnessMigration: { selections: mode } }),
+                  defaultModelSelection: base,
                 }),
                 Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
                   enqueueCommand: (effect) => effect,
@@ -187,6 +187,44 @@ const run = <A, E>(
   Effect.scoped(Effect.flatMap(makeHarness(mode), body)).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control resolver routes", () => {
+  it.effect(
+    "create, send and settings infer OpenCode from a provider/model with a Claude default and no migration flag",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { request, calls, shell } = yield* makeHarness("absent", {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "claude-opus-5-5",
+          });
+          for (const providerInstanceId of [undefined, "claudeAgent"]) {
+            const model = {
+              model: legacy.model,
+              variant: "high",
+              ...(providerInstanceId ? { providerInstanceId } : {}),
+            };
+            assert.strictEqual(
+              (yield* request("POST", "/threads", { projectId: shell.projectId, ...model })).status,
+              201,
+            );
+            assert.strictEqual(
+              (yield* request("POST", "/threads/thread/send", { text: "hello", ...model })).status,
+              200,
+            );
+            assert.strictEqual((yield* request("PATCH", "/threads/thread", model)).status, 200);
+          }
+          const recorded = yield* Ref.get(calls);
+          assert.strictEqual(recorded.length, 6);
+          recorded.forEach((item, index) =>
+            assert.deepStrictEqual((item.value as { modelSelection: unknown }).modelSelection, {
+              instanceId: index < 3 ? "opencode" : "claudeAgent",
+              model: legacy.model,
+              options: [{ id: "variant", value: "high" }],
+            }),
+          );
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory)),
+  );
+
   it.effect.each(["off", "dryrun", "apply"] as const)("create, send and settings use %s", (mode) =>
     run(mode, ({ request, calls, shell }) =>
       Effect.gen(function* () {

@@ -188,6 +188,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
+    if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
     const liveCards = (config.liveCardChats ?? ["owner"]).includes(chat.info.slug);
     const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
       liveCards ? {} : { static: true, previewImage: cardPreviewImage() });
