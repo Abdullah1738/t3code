@@ -273,7 +273,13 @@ print("OK")
     def package_tgz(self, name: str, tool: str, version: str, binary: bytes) -> Path:
         path = self.tmp / f"{name}.tgz"
         rel = hc.TOOLS[tool]["binary_in_native"]
-        make_tgz(path, {rel: binary}, modes={rel: 0o755})
+        members = {rel: binary}
+        modes = {rel: 0o755}
+        for companion in hc.TOOLS[tool].get("companions", {}):
+            name = os.path.normpath(os.path.join(os.path.dirname(rel), companion))
+            members[name] = b"#!/bin/sh\nexit 0\n"
+            modes[name] = 0o755
+        make_tgz(path, members, modes=modes)
         return path
 
 
@@ -299,6 +305,27 @@ class StageTests(FakeCliTestCase):
         self.assertTrue((target / "bin" / "claude").is_file())
         self.assertFalse(os.stat(target / "bin" / "claude").st_mode & stat.S_IWUSR)
         self.assertEqual(result["binarySha256"], hc.sha256_file(target / "bin" / "claude"))
+
+    def test_codex_stage_copies_companions_next_to_the_binary(self) -> None:
+        self.publish("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        result = hc.stage("codex", "0.166.0")
+        bin_dir = self.root / "codex" / "0.166.0" / "bin"
+        for name in ("codex", "codex-code-mode-host", "rg"):
+            self.assertTrue((bin_dir / name).is_file(), name)
+            self.assertTrue(os.stat(bin_dir / name).st_mode & stat.S_IXUSR, name)
+            self.assertFalse(os.stat(bin_dir / name).st_mode & stat.S_IWUSR, name)
+        self.assertEqual(set(result["companions"]), {"codex-code-mode-host", "rg"})
+
+    def test_codex_stage_refuses_a_package_without_its_code_mode_host(self) -> None:
+        pkg = hc.pack_spec("codex", "0.166.0")
+        tgz = self.tmp / "codex-missing.tgz"
+        rel = hc.TOOLS["codex"]["binary_in_native"]
+        make_tgz(tgz, {rel: self.fake_codex_binary("0.166.0")}, modes={rel: 0o755})
+        self.set_npm(latest={pkg: "0.166.0"}, tarballs={pkg: tgz}, integrity={pkg: sri(tgz.read_bytes())})
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.stage("codex", "0.166.0")
+        self.assertIn("companion", str(ctx.exception))
+        self.assertFalse((self.root / "codex" / "0.166.0").exists())
 
     def test_integrity_mismatch_refuses_stage_and_writes_nothing(self) -> None:
         self.publish("claude", "2.1.316", self.fake_claude_binary("2.1.316"), lie=True)

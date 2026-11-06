@@ -93,6 +93,10 @@ TOOLS = {
         "native": "@openai/codex",  # darwin build is published as <v>-darwin-arm64
         "native_suffix": "-darwin-arm64",
         "binary_in_native": "package/vendor/aarch64-apple-darwin/bin/codex",
+        # Codex runs every tool call through code mode, which spawns this sibling of
+        # its own executable; without it no tool can run. `rg` backs file search.
+        # Paths are relative to the binary's directory in the package -> staged bin/.
+        "companions": {"codex-code-mode-host": "codex-code-mode-host", "../codex-path/rg": "rg"},
         "version_flag": ["--version"],
         "version_regex": r"codex-cli\s+(\d+\.\d+\.\d+)",
         "minimum_model_key": "codex",
@@ -423,6 +427,13 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         bin_dir.mkdir(parents=True)
         final_bin = bin_dir / ("claude" if tool == "claude" else "codex")
         shutil.copy2(binary, final_bin)
+        companions = {}
+        for rel, name in TOOLS[tool].get("companions", {}).items():
+            source = (binary.parent / rel).resolve()
+            if not source.is_file() or extract.resolve() not in source.parents:
+                raise HarnessError(f"{tool}: companion {rel} not in the package")
+            shutil.copy2(source, bin_dir / name)
+            companions[name] = sha256_file(bin_dir / name)
         digest = sha256_file(final_bin)
         tool_dir(tool).mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -433,7 +444,8 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         for dirpath, dirs, files in os.walk(target, topdown=False):
             for name in files:
                 full = Path(dirpath) / name
-                os.chmod(full, 0o555 if full == target / "bin" / final_bin.name else 0o444)
+                executable = full.parent == target / "bin"
+                os.chmod(full, 0o555 if executable else 0o444)
             for name in dirs:
                 os.chmod(Path(dirpath) / name, 0o555)
         os.chmod(target, 0o555)
@@ -441,8 +453,10 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         state[tool]["candidate"] = version
         save_state(state)
         result = {"tool": tool, "version": version, "dir": str(target),
-                  "binary": str(target / "bin" / final_bin.name), "sha512": actual, "binarySha256": digest}
+                  "binary": str(target / "bin" / final_bin.name), "sha512": actual, "binarySha256": digest,
+                  "companions": companions}
         write_record("stage", tool, version, "staged", binarySha256=digest, integrity=actual,
+                     companions=companions,
                      harnessHomes=harness_home_hashes())
         return result
     finally:

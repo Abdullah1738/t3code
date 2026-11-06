@@ -26,7 +26,7 @@
     "/Users/ardud/.config/opencode/skills/remote-compute/scripts/blockers",
     "/Users/ardud/.local/share/harness-hooks/coord-blockers"
   ],
-  "shellPath": ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+  "shellPath": ["/Users/ardud/.bun/bin", "/Users/ardud/.nvm/versions/node/v26.2.0/bin", "/Users/ardud/.cargo/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin", "/Users/ardud/.local/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
   "hooks": [
     {"harness": "claude", "event": "PreToolUse", "matcher": "Bash|bash|shell|exec_command|shell_command", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
     {"harness": "claude", "event": "PreToolUse", "matcher": "mcp__betterstack__.*", "command": "/opt/homebrew/bin/python3 /Users/ardud/.local/share/harness-hooks/src/claude.py", "timeoutSec": 10},
