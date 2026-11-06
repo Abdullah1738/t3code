@@ -5,6 +5,14 @@ import * as Stream from "effect/Stream";
 
 export const BOARD_SCRIPT_BYTE_LIMIT = 2 * 1024 * 1024;
 
+// Only running crw counts. Reading its database or naming it in prose/prompts does not.
+const CRW_INVOCATION: ReadonlyArray<RegExp> = [
+  /\bcrw\.mjs\b/,
+  // reader.mjs is crw's read-only GitHub/architecture reader; it starts no agents.
+  /crpko-review-workflow\/(?!reader\.mjs\b)[\w./-]*\.(?:mjs|ts|py|sh)\b/,
+  /(?:^|[;&|(]\s*|\b(?:exec|execSync|execFile|spawn|spawnSync|system|run|popen|check_output|call)\s*\(?\s*\[?\s*["'`]?)(?:[\w./~-]*\/)?crw\s*["'`]?\s*,?\s*["'`]?[a-z][\w-]*/m,
+];
+
 export const boardScriptDependencyProblem = (text: string): string | null => {
   if (/\b(?:crpko-reviewer|lean-reviewer)\b/.test(text)) return "OpenCode reviewer dependency";
   const selector =
@@ -14,7 +22,7 @@ export const boardScriptDependencyProblem = (text: string): string | null => {
   if (selector) return `Unverified named-agent selector ${selector[1]}`;
   if (/(?:\.config\/opencode\/agents\/|opencode\s+(?:run|agent)\b[^\n]*--agent\b)/i.test(text))
     return "Direct OpenCode agent configuration";
-  if (/\b(?:crw|crpko-review-workflow)(?:\.(?:mjs|ts|py))?\b/.test(text))
+  if (CRW_INVOCATION.some((pattern) => pattern.test(text)))
     return "External crw coordinator dependency has not been verified as native";
   return null;
 };

@@ -1343,7 +1343,8 @@ const make = Effect.gen(function* () {
           );
         }
       }
-      const explicitSource = input.target.providerInstanceId ??
+      const explicitSource =
+        input.target.providerInstanceId ??
         (input.target.driverKind === undefined || input.target.driverKind === "opencode"
           ? "opencode"
           : undefined);
@@ -1550,8 +1551,7 @@ const make = Effect.gen(function* () {
       const optionOverridesEffort =
         requestedOptions?.some((option) => option.id === effortId || option.id === "variant") ===
         true;
-      const overridesEffort =
-        requestedSuffix !== undefined || optionOverridesEffort;
+      const overridesEffort = requestedSuffix !== undefined || optionOverridesEffort;
       const requestedIds = new Set(requestedOptions?.map((option) => option.id));
       const mergedOptions =
         requestedOptions === undefined
@@ -1572,9 +1572,11 @@ const make = Effect.gen(function* () {
               ...inheritedSelection,
               instanceId: effortInstanceId,
               ...(overridesEffort || requestedOptions?.length === 0
-                ? { options: (inheritedSelection.options ?? []).filter(
-                    (option) => option.id !== effortId && option.id !== "variant",
-                  ) }
+                ? {
+                    options: (inheritedSelection.options ?? []).filter(
+                      (option) => option.id !== effortId && option.id !== "variant",
+                    ),
+                  }
                 : {}),
             }
           : { instanceId, model, options: [] },
@@ -1597,8 +1599,8 @@ const make = Effect.gen(function* () {
           ...(requestedOptions ?? []),
         ];
         const position = (id: string) => {
-          const index = order.findIndex((option) =>
-            option.id === id || (id === effortId && option.id === "variant"),
+          const index = order.findIndex(
+            (option) => option.id === id || (id === effortId && option.id === "variant"),
           );
           return index < 0 ? order.length : index;
         };
@@ -2870,7 +2872,15 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
+    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, rawInput) {
+      const callerThreadId = scope.thread?.threadId;
+      if (rawInput.threadId === undefined && callerThreadId === undefined) {
+        return yield* failure(
+          "invalid_request",
+          "threadId is required when the caller is not a T3 thread.",
+        );
+      }
+      const input = { ...rawInput, threadId: (rawInput.threadId ?? callerThreadId)! };
       const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
       const view = input.view ?? "messages";
       const afterPosition = input.afterPosition ?? -1;

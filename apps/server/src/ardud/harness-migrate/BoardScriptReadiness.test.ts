@@ -19,6 +19,10 @@ it.each([
   "cat ~/.config/opencode/agents/reviewer.md",
   "exec crw tick",
   "python3 /external/crpko-review-workflow/cli.py",
+  'exec("crw tick")',
+  'subprocess.run(["crw", "tick"])',
+  "node /Volumes/x/crw.mjs tick",
+  "crw review PR-1",
 ])("refuses a concrete unverified dependency: %s", (text) => {
   assert.isNotNull(boardScriptDependencyProblem(text));
 });
@@ -28,6 +32,12 @@ it.each([
   'client.session.prompt({model: {providerID: "openai", modelID: "gpt-6.1-sol"}})',
   't3ctl send thread-id "Continue the task"',
   'const agentDocumentation = "native agent instructions"',
+  '"""External PR cards (replaces the crw review loop)."""',
+  '"""crw linkedIssues: which linked tickets decide readiness."""',
+  "q = \"sqlite3 -json 'file:/Volumes/x/crpko-review-workflow/data/crw.db?immutable=1'\"",
+  'CRW_HOLD = re.compile(r"(?m)^FAIL\\s+crw hold\\b.*$")',
+  "For PR review asks, check crw state first (crpko-review-workflow skill).",
+  "node /Volumes/ExternalSSD/crpko-review-workflow/reader.mjs pr Equicom-Crypto/x 1",
 ])("does not mistake generic agent documentation for a named selector: %s", (text) => {
   assert.isNull(boardScriptDependencyProblem(text));
 });
