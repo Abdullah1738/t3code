@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
+// Generic Linux test boxes lack zsh; exercise this macOS installer on the Mac
+// with an isolated HOME rather than installing another shell just for the suite.
+const hasZsh = spawnSync("zsh", ["--version"]).status === 0;
 let root: string;
 let repo: string;
 let home: string;
@@ -14,6 +17,7 @@ function run(args: string[], cwd = repo) {
 const install = (...args: string[]) => run(["zsh", "integrations/opencode-plugins/install.zsh", ...args]);
 
 beforeAll(() => {
+  if (!hasZsh) return;
   root = mkdtempSync(join(tmpdir(), "codemode-install-"));
   repo = join(root, "repo");
   home = join(root, "home");
@@ -30,7 +34,7 @@ beforeAll(() => {
   ]) expect(run(args).status).toBe(0);
 });
 
-test("installer distinguishes missing files, unpushed work, drift and backups", () => {
+test.skipIf(!hasZsh)("installer distinguishes missing files, unpushed work, drift and backups", () => {
   const check = install("--check");
   expect(check.status).toBe(1);
   expect(check.output).toContain("plugin/codemode-guard.ts not installed");
@@ -61,7 +65,7 @@ test("installer distinguishes missing files, unpushed work, drift and backups", 
   expect(install().output).toContain("not on origin/main");
 });
 
-test("installed plugin loads its helper, logs a denial and reloads its off switch by mtime", () => {
+test.skipIf(!hasZsh)("installed plugin loads its helper, logs a denial and reloads its off switch by mtime", () => {
   const script = `
     import { readFileSync, writeFileSync, utimesSync, unlinkSync } from 'node:fs';
     import { pathToFileURL } from 'node:url';
