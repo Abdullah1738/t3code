@@ -259,7 +259,7 @@ log "snapshot $snap added_packed=$added"
 
 # 3. retention, daily
 if [ ! -f "$PRUNE_STAMP" ] || [ $(( $(date +%s) - $(stat -f %m "$PRUNE_STAMP") )) -gt 86400 ]; then
-  pout=$(/usr/sbin/taskpolicy -b nice -n 10 "$RESTIC" forget --host ardud-mac --tag memory-live \
+  pout=$(/usr/sbin/taskpolicy -d default nice -n 10 "$RESTIC" forget --host ardud-mac --tag memory-live \
     --keep-last 12 --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
     --prune --max-unused 15% 2>&1)
   prc=$?

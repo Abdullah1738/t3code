@@ -80,7 +80,7 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
   Snapshots hold replicas of memory.db and opencode_raw.db, plus
   `robob-state.sql`, a `.dump` of Robob's small state tables (schedules,
   projects, board, import map, thread index). The full Robob DB is not backed up.
-  Replicas and restic run at background I/O priority; limits for replicas and restic backup are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s).
+  Replicas and restic run at nice 10 with normal I/O priority (darwin-background I/O stalls on the USB SSD; see `src/run_limited.py`); limits for replicas and restic backup are `MEMORY_BACKUP_REPLICA_TIMEOUT_S` (10800 s) and `MEMORY_BACKUP_RESTIC_TIMEOUT_S` (7200 s).
 - `com.abdullah.session-reaper` (30 min) and `com.abdullah.location-reaper` (5 min)
 
 ## Backend (OpenChamber or Robob)
