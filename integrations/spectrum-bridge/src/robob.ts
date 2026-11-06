@@ -71,9 +71,8 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
   const records: MessageRecord[] = [];
   for (const [runId, group] of [...byRun].sort((a, b) => ordinal(a[0]) - ordinal(b[0]))) {
     group.sort((a, b) => epoch(a.createdAt) - epoch(b.createdAt) || a.messageId.localeCompare(b.messageId));
-    // Runs older than the detail's recent window settled long ago.
-    const status = runs.get(runId)?.status ?? "completed";
-    const settled = TERMINAL.has(status);
+    const run = runs.get(runId);
+    const settled = run !== undefined && TERMINAL.has(run.status);
     let last: Extract<MessageRecord, { type: "assistant" }> | undefined;
     for (const message of group) {
       const created = epoch(message.createdAt);
@@ -94,10 +93,9 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       };
       records.push(last);
     }
-    if (!settled) continue;
-    const run = runs.get(runId) ?? { runId, ordinal: ordinal(runId), status };
+    if (!settled || !run) continue;
     const failure = runFailure(thread, run, group, runId === latest);
-    const result = failure ? "failed" : outcome(status);
+    const result = failure ? "failed" : outcome(run.status);
     if (failure) {
       // Carries the provider's error text, which is how a refusal is recognised.
       const error = { type: "provider", message: failure };
@@ -164,6 +162,7 @@ export class RobobBackend implements ChatBackend {
    * an `unknown` can still resolve, so it is always asked again. A settled run's proof never changes.
    */
   private readonly settledEvidence = new Map<string, "ran" | "none">();
+  private readonly historicalRuns = new Map<string, RunSummary>();
   /** Threads createChat made whose first turn has not been judged yet. */
   private readonly firstTurns = new Map<string, string | null>();
   private readonly checkingFirstTurns = new Set<string>();
@@ -273,17 +272,7 @@ export class RobobBackend implements ChatBackend {
     let alert = this.firstTurns.get(thread.threadId);
     if (!alert) {
       const runs = [...thread.recentRuns, ...(thread.run ? [thread.run] : [])];
-      const firstId = messages.find(message => message.runId !== null && runOrdinal(message.runId) === 1)?.runId;
-      // Messages outlive the five-run detail window; their diagnostic still proves failure.
-      const first = runs.find(run => run.ordinal === 1) ?? (firstId && runs.some(run => run.ordinal > 1)
-        ? { runId: firstId, ordinal: 1, status: "completed", model: undefined }
-        : undefined);
-      // The bounded recent-runs window no longer contains the first turn. Never mistake a later failure for it.
-      if (!first && runs.some(run => run.ordinal > 1)) {
-        this.firstTurns.delete(thread.threadId);
-        this.saveFirstTurns();
-        return;
-      }
+      const first = runs.find(run => run.ordinal === 1);
       if (!first || !TERMINAL.has(first.status)) return;
       const error = runFailure(thread, first, messages, !runs.some(run => run.ordinal > first.ordinal));
       if (!error) {
@@ -389,8 +378,9 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     // Read messages after the run state: an earlier page must not make a just-completed
     // first turn look successful before its selected-model error text has arrived.
-    const { thread } = await this.client.thread(threadId);
+    let { thread } = await this.client.thread(threadId);
     const { messages } = await this.client.messages(threadId);
+    thread = await this.restoreRunStatuses(thread, messages, until, limit);
     await this.checkFirstTurn(thread, messages);
     await this.flushFirstTurnAlert();
     const records = recordsFromThread(thread, messages);
@@ -402,6 +392,53 @@ export class RobobBackend implements ChatBackend {
     await this.markRunEvidence(thread, page);
     // OpenCode's own step rows are a fallback for OpenCode threads only; every other driver is judged by Robob.
     return this.isOpenCodeThread(thread) ? this.markAnswers(page) : page;
+  }
+
+  /** The detail keeps five runs, not five outcomes. Read missing page outcomes before forwarding any partial text. */
+  private async restoreRunStatuses(thread: ThreadDetail, messages: ControlMessage[], until: string | undefined, limit: number): Promise<ThreadDetail> {
+    const records = recordsFromThread(thread, messages);
+    const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
+    const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
+    const messageRuns = new Map(messages.filter(message => message.runId !== null).map(message => [
+      message.role === "user" ? promptId(thread.threadId, message) : message.messageId, message.runId!,
+    ]));
+    // A historical idle marker is absent until its status is restored; still honour an idle watermark.
+    const watermarkRun = until?.startsWith("idle:") ? until.slice("idle:".length) : undefined;
+    const watermarkOrdinal = watermarkRun === undefined ? 0 : runOrdinal(watermarkRun);
+    const needed = new Set(records.slice(start).flatMap(record => {
+      const runId = record.type === "assistant" ? record.runId : messageRuns.get(record.id);
+      return runId ? [runId] : [];
+    }));
+    if (watermarkRun) for (const message of messages) {
+      if (message.runId !== null && runOrdinal(message.runId) >= watermarkOrdinal) needed.add(message.runId);
+    }
+    if (this.firstTurns.get(thread.threadId) === null) {
+      const firstId = messages.find(message => message.runId !== null && runOrdinal(message.runId) === 1)?.runId;
+      if (firstId) needed.add(firstId);
+    }
+    const known = new Set([...thread.recentRuns, ...(thread.run ? [thread.run] : [])].map(run => run.runId));
+    const restored: RunSummary[] = [];
+    for (const runId of needed) {
+      if (known.has(runId)) continue;
+      const key = `${thread.threadId}\u0000${runId}`;
+      let run = this.historicalRuns.get(key);
+      if (!run) {
+        const evidence = await this.client.runEvidence(thread.threadId, runId);
+        if (evidence.runId !== runId || !TERMINAL.has(evidence.status)) throw new Error("Robob run outcome is not yet known");
+        run = { runId, ordinal: runOrdinal(runId), status: evidence.status };
+        // Waiting means a reply is available, not that recovery can no longer change the outcome.
+        if (evidence.status !== "waiting") {
+          if (this.historicalRuns.size > 5_000) this.historicalRuns.clear();
+          this.historicalRuns.set(key, run);
+          if (evidence.toolEvidence !== "unknown") {
+            if (this.settledEvidence.size > 5_000) this.settledEvidence.clear();
+            this.settledEvidence.set(key, evidence.toolEvidence);
+          }
+        }
+      }
+      restored.push(run);
+    }
+    return restored.length ? { ...thread, recentRuns: [...thread.recentRuns, ...restored] } : thread;
   }
 
   /**

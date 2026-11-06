@@ -43,7 +43,7 @@ function fakeControl() {
   const natives = new Map<string, string>();
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
-  const flags = { ignoreSettled: false, recentRunsLimit: Infinity };
+  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable" };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
@@ -103,10 +103,13 @@ function fakeControl() {
         const runId = parts[3]!;
         const run = thread.runs.find(candidate => candidate.runId === runId);
         if (!run) return notFound();
+        const historical = !thread.runs.slice(-flags.recentRunsLimit).some(candidate => candidate.runId === runId);
+        if (historical && flags.historicalEvidence === "unavailable") return ok({}, 503);
         const forced = thread.evidence?.[runId];
         const messages = thread.messages.filter(message => message.runId === runId && message.role === "assistant")
           .map(message => ({ id: message.messageId, phase: message.phase ?? "unknown", text: message.text.slice(0, 200) }));
-        return ok({ runId, status: run.status, toolEvidence: forced ?? "unknown", complete: forced === "none", messages });
+        return ok({ runId, status: historical && flags.historicalEvidence !== "terminal" ? flags.historicalEvidence : run.status,
+          toolEvidence: forced ?? "unknown", complete: forced === "none", messages });
       }
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
@@ -474,6 +477,116 @@ test("a successful first turn stays successful when an unobserved later turn fai
   const records = await backend.messages(chat.id, chat.directory);
   expect(alerts).toEqual([]);
   expect(records.filter(record => record.type === "idle").map(record => record.outcome)).toEqual(["succeeded", "failed"]);
+});
+
+test.each([
+  { firstStatus: "failed", partial: false },
+  { firstStatus: "failed", partial: true },
+  { firstStatus: "completed", partial: false },
+  { firstStatus: "completed", partial: true },
+])("historical first-turn outcome is read back after restart and five later runs (%j)", async ({ firstStatus, partial }) => {
+  const control = fakeControl();
+  control.flags.recentRunsLimit = 5;
+  const store = new Store(":memory:");
+  stores.push(store);
+  const alerts: string[] = [];
+  const options = { alert: async (_id: string, text: string) => { alerts.push(text); return true; } };
+  const before = control.backend("/chats", options);
+  before.trackFirstTurns(store);
+  const transport = { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } };
+  const routerOptions = {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0,
+  };
+  const router = new Router(store, before, transport, routerOptions);
+  store.acceptInbound("first", { id: "first", text: "hi", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const chat = store.get<{ id: string; directory: string }>("route")!;
+  const thread = control.threads.get(chat.id)!;
+  if (partial) control.reply(chat.id, "Partial first-run output", firstStatus);
+  else thread.runs[0]!.status = firstStatus;
+  const firstRun = thread.runs[0]!.runId;
+  const steered: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const id = `msg_${String(i).repeat(64)}`;
+    steered.push(id);
+    await before.prompt(chat.id, chat.directory, id, "follow up");
+    control.reply(chat.id, `Later answer ${i}`, "completed");
+  }
+  store.set("activeTurn", { ...store.get<object>("activeTurn"), steered, steeredAt: Date.now() });
+  const after = control.backend("/chats", options);
+  after.trackFirstTurns(store);
+  const resumed = new Router(store, after, transport, routerOptions);
+  const records = await after.messages(chat.id, chat.directory, { until: steered[0] });
+  expect(control.calls.some(call => call.path.includes(`/runs/${encodeURIComponent(firstRun)}/evidence`))).toBe(true);
+  expect(records.find(record => record.id === `idle:${firstRun}`)).toMatchObject({ outcome: firstStatus === "failed" ? "failed" : "succeeded" });
+  await resumed.tick();
+  await resumed.tick();
+  expect(alerts).toHaveLength(firstStatus === "failed" ? 1 : 0);
+  expect(store.get<unknown[]>("firstTurns")).toEqual([]);
+  const expected = Array.from({ length: 5 }, (_, i) => `Later answer ${i}`);
+  if (firstStatus === "completed" && partial) expected.unshift("Partial first-run output");
+  expect(store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text)).toEqual(expected);
+  expect(store.pendingOutbox().filter(item => item.kind === "control")).toHaveLength(firstStatus === "failed" ? 1 : 0);
+  if (firstStatus === "failed") expect(alerts[0]).toContain("Run failed without error details");
+});
+
+test.each(["running", "unknown", "unavailable"] as const)("inconclusive historical evidence (%s) retains pending first-turn state and never forwards partial output", async status => {
+  const control = fakeControl();
+  control.flags.recentRunsLimit = 5;
+  const store = new Store(":memory:");
+  stores.push(store);
+  const alerts: string[] = [];
+  const options = { alert: async (_id: string, text: string) => { alerts.push(text); return true; } };
+  const before = control.backend("/chats", options);
+  before.trackFirstTurns(store);
+  const chat = await before.createChat();
+  await before.prompt(chat.id, chat.directory, `msg_${"a".repeat(64)}`, "hi");
+  control.reply(chat.id, "Partial output, not an answer", "failed");
+  for (let i = 0; i < 5; i++) {
+    await before.prompt(chat.id, chat.directory, `msg_${String(i).repeat(64)}`, "later");
+    control.reply(chat.id, "Later answer", "completed");
+  }
+  const after = control.backend("/chats", options);
+  after.trackFirstTurns(store);
+  control.flags.historicalEvidence = status;
+  await expect(after.messages(chat.id)).rejects.toThrow();
+  expect(store.get("firstTurns")).toMatchObject([{ id: chat.id, alert: null }]);
+  expect(alerts).toEqual([]);
+  control.flags.historicalEvidence = "terminal";
+  const records = await after.messages(chat.id);
+  expect(records.find(record => record.id === `idle:${control.threads.get(chat.id)!.runs[0]!.runId}`)).toMatchObject({ outcome: "failed", firstTurnFailure: true });
+  expect(alerts).toHaveLength(1);
+  expect(store.get<unknown[]>("firstTurns")).toEqual([]);
+});
+
+test("record mapping never invents a successful idle for an unknown historical outcome", () => {
+  const runId = "run:thread:t:ordinal:1";
+  const records = recordsFromThread({ threadId: "t", lastError: null, run: null, recentRuns: [] }, [{
+    messageId: "partial", runId, role: "assistant", text: "Partial output", streaming: false,
+    createdAt: null, updatedAt: null,
+  }]);
+  expect(records.some(record => record.type === "idle")).toBe(false);
+});
+
+test.each(["cancelled", "failed"])("a historical waiting outcome is re-read when recovery changes it to %s", async status => {
+  const control = fakeControl();
+  control.flags.recentRunsLimit = 5;
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"a".repeat(64)}`, "hi");
+  control.reply(chat.id, "First answer", "waiting");
+  for (let i = 0; i < 5; i++) {
+    await backend.prompt(chat.id, chat.directory, `msg_${String(i).repeat(64)}`, "later");
+    control.reply(chat.id, "Later answer", "waiting");
+  }
+  const first = control.threads.get(chat.id)!.runs[0]!;
+  const before = await backend.messages(chat.id);
+  expect(before.find(record => record.id === `idle:${first.runId}`)).toMatchObject({ outcome: "succeeded" });
+  first.status = status;
+  const after = await backend.messages(chat.id);
+  expect(after.find(record => record.id === `idle:${first.runId}`)).toMatchObject({ outcome: status === "failed" ? "failed" : "interrupted" });
+  expect(control.calls.filter(call => call.path.includes(`/runs/${encodeURIComponent(first.runId)}/evidence`))).toHaveLength(4);
 });
 
 test("createChat refuses a chat root that is not a registered project", async () => {
