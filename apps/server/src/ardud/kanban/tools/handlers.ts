@@ -804,7 +804,7 @@ const handlers = {
   pool_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
         return {
@@ -819,7 +819,7 @@ const handlers = {
   pool_remove: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
         return { pools: yield* service.removePool(board.id, model) };

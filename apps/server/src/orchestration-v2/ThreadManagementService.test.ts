@@ -312,14 +312,15 @@ const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettin
 
 // ardud: an accepted steer/restart can be retried after the run or thread changes state.
 it.effect.each([
-  ["steer", true, true, true],
-  ["restart", true, true, true],
-  ["restart", false, true, true],
-  ["restart", false, false, true],
-  ["restart", false, true, false],
+  ["steer", true, true, true, false],
+  ["steer", true, true, true, true],
+  ["restart", true, true, true, false],
+  ["restart", false, true, true, false],
+  ["restart", false, false, true, false],
+  ["restart", false, true, false, false],
 ] as const)(
   "replays the capability-selected send after completion or archive (%j)",
-  ([mode, native, interrupt, queue]) => {
+  ([mode, native, interrupt, queue, activeTurnOnly]) => {
     const projectId = ProjectId.make(`project:receipt:${mode}`);
     const threadId = ThreadId.make(`thread:receipt:${mode}`);
     const runId = RunId.make(`run:receipt:${mode}`);
@@ -440,6 +441,7 @@ it.effect.each([
         messageId,
         commandId,
         mode,
+        activeTurnOnly,
         text: "steer",
         attachments: [],
         createdBy: "user" as const,
@@ -463,7 +465,11 @@ it.effect.each([
         messageId,
         dispatchMode: fallback
           ? { type: "queue_after_active" }
-          : { type: mode === "restart" ? "restart_active" : "steer_active", targetRunId: runId },
+          : {
+              type: mode === "restart" ? "restart_active" : "steer_active",
+              targetRunId: runId,
+              ...(activeTurnOnly ? { activeTurnOnly: true } : {}),
+            },
       });
       yield* service.sendToThread(input);
       expect(freshCommands).toHaveLength(fallback ? 2 : 1);

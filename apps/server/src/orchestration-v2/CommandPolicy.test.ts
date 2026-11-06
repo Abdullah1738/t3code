@@ -64,6 +64,28 @@ function dispatchProjection(
   } as unknown as OrchestrationV2ThreadProjection;
 }
 
+it.each(["/compact", " /LOGOUT "])("keeps strict steering targeted during or after %s", (text) => {
+  const projection = dispatchProjection(baseCapabilities);
+  const requested = {
+    type: "steer_active" as const,
+    targetRunId: activeRunId,
+    activeTurnOnly: true,
+  };
+  for (const status of ["running", "completed"] as const) {
+    const maintenance = {
+      ...projection,
+      messages: projection.messages.map((message) => ({ ...message, text })),
+      runs: projection.runs.map((run) => ({ ...run, status })),
+    };
+    for (const deliveryIntent of [undefined, "auto", "steer", "restart"] as const) {
+      assert.deepEqual(
+        CommandPolicy.resolveMessageDispatchIntent(maintenance, requested, deliveryIntent),
+        requested,
+      );
+    }
+  }
+});
+
 it("resolves automatic message delivery from authoritative provider capabilities", () => {
   assert.deepEqual(
     CommandPolicy.resolveMessageDispatchIntent(

@@ -79,6 +79,8 @@ export interface KanbanSendInput {
   readonly key?: string;
   /** Switch the thread to this model for the turn the message starts. */
   readonly model?: ModelSelection;
+  /** Steer only an existing turn; never start an idle thread. */
+  readonly mode?: "steer";
 }
 
 /**
@@ -367,7 +369,8 @@ const make = Effect.gen(function* () {
         text: input.text,
         attachments: [],
         ...(input.model ? { modelSelection: input.model } : {}),
-        mode: "auto",
+        mode: input.mode ?? "auto",
+        ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
         createdBy: "system",
         creationSource: "server",
       });

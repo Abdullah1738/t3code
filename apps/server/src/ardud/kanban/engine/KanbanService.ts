@@ -1412,6 +1412,14 @@ const make = Effect.gen(function* () {
   const release = (card: KanbanCard) =>
     ({ ...card, activeThreadId: null, activeRole: null, activePool: null }) satisfies KanbanCard;
 
+  const releaseStalled = (card: KanbanCard, at: string): KanbanCard => ({
+    ...release(card),
+    stage:
+      card.stage === "working" ? "todo" : card.stage === "in_review" ? "needs_review" : card.stage,
+    movedAt: at,
+    updatedAt: at,
+  });
+
   // Logged when a card leaves a thread that got too long; a repeat inside an hour is flagged.
   const FRESH_START = "Thread too long; the next run starts on a fresh thread";
   const COMPACT_FIRST = "Thread too long; compacting it before the next run";
@@ -1473,6 +1481,7 @@ const make = Effect.gen(function* () {
     what: string,
     /** Set to pause the card instead of dropping it: when it comes back. */
     until: string | null = null,
+    respectPause = false,
   ) {
     const threadId = card.activeThreadId;
     if (threadId === null) return false;
@@ -1496,9 +1505,13 @@ const make = Effect.gen(function* () {
       yield* threads.interrupt(threadId, `Card #${card.number} ${what}`);
       return false;
     }
+    const board = respectPause ? yield* boardOf(card.boardId) : null;
+    // A live held worker must hear about the flag, without waking an idle one.
+    const steerOnly = board?.pause && others.some((other) => !board.pause!.keep.includes(other.id));
     yield* threads
       .send({
         threadId,
+        ...(steerOnly ? { mode: "steer" as const } : {}),
         text:
           until !== null
             ? Briefs.pauseCardText(card, what, until, others)
@@ -4830,6 +4843,30 @@ const make = Effect.gen(function* () {
                   yield* forkProposals(board.id);
                 }
               }
+              // Repair stalled cards that held slots before flags released them.
+              for (const card of yield* cardsForPlan) {
+                if (card.stalled === null || card.activeThreadId === null) continue;
+                const current = yield* store.card(card.id);
+                if (current === null || current.stalled === null || current.activeThreadId === null)
+                  continue;
+                yield* letGo(current, false, "is stalled", "after the flag is cleared", true).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("kanban stalled-slot thread release failed", {
+                      cardId: current.id,
+                      cause,
+                    }),
+                  ),
+                );
+                const next = releaseStalled(current, yield* nowIso);
+                // Attribution also controls whether the old reviewer may submit a late verdict.
+                yield* logEvent(next, current.stalled.by, "flagged", {
+                  fromStage: current.stage,
+                  toStage: next.stage,
+                  body: `Released stalled slot: ${current.stalled.reason}`,
+                });
+                yield* saveCard(next);
+                updateCard(next);
+              }
               // A card whose thread was deleted goes back to its queue for a new one.
               for (const card of yield* cardsForPlan) {
                 if (board.pause !== null && !board.pause.keep.includes(card.id)) continue;
@@ -6587,19 +6624,17 @@ const make = Effect.gen(function* () {
         const at = yield* nowIso;
         const selfFlag =
           reason !== null && actor._tag === "thread" && card.activeThreadId === actor.threadId;
+        if (reason !== null && card.activeThreadId !== null && !selfFlag) {
+          yield* letGo(card, false, "is stalled", "after the flag is cleared", true);
+        }
         const flagged: KanbanCard = {
           ...card,
           stalled: reason === null ? null : { reason, by: actor, at },
           updatedAt: at,
         };
-        // A thread that can't go on frees its slot; it ends its turn on its own.
-        const next: KanbanCard = selfFlag
-          ? {
-              ...release(flagged),
-              stage: card.activeRole === "review" ? "needs_review" : "todo",
-              movedAt: at,
-            }
-          : flagged;
+        // A stalled card holds no slot, whoever flagged it.
+        const next: KanbanCard =
+          reason !== null && card.activeThreadId !== null ? releaseStalled(flagged, at) : flagged;
         yield* logEvent(next, actor, "flagged", {
           fromStage: card.stage,
           toStage: next.stage,
@@ -7053,7 +7088,7 @@ const make = Effect.gen(function* () {
           question: null,
           settledAt: null,
           wakeNote: text.trim() || card.wakeNote,
-          movedAt: at,
+          movedAt: card.stage === "todo" || card.stage === "needs_review" ? card.movedAt : at,
           updatedAt: at,
         };
         yield* logEvent(next, actor, "moved", {

@@ -312,9 +312,9 @@ describe("planDispatch", () => {
       pause: { reason: "Ship the fix", keep: [kept.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     const available = pools([[opus, 3]]);
-    expect(planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role])).toEqual(
-      [[kept.id, "work"]],
-    );
+    expect(
+      planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role]),
+    ).toEqual([[kept.id, "work"]]);
     const ctx = {
       threadId: "t1",
       pool: poolKey(opus),
@@ -360,15 +360,56 @@ describe("planDispatch", () => {
     expect(planDispatch(board, [scriptStep], pools([[opus, 2]]))).toEqual([]);
   });
 
-  it("takes reviews before work and todo by priority", () => {
+  it("interleaves reviews and todos by priority", () => {
     const low = card({ priority: 3 });
     const high = card({ priority: 1 });
     const review = card({ stage: "needs_review" });
     const plan = planDispatch(board, [low, high, review], pools([[opus, 2]]));
     expect(plan.map((d) => [d.cardId, d.role])).toEqual([
-      [review.id, "review"],
       [high.id, "work"],
+      [review.id, "review"],
     ]);
+  });
+
+  it.each([
+    { todoPriority: 1, reviewPriority: 3, winner: "work" },
+    { todoPriority: 2, reviewPriority: 2, winner: "review" },
+    { todoPriority: 3, reviewPriority: 1, winner: "review" },
+  ])(
+    "$winner wins a single slot (todo P$todoPriority, review P$reviewPriority)",
+    ({ todoPriority, reviewPriority, winner }) => {
+      const todo = card({ priority: todoPriority, movedAt: "2026-10-25T00:00:00Z" });
+      const review = card({
+        stage: "needs_review",
+        priority: reviewPriority,
+        movedAt: "2026-10-25T01:00:00Z",
+      });
+      expect(planDispatch(board, [todo, review], pools([[opus, 1]]))).toMatchObject([
+        { cardId: winner === "work" ? todo.id : review.id, role: winner },
+      ]);
+    },
+  );
+
+  it("orders reviews by card priority then movedAt, without inherited urgency", () => {
+    const low = card({ stage: "needs_review", priority: 3, movedAt: "2026-10-25T00:00:00Z" });
+    const urgent = card({ priority: 1, blockedBy: [low.id] });
+    const newer = card({ stage: "needs_review", priority: 2, movedAt: "2026-10-25T02:00:00Z" });
+    const older = card({ stage: "needs_review", priority: 2, movedAt: "2026-10-25T01:00:00Z" });
+    expect(
+      planDispatch(board, [low, urgent, newer, older], pools([[opus, 3]])).map((d) => d.cardId),
+    ).toEqual([older.id, newer.id, low.id]);
+  });
+
+  it("keeps todo urgency and pick order when competing with reviews", () => {
+    const review = card({ stage: "needs_review", priority: 2 });
+    const blocker = card({ priority: 4 });
+    const urgent = card({ priority: 1, blockedBy: [blocker.id] });
+    const routine = card({ priority: 2 });
+    expect(
+      planDispatch(board, [review, routine, blocker, urgent], pools([[opus, 3]])).map(
+        (d) => d.cardId,
+      ),
+    ).toEqual([blocker.id, review.id, routine.id]);
   });
 
   it("at the same priority takes the card holding up the most work first", () => {
@@ -603,9 +644,9 @@ describe("thread batching", () => {
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     expect(planDispatch(paused, [held, back], pools([[opus, 1]]))).toEqual([]);
-    expect(planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]]))).toMatchObject([
-      { cardId: back.id, joins: true },
-    ]);
+    expect(
+      planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]])),
+    ).toMatchObject([{ cardId: back.id, joins: true }]);
   });
 
   it("keeps a held slot for a thread between cards", () => {
@@ -690,9 +731,16 @@ describe("thread batching", () => {
       ...board,
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
-    expect(planDispatch(paused, [held, back], pools([[opus, 1], [haiku, 1]]))).toMatchObject([
-      { cardId: back.id, joins: false, fresh: true },
-    ]);
+    expect(
+      planDispatch(
+        paused,
+        [held, back],
+        pools([
+          [opus, 1],
+          [haiku, 1],
+        ]),
+      ),
+    ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
   });
 
   it("never picks up a backlog card, not even back to its own thread", () => {
