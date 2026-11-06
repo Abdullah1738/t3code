@@ -139,7 +139,7 @@ cp "$HERE/scripts/stage_lib.sh" "$HERE/scripts/memory_stall_watch.sh" "$HERE/scr
 printf '#!/bin/bash\nexit 0\n' > "$TICK/scripts/memory_stall_watch.sh"
 cat > "$TICK/fakepy" <<'PYEOF'
 #!/bin/bash
-[ "$2" = src/sync_muse.py ] && /usr/bin/python3 -c 'import ctypes;print(ctypes.CDLL(None).getiopolicy_np(0,0))' > "$MEMORY_ROOT/iopol"
+[ "$2" = src/sync_muse.py ] && [ -x /usr/sbin/taskpolicy ] && /usr/bin/python3 -c 'import ctypes;print(ctypes.CDLL(None).getiopolicy_np(0,0))' > "$MEMORY_ROOT/iopol"
 case "$2" in
   *sync_claude.py) echo claude >> "$MEMORY_ROOT/ran.log"; exit 3 ;;
   *) echo "$2" >> "$MEMORY_ROOT/ran.log"; exit 0 ;;
@@ -148,11 +148,12 @@ PYEOF
 chmod +x "$TICK/fakepy"
 sed "s#PY=/opt/homebrew/bin/python3#PY=$TICK/fakepy#; s#ROOT=\"\$HOME/.local/share/memory-system\"#ROOT=\"$TICK\"#" "$TICK/scripts/memory_capture_tick.sh" > "$TICK/scripts/tick.sh"
 mkdir -p "$T/logs/state"
-MEMORY_ROOT="$TICK" /usr/sbin/taskpolicy -d throttle bash "$TICK/scripts/tick.sh" >/dev/null 2>&1
+THROTTLE=(); [ -x /usr/sbin/taskpolicy ] && THROTTLE=(/usr/sbin/taskpolicy -d throttle)  # macOS only
+MEMORY_ROOT="$TICK" "${THROTTLE[@]}" bash "$TICK/scripts/tick.sh" >/dev/null 2>&1
 grep -q "claude capture failed rc=3" "$TICK/logs/capture-$(date +%Y%m%d).log" && pass "failing claude stage is logged" || fail "claude failure not logged"
 grep -q "sync_codex.py" "$MEMORY_ROOT/ran.log" 2>/dev/null || grep -q "sync_codex.py" "$TICK/ran.log" && pass "codex stage still runs after claude fails" || fail "codex skipped after claude failed"
 grep -q "sync_thread_identity.py" "$TICK/ran.log" && pass "identity stage runs" || fail "identity stage did not run"
-[ "$(cat "$TICK/iopol" 2>/dev/null)" = 0 ] && pass "stages run at default I/O policy under a throttled parent" || fail "stage I/O policy $(cat "$TICK/iopol" 2>/dev/null)"
+[ -z "${THROTTLE[*]}" ] || [ "$(cat "$TICK/iopol" 2>/dev/null)" = 0 ] && pass "stages run at default I/O policy under a throttled parent" || fail "stage I/O policy $(cat "$TICK/iopol" 2>/dev/null)"
 tail -1 "$TICK/ran.log" | grep -q "wal_truncate.py" && pass "wal truncate runs last" || fail "wal truncate not run last: $(tail -1 "$TICK/ran.log")"
 grep -q "wal=0" "$TICK/logs/capture-$(date +%Y%m%d).log" && pass "wal rc logged" || fail "wal rc not logged"
 [ "$(sed -n 's/.*"state": "\([a-z]*\)".*/\1/p' "$TICK/logs/capture_last.json")" = failed ] && pass "aggregate capture status is failed" || fail "aggregate status not failed: $(cat "$TICK/logs/capture_last.json" 2>/dev/null)"
