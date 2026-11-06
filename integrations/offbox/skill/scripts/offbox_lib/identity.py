@@ -259,9 +259,21 @@ def _ancestors(thread_id: str) -> set[str]:
 PERSON_OWNER_PREFIX = "person:"
 
 
-def _explicit_thread(resolved_thread: str | None) -> str | None:
+CLAUDE_NATIVE_CHILD = "provider-native-child"
+
+
+def claude_native_child(me: dict) -> bool:
+    """A Claude in-process child: it shares its parent's session id and its whole process env."""
+    return me.get("driver") == "claudeAgent" and me.get("executionKind") == CLAUDE_NATIVE_CHILD
+
+
+def _explicit_thread(resolved_thread: str | None, driver: str | None = None,
+                     execution_kind: str | None = None) -> str | None:
     """OFFBOX_THREAD is an inherited shell value, so it only counts when it names the caller's
-    own execution or one of its ancestors. An unrelated parent's value is ignored and logged."""
+    own execution or one of its ancestors. An unrelated parent's value is ignored and logged.
+
+    A Claude in-process child shares the parent's process env, so an ancestor's OFFBOX_THREAD reaches it by
+    inheritance, not as its own choice. Such a child accepts the value only when it names the child itself."""
     explicit = os.environ.get("OFFBOX_THREAD") or None
     if explicit is None:
         return None
@@ -270,7 +282,12 @@ def _explicit_thread(resolved_thread: str | None) -> str | None:
     if resolved_thread is None:
         log("OFFBOX_THREAD ignored: the caller has no resolved Robob thread")
         return None
-    if explicit == resolved_thread or explicit in _ancestors(resolved_thread):
+    if explicit == resolved_thread:
+        return explicit
+    if driver == "claudeAgent" and execution_kind == CLAUDE_NATIVE_CHILD:
+        log(f"OFFBOX_THREAD ignored: {explicit} is not this Claude native child's own thread")
+        return None
+    if explicit in _ancestors(resolved_thread):
         return explicit
     log(f"OFFBOX_THREAD ignored: {explicit} is not this execution or an ancestor")
     return None
@@ -320,7 +337,7 @@ def whoami(cwd: str | None = None) -> dict:
         else:
             # Not yet (pending), ambiguous or unavailable: never the unowned local owner.
             log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}")
-        explicit = _explicit_thread(me["thread"])
+        explicit = _explicit_thread(me["thread"], driver, me["executionKind"])
         if explicit is not None:
             me["thread"] = explicit
     me["owner"] = me["thread"] or f"local:{root}"

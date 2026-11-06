@@ -43,10 +43,18 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
             return
         ses = me.get("session")
         if do_clear:
-            keep = [e for e in cur if not (e.get("session_id") == ses or (me.get("thread") and
-                                                                           e.get("thread_id") == me.get("thread")))]
+            thread = me.get("thread")
+            if me.get("driver") == "claudeAgent":
+                # A Claude parent and its in-process children share one session id, so the session names none of
+                # them. Clear only the caller's own thread's entries, never a parent's or a sibling's.
+                def mine(e):
+                    return bool(thread) and e.get("thread_id") == thread
+            else:
+                def mine(e):
+                    return e.get("session_id") == ses or bool(thread and e.get("thread_id") == thread)
+            keep = [e for e in cur if not mine(e)]
             atomic_write_json(EXEMPTIONS, keep)
-            event(db(), None, "exemption_clear", f"session={ses} removed={len(cur) - len(keep)}")
+            event(db(), None, "exemption_clear", f"session={ses} thread={thread} removed={len(cur) - len(keep)}")
             print(f"cleared {len(cur) - len(keep)} exemption(s)")
             return
         if not reason or len(reason.strip()) < 8:
@@ -55,8 +63,10 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
             say("note: no OPENCODE_SESSION_ID; the exemption is recorded but the gate can't match it to a session")
         secs = parse_ttl(ttl)
         # The driver goes with the session id: the monitor matches a native UUID only under the driver it was written
-        # for, and an entry without one is read as OpenCode.
+        # for, and an entry without one is read as OpenCode. The execution kind tells the monitor that a Claude
+        # in-process child's entry covers that child's thread only, not the session it shares with its parent.
         e = {"session_id": ses, "driver": me.get("driver") or "opencode", "thread_id": me.get("thread"),
+             "execution_kind": me.get("executionKind"),
              "reason": reason.strip()[:500], "created_at": now(), "expires_at": now() + secs,
              "repo_root": me.get("repo_root"), "pid": os.getppid()}
         cur.append(e)

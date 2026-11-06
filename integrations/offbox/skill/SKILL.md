@@ -75,6 +75,10 @@ offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
 offbox local --list ; offbox local --clear
 ```
 
+A Claude Code subagent (in-process child) shares its parent's session id, so its exemption and its `--clear`
+cover its own Robob thread only, never the parent's or a sibling's. An inherited `OFFBOX_THREAD` only counts for such
+a child when it names the child itself.
+
 The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
 
 ## Your box (lease)

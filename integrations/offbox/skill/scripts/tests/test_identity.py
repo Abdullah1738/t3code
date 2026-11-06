@@ -611,6 +611,101 @@ class ClaudeCommandIdentityTests(IdentityTests):
         self.assertEqual(me["resolution"], "unresolved")
         self.assertFalse(me["proven"])
 
+    def native_child(self):
+        def fake(event, harness, fresh=False):
+            if event.get("agent_id"):
+                return resolved(CHILD, parent=PARENT, kind="provider-native-child", accepts=False)
+            return resolved(PARENT)
+        return patch.object(self.engine, "resolve_identity", side_effect=fake)
+
+    def test_claude_native_child_ignores_an_inherited_ancestor_offbox_thread(self):
+        # The parent's OFFBOX_THREAD reaches every in-process child through the shared env. The child keeps its own
+        # thread rather than taking the parent's leases.
+        with self.native_child():
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token("agent-1"),
+                          OFFBOX_THREAD=PARENT)
+        self.assertEqual(me["executionKind"], "provider-native-child")
+        self.assertEqual(me["thread"], CHILD)
+        self.assertEqual(me["owner"], CHILD)
+
+    def test_claude_native_child_accepts_offbox_thread_naming_itself(self):
+        with self.native_child():
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token("agent-1"),
+                          OFFBOX_THREAD=CHILD)
+        self.assertEqual(me["owner"], CHILD)
+        self.assertTrue(me["proven"])
+
+    def test_claude_parent_still_honours_offbox_thread_naming_itself(self):
+        with self.native_child():
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token(),
+                          OFFBOX_THREAD=PARENT)
+        self.assertEqual(me["owner"], PARENT)
+
+    def test_person_owner_is_still_honoured_for_a_claude_native_child(self):
+        with self.native_child():
+            me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=self.token("agent-1"),
+                          OFFBOX_THREAD="person:moni")
+        self.assertEqual(me["owner"], "person:moni")
+
+
+class ClaudeExemptionClearTests(unittest.TestCase):
+    """`offbox local --clear` from a resolved Claude caller. Parent and children share one session id, so a clear
+    matches the caller's thread only and leaves the parent's and siblings' exemptions in place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.file = root / "exemptions.json"
+        (root / "locks").mkdir()
+        for p in (patch.object(common, "STATE", root / "STATE"), patch.object(common, "DB_PATH", root / "db.sqlite"),
+                  patch.object(common, "LOG_PATH", root / "log"), patch.object(common, "LOCKS_DIR", root / "locks"),
+                  patch.object(common, "EXEMPTIONS", self.file), patch.object(misc, "EXEMPTIONS", self.file)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def caller(self, thread, driver="claudeAgent", kind="provider-native-child", session=CLAUDE_UUID):
+        return {"session": session, "thread": thread, "driver": driver, "executionKind": kind,
+                "repo_root": self.tmp.name, "proven": True}
+
+    def add(self, me, reason):
+        with patch("builtins.print"):
+            misc.local_exempt(me, reason, "2h", False, False)
+
+    def clear(self, me):
+        with patch("builtins.print"):
+            misc.local_exempt(me, None, "2h", False, True)
+
+    def threads(self):
+        return sorted(e.get("thread_id") or "" for e in json.loads(self.file.read_text()))
+
+    def test_child_clear_keeps_the_parent_and_sibling_exemptions(self):
+        self.add(self.caller(PARENT, kind="top-level"), "parent needs the local simulator")
+        self.add(self.caller(CHILD), "child needs local xcode build")
+        self.add(self.caller(OTHER), "sibling needs local devices too")
+        self.clear(self.caller(CHILD))
+        self.assertEqual(self.threads(), sorted([PARENT, OTHER]))
+
+    def test_parent_clear_keeps_the_children_exemptions(self):
+        self.add(self.caller(PARENT, kind="top-level"), "parent needs the local simulator")
+        self.add(self.caller(CHILD), "child needs local xcode build")
+        self.clear(self.caller(PARENT, kind="top-level"))
+        self.assertEqual(self.threads(), [CHILD])
+
+    def test_written_entry_records_the_execution_kind(self):
+        self.add(self.caller(CHILD), "child needs local xcode build")
+        entry = json.loads(self.file.read_text())[0]
+        self.assertEqual(entry["execution_kind"], "provider-native-child")
+        self.assertEqual(entry["thread_id"], CHILD)
+
+    def test_other_drivers_still_clear_by_session(self):
+        # OpenCode keeps the old behaviour: the session id names the caller, so its entries go even without a thread.
+        self.file.write_text(json.dumps([
+            {"session_id": "ses_a", "driver": "opencode", "thread_id": None, "expires_at": 9999999999},
+            {"session_id": "ses_b", "driver": "opencode", "thread_id": None, "expires_at": 9999999999}]))
+        self.clear(self.caller(None, driver="opencode", kind=None, session="ses_a"))
+        self.assertEqual([e["session_id"] for e in json.loads(self.file.read_text())], ["ses_b"])
+
 
 if __name__ == "__main__":
     unittest.main()
