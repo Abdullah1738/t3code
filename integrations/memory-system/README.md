@@ -24,6 +24,11 @@ runtime data.
   (`muse_sync_files`), projects prompts, answers, reasoning summaries and tool
   calls/results, skips Muse's reminder-observer children, and keeps Robob thread
   titles and parents in `muse_sessions`. Runs inside the capture tick.
+- `src/wal_truncate.py` - last step of the capture tick. The writers run with
+  auto-checkpoints off, so it resets the `memory.db` and `opencode_raw.db` WALs
+  with a zero-wait PASSIVE then TRUNCATE checkpoint. A reader holding old frames
+  just leaves it for the next tick; it never fails the tick (`WAL {...}` lines
+  in the capture log).
 - `src/build_text_fts.py` - builds `episodic_text_fts`, the contentless
   user/assistant text index the search uses (writers need SQLite >= 3.47; not in
   `schema.sql`, so run it after a DB rebuild).
