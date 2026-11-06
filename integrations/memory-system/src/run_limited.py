@@ -93,7 +93,13 @@ def main():
     if not command:
         parser.error("a command is required after --")
     if args.background:
-        command = ["/usr/sbin/taskpolicy", "-b", *command]
+        # Not `taskpolicy -b` (PRIO_DARWIN_BG): darwin-background I/O to the USB
+        # ExternalSSD is throttled to ~0.02-0.1 MB/s whenever anything else uses
+        # the disk, so the 107 GB sqlite3_rsync replica hashed for 3 h and timed
+        # out on every run from 2026-11-03 to 11-06 (unthrottled: 20 min). Lower
+        # CPU priority only, and lift launchd's LowPriorityIO (IOPOL_THROTTLE),
+        # which children inherit, to IOPOL_DEFAULT.
+        command = ["/usr/sbin/taskpolicy", "-d", "default", "/usr/bin/nice", "-n", "10", *command]
     return run(command, args.seconds)
 
 

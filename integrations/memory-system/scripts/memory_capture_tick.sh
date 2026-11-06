@@ -5,6 +5,15 @@
 # deadline. The stage status tracks OpenCode; Muse writes logs/muse_last.json,
 # which the health check (muse_lag) reads. It also runs the stall watcher.
 set -u
+# launchd's LowPriorityIO puts this job (and every child) at IOPOL_THROTTLE. Since
+# the data moved to the USB ExternalSSD (2026-11-02) throttled reads drop to
+# ~0.05 MB/s whenever anything else touches the disk, and ticks went from ~15 s to
+# 600-1200 s with stage timeouts. Re-run once at normal I/O priority; launchd's
+# Nice 10 still applies.
+if [ -z "${MEMORY_TICK_IOPOL:-}" ] && [ -x /usr/sbin/taskpolicy ]; then
+  export MEMORY_TICK_IOPOL=default
+  exec /usr/sbin/taskpolicy -d default /bin/bash "$0" "$@"
+fi
 ROOT="$HOME/.local/share/memory-system"
 cd "$ROOT" || exit 1
 STAGE_LOG="$ROOT/logs/capture-$(date +%Y%m%d).log"
