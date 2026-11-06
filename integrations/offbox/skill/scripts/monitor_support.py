@@ -97,11 +97,34 @@ def parent_session(session):
     return cached(("parent", session), lookup)
 
 
-def live_exemption(session, now=None, driver=None):
+CLAUDE_NATIVE_CHILD = "provider-native-child"
+
+
+def _claude_entry_is_child(entry):
+    """Whether a Claude exemption was written by an in-process child, so it covers that child's thread only.
+
+    A Claude parent and its in-process children share one session id. New entries record the writer's execution kind.
+    An entry with a thread but no kind (written before the kind was recorded) is the session's own only when its
+    thread is the one C1 answers for the bare session id (the parent); anything else, including a C1 outage, is
+    read as a child's. An entry with no thread predates Claude resolution and keeps its session-wide meaning."""
+    thread = entry.get("thread_id")
+    if not thread:
+        return False
+    kind = entry.get("execution_kind")
+    if kind:
+        return kind == CLAUDE_NATIVE_CHILD
+    ident = resolve(entry["session_id"], "claudeAgent")
+    return not (ident.get("resolution") == "resolved" and ident.get("robobThreadId") == thread)
+
+
+def live_exemption(session, now=None, driver=None, thread=None):
     """Whether a live exemption covers this session. A native exemption (a bare UUID) matches only the driver it was
     written under, so one UUID under Claude and Codex is two separate answers. An entry without a driver predates
     native drivers and only ever meant OpenCode. OpenCode's parent lookup is skipped for native callers, which have
-    no OpenCode parent."""
+    no OpenCode parent.
+
+    A Claude in-process child's exemption names the session it shares with its parent and siblings, so it covers
+    only that child's thread: it matches when the caller passes the same `thread`, never the session as a whole."""
     now = time.time() if now is None else now
     entries = read_json(STATE / "exemptions.json", [])
     if not isinstance(entries, list):
@@ -122,6 +145,10 @@ def live_exemption(session, now=None, driver=None):
             continue
         entry_driver = entry.get("driver") or "opencode"
         if (driver or "opencode") != entry_driver:
+            continue
+        if entry_driver == "claudeAgent" and entry["session_id"] == session and _claude_entry_is_child(entry):
+            if thread and entry.get("thread_id") == thread:
+                return True
             continue
         live.add(entry["session_id"])
     if session in live:

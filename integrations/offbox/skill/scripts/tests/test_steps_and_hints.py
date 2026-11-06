@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -267,7 +268,41 @@ class AutoSizeTests(Isolated):
     def test_explicit_size_wins(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(self.size('docker compose up -d', d, explicit='large'), 'large')
+            self.assertEqual(self.size('docker compose up -d', d, explicit='xlarge'), 'xlarge')
+            self.assertEqual(self.size('go test ./...', d, explicit='default'), 'default')
+
+    def test_explicit_xlarge_without_a_reason_runs_on_large(self):
+        with tempfile.TemporaryDirectory() as d:
+            got, why = lease.auto_size(self.con, 'uv sync --frozen && uv run pytest -q tests', self.ident(d), 'xlarge')
+            self.assertEqual(got, 'large')
+            self.assertIn('OFFBOX_ALLOW_XLARGE=1', why)
+            with patch.dict(os.environ, {'OFFBOX_ALLOW_XLARGE': '1'}):
+                self.assertEqual(self.size('uv run pytest -q tests', d, explicit='xlarge'), 'xlarge')
+            Path(d, 'package.json').write_text('{}')
+            self.assertEqual(self.size('npx tsc --noEmit', d, explicit='xlarge'), 'xlarge')
+            self.assertEqual(self.size('docker build -t x .', d, explicit='xlarge'), 'xlarge')
+            self.assertEqual(self.size('make test-integration', d, explicit='xlarge'), 'large')
+            Path(d, 'compose.yaml').write_text('services: {}\n')
+            self.assertEqual(self.size('make test-integration', d, explicit='xlarge'), 'xlarge')
             self.assertEqual(self.size('go test ./...', d, explicit='xlarge'), 'xlarge')
+            self.assertEqual(self.size('uv run pytest -q tests', d, explicit='xlarge'), 'xlarge')
+            for narrow in ('go test -run TestParse ./internal/parser', 'pytest tests/test_parser.py::test_one',
+                           'pytest tests/test_parser.py', 'uv run pytest -q tests/parser_test.py',
+                           './gradlew help', 'npx vitest run src/a.test.ts'):
+                self.assertEqual(self.size(narrow, d, explicit='xlarge'), 'large', narrow)
+
+    def test_explicit_xlarge_kept_for_js_suites_in_testcontainers_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'package.json').write_text('{"devDependencies":{"testcontainers":"^10"}}')
+            for cmd in ('npx vitest run', 'pnpm test', 'vp test run', 'npm run test', 'node --test scripts/'):
+                self.assertEqual(self.size(cmd, d, explicit='xlarge'), 'xlarge', cmd)
+            self.assertEqual(self.size('npx eslint .', d, explicit='xlarge'), 'large')
+
+    def test_explicit_xlarge_kept_after_same_kind_oom_on_large(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'uv run pytest -n auto tests', 'large')
+            self.assertEqual(self.size('uv run pytest -q tests/x', d, explicit='xlarge'), 'xlarge')
+            self.assertEqual(self.size('go test ./pkg', d, explicit='xlarge'), 'large')
 
     def test_container_stacks_get_xlarge(self):
         with tempfile.TemporaryDirectory() as d:
@@ -287,14 +322,71 @@ class AutoSizeTests(Isolated):
             Path(d, 'package.json').write_text('{}')
             self.assertEqual(self.size('npx tsc --noEmit -p apps/server', d), 'xlarge')
 
-    def test_recent_oom_in_repo_gets_xlarge(self):
+    def oom(self, d, cmd, size, age=3600, key='repo', box='bx_o'):
+        self.con.execute("INSERT OR IGNORE INTO leases(box_id,owner,repo_root,repo_key,remote_dir) VALUES (?,'o',?,?,'r')",
+                         (box, d, key))
+        self.con.execute("INSERT INTO runs(run_id,box_id,size,exit_code,start_at,cmd) VALUES (?,?,?,137,?,?)",
+                         (f'r{time.time_ns()}', box, size, time.time() - age, cmd))
+        self.con.commit()
+
+    def test_recent_oom_bumps_the_same_kind_one_size(self):
         with tempfile.TemporaryDirectory() as d:
-            self.con.execute("INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir) VALUES ('bx_o','o',?,'repo','r')", (d,))
-            self.con.execute("INSERT INTO runs(run_id,box_id,size,exit_code,start_at) VALUES ('r1','bx_o','large',137,?)",
-                             (time.time() - 3600,))
-            self.con.commit()
-            self.assertEqual(self.size('npx vitest run', d), 'xlarge')
+            self.oom(d, 'npx vitest run', 'large')
+            self.assertEqual(self.size('npx vitest run src/x', d), 'xlarge')
             self.assertIsNone(self.size('npx vitest run', d, key='other'))
+            self.assertIsNone(self.size('go test -run TestX ./internal/pkg', d))
+
+    def test_oom_on_default_box_bumps_to_large_not_xlarge(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'timeout 1800 uv run pytest -n auto -q tests', 'default')
+            self.assertEqual(self.size('uv run pytest -q tests/test_a.py', d), 'large')
+
+    def test_old_oom_is_forgotten_after_three_days(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'npx vitest run', 'large', age=4 * 86400)
+            self.assertIsNone(self.size('npx vitest run', d))
+
+    def test_install_before_the_job_does_not_match_every_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'pnpm i --frozen-lockfile ; cd apps/server && vp run typecheck', 'large')
+            self.assertIsNone(self.size('pnpm i --frozen-lockfile ; vp test run apps/web', d))
+            self.oom(d, 'npm ci', 'large')
+            self.assertEqual(self.size('npm ci', d), 'xlarge')
+
+    def test_command_kinds(self):
+        k = lease.command_kinds
+        self.assertEqual(k('timeout 1800 uv run pytest -n auto -q tests'), {'pytest'})
+        self.assertEqual(k('GOFLAGS=-mod=mod go vet ./...'), {'vet'})
+        self.assertEqual(k('cd apps && npx tsc --noEmit ; npx vp test run x'), {'tsc', 'test'})
+        self.assertEqual(k('make test-integration'), {'make test-integration'})
+        self.assertNotEqual(k('make type'), k('make test'))
+        self.assertEqual(k('uv sync --frozen'), {'install'})
+        self.assertEqual(k('set -o pipefail; uv run pytest tests'), {'pytest'})
+        self.assertEqual(k('set -o pipefail; go vet ./pkg'), {'vet'})
+        self.assertEqual(k('uv run --with y pytest tests'), {'pytest'})
+        self.assertEqual(k('nice -n 10 go test ./...'), {'test'})
+        self.assertEqual(k('timeout --signal=KILL 1800 uv run pytest -q'), {'pytest'})
+        self.assertEqual(k("bash -c 'cd core && GOTOOLCHAIN=local go test -race ./...'"), {'test'})
+        self.assertEqual(k("npx -y -p node@22 -p npm@10 -c 'node --version'"), {'node'})
+        self.assertEqual(k('timeout 30m uv run pytest tests'), {'pytest'})
+        self.assertEqual(k('npx vitest@3 run src/a.test.ts'), {'vitest'})
+        self.assertEqual(k('npx --yes pnpm@11.10.0 install --frozen-lockfile'), {'install'})
+        self.assertEqual(k('xvfb-run -a pytest -q tests/a.py'), {'pytest'})
+        self.assertEqual(k('make -C backend test'), {'make test'})
+        self.assertNotEqual(k('make -C backend test'), k('make -C backend lint'))
+        self.assertEqual(k('exec uv run pytest tests'), {'pytest'})
+        self.assertEqual(k('bash -lc "exec go test ./pkg"'), {'test'})
+
+    def test_exec_wrapped_oom_still_bumps_the_same_job(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'exec uv run pytest tests', 'large')
+            self.assertEqual(self.size('uv run pytest -q tests/x', d), 'xlarge')
+
+    def test_shell_setup_shared_with_an_oom_does_not_bump_other_jobs(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.oom(d, 'set -o pipefail; uv run pytest tests', 'large')
+            self.assertIsNone(self.size('set -o pipefail; go vet ./pkg', d))
+            self.assertEqual(self.size('uv run --with y pytest tests', d), 'xlarge')
 
 
 class ExitHintTests(unittest.TestCase):

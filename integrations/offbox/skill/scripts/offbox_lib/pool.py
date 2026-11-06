@@ -132,9 +132,10 @@ def candidates(con, key, size, source, me=None):
             continue
         out.append(r)
     # Running boxes first: the caller's own box (its checkout is already synced there), then the smallest that
-    # fits. A running box bigger than this run needs (grown by an earlier --size run) goes after a stopped box
-    # while starts are plentiful: the stopped one resumes at the right size and the big one stops on its short
-    # idle timer.
+    # fits. A running xlarge box this run doesn't need (grown for an earlier run) goes after a stopped box while
+    # starts are plentiful, even when it is the caller's own: the stopped one resumes at the right size and the big
+    # one stops on its short idle timer. 13 Oct - 5 Nov, 5,448 ordinary runs went to the caller's own grown xlarge
+    # box. Only xlarge: a large box over a generic (default) box's size costs less than the resume.
     from . import lease
     rank = {n: i for i, n in enumerate(SIZES)}
     want = rank.get(size or "", 0)
@@ -151,7 +152,8 @@ def candidates(con, key, size, source, me=None):
         own = 0 if r["box_id"] in mine else 1
         if have < want:
             return (0, 2, have)  # needs a grow
-        if plentiful and own and have > max(want, rank.get(lease.natural_size(con, r), 1)):
+        oversized = have > max(want, rank.get(lease.natural_size(con, r), 1))
+        if plentiful and oversized and (own or r["size"] == "xlarge"):
             return (2, 0, have)
         return (0, own, have)
     out.sort(key=fit)

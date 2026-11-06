@@ -311,6 +311,11 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
                             (status, code, now(), run["run_id"]))
                 con.commit()
                 event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
+                if state in api.LIVE_STATES:
+                    from .runs import settle_docker
+                    settle_docker(con, run, status)
+                    # The run's client died: the box still has its 30-min run ttl. Bring it to the idle window.
+                    lease.idle_ttl(bid)
 
 
 def print_actions(actions: list[str]) -> None:

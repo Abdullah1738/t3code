@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -244,11 +245,35 @@ class PoolTests(Isolated):
         self.assertEqual(resume.call_args.args[2],'xlarge')  # an explicit bigger --size still wins
         self.assertEqual(got['size'],'xlarge')
 
-    def test_callers_own_running_box_is_preferred_and_never_demoted(self):
+    def test_callers_own_running_box_is_preferred(self):
         self.box('other', size='large', member=True, used=900)
+        self.box('mine', size='large', member=True, used=100)
+        self.box('cold', 'stopped', size='large', member=True, used=50)
+        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.commit()
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
+            row = pool.acquire(self.me)
+            pool.release_guard(row)
+        self.assertEqual(reuse.call_args.args[1]['box_id'],'mine')
+
+    def test_callers_own_grown_xlarge_yields_to_a_stopped_box_for_an_ordinary_run(self):
         self.box('mine', size='xlarge', member=True, used=100)
         self.box('cold', 'stopped', size='large', member=True, used=50)
         self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.commit()
+        with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
+            row = pool.acquire(self.me)
+            pool.release_guard(row)
+            self.assertEqual(reuse.call_args.args[1]['box_id'],'cold')
+            row = pool.acquire(self.me, size='xlarge')
+            pool.release_guard(row)
+        self.assertEqual(reuse.call_args.args[1]['box_id'],'mine')  # a run that needs xlarge still gets it
+
+    def test_callers_own_grown_xlarge_still_used_when_starts_are_tight(self):
+        self.box('mine', size='xlarge', member=True, used=100)
+        self.box('cold', 'stopped', size='large', member=True, used=50)
+        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.executemany("INSERT INTO start_requests(ts) VALUES (?)",[(common.now()-7200,)]*400)
         self.con.commit()
         with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
             row = pool.acquire(self.me)
@@ -432,6 +457,57 @@ class PoolTests(Isolated):
         self.assertTrue(lease.docker_recent(self.con, 'dk'))
         self.assertTrue(lease.docker_recent(self.con, repo_root='/r'))
         self.assertFalse(lease.docker_recent(self.con, 'other'))
+
+    def test_finished_run_with_no_container_drops_the_docker_window(self):
+        t = common.now()
+        self.box('dk')
+        for rid, seen in (('r-nc', False), ('r-c', True)):
+            self.con.execute("""INSERT INTO runs (run_id, box_id, owner, repo_root, cwd, cmd, mode, status, start_at,
+                docker) VALUES (?,'dk','w','/r','/r','uv run ruff check','fg','running',?,1)""", (rid, t - 60))
+            self.con.commit()
+            with patch.object(runs,'containers_seen',return_value=seen), patch.object(api,'set_ttl'):
+                runs.finish(rid, 0)
+        got = dict(self.con.execute("SELECT run_id, docker FROM runs WHERE run_id IN ('r-nc','r-c')").fetchall())
+        self.assertEqual(got, {'r-nc': 0, 'r-c': 1})
+        self.con.execute("DELETE FROM runs WHERE run_id='r-c'")
+        self.con.commit()
+        self.assertFalse(lease.docker_recent(self.con, 'dk'))
+
+    def test_unfinished_docker_command_counts_but_a_finished_one_needs_the_flag(self):
+        t = common.now()
+        self.con.execute("""INSERT INTO runs (run_id, box_id, owner, repo_root, cwd, cmd, mode, status, start_at,
+            docker) VALUES ('live','b1','w','/r','/r','docker compose up -d','fg','running',?,0)""", (t - 60,))
+        self.con.execute("""INSERT INTO runs (run_id, box_id, owner, repo_root, cwd, cmd, mode, status, start_at,
+            end_at, docker) VALUES ('old','b2','w','/r','/r','docker ps','fg','done',?,?,0)""", (t - 120, t - 60))
+        self.con.commit()
+        self.assertTrue(lease.docker_recent(self.con, 'b1'))
+        self.assertFalse(lease.docker_recent(self.con, 'b2'))
+
+    def test_container_marker_only_a_clear_zero_drops_the_window(self):
+        def ssh_says(out, rc=0):
+            return patch.object(runs.ssh_sync, 'ssh', return_value=subprocess.CompletedProcess([], rc, out.encode(), b''))
+        with ssh_says('0\n'):
+            self.assertFalse(runs.containers_seen('bx', 'r'))
+        for out in ('1\n', 'unknown\n', ''):  # a container started / dockerd didn't answer / odd output
+            with ssh_says(out):
+                self.assertTrue(runs.containers_seen('bx', 'r'), out)
+        with ssh_says('0\n', rc=255):
+            self.assertTrue(runs.containers_seen('bx', 'r'))
+        with patch.object(runs.ssh_sync, 'ssh', side_effect=OSError('down')):
+            self.assertTrue(runs.containers_seen('bx', 'r'))
+
+    def test_reaper_settles_docker_and_brings_a_dead_clients_box_to_the_idle_window(self):
+        t = common.now()
+        self.box('dead', used=t-30)
+        self.con.execute("""INSERT INTO runs (run_id, box_id, owner, repo_root, cwd, cmd, mode, status, start_at,
+            process_id, docker) VALUES ('rd','dead','w','/r','/r','uv run ruff check','fg','running',?,7,1)""",
+                         (t - 600,))
+        self.con.commit()
+        with patch.object(api,'cmd_status',return_value={'running':False,'status':'exited','exitCode':0}), \
+                patch.object(runs,'containers_seen',return_value=False), patch.object(api,'set_ttl') as ttl:
+            reap._check_unlocked(self.con,'dead','running',False,[])
+        self.assertEqual(self.con.execute("SELECT docker FROM runs WHERE run_id='rd'").fetchone()[0], 0)
+        ttl.assert_called_once_with('dead', 600)  # large idle window, not the 30-min run ttl or Docker's 20 min
 
     def test_reaper_uses_per_size_idle_limit(self):
         t = common.now()

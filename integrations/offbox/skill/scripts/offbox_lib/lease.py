@@ -48,7 +48,7 @@ def natural_size(con, row) -> str:
     return size if _rank(size) >= _rank("large") else "large"
 
 
-DOCKER_CMD = re.compile(r"docker|compose|testcontainers|localstack")
+DOCKER_CMD = re.compile(r"docker|podman|compose|testcontainers|localstack", re.I)
 DOCKER_MANIFEST = re.compile(r"testcontainers|dockertest")
 
 
@@ -85,32 +85,165 @@ def typecheck_size(cmd: str, repo_root: str, size: str | None) -> str | None:
 # narrow tests fit large (16 GB; measured per-job peak ~12 GB, 13-31 Oct).
 BIG_STACK_CMD = re.compile(r"\bcompose\b|docker-compose|localstack|testcontainers")
 WHOLE_SUITE_CMD = re.compile(r"\./\.\.\.|\bmake\s+test|\bpytest(?![^;&|]*::)")
-OOM_WINDOW_S = 14 * 86400
+# An exit 137 bumps the next runs of the same kind of command for a few days. It used to put the whole repo on
+# xlarge for 14 days: 2 OOMs in backoffice-core sent 1,391 ordinary runs to xlarge (13 Oct - 5 Nov).
+OOM_WINDOW_S = 3 * 86400
+# command_kinds() reads the job out of each ;/&&/||/| part of a command: shell setup statements are dropped, then
+# env assignments, wrappers (timeout, nice, uv run, npx, go, ...) and their options are skipped.
+_SETUP = {"set", "export", "cd", "source", ".", "trap", "unset", "local", "shopt", "ulimit", "umask", "alias",
+          "pushd", "popd", "declare", "readonly"}
+# Wrapper word -> its options that take a value (skipped with the value). A wrapper's first other word that is a
+# number is its own argument too (timeout 1800, nice 10).
+_WRAPPERS = {
+    "env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": {"-f", "-o"}, "command": set(), "sudo": {"-u", "-g"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"}, "nice": {"-n", "--adjustment"},
+    "taskpolicy": {"-c", "-t", "-l", "-p"}, "stdbuf": {"-i", "-o", "-e"}, "xvfb-run": {"-s", "-n", "-e", "-f"},
+    "bash": set(), "sh": set(), "zsh": set(),
+    "uv": {"--with", "--python", "-p", "--project", "--directory", "--group", "--extra", "--package", "--env-file",
+           "--with-requirements", "--index", "--index-url", "--from"},
+    "run": {"--with", "--python", "-p", "--project", "--directory", "--group", "--extra", "--package", "--env-file",
+            "--with-requirements", "--from"},
+    "npx": {"-p", "--package"}, "pnpm": {"-C", "--dir", "--filter", "-F"},
+    "yarn": {"--cwd"}, "npm": {"--prefix", "-w", "--workspace"}, "bunx": {"-p", "--package"},
+    "exec": set(), "dlx": set(), "poetry": {"-C", "--directory"}, "pipenv": set(), "python": set(),
+    "python3": set(), "-m": set(), "go": {"-C"}, "vp": set(), "corepack": set(),
+}
+_KIND_WORD = re.compile(r"[A-Za-z][\w.+-]*")
+_DURATION = re.compile(r"\d+(\.\d+)?[smhd]?")  # timeout 1800 / 30m, nice 10
+# Plumbing and output filters say nothing about how much memory the job needs.
+_KIND_NOISE = {"echo", "printf", "exit", "true", "false", "[", "[[", "grep", "rg", "head", "tail", "sed", "awk",
+               "sort", "uniq", "wc", "tee", "cat", "ls", "mkdir", "rm", "cp", "mv", "do", "done", "then", "fi",
+               "if", "for", "while", "until", "wait", "sleep", "date", "pwd", "cut", "tr", "xargs", "git", "return",
+               "case", "esac", "else", "elif", "nvm", "which", "type", "chmod", "touch", "ln", "find", "jq"}
+_KIND_ALIAS = {"i": "install", "ci": "install", "add": "install", "sync": "install"}
 
 
-def oom_recent(con, repo_key: str, within: int = OOM_WINDOW_S) -> bool:
-    """A box in this repo killed a run for memory (exit 137) on a smaller size lately."""
-    return con.execute("SELECT 1 FROM runs r JOIN leases l USING(box_id) WHERE l.repo_key=? AND r.exit_code=137 "
-                       "AND COALESCE(r.size,'') != 'xlarge' AND r.start_at>? LIMIT 1",
-                       (repo_key, now() - within)).fetchone() is not None
+def _part_kind(words: list[str]) -> str | None:
+    i = 0
+    while i < len(words):
+        if words[i].rsplit("/", 1)[-1] in _SETUP:  # a setup statement, even behind `bash -c`
+            return None
+        w = words[i]
+        base = w.rsplit("/", 1)[-1]
+        if not base.startswith("@"):
+            base = base.split("@", 1)[0]  # npx vitest@3 / pnpm@11 -> vitest / pnpm
+        if "=" in w.split("/")[0] and not w.startswith("-"):  # VAR=value
+            i += 1
+            continue
+        if base in _WRAPPERS:
+            opts = _WRAPPERS[base]
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or _DURATION.fullmatch(words[i])) \
+                    and words[i] not in ("-c", "--call", "-lc"):
+                opt = words[i].split("=", 1)[0]
+                i += 2 if (opt in opts and "=" not in words[i]) else 1
+            continue
+        if base.startswith("-") or base.startswith("@"):  # incl. `-c`: what follows is the command
+            i += 1
+            continue
+        m = _KIND_WORD.match(base)
+        if not m or m.group(0).lower() in _KIND_NOISE:
+            return None
+        kind = _KIND_ALIAS.get(m.group(0).lower(), m.group(0).lower())
+        if kind == "make":  # make's target is the job: `make test` and `make type` are different kinds
+            target, j = "", i + 1
+            while j < len(words):
+                x = words[j]
+                if x in ("-C", "-f", "-I", "-j", "-l", "-o", "-W", "--directory", "--file", "--include-dir"):
+                    j += 2 if not (x == "-j" and (j + 1 >= len(words) or not words[j + 1].isdigit())) else 1
+                    continue
+                if x.startswith("-") or "=" in x:
+                    j += 1
+                    continue
+                target = x
+                break
+            kind = f"make {target}".strip()
+        return kind
+    return None
+
+
+def command_kinds(cmd: str) -> set[str]:
+    """Job kinds in a command: pytest, test (go/vp/npm test), vitest, tsc, typecheck, make <target>, install..."""
+    kinds = set()
+    for part in re.split(r"&&|\|\||;|\n|\|", cmd or ""):
+        kind = _part_kind(part.replace("'", " ").replace('"', " ").replace("(", " ").replace(")", " ").split())
+        if kind:
+            kinds.add(kind)
+    # A dependency install comes before nearly every job, so it names the job only when it is all there is.
+    return (kinds - {"install"}) or kinds
+
+
+def oom_recent(con, repo_key: str, cmd: str = "", within: int = OOM_WINDOW_S) -> str | None:
+    """Size to bump this run to: one above the size whose run of the same kind was killed for memory (exit 137)
+    in this repo lately. None when nothing of this kind was."""
+    kinds = command_kinds(cmd)
+    if not kinds:
+        return None
+    best = None
+    for size, oom_cmd in con.execute(
+            "SELECT COALESCE(r.size,'large'), r.cmd FROM runs r JOIN leases l USING(box_id) WHERE l.repo_key=? "
+            "AND r.exit_code=137 AND COALESCE(r.size,'') != 'xlarge' AND r.start_at>?",
+            (repo_key, now() - within)).fetchall():
+        if kinds & command_kinds(oom_cmd or ""):
+            up = SIZES[min(SIZES.index(size if size in SIZES else "large") + 1, len(SIZES) - 1)]
+            if _rank(up) < _rank("large"):
+                up = "large"
+            if best is None or _rank(up) > _rank(best):
+                best = up
+    return best
+
+
+# Test runners whose suite may start containers in a testcontainers/compose repo (explicit xlarge kept for them).
+SUITE_RUNNER_CMD = re.compile(r"\bmake\s+(-\S+\s+(\S+\s+)?)*\S*(test|integration|e2e)|"
+                              r"\b(vitest|jest|mocha|ava|playwright)\b|"
+                              r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?test|\bvp\s+(run\s+)?test|\bnode\s+--test|"
+                              r"\bgo\s+test\b|\bpytest\b|\bcargo\s+test|\bgradlew?\b.*\b(test|check|integration)")
+# One named test or test file.
+NARROW_TEST_CMD = re.compile(r"\s-run[\s=]|::|--tests\s|--test-name-pattern|\s-t\s|\.(test|spec)\.[jt]sx?\b|"
+                             r"\btest_\w+\.py\b|\w+_test\.py\b")
+COMPOSE_FILES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+
+
+def xlarge_needed(cmd: str, repo_root: str, repo_key: str) -> bool:
+    """An explicit --size xlarge is kept for: anything that runs Docker, a type-check, the harness repo, or a whole
+    suite in a repo with testcontainers or a compose file (`make test-integration` brings up its stack)."""
+    if typecheck_size(cmd, repo_root, None) or DOCKER_CMD.search(cmd or "") or "harness" in repo_key:
+        return True
+    if not WHOLE_SUITE_CMD.search(cmd or "") and not SUITE_RUNNER_CMD.search(cmd or ""):
+        return False
+    if NARROW_TEST_CMD.search(cmd or "") and not re.search(r"\./\.\.\.|\bmake\s+test", cmd or ""):
+        # One test or file (WHOLE_SUITE_CMD reads any bare pytest as a suite, so it can't veto this): the OOM bump or
+        # OFFBOX_ALLOW_XLARGE covers the rare big one.
+        return False
+    return uses_docker("", repo_root) or any(os.path.isfile(os.path.join(repo_root, n)) for n in COMPOSE_FILES)
 
 
 def auto_size(con, cmd: str, me: dict, size: str | None) -> tuple[str | None, str]:
-    """Size for a run that didn't pass --size (an explicit size always wins) -> (size or None, reason).
+    """Size for a run -> (size or None, reason). None means the template/base size (large for Go/Node/harness,
+    default for generic).
 
-    None means the template/base size (large for Go/Node/harness, default for generic)."""
+    An explicit size wins, except --size xlarge on a command no xlarge rule covers and no same-kind OOM backs: that
+    runs on large. 1,054 hand-picked xlarge runs (13 Oct - 5 Nov) were mostly uv sync + pytest and narrow go tests.
+    OFFBOX_ALLOW_XLARGE=1 keeps an explicit xlarge."""
+    rk = me.get("repo_key") or ""
+    root = me.get("repo_root") or ""
+    if size == "xlarge" and os.environ.get("OFFBOX_ALLOW_XLARGE") != "1" and not xlarge_needed(cmd, root, rk) \
+            and oom_recent(con, rk, cmd) != "xlarge":
+        return "large", ("--size xlarge isn't needed for this command (no container stack, type-check or recent "
+                         "out-of-memory kill of this kind): running it on large. If it is killed for memory (exit "
+                         "137), the next run of this kind goes to xlarge by itself; OFFBOX_ALLOW_XLARGE=1 forces xlarge")
     if size:
         return size, ""
-    tc = typecheck_size(cmd, me.get("repo_root") or "", None)
+    tc = typecheck_size(cmd, root, None)
     if tc:
         return tc, "typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override"
-    rk = me.get("repo_key") or ""
     if BIG_STACK_CMD.search(cmd or "") or "harness" in rk:
         return "xlarge", "container stack run: using an xlarge box; pass --size to override"
-    if WHOLE_SUITE_CMD.search(cmd or "") and uses_docker("", me.get("repo_root") or ""):
+    if WHOLE_SUITE_CMD.search(cmd or "") and uses_docker("", root):
         return "xlarge", "whole suite in a testcontainers repo: using an xlarge box; pass --size to override"
-    if oom_recent(con, rk):
-        return "xlarge", "a run in this repo was killed for memory in the last 14 days: using an xlarge box"
+    bump = oom_recent(con, rk, cmd)
+    if bump:
+        return bump, f"a run like this one was killed for memory here in the last 3 days: using a {bump} box"
     return None, ""
 
 
@@ -118,15 +251,19 @@ def docker_recent(con, box_id: str | None = None, within: int = 7200, repo_root:
                   thread: str | None = None) -> bool:
     """Docker ran lately on this box (its stop archives images and its next boot reloads them, so stop it less),
     or for this repo/thread (local-first then leaves the next check on the box). Recency counts from the run's
-    start or end; a run still going counts."""
+    start or end; a run still going counts.
+
+    runs.docker starts from the command and manifest (uses_docker) and is cleared at the end of a run that started
+    no container (runs.finish), so only a run still going counts on its command text alone. 13 Oct - 5 Nov, 1,826
+    runs got the 20-minute Docker idle window from a testcontainers manifest alone (ruff, make type, uv sync)."""
     if box_id:
         where, args = "box_id=?", [box_id]
     else:
         where, args = "(repo_root=? OR thread_id=?)", [repo_root or "-", thread or "-"]
     t = now() - within
     sql = (f"SELECT 1 FROM runs WHERE {where} AND mode!='local' AND (start_at>? OR end_at>? OR "
-           "(end_at IS NULL AND status IN ('starting','running'))) AND (docker=1 OR cmd LIKE '%docker%' "
-           "OR cmd LIKE '%compose%' OR cmd LIKE '%testcontainers%') LIMIT 1")
+           "(end_at IS NULL AND status IN ('starting','running'))) AND (docker=1 OR (end_at IS NULL AND "
+           "(cmd LIKE '%docker%' OR cmd LIKE '%compose%' OR cmd LIKE '%testcontainers%'))) LIMIT 1")
     return con.execute(sql, (*args, t, t)).fetchone() is not None
 
 
