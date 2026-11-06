@@ -48,7 +48,7 @@ def natural_size(con, row) -> str:
     return size if _rank(size) >= _rank("large") else "large"
 
 
-DOCKER_CMD = re.compile(r"docker|compose|testcontainers|localstack")
+DOCKER_CMD = re.compile(r"docker|podman|compose|testcontainers|localstack", re.I)
 DOCKER_MANIFEST = re.compile(r"testcontainers|dockertest")
 
 
