@@ -5770,6 +5770,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       }: ShellSnapshotOptions = {},
     ) =>
       sql<ShellThreadRow>`
+            -- Full snapshots revisit runs for every thread; one sequential read
+            -- avoids thrashing the disk cache on the fragmented live database.
+            WITH shell_runs AS ${threadId === undefined ? sql`MATERIALIZED` : sql`NOT MATERIALIZED`} (
+              SELECT * FROM orchestration_v2_projection_runs
+              ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}
+            )
             SELECT
               t.thread_id,
               t.payload_json,
@@ -5787,7 +5793,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               active.status AS active_run_status,
               (
                 SELECT r.status
-                FROM orchestration_v2_projection_runs r
+                FROM shell_runs r
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
@@ -5800,7 +5806,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   json_extract(r.payload_json, '$.startedAt'),
                   r.requested_at
                 )
-                FROM orchestration_v2_projection_runs r
+                FROM shell_runs r
                 WHERE r.thread_id = t.thread_id
                   AND r.status IN ('preparing', 'starting', 'running', 'waiting')
                 ORDER BY r.ordinal DESC, r.run_id DESC
@@ -5846,7 +5852,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               (
                 SELECT secret.payload_json
                 -- Keep runs outermost so completed history is never scanned for a pending secret.
-                FROM orchestration_v2_projection_runs r
+                FROM shell_runs r
                 CROSS JOIN orchestration_v2_projection_turn_items secret
                   INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
                 WHERE r.thread_id = t.thread_id
@@ -5880,39 +5886,38 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   AND plan.kind = 'proposed_plan'
                   AND plan.status = 'active'
               ) AS has_actionable_proposed_plan,
-              -- Count per run on the covering (thread_id, run_id) index, then
-              -- look up each run once, instead of one run lookup per item.
+              -- Counts follow the winning hot/delta/base identity transactionally.
+              -- Do not correlate the history UNION: SQLite materializes all items.
               (
                 SELECT COALESCE(SUM(per_run.item_count), 0)
                 FROM (
-                  SELECT i.run_id, COUNT(*) AS item_count
-                  FROM ardud_history_turn_items i
-                  WHERE i.thread_id = t.thread_id
-                  GROUP BY i.run_id
+                  SELECT NULLIF(i.run_key, '') AS run_id, i.item_count
+                  FROM ardud_shell_item_counts i
+                  WHERE i.thread_id = t.thread_id AND i.item_count > 0
                 ) per_run
-                LEFT JOIN orchestration_v2_projection_runs r
+                LEFT JOIN shell_runs r
                   ON r.run_id = per_run.run_id
                 WHERE per_run.run_id IS NULL OR r.status <> 'rolled_back'
               ) AS item_count,
               (
-                SELECT COUNT(*)
-                FROM ardud_history_turn_items i
+                SELECT COALESCE(SUM(i.item_count), 0)
+                FROM ardud_shell_item_counts i
                 WHERE i.thread_id = t.thread_id
-                  AND i.run_id IS NULL
+                  AND i.run_key = ''
               ) AS runless_item_count
             FROM orchestration_v2_projection_threads t
-            LEFT JOIN orchestration_v2_projection_runs active ON active.run_id = (
+            LEFT JOIN shell_runs active ON active.run_id = (
               SELECT r.run_id
-              FROM orchestration_v2_projection_runs r
+              FROM shell_runs r
               WHERE r.thread_id = t.thread_id
                 AND r.status IN ('preparing', 'starting', 'running')
               ORDER BY r.ordinal DESC, r.run_id DESC
               LIMIT 1
             )
             -- The newest run not waiting in a held queue, matching latestUnheldRun.
-            LEFT JOIN orchestration_v2_projection_runs presented ON presented.run_id = (
+            LEFT JOIN shell_runs presented ON presented.run_id = (
               SELECT candidate.run_id
-              FROM orchestration_v2_projection_runs candidate
+              FROM shell_runs candidate
               WHERE candidate.thread_id = t.thread_id
                 AND NOT (
                   candidate.status = 'queued'
@@ -5921,9 +5926,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ORDER BY candidate.ordinal DESC, candidate.run_id DESC
               LIMIT 1
             )
-            LEFT JOIN orchestration_v2_projection_runs blocked ON blocked.run_id = (
+            LEFT JOIN shell_runs blocked ON blocked.run_id = (
               SELECT candidate.run_id
-              FROM orchestration_v2_projection_runs candidate
+              FROM shell_runs candidate
               WHERE candidate.thread_id = t.thread_id
                 AND candidate.status <> 'queued'
                 AND NOT (
@@ -5971,19 +5976,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const selectShellRunItemCounts = (threadIds?: ReadonlyArray<ThreadId>) =>
       threadIds === undefined
         ? sql<ShellRunItemCountRow>`
-            SELECT thread_id, run_id, COUNT(*) AS item_count
-            FROM ardud_history_turn_items
-            WHERE run_id IS NOT NULL
-            GROUP BY thread_id, run_id
+            SELECT thread_id, run_key AS run_id, item_count
+            FROM ardud_shell_item_counts
+            WHERE run_key <> '' AND item_count > 0
           `
         : sql<ShellRunItemCountRow>`
-            SELECT thread_id, run_id, COUNT(*) AS item_count
-            FROM ardud_history_turn_items
-            WHERE run_id IS NOT NULL
+            SELECT thread_id, run_key AS run_id, item_count
+            FROM ardud_shell_item_counts
+            WHERE run_key <> '' AND item_count > 0
               AND thread_id IN ${sql.in(threadIds)}
-            GROUP BY thread_id, run_id
           `;
 
+    // Large IN lists otherwise random-read nearly the entire provider table.
     const selectShellProviderThreadRows = (threadIds?: ReadonlyArray<ThreadId>) =>
       threadIds === undefined
         ? sql<PayloadRow & { readonly thread_id: string }>`
@@ -5993,7 +5997,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           `
         : sql<PayloadRow & { readonly thread_id: string }>`
             SELECT thread_id, payload_json
-            FROM orchestration_v2_projection_provider_threads
+            FROM orchestration_v2_projection_provider_threads ${threadIds.length > 1000 ? sql`NOT INDEXED` : sql``}
             WHERE thread_id IN ${sql.in(threadIds)}
           `;
 

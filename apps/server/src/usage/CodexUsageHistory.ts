@@ -62,7 +62,7 @@ const make = Effect.gen(function* () {
         json_extract(turn.payload_json, '$.nativeTurnRef.nativeId') AS native_turn_id,
         (
           SELECT json_extract(event.payload_json, '$.modelSelection')
-          FROM ardud_history_events AS event
+          FROM ardud_thread_history_events AS event
           WHERE event.aggregate_kind = 'thread'
             AND event.application_event_version = 2
             AND event.stream_id = attempt.thread_id

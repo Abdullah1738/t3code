@@ -18,6 +18,7 @@ import {
 import { HistoryArchiveDurability } from "./archiveCheckpoint.ts";
 import { ArchiveSnapshotGate } from "./archiveSnapshotGate.ts";
 import * as NodeURL from "node:url";
+import { initializeShellItemCounts } from "./shellItemCounts.ts";
 
 class HistoryArchiveMissing extends Schema.TaggedError<HistoryArchiveMissing>()(
   "HistoryArchiveMissing",
@@ -105,6 +106,7 @@ export const initializeHistoryArchive = Effect.fn("HistoryArchive.initialize")(f
     yield* sql.unsafe(historyViewSql(table));
   }
   for (const view of eventHistoryLookupViews) yield* sql.unsafe(view);
+  yield* initializeShellItemCounts(baseFilename);
   yield* sql`CREATE TABLE IF NOT EXISTS ardud_history_archive_cursor (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), thread_id TEXT NOT NULL)`;
   yield* sql`CREATE TABLE IF NOT EXISTS ardud_history_archive_progress (

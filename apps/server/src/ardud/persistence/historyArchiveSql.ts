@@ -118,6 +118,7 @@ export const emptyBaseSchemaSql = [
   "CREATE INDEX ardud_base.idx_orchestration_events_agent_stream_sequence ON orchestration_events(stream_id,sequence) WHERE application_event_version = 2 AND aggregate_kind = 'thread'",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_run_ordinal_idx ON orchestration_v2_projection_turn_items(run_id,ordinal)",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_thread_ordinal_idx ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id)",
+  "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_thread_run_idx ON orchestration_v2_projection_turn_items(thread_id,run_id)",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_user_message_idx ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id) WHERE type='user_message'",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_failed_error_idx ON orchestration_v2_projection_turn_items(thread_id,run_id,node_id,updated_at DESC,ordinal DESC,turn_item_id DESC) WHERE type='error' AND status='failed'",
 ];

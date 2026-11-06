@@ -418,7 +418,9 @@ const makeEventStore = Effect.gen(function* () {
         input.commandId !== undefined
           ? "ardud_command_history_events"
           : input.onlyAgentEvents === true
-            ? "ardud_history_events"
+            ? input.threadId === undefined
+              ? "ardud_history_events"
+              : "ardud_thread_history_events"
             : "ardud_application_history_events",
       )} AS orchestration_events
       WHERE sequence > ${input.afterSequence}
@@ -604,7 +606,7 @@ const makeEventStore = Effect.gen(function* () {
         COALESCE(MAX(event_type = 'thread.created'), 0) AS "hasCreateEvent"
       FROM (
         SELECT ${restoredPayloadJson} AS payload_json, event_type
-        FROM ardud_history_events AS orchestration_events
+        FROM ardud_thread_history_events AS orchestration_events
         WHERE aggregate_kind = 'thread'
           AND stream_id = ${input.threadId}
           AND application_event_version = 2

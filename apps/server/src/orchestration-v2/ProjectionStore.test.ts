@@ -5515,6 +5515,15 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             assert.include(errorLookup, "(thread_id=? AND run_id=? AND node_id=?)");
           }
           assert.notMatch(plan.join("\n"), /SEARCH (?:item|error) USING AUTOMATIC/);
+          if (marker.includes("blocking")) {
+            assert.isTrue(
+              plan.some((detail) => detail.includes("SEARCH i USING PRIMARY KEY (thread_id=?")),
+            );
+            assert.notMatch(
+              plan.join("\n"),
+              /SCAN (?:main\.orchestration_v2_projection_turn_items|cold|base)\b/,
+            );
+          }
         }
       }),
   );
