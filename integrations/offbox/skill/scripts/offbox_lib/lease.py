@@ -572,6 +572,10 @@ class ResumeStuck(ArchivingSkip):
     """The archived retry was spent; this caller must not resume the box again."""
 
 
+class ResumeStopped(ArchivingSkip):
+    """A pending attempt is confirmed stopped; reconcile its siblings before choosing its one retry."""
+
+
 class _ResumeExpired(Exception):
     """The stopped box's data expired while a resume was being requested."""
 
@@ -678,13 +682,15 @@ def _wait_unanswered_resume(con, box_id):
             time.sleep(min(2, max(0, end - time.time())))
 
 
-def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True):
+def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
+                      confirm_only: bool = False):
     from . import allocation
     with allocation.guard(box_id, reconcile=pending):
-        return _resume_under_guard(con, box_id, ttl, size, pending, retry)
+        return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
 
 
-def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True):
+def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
+                        confirm_only: bool = False):
     key = f"resume_unanswered:{box_id}"
 
     def mark_pending():
@@ -786,6 +792,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         confirmed = confirm(unanswered)
         if confirmed:
             return confirmed, False
+        if confirm_only:
+            from . import allocation
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+            allocation.clear_resume(con, box_id)
+            raise ResumeStopped(f"{box_id} stayed archived after its unanswered resume; attempt settled")
         if not retry:
             raise ResumeUnresolved(f"resume of {box_id} was unanswered after its archived retry; "
                                    "nothing ran. Retry later") from unanswered
@@ -799,7 +810,46 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
     return None, False
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False):
+def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
+                      skip_archiving=False):
+    left_stopped = bool(confirmed)
+    if confirmed and confirmed.get('state') in api.STARTING_STATES:
+        _wait_unanswered_resume(con, box_id)
+    sent_at = now()
+
+    def check_resume(state):
+        nonlocal sent_at, retried, left_stopped
+        if state.get('state') not in api.STOPPED_STATES:
+            left_stopped = True
+        if left_stopped or now() - sent_at < RESUME_STUCK_S:
+            return
+        if not retried and request_resume is not None:
+            retried = True
+            observed, _ = request_resume(retry=False)
+            if observed:
+                left_stopped = True
+                if observed.get('state') in api.STARTING_STATES:
+                    _wait_unanswered_resume(con, box_id)
+            sent_at = now()
+            event(con, box_id, 'resume_resent', f'still archived after {RESUME_STUCK_S}s')
+            return
+        con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+        con.commit()
+        event(con, box_id, 'resume_stuck', f'still archived after two resumes, {RESUME_STUCK_S}s each')
+        message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
+        if skip_archiving:
+            raise ResumeStuck(message, code=EXIT_BUSY)
+        raise OffboxError(message)
+
+    try:
+        return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+        raise
+    except OffboxError as e:
+        raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
     box_id = row["box_id"]
     from . import allocation
     allocation.recover_resumes(con, row['repo_key'])
@@ -807,15 +857,11 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     if pending:
         pending_size = pending[0] if pending[0] in SIZES else None
         try:
-            confirmed, _ = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
-            if confirmed and confirmed.get('state') in api.STARTING_STATES:
-                _wait_unanswered_resume(con, box_id)
+            confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True,
+                                                  confirm_only=skip_archiving)
+            up = _bring_up_resumed(con, box_id, confirmed, retried, skip_archiving=skip_archiving)
         except _ResumeExpired:
             return None
-        try:
-            up = _bring_up(box_id)
-        except OffboxError as e:
-            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
         want = up.get("type") if isinstance(up, dict) else None
         want = want if want in SIZES else row["size"]
         con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
@@ -910,14 +956,11 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
-        resent = False
-        left_stopped = False
-
-        def request_resume():
-            nonlocal want, resent, left_stopped
+        def request_resume(retry=True):
+            nonlocal want
             try:
                 confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S,
-                                                       want if want != s.get("type") else None, retry=not resent)
+                                                       want if want != s.get("type") else None, retry=retry)
             except api.ApiError as e:
                 if e.api_code in api.DATA_GONE:
                     _forget_expired(con, box_id, str(e))
@@ -934,49 +977,18 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
                 want = s.get("type")
                 try:
-                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=not resent)
+                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=retry)
                 except api.ApiError as e2:
                     tb = _too_big(con, box_id, e2)
                     if tb:
                         raise tb from e2
                     raise
-            # Confirmation may already have used the one archived retry; the state callback must not send a third.
-            resent = resent or retried
-            if confirmed:
-                left_stopped = True
-                if confirmed.get("state") in api.STARTING_STATES:
-                    _wait_unanswered_resume(con, box_id)
+            return confirmed, retried
 
         try:
-            request_resume()
-            sent_at = now()
-
-            def check_resume(state):
-                nonlocal sent_at, resent, left_stopped
-                if state.get("state") not in api.STOPPED_STATES:
-                    left_stopped = True
-                if left_stopped or now() - sent_at < RESUME_STUCK_S:
-                    return
-                if not resent:
-                    resent = True
-                    request_resume()
-                    sent_at = now()
-                    event(con, box_id, "resume_resent", f"still archived after {RESUME_STUCK_S}s")
-                    return
-                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-                con.commit()
-                event(con, box_id, "resume_stuck", f"still archived after two resumes, {RESUME_STUCK_S}s each")
-                message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
-                if skip_archiving:
-                    raise ResumeStuck(message, code=EXIT_BUSY)
-                raise OffboxError(message)
-
-            try:
-                up = _bring_up(box_id, since=t, stale_error=s.get("error"), on_state=check_resume)
-            except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
-                raise
-            except OffboxError as e:
-                raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
+            confirmed, retried = request_resume(retry=not retrying)
+            up = _bring_up_resumed(con, box_id, confirmed, retrying or retried, request_resume,
+                                  since=t, stale_error=s.get('error'), skip_archiving=skip_archiving)
         except _ResumeExpired:
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:

@@ -191,6 +191,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     create_first = False
     resume_stall = None
     resume_stuck = set()
+    pending_retries = set()
     while True:
         lease.cap_check()
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
@@ -211,6 +212,11 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     raise lease.ResumeUnresolved(f"{bid} has an active run and an unanswered resume; nothing ran")
                 try:
                     got = lease._reuse(con, pending, size, skip_archiving=True)
+                except lease.ResumeStopped as e:
+                    pending_retries.add(bid)
+                    guard.__exit__(None, None, None)
+                    say(str(e))
+                    continue
                 except lease.ResumeProvisionStalled as e:
                     con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
                     con.commit()
@@ -339,7 +345,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                             capacity.check(con)
                         if row['state'] != 'running':
                             stopped_tries += 1
-                        got = lease._reuse(con, row, size, skip_archiving=True)
+                        options = {'retrying': True} if row['box_id'] in pending_retries else {}
+                        got = lease._reuse(con, row, size, skip_archiving=True, **options)
                     except lease.ResumeProvisionStalled as e:
                         con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
                                     (str(e), row['box_id']))

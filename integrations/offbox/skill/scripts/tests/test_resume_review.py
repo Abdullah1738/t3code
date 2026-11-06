@@ -150,6 +150,7 @@ class ResumeRecoveryTests(Isolated):
                 self.con.execute('DELETE FROM leases')
                 self.con.execute('DELETE FROM kv')
                 self.con.execute('DELETE FROM start_requests')
+                self.con.execute('DELETE FROM events')
                 self.con.execute('DELETE FROM pool_members')
                 for bid in ('one', 'two'):
                     self.box(bid, 'stopped', member=True)
@@ -274,3 +275,108 @@ class BringUpOutageTests(Isolated):
         error = lease.ResumeUnresolved('not ready', cause)
         self.assertTrue(error.started)
         self.assertTrue(error.outage)
+
+
+class PersistentArchivedTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        self.clock.time.time = lambda: self.clock.t
+        for mod in (api, lease, pool):
+            self.stack.enter_context(patch.object(mod, 'time', self.clock.time))
+        self.stack.enter_context(patch.object(lease, 'now', lambda: self.clock.t))
+        self.stack.enter_context(patch.object(allocation, 'now', lambda: self.clock.t))
+        self.stack.enter_context(patch.object(lease.ssh_sync, 'setup'))
+        self.stack.enter_context(patch.object(lease.ssh_sync, 'wait_ssh'))
+        self.stack.enter_context(patch.object(lease.ssh_sync, 'cfg_path', return_value=Path(self.tmp.name) / 'no-cfg'))
+        self.stack.enter_context(patch.object(lease, 'ensure_ttl'))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS': '4'}))
+        self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+
+    def pending(self, bid, journal=False):
+        self.box(bid, 'stopped', member=True)
+        if journal:
+            self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume',?,'uncertain')",
+                             (self.clock.t - 1, bid))
+        else:
+            self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', 'large', self.clock.t))
+        self.con.commit()
+
+    def test_two_pending_archived_boxes_reconcile_then_single_retry_succeeds(self):
+        self.pending('one', journal=True)
+        self.pending('two', journal=True)
+        sends = []
+
+        def get(bid, **kwargs):
+            return {'state': 'running' if bid in sends else 'archived', 'type': 'large'}
+
+        with patch.object(api, 'get', side_effect=get), \
+                patch.object(api, 'resume', side_effect=lambda bid, *args: sends.append(bid)), \
+                patch.object(lease, 'acquire_private') as create:
+            for _ in range(2):
+                got = pool.acquire(self.me)
+                pool.release_guard(got)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(got['box_id'], sends[0])
+        self.assertLess(self.clock.t, 1009)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM kv WHERE k LIKE 'resume_unanswered:%'").fetchone()[0], 0)
+        create.assert_not_called()
+
+    def test_pending_acknowledged_retry_still_archived_uses_sibling_within_bound(self):
+        for journal in (False, True):
+            with self.subTest(journal=journal):
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM pool_members')
+                self.con.execute('DELETE FROM pool_callers')
+                self.con.execute('DELETE FROM kv')
+                self.con.execute('DELETE FROM start_requests')
+                self.con.execute('DELETE FROM events')
+                self.pending('cold', journal)
+                self.box('sibling', 'stopped', member=True)
+                sends = []
+                started = self.clock.t
+
+                def get(bid, **kwargs):
+                    return {'state': 'running' if bid == 'sibling' and bid in sends else 'archived', 'type': 'large'}
+
+                with patch.object(api, 'get', side_effect=get), \
+                        patch.object(api, 'resume', side_effect=lambda bid, *args: sends.append(bid)), \
+                        patch.object(lease, 'acquire_private') as create:
+                    got = pool.acquire(self.me)
+                    pool.release_guard(got)
+                self.assertEqual(got['box_id'], 'sibling')
+                self.assertEqual(sends, ['cold', 'sibling'])
+                self.assertLess(self.clock.t - started, 4 + lease.RESUME_STUCK_S + 2)
+                self.assertEqual(self.con.execute("SELECT count(*) FROM events WHERE box_id='cold' AND kind='resume_stuck'").fetchone()[0],
+                                 1)
+                create.assert_not_called()
+
+    def test_direct_pending_retry_acknowledged_but_archived_is_bounded(self):
+        self.pending('cold')
+        row = self.con.execute("SELECT * FROM leases WHERE box_id='cold'").fetchone()
+        with patch.object(api, 'get', return_value={'state': 'archived', 'type': 'large'}), \
+                patch.object(api, 'resume', return_value={}) as resume:
+            with self.assertRaisesRegex(lease.ResumeUnresolved, 'after two resumes'):
+                lease._reuse(self.con, row, None)
+        resume.assert_called_once()
+        self.assertLess(self.clock.t, 1000 + 4 + lease.RESUME_STUCK_S + 2)
+
+    def test_two_pending_archived_reconcile_before_any_retry_send(self):
+        for bid in ('one', 'two'):
+            self.pending(bid, journal=True)
+        observations = set()
+        sends = []
+
+        def get(bid, **kwargs):
+            if kwargs:
+                observations.add(bid)
+            return {'state': 'running' if bid in sends else 'archived', 'type': 'large'}
+
+        def resume(bid, *args):
+            self.assertEqual(observations, {'one', 'two'})
+            sends.append(bid)
+
+        with patch.object(api, 'get', side_effect=get), patch.object(api, 'resume', side_effect=resume):
+            got = pool.acquire(self.me)
+            pool.release_guard(got)
+        self.assertEqual(len(sends), 1)
