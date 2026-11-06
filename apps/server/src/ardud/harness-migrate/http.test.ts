@@ -9,7 +9,7 @@ import * as Startup from "../../serverRuntimeStartup.ts";
 import * as Cutover from "./CutoverEngine.ts";
 import * as Input from "./CutoverInput.ts";
 import * as Job from "./CutoverJob.ts";
-import { routes } from "./http.ts";
+import { routes, summarizePlan } from "./http.ts";
 
 const status: Cutover.CutoverStatus = {
   active: false,
@@ -191,3 +191,23 @@ it.effect("bad preparation fails closed until cutover is completed", () =>
     }),
   ),
 );
+
+it("summarizes a plan without payloads", () => {
+  const summary = summarizePlan({
+    readiness: [{ id: "native", ready: false, reason: "evidence missing" }],
+    items: [
+      { key: "thread:a", kind: "thread", ref: "a", payload: { big: "x".repeat(100) }, wake: true },
+      { key: "thread:b", kind: "thread", ref: "b", payload: {}, wake: false },
+      { key: "settings:model", kind: "selection", ref: "settings", payload: {}, wake: false },
+    ],
+    refusals: [
+      { ref: "c", reason: "unknown model" },
+      { ref: "d", reason: "unknown model" },
+    ],
+  });
+  assert.deepStrictEqual(summary.kinds, { thread: 2, selection: 1 });
+  assert.deepStrictEqual(summary.scopes, { thread: 2, settings: 1 });
+  assert.strictEqual(summary.wakeThreads, 1);
+  assert.deepStrictEqual(summary.refusalReasons, { "unknown model": 2 });
+  assert.ok(!JSON.stringify(summary).includes("xxxx"));
+});

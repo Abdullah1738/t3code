@@ -19,6 +19,35 @@ const json = (body: unknown, status = 200) =>
     headers: { "cache-control": "no-store" },
   });
 
+export const summarizePlan = (plan: Cutover.CutoverPlan) => {
+  const kinds: Record<string, number> = {};
+  const scopes: Record<string, number> = {};
+  let wake = 0;
+  for (const item of plan.items) {
+    kinds[item.kind] = (kinds[item.kind] ?? 0) + 1;
+    const scope = item.key.split(":")[0] ?? item.kind;
+    scopes[scope] = (scopes[scope] ?? 0) + 1;
+    if (item.wake) wake++;
+  }
+  const refusalReasons: Record<string, number> = {};
+  for (const refusal of plan.refusals)
+    refusalReasons[refusal.reason] = (refusalReasons[refusal.reason] ?? 0) + 1;
+  return {
+    summary: true,
+    items: plan.items.length,
+    kinds,
+    scopes,
+    wakeThreads: wake,
+    readiness: plan.readiness,
+    refusals: plan.refusals.length,
+    refusalReasons,
+    refusalSamples: plan.refusals.slice(0, 20),
+    itemSamples: plan.items
+      .slice(0, 10)
+      .map(({ key, kind, ref, wake }) => ({ key, kind, ref, wake })),
+  };
+};
+
 export const routes = HttpRouter.addAll(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -80,7 +109,15 @@ export const routes = HttpRouter.addAll(
             },
           });
         }
-        return json({ ok: true, cutover: yield* action === "run" ? job.start() : cutover.plan() });
+        if (action === "run") return json({ ok: true, cutover: yield* job.start() });
+        const plan = yield* cutover.plan();
+        // A production plan lists every thread with its payload and passes the
+        // control API's 16 MiB reply cap; ?summary=1 returns counts instead.
+        const url = new URL(request.url, "http://localhost");
+        return json({
+          ok: true,
+          cutover: url.searchParams.get("summary") === "1" ? summarizePlan(plan) : plan,
+        });
       },
       Effect.catchTags({
         CutoverError: (error) =>
