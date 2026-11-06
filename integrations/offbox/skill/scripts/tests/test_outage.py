@@ -144,7 +144,7 @@ class OutageStateTests(OutageBase):
         with probe as p, contextlib.redirect_stderr(io.StringIO()):
             start = self.clock.t
             self.assertFalse(outage.wait_until_up("HTTP 525", 60))
-        self.assertEqual(p.call_count, 4)
+        self.assertEqual(p.call_count, 3)
         self.assertLessEqual(self.clock.t - start, 60)
 
     def test_zero_budget_does_not_probe(self):

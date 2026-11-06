@@ -118,6 +118,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry:
             try:
                 with file_lock('box-'+box_id, timeout=0):
+                    if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                        actions[-1] += ' (unanswered resume; skipped)'
+                        return
                     if lease.active_runs(con, box_id):
                         actions[-1] += ' (busy; skipped)'
                         return
@@ -134,6 +137,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
+        if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{bid}",)).fetchone():
+            actions.append(f"defer {bid}: unanswered resume needs reconciliation")
+            continue
         if bid in protected:
             continue
         if b is None:

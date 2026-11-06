@@ -236,6 +236,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   fall back locally don't wait. A run that already started keeps reattaching for up to 30 min of outage and keeps its
   box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
   shows `boat.dev: DOWN since ...` during one.
+- A resume with no answer is checked on the box; 503 out_of_capacity and 409 resume_failed / deploy_failed at capacity are waited out like a boat.dev outage.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the

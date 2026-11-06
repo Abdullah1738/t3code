@@ -70,11 +70,11 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     con = db()
     capacity.schema(con)
     if show_all:
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') ORDER BY last_used_at DESC").fetchall()
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') ORDER BY last_used_at DESC").fetchall()
     else:
         # The caller's own leases are selected by owner. An unproven caller's owner string is shared, so it sees none.
         require_proven(me, "list")
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?)) ORDER BY last_used_at DESC",
                            (me['owner'], me['owner'])).fetchall()
     out = []
@@ -100,9 +100,9 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
     con = db()
     capacity.schema(con)
     if box_id:
-        rows = con.execute("SELECT * FROM leases WHERE box_id=? AND state IN ('running','stopped')", (box_id,)).fetchall()
+        rows = con.execute("SELECT * FROM leases WHERE box_id=? AND state IN ('running','stopped','resume_stalled')", (box_id,)).fetchall()
     elif mine:
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?))", (me['owner'],me['owner'])).fetchall()
     else:
         row = lease.find_lease(con, me['owner'], me['repo_root'])
@@ -143,8 +143,11 @@ def _release_one(con, r, delete):
             lease.delete_box(con, r["box_id"], "release --delete")
             print(f"deleted {r['box_id']}")
         else:
-            if r["state"] == "running":
+            if r["state"] in ("running", "resume_stalled"):
                 lease.stop_box(con, r["box_id"], "release")
+            if r['state'] == 'resume_stalled':
+                print(f"stop requested for {r['box_id']} (disk kept; remains set aside)")
+                return
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 

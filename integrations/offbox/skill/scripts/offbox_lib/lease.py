@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, month_key, new_id, now, read_json, say)
+                     file_lock, iso, log, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -431,20 +431,24 @@ _FOLLOW_STOP_S = 160
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None) -> dict:
-    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error)
-    ssh_sync.setup(box_id)
-    ssh_sync.wait_ssh(box_id)
-    if recipe:
-        run_recipe(box_id, recipe, box_held=box_held)
-    elif fresh:
-        bootstrap_fresh(box_id)
+    from . import outage
+    with outage.accepted_machine():
+        s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error)
+        ssh_sync.setup(box_id)
+        ssh_sync.wait_ssh(box_id)
+        if recipe:
+            run_recipe(box_id, recipe, box_held=box_held)
+        elif fresh:
+            bootstrap_fresh(box_id)
     return s
 
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+        raise ResumeUnresolved(f"{box_id} has an unanswered resume; refresh deferred")
     capacity.check(con)
-    api.resume(box_id, 600)
+    _resume_confirmed(con, box_id, 600, None)
     api.wait_state(box_id, api.LIVE_STATES, timeout=60)
     api.stop(box_id)
     event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
@@ -619,8 +623,170 @@ def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
     con.commit()
 
 
+class ResumeUnresolved(OffboxError):
+    """A resume may have been accepted, but its box could not be confirmed."""
+
+
+class ResumeProvisionStalled(OffboxError):
+    """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+
+def _wait_unanswered_resume(con, box_id):
+    from . import outage
+    seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
+    key = f'resume_provision:{box_id}'
+    saved = con.execute('SELECT v FROM kv WHERE k=?', (key,)).fetchone()
+    end = float(saved[0]) if saved else time.time() + seconds
+    if not saved:
+        con.execute('INSERT INTO kv VALUES (?,?,?)', (key, str(end), time.time()))
+        con.commit()
+    def settled():
+        con.execute('DELETE FROM kv WHERE k IN (?,?)', (key, f'resume_unanswered:{box_id}'))
+        con.commit()
+    with outage.accepted_machine():
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                settled()
+                raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
+                                             "nothing ran; set aside and trying a new box")
+            try:
+                state = api.get(box_id, deadline=time.time() + left)
+            except OffboxError:
+                state = None
+            if state and state.get("state") in api.LIVE_STATES:
+                settled()
+                return
+            time.sleep(min(2, max(0, end - time.time())))
+
+
+def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False):
+    from . import allocation
+    with allocation.guard(box_id):
+        return _resume_under_guard(con, box_id, ttl, size, pending)
+
+
+def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False):
+    key = f"resume_unanswered:{box_id}"
+
+    def mark_pending():
+        con.execute("INSERT OR REPLACE INTO kv(k,v,ts) VALUES (?, ?, ?)", (key, size or "", now()))
+        con.commit()
+
+    def clear_pending():
+        con.execute("DELETE FROM kv WHERE k=?", (key,))
+        con.commit()
+
+    def confirm(unanswered):
+        log(f"resume_unanswered {box_id}")
+        # A read timeout is not a refusal. Only resend if boat confirms the box stayed stopped for the full window.
+        seconds = capacity.setting("OFFBOX_RESUME_CONFIRM_SECONDS", 120, minimum=0, maximum=120)
+        end = time.monotonic() + seconds
+        last = None
+        observed = False
+        unreadable = False
+        observations = 0
+        previous_read = time.monotonic()
+        while True:
+            left = end - time.monotonic()
+            from . import outage
+            remaining = outage.allocation_left()
+            if remaining is not None:
+                left = min(left, remaining)
+            if left <= 0:
+                break
+            try:
+                last = api.get(box_id, deadline=time.time() + left)
+            except OffboxError:
+                last = None
+                observed = False
+                unreadable = True
+            if last is None:
+                unreadable = True
+            read_at = time.monotonic()
+            if read_at > end or read_at - previous_read > 3:
+                unreadable = True
+            previous_read = read_at
+            if last and last.get("state") in api.STARTING_STATES + api.LIVE_STATES:
+                if last.get('state') in api.LIVE_STATES:
+                    clear_pending()
+                    con.execute('DELETE FROM kv WHERE k=?', (f'resume_provision:{box_id}',))
+                    con.commit()
+                return last
+            if last and last.get("state") not in api.STOPPED_STATES:
+                raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                       "nothing ran. Retry later") from unanswered
+            if last:
+                observed = True
+                observations += 1
+            left = end - time.monotonic()
+            remaining = outage.allocation_left()
+            if remaining is not None:
+                left = min(left, remaining)
+            if remaining is not None and remaining <= 0:
+                raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                       "nothing ran. Retry later") from unanswered
+            if left <= 0:
+                break
+            # Leave time for a final observation near the boundary, not a second after it.
+            time.sleep(min(2, max(0, left - 0.05)))
+            if left <= 0.05:
+                break
+        if not last or not observed or unreadable or observations < 2:
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                   "nothing ran. Retry later") from unanswered
+        return False
+
+    def send():
+        # The persistent marker is written before sending: a killed client cannot forget an ambiguous resume.
+        from . import outage
+        if outage.allocation_left() == 0:
+            from .pool import PoolBusyError
+            raise PoolBusyError("allocation wait expired before resume; nothing ran")
+        mark_pending()
+        try:
+            api.resume(box_id, ttl, size)
+        except OffboxError as e:
+            if isinstance(e, api.NetworkError) or (isinstance(e, api.ApiError) and e.status in (502, 504, 520, 524)):
+                return e
+            clear_pending()
+            raise
+        clear_pending()
+        return None
+
+    unanswered = None if pending else send()
+    if pending or unanswered is not None:
+        confirmed = confirm(unanswered)
+        if confirmed:
+            return confirmed
+        unanswered = send()
+        if unanswered is not None:
+            confirmed = confirm(unanswered)
+            if confirmed:
+                return confirmed
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered twice; nothing ran. Retry later") from unanswered
+    return False
+
+
 def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     box_id = row["box_id"]
+    pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
+    if pending:
+        pending_size = pending[0] if pending[0] in SIZES else None
+        confirmed = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True)
+        if confirmed and confirmed.get('state') in api.STARTING_STATES:
+            _wait_unanswered_resume(con, box_id)
+        try:
+            up = _bring_up(box_id)
+        except OffboxError as e:
+            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran") from e
+        want = up.get("type") if isinstance(up, dict) else None
+        want = want if want in SIZES else row["size"]
+        con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
+        con.commit()
+        if _bigger(size, want):
+            raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
+        return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
         p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-O", "check", box_id], capture_output=True, timeout=10)
@@ -709,7 +875,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
         try:
-            api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
+            unanswered = _resume_confirmed(con, box_id, RUN_TTL_S, want if want != s.get("type") else None)
         except api.ApiError as e:
             if e.api_code in api.DATA_GONE:
                 _forget_expired(con, box_id, str(e))
@@ -726,18 +892,28 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
             say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
             want = s.get("type")
             try:
-                api.resume(box_id, RUN_TTL_S, None)
+                unanswered = _resume_confirmed(con, box_id, RUN_TTL_S, None)
             except api.ApiError as e2:
                 tb = _too_big(con, box_id, e2)
                 if tb:
                     raise tb from e2
                 raise
-        up = _bring_up(box_id, since=t, stale_error=s.get("error"))
+        if unanswered and unanswered.get('state') in api.STARTING_STATES:
+            _wait_unanswered_resume(con, box_id)
+        try:
+            up = _bring_up(box_id, since=t, stale_error=s.get("error"))
+        except api.SupplyOut:
+            raise
+        except OffboxError as e:
+            raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran") from e
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
         event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
-        _bring_up(box_id)
+        try:
+            _bring_up(box_id)
+        except OffboxError as e:
+            raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran") from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)
     else:
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
@@ -817,6 +993,8 @@ def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
     the hold, since a run may be allocating the box right now."""
     try:
         with file_lock('box-' + box_id, timeout=0):
+            if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                return False
             return _release_locked(con, box_id, run_id)
     except OffboxError:
         return False

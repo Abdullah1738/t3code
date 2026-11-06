@@ -166,17 +166,52 @@ def cmd_run(a, me) -> int:
         if not a.remote:
             why = "could not start locally"
     log(f"remote: {why}")
-    from . import outage
+    from . import api, outage, pool
     waited_from = None
+    capacity_since = capacity_last_say = None
+    capacity_round = None
+    last_outage = None
     try:
         while True:
             try:
-                return _remote_once(a, me)
+                if waited_from is None:
+                    return _remote_once(a, me)
+                remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                if remaining <= 0:
+                    raise last_outage
+                if capacity_round is not None:
+                    pause = outage.CAPACITY_RETRY_S - (time.monotonic() - capacity_round)
+                    if pause > 0:
+                        time.sleep(min(pause, remaining))
+                        remaining = outage.window_seconds() - (time.monotonic() - waited_from)
+                        if remaining <= 0:
+                            raise last_outage
+                    capacity_round = time.monotonic()
+                with outage.allocation_budget(remaining):
+                    return _remote_once(a, me)
             except OffboxError as e:
-                if not _outage_wait_applies(a, e):
+                if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
+                        time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
+                    raise last_outage
+                machine_capacity = isinstance(e, api.BoatAtCapacity)
+                if machine_capacity:
+                    if e.started or not (a.no_fallback or a.remote or a.bg or
+                                         not fallback.allowed(a.cmd, e, os.getcwd())):
+                        raise
+                elif not _outage_wait_applies(a, e):
                     raise
                 if waited_from is None:
                     waited_from = time.monotonic()
+                last_outage = e
+                if machine_capacity:
+                    if capacity_since is None:
+                        capacity_since = outage.now()
+                        capacity_round = time.monotonic()
+                    retry, capacity_last_say = outage.wait_for_capacity(
+                        waited_from, capacity_since, capacity_last_say, outage.window_seconds())
+                    if retry:
+                        continue
+                    raise
                 left = outage.window_seconds() - (time.monotonic() - waited_from)
                 if left > 0 and outage.wait_until_up(outage.reason_of(e), left):
                     continue
