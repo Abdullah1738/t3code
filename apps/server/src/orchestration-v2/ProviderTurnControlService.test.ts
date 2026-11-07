@@ -218,6 +218,7 @@ it.effect(
         ProjectionStore.ProjectionStoreV2.of({
           apply: () => Effect.void,
           listCutoverCandidates: () => Effect.die("unused listCutoverCandidates"),
+          getLiveSharedProviderSessions: () => Effect.die("unused getLiveSharedProviderSessions"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
