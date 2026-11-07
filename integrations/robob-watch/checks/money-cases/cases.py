@@ -30,6 +30,7 @@ words already explain, wait for the receipt from a merchant he already pays, nev
 A deadline is a date (09:00 Dubai that day) or an ISO time. Every open case has one.
 """
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import fcntl
@@ -71,8 +72,9 @@ CASE_AFTER = dt.timedelta(hours=12)
 FOLLOW_FOR = dt.timedelta(days=7)
 # A charge that became a money case is still looked up this long, so a late receipt settles it.
 FOLLOW_CASE = dt.timedelta(days=30)
-FOLLOW_BUDGET = 25  # seconds of archive lookups per check
-FOLLOW_EACH = 8  # at most this many of them per question, least recently checked first
+CHECK_BUDGET = 40
+FOLLOW_BUDGET = 20  # seconds of archive lookups per check
+FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
 EVENT_LIMIT = 4000
@@ -128,6 +130,53 @@ def check_secret(name, text):
     if card_numbers(text) or LABELLED.search(text):
         raise CaseError(f'{name} looks like it holds a card number, code or password; keep those out of the book')
     return text
+
+
+class CheckTimeout(CaseError):
+    pass
+
+
+class LookupTimeout(Exception):
+    pass
+
+
+@contextmanager
+def within(deadline, error):
+    if deadline is None:
+        yield
+        return
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise error
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    # Keep an earlier enclosing deadline and its exception handler.
+    if previous[0] and previous[0] <= remaining:
+        yield
+        return
+    handler = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+
+    def expired(*_):
+        raise error
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, handler)
+        if previous[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous[0] - (time.monotonic() - started)),
+                             previous[1])
+
+
+def lock_wait(deadline):
+    if deadline is None:
+        return 10
+    if time.time() >= deadline:
+        raise CheckTimeout('out of time; the rest next check')
+    return max(1, min(10, int(deadline - time.time())))
 
 
 def now_dubai():
@@ -296,19 +345,24 @@ def read_json(path, default):
 
 
 def write_json(path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    # Let a budget alarm fire after the atomic replacement, never in the middle of a book write.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1)
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(obj, f, ensure_ascii=False, indent=1)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 def load(data=None):
@@ -330,23 +384,16 @@ def load_questions(data=None):
 class Locked:
     """Serialise read-modify-write of cases.json (or questions.json) between CLI calls and checks."""
 
-    def __init__(self, data, name='cases'):
-        self.data, self.name = data, name
+    def __init__(self, data, name='cases', wait=10):
+        self.data, self.name, self.wait = data, name, wait
 
     def __enter__(self):
         self.data.mkdir(parents=True, exist_ok=True)
         self.lock = (self.data / f'{self.name}.lock').open('a')
 
-        def timed_out(*_):
-            raise CaseError(f'{self.name}.lock still held after 10s')
-        previous = signal.signal(signal.SIGALRM, timed_out)
-        signal.alarm(10)
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX)
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
-        try:
+            with within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
+                fcntl.flock(self.lock, fcntl.LOCK_EX)
             self.book = load(self.data) if self.name == 'cases' else load_questions(self.data)
         except BaseException:
             self.lock.close()
@@ -372,7 +419,7 @@ def find(book, case_id):
 
 def add(data, case_id, merchant, amount, currency, state, next_action, deadline, who,
         reference='', why='', watchers=(), at=None, root=None, charged='', kind='charge', unmatched=False,
-        repeat=None, distinct=False):
+        repeat=None, distinct=False, end=None):
     if not ID.fullmatch(case_id):
         raise CaseError(f'id {case_id!r} must be lowercase letters, digits and dashes')
     if kind not in KINDS:
@@ -394,7 +441,7 @@ def add(data, case_id, merchant, amount, currency, state, next_action, deadline,
         'opened': stamp(at), 'updated': stamp(at), 'closed': None, 'outcome': None,
         'history': [{'at': stamp(at), 'text': 'opened'}],
     }
-    with Locked(data) as book:
+    with Locked(data, wait=lock_wait(end)) as book:
         if any(c['id'] == case_id for c in book['cases']):
             raise CaseError(f'case {case_id!r} already exists')
         candidates = same_charge(book['cases'], case)
@@ -827,7 +874,19 @@ def prune_questions(book, now):
     book['questions'] = [q for q in book['questions'] if q.get('status') == 'open' or (q.get('closed') or '') >= cutoff]
 
 
-def case_from(data, q, now, by, root=None):
+def recover_case(data, q, cases=None):
+    if not q or q.get('status') != 'open':
+        return
+    cid = 'charge-' + q['id'][2:]
+    cases = load(data)['cases'] if cases is None else cases
+    previous = next((c for c in cases if c['id'] == cid and c.get('why') == f'charge question {q["id"]}'), None)
+    # A case can commit just before an alarm prevents its question link from being saved.
+    if previous:
+        q['case'] = cid
+        settle(q, f'now money case {cid}', 'check', parse_time(previous['opened']), 'case')
+
+
+def case_from(data, q, now, by, root=None, end=None):
     """Turn a charge question he never answered into a money case (never a third ask)."""
     cid = 'charge-' + q['id'][2:]
     n = len(q.get('asks', []))
@@ -838,7 +897,9 @@ def case_from(data, q, now, by, root=None):
             'tell him once it is an open money case, with options (his charge, dispute it, block the card); '
             'never ask about the charge again',
             (now + dt.timedelta(days=2)).date().isoformat(), 'Abdullah',
-            reference=f'card ending {q["card"]}', why=f'charge question {q["id"]}', at=now, root=root)
+            reference=f'card ending {q["card"]}', why=f'charge question {q["id"]}', at=now, root=root, end=end)
+    except CheckTimeout:
+        raise
     except CaseError as e:
         if 'already exists' not in str(e):
             raise
@@ -847,10 +908,13 @@ def case_from(data, q, now, by, root=None):
     return cid
 
 
-def close_untouched(data, cid, outcome, now):
+def close_untouched(data, cid, outcome, now, end=None):
     """Close a money case a charge question opened, unless someone has worked on it since."""
-    with Locked(data) as book:
+    with Locked(data, wait=lock_wait(end)) as book:
         case = next((c for c in book['cases'] if c['id'] == cid), None)
+        if case and case['status'] == 'closed':
+            # A previous check may have saved the case just before its question write timed out.
+            return True
         if not case or case['status'] != 'open' or len(case.get('history', [])) > 1:
             return False
         outcome = clip(redact(outcome), 200)
@@ -871,6 +935,7 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     at = (at or now).astimezone(TZ)
     chan = channel(sender)
     q = question_for(load_questions(data), charge, at, chan, item)
+    recover_case(data, q)
     base = {'kind': charge['kind'], 'errors': []}
     if record and q:
         # Record the alert before the early returns below, or the next copy of this charge (say the
@@ -878,7 +943,9 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
         with Locked(data or DATA, 'questions') as book:
             live = question_for(book, charge, at, chan, item)
             if live:
+                recover_case(data, live)
                 attach(live, chan, at, item)
+                q = live
     if q and q['status'] == 'closed':
         return {**base, 'verdict': 'explained', 'why': q.get('outcome') or '', 'id': q['id']}
     if q and q['status'] == 'case':
@@ -895,8 +962,11 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     if record:
         with Locked(data or DATA, 'questions') as book:
             q = question_for(book, charge, at, chan, item) or new_question(book, charge, text, at, now, chan, item)
+            recover_case(data, q)
             attach(q, chan, at, item)
             qid = q['id']
+            if q['status'] == 'case':
+                return {**base, 'verdict': 'case', 'why': f"money case {q['case']}", 'id': qid}
             if q['status'] == 'open' and not q.get('asks') and not q.get('passed'):
                 note_why(q, r['why'], now)
                 if verdict == 'explained':
@@ -916,6 +986,7 @@ def triaged(data, outcomes, now=None):
     with Locked(data or DATA, 'questions') as book:
         for qid, item, raised in outcomes:
             q = next((x for x in book['questions'] if x.get('id') == qid), None)
+            recover_case(data, q)
             if not q or q['status'] != 'open' or q.get('asks') or q.get('passed'):
                 continue
             if raised:
@@ -949,6 +1020,7 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
     with Locked(data, 'questions') as book:
         q = (find_question(book, q['id']) if q else None) or question_for(book, charge, at, chan) \
             or new_question(book, charge, text, at, now, chan)
+        recover_case(data, q)
         if chan:
             attach(q, chan, at)
         if q['status'] == 'closed':
@@ -988,6 +1060,7 @@ def answered(data, qid, note, now=None):
     now = (now or now_dubai()).astimezone(TZ)
     with Locked(data, 'questions') as book:
         q = find_question(book, qid)
+        recover_case(data, q)
         if q['status'] == 'case':
             cid = q['case']
             settle(q, note, 'answered', now)
@@ -1001,7 +1074,7 @@ def answered(data, qid, note, now=None):
         return q
 
 
-def follow(data, now, root=None, deadline=None, find=None, said=None):
+def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, stats=None):
     """Close questions a receipt or his words now explain, including ones already turned into money
     cases (FOLLOW_CASE); turn ones he didn't answer after the re-ask, or followed past FOLLOW_FOR,
     into money cases. Least recently checked first, at most FOLLOW_EACH seconds each, so one slow
@@ -1015,6 +1088,24 @@ def follow(data, now, root=None, deadline=None, find=None, said=None):
             continue
         if q.get('status') == 'open' or (q.get('status') == 'case' and now - at <= FOLLOW_CASE):
             todo.append((q.get('checked') or '', at, q))
+    stats = stats if stats is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    memo = {}
+    source = said or (lambda *a, **kw: charges.owner_texts(*a, **kw, stats=stats))
+    charge_times = [at for _, at, q in todo if q.get('kind') == 'charge']
+    owner_rows = None
+    if charge_times and now - (min(charge_times) - charges.OWNER_AROUND) <= dt.timedelta(days=2):
+        try:
+            with within(deadline, LookupTimeout('out of time')):
+                owner_rows = source(min(charge_times) - charges.OWNER_AROUND, now, deadline=deadline)
+        except (charges.Lookup, LookupTimeout) as e:
+            errors.append(f'his threads: {e}')
+            owner_rows = []
+
+    def owner(since, until, deadline=None):
+        if owner_rows is None:
+            return source(since, until, deadline=deadline)
+        return [row for row in owner_rows if since <= parse_time(row[0]) <= until]
+
     for _, at, q in sorted(todo, key=lambda x: x[0]):
         if deadline is not None and deadline - time.time() < 2:
             errors.append('out of time; the rest next check')
@@ -1022,24 +1113,36 @@ def follow(data, now, root=None, deadline=None, find=None, said=None):
         looked.add(q['id'])
         if q.get('kind') == 'charge':
             each = time.time() + FOLLOW_EACH
-            hit = charges.found(charge_of(q), at, now, each if deadline is None else min(deadline, each),
-                                find, said, errors)
+            each = each if deadline is None else min(deadline, each)
+            stats['lookups'] += 1
+            try:
+                with within(each, LookupTimeout('out of time')):
+                    hit = charges.found(charge_of(q), at, now, each, find, owner, errors, memo, stats)
+            except (charges.Lookup, LookupTimeout) as e:
+                errors.append(str(e))
+                # A slow receipt cannot hide owner evidence already loaded in this run.
+                hit = charges.owner_found(charge_of(q), at, now, said=owner, errors=errors) \
+                    if owner_rows is not None else None
             if hit:
                 hits[q['id']] = hit
     if not looked:
         return errors
-    with Locked(data, 'questions') as book:
+    with Locked(data, 'questions', wait=lock_wait(end)) as book:
+        cases = load(data)['cases']
         for q in book['questions']:
             if q['id'] not in looked:
                 continue
             q['checked'] = stamp(now)
+            recover_case(data, q, cases)
             if q.get('status') == 'case':
                 if q['id'] in hits:
                     cid = q['case']
                     settle(q, hits[q['id']]['why'], 'check', now)
                     q['was_case'] = cid
                     try:
-                        q['case_closed'] = close_untouched(data, cid, 'explained: ' + hits[q['id']]['why'], now)
+                        q['case_closed'] = close_untouched(data, cid, 'explained: ' + hits[q['id']]['why'], now, end=end)
+                    except CheckTimeout:
+                        raise
                     except CaseError as e:
                         errors.append(f"{q['id']}: {e}")
                 continue
@@ -1051,10 +1154,12 @@ def follow(data, now, root=None, deadline=None, find=None, said=None):
             asks, at = q.get('asks', []), parse_time(q['at'])
             try:
                 if len(asks) >= MAX_ASKS and now - parse_time(asks[-1]['at']) >= CASE_AFTER:
-                    case_from(data, q, now, 'check', root)
+                    case_from(data, q, now, 'check', root, end=end)
                 elif now - at >= FOLLOW_FOR:
                     # Never closed unseen: a week without an explanation is a money case he hears about.
-                    case_from(data, q, now, 'check', root)
+                    case_from(data, q, now, 'check', root, end=end)
+            except CheckTimeout:
+                raise
             except CaseError as e:
                 errors.append(f"{q['id']}: {e}")
         prune_questions(book, now)
@@ -1095,91 +1200,125 @@ def question_entries(questions, now, sent):
 
 
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
+    started = time.time()
+    end = started + CHECK_BUDGET
+    # Leave a second to finish timing and atomically save pings after the work timer is disarmed.
+    work_end = end - 1
+    stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    phases = {}
+    phase, phase_at = 'reconcile', started
     now = (now or now_dubai()).astimezone(TZ)
     pings = wd / 'pings.json'
     state = read_json(pings, {'sent': {}})
     state.setdefault('sent', {})
-    out = state.pop('outbox', None)
-    clock = state.setdefault('clock', {})
-    delivered_at = delivery_time(out, wd) if out else None
-    if out and delivered_at:
-        # Record what was actually delivered, at the real delivery time: a retry overnight or later must not
-        # count as the day the check built it.
-        for key in out['keys']:
-            # Each case's one-a-day cap is the day its reminder was delivered, not the day it was built.
-            state['sent'][key] = delivered_at.isoformat(timespec='seconds')
-        for cid in out.get('days', []):
-            state['sent'][f"{cid}|day|{delivered_at.astimezone(TZ).date()}"] = delivered_at.isoformat(timespec='seconds')
-        # Start the two-day yes/no clock at the first reminder actually delivered since the last answer.
-        for cid, answer in out.get('clock', {}).items():
-            if clock.get(cid, {}).get('answer') != answer['answer']:
-                clock[cid] = {'answer': answer['answer'], 'at': delivered_at.isoformat(timespec='seconds')}
-    elif out:
-        # Not delivered yet. Two cases: the runner took the event (it is in state.json `pending`, and it will
-        # retry it), or the runner never took it (the check died before the runner saved it). Only the first
-        # is kept; the second is dropped and rebuilt below, or it would block every alert for good.
-        if runner_owns(wd, out):
-            state['outbox'] = out
-    errors = follow(data or DATA, now, root, time.time() + FOLLOW_BUDGET, find, said)
-    if errors:
-        state['question_errors'] = {'at': stamp(now), 'errors': errors[:10]}
-    else:
-        state.pop('question_errors', None)
-    # An event the runner never took is rebuilt from the book, so it skips quiet hours and closed or moved cases.
-    cases = load(data)['cases']
-    cutoff = stamp(now - KEEP_SENT)
-    live = live_keys(cases)
-    state['sent'] = {k: v for k, v in state['sent'].items() if v >= cutoff or k in live or k.startswith(live)}
     event = ''
-    # An undelivered event is still out: the runner retries it. Never build a second one over it, so no
-    # case key is recorded for an event that was never shown.
-    if not quiet(now) and 'outbox' not in state:
-        entries = attention(cases, now, state['sent'], root, clock) + \
-            question_entries(load_questions(data)['questions'], now, state['sent'])
-        if entries:
-            header = f'Money cases: {len(entries)} need attention.'
-            footer = 'Details: money-cases show ID.'
-            # Reserve for the longest overflow line that can be printed (its count is at most len(entries)).
-            more = (f'{len(entries)} more need attention; they follow in a later check '
-                    f'(one reminder per case a day; money-cases list).')
-            room = EVENT_LIMIT - units(header) - units(more) - units(footer) - 3
-            shown, taken, full, days = [], [], 0, []
-            # Only what fits is recorded as sent; a case with more pings than fit gets the rest next check.
-            for head, items, tail, day in entries:
-                texts = []
-                for key, text in items:
-                    if units(case_line(head, texts + [text], tail)) + 1 > room:
-                        break
-                    texts.append(text)
-                    taken.append(key)
-                if not texts and not shown:
-                    # Lines are clipped field by field, so this only guards a hand-edited book.
-                    texts.append(items[0][1])
-                    taken.append(items[0][0])
-                if texts:
-                    line = fit(case_line(head, texts, tail), room - 1)
-                    shown.append(line)
-                    room -= units(line) + 1
-                    if day:
-                        days.append(day)
-                if len(texts) < len(items):
-                    break
-                full += 1
-            tail = ['Details: money-cases show ID.']
-            if full < len(entries):
-                tail.insert(0, f'{len(entries) - full} more need attention; they follow in a later check '
-                               f'(one reminder per case a day; money-cases list).')
-            event = '\n'.join([header, *shown, *tail])
-            # The clock start for any case whose first reminder is in this event (only when it is delivered).
-            by_id = {c['id']: c for c in cases}
-            starts = {}
-            for key in taken:
-                cid = key.split('|', 1)[0]
-                if cid in by_id and cid not in starts:
-                    starts[cid] = {'answer': answered_at(by_id[cid]).isoformat()}
-            state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
-                               'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
+    retained_outbox = state.get('outbox')
+    try:
+        with within(work_end, CheckTimeout('out of time; the rest next check')):
+            out = state.pop('outbox', None)
+            clock = state.setdefault('clock', {})
+            delivered_at = delivery_time(out, wd) if out else None
+            if out and delivered_at:
+                # Record what was actually delivered, at the real delivery time: a retry overnight or later must not
+                # count as the day the check built it.
+                for key in out['keys']:
+                    # Each case's one-a-day cap is the day its reminder was delivered, not the day it was built.
+                    state['sent'][key] = delivered_at.isoformat(timespec='seconds')
+                for cid in out.get('days', []):
+                    state['sent'][f"{cid}|day|{delivered_at.astimezone(TZ).date()}"] = delivered_at.isoformat(timespec='seconds')
+                # Start the two-day yes/no clock at the first reminder actually delivered since the last answer.
+                for cid, answer in out.get('clock', {}).items():
+                    if clock.get(cid, {}).get('answer') != answer['answer']:
+                        clock[cid] = {'answer': answer['answer'], 'at': delivered_at.isoformat(timespec='seconds')}
+            elif out:
+                # Not delivered yet. Two cases: the runner took the event (it is in state.json `pending`, and it will
+                # retry it), or the runner never took it (the check died before the runner saved it). Only the first
+                # is kept; the second is dropped and rebuilt below, or it would block every alert for good.
+                if runner_owns(wd, out):
+                    state['outbox'] = out
+            retained_outbox = state.get('outbox')
+            phases[phase] = time.time() - phase_at
+            phase, phase_at = 'follow', time.time()
+            errors = follow(data or DATA, now, root, min(end - 8, time.time() + FOLLOW_BUDGET), find, said,
+                            end=work_end, stats=stats)
+            phases[phase] = time.time() - phase_at
+            phase, phase_at = 'attention', time.time()
+            if errors:
+                state['question_errors'] = {'at': stamp(now), 'errors': errors[:10]}
+            else:
+                state.pop('question_errors', None)
+            # An event the runner never took is rebuilt from the book, so it skips quiet hours and closed or moved cases.
+            cases = load(data)['cases']
+            cutoff = stamp(now - KEEP_SENT)
+            live = live_keys(cases)
+            state['sent'] = {k: v for k, v in state['sent'].items() if v >= cutoff or k in live or k.startswith(live)}
+            # An undelivered event is still out: the runner retries it. Never build a second one over it, so no
+            # case key is recorded for an event that was never shown.
+            if not quiet(now) and 'outbox' not in state:
+                entries = attention(cases, now, state['sent'], root, clock) + \
+                    question_entries(load_questions(data)['questions'], now, state['sent'])
+                phases[phase] = time.time() - phase_at
+                phase, phase_at = 'build_write', time.time()
+                if entries:
+                    header = f'Money cases: {len(entries)} need attention.'
+                    footer = 'Details: money-cases show ID.'
+                    # Reserve for the longest overflow line that can be printed (its count is at most len(entries)).
+                    more = (f'{len(entries)} more need attention; they follow in a later check '
+                            f'(one reminder per case a day; money-cases list).')
+                    room = EVENT_LIMIT - units(header) - units(more) - units(footer) - 3
+                    shown, taken, full, days = [], [], 0, []
+                    # Only what fits is recorded as sent; a case with more pings than fit gets the rest next check.
+                    for head, items, tail, day in entries:
+                        texts = []
+                        for key, text in items:
+                            if units(case_line(head, texts + [text], tail)) + 1 > room:
+                                break
+                            texts.append(text)
+                            taken.append(key)
+                        if not texts and not shown:
+                            # Lines are clipped field by field, so this only guards a hand-edited book.
+                            texts.append(items[0][1])
+                            taken.append(items[0][0])
+                        if texts:
+                            line = fit(case_line(head, texts, tail), room - 1)
+                            shown.append(line)
+                            room -= units(line) + 1
+                            if day:
+                                days.append(day)
+                        if len(texts) < len(items):
+                            break
+                        full += 1
+                    tail = ['Details: money-cases show ID.']
+                    if full < len(entries):
+                        tail.insert(0, f'{len(entries) - full} more need attention; they follow in a later check '
+                                       f'(one reminder per case a day; money-cases list).')
+                    event = '\n'.join([header, *shown, *tail])
+                    # The clock start for any case whose first reminder is in this event (only when it is delivered).
+                    by_id = {c['id']: c for c in cases}
+                    starts = {}
+                    for key in taken:
+                        cid = key.split('|', 1)[0]
+                        if cid in by_id and cid not in starts:
+                            starts[cid] = {'answer': answered_at(by_id[cid]).isoformat()}
+                    state['outbox'] = {'run': run, 'keys': taken, 'at': stamp(now), 'fires': runner_fires(wd),
+                                       'clock': starts, 'days': list(dict.fromkeys(days)), 'event': event}
+    except CheckTimeout as e:
+        errors = state.setdefault('question_errors', {'at': stamp(now), 'errors': []})['errors']
+        errors.append(str(e))
+        # A partly built event was never handed to the runner. Keep only a previously owned outbox.
+        state.pop('outbox', None)
+        if retained_outbox is not None:
+            state['outbox'] = retained_outbox
+        event = ''
+    phases[phase] = time.time() - phase_at
+    for name in ('reconcile', 'follow', 'attention', 'build_write'):
+        phases.setdefault(name, 0)
+    state['timing'] = {'at': stamp(now), 'total_s': round(time.time() - started, 3),
+                       **{f'{key}_s': round(value, 3) for key, value in phases.items()},
+                       **stats, 'slowest': max(phases, key=phases.get)}
     write_json(pings, state)
+    if state['timing']['total_s'] > 20:
+        print('money-cases timing: ' + json.dumps(state['timing'], sort_keys=True), file=sys.stderr)
     return event
 
 
