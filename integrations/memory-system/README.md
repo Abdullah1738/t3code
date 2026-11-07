@@ -70,7 +70,8 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
 - `com.abdullah.memory-sync` - capture tick, every 120 s
 - `com.abdullah.opencode-readonly` - paced native export, continuous with 15s
   between completed cycles; reference plist in `scripts/`. It is independent of
-  Robob restarts and runs at background CPU/I/O priority.
+  Robob restarts and runs at nice 15 with normal I/O priority (launchd
+  `LowPriorityIO`/`Background` reads crawl on the USB SSD; see `src/run_limited.py`).
 - `com.abdullah.recall` - recall server on 127.0.0.1:18765. The plist raises
   `NumberOfFiles` to 8192; launchd's default 256 is too low for many clients.
   Reference copy: `scripts/com.abdullah.recall.plist`.
