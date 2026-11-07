@@ -665,6 +665,9 @@ def track_exact(app, vertical, order):
     if vertical=='nownow':
         from commerce_nownow import reader
         return reader().track(order)
+    if vertical=='food':
+        from noon_vertical_reads import track
+        return track(order, 'food')
     journal.fail('INVALID_COMMERCE_VERTICAL')
 
 
