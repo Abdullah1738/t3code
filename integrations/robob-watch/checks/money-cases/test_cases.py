@@ -1052,15 +1052,15 @@ class CheckBudget(Base):
                 if action == 'close':
                     mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
                 replace = mc.os.replace
-                def slow_replace(src, dst):
+                def interrupted_replace(src, dst):
                     replace(src, dst)
                     if Path(dst).name == 'cases.json':
-                        time.sleep(0.1)
-                with patch.object(mc.os, 'replace', slow_replace):
-                    with self.assertRaises(mc.CheckTimeout):
                         with mc.within(time.time() + 0.05, mc.CheckTimeout('out of time')):
-                            mc.follow(self.data, now, self.root, time.time() + 5, finder(),
-                                      owner if action == 'close' else nobody)
+                            mc.signal.raise_signal(mc.signal.SIGALRM)
+                with patch.object(mc.os, 'replace', interrupted_replace):
+                    with self.assertRaises(mc.CheckTimeout):
+                        mc.follow(self.data, now, self.root, time.time() + 5, finder(),
+                                  owner if action == 'close' else nobody)
                 self.assertEqual(self.questions()[0]['status'], 'case' if action == 'close' else 'open')
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
                 mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
@@ -1083,14 +1083,14 @@ class CheckBudget(Base):
                 when = now - dt.timedelta(days=8)
                 qid = self.seed([when])['questions'][0]['id']
                 replace = mc.os.replace
-                def slow_replace(src, dst):
+                def interrupted_replace(src, dst):
                     replace(src, dst)
                     if Path(dst).name == 'cases.json':
-                        time.sleep(0.1)
-                with patch.object(mc.os, 'replace', slow_replace):
-                    with self.assertRaises(mc.CheckTimeout):
                         with mc.within(time.time() + 0.05, mc.CheckTimeout('out of time')):
-                            mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                            mc.signal.raise_signal(mc.signal.SIGALRM)
+                with patch.object(mc.os, 'replace', interrupted_replace):
+                    with self.assertRaises(mc.CheckTimeout):
+                        mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
                 if entry == 'answered':
