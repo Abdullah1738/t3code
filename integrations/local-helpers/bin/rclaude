@@ -53,6 +53,15 @@ case ${1:-} in
     exec "$bin" "$@" ;;
 esac
 
+# Interactive Claude asks once whether to trust a custom ANTHROPIC_API_KEY and remembers "No" in
+# .claude.json, then says "Not logged in" (the SDK path Robob uses never asks). An apiKeyHelper is
+# never asked about, so the 9router key goes through one instead.
+key_helper=''
+if [[ -n ${ANTHROPIC_API_KEY:-} ]]; then
+  export RCLAUDE_API_KEY=$ANTHROPIC_API_KEY
+  unset ANTHROPIC_API_KEY
+  key_helper='printenv RCLAUDE_API_KEY'
+fi
 # Robob's default selection when it's this instance (model, effort, fastMode), like compileClaudeModelSelection.
 sel='if .defaultModelSelection.instanceId == $i then .defaultModelSelection else {} end'
 opt() { q "($sel) | (.options // []) | map(select(.id == \"$1\"))[0].value // empty" }
@@ -68,8 +77,8 @@ case $effort in
 esac
 compact=$(q '.providerInstances[$i].config.autoCompactWindow // empty')
 [[ -z $compact || $compact == <-> ]] || { print -u2 "rclaude: ignoring autoCompactWindow '$compact' (not a number)"; compact='' }
-sdk_settings=$($jq -cn --arg c "$compact" --argjson f $fast --argjson u $ultracode \
-  '{fastMode: $f} + (if $u then {ultracode: true} else {} end) + (if $c == "" then {} else {autoCompactWindow: ($c | tonumber)} end) + {showThinkingSummaries: true}')
+sdk_settings=$($jq -cn --arg c "$compact" --argjson f $fast --argjson u $ultracode --arg k "$key_helper" \
+  '{fastMode: $f} + (if $u then {ultracode: true} else {} end) + (if $c == "" then {} else {autoCompactWindow: ($c | tonumber)} end) + {showThinkingSummaries: true} + (if $k == "" then {} else {apiKeyHelper: $k} end)')
 
 # Same flags as a running thread (ps of a Robob claude process), minus the SDK stream/stdio plumbing.
 # --add-dir takes several values, so it uses the = form: a prompt after it isn't read as a directory.
