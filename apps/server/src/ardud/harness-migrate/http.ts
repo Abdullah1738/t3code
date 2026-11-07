@@ -48,6 +48,60 @@ export const summarizePlan = (plan: Cutover.CutoverPlan) => {
   };
 };
 
+/**
+ * Status without per-item payloads. 7 Nov 2026: a production status listed every ledger item
+ * with its payload (~436 MB), which the 16 MiB reply cap only rejected after building it.
+ * Callers (stream-recovery, the installer) read only active/completed/claims; `?items=1` adds a
+ * small per-item view without payloads.
+ */
+export const summarizeStatus = (status: Cutover.CutoverStatus, withItems = false) => {
+  const counts: Record<string, number> = {};
+  const reasons: Record<string, number> = {};
+  for (const item of status.items) {
+    const key = `${item.kind}:${item.state}`;
+    counts[key] = (counts[key] ?? 0) + 1;
+    if (item.reason !== null) reasons[item.reason] = (reasons[item.reason] ?? 0) + 1;
+  }
+  return {
+    active: status.active,
+    completed: status.completed,
+    claimedThreadIds: status.claimedThreadIds,
+    claimedRuns: status.claimedRuns,
+    refusals: status.refusals,
+    counts,
+    reasons,
+    ...(withItems
+      ? {
+          items: status.items.map(
+            ({
+              key,
+              kind,
+              ref,
+              wake,
+              state,
+              phase,
+              attempts,
+              reason,
+              rollbackAttempts,
+              rolledBack,
+            }) => ({
+              key,
+              kind,
+              ref,
+              wake,
+              state,
+              phase,
+              attempts,
+              reason,
+              rollbackAttempts,
+              rolledBack,
+            }),
+          ),
+        }
+      : {}),
+  };
+};
+
 export const routes = HttpRouter.addAll(
   Effect.gen(function* () {
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -74,6 +128,9 @@ export const routes = HttpRouter.addAll(
             403,
           );
         yield* startup.awaitCommandReady;
+        const url = new URL(request.url, "http://localhost");
+        // Per-item rows (no payloads) only on request: 36k items are ~11 MB even without payloads.
+        const withItems = url.searchParams.get("items") === "1";
         if (action === "status") {
           const status = yield* cutover.status();
           const prepared = yield* input.readOptional.pipe(Effect.result);
@@ -96,7 +153,7 @@ export const routes = HttpRouter.addAll(
           return json({
             ok: true,
             cutover: {
-              ...status,
+              ...summarizeStatus(status, withItems),
               active: status.active || (!status.completed && claims !== null),
               claimedThreadIds: [
                 ...new Set([
@@ -109,11 +166,11 @@ export const routes = HttpRouter.addAll(
             },
           });
         }
-        if (action === "run") return json({ ok: true, cutover: yield* job.start() });
+        if (action === "run")
+          return json({ ok: true, cutover: summarizeStatus(yield* job.start(), withItems) });
         const plan = yield* cutover.plan();
         // A production plan lists every thread with its payload and passes the
         // control API's 16 MiB reply cap; ?summary=1 returns counts instead.
-        const url = new URL(request.url, "http://localhost");
         return json({
           ok: true,
           cutover: url.searchParams.get("summary") === "1" ? summarizePlan(plan) : plan,

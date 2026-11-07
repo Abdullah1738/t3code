@@ -857,3 +857,67 @@ it.effect(
       }),
     ).pipe(Effect.provide(database)),
 );
+
+it.effect(
+  "keeps the ledger in memory across passes and loads deferred payloads only to apply them",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "cutover-engine-big-" });
+        const storeContext = yield* Layer.build(
+          CutoverStore.layerWithOptions({
+            snapshotPath: path.join(directory, "plan.json"),
+            maxInlinePayloadBytes: 256,
+          }).pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" }))),
+        );
+        const store = yield* CutoverStore.CutoverStore.pipe(Effect.provide(storeContext));
+        let reads = 0;
+        const counting = CutoverStore.CutoverStore.of({
+          ...store,
+          read: () => Effect.suspend(() => ((reads += 1), store.read())),
+        });
+        const target = { instanceId: "codex", model: "gpt-6.1-sol" };
+        const big: CutoverItem = {
+          key: "board:big",
+          kind: "selection",
+          ref: "big",
+          payload: { scope: "board", after: { model: target, cards: "z".repeat(4000) } },
+          wake: false,
+        };
+        const applied: Array<unknown> = [];
+        const checked: Array<unknown> = [];
+        const actions = CutoverEngine.CutoverActions.of({
+          check: (items) =>
+            Effect.sync(() => {
+              checked.push(items.find((entry) => entry.key === "board:big")?.payload);
+              return [];
+            }),
+          plan: Effect.succeed(plan([big, item("one"), item("two")])),
+          apply: (entry, phase) =>
+            Effect.sync(() => {
+              if (entry.key === "board:big") applied.push({ phase, payload: entry.payload });
+            }),
+        });
+        const context = yield* Layer.build(
+          CutoverEngine.layerWithOptions({ paceMillis: 0, batchSize: 1 }).pipe(
+            Layer.provide(Layer.succeed(CutoverEngine.CutoverActions, actions)),
+            Layer.provide(Layer.succeed(CutoverStore.CutoverStore, counting)),
+          ),
+        );
+        const engine = yield* CutoverEngine.HarnessCutover.pipe(Effect.provide(context));
+        let state = yield* engine.run();
+        for (let pass = 0; pass < 10 && !state.completed; pass++) state = yield* engine.run();
+        assert.isTrue(state.completed);
+        // The full payload reached apply exactly once; status and readiness saw only selection leaves.
+        assert.deepStrictEqual(applied, [{ phase: "switch", payload: big.payload }]);
+        for (const seen of checked) assert.deepStrictEqual(seen, [target]);
+        assert.ok(!JSON.stringify(state).includes("zzzz"));
+        // One read for the first pass and one inside start(); every later pass used the cache.
+        assert.isAtMost(reads, 2);
+        yield* engine.status();
+        assert.isAtMost(reads, 2);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);

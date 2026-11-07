@@ -120,13 +120,53 @@ const make = Effect.fn("HarnessCutover.make")(function* (
   const storageError = (cause: CutoverStore.CutoverStoreError) =>
     new CutoverError({ operation: cause.operation, cause });
 
-  const read = store.read().pipe(Effect.mapError(storageError));
+  // The engine is the ledger's only writer, so after one read it keeps the snapshot in memory
+  // instead of re-reading (and re-decoding) every row on each 2 s job pass. Any failure drops
+  // the cache so the next call re-reads what was actually persisted.
+  let cached: CutoverStore.CutoverSnapshot | null = null;
+  const read = Effect.suspend(() =>
+    cached !== null && !cached.initializing
+      ? Effect.succeed<CutoverStore.CutoverSnapshot | null>(cached)
+      : store.read().pipe(
+          Effect.tap((snapshot) =>
+            Effect.sync(() => {
+              cached = snapshot !== null && !snapshot.initializing ? snapshot : null;
+            }),
+          ),
+        ),
+  ).pipe(Effect.mapError(storageError));
+  const remember = (snapshot: CutoverStore.CutoverSnapshot) =>
+    Effect.sync(() => {
+      cached = snapshot.initializing ? null : snapshot;
+    });
+  const forget = Effect.sync(() => {
+    cached = null;
+  });
   const status = Effect.fn("HarnessCutover.status")(function* () {
     return describe(yield* read);
   });
   const save = Effect.fn("HarnessCutover.save")(function* (item: CutoverStore.CutoverLedgerItem) {
     yield* store.save(item).pipe(Effect.mapError(storageError));
   });
+  // Large payloads are read only for the action that needs them and dropped afterwards; the
+  // ledger keeps their selection leaves.
+  const full = Effect.fn("HarnessCutover.fullPayload")(function* (
+    item: CutoverStore.CutoverLedgerItem,
+  ) {
+    if (!item.payloadDeferred) return item;
+    if (store.payload === undefined) return yield* new CutoverError({ operation: "read-payload" });
+    const payload = yield* store.payload(item.key).pipe(Effect.mapError(storageError));
+    return { ...item, payload };
+  });
+  const apply = (item: CutoverStore.CutoverLedgerItem, phase: CutoverPhase) =>
+    full(item).pipe(Effect.flatMap((loaded) => actions.apply(loaded, phase)));
+  const slim = (
+    updated: CutoverStore.CutoverLedgerItem,
+    original: CutoverStore.CutoverLedgerItem,
+  ): CutoverStore.CutoverLedgerItem =>
+    original.payloadDeferred
+      ? { ...updated, payload: original.payload, payloadDeferred: true }
+      : updated;
 
   const rollback = Effect.fn("HarnessCutover.rollback")(function* (
     item: CutoverStore.CutoverLedgerItem,
@@ -145,7 +185,7 @@ const make = Effect.fn("HarnessCutover.make")(function* (
       rollbackAttempts: item.rollbackAttempts + 1,
     };
     yield* save(pending);
-    const result = yield* Effect.result(actions.apply(pending, "rollback"));
+    const result = yield* Effect.result(apply(pending, "rollback"));
     const restored: CutoverStore.CutoverLedgerItem = {
       ...pending,
       rolledBack: Result.isSuccess(result),
@@ -169,7 +209,7 @@ const make = Effect.fn("HarnessCutover.make")(function* (
       reason: null,
     };
     yield* save(current);
-    const result = yield* Effect.result(actions.apply(current, phase));
+    const result = yield* Effect.result(apply(current, phase));
     if (Result.isFailure(result)) {
       if (result.failure._tag === "CutoverDeferred") {
         const deferred: CutoverStore.CutoverLedgerItem = {
@@ -198,88 +238,103 @@ const make = Effect.fn("HarnessCutover.make")(function* (
     return current;
   });
 
-  const run = Effect.fn("HarnessCutover.run")(function* () {
-    const existing = yield* read;
-    if (existing !== null && actions.check === undefined) {
-      return yield* new CutoverError({ operation: "resume-readiness" });
-    }
-    const fresh = existing === null ? yield* actions.plan : null;
-    const readiness =
-      existing !== null && actions.check ? yield* actions.check(existing.items) : fresh!.readiness;
-    const refusals = existing?.refusals ?? fresh!.refusals;
-    const refused = readiness
-      .filter((check) => !check.ready)
-      .map((check) => ({
-        ref: check.id,
-        reason: check.reason,
-      }));
-    if (refused.length > 0 || refusals.length > 0) {
-      return describe(existing, [...refusals, ...refused]);
-    }
+  const run = Effect.fn("HarnessCutover.run")(
+    function* () {
+      const existing = yield* read;
+      if (existing !== null && actions.check === undefined) {
+        return yield* new CutoverError({ operation: "resume-readiness" });
+      }
+      const fresh = existing === null ? yield* actions.plan : null;
+      const readiness =
+        existing !== null && actions.check
+          ? yield* actions.check(existing.items)
+          : fresh!.readiness;
+      const refusals = existing?.refusals ?? fresh!.refusals;
+      const refused = readiness
+        .filter((check) => !check.ready)
+        .map((check) => ({
+          ref: check.id,
+          reason: check.reason,
+        }));
+      if (refused.length > 0 || refusals.length > 0) {
+        return describe(existing, [...refusals, ...refused]);
+      }
 
-    // Frozen plan import must finish before any switch can be delivered.
-    let snapshot =
-      (existing?.initializing ? null : existing) ??
-      (yield* store
-        .start(existing?.items ?? fresh!.items, refusals)
-        .pipe(Effect.mapError(storageError)));
-    let processed = 0;
-    const visited = new Set<string>();
-    const deferredKeys = new Set(
-      snapshot.items
-        .filter((item) => item.reason !== null && item.state !== "failed")
-        .map((item) => item.key),
-    );
-    // A wake can run board actions immediately. Restore every card and future selection before sending it.
-    // Defer retries until untouched switches and briefs get a turn, keeping persisted plan order within each group.
-    for (const retryDeferred of [false, true]) {
-      for (const pass of ["switch", "brief", "finalize"] as const) {
-        if (
-          pass === "brief" &&
-          snapshot.items.some(
-            (row) => (row.kind === "selection" || row.kind === "card") && !done(row),
+      // Frozen plan import must finish before any switch can be delivered.
+      let snapshot =
+        (existing?.initializing ? null : existing) ??
+        (yield* store
+          .start(existing?.items ?? fresh!.items, refusals)
+          .pipe(Effect.mapError(storageError)));
+      yield* remember(snapshot);
+      let processed = 0;
+      const visited = new Set<string>();
+      const deferredKeys = new Set(
+        snapshot.items
+          .filter((item) => item.reason !== null && item.state !== "failed")
+          .map((item) => item.key),
+      );
+      // A wake can run board actions immediately. Restore every card and future selection before sending it.
+      // Defer retries until untouched switches and briefs get a turn, keeping persisted plan order within each group.
+      for (const retryDeferred of [false, true]) {
+        for (const pass of ["switch", "brief", "finalize"] as const) {
+          if (
+            pass === "brief" &&
+            snapshot.items.some(
+              (row) => (row.kind === "selection" || row.kind === "card") && !done(row),
+            )
           )
-        )
-          continue;
-        for (const [index, item] of snapshot.items.entries()) {
-          if (done(item) || visited.has(item.key)) continue;
-          if (processed >= batchSize) break;
-          if (deferredKeys.has(item.key) !== retryDeferred) continue;
-          if (pass === "finalize") {
+            continue;
+          for (const [index, item] of snapshot.items.entries()) {
+            if (done(item) || visited.has(item.key)) continue;
+            if (processed >= batchSize) break;
+            if (deferredKeys.has(item.key) !== retryDeferred) continue;
+            if (pass === "finalize") {
+              if (
+                item.kind !== "finalize" ||
+                snapshot.refusals.length > 0 ||
+                snapshot.items.some((row) => row.kind !== "finalize" && !done(row))
+              )
+                continue;
+            } else if (item.kind === "finalize" || item.phase !== pass) {
+              continue;
+            }
             if (
-              item.kind !== "finalize" ||
-              snapshot.refusals.length > 0 ||
-              snapshot.items.some((row) => row.kind !== "finalize" && !done(row))
+              item.attempts >= MAX_ATTEMPTS &&
+              (item.rolledBack ||
+                item.rollbackAttempts >= MAX_ATTEMPTS ||
+                (item.kind !== "selection" && item.kind !== "thread"))
             )
               continue;
-          } else if (item.kind === "finalize" || item.phase !== pass) {
-            continue;
+            if (processed > 0 && paceMillis > 0) yield* Effect.sleep(paceMillis);
+            processed += 1;
+            const updated = slim(
+              item.attempts >= MAX_ATTEMPTS
+                ? yield* rollback(item)
+                : yield* process(item, pass === "brief" ? "brief" : "switch"),
+              item,
+            );
+            const items = snapshot.items.slice();
+            items[index] = updated;
+            snapshot = { ...snapshot, items };
+            yield* remember(snapshot);
+            // A successful switch may enter the brief pass in this invocation; failed/deferred work may not.
+            if (updated.state !== "switched" || updated.phase !== "brief") visited.add(item.key);
+            if (updated.reason !== null) visited.add(item.key);
+            if (item.kind === "selection" && !done(updated) && updated.attempts < MAX_ATTEMPTS)
+              break;
           }
-          if (
-            item.attempts >= MAX_ATTEMPTS &&
-            (item.rolledBack ||
-              item.rollbackAttempts >= MAX_ATTEMPTS ||
-              (item.kind !== "selection" && item.kind !== "thread"))
-          )
-            continue;
-          if (processed > 0 && paceMillis > 0) yield* Effect.sleep(paceMillis);
-          processed += 1;
-          const updated =
-            item.attempts >= MAX_ATTEMPTS
-              ? yield* rollback(item)
-              : yield* process(item, pass === "brief" ? "brief" : "switch");
-          const items = snapshot.items.slice();
-          items[index] = updated;
-          snapshot = { ...snapshot, items };
-          // A successful switch may enter the brief pass in this invocation; failed/deferred work may not.
-          if (updated.state !== "switched" || updated.phase !== "brief") visited.add(item.key);
-          if (updated.reason !== null) visited.add(item.key);
-          if (item.kind === "selection" && !done(updated) && updated.attempts < MAX_ATTEMPTS) break;
         }
       }
-    }
-    return describe(snapshot);
-  }, lock.withPermits(1));
+      return describe(snapshot);
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.tapError(() => forget),
+        Effect.onInterrupt(() => forget),
+        lock.withPermits(1),
+      ),
+  );
 
   return HarnessCutover.of({
     plan: Effect.fn("HarnessCutover.plan")(() => actions.plan),

@@ -9,7 +9,7 @@ import * as Startup from "../../serverRuntimeStartup.ts";
 import * as Cutover from "./CutoverEngine.ts";
 import * as Input from "./CutoverInput.ts";
 import * as Job from "./CutoverJob.ts";
-import { routes, summarizePlan } from "./http.ts";
+import { routes, summarizePlan, summarizeStatus } from "./http.ts";
 
 const status: Cutover.CutoverStatus = {
   active: false,
@@ -149,7 +149,7 @@ it.effect("returns uncached plan/status schemas and starts run only through the 
         assert.deepStrictEqual(response, {
           status: 200,
           cache: "no-store",
-          body: success(action === "plan" ? plan : status),
+          body: success(action === "plan" ? plan : summarizeStatus(status)),
         });
       }
       assert.deepStrictEqual(calls, ["plan", "status", "run"]);
@@ -165,7 +165,7 @@ it.effect.each([status, rolledBack])(
         assert.deepStrictEqual(
           (yield* request("status", "read")).body,
           success({
-            ...state,
+            ...summarizeStatus(state),
             active: true,
             claimedThreadIds: state.items.length ? [] : ["interrupted"],
             claimedRuns: state.items.length ? [] : claims.interruptedThreads,
@@ -187,7 +187,10 @@ it.effect("bad preparation fails closed until cutover is completed", () =>
       });
       const state = { ...status, completed: true };
       const { request } = yield* make({ prepared, state });
-      assert.deepStrictEqual((yield* request("status", "read")).body, success(state));
+      assert.deepStrictEqual(
+        (yield* request("status", "read")).body,
+        success(summarizeStatus(state)),
+      );
     }),
   ),
 );
@@ -210,4 +213,20 @@ it("summarizes a plan without payloads", () => {
   assert.strictEqual(summary.wakeThreads, 1);
   assert.deepStrictEqual(summary.refusalReasons, { "unknown model": 2 });
   assert.ok(!JSON.stringify(summary).includes("xxxx"));
+});
+
+it("summarizes status without payloads; per-item rows only on request", () => {
+  const big: Cutover.CutoverStatus = {
+    ...rolledBack,
+    items: [{ ...rolledBack.items[0]!, payload: { cards: "x".repeat(10_000) } }],
+  };
+  const summary = summarizeStatus(big);
+  assert.notProperty(summary, "items");
+  assert.deepStrictEqual(summary.counts, { "thread:failed": 1 });
+  assert.deepStrictEqual(summary.reasons, { failed: 1 });
+  assert.ok(!JSON.stringify(summary).includes("xxxx"));
+  const rows = summarizeStatus(big, true);
+  assert.strictEqual(rows.items?.length, 1);
+  assert.notProperty(rows.items![0]!, "payload");
+  assert.ok(!JSON.stringify(rows).includes("xxxx"));
 });

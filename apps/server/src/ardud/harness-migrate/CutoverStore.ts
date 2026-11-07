@@ -30,7 +30,45 @@ export interface CutoverLedgerItem extends CutoverItem {
   readonly reason: string | null;
   readonly rollbackAttempts: number;
   readonly rolledBack: boolean;
+  /**
+   * The stored payload is larger than the inline limit. `payload` then holds only its
+   * model-selection leaves (enough for readiness rechecks); apply reads the full payload
+   * with `CutoverStore.payload` and drops it afterwards.
+   */
+  readonly payloadDeferred?: boolean;
 }
+
+/**
+ * Payloads above this many bytes are not kept in memory with the ledger. 7 Nov 2026: the
+ * production ledger was 420 MB (one board selection alone 232 MB, ~2,900 pinned-card items of
+ * 16-460 KB); re-decoding it every 2 s ran the server out of heap. At 16 KB the in-memory
+ * ledger is ~15 MB.
+ */
+export const DEFAULT_MAX_INLINE_PAYLOAD_BYTES = 16 * 1024;
+
+/** Every `{ instanceId, model, options? }` object in a payload, de-duplicated. */
+export const selectionLeaves = (value: unknown): ReadonlyArray<unknown> => {
+  const out = new Map<string, unknown>();
+  const visit = (entry: unknown): void => {
+    if (Array.isArray(entry)) {
+      for (const child of entry) visit(child);
+      return;
+    }
+    if (entry === null || typeof entry !== "object") return;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.instanceId === "string" && typeof record.model === "string") {
+      const leaf =
+        record.options === undefined
+          ? { instanceId: record.instanceId, model: record.model }
+          : { instanceId: record.instanceId, model: record.model, options: record.options };
+      out.set(JSON.stringify(leaf), leaf);
+      return;
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(value);
+  return [...out.values()];
+};
 
 export interface CutoverSnapshot {
   readonly items: ReadonlyArray<CutoverLedgerItem>;
@@ -47,6 +85,8 @@ export class CutoverStore extends Context.Service<
       refusals: CutoverPlan["refusals"],
     ) => Effect.Effect<CutoverSnapshot, CutoverStoreError>;
     readonly save: (item: CutoverLedgerItem) => Effect.Effect<void, CutoverStoreError>;
+    /** The full stored payload of one item (for items read with `payloadDeferred`). */
+    readonly payload?: (key: string) => Effect.Effect<unknown, CutoverStoreError>;
   }
 >()("t3/ardud/harness-migrate/CutoverStore") {}
 
@@ -123,7 +163,9 @@ interface Row {
   readonly item_key: string;
   readonly kind: string;
   readonly ref: string;
-  readonly payload_json: string;
+  /** Null when the payload is above the inline limit; read it with `payload(key)`. */
+  readonly payload_json: string | null;
+  readonly payload_bytes: number;
   readonly wake: number;
   readonly state: string;
   readonly phase: string;
@@ -133,7 +175,10 @@ interface Row {
   readonly rolled_back: number;
 }
 
-const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
+const make = Effect.fn("CutoverStore.make")(function* (
+  snapshotPath: string,
+  maxInlinePayloadBytes: number = DEFAULT_MAX_INLINE_PAYLOAD_BYTES,
+) {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -176,6 +221,56 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
     Effect.mapError(fail("freeze-plan")),
   );
 
+  // Stored payloads never change after import, so the selection leaves of a large one are
+  // computed once per process instead of decoding hundreds of MB on every read.
+  const leavesCache = new Map<string, ReadonlyArray<unknown>>();
+  const payload = Effect.fn("CutoverStore.payload")(function* (key: string) {
+    const rows = yield* sql<{
+      payload_json: string;
+    }>`SELECT payload_json FROM ardud_harness_cutover_items WHERE item_key = ${key} AND kind != 'snapshot'`.pipe(
+      Effect.mapError(fail("read-payload")),
+    );
+    const row = rows[0];
+    if (row === undefined)
+      return yield* new CutoverStoreError({
+        operation: "read-payload",
+        cause: "Missing cutover item",
+      });
+    return yield* decodePayload(row.payload_json).pipe(Effect.mapError(fail("decode-payload")));
+  });
+  // SQLite walks the large payload, so it never enters the JS heap. Selections do not nest
+  // (their options are { id, value } objects), so every matching object is a leaf.
+  const payload_ = Effect.fn("CutoverStore.payloadLeaves")(function* (key: string) {
+    const cached = leavesCache.get(key);
+    if (cached !== undefined) return cached;
+    const rows = yield* sql<{
+      instance_id: string;
+      model: string;
+      options: string | null;
+    }>`SELECT DISTINCT json_extract(t.value, '$.instanceId') AS instance_id,
+          json_extract(t.value, '$.model') AS model,
+          json_extract(t.value, '$.options') AS options
+        FROM ardud_harness_cutover_items i, json_tree(i.payload_json) t
+        WHERE i.item_key = ${key} AND i.kind != 'snapshot' AND t.type = 'object'
+          AND json_type(t.value, '$.instanceId') = 'text' AND json_type(t.value, '$.model') = 'text'`.pipe(
+      Effect.mapError(fail("read-payload-leaves")),
+    );
+    const leaves: Array<unknown> = [];
+    for (const row of rows) {
+      const options =
+        row.options === null
+          ? undefined
+          : yield* decodePayload(row.options).pipe(Effect.mapError(fail("decode-payload-leaves")));
+      leaves.push(
+        options === undefined
+          ? { instanceId: row.instance_id, model: row.model }
+          : { instanceId: row.instance_id, model: row.model, options },
+      );
+    }
+    leavesCache.set(key, leaves);
+    return leaves;
+  });
+
   const read = Effect.fn("CutoverStore.read")(function* () {
     if (!(yield* exists)) {
       const frozen = yield* loadFrozen();
@@ -187,11 +282,14 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
             initializing: true,
           };
     }
-    const rows = yield* sql<Row>`SELECT * FROM ardud_harness_cutover_items ORDER BY ordinal`.pipe(
-      Effect.mapError(fail("read-items")),
-    );
+    // Large payloads (whole-board snapshots) stay on disk: only their selection leaves are kept.
+    const rows = yield* sql<Row>`SELECT item_key, kind, ref,
+        CASE WHEN length(CAST(payload_json AS BLOB)) > ${maxInlinePayloadBytes} THEN NULL ELSE payload_json END AS payload_json,
+        length(CAST(payload_json AS BLOB)) AS payload_bytes,
+        wake, state, phase, attempts, reason, rollback_attempts, rolled_back
+      FROM ardud_harness_cutover_items ORDER BY ordinal`.pipe(Effect.mapError(fail("read-items")));
     const marker = rows.find((row) => row.item_key === SNAPSHOT_KEY);
-    if (!marker)
+    if (!marker || marker.payload_json === null)
       return yield* new CutoverStoreError({
         operation: "read-snapshot",
         cause: "Missing snapshot marker",
@@ -203,8 +301,11 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
       rows.filter((row) => row.item_key !== SNAPSHOT_KEY),
       (row) =>
         Effect.gen(function* () {
-          const payload = yield* decodePayload(row.payload_json);
-          return yield* decodeItem({
+          const deferred = row.payload_json === null;
+          const payload = deferred
+            ? yield* payload_(row.item_key)
+            : yield* decodePayload(row.payload_json!);
+          const item = yield* decodeItem({
             key: row.item_key,
             kind: row.kind,
             ref: row.ref,
@@ -217,6 +318,7 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
             rollbackAttempts: row.rollback_attempts,
             rolledBack: row.rolled_back === 1,
           });
+          return deferred ? { ...item, payloadDeferred: true } : item;
         }).pipe(Effect.mapError(fail("decode-item"))),
     );
     if (header.ready) {
@@ -334,11 +436,13 @@ const make = Effect.fn("CutoverStore.make")(function* (snapshotPath: string) {
       });
   });
 
-  return CutoverStore.of({ read, start, save });
+  return CutoverStore.of({ read, start, save, payload });
 });
 
-export const layerWithOptions = (options: { readonly snapshotPath: string }) =>
-  Layer.effect(CutoverStore, make(options.snapshotPath));
+export const layerWithOptions = (options: {
+  readonly snapshotPath: string;
+  readonly maxInlinePayloadBytes?: number;
+}) => Layer.effect(CutoverStore, make(options.snapshotPath, options.maxInlinePayloadBytes));
 export const layer = Layer.effect(
   CutoverStore,
   Effect.gen(function* () {

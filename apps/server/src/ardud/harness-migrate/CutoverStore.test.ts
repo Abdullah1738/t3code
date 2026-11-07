@@ -191,3 +191,78 @@ it.effect(
       }),
     ).pipe(Effect.provide(TestLayer)),
 );
+
+const SmallInlineLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "cutover-store-small-" });
+    return CutoverStore.layerWithOptions({
+      snapshotPath: path.join(directory, "plan.json"),
+      maxInlinePayloadBytes: 512,
+    }).pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })));
+  }),
+).pipe(Layer.provideMerge(NodeServices.layer));
+
+it.effect("large payloads stay on disk: reads keep only their selection leaves", () =>
+  Effect.gen(function* () {
+    const store = yield* CutoverStore.CutoverStore;
+    const before = {
+      instanceId: "opencode",
+      model: "opus/cx/gpt-6.1-sol",
+      options: [{ id: "variant", value: "xhigh" }],
+    };
+    const after = {
+      instanceId: "codex",
+      model: "gpt-6.1-sol",
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
+    };
+    const board: CutoverItem = {
+      key: "board:big",
+      kind: "selection",
+      ref: "big",
+      payload: {
+        scope: "board",
+        before: {
+          cards: [
+            { prompt: "x".repeat(2000), model: before },
+            { prompt: "y", model: before },
+          ],
+        },
+        after: {
+          cards: [
+            { prompt: "x".repeat(2000), model: after },
+            { prompt: "y", model: after },
+          ],
+        },
+      },
+      wake: false,
+    };
+    yield* store.start([item, board], []);
+    const read = (yield* store.read())!;
+    assert.deepStrictEqual(read.items[0]!.payload, item.payload);
+    assert.isUndefined(read.items[0]!.payloadDeferred);
+    const deferred = read.items[1]!;
+    assert.isTrue(deferred.payloadDeferred);
+    assert.sameDeepMembers([...(deferred.payload as ReadonlyArray<unknown>)], [before, after]);
+    assert.ok(!JSON.stringify(read).includes("xxxx"));
+    assert.deepStrictEqual(yield* store.payload!("board:big"), board.payload);
+    // Saving progress on a deferred item never rewrites its stored payload.
+    yield* store.save({ ...deferred, state: "switched" });
+    assert.deepStrictEqual(yield* store.payload!("board:big"), board.payload);
+    assert.strictEqual((yield* store.read())!.items[1]!.state, "switched");
+  }).pipe(Effect.provide(SmallInlineLayer)),
+);
+
+it("selectionLeaves finds every distinct selection object", () => {
+  const a = { instanceId: "codex", model: "gpt-6.1-sol" };
+  const b = {
+    instanceId: "claudeAgent",
+    model: "claude-opus-5-5",
+    options: [{ id: "effort", value: "high" }],
+  };
+  assert.sameDeepMembers(
+    [...CutoverStore.selectionLeaves({ x: [a, { y: b }, a], z: "a", n: null })],
+    [a, b],
+  );
+});
