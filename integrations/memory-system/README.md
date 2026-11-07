@@ -67,11 +67,20 @@ Nothing under `data/`, `logs/` or `.venv/` belongs in git.
 
 ## LaunchAgents (gui/501)
 
+Every agent that touches the data on the USB ExternalSSD sets
+`ProcessType Interactive` and never `LowPriorityIO`. Measured 7 Nov 2026 with
+4 KB random reads of memory.db: a login shell gets ~3,500 IOPS, a launchd
+agent with no ProcessType 20-95, with `Nice` 10-15 or `LowPriorityIO` 10-25,
+with `Standard` ~800 and with `Interactive` ~3,200. `taskpolicy -d default`
+and `nice` inside the job don't lift it (launchd's role/QoS clamp does). At
+20 IOPS the 107 GB backup replica ran 3 h and timed out, a 4 s
+`sync_thread_identity` hit its 60 s limit, and a slow reader pinned the WAL.
+CPU niceness is fine to keep in the scripts (`nice -n 10`).
+
 - `com.abdullah.memory-sync` - capture tick, every 120 s
 - `com.abdullah.opencode-readonly` - paced native export, continuous with 15s
   between completed cycles; reference plist in `scripts/`. It is independent of
-  Robob restarts and runs at nice 15 with normal I/O priority (launchd
-  `LowPriorityIO`/`Background` reads crawl on the USB SSD; see `src/run_limited.py`).
+  Robob restarts.
 - `com.abdullah.recall` - recall server on 127.0.0.1:18765. The plist raises
   `NumberOfFiles` to 8192; launchd's default 256 is too low for many clients.
   Reference copy: `scripts/com.abdullah.recall.plist`.
