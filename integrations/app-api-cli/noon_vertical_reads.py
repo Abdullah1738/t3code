@@ -58,6 +58,9 @@ def _read(route, headers, deadline, order=None):
         host, path = 'api-app.noon.com', '/_svc/order-v2/order/' + order
     elif route == 'food_track' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/tracking/' + order + '/info'
+    elif route == 'food_detail' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
+        host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/details'
+        body = json.dumps({'orderNr': order}).encode()
     elif route == 'food_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/orders'
         body = b'{}'

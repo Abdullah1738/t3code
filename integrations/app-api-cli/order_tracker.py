@@ -632,7 +632,14 @@ def fetch(cfg, state, now):
     if cfg['app'] != 'amazon':
         from native_orders import track, OrderError
         try:
+            merchandise=None
             native = track(cfg['app'], cfg['order'], timeout=8)
+            if cfg['app']=='noon':
+                from noon_order_details import details
+                try:
+                    merchandise=details(cfg['order'], cfg.get('vertical') or delivery_cards.lane(cfg,{}), timeout=8)
+                except Exception:
+                    native_details['item_details_unavailable']=True
             if cfg['app'] == 'talabat' and native.get('raw_status') == 'order_confirmingdelayed':
                 from talabat_http_orders import CONFIRMATION_DELAY_S, confirmation_problem
                 first_seen = state.setdefault('talabat_confirmation_delayed_since', now)
@@ -664,6 +671,11 @@ def fetch(cfg, state, now):
                 'profile_verified', 'account_verified', 'order_id_verified', 'order_account_verified',
                 'order_list_present', 'order_list_verification', 'order_list_error',
                 'purchase_confirmed', 'payment_capture_verified') if k in native})
+            if merchandise:
+                native_details.update({k:merchandise[k] for k in ('vendor_name','items','total','price_breakdown','items_complete',
+                    'eta_text','status_text','declared_item_units','observed_item_units','account_verified') if k in merchandise})
+                if merchandise.get('items_complete'):
+                    native_details['manifest_items']=merchandise['items']
             if cfg['app'] == 'talabat' and native.get('problem'):
                 native_details['problem'] = native['problem']
             native_details['native_coverage'] = native['coverage']
@@ -680,13 +692,15 @@ def fetch(cfg, state, now):
                                  'evidence_key': 'native:' + part['scope'] + ':' + identity,
                                  'observed_at': stamp(now),
                                  'evidence': 'Authenticated native response; exact order and part ID verified.'})
-            if native['status'] in RANK and native['status'] != 'unknown':
+            if (native['status'] in RANK and native['status'] != 'unknown') or (
+                    cfg['app']=='noon' and native.get('account_verified') is True):
                 return {**native_details, 'app': cfg['app'], 'order': cfg['order'], 'status': native['status'],
                         'partial_evidence': evidence,
                         'eta': native.get('eta') or cfg.get('eta'),
                         'eta_source': (native.get('eta_source') or 'native_order_api') if native.get('eta') else
                                       ('checkout_supplied' if cfg.get('eta') else None),
-                         'eta_text': native.get('eta_text'), 'eta_text_source': native.get('eta_source'),
+                         'eta_text': merchandise.get('eta_text') if merchandise and 'eta_text' in merchandise else native.get('eta_text'),
+                         'eta_text_source': native.get('eta_source'),
                          'rider': native.get('rider'),
                         'checked_at': stamp(now), 'errors': [], 'coverage': native['coverage'],
                         'evidence': [{'stage': native['status'], 'source': 'native_order_api',

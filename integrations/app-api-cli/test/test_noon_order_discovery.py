@@ -10,6 +10,14 @@ from noon_order_discovery import scan_lane
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_overlapping_prime_is_quiet_and_does_not_read_history(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', WATCH_DIR=directory), \
+                patch.object(discovery.fcntl, 'flock', side_effect=BlockingIOError), \
+                patch.object(discovery.core, 'orders') as read:
+            discovery.main()
+            read.assert_not_called()
+            self.assertFalse((Path(directory)/'noon-discovery.json').exists())
+
     def test_failed_reader_still_emits_pending_registration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'noon-discovery.json'

@@ -24,7 +24,7 @@ CAMPAIGN = 'commerce-unrestricted-v1'
 TOTAL_LIMIT_MINOR = None
 ORDER_LIMIT_MINOR = None
 MAX_SQLITE_INTEGER = (1 << 63) - 1
-VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall'},
+VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall', 'food'},
              'talabat': {'shops', 'restaurants', 'mart'}}
 OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED',
                        'ORDER_ID_RECEIVED', 'PAYMENT_REPORTED_SUCCESS',

@@ -261,6 +261,7 @@ def food_menu_raw(code, headers, timeout):
                       'choice_groups': choices(i.get('modifiers'))})
     status = data.get('operatingStatusCode')
     info = {'id': code, 'name': clean_name(data.get('name')), 'address': data.get('address'),
+            'menu_code': menu.get('menuCode'), 'menu_version': menu.get('version'),
             'status': 'open' if status == 'open' and data.get('isAcceptingOrders') else ('not_accepting_orders' if status == 'open' else (status or 'unknown')),
             'status_message': strip_html(data.get('formattedOperatingStatusMsg')) or data.get('closeMsg') or None,
             'eta': (data.get('minutesToDeliver') + ' mins') if data.get('minutesToDeliver') else None,

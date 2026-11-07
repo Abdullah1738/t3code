@@ -480,6 +480,8 @@ def track(order, timeout=10, *, deadline=None):
             shipments.append(evidence)
         out = base(order, 'marketplace', True)
         states = {s['status'] for s in shipments}
+        raws = {s.get('raw_status') for s in shipments}
+        out['raw_status'] = next(iter(raws)) if len(raws)==1 else None
         # Can confirm an active stage exists, but cannot certify order terminality
         # from a bounded set of shipments. Parent retains shipment evidence.
         state = next(iter(states)) if len(states) == 1 else 'unknown'

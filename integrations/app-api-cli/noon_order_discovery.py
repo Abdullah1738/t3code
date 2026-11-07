@@ -45,7 +45,10 @@ def main():
     root = Path(os.environ['WATCH_DIR'])
     root.mkdir(parents=True, exist_ok=True)
     with (root/'noon-discovery.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # Registration's prime check can overlap the runner's tick.
         path = root/'noon-discovery.json'
         state = json.loads(path.read_text()) if path.exists() else {}
         events, errors = [], {}

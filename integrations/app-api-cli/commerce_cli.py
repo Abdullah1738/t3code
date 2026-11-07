@@ -668,6 +668,9 @@ def track_exact(app, vertical, order):
     if vertical=='food':
         from noon_vertical_reads import track
         return track(order, 'food')
+    if vertical=='marketplace':
+        from native_orders import noon_marketplace_track
+        return noon_marketplace_track(order,15)
     journal.fail('INVALID_COMMERCE_VERTICAL')
 
 
@@ -702,6 +705,13 @@ def checkout_check(vertical):
 
 def review_contract(vertical):
     """Machine-readable native contract gaps, not synthetic financial approval."""
+    if vertical=='food':
+        return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
+            'prepare_only':True,'purchase_enabled':False,'financial_send':False,
+            'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes','2342'],
+            'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
+            'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
+            'unresolved':['paid placement and payment-intent response contract','CVV/3DS continuation','paid recovery and automatic tracker binding']}
     if vertical in ('main','supermall'):
         from noon_marketplace_native_shape import NATIVE_SHAPE,UNRESOLVED
         from noon_marketplace_invoice import NATIVE_ROLE_CONTRACT
@@ -831,6 +841,9 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
 
 def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
+    if binding['app']=='noon' and binding['vertical']=='food':
+        from commerce_food import recover
+        return recover(flow_id)
     if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
     if binding['vertical']=='nownow' and journal.preorder_status(flow_id)['operations']:
         from commerce_preorder import recover
@@ -972,6 +985,8 @@ def main(argv=None):
     track=commands.add_parser('track');track.add_argument('flow_id')
     exact=commands.add_parser('track-exact');exact.add_argument('app',choices=('noon','talabat'))
     exact.add_argument('vertical');exact.add_argument('order')
+    detail=commands.add_parser('order-details',help='Read exact noon merchandise, choices, notes and totals')
+    detail.add_argument('app',choices=('noon',));detail.add_argument('vertical');detail.add_argument('order')
     status=commands.add_parser('order-status');status.add_argument('flow_id')
     disposition=commands.add_parser('reconcile-order');disposition.add_argument('flow_id')
     disposition.add_argument('--close-duplicate',action='store_true',
@@ -993,7 +1008,7 @@ def main(argv=None):
     disposition.add_argument('--attested-by',choices=('owner',))
     cart=commands.add_parser('marketplace-cart');cart.add_argument('service',choices=('main','supermall'))
     preflight=commands.add_parser('checkout-check');preflight.add_argument('vertical',choices=('main','supermall','nownow','minutes'))
-    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow'))
+    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow','food'))
     auth=commands.add_parser('auth');auth.add_argument('app',choices=('noon','talabat'))
     auth.add_argument('vertical');maintenance=auth.add_mutually_exclusive_group()
     maintenance.add_argument('--recover',action='store_true');maintenance.add_argument('--reconcile',action='store_true')
@@ -1002,6 +1017,11 @@ def main(argv=None):
     talabat_arguments(buy)
     order=commands.add_parser('order')
     order_commands=order.add_subparsers(dest='order_command',required=True)
+    food_order=order_commands.add_parser('food', help='Journalled Food prepare-only; paid transport is disabled pending proof')
+    food_order.add_argument('--outlet-code',required=True)
+    food_order.add_argument('--items-file',required=True)
+    food_order.add_argument('--prepare-only',action='store_true')
+    food_order.add_argument('--resume-flow')
     talabat_order=order_commands.add_parser('talabat',
         help='Caller-authorized Talabat basket with per-item notes and menu choices')
     talabat_arguments(talabat_order)
@@ -1116,6 +1136,9 @@ def main(argv=None):
         elif args.command=='test-talabat-shops':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='talabat':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='minutes':result=order_minutes(args)
+        elif args.command=='order' and args.order_command=='food':
+            from commerce_food import prepare
+            result=prepare(args)
         elif args.command=='order' and args.order_command=='nownow':result=order_nownow(args)
         elif args.command=='order' and args.order_command=='main':result=order_main(args)
         elif args.command=='order' and args.order_command=='supermall':result=order_supermall(args)
@@ -1177,6 +1200,9 @@ def main(argv=None):
         elif args.command=='checkout-check':result=checkout_check(args.vertical)
         elif args.command=='review-contract':result=review_contract(args.vertical)
         elif args.command=='track-exact':result=track_exact(args.app,args.vertical,args.order)
+        elif args.command=='order-details':
+            from noon_order_details import details
+            result=details(args.order,args.vertical)
         elif args.command=='auth':
             manager=CommerceAuth()
             if args.diagnose_readonly:
