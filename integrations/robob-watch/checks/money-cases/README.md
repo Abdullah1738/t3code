@@ -4,7 +4,7 @@ One place for open money cases (refunds, disputes, failed or unexpected charges,
 
 The code lives here. The cases live in `~/Documents/assistant/money-cases/cases.json` (mode 600), never in git.
 
-The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds. It reads Robob's server-owned read replica `readonly/state.sqlite`, never the live statev2 database.
+The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads Robob's server-owned read replica `readonly/state.sqlite`, never the live statev2 database.
 
 ## Use
 

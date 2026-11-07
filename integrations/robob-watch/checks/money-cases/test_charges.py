@@ -636,6 +636,14 @@ class OwnerTexts(unittest.TestCase):
 
 
 class SearchOutput(unittest.TestCase):
+    def test_msgs_never_inherits_interactive_stdin(self):
+        done = ch.subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(ch.subprocess, 'run', return_value=done) as run:
+            ch.search('Acme', '2026-11-01')
+            ch.show({'id': 1})
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertTrue(all(call.kwargs['stdin'] == ch.subprocess.DEVNULL for call in run.call_args_list))
+
     def test_snippets_with_unicode_line_separators_stay_one_row(self):
         rows = [{'id': 1, 'snip': 'Sincerely,\u2028Apple\x85end\x1cx'}, {'id': 2, 'snip': 'ok'}]
         out = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows)

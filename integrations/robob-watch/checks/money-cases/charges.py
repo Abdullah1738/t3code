@@ -165,7 +165,7 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     if stats is not None:
         stats['msgs_calls'] += 1
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if done.returncode:
             raise Lookup(f'msgs exit {done.returncode}: {done.stderr.strip()[:200]}')
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:

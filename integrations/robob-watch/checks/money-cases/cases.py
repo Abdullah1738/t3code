@@ -34,6 +34,7 @@ from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal, InvalidOperation
 import fcntl
+import faulthandler
 import hashlib
 import json
 import os
@@ -344,25 +345,33 @@ def read_json(path, default):
         return default
 
 
-def write_json(path, obj):
-    # Let a budget alarm fire after the atomic replacement, never in the middle of a book write.
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+def write_json(path, obj, timing=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+
+    def put(text):
+        pending = memoryview(text.encode('utf-8'))
+        while pending:
+            written = os.write(fd, pending)
+            if not written:
+                raise OSError('could not write temporary JSON file')
+            pending = pending[written:]
+
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
-        try:
-            with os.fdopen(fd, 'w') as f:
-                json.dump(obj, f, ensure_ascii=False, indent=1)
-                f.write('\n')
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        # No buffered stream: closing after an interrupted flush must not retry the write.
+        put(json.dumps(obj, ensure_ascii=False, indent=1) + '\n')
+        os.fsync(fd)
+        if timing is not None:
+            # Sample after the data fsync; the timing footer and its fsync are also bounded.
+            os.lseek(fd, -2, os.SEEK_END)
+            put(',\n "timing": ' + json.dumps(timing(), ensure_ascii=False) + '\n}\n')
+            os.fsync(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def load(data=None):
@@ -1202,7 +1211,7 @@ def question_entries(questions, now, sent):
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     started = time.time()
     end = started + CHECK_BUDGET
-    # Leave a second to finish timing and atomically save pings after the work timer is disarmed.
+    # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
     stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     phases = {}
@@ -1313,12 +1322,27 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     phases[phase] = time.time() - phase_at
     for name in ('reconcile', 'follow', 'attention', 'build_write'):
         phases.setdefault(name, 0)
-    state['timing'] = {'at': stamp(now), 'total_s': round(time.time() - started, 3),
-                       **{f'{key}_s': round(value, 3) for key, value in phases.items()},
-                       **stats, 'slowest': max(phases, key=phases.get)}
-    write_json(pings, state)
-    if state['timing']['total_s'] > 20:
-        print('money-cases timing: ' + json.dumps(state['timing'], sort_keys=True), file=sys.stderr)
+    save_at = time.time()
+    built_s = phases['build_write']
+
+    def timing():
+        phases['build_write'] = built_s + time.time() - save_at
+        return {'at': stamp(now), 'total_s': round(time.time() - started, 3),
+                **{f'{key}_s': round(value, 3) for key, value in phases.items()},
+                **stats, 'slowest': max(phases, key=phases.get)}
+
+    saved = False
+    state.pop('timing', None)
+    try:
+        with within(end, CheckTimeout('out of time saving pings; the rest next check')):
+            write_json(pings, state, timing=timing)
+            saved = True
+    except CheckTimeout:
+        # The old pings file is intact; never emit an event without its committed outbox.
+        event = ''
+    result = timing()
+    if not saved or result['total_s'] > 20:
+        print('money-cases timing: ' + json.dumps({**result, 'pings_saved': saved}, sort_keys=True), file=sys.stderr)
     return event
 
 
@@ -1464,27 +1488,35 @@ def main(argv=None):
                 if not qs:
                     print('No charge questions.')
         elif args.command == 'check':
-            wd = Path(os.environ.get('WATCH_DIR', LIVE))
-            wd.mkdir(parents=True, exist_ok=True)
-            data = DATA
-            if wd.resolve() != LIVE.resolve():
-                # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
-                data = wd / 'scratch-books'
-                if not data.exists():
-                    data.mkdir(mode=0o700)
-                    for name in ('cases.json', 'questions.json'):
-                        if (DATA / name).exists():
-                            shutil.copy2(DATA / name, data / name)
-            with (wd / 'check.lock').open('a') as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # Nonzero so the runner keeps its last .run-ok acknowledgement.
-                    print('money-cases check already running', file=sys.stderr)
-                    return 75
-                event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
-            if event:
-                print(event)
+            if hasattr(sys.stderr, 'reconfigure'):
+                sys.stderr.reconfigure(line_buffering=True)
+            faulthandler.enable(file=sys.stderr)
+            faulthandler.dump_traceback_later(float(os.environ.get('MONEY_CASES_HARD_STOP', CHECK_BUDGET + 8)),
+                                             exit=True)
+            try:
+                wd = Path(os.environ.get('WATCH_DIR', LIVE))
+                wd.mkdir(parents=True, exist_ok=True)
+                data = DATA
+                if wd.resolve() != LIVE.resolve():
+                    # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
+                    data = wd / 'scratch-books'
+                    if not data.exists():
+                        data.mkdir(mode=0o700)
+                        for name in ('cases.json', 'questions.json'):
+                            if (DATA / name).exists():
+                                shutil.copy2(DATA / name, data / name)
+                with (wd / 'check.lock').open('a') as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        # Nonzero so the runner keeps its last .run-ok acknowledgement.
+                        print('money-cases check already running', file=sys.stderr)
+                        return 75
+                    event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
+                if event:
+                    print(event)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
         elif args.command == 'brief':
             line = brief(load()['cases'])
             if line:
