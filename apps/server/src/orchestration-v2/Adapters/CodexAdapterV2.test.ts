@@ -46,6 +46,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Predicate from "effect/Predicate";
 import * as FileSystem from "effect/FileSystem";
 import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp";
@@ -1962,6 +1963,27 @@ describe("CodexAdapterV2 session initialize", () => {
                   },
                 ]
               : []),
+            ...(scenario === "success"
+              ? []
+              : [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "cleanup",
+                    frame: {
+                      id: injectExpected ? 4 : 3,
+                      method: "thread/unsubscribe",
+                      params: { threadId: nativeThreadId },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "cleanup-result",
+                    frame: {
+                      id: injectExpected ? 4 : 3,
+                      result: {},
+                    },
+                  },
+                ]),
           ],
         }),
       );
@@ -1998,7 +2020,12 @@ describe("CodexAdapterV2 session initialize", () => {
       const result = yield* session.ensureThread(threadId, existing).pipe(Effect.result);
       assert.deepEqual(
         session.requests.map((request) => request.method),
-        ["initialize", "thread/start", ...(injectExpected ? ["thread/inject_items"] : [])],
+        [
+          "initialize",
+          "thread/start",
+          ...(injectExpected ? ["thread/inject_items"] : []),
+          ...(scenario === "success" ? [] : ["thread/unsubscribe"]),
+        ],
       );
       if (scenario === "success") {
         assert.equal(result._tag, "Success");
@@ -2041,6 +2068,104 @@ describe("CodexAdapterV2 session initialize", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+
+  it.effect.each([
+    { operation: "start", lateReply: true },
+    { operation: "fork", lateReply: true },
+    { operation: "start", lateReply: false },
+    { operation: "fork", lateReply: false },
+  ] as const)(
+    "cancels native $operation allocation with lateReply=$lateReply",
+    ({ operation, lateReply }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const dispatched = yield* Deferred.make<void>();
+          const reply = yield* Deferred.make<void>();
+          const cleaned = yield* Deferred.make<void>();
+          const nativeThreadId = `cancelled-${operation}`;
+          const allocatedId = operation === "start" ? nativeThreadId : "late-fork";
+          const preamble = replayPreamble(nativeThreadId);
+          const allocation =
+            operation === "start"
+              ? preamble.slice(0, 5)
+              : [
+                  ...preamble.slice(0, 5),
+                  {
+                    type: "expect_outbound" as const,
+                    label: "thread/fork",
+                    frame: {
+                      id: 3,
+                      method: "thread/fork",
+                      params: {
+                        threadId: nativeThreadId,
+                        config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                      },
+                    },
+                  },
+                  {
+                    ...withReplayRequestId(replayPreamble(allocatedId)[4]!, 3),
+                    label: "thread/fork",
+                  },
+                ];
+          const session = yield* openReplaySession(
+            makeCodexReplayTranscript({
+              scenario: `cancelled-allocation-${operation}`,
+              entries: [
+                ...allocation,
+                {
+                  type: "expect_outbound",
+                  label: "cleanup",
+                  frame: {
+                    id: operation === "start" ? 3 : 4,
+                    method: "thread/unsubscribe",
+                    params: { threadId: allocatedId },
+                  },
+                },
+                {
+                  type: "emit_inbound",
+                  label: "cleanup-result",
+                  frame: { id: operation === "start" ? 3 : 4, result: {} },
+                },
+              ],
+            }),
+            (entry) =>
+              entry.label === `thread/${operation}`
+                ? Deferred.succeed(dispatched, undefined).pipe(
+                    Effect.andThen(Deferred.await(reply)),
+                  )
+                : entry.label === "cleanup-result"
+                  ? Deferred.succeed(cleaned, undefined)
+                  : Effect.void,
+          );
+          const source = operation === "fork" ? yield* session.ensureThread("source") : undefined;
+          const loading = yield* (
+            operation === "start"
+              ? session.ensureThread("target")
+              : session.runtime.forkThread({
+                  sourceProviderThread: source!,
+                  targetThreadId: ThreadId.make("target"),
+                })
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(dispatched);
+          yield* Fiber.interrupt(loading);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(loading)));
+          assert.notInclude(
+            session.requests.map((request) => request.method),
+            "thread/unsubscribe",
+          );
+          if (lateReply) {
+            yield* Deferred.succeed(reply, undefined);
+            yield* Deferred.await(cleaned);
+            assert.equal(session.requests.at(-1)?.method, "thread/unsubscribe");
+            assert.deepEqual(session.requests.at(-1)?.params, { threadId: allocatedId });
+          }
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("resumes an already injected row without starting or injecting again", () =>
@@ -9115,10 +9240,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         if (model) {
           assert.deepEqual(harness.subagentUpdates().at(-1)?.subagent.modelSelection?.options, [
             { id: "reasoningEffort", value: "high" },
-            ...(name.startsWith("current Codex") ? [] : [{ id: "serviceTier", value: "priority" }]),
+            { id: "serviceTier", value: "priority" },
           ]);
         }
-        assert.equal(metadataRequests, name === "current Codex Sol" ? 1 : 2);
+        assert.equal(metadataRequests, 1);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -9128,26 +9253,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   );
 
   it.effect.each(["failed", "malformed", "wrong child", "blank model"] as const)(
-    "resumes child metadata after a %s read",
+    "does not load a child for metadata after a %s read",
     (readResult) =>
       Effect.scoped(
         Effect.gen(function* () {
-          const modelReported = yield* Deferred.make<void>();
-          const model = "gpt-6-sol";
           const metadataRequests: Array<string> = [];
           const harness = yield* makeCodexReplayHarness(
             resumeSubagentTranscript,
-            (event) =>
-              event.type === "subagent.updated" && event.subagent.model === model
-                ? Deferred.succeed(modelReported, undefined)
-                : Effect.void,
+            () => Effect.void,
             undefined,
             (threadId, method) => {
               assert.equal(threadId, RESUME_CHILD_THREAD);
               metadataRequests.push(method);
-              if (method === "thread/resume") {
-                return Effect.succeed({ thread: { id: threadId }, model });
-              }
               switch (readResult) {
                 case "failed":
                   return Effect.fail(
@@ -9175,11 +9292,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               text: RESUME_PROMPT,
             }),
           );
-          yield* Deferred.await(modelReported);
           yield* TestClock.adjust("100 millis");
           yield* harness.firstTerminal;
-          assert.equal(harness.subagentUpdates().at(-1)?.subagent.model, model);
-          assert.deepEqual(metadataRequests, ["thread/read", "thread/resume"]);
+          assert.equal(harness.subagentUpdates().at(-1)?.subagent.model, null);
+          assert.deepEqual(metadataRequests, ["thread/read"]);
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),

@@ -54,7 +54,14 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
-const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+
+export const providerIdleUnloadMs = (value = process.env.ROBOB_PROVIDER_IDLE_UNLOAD_MS): number => {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 2 ** 31 - 1
+    ? parsed
+    : DEFAULT_IDLE_TIMEOUT_MS;
+};
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
 const RELEASE_SCOPE_CLOSE_TIMEOUT_MS = 30 * 1000;
 
@@ -497,7 +504,7 @@ export const layerWithOptions = (
         readonly providerSessionId: ProviderSessionId;
         readonly threadId: ThreadId;
       }) => `${input.providerSessionId}\u0000${input.threadId}`;
-      const idleTimeoutMs = Math.max(1, options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
+      const idleTimeoutMs = Math.max(1, options.idleTimeoutMs ?? providerIdleUnloadMs());
       const maxIdlePinMs = Math.max(0, options.maxIdlePinMs ?? DEFAULT_MAX_IDLE_PIN_MS);
       interface PreparedMcpCredential {
         readonly mcpCredentialId: string | undefined;
@@ -2002,6 +2009,41 @@ export const layerWithOptions = (
                   threadId,
                   providerThread,
                 }).pipe(Effect.andThen(scheduleThreadUnload(providerSessionId, providerThread.id))),
+              ),
+              Effect.ensuring(scheduleThreadUnload(providerSessionId, input.providerThread.id)),
+            );
+          },
+          rollbackThread: (input) => {
+            const threadId = input.providerThread.appThreadId;
+            if (threadId === null) return runtime.rollbackThread(input);
+            return observeActivity(
+              providerSessionId,
+              ensureThreadAttached({
+                providerSessionId,
+                threadId,
+                providerInstanceId: runtime.instanceId,
+              }),
+            ).pipe(
+              Effect.andThen(
+                holdThreadLoaded({
+                  providerSessionId,
+                  threadId,
+                  providerThread: input.providerThread,
+                }),
+              ),
+              Effect.andThen(
+                Effect.acquireUseRelease(
+                  observeActivity(
+                    providerSessionId,
+                    markBusy(providerSessionId, busyTurnKey(input.providerThread.id, -1), threadId),
+                  ),
+                  () => runtime.rollbackThread(input),
+                  () =>
+                    observeActivity(
+                      providerSessionId,
+                      markIdle(providerSessionId, input.providerThread.id, -1),
+                    ),
+                ),
               ),
             );
           },
