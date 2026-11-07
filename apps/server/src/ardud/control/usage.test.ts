@@ -27,6 +27,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { firstRunningSelectionSql } from "../persistence/historyArchiveSql.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 import * as Usage from "./usage.ts";
 
@@ -546,6 +547,25 @@ describe("usage feed", () => {
             ),
           ),
         );
+      }),
+    ),
+  );
+
+  it.effect("finds an attempt's selection through each history store's stream index", () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const plan = (yield* sql.unsafe<{ detail: string }>(
+          `EXPLAIN QUERY PLAN SELECT ${firstRunningSelectionSql("a")} AS selection_json
+           FROM orchestration_v2_projection_run_attempts AS a`,
+        ))
+          .map((row) => row.detail)
+          .join("\n");
+        // A history view here walked every V2 event in the base archive per row.
+        assert.notMatch(plan, /CO-ROUTINE ardud_|SCAN (?:hot|cold|base)\b/);
+        for (const store of ["hot", "cold", "base"]) {
+          assert.match(plan, new RegExp(`SEARCH ${store} USING .*\\(stream_id=\\?`));
+        }
       }),
     ),
   );

@@ -122,3 +122,39 @@ export const emptyBaseSchemaSql = [
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_user_message_idx ON orchestration_v2_projection_turn_items(thread_id,ordinal,turn_item_id) WHERE type='user_message'",
   "CREATE INDEX ardud_base.orchestration_v2_projection_turn_items_failed_error_idx ON orchestration_v2_projection_turn_items(thread_id,run_id,node_id,updated_at DESC,ordinal DESC,turn_item_id DESC) WHERE type='error' AND status='failed'",
 ];
+
+/**
+ * The modelSelection of an attempt's first running `run.updated` event, read
+ * from each store through its stream index. A correlated subquery on
+ * ardud_thread_history_events/ardud_history_events cannot push the outer
+ * `stream_id` into the union branches, so SQLite walked every V2 event in the
+ * base archive per row. Hot rows hide archive and base copies, as in the views.
+ * `attempt` names the outer run_attempts alias; it is SQL text, never input.
+ */
+export const firstRunningSelectionSql = (attempt: string) => {
+  const where = (store: string) => `${store}.application_event_version = 2
+        AND ${store}.aggregate_kind = 'thread'
+        AND ${store}.stream_id = ${attempt}.thread_id
+        AND ${store}.event_type = 'run.updated'
+        AND json_extract(${store}.payload_json, '$.id') = ${attempt}.run_id
+        AND json_extract(${store}.payload_json, '$.activeAttemptId') = ${attempt}.attempt_id
+        AND json_extract(${store}.payload_json, '$.status') = 'running'`;
+  return `(SELECT json_extract(event.payload_json, '$.modelSelection') FROM (
+      SELECT * FROM (SELECT hot.sequence, hot.payload_json FROM main.orchestration_events AS hot
+        INDEXED BY idx_orchestration_events_agent_stream_sequence
+        WHERE ${where("hot")} ORDER BY hot.sequence LIMIT 1)
+      UNION ALL
+      SELECT * FROM (SELECT cold.sequence, cold.payload_json FROM ardud_archive.ardud_events AS cold
+        INDEXED BY ardud_events_stream_idx
+        WHERE ${where("cold")}
+          AND NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hidden WHERE hidden.sequence = cold.sequence)
+        ORDER BY cold.sequence LIMIT 1)
+      UNION ALL
+      SELECT * FROM (SELECT base.sequence, base.payload_json FROM ardud_base.orchestration_events AS base
+        INDEXED BY idx_orchestration_events_agent_stream_sequence
+        WHERE ${where("base")}
+          AND NOT EXISTS (SELECT 1 FROM main.orchestration_events AS hidden WHERE hidden.sequence = base.sequence)
+          AND NOT EXISTS (SELECT 1 FROM ardud_archive.ardud_events AS delta WHERE delta.sequence = base.sequence)
+        ORDER BY base.sequence LIMIT 1)
+    ) AS event ORDER BY event.sequence LIMIT 1)`;
+};

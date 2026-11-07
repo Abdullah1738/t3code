@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { firstRunningSelectionSql } from "../persistence/historyArchiveSql.ts";
 
 const MAX_WINDOW_MS = 72 * 60 * 60 * 1000;
 const CANDIDATE_PAGE_SIZE = 400;
@@ -228,18 +229,7 @@ const make = Effect.gen(function* () {
         COALESCE(pt.driver, pt.provider, r.provider) AS driver,
         CASE WHEN c.run_attempt_id IS NULL
           THEN json_extract(t.payload_json, '$.modelSelection')
-          ELSE (
-            SELECT json_extract(event.payload_json, '$.modelSelection')
-            FROM ardud_history_events AS event
-            WHERE event.aggregate_kind = 'thread'
-              AND event.application_event_version = 2
-              AND event.stream_id = a.thread_id
-              AND event.event_type = 'run.updated'
-              AND json_extract(event.payload_json, '$.id') = a.run_id
-              AND json_extract(event.payload_json, '$.activeAttemptId') = a.attempt_id
-              AND json_extract(event.payload_json, '$.status') = 'running'
-            ORDER BY event.sequence LIMIT 1
-          ) END AS selection_json
+          ELSE ${sql.literal(firstRunningSelectionSql("a"))} END AS selection_json
       FROM candidates c
       LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = c.thread_id
       LEFT JOIN projection_projects p ON p.project_id = t.project_id
