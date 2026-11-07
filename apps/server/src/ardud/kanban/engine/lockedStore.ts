@@ -12,10 +12,17 @@ export const wrap = (
     id: Parameters<KanbanStoreShape["card"]>[0],
     effect: Effect.Effect<A, E, R>,
     write = false,
+    collection = false,
   ) =>
     store
       .card(id)
-      .pipe(Effect.flatMap((row) => (row ? locks.access(row.boardId, effect, write) : effect)));
+      .pipe(
+        Effect.flatMap((row) =>
+          row
+            ? locks.access(row.boardId, effect, write, collection ? undefined : `card:${id}`)
+            : effect,
+        ),
+      );
   const discussion = <A, E, R>(
     id: Parameters<KanbanStoreShape["discussion"]>[0],
     effect: Effect.Effect<A, E, R>,
@@ -23,7 +30,11 @@ export const wrap = (
   ) =>
     store
       .discussion(id)
-      .pipe(Effect.flatMap((row) => (row ? locks.access(row.boardId, effect, write) : effect)));
+      .pipe(
+        Effect.flatMap((row) =>
+          row ? locks.access(row.boardId, effect, write, `discussion:${id}`) : effect,
+        ),
+      );
   const thread = <A, E, R>(id: string, effect: Effect.Effect<A, E, R>) =>
     store
       .threadLink(id)
@@ -31,16 +42,16 @@ export const wrap = (
   return {
     ...store,
     boards: locks.observe(store.boards),
-    putBoard: (row) => locks.access(row.id, store.putBoard(row), true),
+    putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
     putBoardWithPools: (row, pools) =>
-      locks.access(row.id, store.putBoardWithPools(row, pools), true),
+      locks.access(row.id, store.putBoardWithPools(row, pools), true, "board"),
     cards: (id) => locks.access(id, store.cards(id)),
     summaryCards: (id) => locks.access(id, store.summaryCards(id)),
     card: (id) => card(id, store.card(id)),
     cardByNumber: (id, number) => locks.access(id, store.cardByNumber(id, number)),
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
-    putCard: (row) => locks.access(row.boardId, store.putCard(row), true),
+    putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),
     addCardEvent: (row) => card(row.cardId, store.addCardEvent(row), true),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     goals: (id) => locks.access(id, store.goals(id)),
@@ -56,7 +67,8 @@ export const wrap = (
     discussions: (id) => locks.access(id, store.discussions(id)),
     discussion: (id) => discussion(id, store.discussion(id)),
     discussionByEvaluator: (id) => thread(id, store.discussionByEvaluator(id)),
-    putDiscussion: (row) => locks.access(row.boardId, store.putDiscussion(row), true),
+    putDiscussion: (row) =>
+      locks.access(row.boardId, store.putDiscussion(row), true, `discussion:${row.id}`),
     messages: (id, options) => discussion(id, store.messages(id, options)),
     ownerWait: (id) => discussion(id, store.ownerWait(id)),
     allMessages: (id) => discussion(id, store.allMessages(id)),
@@ -71,8 +83,9 @@ export const wrap = (
     threadLinks: (filter) =>
       "boardId" in filter
         ? locks.access(filter.boardId, store.threadLinks(filter))
-        : card(filter.cardId, store.threadLinks(filter)),
-    putThreadLink: (row) => locks.access(row.boardId, store.putThreadLink(row), true),
+        : card(filter.cardId, store.threadLinks(filter), false, true),
+    putThreadLink: (row) =>
+      locks.access(row.boardId, store.putThreadLink(row), true, `thread:${row.threadId}`),
     addThreadCard: (id, cardId, at) => card(cardId, store.addThreadCard(id, cardId, at), true),
     threadCards: (id) => thread(id, store.threadCards(id)),
   };

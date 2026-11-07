@@ -809,12 +809,22 @@ const withDefaultLevel = (selection: ModelSelection, fallback: ModelSelection): 
     : { ...selection, options: [...(selection.options ?? []), effort] };
 };
 
+const ownerDeliveryKey = Context.Reference<string | undefined>("KanbanOwnerDeliveryKey", {
+  defaultValue: () => undefined,
+});
+
+const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDelivered", {
+  defaultValue: () => undefined,
+});
+
 const make = Effect.gen(function* () {
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
   const routingEnabled = locks.outside(
     selectionRoutingEnabled.pipe(Effect.provideContext(context)),
+    undefined,
+    true,
   );
   const canonicalModel = Effect.fn("KanbanService.canonicalModel")(function* (
     selection: ModelSelection,
@@ -859,23 +869,54 @@ const make = Effect.gen(function* () {
     (effect) => effect.pipe(Effect.ignore),
   );
   const threads: typeof threadIo = {
-    view: (id) => locks.outside(threadIo.view(id)),
-    find: (id) => locks.outside(threadIo.find(id)),
-    model: (id) => locks.outside(threadIo.model(id)),
-    lastFailure: (id) => locks.outside(threadIo.lastFailure(id)),
-    findLastFailure: (id) => locks.outside(threadIo.findLastFailure(id)),
-    latestRun: (id) => locks.outside(threadIo.latestRun(id)),
+    view: (id) => locks.outside(threadIo.view(id), undefined, true),
+    find: (id) => locks.outside(threadIo.find(id), undefined, true),
+    model: (id) => locks.outside(threadIo.model(id), undefined, true),
+    lastFailure: (id) => locks.outside(threadIo.lastFailure(id), undefined, true),
+    findLastFailure: (id) => locks.outside(threadIo.findLastFailure(id), undefined, true),
+    latestRun: (id) => locks.outside(threadIo.latestRun(id), undefined, true),
     compactRun: (id, run) => locks.outside(threadIo.compactRun(id, run)),
     launch: (input) =>
       locks
-        .outside(threadIo.launch(input), (id) => abandonLaunch(input, id))
+        .outside(
+          threadIo.launch(input).pipe(
+            Effect.tap((id) =>
+              Effect.gen(function* () {
+                (yield* ownerDelivered)?.add(id);
+              }),
+            ),
+          ),
+          (id) => abandonLaunch(input, id),
+        )
         .pipe(Effect.tap((id) => locks.launched(id, abandonLaunch(input, id)))),
-    send: (input) => locks.outside(threadIo.send(input)),
+    send: (input) =>
+      Effect.gen(function* () {
+        const key = yield* ownerDeliveryKey;
+        const delivered = yield* ownerDelivered;
+        const answer = input.key === undefined;
+        if (answer && delivered?.has(input.threadId)) return;
+        return yield* locks.outside(
+          threadIo
+            .send({
+              ...input,
+              ...(key === undefined
+                ? {}
+                : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
+            })
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (answer) delivered?.add(input.threadId);
+                }),
+              ),
+            ),
+        );
+      }),
     setModel: (id, model) => locks.outside(threadIo.setModel(id, model)),
     interrupt: (id, reason) => locks.outside(threadIo.interrupt(id, reason)),
   };
   const modelIo = yield* KanbanModels;
-  const models = { ...modelIo, listed: locks.outside(modelIo.listed) };
+  const models = { ...modelIo, listed: locks.outside(modelIo.listed, undefined, true) };
   const textIo = yield* TextGeneration.TextGeneration;
   const textGeneration: typeof textIo = {
     ...textIo,
@@ -888,9 +929,13 @@ const make = Effect.gen(function* () {
       : {}),
   };
   const projectIo = yield* ProjectService.ProjectService;
-  const projects = { getById: (id: ProjectId) => locks.outside(projectIo.getById(id)) };
+  const projects = {
+    getById: (id: ProjectId) => locks.outside(projectIo.getById(id), undefined, true),
+  };
   const providerIo = yield* ProviderRegistry.ProviderRegistry;
-  const providerRegistry = { getProviders: locks.outside(providerIo.getProviders) };
+  const providerRegistry = {
+    getProviders: locks.outside(providerIo.getProviders, undefined, true),
+  };
   const serverConfig = yield* ServerConfig.ServerConfig;
   const attachmentIo = makeBoardAttachments(serverConfig, yield* FileSystem.FileSystem);
   const attachments: typeof attachmentIo = {
@@ -1081,7 +1126,7 @@ const make = Effect.gen(function* () {
   });
 
   const boardOf = Effect.fn("KanbanService.boardOf")(function* (boardId: string) {
-    const board = (yield* locks.access(boardId, store.boards)).find(
+    const board = (yield* locks.access(boardId, rawStore.boards, false, "board")).find(
       (candidate) => candidate.id === boardId,
     );
     if (!board) return yield* failWith("not-found", `board ${boardId}`);
@@ -2292,7 +2337,9 @@ const make = Effect.gen(function* () {
     if (card) {
       for (const priorId of priors) {
         const handoff = Briefs.cardHandoffText(card.number, discussion.id, threadId);
-        yield* threads.send({ threadId: priorId, text: handoff }).pipe(Effect.ignore);
+        yield* threads
+          .send({ threadId: priorId, text: handoff, key: `handoff:${threadId}:${priorId}` })
+          .pipe(Effect.ignore);
         const prior = actorOf(priorId);
         if (next.participants.some((p) => actorKey(p.actor) === actorKey(prior))) {
           next = withParticipant(next, prior, "Evaluator", { typingUntil: null, owes: null });
@@ -2583,6 +2630,138 @@ const make = Effect.gen(function* () {
     }
     yield* toEvaluator(current, text);
   });
+
+  const ownerDeliveries = new Map<string, Set<string>>();
+  /** Saving succeeds independently of delivery. Every retry starts with fresh board state. */
+  const routeSavedOwner = (
+    discussionId: KanbanDiscussion["id"],
+    key: string,
+    route: Effect.Effect<unknown, unknown>,
+  ) => {
+    let delivered = ownerDeliveries.get(key);
+    if (!delivered) ownerDeliveries.set(key, (delivered = new Set()));
+    const attempt = locks
+      .fresh(locks.run(route))
+      .pipe(
+        Effect.provideService(ownerDeliveryKey, key),
+        Effect.provideService(ownerDelivered, delivered),
+      );
+    const retry = (remaining: number): Effect.Effect<void> =>
+      attempt.pipe(
+        Effect.asVoid,
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logWarning("kanban saved owner message delivery pending", {
+              discussionId,
+              key,
+              cause,
+            });
+            if (remaining > 0) {
+              yield* Effect.yieldNow;
+              return yield* retry(remaining - 1);
+            }
+            // Visible evidence survives a process restart even if the retry worker cannot.
+            yield* locks
+              .fresh(
+                locks.run(
+                  postUnlocked(
+                    discussionId,
+                    { _tag: "system", component: "owner-delivery" },
+                    [
+                      {
+                        _tag: "md",
+                        text: `Owner message delivery pending (${key}). Retrying in the background.`,
+                      },
+                    ],
+                    false,
+                  ),
+                ),
+              )
+              .pipe(Effect.ignore);
+            yield* attempt.pipe(
+              Effect.asVoid,
+              Effect.catchCause((failure) =>
+                Effect.logWarning("kanban owner delivery retry failed", { key, failure }).pipe(
+                  Effect.andThen(Effect.fail("pending")),
+                ),
+              ),
+              Effect.retry(Schedule.spaced("5 seconds")),
+              Effect.forkIn(scope),
+            );
+          }),
+        ),
+      );
+    return retry(3);
+  };
+  const routeRetainingAskers = (
+    discussionId: KanbanDiscussion["id"],
+    key: string,
+    text: string,
+    route: Effect.Effect<unknown, unknown>,
+    askId?: string,
+  ) =>
+    Effect.gen(function* () {
+      const initial = yield* rawStore.discussion(discussionId);
+      const card = initial?.cardId ? yield* rawStore.card(initial.cardId) : null;
+      const specific = card?.asks.find((ask) => ask.id === askId);
+      const asks = specific ? [specific] : card ? kanbanOpenAsks(card) : [];
+      yield* routeSavedOwner(
+        discussionId,
+        key,
+        Effect.gen(function* () {
+          yield* route;
+          for (const ask of asks) {
+            const by = ask.by;
+            if (by._tag !== "thread" && by._tag !== "evaluator") continue;
+            // A blocked worker receives its answer through the saved wake note.
+            if (
+              by._tag === "thread" &&
+              card?.stage === "needs_owner" &&
+              by.threadId === card.workThreadId
+            )
+              continue;
+            const current = yield* discussionOf(discussionId);
+            const next = current.cardId ? yield* cardOf(current.cardId) : null;
+            const live =
+              by._tag === "evaluator"
+                ? yield* liveEvaluator(by.threadId)
+                : by.threadId === next?.activeThreadId;
+            if (live)
+              yield* deliver(
+                current,
+                by,
+                by._tag === "evaluator" ? "Evaluator" : "Worker",
+                by.threadId,
+                text,
+              );
+            else
+              yield* toEvaluator(
+                current,
+                next && by._tag === "thread" ? Asks.passOnText(next, ask, text) : text,
+              );
+          }
+        }),
+      );
+    }).pipe(Effect.mapError(toKanbanError));
+  const routeOwnerPost = (message: KanbanMessage) =>
+    message.author._tag !== "owner"
+      ? Effect.void
+      : Effect.gen(function* () {
+          const initial = yield* discussionOf(message.discussionId);
+          const text = Briefs.ownerMessageText(
+            initial.title,
+            initial.id,
+            blocksText(message.blocks, attachments.pathOf),
+          );
+          yield* routeRetainingAskers(
+            message.discussionId,
+            `owner-post:${message.discussionId}:${message.seq}`,
+            text,
+            Effect.gen(function* () {
+              yield* routeToOwnerAgent(yield* discussionOf(message.discussionId), text);
+            }),
+          );
+        }).pipe(Effect.mapError(toKanbanError));
 
   /** Internal posts, including asks that own a sequence, must not deduplicate. */
   const postUnlocked = Effect.fn("KanbanService.postUnlocked")(function* (
@@ -5913,7 +6092,10 @@ const make = Effect.gen(function* () {
   )(function* (input: RestoreCutoverCardInput) {
     const view = yield* read(threads.find(input.threadId));
     if (view === null || view.archived) {
-      return yield* failWith("not-found", `existing thread ${input.threadId} is missing or archived`);
+      return yield* failWith(
+        "not-found",
+        `existing thread ${input.threadId} is missing or archived`,
+      );
     }
     yield* guard(
       Effect.gen(function* () {
@@ -6887,9 +7069,18 @@ const make = Effect.gen(function* () {
         yield* boardOf(boardId);
         const discussion = yield* newDiscussion(boardId, title, null, actor);
         if (!blocks?.length) return discussion;
-        yield* postUnlocked(discussion.id, actor, blocks);
+        yield* postUnlocked(discussion.id, actor, blocks, actor._tag !== "owner");
         return yield* discussionOf(discussion.id);
       }),
+    ).pipe(
+      Effect.tap((discussion) =>
+        actor._tag === "owner" && blocks?.length
+          ? rawStore.message(discussion.id, discussion.lastSeq).pipe(
+              Effect.flatMap((message) => (message ? routeOwnerPost(message) : Effect.void)),
+              Effect.mapError(toKanbanError),
+            )
+          : Effect.void,
+      ),
     );
 
   const updateDiscussion: KanbanServiceShape["updateDiscussion"] = (discussionId, patch, actor) =>
@@ -6974,8 +7165,17 @@ const make = Effect.gen(function* () {
         if (!block.multi && picked.length + (words === "" ? 0 : 1) > 1) {
           return yield* failWith("invalid", "pick one option or write your own answer");
         }
-        const at = yield* nowIso;
         const key = actorKey(by);
+        const previous = message.answers.find(
+          (entry) => entry.blockId === blockId && actorKey(entry.by) === key,
+        );
+        const choiceIds = picked.map((option) => option.id);
+        const same =
+          previous &&
+          previous.text === (words === "" ? null : words) &&
+          previous.choice.length === choiceIds.length &&
+          previous.choice.every((id, index) => id === choiceIds[index]);
+        const at = same ? previous.at : yield* nowIso;
         const next: KanbanMessage = {
           ...message,
           answers: [
@@ -6993,46 +7193,64 @@ const make = Effect.gen(function* () {
         };
         yield* store.putMessage(next);
         yield* publish(discussion.boardId, { _tag: "message", message: next });
-        if (by._tag !== "owner") return next;
-        const said = [
-          ...picked.map((option) => option.label),
-          ...(words === "" ? [] : [`his own answer: "${words}"`]),
-        ].join(", ");
-        const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${said}`;
-        const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
-        // A pick on an ask answers that ask alone.
-        const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
-        if (card !== null && ask !== undefined && ask.closedAt === null) {
-          yield* routeToOwnerAgent(discussion, note, "owner", (open) => open.id === ask.id);
-          return next;
-        }
-        if (card !== null && ask !== undefined) {
-          // Already answered or dropped: its asker hears the late pick, and nothing else closes.
-          const by = ask.by;
-          if (by._tag === "thread" && by.threadId === card.activeThreadId) {
-            yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, note);
-          } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
-            yield* deliver(discussion, by, "Evaluator", by.threadId, note);
-          } else {
-            yield* toEvaluator(
-              discussion,
-              by._tag === "thread" ? Asks.passOnText(card, ask, note) : note,
-            );
-          }
-          return next;
-        }
-        // A pick on a card waiting on the owner answers it like a reply does.
-        const waiting = card !== null && card.stage === "needs_owner";
-        const author = message.author;
-        if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
-          if (yield* liveEvaluator(author.threadId)) {
-            yield* deliver(discussion, author, message.authorName, author.threadId, note);
-            return next;
-          }
-        }
-        yield* routeToOwnerAgent(discussion, note);
-        return next;
+        return {
+          next,
+          note: `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")}`,
+        };
       }),
+    ).pipe(
+      Effect.flatMap(({ next, note }) =>
+        by._tag !== "owner"
+          ? Effect.succeed(next)
+          : routeRetainingAskers(
+              discussionId,
+              `owner-answer:${discussionId}:${seq}:${blockId}:${next.answers.find((entry) => entry.blockId === blockId && actorKey(entry.by) === actorKey(by))!.at}`,
+              note,
+              Effect.gen(function* () {
+                const discussion = yield* discussionOf(discussionId);
+                const message = next;
+                const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
+                // A pick on an ask answers that ask alone.
+                const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
+                if (card !== null && ask !== undefined && ask.closedAt === null) {
+                  yield* routeToOwnerAgent(discussion, note, "owner", (open) => open.id === ask.id);
+                  return;
+                }
+                if (card !== null && ask !== undefined) {
+                  // Already answered or dropped: its asker hears the late pick, and nothing else closes.
+                  const by = ask.by;
+                  if (by._tag === "thread" && by.threadId === card.activeThreadId) {
+                    yield* deliver(
+                      discussion,
+                      by,
+                      roleName(card.activeRole ?? "work"),
+                      by.threadId,
+                      note,
+                    );
+                  } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
+                    yield* deliver(discussion, by, "Evaluator", by.threadId, note);
+                  } else {
+                    yield* toEvaluator(
+                      discussion,
+                      by._tag === "thread" ? Asks.passOnText(card, ask, note) : note,
+                    );
+                  }
+                  return;
+                }
+                // A pick on a card waiting on the owner answers it like a reply does.
+                const waiting = card !== null && card.stage === "needs_owner";
+                const author = message.author;
+                if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
+                  if (yield* liveEvaluator(author.threadId)) {
+                    yield* deliver(discussion, author, message.authorName, author.threadId, note);
+                    return;
+                  }
+                }
+                yield* routeToOwnerAgent(discussion, note);
+              }),
+              blockId,
+            ).pipe(Effect.as(next)),
+      ),
     );
 
   // Null when the read is already recorded, else the discussion to save.
@@ -7206,7 +7424,9 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.tapError((cause) => Effect.logWarning("Board startup recovery will retry", { cause })),
+        Effect.tapError((cause) =>
+          Effect.logWarning("Board startup recovery will retry", { cause }),
+        ),
         Effect.retry(Schedule.spaced("1 second")),
         Effect.andThen(Deferred.succeed(startupReady, undefined)),
       ),
@@ -7303,14 +7523,16 @@ const make = Effect.gen(function* () {
         }),
       ),
     post: (discussionId, author, blocks) =>
-      guard(postUnlocked(discussionId, author, blocks, true, true)),
+      guard(postUnlocked(discussionId, author, blocks, author._tag !== "owner", true)).pipe(
+        Effect.tap(routeOwnerPost),
+      ),
     postToCard: (cardId, author, blocks) =>
       guard(
         Effect.gen(function* () {
           const discussion = yield* cardDiscussionUnlocked(cardId);
-          return yield* postUnlocked(discussion.id, author, blocks, true, true);
+          return yield* postUnlocked(discussion.id, author, blocks, author._tag !== "owner", true);
         }),
-      ),
+      ).pipe(Effect.tap(routeOwnerPost)),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,
