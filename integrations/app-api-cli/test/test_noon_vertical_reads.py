@@ -14,6 +14,24 @@ SUPERMALL_FRESH = json.loads((Path(__file__).parent
 
 
 class VerticalReadsTest(unittest.TestCase):
+    def test_full_cancelled_inventory_is_terminal_with_native_provenance(self):
+        data=self.manifest();data['itemGroups'][0]['subStatus']['highStatusCode']='cancelled'
+        data['itemGroups'][0]['text']='Cancelled today, 06:18 PM'
+        result=v.manifest_projection(data,self.order)
+        self.assertEqual(result['status'],'cancelled');self.assertTrue(result['whole_order_complete'])
+        self.assertEqual(result['terminal_evidence']['source'],'native_order_detail_item_groups')
+        self.assertIn('06:18 PM',result['terminal_evidence']['provider_text'][0])
+
+    def test_full_cancellation_wins_over_cached_processing(self):
+        import native_orders
+        data=self.manifest();data['itemGroups'][0]['subStatus']['highStatusCode']='cancelled'
+        manifest=v.manifest_projection(data,self.order)
+        scoped={'status':'unknown','raw_status':'processing','whole_order_complete':False,'items':[]}
+        with patch.object(v.core,'track',return_value=scoped), patch.object(v,'track',return_value=manifest):
+            result=native_orders.noon_marketplace_track(self.order,10)
+        self.assertEqual(result['status'],'cancelled');self.assertTrue(result['whole_order_complete'])
+        self.assertEqual(result['terminal_evidence']['order'],self.order)
+
     def test_food_live_window_and_unknown_status(self):
         data = {'status': 'success', 'data': {'orderNr': 'FTEST', 'status': 'delivering',
                 'estimate': {'time': '05:45 PM - 05:55 PM', 'timestamp': '2026-11-07T17:45:00'}}}

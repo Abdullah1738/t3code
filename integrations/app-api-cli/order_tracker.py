@@ -663,7 +663,7 @@ def fetch(cfg, state, now):
             elif cfg['app'] == 'talabat':
                 state.pop('talabat_confirmation_delayed_since', None)
             native_details.update({k: native[k] for k in (
-                'shipments', 'items', 'vendor_name', 'scope', 'whole_order_complete', 'truncated',
+                'shipments', 'items', 'vendor_name', 'scope', 'whole_order_complete', 'truncated','terminal_evidence',
                 'warnings', 'partial', 'read_coverage', 'eta_window', 'eta_relative_minutes', 'status_text', 'status_source',
                 'status_text_source', 'raw_status', 'manifest_complete', 'manifest_source',
                 'manifest_item_count', 'observed_item_count', 'manifest_items',

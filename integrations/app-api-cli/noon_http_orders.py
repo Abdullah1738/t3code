@@ -36,7 +36,7 @@ MINUTES_STAGES = {'confirmed': 'placed', 'preparing': 'preparing',
                   'ready_for_pickup': 'preparing',
                   'picked_up': 'out for delivery',
                   'arrived_at_delivery': 'nearby', 'delivered': 'delivered'}
-MARKETPLACE_STAGES = {'out_for_delivery': 'out for delivery', 'delivered': 'delivered'}
+MARKETPLACE_STAGES = {'out_for_delivery': 'out for delivery', 'delivered': 'delivered', 'cancelled':'cancelled'}
 ORDER = re.compile(r'[A-Z0-9]{1,64}')
 # Live-verified 2026-10-11: marketplace shipments are -S<digits> (packed+) and
 # rocket orders bind a -U<digits> fulfillment unit until packing rebinds -S.

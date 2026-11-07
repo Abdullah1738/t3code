@@ -221,13 +221,19 @@ def manifest_projection(data, order):
                 and all(i['shipment_id'] for i in items if i['raw_status'] == 'delivered')
                 and not any(row.get('virtualBundleCode') for g in groups for row in g['items']))
     delivered = complete and all(i['status'] == 'delivered' for i in items)
+    cancelled = complete and all(i['raw_status']=='cancelled' for i in items)
     out = core.base(order, 'marketplace')
     out.update(items=items, manifest_source='native_order_detail_item_groups',
-               manifest_complete=bool(complete), whole_order_complete=bool(delivered),
-               status='delivered' if delivered else 'unknown', scope='order',
+               manifest_complete=bool(complete), whole_order_complete=bool(delivered or cancelled),
+               status='delivered' if delivered else 'cancelled' if cancelled else 'unknown', scope='order',
                manifest_item_count=count, observed_item_count=len(items),
                coverage='exact_order_detail_inventory; invoice_count_reconciled' if complete
                         else 'exact_order_detail_inventory; incomplete_or_unverified_count_contract')
+    if cancelled:
+        out['terminal_evidence']={'source':'native_order_detail_item_groups','order':order,
+            'raw_status':'cancelled','item_ids':sorted(seen),'invoice_item_count':count,
+            'observed_at':out['checked_at'],
+            'provider_text':[core.text(g.get('text')) for g in groups]}
     return out
 
 

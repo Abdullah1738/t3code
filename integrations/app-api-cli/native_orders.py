@@ -240,6 +240,12 @@ def noon_marketplace_track(order, timeout):
                 known.add(key)
         out['shipments'] = parts
         if (manifest.get('manifest_complete') is True and manifest.get('whole_order_complete') is True
+                and manifest.get('status')=='cancelled'):
+            # Full exact cancellation is authoritative over cached processing cards.
+            out.update(status='cancelled',raw_status='cancelled',whole_order_complete=True,scope='order',
+                       eta=None,eta_text=None,eta_source=None,rider=None,coverage=manifest['coverage'],
+                       terminal_evidence=manifest['terminal_evidence'])
+        if (manifest.get('manifest_complete') is True and manifest.get('whole_order_complete') is True
                 and manifest.get('status') == 'delivered'):
             if _noon_manifest_conflict(scoped or {}, manifest):
                 failures.append('MANIFEST_SCOPED_EVIDENCE_CONFLICT')
