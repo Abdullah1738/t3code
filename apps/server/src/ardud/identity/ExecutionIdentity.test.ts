@@ -1,6 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -458,6 +461,108 @@ const runStaleOnly = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.Executio
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ExecutionIdentity", () => {
+  it.effect(
+    "indexes native-id and pending-provider queries on an existing database idempotently",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
+            thread("t-index", "pt-index", { parentThreadId: null, rootThreadId: "t-index" }),
+          )}`;
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+            provider("pt-index", "t-index", "codex", "native-index", CLOCK_NOW),
+          )}`;
+
+          const nativePlan = sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN
+          SELECT pt.provider_thread_id, pt.thread_id,
+            COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+            COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+            pt.updated_at,
+            CASE WHEN t.active_provider_thread_id = pt.provider_thread_id THEN 1 ELSE 0 END AS active
+          FROM orchestration_v2_projection_provider_threads pt
+          LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = pt.thread_id
+          WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${"native-index"}
+        `;
+          const pendingPlan = sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN
+          SELECT COALESCE(driver, json_extract(payload_json, '$.driver')) AS driver,
+            COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
+          FROM orchestration_v2_projection_provider_threads
+          WHERE json_extract(payload_json, '$.createdAt') >= ${CLOCK_NOW}
+        `;
+
+          assert.include(
+            (yield* nativePlan).map((row) => row.detail),
+            "SCAN pt",
+          );
+          assert.include(
+            (yield* pendingPlan).map((row) => row.detail),
+            "SCAN orchestration_v2_projection_provider_threads",
+          );
+
+          yield* Layer.build(Layer.fresh(ExecutionIdentity.layer));
+          yield* Layer.build(Layer.fresh(ExecutionIdentity.layer));
+
+          const nativeDetails = (yield* nativePlan).map((row) => row.detail).join("\n");
+          const pendingDetails = (yield* pendingPlan).map((row) => row.detail).join("\n");
+          assert.include(nativeDetails, "USING INDEX ardud_idx_provider_threads_native_id");
+          assert.notMatch(
+            nativeDetails,
+            /SCAN (?:pt|orchestration_v2_projection_provider_threads)\b/,
+          );
+          assert.include(pendingDetails, "USING INDEX ardud_idx_provider_threads_created_at");
+          assert.notMatch(pendingDetails, /SCAN orchestration_v2_projection_provider_threads\b/);
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory)),
+  );
+
+  it.effect.each(["ardud_idx_provider_threads_native_id", "ardud_idx_provider_threads_created_at"])(
+    "warns and keeps resolving when creating %s fails",
+    (index) => {
+      const warnings: Array<unknown> = [];
+      const logger = Logger.make(({ logLevel, message }) => {
+        if (logLevel === "Warn") warnings.push(message);
+      });
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          // A conflicting schema name makes CREATE INDEX fail without breaking identity reads.
+          yield* sql`CREATE TABLE ${sql(index)} (id TEXT)`;
+          yield* Effect.gen(function* () {
+            yield* seed;
+            const identity = yield* ExecutionIdentity.ExecutionIdentity;
+            assert.strictEqual(
+              (yield* identity.resolve({ nativeId: "ses_top" })).resolution,
+              "resolved",
+            );
+          }).pipe(Effect.provide(ExecutionIdentity.layer));
+          assert.lengthOf(warnings, 1);
+          const indexes = yield* sql<{ readonly name: string }>`
+            SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN (
+              'ardud_idx_provider_threads_native_id', 'ardud_idx_provider_threads_created_at'
+            )
+          `;
+          assert.lengthOf(indexes, 1);
+          assert.notStrictEqual(indexes[0]?.name, index);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.merge(Sqlite.layerMemory, Logger.layer([logger], { mergeWithExisting: false })),
+        ),
+      );
+    },
+  );
+
+  it.effect("builds without the projection table", () =>
+    Effect.scoped(Layer.build(ExecutionIdentity.layer)).pipe(
+      Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })),
+    ),
+  );
+
   it.effect("resolves a top-level OpenCode session to its thread", () =>
     run(
       Effect.gen(function* () {

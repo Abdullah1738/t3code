@@ -157,6 +157,25 @@ const make = Effect.gen(function* () {
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import")));
 
+  // Sqlite setup runs migrations first; index failures must not prevent startup.
+  for (const ensureIndex of [
+    sql`
+      CREATE INDEX IF NOT EXISTS ardud_idx_provider_threads_native_id
+      ON orchestration_v2_projection_provider_threads (json_extract(payload_json, '$.nativeThreadRef.nativeId'))
+    `,
+    sql`
+      CREATE INDEX IF NOT EXISTS ardud_idx_provider_threads_created_at
+      ON orchestration_v2_projection_provider_threads (json_extract(payload_json, '$.createdAt'))
+    `,
+  ]) {
+    yield* ensureIndex.pipe(
+      Effect.mapError(fail("ensure-identity-indexes")),
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to ensure execution identity indexes", error),
+      ),
+    );
+  }
+
   // Driver and instance columns are newer than some rows; fall back to payload.
   const providerRowsFor = (nativeId: string) =>
     sql<ProviderRow>`
@@ -246,7 +265,11 @@ const make = Effect.gen(function* () {
   // Claude's in-process tasks share the root provider thread. Resolve just the
   // immediate owner here; hook policy handles any further ancestry separately.
   const ownerChildThread = (threadId: string, parentNodeId: string) =>
-    sql<{ readonly child_thread_id: string; readonly provider_thread_id: string | null; readonly native_agent_id: string | null }>`
+    sql<{
+      readonly child_thread_id: string;
+      readonly provider_thread_id: string | null;
+      readonly native_agent_id: string | null;
+    }>`
       SELECT s.child_thread_id, n.provider_thread_id,
         json_extract(s.payload_json, '$.nativeTaskRef.nativeId') AS native_agent_id
       FROM orchestration_v2_projection_subagents AS s
@@ -375,7 +398,10 @@ const make = Effect.gen(function* () {
         const owner = subagent.parent_node_id
           ? yield* ownerChildThread(threadId, subagent.parent_node_id)
           : null;
-        if (owner !== null && (owner.provider_thread_id !== row.provider_thread_id || !owner.native_agent_id)) {
+        if (
+          owner !== null &&
+          (owner.provider_thread_id !== row.provider_thread_id || !owner.native_agent_id)
+        ) {
           return unresolved("unavailable");
         }
         return {
