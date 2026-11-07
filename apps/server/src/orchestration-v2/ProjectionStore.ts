@@ -569,6 +569,13 @@ export interface ProjectionStoreV2Shape {
   readonly canStartQueuedRun: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly getLiveSharedProviderSessions: () => Effect.Effect<
+    ReadonlyArray<{
+      readonly threadId: ThreadId;
+      readonly session: OrchestrationV2ThreadProjection["providerSessions"][number];
+    }>,
+    ProjectionStoreV2Error
+  >;
   readonly getRecoveryThreadIds: (
     kind: ProjectionRecoveryKind,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
@@ -672,7 +679,10 @@ function needsRecovery(
             ["pending", "running", "waiting"].includes(subagent.status),
         ) ||
         projection.providerSessions.some(
-          (session) => session.status !== "stopped" && session.status !== "error",
+          (session) =>
+            session.status !== "stopped" &&
+            session.status !== "error" &&
+            !isSharedProviderSession(session),
         ) ||
         projection.providerThreads.some(
           (thread) =>
@@ -686,6 +696,15 @@ function needsRecovery(
         )
       );
   }
+}
+
+export function isSharedProviderSession(
+  session: OrchestrationV2ThreadProjection["providerSessions"][number],
+): boolean {
+  return (
+    session.id.endsWith(":shared") ||
+    session.capabilities?.sessions?.supportsMultipleProviderThreadsPerSession === true
+  );
 }
 
 function upsertById<T extends { readonly id: string }>(items: ReadonlyArray<T>, next: T): Array<T> {
@@ -987,6 +1006,13 @@ export function applyToProjection(
  */
 export interface ProjectionReplayState {
   readonly projections: Map<ThreadId, OrchestrationV2ThreadProjection>;
+  readonly providerSessions: Map<
+    ProviderSessionId,
+    {
+      readonly threadId: ThreadId;
+      readonly session: OrchestrationV2ThreadProjection["providerSessions"][number];
+    }
+  >;
   readonly providerSessionThreadIds: Map<ProviderSessionId, ReadonlySet<ThreadId>>;
   readonly providerThreadInstanceIds: Map<ProviderThreadId, ProviderInstanceId>;
 }
@@ -994,6 +1020,7 @@ export interface ProjectionReplayState {
 function makeProjectionReplayState(): ProjectionReplayState {
   return {
     projections: new Map(),
+    providerSessions: new Map(),
     providerSessionThreadIds: new Map(),
     providerThreadInstanceIds: new Map(),
   };
@@ -1043,6 +1070,10 @@ function applyToProjectionReplayState(
       break;
     }
     case "provider-session.attached": {
+      state.providerSessions.set(event.payload.id, {
+        threadId: event.threadId,
+        session: event.payload,
+      });
       const boundThreadIds = new Set(state.providerSessionThreadIds.get(event.payload.id) ?? []);
       boundThreadIds.add(event.threadId);
       state.providerSessionThreadIds.set(event.payload.id, boundThreadIds);
@@ -1058,6 +1089,10 @@ function applyToProjectionReplayState(
       break;
     }
     case "provider-session.updated": {
+      state.providerSessions.set(event.payload.id, {
+        threadId: event.threadId,
+        session: event.payload,
+      });
       const boundThreadIds = state.providerSessionThreadIds.get(event.payload.id) ?? [];
       for (const threadId of boundThreadIds) {
         if (threadId === event.threadId) continue;
@@ -3958,6 +3993,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
+    const getLiveSharedProviderSessions = Effect.fn(
+      "ProjectionStore.getLiveSharedProviderSessions",
+    )(
+      function* () {
+        const rows = yield* sql<PayloadRow & { readonly thread_id: string | null }>`
+          SELECT sessions.payload_json, COALESCE(sessions.thread_id, (
+            SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings
+            WHERE provider_session_id = sessions.provider_session_id LIMIT 1
+          )) AS thread_id
+          FROM orchestration_v2_projection_provider_sessions AS sessions
+          WHERE sessions.status NOT IN ('stopped', 'error')
+            AND (sessions.provider_session_id GLOB '*:shared' OR CASE WHEN json_valid(sessions.payload_json) THEN json_extract(sessions.payload_json, '$.capabilities.sessions.supportsMultipleProviderThreadsPerSession') IS 1 ELSE 0 END)
+        `;
+        return yield* Effect.forEach(
+          rows.filter((row) => row.thread_id !== null),
+          (row) =>
+            decodeProviderSessionPayload(row.payload_json).pipe(
+              Effect.map((session) => ({ threadId: ThreadId.make(row.thread_id!), session })),
+            ),
+        );
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getRecoveryThreadIds = Effect.fn("ProjectionStore.getRecoveryThreadIds")(
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
@@ -4039,11 +4098,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 CROSS JOIN orchestration_v2_projection_provider_session_bindings AS bindings
                   ON bindings.provider_session_id = sessions.provider_session_id
                 WHERE sessions.status NOT IN ('stopped', 'error')
+                  AND NOT (sessions.provider_session_id GLOB '*:shared' OR CASE WHEN json_valid(sessions.payload_json) THEN json_extract(sessions.payload_json, '$.capabilities.sessions.supportsMultipleProviderThreadsPerSession') IS 1 ELSE 0 END)
                 UNION
                 -- A detach drops the binding but keeps the session's status.
                 SELECT sessions.thread_id
                 FROM orchestration_v2_projection_provider_sessions AS sessions
                 WHERE sessions.status NOT IN ('stopped', 'error')
+                  AND NOT (sessions.provider_session_id GLOB '*:shared' OR CASE WHEN json_valid(sessions.payload_json) THEN json_extract(sessions.payload_json, '$.capabilities.sessions.supportsMultipleProviderThreadsPerSession') IS 1 ELSE 0 END)
                   AND sessions.thread_id IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM orchestration_v2_projection_provider_session_bindings AS bindings
@@ -4060,14 +4121,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 CROSS JOIN orchestration_v2_projection_subagents AS subagents
                   ON subagents.provider_thread_id = pending_provider_threads.provider_thread_id
                 UNION
-                SELECT subagents.child_thread_id FROM orchestration_v2_projection_subagents AS subagents
-                WHERE subagents.child_thread_id IS NOT NULL
+                -- Match the partial live-nodes index, retaining the original statuses.
+                SELECT node.thread_id FROM orchestration_v2_projection_nodes AS node
+                WHERE node.status IN ('pending', 'starting', 'running', 'waiting')
+                  AND node.status <> 'starting'
+                  AND node.run_id IS NULL
+                  AND node.kind = 'root_turn'
                   AND EXISTS (
-                    SELECT 1 FROM orchestration_v2_projection_nodes AS node
-                    WHERE node.thread_id = subagents.child_thread_id
-                      AND node.run_id IS NULL
-                      AND node.kind = 'root_turn'
-                      AND node.status IN ('pending', 'running', 'waiting')
+                    SELECT 1 FROM orchestration_v2_projection_subagents AS subagents
+                    WHERE subagents.child_thread_id = node.thread_id
                   )
                 UNION
                 -- No native subagent outlives the provider process that ran it.
@@ -6648,6 +6710,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getPlan,
       getProviderControlContext,
       getLimitRecoveryCandidates,
+      getLiveSharedProviderSessions,
       getRecoveryThreadIds,
       getUnreadableThreadIds,
       getThreadSnapshot,
@@ -6674,6 +6737,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           const result = yield* Ref.modify(replayState, (existing) => {
             const next: ProjectionReplayState = {
               projections: new Map(existing.projections),
+              providerSessions: new Map(existing.providerSessions),
               providerSessionThreadIds: new Map(existing.providerSessionThreadIds),
               providerThreadInstanceIds: new Map(existing.providerThreadInstanceIds),
             };
@@ -6879,6 +6943,17 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 );
               })
               .toSorted((left, right) => left.id.localeCompare(right.id)),
+          ),
+        ),
+      getLiveSharedProviderSessions: () =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.providerSessions.values()].filter(
+              ({ session }) =>
+                isSharedProviderSession(session) &&
+                session.status !== "stopped" &&
+                session.status !== "error",
+            ),
           ),
         ),
       getRecoveryThreadIds: Effect.fn("ProjectionStore.getRecoveryThreadIds")(function* (kind) {

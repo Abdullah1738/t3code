@@ -1585,6 +1585,79 @@ it.effect("memory recovery selects unfinished runless native subagents", () =>
   runlessNativeSubagentNeedsRecovery.pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
 
+for (const [name, layer] of [
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const) {
+  it.effect(`${name} excludes shared bindings but retains dedicated sessions for recovery`, () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("shared-session-selection");
+      const now = yield* DateTime.now;
+      for (const [id, shared] of [
+        ["session:suffix:shared", false],
+        ["session:capability", true],
+        ["session:dedicated", false],
+      ] as const) {
+        const session = {
+          id: ProviderSessionId.make(id),
+          driver,
+          providerInstanceId,
+          status: "ready" as const,
+          cwd: "/workspace",
+          model: modelSelection.model,
+          capabilities: {
+            ...CodexProviderCapabilitiesV2,
+            sessions: {
+              ...CodexProviderCapabilitiesV2.sessions,
+              supportsMultipleProviderThreadsPerSession: shared,
+            },
+          },
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        };
+        yield* store.apply({
+          id: EventId.make(`event:${id}:attach`),
+          type: "provider-session.attached",
+          threadId,
+          occurredAt: now,
+          payload: session,
+        });
+        assert.equal(
+          (yield* store.getRecoveryThreadIds("runtime")).includes(threadId),
+          id === "session:dedicated",
+        );
+      }
+      assert.deepEqual(
+        (yield* store.getLiveSharedProviderSessions()).map(({ session }) => session.id).sort(),
+        ["session:capability", "session:suffix:shared"],
+      );
+      for (const { session } of yield* store.getLiveSharedProviderSessions()) {
+        yield* store.apply({
+          id: EventId.make(`event:${session.id}:detach`),
+          type: "provider-session.detached",
+          threadId,
+          occurredAt: now,
+          payload: { providerSessionId: session.id, detachedAt: now },
+        });
+      }
+      const detached = yield* store.getLiveSharedProviderSessions();
+      assert.lengthOf(detached, 2);
+      for (const { session } of detached) {
+        yield* store.apply({
+          id: EventId.make(`event:${session.id}:stop`),
+          type: "provider-session.updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...session, status: "stopped" },
+        });
+      }
+      assert.isEmpty(yield* store.getLiveSharedProviderSessions());
+    }).pipe(Effect.provide(layer)),
+  );
+}
+
 const assertProjectScopedShells = Effect.fn("assertProjectScopedShells")(function* (
   suffix: string,
 ) {
@@ -4794,6 +4867,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN ${recoveryStatement}`,
       );
+      assert.include(
+        recoveryPlan.map((row) => row.detail).join("\n"),
+        "orchestration_v2_projection_nodes_live_idx",
+      );
       assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
@@ -5150,6 +5227,11 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           payload: session,
         });
       }
+      assert.notInclude(yield* store.getRecoveryThreadIds("runtime"), otherThreadId);
+      assert.include(
+        (yield* store.getLiveSharedProviderSessions()).map(({ session }) => session.id),
+        session.id,
+      );
       yield* assertSummary("Plan limit reached.", "usage_limit");
       yield* store.apply({
         id: EventId.make("event:limit-shell:session-failed"),
