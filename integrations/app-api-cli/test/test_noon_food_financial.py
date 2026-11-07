@@ -1,0 +1,313 @@
+import copy
+import json
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import commerce_journal as j
+import noon_food_financial as f
+import noon_food_recovery as recovery
+import commerce_food as food
+from noon_checkout import fingerprint
+
+
+ORDER='FSYNTHETIC1'
+CARD='161'
+INTENT='synthetic-secret-never-persist'
+
+
+class Reader:
+    def __init__(self):
+        self.session_data={'account_hash':'a'*64,'scope_hash':'b'*64,'session_id':'SESSION1',
+            'review_hash':'c'*64,'amount_minor':4585,'card_hash':j.digest(CARD),'order_id':None}
+        self.order_data={'order_id':ORDER,'account_hash':'a'*64,'scope_hash':'b'*64,'amount_minor':4585,
+            'card_hash':j.digest(CARD),'intent':INTENT,'accepted':False,'cvv_required':False}
+        self.payment_data={'reference':ORDER,'currency_code':'AED','amount':45.85,'cc_masked':'****2342',
+            'payment_method_code':'cc_noonpay','id_token':CARD,'status':'synthetic_pending',
+            'transaction_status':'SYNTHETIC_PENDING','error_code':'0','authorized_amount':0,'captured_amount':0}
+
+    def session(self):return copy.deepcopy(self.session_data)
+    def order(self, order):return copy.deepcopy(self.order_data)
+    def payment(self, intent):return copy.deepcopy(self.payment_data)
+    def card_token(self):return CARD
+    def continuation_verified(self, row, payment):return True
+    def capture(self):
+        self.payment_data.update(status='payment_confirmed',transaction_status='CAPTURED',
+                                 authorized_amount=45.85,captured_amount=45.85)
+
+
+class FoodFinancialTests(unittest.TestCase):
+    def setUp(self):
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        self.root=Path(temp.name)
+        p=patch.object(j,'ROOT',self.root);p.start();self.addCleanup(p.stop)
+        self.flow=str(uuid.uuid4())
+        j.open_flow(flow_id=self.flow,app='noon',vertical='food',account_hash='a'*64,scope_hash='b'*64)
+        self.reader=Reader();self.calls=[];self.registrations=[]
+        self.fail_send=None
+        def send(operation,payload):
+            self.calls.append((operation,copy.deepcopy(payload)))
+            if operation=='place':self.reader.session_data['order_id']=ORDER
+            if self.fail_send==operation:raise TimeoutError('synthetic')
+        self.transport=SimpleNamespace(assert_enabled=lambda:None,send=send)
+        def register(order,*,paid):
+            self.registrations.append((order,paid))
+            return {'registered':True,'order':order,'held':not paid}
+        self.co=f.Coordinator(self.flow,self.reader,register,transport=self.transport)
+
+    def test_default_transport_refuses_before_reads_or_journal(self):
+        reader=Mock()
+        co=f.Coordinator(self.flow,reader,Mock())
+        for method in (co.place,co.complete_payment):
+            with self.assertRaisesRegex(j.JournalError,'FOOD_LIVE_FINANCIAL_TRANSPORT_DISABLED'):method()
+        self.assertEqual(j.inspect(self.flow)['operations'],[])
+        self.assertEqual(reader.mock_calls,[])
+
+    def test_ambiguous_place_bound_recovery_never_resends(self):
+        self.fail_send='place'
+        self.assertEqual(self.co.place()['state'],'PLACE_OUTCOME_UNKNOWN')
+        self.assertEqual(j.inspect(self.flow)['state'],'FENCED')
+        before=self.co.path.read_text()
+        with self.assertRaises(j.JournalError):self.co.place()
+        self.assertEqual(self.co.path.read_text(),before)
+        result=self.co.recover()
+        self.assertEqual(result['state'],'PAYMENT_UNCONFIRMED')
+        self.assertEqual(result['order'],ORDER)
+        self.assertTrue(result['tracker']['held'])
+        self.assertEqual(len(self.calls),1)
+        self.reader.capture();self.reader.order_data['accepted']=True
+        self.assertEqual(self.co.recover()['state'],'PAID_AND_ACCEPTED')
+        self.assertEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        self.assertEqual(self.co.recover()['state'],'PAID_AND_ACCEPTED')
+        self.assertEqual(len(self.calls),1)
+
+    def test_place_without_exact_session_order_retains_reservation(self):
+        self.fail_send='place';self.co.place();self.reader.session_data['order_id']=None
+        self.assertEqual(self.co.recover()['state'],'PLACE_OUTCOME_UNKNOWN')
+        self.assertEqual(j.inspect(self.flow)['reserved_minor'],4585)
+        self.assertEqual(self.registrations,[])
+        with self.assertRaises(j.JournalError):
+            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+
+    def test_ambiguous_complete_recovery_and_repeat_are_read_only(self):
+        self.co.place();self.fail_send='complete'
+        self.assertEqual(self.co.complete_payment()['state'],'PAYMENT_OUTCOME_UNKNOWN')
+        with self.assertRaises(j.JournalError):self.co.complete_payment()
+        self.assertEqual([r[0] for r in self.calls],['place','complete'])
+        self.reader.capture();self.reader.order_data['accepted']=True
+        self.assertEqual(self.co.recover()['state'],'PAID_AND_ACCEPTED')
+        self.assertEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        self.co.recover()
+        self.assertEqual(len(self.calls),2)
+
+    def test_crash_after_reservation_before_response_is_recovery_only(self):
+        def crash(operation,payload):raise SystemExit('simulated process exit')
+        self.transport.send=crash
+        with self.assertRaises(SystemExit):self.co.place()
+        self.assertEqual(j.inspect(self.flow)['operations'][0]['state'],'MAY_HAVE_SENT')
+        with self.assertRaises(j.JournalError):self.co.place()
+        self.assertEqual(self.co.recover()['state'],'PLACE_OUTCOME_UNKNOWN')
+        self.reader.session_data['order_id']=ORDER;self.reader.capture();self.reader.order_data['accepted']=True
+        self.assertEqual(self.co.recover()['state'],'PAID_AND_ACCEPTED')
+
+    def test_two_workers_can_dispatch_place_only_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        other=f.Coordinator(self.flow,self.reader,self.co.registrar,transport=self.transport)
+        def place(co):
+            try:return co.place()['state']
+            except j.JournalError:return 'blocked'
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(place,[self.co,other]))
+        self.assertEqual(sorted(results),['PAYMENT_UNCONFIRMED','blocked'])
+        self.assertEqual(len(self.calls),1)
+
+    def test_retained_state_must_match_journal_quote(self):
+        self.co.place()
+        state=json.loads(self.co.path.read_text());state['amount_minor']=4586
+        self.co.save(state);self.reader.session_data['amount_minor']=4586
+        with self.assertRaisesRegex(j.JournalError,'JOURNAL_BINDING_MISMATCH'):self.co.recover()
+
+    def test_successful_complete_ack_is_not_capture(self):
+        self.co.place()
+        self.assertEqual(self.co.complete_payment()['state'],'PAYMENT_UNCONFIRMED')
+        with self.assertRaises(j.JournalError):self.co.complete_payment()
+        self.assertNotEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        self.assertEqual(len(self.calls),2)
+
+    def test_captured_but_not_accepted_keeps_card_held(self):
+        self.co.place();self.reader.capture()
+        result=self.co.recover()
+        self.assertEqual(result['state'],'PAID_AWAITING_ACCEPTANCE')
+        self.assertTrue(result['paid']);self.assertFalse(result['accepted'])
+        self.assertTrue(result['tracker']['held'])
+        self.assertEqual(j.inspect(self.flow)['state'],'ACTIVE')
+        self.co.complete_payment()
+        self.assertEqual(len(self.calls),1)
+
+    def test_registration_failure_cannot_finish_or_trigger_payment(self):
+        self.co.place();self.reader.capture();self.reader.order_data['accepted']=True
+        self.co.registrar=lambda *a,**kw:{'registered':False,'order':ORDER}
+        with self.assertRaises(j.JournalError):self.co.recover()
+        self.assertNotEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        self.assertEqual(len(self.calls),1)
+
+    def test_payment_outage_still_registers_exact_order_held(self):
+        self.reader.payment=Mock(side_effect=TimeoutError('do not persist me'))
+        result=self.co.place()
+        self.assertEqual(result['order'],ORDER)
+        self.assertTrue(result['tracker']['held'])
+        self.assertEqual(result['state'],'PAYMENT_UNCONFIRMED')
+        self.assertIsNotNone(result['payment_error'])
+
+    def test_different_session_review_amount_card_or_account_block_recovery(self):
+        self.co.place()
+        for key,value in [('session_id','SESSION2'),('review_hash','d'*64),('amount_minor',4586),
+                          ('card_hash','e'*64),('account_hash','f'*64),('scope_hash','e'*64)]:
+            old=self.reader.session_data[key];self.reader.session_data[key]=value
+            with self.subTest(key=key),self.assertRaises(j.JournalError):self.co.recover()
+            self.reader.session_data[key]=old
+        self.assertEqual(len(self.calls),1)
+
+    def test_order_and_intent_replacement_refused(self):
+        self.co.place()
+        self.reader.order_data['intent']='replacement'
+        with self.assertRaisesRegex(j.JournalError,'INTENT_CHANGED'):self.co.recover()
+        self.reader.order_data['intent']=INTENT;self.reader.session_data['order_id']='FOTHER'
+        with self.assertRaisesRegex(j.JournalError,'ORDER_ID_CHANGED'):self.co.recover()
+
+    def test_unknown_pending_and_missing_cvv_never_send(self):
+        self.co.place();self.reader.continuation_verified=lambda *a:False
+        with self.assertRaisesRegex(j.JournalError,'UNPAID_INTENT_CONTRACT'):self.co.complete_payment()
+        self.reader.continuation_verified=lambda *a:True;self.reader.order_data['cvv_required']=None
+        with self.assertRaisesRegex(j.JournalError,'CVV_REQUIREMENT_UNKNOWN'):self.co.complete_payment()
+        self.reader.order_data['cvv_required']=True
+        with self.assertRaisesRegex(j.JournalError,'ENCRYPTED_CVV_REQUIRED'):self.co.complete_payment()
+        self.assertEqual(len(self.calls),1)
+
+    def test_challenge_and_failed_payment_never_replayed(self):
+        self.co.place();self.reader.payment_data['redirect_url']='https://example.invalid/challenge'
+        with self.assertRaisesRegex(j.JournalError,'CHALLENGE_ALREADY_ACTIVE'):self.co.complete_payment()
+        self.reader.payment_data.pop('redirect_url');self.reader.payment_data['status']='payment_failed'
+        with self.assertRaisesRegex(j.JournalError,'PAYMENT_FAILED_NO_RETRY'):self.co.complete_payment()
+        self.assertEqual(len(self.calls),1)
+
+    def test_cvv_and_secrets_absent_from_durable_files(self):
+        self.co.place();self.reader.order_data['cvv_required']=True
+        encrypted={'encCvv':'synthetic-encrypted-cvv-private','publicKeyName':'key-name'}
+        self.co.complete_payment(cvv_encryption=encrypted)
+        self.assertEqual(self.calls[-1][1]['cvvEncryption'],encrypted)
+        for path in self.root.rglob('*'):
+            if path.is_file():
+                for secret in (INTENT,encrypted['encCvv']):self.assertNotIn(secret.encode(),path.read_bytes())
+        self.assertEqual(self.co.path.stat().st_mode & 0o777,0o600)
+
+    def test_payment_proof_requires_exact_capture_currency_card_reference(self):
+        self.reader.capture();raw=self.reader.payment(INTENT)
+        self.assertTrue(f.payment_projection(raw,ORDER,4585,j.digest(CARD))['paid'])
+        for key,value in [('reference','FOTHER'),('currency_code','USD'),('amount',45.86),
+                          ('cc_masked','****5542'),('id_token','162')]:
+            with self.subTest(key=key),self.assertRaises(j.JournalError):
+                f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD))
+        for key,value in [('captured_amount',1),('authorized_amount',1),('transaction_status','AUTHORIZED'),
+                          ('error_code','1'),('refunded_amount',1),('reversed_amount',1)]:
+            self.assertFalse(f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD))['paid'])
+
+    def test_native_adapter_does_not_guess_unpaid_contract(self):
+        self.assertFalse(recovery.NativeReader.__new__(recovery.NativeReader).continuation_verified({},{}))
+
+    def test_food_paid_reconciliation_cannot_lift_nonfinancial_fence(self):
+        j.consume(self.flow,'cart',kind='cart',request_hash='e'*64)
+        j.observe(self.flow,'cart',outcome='UNKNOWN',evidence_hash='e'*64)
+        with self.assertRaises(j.JournalError):j.reconcile_food_paid(self.flow,evidence_hash='a'*64)
+
+
+class NativeOrderTests(unittest.TestCase):
+    def fixture(self):
+        flow=SimpleNamespace(account=fingerprint('synthetic-customer'),scope='b'*64,outlet='OUTLET1',
+            headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'},
+            rows=food.manifest([{'item_code':'I1','qty':1,'modifiers':{'MD1':{'I2':1}},'notes':'Extra crispy'}]))
+        state={'review':{'payable_minor':4585},'card_hash':j.digest(CARD)}
+        raw={'orderNr':ORDER,'customerCode':'synthetic-customer','outletInfo':{'outletCode':'OUTLET1'},
+            'addressCode':'ADDRESS','addressVersion':1,'items':flow.rows,'currencyCode':'AED',
+            'orderTotal':45.85,'orderPaymentAmount':45.85,'orderWalletAmount':0,
+            'creditCardMask':'****2342','paymentMethodCode':'prepaid','prepaidPaymentMethodCode':'cc_noonpay',
+            'paymentProviderCode':'NOON_PAY','deliveryPreferenceInfo':[{'code':k,'choice':True} for k in food.QUIET],
+            'driverNotes':food.QUIET_NOTE,'paymentClientSecret':INTENT,'orderStatusCode':'delivered'}
+        return flow,state,raw
+
+    def test_native_order_projection_and_mismatch_guards(self):
+        flow,state,raw=self.fixture()
+        self.assertTrue(recovery.project_order(raw,ORDER,flow,state)['accepted'])
+        for key,value in [('orderNr','FOTHER'),('customerCode','other'),('outletInfo',{}),('addressVersion',2),
+                          ('items',[]),('orderTotal',46),('orderWalletAmount',1),('creditCardMask','****5542'),
+                          ('driverNotes',''),('deliveryPreferenceInfo',[])]:
+            with self.subTest(key=key),self.assertRaises(j.JournalError):
+                recovery.project_order({**raw,key:value},ORDER,flow,state)
+
+    def test_unknown_order_acceptance_is_not_inferred_from_paid(self):
+        flow,state,raw=self.fixture();raw['orderStatusCode']='unseen_state'
+        self.assertFalse(recovery.project_order(raw,ORDER,flow,state)['accepted'])
+
+    def test_native_session_binding_preserves_all_preparation_guards(self):
+        flow=food.FoodFlow.__new__(food.FoodFlow)
+        flow.outlet='OUTLET1';flow.account='a'*64;flow.scope='b'*64
+        flow.headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'}
+        flow.rows=food.manifest([{'item_code':'I1'}]);flow.state={'session':'SESSION1'}
+        data={'checkoutSessionCode':'SESSION1','outletCode':'OUTLET1','addressCode':'ADDRESS','addressVersion':1,
+            'items':flow.rows,'deliveryPreferenceInfo':[{'code':k,'value':True} for k in food.QUIET],
+            'driverNotes':food.QUIET_NOTE,'creditCardMask':'****2342','paymentMethodCode':'prepaid',
+            'prepaidPaymentMethodCode':'cc_noonpay','orderWalletAmount':0,'orderPaymentAmount':45.85,'orderTotal':45.85}
+        review=flow.review(data)
+        reader=recovery.NativeReader.__new__(recovery.NativeReader);reader.flow_id='synthetic'
+        reader.state={'outlet':flow.outlet,'items':flow.rows,'session':'SESSION1',
+            'review':review,'review_hash':j.digest(review),'card_hash':j.digest(CARD)}
+        flow.read=lambda:data
+        with patch.object(food,'FoodFlow',return_value=flow),patch.object(j,'inspect',return_value={
+                'operations':[{'name':'set_payment_method','state':'OBSERVED'}]}):
+            self.assertIsNone(reader.session()['order_id'])
+            data['orderNr']=ORDER
+            self.assertEqual(reader.session()['order_id'],ORDER)
+            data['orderTotal']=46
+            with self.assertRaises(j.JournalError):reader.session()
+
+    def test_financial_recovery_cli_dispatch_never_calls_preparation(self):
+        with patch.object(j,'binding',return_value={'app':'noon','vertical':'food'}),\
+             patch.object(j,'inspect',return_value={'operations':[{'kind':'place'}]}),\
+             patch.object(recovery,'NativeReader') as reader,patch.object(recovery,'TrackerRegistrar'),\
+             patch.object(f,'Coordinator') as coordinator,patch.object(food,'FoodFlow') as prep:
+            coordinator.return_value.recover.return_value={'financial_send':False}
+            self.assertEqual(food.recover('synthetic'),{'financial_send':False})
+            reader.assert_called_once_with('synthetic');prep.assert_not_called()
+
+
+class RegistrarTests(unittest.TestCase):
+    def test_registration_requires_receipt_exact_config_watcher_and_hold(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(Path,'home',return_value=Path(temp)):
+            root=Path(temp);name='order-noon-'+ORDER.lower()
+            config={'app':'noon','order':ORDER,'watcher':name,'vertical':'food','delivery_card':{'held':True}}
+            cfgpath=root/'.local/state/order-tracker/orders'/f'{name}.json'
+            watchpath=root/'.local/share/robob-watch/watchers'/name/'watcher.json'
+            cfgpath.parent.mkdir(parents=True);watchpath.parent.mkdir(parents=True)
+            cfgpath.write_text(json.dumps(config));watchpath.write_text(json.dumps({'id':name}))
+            reader=SimpleNamespace(flow_id='synthetic',state={'review':{'store':'Restaurant'}})
+            registrar=recovery.TrackerRegistrar(reader)
+            receipt={'tracker_id':name,'watcher_registered':True,'moni_notified':'skipped'}
+            result=SimpleNamespace(returncode=0,stdout=json.dumps(receipt).encode())
+            with patch.object(j,'inspect',return_value={'order_id':ORDER,'reserved_minor':4585}),\
+                 patch.object(recovery.subprocess,'run',return_value=result) as run:
+                self.assertTrue(registrar(ORDER,paid=False)['registered'])
+                self.assertIn('--hold-placed-text',run.call_args.args[0])
+                with self.assertRaises(j.JournalError):registrar(ORDER,paid=True)
+                config['delivery_card']['held']=False;cfgpath.write_text(json.dumps(config))
+                self.assertTrue(registrar(ORDER,paid=True)['registered'])
+                self.assertIn('--payment-confirmed',run.call_args.args[0])
+                result.stdout=json.dumps({**receipt,'watcher_registered':False}).encode()
+                with self.assertRaises(j.JournalError):registrar(ORDER,paid=True)
+                result.stdout=json.dumps(receipt).encode();config['order']='FOTHER';cfgpath.write_text(json.dumps(config))
+                with self.assertRaises(j.JournalError):registrar(ORDER,paid=True)
+
+
+if __name__=='__main__':unittest.main()

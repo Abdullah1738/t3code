@@ -706,12 +706,13 @@ def checkout_check(vertical):
 def review_contract(vertical):
     """Machine-readable native contract gaps, not synthetic financial approval."""
     if vertical=='food':
+        from noon_food_financial import contract
         return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
             'prepare_only':True,'purchase_enabled':False,'financial_send':False,
             'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes','2342'],
             'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
             'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
-            'unresolved':['paid placement and payment-intent response contract','CVV/3DS continuation','paid recovery and automatic tracker binding']}
+            'financial_contract':contract()}
     if vertical in ('main','supermall'):
         from noon_marketplace_native_shape import NATIVE_SHAPE,UNRESOLVED
         from noon_marketplace_invoice import NATIVE_ROLE_CONTRACT

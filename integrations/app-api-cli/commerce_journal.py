@@ -485,11 +485,20 @@ def reconcile_fenced_payment(flow_id, *, evidence_hash):
 
 def reconcile_marketplace_paid(flow_id, *, evidence_hash):
     """Lift only financial fences superseded by exact marketplace paid evidence."""
+    return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('main','supermall'))
+
+
+def reconcile_food_paid(flow_id, *, evidence_hash):
+    """Food adapter has independently bound session, order, intent and capture."""
+    return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('food',))
+
+
+def _reconcile_noon_paid(flow_id, *, evidence_hash, verticals):
     if not _hash(evidence_hash):
         fail('JOURNAL_OBSERVATION_INVALID')
     with _db() as db:
         flow = _get(db, flow_id)
-        if (flow['app'] != 'noon' or flow['vertical'] not in ('main', 'supermall')
+        if (flow['app'] != 'noon' or flow['vertical'] not in verticals
                 or flow['state'] != 'FENCED' or not flow['order_id']):
             fail('JOURNAL_MARKETPLACE_RECONCILIATION_INVALID')
         ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
@@ -958,6 +967,13 @@ def binding(flow_id):
         row = _get(db, flow_id)
         return {'flow_id': row['id'], 'app': row['app'], 'vertical': row['vertical'],
                 'account_hash': row['account_hash'], 'scope_hash': row['scope_hash']}
+
+
+def financial_binding(flow_id):
+    """Private immutable quote/cart reservation for exact financial recovery."""
+    with _db() as db:
+        row = _get(db, flow_id)
+        return {key: row[key] for key in ('review_hash', 'place_cart_hash', 'reserved_minor')}
 
 
 def completed_order_binding(*, app, vertical, account_hash, order_id):

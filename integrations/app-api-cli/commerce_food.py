@@ -119,8 +119,9 @@ class FoodFlow:
         if flow_id:
             binding = journal.binding(flow_id)
             local = journal.inspect(flow_id)
-            require(local['state'] in (('ACTIVE','RELEASED') if read_only else ('ACTIVE',)) and not local['order_id'] and
-                    not any(o['kind'] in ('place','payment','prepay','preauthorize') for o in local['operations']), 'FOOD_PREPARATION_ONLY_FLOW_REQUIRED')
+            if not read_only:
+                require(local['state']=='ACTIVE' and not local['order_id'] and
+                        not any(o['kind'] in ('place','payment','prepay','preauthorize') for o in local['operations']), 'FOOD_PREPARATION_ONLY_FLOW_REQUIRED')
             require(binding['vertical']=='food' and binding['account_hash']==self.account and binding['scope_hash']==self.scope, 'FOOD_RECOVERY_SCOPE_MISMATCH')
             self.state = json.loads(self.path.read_text())
             require(self.state['scope']==self.scope, 'FOOD_RECOVERY_SCOPE_MISMATCH')
@@ -214,6 +215,7 @@ class FoodFlow:
                      and r['ccMasked'].endswith('2342') and r.get('isDeleted') is False]
             require(len(matches)==1 and str(matches[0].get('id','')).isdigit(), 'FOOD_CARD_2342_NOT_UNIQUE')
             card=matches[0]
+            self.state['card_hash']=journal.digest(str(card['id'])); self.save()
             self.write('set-payment-method', {'sessionCode':self.state['session'],'walletAmount':0,
                        'creditCardMask':card['ccMasked'],'paymentMethod':'prepaid',
                        'prepaidPaymentMethod':'cc_noonpay','paymentTokenCode':str(card['id'])})
@@ -237,8 +239,11 @@ def recover(flow_id):
     """Status-only recovery never turns an interrupted preparation into a send."""
     binding=journal.binding(flow_id); local=journal.inspect(flow_id)
     require(binding['app']=='noon' and binding['vertical']=='food', 'FOOD_FLOW_REQUIRED')
-    require(not local['order_id'] and not any(o['kind'] in ('place','payment','prepay','preauthorize') for o in local['operations']),
-            'FOOD_FINANCIAL_RECOVERY_CONTRACT_NOT_VERIFIED')
+    if any(o['kind'] in ('place','payment') for o in local['operations']):
+        from noon_food_financial import Coordinator
+        from noon_food_recovery import NativeReader, TrackerRegistrar
+        reader=NativeReader(flow_id)
+        return Coordinator(flow_id,reader,TrackerRegistrar(reader)).recover()
     state=json.loads((ROOT/(flow_id+'.json')).read_text())
     rows=[{'item_code':r['itemCode'],'qty':r['qty'],'modifiers':r['modifiers'],'notes':r['notes']} for r in state['items']]
     flow=FoodFlow(state['outlet'],rows,flow_id,read_only=True)
