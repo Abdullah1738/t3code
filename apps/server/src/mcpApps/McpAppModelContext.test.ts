@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Tracer from "effect/Tracer";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpAppModelContext from "./McpAppModelContext.ts";
@@ -58,6 +59,42 @@ layer("McpAppModelContext", (it) => {
 
       yield* set(threadId, "item-kept", "");
       assert.deepEqual(yield* texts(threadId), []);
+    }),
+  );
+
+  it.effect("looks up app items by id in every history store instead of scanning them", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* McpAppModelContext.McpAppModelContext;
+      const statements: Array<string> = [];
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            const query = span.attributes.get("db.query.text");
+            if (typeof query === "string") statements.push(query);
+          };
+          return span;
+        },
+      });
+      yield* store.forThread(threadId).pipe(Effect.withTracer(tracer));
+      const statement = statements.find((text) => text.includes("ardud_history_turn_items"));
+      assert.isDefined(statement);
+      const plan = (yield* sql.unsafe<{ readonly detail: string }>(
+        `EXPLAIN QUERY PLAN ${statement}`,
+      ))
+        .map((row) => row.detail)
+        .join("\n");
+      // Each store is searched by turn_item_id; a co-routine or scan of the
+      // history view walks the whole base archive.
+      assert.notMatch(
+        plan,
+        /CO-ROUTINE ardud_history_turn_items|SCAN (?:main\.)?orchestration_v2_projection_turn_items|SCAN cold|SCAN base/,
+      );
+      assert.match(plan, /SEARCH cold USING .*\(turn_item_id=\?\)/);
+      assert.match(plan, /SEARCH base USING .*\(turn_item_id=\?\)/);
     }),
   );
 });
