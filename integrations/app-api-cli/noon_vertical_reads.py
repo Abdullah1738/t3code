@@ -4,6 +4,7 @@ Food and NowNow tracking are exact-order. Marketplace completion requires the
 exact full-detail inventory to reconcile with its independent invoice count.
 """
 import http.client
+import datetime as dt
 import json
 import re
 import urllib.error
@@ -127,9 +128,30 @@ def food_projection(data, order):
     if row.get('orderNr') != order or not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = core.base(order, 'food')
-    out.update(raw_status=raw, status='delivered' if raw == 'delivered' else 'unknown',
+    out.update(raw_status=raw, status={'delivered': 'delivered', 'delivering': 'out for delivery',
+                                     'picked_up': 'picked up'}.get(raw, 'unknown'),
                scope='order', status_text=core.text(row.get('statusLabel')),
-               coverage='exact_native_food_order; delivered_only_live_verified')
+               coverage='exact_native_food_order; delivered_delivering_picked_up_verified')
+    estimate = row.get('estimate')
+    if isinstance(estimate, dict):
+        window = estimate.get('time')
+        timestamp = estimate.get('timestamp')
+        if isinstance(window, str) and isinstance(timestamp, str):
+            match = re.fullmatch(r'(\d{2}:\d{2} [AP]M) - (\d{2}:\d{2} [AP]M)', window)
+            if match:
+                try:
+                    anchor = dt.datetime.fromisoformat(timestamp)
+                    anchor = anchor.replace(tzinfo=core.DUBAI) if anchor.tzinfo is None else anchor.astimezone(core.DUBAI)
+                    start = dt.datetime.combine(anchor.date(), dt.datetime.strptime(match[1], '%I:%M %p').time(), core.DUBAI)
+                    end = dt.datetime.combine(anchor.date(), dt.datetime.strptime(match[2], '%I:%M %p').time(), core.DUBAI)
+                    if end < start:
+                        end += dt.timedelta(days=1)
+                    if start == anchor and dt.timedelta(0) <= end-start <= dt.timedelta(hours=4):
+                        out.update(eta=end.isoformat(), eta_text=window,
+                                   eta_window={'start': start.isoformat(), 'end': end.isoformat()},
+                                   eta_source='native_food_tracking_estimate')
+                except ValueError:
+                    pass
     # Delivered responses still include driver contact and coordinates. No
     # display-consent gate or active ETA contract has been verified: omit both.
     return out

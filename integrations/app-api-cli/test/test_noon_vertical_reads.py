@@ -14,6 +14,17 @@ SUPERMALL_FRESH = json.loads((Path(__file__).parent
 
 
 class VerticalReadsTest(unittest.TestCase):
+    def test_food_live_window_and_unknown_status(self):
+        data = {'status': 'success', 'data': {'orderNr': 'FTEST', 'status': 'delivering',
+                'estimate': {'time': '05:45 PM - 05:55 PM', 'timestamp': '2026-11-07T17:45:00'}}}
+        result = v.food_projection(data, 'FTEST')
+        self.assertEqual(result['status'], 'out for delivery')
+        self.assertEqual(result['eta'], '2026-11-07T17:55:00+04:00')
+        data['data']['estimate']['timestamp'] = '2026-11-07T16:45:00'
+        self.assertIsNone(v.food_projection(data, 'FTEST')['eta'])
+        data['data']['status'] = 'future_status'
+        self.assertEqual(v.food_projection(data, 'FTEST')['status'], 'unknown')
+
     order = 'NAEIA0002358740'
 
     def manifest(self):
