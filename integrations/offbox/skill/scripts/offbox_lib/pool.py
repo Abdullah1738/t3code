@@ -8,7 +8,7 @@ import os
 import time
 
 from . import capacity
-from .common import (DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
+from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      now, say)
 from .identity import remote_dir_for
 
@@ -89,13 +89,15 @@ def _pending(con, key) -> int:
 
 TOO_BIG_LIKE = f"{TOO_BIG_NOTE}%"  # a box marked too big frees its pool slot and is never offered again
 DEAD_LIKE = f"{DEAD_MOUNT_NOTE}%"  # same for a box whose filesystem died
+WEDGED_LIKE = f"{BOX_WEDGED_NOTE}%"
 
 
 def members(con, key):
     return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
         WHERE p.pool_key=? AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
-        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE)).fetchall()
+        AND COALESCE(l.note,'') NOT LIKE ?
+        ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE)).fetchall()
 
 
 def _source_member(con, key, source) -> bool:
@@ -116,12 +118,13 @@ def candidates(con, key, size, source, me=None):
         WHERE l.repo_key=? AND l.state IN ('running','stopped')
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
+        AND COALESCE(l.note,'') NOT LIKE ?
         AND NOT EXISTS (SELECT 1 FROM bases b WHERE b.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM templates t WHERE t.box_id=l.box_id)
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id AND r.status IN ('starting','running'))
         AND NOT EXISTS (SELECT 1 FROM prune_holds h WHERE h.box_id=l.box_id)
         ORDER BY (l.state='running') DESC, (l.size=?) DESC, l.last_used_at DESC""",
-        (key, TOO_BIG_LIKE, DEAD_LIKE, size)).fetchall()
+        (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE, size)).fetchall()
     full = not _room(con, key)
     out = []
     for r in rows:
@@ -197,7 +200,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     while True:
         lease.cap_check()
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                              "WHERE l.repo_key=? AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+                              "WHERE l.repo_key=? AND l.state IN ('running','stopped') "
+                              "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone()
         if create_first:
             pending = None
         if pending:
@@ -206,7 +210,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             guard.__enter__()
             try:
                 pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
-                                      "WHERE l.box_id=? AND l.state IN ('running','stopped')", (bid,)).fetchone()
+                                      "WHERE l.box_id=? AND l.state IN ('running','stopped') "
+                                      "AND COALESCE(l.note,'') NOT LIKE ?", (bid, WEDGED_LIKE)).fetchone()
                 if not pending:
                     guard.__exit__(None, None, None)
                     continue
@@ -271,7 +276,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     rows, can_create = [], True
                 pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
                                       "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
-                                      "AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+                                      "AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ? "
+                                      "LIMIT 1", (key, WEDGED_LIKE)).fetchone()
                 if pending:
                     raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
                                                  "retry once it has been checked; nothing ran")
@@ -510,16 +516,23 @@ def _refresh_background(con, key):
         try:
             with file_lock('box-'+row['box_id'], timeout=0):
                 st = api.cmd_status(row['box_id'], row['process_id'])
-                if st and not st.get('running') and st.get('status') == 'exited':
-                    if (st.get('exitCode') == runs.EXIT_REPO_SETUP
+                if st and not st.get('running') and st.get('status') in ('exited', 'lost'):
+                    code = st.get('exitCode')
+                    if code is None and row['command_id']:
+                        code = (api.history_get(row['box_id'], row['command_id']) or {}).get('exitCode')
+                    if (st.get('status') == 'exited' and code == runs.EXIT_REPO_SETUP
                             and runs.REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
                         runs.finish(row['run_id'], EXIT_INFRA, 'infra')
+                        continue
+                    wedged = runs.settle_box_wedged(con, row, code)
+                    if wedged:
+                        say(runs.wedged_message(row['box_id'], *wedged))
                         continue
                     import json
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:
                         runs.do_pulls(row['box_id'], dict(row), pulls)
-                    runs.finish(row['run_id'], st.get('exitCode'))
+                    runs.finish(row['run_id'], code)
         except OffboxError:
             pass
 

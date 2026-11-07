@@ -75,9 +75,9 @@ class ImageWaitFixture:
                 .replace('/run/offbox-images-ready', str(self.ready))
                 .replace('/var/tmp/offbox-image-restore.log', str(self.root / 'restore.log')))
 
-    def run(self):
+    def run(self, timeout=8):
         return subprocess.run(['bash', '-c', self.script() + '\necho USER_COMMAND\nexit 7\n'],
-                              env=self.env, capture_output=True, text=True, timeout=8)
+                              env=self.env, capture_output=True, text=True, timeout=timeout)
 
     def invoked(self):
         return self.calls.read_text().splitlines() if self.calls.exists() else []
@@ -85,7 +85,7 @@ class ImageWaitFixture:
 
 class ImageWaitTests(unittest.TestCase):
     def test_each_stalled_stage_is_bounded_and_user_command_still_runs(self):
-        for stage in ('flock', 'info', 'inspect', 'zstd', 'load'):
+        for stage in ('flock', 'inspect', 'zstd', 'load'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as d:
                 fx = ImageWaitFixture(d, stage)
                 start = time.monotonic()
@@ -96,13 +96,126 @@ class ImageWaitTests(unittest.TestCase):
                 self.assertIn('kept docker images still loading after 1s; continuing without waiting', result.stderr)
                 self.assertFalse(fx.ready.exists(), stage)
 
+    def test_restore_and_docker_hang_marks_wedged_before_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d, 'info')
+            fx.tool('ps', '#!/bin/bash\nprintf "D sync\\nDs umount\\nS bash\\nD a\\nD b\\nD c\\nD d\\n"\n')
+            start = time.monotonic()
+            result = fx.run(timeout=18)
+            self.assertLess(time.monotonic() - start, 16)
+            self.assertEqual(result.returncode, 97, result.stderr)
+            self.assertNotIn('USER_COMMAND', result.stdout)
+            self.assertIn('offbox-box-wedged: kept image restore did not finish in 1s and docker does not answer; '
+                          'D-state: 6 (sync, umount, a, b, c)', result.stderr)
+
+    def test_restore_loading_past_deadline_and_unresponsive_docker_never_runs_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d, 'load')
+            fx.env['SEEN_INFO'] = str(fx.root / 'seen-info')
+            # Docker answers before loading starts, then stalls when checked after the restore deadline.
+            fx.tool('docker', DOCKER.replace("'info ')", "'info ') if [ -e \"$SEEN_INFO\" ]; then exec sleep 30; fi; "
+                                            'touch "$SEEN_INFO";'))
+            start = time.monotonic()
+            result = fx.run(timeout=18)
+            self.assertLess(time.monotonic() - start, 16)
+            self.assertEqual(result.returncode, 97, result.stderr)
+            self.assertNotIn('USER_COMMAND', result.stdout)
+            self.assertIn('docker load', fx.invoked())
+            self.assertEqual(fx.invoked().count('docker info'), 2)
+            self.assertIn('offbox-box-wedged:', result.stderr)
+            self.assertNotIn('continuing without waiting', result.stderr)
+
+    def test_restore_failure_and_docker_failure_also_marks_wedged(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d)
+            fx.tool('sudo', '#!/bin/bash\nexit 1\n')
+            fx.tool('docker', '#!/bin/bash\nexit 1\n')
+            result = fx.run()
+            self.assertEqual(result.returncode, 97, result.stderr)
+            self.assertNotIn('USER_COMMAND', result.stdout)
+            self.assertIn('offbox-box-wedged:', result.stderr)
+
+    def test_real_preamble_and_exit_wrapper_do_not_reach_cd_or_query_docker_after_wedge(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d)
+            fx.tool('sudo', '#!/bin/bash\nexit 1\n')
+            fx.tool('docker', '#!/bin/bash\necho docker >> "$CALLS"\nexit 1\n')
+            fx.tool('systemctl', '#!/bin/bash\necho systemctl >> "$CALLS"\nexit 0\n')
+            fx.env['HOME'] = d
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+                 patch.object(runs, 'GO_REPAIR', ':'):
+                script = runs.remote_script('missing-dir', '.', ['echo USER_COMMAND'], None, 'r', wait_images=True)
+            script = script.replace(runs.IMAGE_WAIT, fx.script())
+            result = subprocess.run(['bash', '-c', runs.exit_recording_command(script, 'r').replace('bash -lc', 'bash -c')],
+                                    env=fx.env, capture_output=True, text=True, timeout=8)
+            self.assertEqual(result.returncode, 97, result.stderr)
+            self.assertNotIn('USER_COMMAND', result.stdout)
+            self.assertNotIn('remote dir', result.stderr)
+            self.assertNotIn('offbox-command-started:', result.stderr)
+            self.assertEqual((fx.root / '.offbox/exit/r.rc').read_text().strip(), '97')
+            self.assertNotIn('systemctl', fx.invoked())
+
+    def test_docker_probe_and_d_state_probe_are_bounded_when_signals_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d)
+            fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '1'
+            fx.env['STUCK_PIDS'] = str(fx.root / 'pids')
+            fx.tool('timeout', '#!/bin/bash\necho $$ >> "$STUCK_PIDS"\ntrap "" TERM\nexec sleep 30\n')
+            fx.tool('ps', '#!/bin/bash\necho $$ >> "$STUCK_PIDS"\ntrap "" TERM\nexec sleep 30\n')
+            script = fx.script().replace('os.killpg(child.pid, signal.SIGKILL)', 'raise PermissionError("D state")')
+            try:
+                start = time.monotonic()
+                result = subprocess.run(['bash', '-c', script + '\necho USER_COMMAND\n'], env=fx.env,
+                                        capture_output=True, text=True, timeout=18)
+                self.assertLess(time.monotonic() - start, 16)
+                self.assertEqual(result.returncode, 97, result.stderr)
+                self.assertNotIn('USER_COMMAND', result.stdout)
+                self.assertIn('D-state: unknown (ps did not answer)', result.stderr)
+            finally:
+                for pid in Path(fx.env['STUCK_PIDS']).read_text().splitlines():
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_exit_record_filesystem_stalls_cannot_hold_wedged_wrapper_open(self):
+        for stage in ('fifo', 'mkdir', 'mv', 'find'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as d:
+                fx = ImageWaitFixture(d)
+                fx.env['HOME'] = d
+                fx.env['STUCK_PID'] = str(fx.root / 'pid')
+                exit_dir = fx.root / '.offbox/exit'
+                exit_dir.mkdir(parents=True)
+                if stage == 'fifo':
+                    os.mkfifo(exit_dir / 'r.rc.tmp')
+                else:
+                    fx.tool(stage, '#!/bin/bash\necho $$ > "$STUCK_PID"\ntrap "" TERM\nexec sleep 30\n')
+                script = runs.exit_recording_command('echo "offbox-box-wedged: diagnostic" >&2\nexit 97', 'r')
+                script = script.replace('bash -lc', 'bash -c')
+                if stage == 'mv':
+                    script = script.replace('os.killpg(child.pid, signal.SIGKILL)', 'raise PermissionError("D state")')
+                try:
+                    start = time.monotonic()
+                    result = subprocess.run(['bash', '-c', script], env=fx.env,
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 97)
+                    self.assertLess(time.monotonic() - start, 4)
+                    self.assertIn('offbox-box-wedged: diagnostic', result.stderr)
+                finally:
+                    if Path(fx.env['STUCK_PID']).exists():
+                        try:
+                            os.kill(int(Path(fx.env['STUCK_PID']).read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
     def test_deadline_does_not_wait_for_a_restore_it_cannot_kill(self):
         with tempfile.TemporaryDirectory() as d:
             fx = ImageWaitFixture(d)
             fx.env['OFFBOX_IMAGE_WAIT_SECONDS'] = '1'
             pid_file = fx.root / 'stuck.pid'
             fx.env['STUCK_PID'] = str(pid_file)
-            fx.tool('timeout', '#!/bin/bash\necho $$ > "$STUCK_PID"\ntrap "" TERM\nexec sleep 30\n')
+            fx.tool('timeout', '#!/bin/bash\nif [ "$3" = 10s ]; then shift 3; exec "$@"; fi\n'
+                               'echo $$ > "$STUCK_PID"\ntrap "" TERM\nexec sleep 30\n')
             try:
                 start = time.monotonic()
                 # Model root-owned/uninterruptible children: the cleanup signal cannot stop them.
@@ -190,14 +303,15 @@ class ImageWaitTests(unittest.TestCase):
             self.assertIn('docker load', fx.invoked())
 
     def test_failing_sudo_still_runs_command(self):
-        with tempfile.TemporaryDirectory() as d:
-            fx = ImageWaitFixture(d)
-            fx.tool('sudo', '#!/bin/bash\nexit 1\n')
-            result = fx.run()
-            self.assertEqual(result.returncode, 7)
-            self.assertIn('USER_COMMAND', result.stdout)
-            self.assertIn('could not restore kept docker images', result.stderr)
-            self.assertFalse(fx.ready.exists())
+        for code in (1, 97):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as d:
+                fx = ImageWaitFixture(d)
+                fx.tool('sudo', f'#!/bin/bash\nexit {code}\n')
+                result = fx.run()
+                self.assertEqual(result.returncode, 7)
+                self.assertIn('USER_COMMAND', result.stdout)
+                self.assertIn('could not restore kept docker images', result.stderr)
+                self.assertFalse(fx.ready.exists())
 
     def test_busy_boot_restore_times_out_without_running_load(self):
         with tempfile.TemporaryDirectory() as d:

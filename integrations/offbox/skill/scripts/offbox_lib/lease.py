@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      file_lock, iso, log, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
@@ -584,6 +584,9 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    row = con.execute('SELECT note FROM leases WHERE box_id=?', (box_id,)).fetchone()
+    if row and (row['note'] or '').startswith(BOX_WEDGED_NOTE):
+        return
     if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
         raise ResumeUnresolved(f"{box_id} has an unanswered resume; refresh deferred")
     capacity.check(con)
@@ -757,22 +760,32 @@ class DeadMount(OffboxError):
         self.box_id, self.reason = box_id, reason
 
 
-def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
-    con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{DEAD_MOUNT_NOTE} {reason}"[:200], box_id))
-    con.commit()
-    event(con, box_id, "lease_dead_mount", reason)
+def set_aside(con, box_id: str, kind: str, reason: str, run_id: str | None = None) -> bool:
+    """Remove a broken box from selection before trying to stop it. Never archive images or delete its disk."""
+    # A terminal run is no longer reconciled by the pool/reaper. Its marker must commit in the same transaction,
+    # before any event logging, TTL update, resume bookkeeping or network stop can be interrupted.
+    with con:
+        con.execute("UPDATE leases SET note=? WHERE box_id=?", (f"{kind}: {reason}"[:500], box_id))
+        if run_id:
+            con.execute("UPDATE runs SET error='box wedged before the command', status='infra', exit_code=NULL, "
+                        "end_at=? WHERE run_id=? AND status IN ('starting','running')", (now(), run_id))
+            con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, 'box_wedged', reason[:2000]))
+    from . import allocation
+    allocation.clear_resume(con, box_id)
+    event_kind = "lease_" + kind.replace('-', '_')
+    event(con, box_id, event_kind, reason)
+    if run_id:
+        event(con, box_id, 'run_end', f'{run_id} status=infra exit=None; box wedged before the command')
     try:
-        ssh_sync.close_master(box_id)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    try:
-        api.stop(box_id)
-    except OffboxError as e:
+        return stop_box(con, box_id, f"set aside: {kind}", images=False, locked=True)
+    except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
         # The reaper's idle stop catches it later; a dead box must not block the run from moving on.
-        event(con, box_id, "lease_dead_mount_stop_failed", str(e)[:300])
-        return
-    con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
-    con.commit()
+        event(con, box_id, event_kind + "_stop_failed", str(e)[:300])
+        return False
+
+
+def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
+    set_aside(con, box_id, DEAD_MOUNT_NOTE.rstrip(':'), reason)
 
 
 class ResumeUnresolved(OffboxError):
@@ -907,7 +920,9 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
         from . import allocation
         other = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                             "WHERE l.repo_key=(SELECT repo_key FROM leases WHERE box_id=?) "
-                            "AND l.box_id<>? AND l.state IN ('running','stopped') LIMIT 1", (box_id, box_id)).fetchone()
+                            "AND l.box_id<>? AND l.state IN ('running','stopped') "
+                            "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1",
+                            (box_id, box_id, BOX_WEDGED_NOTE + '%')).fetchone()
         if other:
             raise allocation.Unresolved(f"{other[0]} has an unanswered resume; reconcile before sending another")
         if outage.allocation_left() == 0:
@@ -987,6 +1002,10 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
+    # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
+    current = con.execute('SELECT note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
+    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+        return None
     box_id = row["box_id"]
     from . import allocation
     allocation.recover_resumes(con, row['repo_key'])

@@ -11,7 +11,7 @@ import sys
 import time
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
+from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
                      offsets_path, out, read_json, say, silence)
 from .identity import require_proven
@@ -99,7 +99,7 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE)) else ""
+        note = f"  [{d['note']}]" if (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE)) else ""
         print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
@@ -369,6 +369,8 @@ def _settled(r) -> int:
     if repo_setup_failed(r['exit_code'], LOGS_DIR / f"{r['run_id']}.log"):
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
+    if r['error'] == 'box wedged before the command':
+        say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
@@ -522,7 +524,12 @@ def _recover_by(r, log_path, deadline):
     budget = 20.0 if deadline is None else deadline - now()
     if budget <= 0:
         raise _wait_timeout(r)
-    code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+    try:
+        code, how = recover_lost_exit(r["box_id"], r["run_id"], log_path, 0, timeout=min(20.0, budget))
+    except OffboxError:
+        if deadline is not None and now() >= deadline:
+            raise _wait_timeout(r) from None
+        raise
     if deadline is not None and now() >= deadline:
         raise _wait_timeout(r)
     return code, how
@@ -666,10 +673,16 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 def _finalize(r, code, log_path) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
-    from .runs import do_pulls, finish, go_std_glitch, repo_setup_failed
+    from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
+                       settle_box_wedged, wedged_message)
     if repo_setup_failed(code, log_path):
         finish(r['run_id'], EXIT_INFRA, 'infra')
         say('repo toolchain setup failed (exit 98), not your command')
+        return EXIT_INFRA
+    con = db()
+    wedged = settle_box_wedged(con, r, code)
+    if wedged:
+        say(wedged_message(r['box_id'], *wedged))
         return EXIT_INFRA
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
