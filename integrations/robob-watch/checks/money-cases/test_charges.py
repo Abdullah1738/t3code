@@ -2,10 +2,12 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -511,6 +513,38 @@ def relayed(text, inbound='BCA7F873-4770-43DB-8E0E-7E3294F6C71A', **extra):
 
 
 class OwnerTexts(unittest.TestCase):
+    def test_default_state_is_the_read_replica(self):
+        with patch.dict(os.environ, {}, clear=True):
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        self.assertTrue(str(module.STATE_DB).endswith('/readonly/state.sqlite'))
+
+    def test_progress_handler_bounds_a_slow_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'owner.sqlite'
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE threads (thread_id, title, updated_at)')
+                db.execute('CREATE VIEW orchestration_v2_projection_threads AS '
+                           'SELECT thread_id, title, slow(updated_at) AS updated_at FROM threads')
+                db.execute('CREATE TABLE orchestration_v2_projection_messages '
+                           '(thread_id, role, created_at, payload_json)')
+                db.executemany('INSERT INTO threads VALUES (?, ?, ?)',
+                               [(str(n), 'app', '2000-01-01') for n in range(20000)])
+            connect = sqlite3.connect
+            def slow(value):
+                time.sleep(0.0002)
+                return value
+            def connection(*args, **kw):
+                db = connect(*args, **kw)
+                db.create_function('slow', 1, slow)
+                return db
+            started = time.time()
+            remaining = 1.5
+            with patch.object(ch, 'STATE_DB', path), patch.object(ch.sqlite3, 'connect', connection):
+                with self.assertRaisesRegex(ch.Lookup, 'query over time'):
+                    ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), started + remaining)
+            self.assertLess(time.time() - started, remaining + 1)
+
     def test_only_what_he_typed_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'state.sqlite'
@@ -602,6 +636,14 @@ class OwnerTexts(unittest.TestCase):
 
 
 class SearchOutput(unittest.TestCase):
+    def test_msgs_never_inherits_interactive_stdin(self):
+        done = ch.subprocess.CompletedProcess([], 0, '', '')
+        with patch.object(ch.subprocess, 'run', return_value=done) as run:
+            ch.search('Acme', '2026-11-01')
+            ch.show({'id': 1})
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertTrue(all(call.kwargs['stdin'] == ch.subprocess.DEVNULL for call in run.call_args_list))
+
     def test_snippets_with_unicode_line_separators_stay_one_row(self):
         rows = [{'id': 1, 'snip': 'Sincerely,\u2028Apple\x85end\x1cx'}, {'id': 2, 'snip': 'ok'}]
         out = ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows)
