@@ -14,6 +14,14 @@ SUPERMALL_FRESH = json.loads((Path(__file__).parent
 
 
 class VerticalReadsTest(unittest.TestCase):
+    def test_quantity_two_line_reconciles_invoice_units(self):
+        data=self.manifest();data['itemGroups'][0]['items'][0]['quantity']=2
+        data['invoice']['sections'][0]['entries'][0]['title']='Subtotal (2 items)'
+        data['invoice']['sections'][0]['groups'][0]['entries'][0]['title']='Subtotal (2 items)'
+        result=v.manifest_projection(data,self.order)
+        self.assertTrue(result['manifest_complete']);self.assertTrue(result['whole_order_complete'])
+        self.assertEqual(len(result['items']),1)
+
     def test_full_cancelled_inventory_is_terminal_with_native_provenance(self):
         data=self.manifest();data['itemGroups'][0]['subStatus']['highStatusCode']='cancelled'
         data['itemGroups'][0]['text']='Cancelled today, 06:18 PM'
@@ -154,7 +162,7 @@ class SupermallRocketManifestTest(unittest.TestCase):
         self.assertEqual(result['items'][0]['status'], 'out for delivery')
         self.assertTrue(result['manifest_complete'])
         self.assertFalse(result['whole_order_complete'])
-        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(result['status'], 'out for delivery')
 
     def test_live_fresh_rocket_unit_shipment_projects(self):
         """The captured track-exact failure: -U1 group binding, null row id."""

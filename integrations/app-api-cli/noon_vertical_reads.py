@@ -177,7 +177,7 @@ def manifest_projection(data, order):
         if not isinstance(rows, list) or not rows or not isinstance(status, dict):
             raise NoonError('INCOMPLETE_MANIFEST')
         raw = status.get('highStatusCode')
-        if not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
+        if not isinstance(raw, str) or not re.fullmatch(r'[A-Za-z_ -]{1,64}', raw):
             raise NoonError('SCHEMA_CHANGED')
         for row in rows:
             if not isinstance(row, dict):
@@ -212,20 +212,20 @@ def manifest_projection(data, order):
                     raise NoonError('CONFLICTING_ITEM_STATUS')
             seen.add(item)
             items.append({'item_id': item, 'shipment_id': shipment, 'quantity': qty,
-                          'raw_status': raw, 'status': core.MARKETPLACE_STAGES.get(raw, 'unknown'), 'scope': 'item'})
+                          'raw_status': raw, 'status': core.marketplace_stage(raw), 'scope': 'item'})
     count = _invoice_count(data.get('invoice'))
-    # Quantity >1 and bundles have not been live-verified: require both unit and
-    # line counts to reconcile, rather than choosing an unverified interpretation.
-    complete = (count is not None and count == len(items) == sum(i['quantity'] for i in items)
+    # Native NAEIB0035436624: one quantity-2 line, invoice "Subtotal (2 items)".
+    # Count units, while retaining unique item identities and rejecting bundles.
+    complete = (count is not None and count == sum(i['quantity'] for i in items)
                 and _full_detail_shape(data)
-                and all(i['shipment_id'] for i in items if i['raw_status'] == 'delivered')
+                and all(i['shipment_id'] for i in items if i['status'] == 'delivered')
                 and not any(row.get('virtualBundleCode') for g in groups for row in g['items']))
     delivered = complete and all(i['status'] == 'delivered' for i in items)
-    cancelled = complete and all(i['raw_status']=='cancelled' for i in items)
+    cancelled = complete and all(i['status']=='cancelled' for i in items)
     out = core.base(order, 'marketplace')
     out.update(items=items, manifest_source='native_order_detail_item_groups',
                manifest_complete=bool(complete), whole_order_complete=bool(delivered or cancelled),
-               status='delivered' if delivered else 'cancelled' if cancelled else 'unknown', scope='order',
+               status='delivered' if delivered else 'cancelled' if cancelled else core.marketplace_active_stage(i['status'] for i in items), scope='order',
                manifest_item_count=count, observed_item_count=len(items),
                coverage='exact_order_detail_inventory; invoice_count_reconciled' if complete
                         else 'exact_order_detail_inventory; incomplete_or_unverified_count_contract')

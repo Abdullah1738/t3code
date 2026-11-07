@@ -356,13 +356,17 @@ def stage(data, food=False):
 
 
 def eta(data, cfg):
-    checked = instant(data.get('checked_at'))
+    checked = instant(data.get('eta_observed_at') or data.get('checked_at'))
     # Resolve relative estimates against the observation, not render time.
     raw = text(data.get('eta_text'), 80)
     minutes = data.get('eta_relative_minutes')
+    marketplace=cfg.get('app')=='noon' and lane(cfg,{}) in ('main','supermall','marketplace')
+    if marketplace:
+        from noon_http_orders import marketplace_eta_minutes
+        minutes=marketplace_eta_minutes(raw)
     if type(minutes) not in (int, float) or not math.isfinite(minutes):
         minutes = None
-    if minutes is None and raw:
+    if minutes is None and raw and not marketplace:
         hours = re.search(r'(\d+)\s*(?:hr|hour)', raw, re.I)
         mins = re.search(r'(\d+)(?:\s*[-–]\s*(\d+))?\s*min', raw, re.I)
         if hours or mins:

@@ -1,6 +1,7 @@
 """Allowlisted order merchandise projection. Never return raw payment/customer data."""
 import math
 import re
+import datetime as dt
 from decimal import Decimal
 import noon_http_orders as core
 import noon_vertical_reads as vertical
@@ -70,9 +71,13 @@ def details(order, service, timeout=12):
         if not isinstance(groups,list):raise core.NoonError('ORDER_ITEM_SCHEMA_CHANGED')
         raw=[i for g in groups for i in g.get('items',[])];store='noon'
         count=vertical._invoice_count(row.get('invoice'))
+        active_groups=[g for g in groups if core.marketplace_stage((g.get('subStatus') or {}).get('highStatusCode')) not in ('delivered','cancelled')]
+        estimates=list(dict.fromkeys(core.text(g.get('text')) for g in active_groups
+                    if isinstance(g.get('text'),str) and g['text'].startswith('Arriving ')))
+        all_estimated=bool(active_groups) and all(isinstance(g.get('text'),str) and g['text'].startswith('Arriving ') for g in active_groups)
         extra={'declared_item_units':count,'observed_item_units':sum(i.get('quantity',0) for i in raw),
-               'eta_text':' / '.join(dict.fromkeys(core.text(g.get('text')) for g in groups
-                    if isinstance(g.get('text'),str) and g['text'].startswith('Arriving '))) or None,
+               'eta_text':estimates[0] if all_estimated and len(estimates)==1 else None,
+               'eta_observed_at':dt.datetime.now(dt.timezone.utc).isoformat(),
                'status_text':' / '.join(dict.fromkeys(core.text((g.get('subStatus') or {}).get('highStatus'))
                     if (g.get('subStatus') or {}).get('highStatusCode') in ('cancelled','canceled','delivered')
                     else core.text(g.get('subText')) for g in groups)) or None}
