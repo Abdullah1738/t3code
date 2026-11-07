@@ -731,7 +731,16 @@ const make = Effect.gen(function* () {
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);
-      if (reason !== null) {
+      // ardud: idle threads keep their OpenCode selection until their next turn, and the composer
+      // sends the thread's own selection explicitly. That is the inherited case; migrate it below.
+      const ownSelection =
+        reason !== null &&
+        options.migrate &&
+        modelSelectionsEqual(
+          command.modelSelection,
+          (yield* orchestrator.getThreadRecords(command.threadId, [])).thread.modelSelection,
+        );
+      if (reason !== null && !ownSelection) {
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,

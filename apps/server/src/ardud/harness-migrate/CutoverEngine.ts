@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -51,6 +52,12 @@ export class CutoverActions extends Context.Service<
     readonly check?: (
       items: ReadonlyArray<CutoverItem>,
     ) => Effect.Effect<CutoverPlan["readiness"], CutoverError>;
+    /**
+     * For a thread that needs no wake: "lazy" leaves it on its source selection (it moves on its
+     * next turn once the cutover completes), "busy" waits for its own run to end, "switch" runs
+     * the normal switch. Absent means every thread is switched.
+     */
+    readonly lazy?: (item: CutoverItem) => Effect.Effect<"lazy" | "busy" | "switch", CutoverError>;
     /** Each phase must be idempotent under item.key, including a replay after a lost acknowledgement. */
     readonly apply: (
       item: CutoverItem,
@@ -79,6 +86,11 @@ export class HarnessCutover extends Context.Service<
 >()("t3/ardud/harness-migrate/CutoverEngine/HarnessCutover") {}
 
 const MAX_ATTEMPTS = 3;
+export const LAZY_REASON = "Idle; moves to its native harness on its next turn.";
+export const BUSY_REASON = "Running; switches after its current run ends.";
+/** Cheap ledger steps (selection rows, lazy and busy checks) per run, besides the paced batch. */
+const LIGHT_BUDGET = 400;
+const READINESS_REUSE_MS = 60_000;
 const needsBrief = (item: CutoverItem) => item.kind === "thread";
 const done = (item: CutoverStore.CutoverLedgerItem) =>
   item.state === "briefed" || (item.state === "switched" && !needsBrief(item));
@@ -124,6 +136,7 @@ const make = Effect.fn("HarnessCutover.make")(function* (
   // instead of re-reading (and re-decoding) every row on each 2 s job pass. Any failure drops
   // the cache so the next call re-reads what was actually persisted.
   let cached: CutoverStore.CutoverSnapshot | null = null;
+  let readyUntil = 0;
   const read = Effect.suspend(() =>
     cached !== null && !cached.initializing
       ? Effect.succeed<CutoverStore.CutoverSnapshot | null>(cached)
@@ -141,6 +154,7 @@ const make = Effect.fn("HarnessCutover.make")(function* (
     });
   const forget = Effect.sync(() => {
     cached = null;
+    readyUntil = 0;
   });
   const status = Effect.fn("HarnessCutover.status")(function* () {
     return describe(yield* read);
@@ -245,10 +259,18 @@ const make = Effect.fn("HarnessCutover.make")(function* (
         return yield* new CutoverError({ operation: "resume-readiness" });
       }
       const fresh = existing === null ? yield* actions.plan : null;
+      // The resumed check re-reads homes, evidence and every board's scripts. A passing result
+      // stays good for a minute so the 2 s job loop spends its time on items, not re-checks.
+      const now = yield* Clock.currentTimeMillis;
+      const reuse = existing !== null && readyUntil > now;
       const readiness =
         existing !== null && actions.check
-          ? yield* actions.check(existing.items)
+          ? reuse
+            ? []
+            : yield* actions.check(existing.items)
           : fresh!.readiness;
+      if (existing !== null && !reuse)
+        readyUntil = readiness.every((check) => check.ready) ? now + READINESS_REUSE_MS : 0;
       const refusals = existing?.refusals ?? fresh!.refusals;
       const refused = readiness
         .filter((check) => !check.ready)
@@ -268,7 +290,15 @@ const make = Effect.fn("HarnessCutover.make")(function* (
           .pipe(Effect.mapError(storageError)));
       yield* remember(snapshot);
       let processed = 0;
+      let light = 0;
       const visited = new Set<string>();
+      const put = (index: number, updated: CutoverStore.CutoverLedgerItem) =>
+        Effect.gen(function* () {
+          const items = snapshot.items.slice();
+          items[index] = updated;
+          snapshot = { ...snapshot, items };
+          yield* remember(snapshot);
+        });
       const deferredKeys = new Set(
         snapshot.items
           .filter((item) => item.reason !== null && item.state !== "failed")
@@ -287,7 +317,7 @@ const make = Effect.fn("HarnessCutover.make")(function* (
             continue;
           for (const [index, item] of snapshot.items.entries()) {
             if (done(item) || visited.has(item.key)) continue;
-            if (processed >= batchSize) break;
+            if (processed >= batchSize && light >= LIGHT_BUDGET) break;
             if (deferredKeys.has(item.key) !== retryDeferred) continue;
             if (pass === "finalize") {
               if (
@@ -306,18 +336,42 @@ const make = Effect.fn("HarnessCutover.make")(function* (
                 (item.kind !== "selection" && item.kind !== "thread"))
             )
               continue;
-            if (processed > 0 && paceMillis > 0) yield* Effect.sleep(paceMillis);
-            processed += 1;
+            if (
+              pass === "switch" &&
+              item.kind === "thread" &&
+              !item.wake &&
+              item.attempts === 0 &&
+              actions.lazy !== undefined
+            ) {
+              if (light >= LIGHT_BUDGET) continue;
+              light += 1;
+              const decision = yield* actions.lazy(item);
+              if (decision !== "switch") {
+                const updated: CutoverStore.CutoverLedgerItem =
+                  decision === "lazy"
+                    ? { ...item, state: "briefed", phase: "brief", reason: LAZY_REASON }
+                    : { ...item, reason: BUSY_REASON };
+                yield* save(updated);
+                yield* put(index, updated);
+                visited.add(item.key);
+                continue;
+              }
+            }
+            if (item.kind === "selection") {
+              if (light >= LIGHT_BUDGET) continue;
+              light += 1;
+            } else {
+              if (processed >= batchSize) continue;
+              if (processed > 0 && paceMillis > 0) yield* Effect.sleep(paceMillis);
+              processed += 1;
+            }
             const updated = slim(
               item.attempts >= MAX_ATTEMPTS
                 ? yield* rollback(item)
                 : yield* process(item, pass === "brief" ? "brief" : "switch"),
               item,
             );
-            const items = snapshot.items.slice();
-            items[index] = updated;
-            snapshot = { ...snapshot, items };
-            yield* remember(snapshot);
+            yield* put(index, updated);
             // A successful switch may enter the brief pass in this invocation; failed/deferred work may not.
             if (updated.state !== "switched" || updated.phase !== "brief") visited.add(item.key);
             if (updated.reason !== null) visited.add(item.key);

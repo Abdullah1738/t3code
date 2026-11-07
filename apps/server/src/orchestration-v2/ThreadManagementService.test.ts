@@ -925,6 +925,39 @@ it.effect.each(["apply", "off"] as const)(
   },
 );
 
+it.effect(
+  "after cutover, an idle thread still on its legacy selection migrates when the composer resends that selection",
+  () => {
+    const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("composer-own", legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "thread.model-selection.set",
+        "message.dispatch",
+      ]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.calls[1]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("after cutover, a legacy selection that is not the thread's own is still refused", () => {
+  const other: ModelSelection = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "opus/cc/claude-haiku-5-5",
+  };
+  const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("composer-other", other)));
+    expect(error._tag).toBe("OrchestratorCommandRejectedError");
+    expect(harness.calls).toEqual([]);
+    expect(harness.getStored()).toEqual(legacySelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
 it.effect("routes only allowlisted threads while global selection routing stays off", () => {
   const harness = migrationHarness({ mode: "off", threadIds: [migrationThreadId] });
   return Effect.gen(function* () {

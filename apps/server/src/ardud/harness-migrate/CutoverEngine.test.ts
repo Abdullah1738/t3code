@@ -921,3 +921,47 @@ it.effect(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect(
+  "a busy idle-class thread waits without attempts, then goes lazy; wakes still switch",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let busy = true;
+        const switched: Array<string> = [];
+        const actions = CutoverEngine.CutoverActions.of({
+          check: () => Effect.succeed([]),
+          plan: Effect.succeed(
+            plan([item("wake"), item("idle", "thread", false), item("busy", "thread", false)]),
+          ),
+          lazy: (entry) =>
+            Effect.succeed(entry.ref === "busy" && busy ? ("busy" as const) : ("lazy" as const)),
+          apply: (entry, phase) =>
+            Effect.sync(() => {
+              if (phase === "switch") switched.push(entry.key);
+            }),
+        });
+        const context = yield* Layer.build(
+          CutoverEngine.layerWithOptions({ paceMillis: 0 }).pipe(
+            Layer.provide(Layer.succeed(CutoverEngine.CutoverActions, actions)),
+          ),
+        );
+        const engine = yield* CutoverEngine.HarnessCutover.pipe(Effect.provide(context));
+        let state = yield* engine.run();
+        const busyRow = state.items.find((row) => row.key === "thread:busy")!;
+        assert.strictEqual(busyRow.state, "planned");
+        assert.strictEqual(busyRow.attempts, 0);
+        assert.strictEqual(busyRow.reason, CutoverEngine.BUSY_REASON);
+        assert.isFalse(state.completed);
+        busy = false;
+        for (let pass = 0; pass < 5 && !state.completed; pass += 1) state = yield* engine.run();
+        assert.isTrue(state.completed);
+        assert.deepStrictEqual(switched, ["thread:wake"]);
+        for (const key of ["thread:idle", "thread:busy"])
+          assert.strictEqual(
+            state.items.find((row) => row.key === key)!.reason,
+            CutoverEngine.LAZY_REASON,
+          );
+      }),
+    ).pipe(Effect.provide(database)),
+);

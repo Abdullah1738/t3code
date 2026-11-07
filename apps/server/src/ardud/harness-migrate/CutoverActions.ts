@@ -616,8 +616,21 @@ export const layer = Layer.effect(
                 .pipe(Effect.mapError(fail("runtime")));
             return;
           }
+          if (records.thread.archivedAt !== null && !item.wake) return;
+          let switchFrom = before;
+          let switchTo = after;
+          if (!item.wake && !sameValue(records.thread.modelSelection, before)) {
+            // Moved since planning (the owner re-picked, or a bridge already went native): map
+            // what the thread has now. A native or unmapped selection needs nothing.
+            const mapped = planSelection(records.thread.modelSelection);
+            if (mapped._tag === "conflict")
+              return yield* new CutoverError({ operation: "thread-unmappable" });
+            if (mapped._tag === "same") return;
+            switchFrom = records.thread.modelSelection;
+            switchTo = mapped.next;
+          }
           if (
-            !sameValue(records.thread.modelSelection, before) ||
+            !sameValue(records.thread.modelSelection, switchFrom) ||
             records.thread.archivedAt !== null
           )
             return yield* new CutoverError({ operation: "thread-changed" });
@@ -680,8 +693,8 @@ export const layer = Layer.effect(
               type: "provider.switch",
               commandId: command(item, "switch"),
               threadId: id,
-              modelSelection: after,
-              ...(records.thread.settledAt === null ? { expectedModelSelection: before } : {}),
+              modelSelection: switchTo,
+              ...(records.thread.settledAt === null ? { expectedModelSelection: switchFrom } : {}),
             })
             .pipe(Effect.mapError(fail("switch")));
           if (
@@ -728,18 +741,29 @@ export const layer = Layer.effect(
           const current = yield* engine
             .getThreadRecords(ThreadId.make(raw.threadId), ["runs"])
             .pipe(Effect.mapError(fail("queued-current")));
-          if (
-            current.runs.some((run) => run.id === item.ref && sameValue(run.modelSelection, after))
-          )
-            return;
+          const queuedRun = current.runs.find((run) => run.id === item.ref);
+          if (queuedRun === undefined || sameValue(queuedRun.modelSelection, after)) return;
+          // A run that left the queue (started, cancelled) since planning has nothing to rebind.
+          if (queuedRun.status !== "queued") return;
+          let expected = before;
+          let next = after;
+          if (phase !== "rollback" && !sameValue(queuedRun.modelSelection, before)) {
+            // Edited since planning: map what is queued now, never what was planned.
+            const mapped = planSelection(queuedRun.modelSelection);
+            if (mapped._tag === "conflict")
+              return yield* new CutoverError({ operation: "queued-unmappable" });
+            if (mapped._tag === "same") return;
+            expected = queuedRun.modelSelection;
+            next = mapped.next;
+          }
           yield* engine
             .dispatch({
               type: "queued-run.rebind-selection",
               commandId: command(item, writePhase),
               threadId: ThreadId.make(raw.threadId),
               runId: RunId.make(item.ref),
-              expectedModelSelection: before,
-              modelSelection: after,
+              expectedModelSelection: expected,
+              modelSelection: next,
             })
             .pipe(Effect.mapError(fail("queued")));
         }
@@ -772,6 +796,25 @@ export const layer = Layer.effect(
               Effect.gen(function* () {
                 const current = yield* store.card(value.before.id);
                 if (sameValue(current, value.after)) return;
+                if (phase !== "rollback") {
+                  // Paused boards still get edited (titles, stages, new asks). Map the card as it
+                  // is now; only its model selections change, and a conflict is never guessed.
+                  if (current === null) return;
+                  const board = (yield* store.boards).find((entry) => entry.id === current.boardId);
+                  if (board === undefined) return;
+                  const planned = planBoard({
+                    board,
+                    pools: yield* store.pools(board.id),
+                    cards: [current],
+                    openLinks: [],
+                  });
+                  if (planned.conflicts.length > 0 || planned.collisions.length > 0)
+                    return yield* new CutoverError({ operation: "pinned-card-conflict" });
+                  const next = planned.next?.cards[0];
+                  if (next === undefined || sameValue(next, current)) return;
+                  yield* store.putCard(next);
+                  return;
+                }
                 if (!sameValue(current, value.before))
                   return yield* new CutoverError({ operation: "pinned-card-changed" });
                 yield* store.putCard(value.after);
@@ -822,6 +865,40 @@ export const layer = Layer.effect(
                   }),
                 };
                 if (sameValue(current, payload.after)) return;
+                if (phase !== "rollback") {
+                  // Paused boards still get edited and gain cards after planning. Re-plan the live
+                  // board and write only its selection changes; conflicts are never guessed.
+                  if (current.board === undefined) return;
+                  const live = { ...current, board: current.board };
+                  const planned = planBoard(live);
+                  if (planned.conflicts.length > 0 || planned.collisions.length > 0)
+                    return yield* new CutoverError({ operation: "board-conflict" });
+                  if (!planned.changed || planned.next === null) return;
+                  // Planned inactive cards keep their own retryable pinned rows; cards created
+                  // after planning have none, so the board row maps them.
+                  const pinnedIds = new Set(
+                    payload.before.cards
+                      .filter((card) => card.activeThreadId === null)
+                      .map((card) => card.id),
+                  );
+                  const next = {
+                    ...planned.next,
+                    cards: planned.next.cards.map((card, index) =>
+                      card.activeThreadId === null && pinnedIds.has(card.id)
+                        ? live.cards[index]!
+                        : card,
+                    ),
+                  };
+                  yield* store.migrateBoardSelections({
+                    ...next,
+                    oldPoolKeys: live.pools.map((pool) => pool.key),
+                    threadLinks: next.openLinks.filter(
+                      (link, index) => !sameValue(link, live.openLinks[index]),
+                    ),
+                    cards: next.cards.filter((card, index) => !sameValue(card, live.cards[index])),
+                  });
+                  return;
+                }
                 if (!sameValue(current, payload.before))
                   return yield* new CutoverError({ operation: "board-changed" });
                 yield* store.migrateBoardSelections({
@@ -868,7 +945,44 @@ export const layer = Layer.effect(
           boards: readonly { id: KanbanBoard["id"]; pause: KanbanBoard["pause"] }[];
           queueThreads: readonly ThreadId[];
         };
-        for (const threadId of payload.queueThreads)
+        for (const threadId of payload.queueThreads) {
+          const records = yield* engine
+            .getThreadRecords(threadId, ["runs"])
+            .pipe(Effect.mapError(fail("release-read")));
+          const queued = records.runs.filter((run) => run.status === "queued");
+          // Releasing an empty queue starts nothing; skip the command.
+          if (queued.length === 0) continue;
+          // A lazy (idle, unswitched) thread may have taken a held message during the cutover.
+          // Move it and its queued turns to the native harness before the queue starts.
+          for (const run of queued) {
+            const mapped = planSelection(run.modelSelection);
+            if (mapped._tag === "conflict")
+              return yield* new CutoverError({ operation: "release-queued-unmappable" });
+            if (mapped._tag === "mapped")
+              yield* engine
+                .dispatch({
+                  type: "queued-run.rebind-selection",
+                  commandId: command(item, `release-rebind:${run.id}`),
+                  threadId,
+                  runId: run.id,
+                  expectedModelSelection: run.modelSelection,
+                  modelSelection: mapped.next,
+                })
+                .pipe(Effect.mapError(fail("release-rebind")));
+          }
+          const own = planSelection(records.thread.modelSelection);
+          if (own._tag === "mapped" && !records.runs.some(Threads.isActiveRun))
+            yield* engine
+              .dispatch({
+                type: "provider.switch",
+                commandId: command(item, `release-switch:${threadId}`),
+                threadId,
+                modelSelection: own.next,
+                ...(records.thread.settledAt === null
+                  ? { expectedModelSelection: records.thread.modelSelection }
+                  : {}),
+              })
+              .pipe(Effect.mapError(fail("release-switch")));
           yield* engine
             .dispatch({
               type: "queue.cutover-release",
@@ -876,6 +990,7 @@ export const layer = Layer.effect(
               commandId: command(item, `queue-release:${threadId}`),
             })
             .pipe(Effect.mapError(fail("release-queue")));
+        }
         for (const entry of payload.boards) {
           const board = (yield* store.boards.pipe(Effect.mapError(fail("finalize-board")))).find(
             (row) => row.id === entry.id,
@@ -925,6 +1040,31 @@ export const layer = Layer.effect(
         ? [...checks, ...scriptChecks, { id: "input", ready: false, reason: input.failure.message }]
         : [...checks, ...scriptChecks];
     });
-    return CutoverActions.of({ plan: plan(), apply, check });
+    // An idle thread needs no switch now: once the cutover completes, its next turn (composer,
+    // control API, board, schedule or a server wake) moves it through the selection migration.
+    // Threads with a live run wait for it; queued work, owner questions and background work keep
+    // the normal switch, which rebinds and defers them safely.
+    const lazy = Effect.fn("CutoverActions.lazy")(function* (item: CutoverItem) {
+      if (item.kind !== "thread" || item.wake) return "switch" as const;
+      const records = yield* engine
+        .getThreadRecords(ThreadId.make(item.ref), [
+          "runs",
+          "runtimeRequests",
+          "providerThreads",
+          "subagents",
+        ])
+        .pipe(Effect.mapError(fail("lazy-read")));
+      if (records.thread.archivedAt !== null || records.thread.deletedAt !== null)
+        return "lazy" as const;
+      if (records.runs.some(Threads.isActiveRun)) return "busy" as const;
+      if (
+        records.runs.some((run) => run.status === "queued") ||
+        records.runtimeRequests.some((request) => request.status === "pending") ||
+        runningBackgroundWork(records).length > 0
+      )
+        return "switch" as const;
+      return "lazy" as const;
+    });
+    return CutoverActions.of({ plan: plan(), apply, check, lazy });
   }),
 );

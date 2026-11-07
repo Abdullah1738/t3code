@@ -1924,17 +1924,70 @@ it.effect(
     ).pipe(Effect.provide(database)),
 );
 
-it.effect("refuses a stale pinned packet rather than overwriting a new owner ask", () =>
+it.effect("maps a pinned packet edited after planning without losing the owner's edit", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const h = yield* makeHarness();
       const entry = itemFor(yield* h.actions.plan, `pinned:${pinned.id}`);
-      const changed = { ...pinned, title: "Owner edited this packet after planning" };
+      const changed = {
+        ...pinned,
+        title: "Owner edited this packet after planning",
+        model: sol,
+        models: [{ model: sol, weight: 1 }],
+      };
+      yield* h.store.putCard(changed);
+      yield* h.actions.apply(entry, "switch");
+      yield* h.actions.apply(entry, "switch");
+      assert.deepStrictEqual(yield* h.store.card(pinned.id), {
+        ...changed,
+        model: nativeSol,
+        models: [{ model: nativeSol, weight: 1 }],
+      });
+    }),
+  ).pipe(Effect.provide(database)),
+);
+
+it.effect("refuses a pinned packet whose new selection cannot be mapped", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const entry = itemFor(yield* h.actions.plan, `pinned:${pinned.id}`);
+      const changed = {
+        ...pinned,
+        // The slug's effort and the variant disagree: a conflict, never guessed.
+        model: {
+          ...legacy("opus/claude-opus-5-5#high"),
+          options: [{ id: "variant", value: "xhigh" }],
+        },
+      };
       yield* h.store.putCard(changed);
       const result = yield* Effect.result(h.actions.apply(entry, "switch"));
       assert.isTrue(Result.isFailure(result));
       if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "CutoverError");
       assert.deepStrictEqual(yield* h.store.card(pinned.id), changed);
+    }),
+  ).pipe(Effect.provide(database)),
+);
+
+it.effect("maps a board edited and grown after planning without touching non-model fields", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const plan = yield* h.actions.plan;
+      const boardItem = itemFor(plan, `board:${board.id}`);
+      const edited = { ...stoppedWork, title: "Edited while paused" };
+      yield* h.store.putCard(edited);
+      const added = card("card:added-later", 9, { model: terra, models: [] });
+      yield* h.store.putCard(added);
+      yield* h.actions.apply(boardItem, "switch");
+      yield* h.actions.apply(boardItem, "switch");
+      assert.deepStrictEqual(yield* h.store.card(added.id), {
+        ...added,
+        model: nativeTerra,
+      });
+      // Planned inactive cards keep their own pinned rows; the board row leaves them alone.
+      assert.deepStrictEqual(yield* h.store.card(edited.id), edited);
+      assert.deepStrictEqual((yield* h.store.boards)[0]!.evaluatorModel, nativeOpus);
     }),
   ).pipe(Effect.provide(database)),
 );
@@ -1982,16 +2035,32 @@ it.effect(
           { path: `${h.stateDir}/harness-cutover-released.json`, text: '{"version":1}' },
         ]);
         assert.deepStrictEqual((yield* h.store.boards)[0], { ...board, pause: null });
-        assert.strictEqual(h.commands.length, expectedThreads.length);
+        // Only threads that still hold queued work are released; an empty release starts nothing.
+        const withQueue = expectedThreads.filter((id) =>
+          h.get(id).runs.some((run) => run.status === "queued"),
+        );
         assert.deepStrictEqual(
           h.commands
             .filter((command) => command.type === "queue.cutover-release")
             .toSorted((a, b) => a.threadId.localeCompare(b.threadId)),
-          expectedThreads.map((id) => ({
+          withQueue.map((id) => ({
             type: "queue.cutover-release",
             threadId: ThreadId.make(id),
             commandId: CommandId.make(`harness-cutover:v1:finalize:queue-release:${id}`),
           })),
+        );
+        // The idle thread that took a late owner answer is still on OpenCode (lazy): its queued
+        // turn and the thread move to the native harness before the release starts it.
+        const idleCommands = h.commands.filter(
+          (command) => "threadId" in command && command.threadId === "ordinary:idle",
+        );
+        assert.deepStrictEqual(
+          idleCommands.map((command) => command.type),
+          ["queued-run.rebind-selection", "provider.switch", "queue.cutover-release"],
+        );
+        assert.deepStrictEqual(
+          (idleCommands[0] as { modelSelection: unknown }).modelSelection,
+          nativeOpus,
         );
         assert.deepStrictEqual(yield* h.store.discussion(discussionId), discussion);
         assert.deepStrictEqual(h.sends, []);
@@ -2171,4 +2240,63 @@ it.effect("a failed normal switch retries without copying or losing the queued o
       assert.deepStrictEqual(h.sends, []);
     }),
   ).pipe(Effect.provide(database)),
+);
+
+it.effect(
+  "lazy cutover: idle threads stay on their source, busy ones wait, and finalize still completes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness({
+          threads: [
+            projection(makeThread("lazy:idle", opus), "completed"),
+            projection(makeThread("lazy:busy", sol), "completed"),
+          ],
+          withBoard: false,
+          withDefaults: false,
+          withFallback: false,
+        });
+        const plan = yield* h.actions.plan;
+        const busyItem = itemFor(plan, "thread:lazy:busy");
+        assert.isFalse(busyItem.wake);
+        // The owner starts a turn after planning: the thread waits, it is never interrupted.
+        h.replace("lazy:busy", {
+          runs: h.get("lazy:busy").runs.map((run) => ({ ...run, status: "running" as const })),
+        });
+        assert.strictEqual(yield* h.actions.lazy!(busyItem), "busy");
+        h.replace("lazy:busy", {
+          runs: h.get("lazy:busy").runs.map((run) => ({ ...run, status: "completed" as const })),
+        });
+        assert.strictEqual(yield* h.actions.lazy!(busyItem), "lazy");
+        // Queued work keeps the normal switch (rebind under the barrier).
+        h.replace("lazy:busy", {
+          runs: [...h.get("lazy:busy").runs, makeRun(h.get("lazy:busy").thread, "queued", 2)],
+        });
+        assert.strictEqual(yield* h.actions.lazy!(busyItem), "switch");
+        h.replace("lazy:busy", {
+          runs: h.get("lazy:busy").runs.filter((run) => run.status !== "queued"),
+        });
+
+        const engine = yield* realEngine(h);
+        let status = yield* engine.run();
+        for (let pass = 0; pass < 6 && !status.completed; pass += 1) status = yield* engine.run();
+        assert.isTrue(status.completed);
+        for (const key of ["thread:lazy:idle", "thread:lazy:busy"]) {
+          const row = status.items.find((entry) => entry.key === key)!;
+          assert.strictEqual(row.state, "briefed");
+          assert.strictEqual(row.reason, CutoverEngine.LAZY_REASON);
+        }
+        // Never switched: each moves on its own next turn, once cutoverComplete is set.
+        assert.deepStrictEqual(h.get("lazy:idle").thread.modelSelection, opus);
+        assert.deepStrictEqual(h.get("lazy:busy").thread.modelSelection, sol);
+        assert.strictEqual(h.settings().ardudHarnessMigration?.cutoverComplete, true);
+        assert.strictEqual(h.settings().ardudHarnessMigration?.selections, "apply");
+        assert.deepStrictEqual(h.sends, []);
+        assert.deepStrictEqual(h.interrupts, []);
+        assert.strictEqual(
+          h.commands.filter((command) => command.type === "provider.switch").length,
+          0,
+        );
+      }),
+    ).pipe(Effect.provide(database)),
 );
