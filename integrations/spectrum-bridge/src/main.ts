@@ -118,6 +118,7 @@ async function main(): Promise<void> {
   });
   await chmod(socketPath, 0o600);
   const store = new Store(join(stateRoot, "state.sqlite"));
+  if (backend instanceof RobobBackend) backend.trackFirstTurns(store);
   // Retire only unsent legacy observer output. Agent-authored notify:* operations are untouched.
   store.db.query("UPDATE outbox SET state = 'cancelled' WHERE id LIKE 'juno:%' AND state IN ('pending', 'uncertain', 'failed')").run();
   const projectScope = hash(process.env.SPECTRUM_PROJECT_ID!);
