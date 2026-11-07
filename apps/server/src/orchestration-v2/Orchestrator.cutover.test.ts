@@ -561,3 +561,73 @@ it.effect("receipt replay precedes completed-cutover selection policy", () =>
     assert.equal(error._tag, "OrchestratorCommandRejectedError");
   }).pipe(Effect.provide(layer(true))),
 );
+
+const seedLegacyThread = (threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    yield* engine.dispatch(create(threadId, native));
+    const created = yield* engine.getThreadProjection(threadId);
+    // A thread that sat idle on OpenCode through the cutover.
+    yield* projections.apply({
+      id: EventId.make(`seed:${threadId}:legacy`),
+      type: "thread.model-selection-updated",
+      threadId,
+      occurredAt: yield* DateTime.now,
+      payload: { ...created.thread, modelSelection: source, providerInstanceId: openCode },
+    });
+  });
+
+it.effect.each([
+  { label: "a server wake", selection: undefined },
+  { label: "the composer's own selection", selection: source },
+])("after cutover, $label on an idle legacy thread starts on the native harness", ({ selection }) =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("lazy:idle");
+    yield* seedLegacyThread(threadId);
+    yield* engine.dispatch({
+      ...send(threadId, "wake", "Delegated task finished", "queue_after_active", selection),
+      createdBy: "agent" as const,
+      creationSource: "server" as const,
+    });
+    const after = yield* engine.getThreadProjection(threadId);
+    assert.equal(after.thread.modelSelection.instanceId, native.instanceId);
+    assert.equal(after.thread.modelSelection.model, native.model);
+    const run = after.runs.at(-1)!;
+    assert.equal(run.modelSelection.instanceId, native.instanceId);
+    assert.notEqual(run.status, "queued");
+  }).pipe(Effect.provide(layer(true))),
+);
+
+it.effect(
+  "after cutover, a busy legacy thread queues on its harness and moves on its next idle turn",
+  () =>
+    Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("lazy:busy");
+      yield* seedLegacyThread(threadId);
+      yield* engine.dispatch(send(threadId, "first", "Start", "start_immediately"));
+      const started = yield* engine.getThreadProjection(threadId);
+      const active = started.runs.at(-1)!;
+      // Simulate a thread that was already running on OpenCode when the cutover completed.
+      yield* projections.apply({
+        id: EventId.make("lazy:busy:legacy"),
+        type: "thread.model-selection-updated",
+        threadId,
+        occurredAt: yield* DateTime.now,
+        payload: { ...started.thread, modelSelection: source, providerInstanceId: openCode },
+      });
+      yield* engine.dispatch({
+        ...send(threadId, "wake", "Background work updated", "queue_after_active"),
+        createdBy: "agent" as const,
+        creationSource: "server" as const,
+      });
+      const busy = yield* engine.getThreadProjection(threadId);
+      assert.deepEqual(busy.thread.modelSelection, source);
+      assert.equal(busy.runs.at(-1)!.status, "queued");
+      assert.deepEqual(busy.runs.at(-1)!.modelSelection, source);
+      assert.notEqual(active.status, "queued");
+    }).pipe(Effect.provide(layer(true))),
+);

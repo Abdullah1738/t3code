@@ -154,6 +154,7 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import { postCutoverSelectionProblem } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { planSelection } from "../ardud/harness-migrate/selectionPlan.ts";
 import { cutoverAdmissionHeld } from "../ardud/harness-migrate/cutoverClaim.ts";
 import { contextResetTurnItem } from "../ardud/context-reset/divider.ts";
 // ardud: archive only while idle
@@ -4879,6 +4880,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ]);
   });
 
+  // ardud: after the harness cutover, idle threads keep their OpenCode selection until their
+  // next turn. Every turn that starts on a quiet thread with its own legacy selection moves it
+  // to the native harness here, whichever path sent it (composer, control API, board, schedule
+  // or a server wake). A thread with live, queued or background work finishes that work first.
+  const lazyCutoverSelection = (
+    projection: OrchestrationV2ThreadProjection,
+    selection: ModelSelection,
+  ) =>
+    Effect.gen(function* () {
+      if (!modelSelectionsEqual(selection, projection.thread.modelSelection)) return selection;
+      const mapped = planSelection(selection);
+      if (mapped._tag !== "mapped") return selection;
+      const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+      if (settings.ardudHarnessMigration?.cutoverComplete !== true) return selection;
+      const quiet =
+        projection.thread.archivedAt === null &&
+        projection.thread.deletedAt === null &&
+        !projection.runs.some((run) => isBlockingRun(run) || run.status === "queued") &&
+        !projection.runtimeRequests.some((request) => request.status === "pending") &&
+        runningBackgroundWork(projection).length === 0;
+      return quiet ? mapped.next : selection;
+    });
+
   const dispatchMessage = Effect.fn("Orchestrator.dispatchMessage")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -5088,7 +5112,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ]);
       projection = yield* getProjectionWithPendingEvents(command.threadId, events);
     }
-    const modelSelection = command.modelSelection ?? projection.thread.modelSelection;
+    const modelSelection = yield* lazyCutoverSelection(
+      projection,
+      command.modelSelection ?? projection.thread.modelSelection,
+    );
     let dispatchMode = resolveMessageDispatchIntent(
       projection,
       command.dispatchMode,
@@ -12185,7 +12212,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         command.modelSelection !== undefined
       ) {
         const reason = postCutoverSelectionProblem(command.modelSelection);
-        if (reason !== null)
+        // ardud: a sender that echoes the thread's own stored selection (the composer, restart
+        // and steer follow-ups) is inheriting it; dispatchMessage moves it to its native harness.
+        const ownSelection =
+          reason !== null &&
+          command.type === "message.dispatch" &&
+          modelSelectionsEqual(
+            command.modelSelection,
+            (yield* projectionStore
+              .getThread(command.threadId)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+                ),
+              )).modelSelection,
+          );
+        if (reason !== null && !ownSelection)
           return yield* new OrchestratorCommandRejectedError({
             commandId: command.commandId,
             commandType: command.type,

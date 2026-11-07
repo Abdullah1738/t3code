@@ -1151,6 +1151,24 @@ it.effect.each(["running", "queued"] as const)(
   },
 );
 
+it.effect.each(["running", "queued"] as const)(
+  "after cutover, a %s thread keeps its harness for this send and moves on a later idle turn",
+  (status) => {
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      runs: [{ status }],
+    });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage(`busy-${status}`, legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual(["message.dispatch"]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: legacySelection });
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
 it.effect.each(["pendingRequest", "backgroundTask"] as const)(
   "does not detach a provider with $0",
   (blocker) => {

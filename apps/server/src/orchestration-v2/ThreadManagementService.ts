@@ -840,6 +840,9 @@ const make = Effect.gen(function* () {
         quiet.runtimeRequests.some((request) => request.status === "pending") ||
         runningBackgroundWork(quiet).length > 0
       ) {
+        // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
+        // queues) on its current harness and the thread moves on its first turn that starts idle.
+        if (options.cutoverComplete) return yield* dispatchUnchanged(command);
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
