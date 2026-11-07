@@ -92,6 +92,29 @@ class FoodFinancialTests(unittest.TestCase):
         with self.assertRaises(j.JournalError):
             j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
 
+    def test_automatic_processing_does_not_claim_capture_or_release(self):
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        result=self.co.place()
+        self.assertEqual(result['state'],'MERCHANT_PROCESSED_CAPTURE_UNVERIFIED')
+        self.assertFalse(result['paid'])
+        self.assertFalse(result['capture_verified'])
+        self.assertTrue(result['tracker']['held'])
+        self.assertEqual(j.inspect(self.flow)['state'],'ACTIVE')
+        self.assertEqual(j.inspect(self.flow)['reserved_minor'],4585)
+        with self.assertRaises(j.JournalError):self.co.place()
+
+    def test_retract_capture_claim_only_adds_fence_and_keeps_history(self):
+        self.reader.capture();self.reader.order_data['accepted']=True
+        self.co.place()
+        j.retract_food_capture_claim(self.flow,evidence_hash=j.digest('correction'))
+        state=j.inspect(self.flow)
+        self.assertEqual(state['state'],'FENCED')
+        self.assertEqual(state['reserved_minor'],4585)
+        self.assertEqual(state['order_id'],ORDER)
+        with self.assertRaises(j.JournalError):self.co.place()
+        with self.assertRaises(j.JournalError):
+            j.open_flow(flow_id=str(uuid.uuid4()),app='noon',vertical='food',account_hash='a'*64,scope_hash='e'*64)
+
     def test_ambiguous_complete_recovery_and_repeat_are_read_only(self):
         self.co.place();self.fail_send='complete'
         self.assertEqual(self.co.complete_payment()['state'],'PAYMENT_OUTCOME_UNKNOWN')
@@ -251,6 +274,37 @@ class NativeOrderTests(unittest.TestCase):
         flow,state,raw=self.fixture();raw['orderStatusCode']='unseen_state'
         self.assertFalse(recovery.project_order(raw,ORDER,flow,state)['accepted'])
 
+    def test_observed_early_acceptance_requires_both_statuses(self):
+        flow,state,raw=self.fixture()
+        raw.update(orderStatusCode='accepted',outletStatusCode='accepted')
+        self.assertTrue(recovery.project_order(raw,ORDER,flow,state)['accepted'])
+        raw['outletStatusCode']='not_synced'
+        self.assertFalse(recovery.project_order(raw,ORDER,flow,state)['accepted'])
+
+    def test_automatic_native_processing_requires_observed_fields(self):
+        flow,state,raw=self.fixture()
+        state['card_hash']=j.digest(CARD)
+        reader=recovery.NativeReader.__new__(recovery.NativeReader)
+        reader.flow=flow;reader.state=state
+        reader.session_data={'paymentRequireCompletion':False,'paymentRequireCvv':False,
+            'paymentToken':CARD,'orderPaymentFinalTotal':45.85}
+        raw.update(orderStatusCode='accepted',outletStatusCode='accepted',paymentClientSecret=None,
+            paymentProcessedAt='2026-11-07T21:46:25',miscInfo={'isPaymentAutoCapture':True},
+            orderRefundToWallet=0,orderIssuedCredit=0,orderAdjustments=0,failedErrorMsg=None)
+        with patch.object(recovery.vertical,'_read',return_value=raw),\
+             patch.object(recovery.vertical,'_food_data',side_effect=lambda value:value):
+            self.assertTrue(reader.order(ORDER)['automatic_payment_processed'])
+            for key in ('paymentRequireCompletion','paymentRequireCvv'):
+                for value in (None,0,'false',True):
+                    reader.session_data[key]=value
+                    self.assertFalse(reader.order(ORDER)['automatic_payment_processed'])
+                reader.session_data[key]=False
+            for key,value in (('paymentProcessedAt',None),('failedErrorMsg','failed'),('orderAdjustments',1),
+                              ('paymentClientSecret',INTENT),('miscInfo',{})):
+                old=raw[key];raw[key]=value
+                self.assertFalse(reader.order(ORDER)['automatic_payment_processed'])
+                raw[key]=old
+
     def test_native_session_binding_preserves_all_preparation_guards(self):
         flow=food.FoodFlow.__new__(food.FoodFlow)
         flow.outlet='OUTLET1';flow.account='a'*64;flow.scope='b'*64
@@ -259,7 +313,8 @@ class NativeOrderTests(unittest.TestCase):
         data={'checkoutSessionCode':'SESSION1','outletCode':'OUTLET1','addressCode':'ADDRESS','addressVersion':1,
             'items':flow.rows,'deliveryPreferenceInfo':[{'code':k,'value':True} for k in food.QUIET],
             'driverNotes':food.QUIET_NOTE,'creditCardMask':'****2342','paymentMethodCode':'prepaid',
-            'prepaidPaymentMethodCode':'cc_noonpay','orderWalletAmount':0,'orderPaymentAmount':45.85,'orderTotal':45.85}
+            'prepaidPaymentMethodCode':'cc_noonpay','orderWalletAmount':0,'orderPaymentAmount':45.85,'orderTotal':45.85,
+            'paymentToken':CARD}
         review=flow.review(data)
         reader=recovery.NativeReader.__new__(recovery.NativeReader);reader.flow_id='synthetic'
         reader.state={'outlet':flow.outlet,'items':flow.rows,'session':'SESSION1',
@@ -270,6 +325,9 @@ class NativeOrderTests(unittest.TestCase):
             self.assertIsNone(reader.session()['order_id'])
             data['orderNr']=ORDER
             self.assertEqual(reader.session()['order_id'],ORDER)
+            data['paymentToken']='other'
+            with self.assertRaisesRegex(j.JournalError,'FOOD_FRESH_CARD_TOKEN_CHANGED'):reader.session()
+            data['paymentToken']=CARD
             data['orderTotal']=46
             with self.assertRaises(j.JournalError):reader.session()
 

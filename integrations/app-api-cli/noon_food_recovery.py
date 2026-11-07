@@ -6,6 +6,7 @@ capture, but cannot authorize a payment continuation from an unknown shape.
 import json
 import os
 import subprocess
+import re
 from pathlib import Path
 
 import commerce_food as food
@@ -30,6 +31,7 @@ class NativeReader:
               for r in self.state['items']]
         self.flow=food.FoodFlow(self.state['outlet'],rows,self.flow_id,read_only=True)
         data=self.flow.read()
+        self.session_data=data
         # An exact owned session is the only permitted source of an order ID.
         # Retain all review guards while allowing that session to have an order.
         review=self.flow.review({**data,'orderNr':None})
@@ -37,6 +39,8 @@ class NativeReader:
         require(review==expected and j.digest(self.state['review'])==self.state['review_hash'],
                 'FOOD_FINANCIAL_REVIEW_CHANGED')
         require(isinstance(self.state.get('card_hash'),str),'FOOD_PREPARED_CARD_BINDING_MISSING')
+        require(j.digest(str(data.get('paymentToken')))==self.state['card_hash'],
+                'FOOD_FRESH_CARD_TOKEN_CHANGED')
         selection=[o for o in j.inspect(self.flow_id)['operations'] if o['name']=='set_payment_method']
         require(len(selection)==1 and selection[0]['state']=='OBSERVED','FOOD_CARD_SELECTION_UNOBSERVED')
         return {'account_hash':self.flow.account,'scope_hash':self.flow.scope,
@@ -47,7 +51,19 @@ class NativeReader:
     def order(self, order):
         require(self.flow is not None,'FOOD_SESSION_READ_REQUIRED')
         data=vertical._food_data(vertical._read('food_detail',self.flow.headers,core.operation_deadline(15),order))
-        return project_order(data,order,self.flow,self.state)
+        row=project_order(data,order,self.flow,self.state)
+        row['automatic_payment_processed']=(
+            self.session_data.get('paymentRequireCompletion') is False
+            and self.session_data.get('paymentRequireCvv') is False
+            and j.digest(str(self.session_data.get('paymentToken')))==self.state['card_hash']
+            and data.get('paymentClientSecret') is None
+            and isinstance(data.get('paymentProcessedAt'),str)
+            and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d',data['paymentProcessedAt']) is not None
+            and (data.get('miscInfo') or {}).get('isPaymentAutoCapture') is True
+            and minor(self.session_data.get('orderPaymentFinalTotal'))==self.state['review']['payable_minor']
+            and all(data.get(k)==0 for k in ('orderRefundToWallet','orderIssuedCredit','orderAdjustments'))
+            and data.get('failedErrorMsg') is None and row['accepted'])
+        return row
 
     def payment(self, intent):
         import noon_nownow_checkout as payment
@@ -94,7 +110,7 @@ def project_order(data, order, flow, state):
     return {'order_id':order,'account_hash':flow.account,'scope_hash':flow.scope,
             'amount_minor':amount,'card_hash':state['card_hash'],'intent':data.get('paymentClientSecret'),
             'cvv_required':data.get('paymentRequireCvv'),
-            'accepted':data.get('orderStatusCode')=='delivered' or
+            'accepted':(data.get('orderStatusCode')=='accepted' and data.get('outletStatusCode')=='accepted') or data.get('orderStatusCode')=='delivered' or
                        (data.get('outletStatusCode')=='picked_up' and data.get('orderStatusCode') in ('delivering','picked_up'))}
 
 

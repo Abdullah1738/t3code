@@ -131,7 +131,7 @@ def food_projection(data, order):
     if row.get('orderNr') != order or not isinstance(raw, str) or not re.fullmatch(r'[a-z_]{1,64}', raw):
         raise NoonError('ORDER_MISMATCH_OR_SCHEMA_CHANGED')
     out = core.base(order, 'food')
-    out.update(raw_status=raw, status={'delivered': 'delivered', 'delivering': 'out for delivery',
+    out.update(raw_status=raw, status={'preparing': 'preparing', 'delivered': 'delivered', 'delivering': 'out for delivery',
                                      'picked_up': 'picked up'}.get(raw, 'unknown'),
                scope='order', status_text=core.text(row.get('statusLabel')),
                coverage='exact_native_food_order; delivered_delivering_picked_up_verified')

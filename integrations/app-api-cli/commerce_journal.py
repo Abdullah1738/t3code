@@ -488,6 +488,23 @@ def reconcile_marketplace_paid(flow_id, *, evidence_hash):
     return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('main','supermall'))
 
 
+def retract_food_capture_claim(flow_id, *, evidence_hash):
+    """Append a correction when merchant processing was mistaken for capture.
+
+    This only increases restrictions. It neither erases history nor permits sends.
+    """
+    if not _hash(evidence_hash):fail('JOURNAL_OBSERVATION_INVALID')
+    with _db() as db:
+        flow=_get(db,flow_id)
+        if flow['app']!='noon' or flow['vertical']!='food' or flow['state']!='COMPLETE' or not flow['order_id']:
+            fail('JOURNAL_FOOD_CORRECTION_INVALID')
+        op=db.execute("SELECT name FROM operations WHERE flow_id=? AND kind='place'",(flow_id,)).fetchone()
+        if not op:fail('JOURNAL_FOOD_CORRECTION_INVALID')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                   (flow_id,op['name'],'UNKNOWN',evidence_hash,flow['order_id'],time.time()))
+        db.execute("UPDATE flows SET state='FENCED' WHERE id=?",(flow_id,))
+
+
 def reconcile_food_paid(flow_id, *, evidence_hash):
     """Food adapter has independently bound session, order, intent and capture."""
     return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('food',))

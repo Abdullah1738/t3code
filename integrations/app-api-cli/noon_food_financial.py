@@ -208,7 +208,9 @@ class Coordinator:
                 # A status outage must not strand an exactly identified order.
                 # No exception payload (which could contain a secret) is persisted.
                 payment_error='FOOD_PAYMENT_PROOF_UNAVAILABLE_OR_MISMATCHED'
-        paid=bool(payment and payment['paid']);accepted=row.get('accepted') is True
+        captured=bool(payment and payment['paid'])
+        automatic=row.get('automatic_payment_processed') is True
+        paid=captured;accepted=row.get('accepted') is True
         if local['state']=='COMPLETE':
             require(paid and accepted,'FOOD_COMPLETED_ORDER_EVIDENCE_CHANGED')
         receipt=self.registrar(order,paid=paid and accepted)
@@ -218,11 +220,12 @@ class Coordinator:
         if local['state']!='COMPLETE':
             if paid:
                 j.observe(self.flow_id,operation,outcome='PAYMENT_REPORTED_SUCCESS',evidence_hash=j.digest(payment),order_id=order)
-                if j.inspect(self.flow_id)['state']=='FENCED':j.reconcile_food_paid(self.flow_id,evidence_hash=j.digest(payment))
+                if captured and j.inspect(self.flow_id)['state']=='FENCED':j.reconcile_food_paid(self.flow_id,evidence_hash=j.digest(payment))
                 if accepted:j.observe(self.flow_id,operation,outcome='EXACT_ORDER_CONFIRMED',evidence_hash=j.digest({'order':order,'accepted':True}),order_id=order)
             j.observe(self.flow_id,operation,outcome='TRACKER_REGISTERED',evidence_hash=j.digest(receipt),order_id=order)
-            if paid and accepted:j.complete(self.flow_id)
-        return {'ok':True,'state':'PAID_AND_ACCEPTED' if paid and accepted else 'PAID_AWAITING_ACCEPTANCE' if paid else 'PAYMENT_UNCONFIRMED',
+            if paid and accepted and j.inspect(self.flow_id)['state']!='FENCED':j.complete(self.flow_id)
+        return {'ok':True,'state':'MERCHANT_PROCESSED_CAPTURE_UNVERIFIED' if automatic and not captured else 'PAID_AND_ACCEPTED' if paid and accepted else 'PAID_AWAITING_ACCEPTANCE' if paid else 'PAYMENT_UNCONFIRMED',
+                'capture_verified':captured,'automatic_payment_processed':automatic,
                 'order':order,'paid':paid,'accepted':accepted,'payment':payment,'tracker':receipt,
                 'payment_error':payment_error,
                 'financial_send':False,'financial_retry':False}
@@ -240,9 +243,15 @@ def contract():
             'optional_wallet_fields':['applePayToken','googlePayToken','adcbTokenCode']},
         'read_only_status':{'url':STATUS_URL,'fields':['clientSecret'],
             'proof':'exact reference, AED amount/authorized/captured, cc_noonpay, 2342 token binding, payment_confirmed/CAPTURED/error 0'},
-        'unsupported':['fresh place response and post-place session field continuity (orderNr/intent/CVV requirement)',
+        'live_place_proof':{'date':'2026-11-07','path':'automatic saved card; one placement, no completion',
+            'observed':['owned session orderNr matches placement and exact order',
+                'explicit false paymentRequireCvv and paymentRequireCompletion',
+                'null paymentClientSecret; paymentProcessedAt populated; accepted/accepted',
+                'fresh saved-card token matches prepared binding; preparing tracking'],
+            'capture_verified':False},
+        'unsupported':['automatic null-intent path has no explicit capture receipt; merchant processing is reported separately',
             'unpaid intent status and safe eligibility for first completion; native adapter refuses unknown states',
             'saved-card absent wallet-field serialization and encrypted-CVV request acceptance',
             '3DS challenge/return contract; recovery reads status only and never follows redirect URLs',
-            'early restaurant acceptance enums; only observed picked_up/delivered proves acceptance'],
-        'proof_required':'One separately authorized, freshly priced restaurant order with one placement and at most one bound completion; capture redacted request shapes and independent session/order/status readbacks. Never replay timeout or ambiguous sends.'}
+            'other early acceptance pairs beyond accepted/accepted'],
+        'proof_required':'Exact capture evidence for the existing automatic order. Completion/CVV/3DS remain unproven and disabled. Never replay placement or payment.'}
