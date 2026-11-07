@@ -2633,10 +2633,10 @@ const make = Effect.gen(function* () {
 
   const ownerDeliveries = new Map<string, Set<string>>();
   /** Saving succeeds independently of delivery. Every retry starts with fresh board state. */
-  const routeSavedOwner = (
+  const routeSavedOwner = <E>(
     discussionId: KanbanDiscussion["id"],
     key: string,
-    route: Effect.Effect<unknown, unknown>,
+    route: Effect.Effect<unknown, E>,
   ) => {
     let delivered = ownerDeliveries.get(key);
     if (!delivered) ownerDeliveries.set(key, (delivered = new Set()));
@@ -2693,11 +2693,11 @@ const make = Effect.gen(function* () {
       );
     return retry(3);
   };
-  const routeRetainingAskers = (
+  const routeRetainingAskers = <E>(
     discussionId: KanbanDiscussion["id"],
     key: string,
     text: string,
-    route: Effect.Effect<unknown, unknown>,
+    route: Effect.Effect<unknown, E>,
     askId?: string,
   ) =>
     Effect.gen(function* () {

@@ -320,7 +320,7 @@ it.effect(
       const after = yield* measure(true);
       assert.deepEqual(before, { conflicts: 40, lostAnswers: 20 });
       assert.deepEqual(after, { conflicts: 0, lostAnswers: 0 });
-      console.log("kanban stress (32 writers, 20 requests, 20 answers)", { before, after });
+      yield* Effect.log("kanban stress (32 writers, 20 requests, 20 answers)", { before, after });
     }),
 );
 

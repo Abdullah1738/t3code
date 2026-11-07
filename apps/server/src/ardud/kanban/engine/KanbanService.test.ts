@@ -12792,11 +12792,13 @@ it.effect("a pending owner post retains every evaluator asker after asks close",
         card.id,
         { question: "One?", blocking: false },
         { _tag: "evaluator", threadId: first },
+        "evaluator",
       );
       yield* kanban.askOwner(
         card.id,
         { question: "Two?", blocking: false },
         { _tag: "evaluator", threadId: second },
+        "evaluator",
       );
       const discussion = yield* kanban.cardDiscussion(card.id);
       fake.rejectSends.add(second);
@@ -12861,11 +12863,13 @@ it.effect(
           card.id,
           { question: "Old?", blocking: false },
           { _tag: "evaluator", threadId: old },
+          "evaluator",
         );
         yield* kanban.askOwner(
           card.id,
           { question: "Live?", blocking: false },
           { _tag: "evaluator", threadId: live },
+          "evaluator",
         );
         const discussion = yield* kanban.cardDiscussion(card.id);
         yield* setArchived(fake, old);
@@ -12904,11 +12908,13 @@ it.effect("worker-triggered evaluator handoffs use distinct keys for every prior
         card.id,
         { question: "One?", blocking: false },
         { _tag: "evaluator", threadId: first },
+        "evaluator",
       );
       yield* kanban.askOwner(
         card.id,
         { question: "Two?", blocking: false },
         { _tag: "evaluator", threadId: second },
+        "evaluator",
       );
       const discussion = yield* kanban.cardDiscussion(card.id);
       yield* kanban.post(discussion.id, { _tag: "thread", threadId: worker }, [
