@@ -53,7 +53,7 @@ class Base(unittest.TestCase):
         path = self.wd / 'state.json'
         state = json.loads(path.read_text()) if path.exists() else {'fires': 0}
         state['fires'] = int(state.get('fires', 0)) + 1
-        state['last_fire_at'] = at(when).isoformat(timespec='seconds')
+        state['last_fire_at'] = at(when).astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
         path.write_text(json.dumps(state))
 
     def watcher(self, watcher_id, status, fires=1):
@@ -63,6 +63,23 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+class Moments(unittest.TestCase):
+    def test_iso_timestamps_are_normalised_to_dubai(self):
+        expected = at('2026-11-05T20:58:51.632')
+        for text in ('2026-11-05T16:58:51.632Z', '2026-11-05T16:58:51.632z',
+                     '2026-11-05T16:58:51.632+00:00', '2026-11-05T20:58:51.632+04:00',
+                     '2026-11-05T20:58:51.632'):
+            with self.subTest(text=text):
+                result = mc.moment(text)
+                self.assertEqual(result, expected)
+                self.assertEqual(result.tzinfo, TZ)
+
+    def test_invalid_timestamps_are_none(self):
+        for text in ('garbage', None, 123, '2026-11-05T16:Z58:51.632'):
+            with self.subTest(text=text):
+                self.assertIsNone(mc.moment(text))
 
 
 class Book(Base):
@@ -105,6 +122,18 @@ class Book(Base):
 
 
 class Pings(Base):
+    def test_runner_z_delivery_is_recorded_and_not_repeated_on_later_ticks(self):
+        self.case(deadline='2026-11-06')
+        self.assertIn('acme', self.check('2026-11-05T20:58:51.632', 'r1'))
+        state = json.loads((self.wd / 'state.json').read_text())
+        self.assertEqual(state['last_fire_at'], '2026-11-05T16:58:51.632Z')
+        for now, run in (('2026-11-05T21:13:51.632', 'r2'), ('2026-11-05T21:28:51.632', 'r3')):
+            with self.subTest(now=now):
+                self.assertEqual(self.check(now, run), '')
+                self.assertEqual(self.sent()['acme|r0|soon'], '2026-11-05T20:58:51+04:00')
+                self.assertNotIn('outbox', json.loads((self.wd / 'pings.json').read_text()))
+        self.assertEqual(json.loads((self.wd / 'state.json').read_text())['fires'], 1)
+
     def test_ping_once_inside_a_day_then_daily_when_overdue(self):
         self.case(deadline='2026-10-25T18:00:00+04:00')
         self.assertEqual(self.check('2026-10-24T17:00'), '')

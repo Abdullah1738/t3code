@@ -259,6 +259,8 @@ def corroborate(data, case_id, merchant, amount, currency, charged, kind, observ
 
 def moment(text):
     try:
+        if isinstance(text, str) and text.endswith(('Z', 'z')):
+            text = text[:-1] + '+00:00'
         t = dt.datetime.fromisoformat(text)
     except (TypeError, ValueError):
         return None
