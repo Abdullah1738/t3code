@@ -155,6 +155,11 @@ def purchase_talabat(args):
     return result
 
 
+def talabat_retired_note():
+    import talabat_retired
+    return talabat_retired.MESSAGE
+
+
 def talabat_discovery(args):
     """Authenticated menu/choice reads, without opening or modifying a cart."""
     from dataclasses import asdict
@@ -231,7 +236,8 @@ def capabilities():
             'nested_subchoices_cart_live_verified':True,
             'nested_subchoices_purchase_live_verified':False,'multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True}},
-        'talabat_order_scope':'arbitrary_catalog_items_and_multiple_lines',
+        'talabat_order_scope':'retired_by_owner_2026_11_07',
+        'talabat_retired':talabat_retired_note(),
         'spending_policy':'caller_managed_no_cli_order_or_campaign_cap',
         'basket_input':'items_file_json_array_or_items_object_with_legacy_single_item_flags',
         'noon_session_recovery':'bounded_same_account_revalidation_and_peer_cookie_adoption',
@@ -1046,6 +1052,9 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Talabat retired by the owner (2026-11-07): refuse before pause, auth or network.
+    import talabat_retired
+    if talabat_retired.requested(args):return talabat_retired.refuse()
     # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
     if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
         print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',

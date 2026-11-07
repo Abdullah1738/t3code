@@ -12,9 +12,9 @@ from pathlib import Path
 from catalog_schema import normalize, download
 from common import HOME_LAT, HOME_LNG, item_matches, money
 
+# Talabat retired by the owner 2026-11-07 (talabat_retired.py): never searched.
 SOURCES = [('noon', 'minutes'), ('noon', 'nownow'), ('careem', 'quik'),
-           ('careem', 'shops'), ('talabat', 'mart'), ('talabat', 'groceries'),
-           ('talabat', 'pharmacies')]
+           ('careem', 'shops')]
 
 
 def strict_match(term, name):
@@ -219,30 +219,16 @@ def main():
     if not terms or len(terms)>12 or not 5 <= o.timeout <=60:
         p.error('Use 1–12 distinct items and timeout 5–60')
     start = time.monotonic()
-    def talabat_batch(section, selected):
-        from talabat_native import batch_products
-        from native import NativeError
-        try:
-            batch = batch_products(selected, section, timeout=max(1,o.timeout-.4), stores=4, open_only=o.open)
-            return [('talabat',section,t,{**normalize(batch[t]), 'coverage':batch[t]['coverage']},None) for t in selected]
-        except NativeError as e:
-            return [('talabat',section,t,None,e.code) for t in selected]
     with cf.ThreadPoolExecutor(48) as pool:
         futures = [pool.submit(search,a,s,t,o.timeout,o.open) for t in terms for a,s in relevant_sources(t) if a != 'talabat']
-        batches = [pool.submit(talabat_batch,'groceries',terms)]
-        pharmacy_terms = [t for t in terms if ('talabat','pharmacies') in relevant_sources(t)]
-        if pharmacy_terms:
-            batches.append(pool.submit(talabat_batch,'pharmacies',pharmacy_terms))
         results = [f.result() for f in futures]
-        for f in batches:
-            results.extend(f.result())
     stores, errors, fallbacks = collect(results, terms, o.open)
     plans, truncated = optimize(stores, terms, o.limit)
     data = {'ok': bool(plans), 'schema_version': 1, 'terms': terms,
             'location': {'latitude':HOME_LAT,'longitude':HOME_LNG}, 'plans': plans,
             'search_errors': errors, 'fallbacks': fallbacks, 'plan_enumeration_truncated':truncated,
             'coverage': [{'app':a, 'section':s, **d['coverage']} for a,s,t,d,e in results
-                         if d and 'coverage' in d and t == (pharmacy_terms[0] if s == 'pharmacies' else terms[0])],
+                         if d and 'coverage' in d and t == terms[0]],
             'stores_searched': len(stores), 'elapsed_seconds':round(time.monotonic()-start,2),
             'notes':['Ranked by coverage, fewest orders, maximum ETA, then items plus known delivery fees.',
                      'Unknown ETA/fees sort last, never as zero. Service, small-order and account fees require checkout.',

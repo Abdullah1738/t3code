@@ -23,6 +23,24 @@ import order_tracker as t
 import order_watch_receipt as receipt
 
 
+# Talabat was retired by the owner on 2026-11-07 (talabat_retired.py). These tests use
+# the old Talabat lane to exercise shared guards (card, pause, Moni go, chat, --for), so
+# the retirement gate is switched off inside this test process only; the gate itself is
+# covered by test_talabat_retired.
+import talabat_retired as _talabat_retired
+from unittest.mock import patch as _retired_patch
+_retired_gate = _retired_patch.object(_talabat_retired, 'requested', return_value=False)
+
+
+def setUpModule():
+    _retired_gate.start()
+
+
+def tearDownModule():
+    _retired_gate.stop()
+
+
+
 def sent_text(args):
     (text,) = [a[len('--text='):] for a in args if a.startswith('--text=')]
     return text

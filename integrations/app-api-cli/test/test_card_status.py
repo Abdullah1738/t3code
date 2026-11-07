@@ -14,6 +14,24 @@ from unittest.mock import Mock, patch
 import card_status as cs
 import commerce_cli as cli
 
+
+# Talabat was retired by the owner on 2026-11-07 (talabat_retired.py). These tests use
+# the old Talabat lane to exercise shared guards (card, pause, Moni go, chat, --for), so
+# the retirement gate is switched off inside this test process only; the gate itself is
+# covered by test_talabat_retired.
+import talabat_retired as _talabat_retired
+from unittest.mock import patch as _retired_patch
+_retired_gate = _retired_patch.object(_talabat_retired, 'requested', return_value=False)
+
+
+def setUpModule():
+    _retired_gate.start()
+
+
+def tearDownModule():
+    _retired_gate.stop()
+
+
 DECLINE = 'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY'
 FLOW = '10000000-0000-4000-8000-000000000042'
 # 2026-10-18 11:11 Dubai (07:11 UTC)

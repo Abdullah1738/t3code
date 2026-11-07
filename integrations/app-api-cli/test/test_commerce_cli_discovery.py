@@ -12,6 +12,7 @@ import commerce_cli as cli
 from talabat_menu_choices import MenuEntry, MenuIndex, ChoiceOption, ChoiceSection, ItemChoices
 
 
+@unittest.skip('Talabat retired by owner 2026-11-07: menu/choices refuse (test_talabat_retired)')
 class DiscoveryCLITests(unittest.TestCase):
     def setUp(self):
         self.item=MenuEntry(123,'Pizza',6000,6000,True,'Pizza')
