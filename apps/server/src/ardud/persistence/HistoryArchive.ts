@@ -19,6 +19,7 @@ import { HistoryArchiveDurability } from "./archiveCheckpoint.ts";
 import { ArchiveSnapshotGate } from "./archiveSnapshotGate.ts";
 import * as NodeURL from "node:url";
 import { initializeShellItemCounts } from "./shellItemCounts.ts";
+import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
 
 class HistoryArchiveMissing extends Schema.TaggedError<HistoryArchiveMissing>()(
   "HistoryArchiveMissing",
@@ -76,37 +77,42 @@ export const initializeHistoryArchive = Effect.fn("HistoryArchive.initialize")(f
     yield* sql`ATTACH DATABASE ${`${NodeURL.pathToFileURL(baseFilename).href}?mode=ro`} AS ardud_base`;
   }
   for (const table of HISTORY_TABLES) {
-    const columns = yield* sql.unsafe<{ name: string; type: string }>(
-      `PRAGMA main.table_info(${table.live})`,
-    );
-    const columnSql = columns.map((column) => `"${column.name}" ${column.type}`).join(", ");
-    yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ardud_archive.${table.archive} (
+    yield* withStartupPhase(
+      table.live === "orchestration_events" ? "sqlite.archive-events" : "sqlite.archive-turn-items",
+      Effect.gen(function* () {
+        const columns = yield* sql.unsafe<{ name: string; type: string }>(
+          `PRAGMA main.table_info(${table.live})`,
+        );
+        const columnSql = columns.map((column) => `"${column.name}" ${column.type}`).join(", ");
+        yield* sql.unsafe(`CREATE TABLE IF NOT EXISTS ardud_archive.${table.archive} (
       ardud_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
       ardud_locator INTEGER GENERATED ALWAYS AS (-(1000000000000 + ardud_rowid)) STORED UNIQUE,
       ${columnSql}, UNIQUE (${table.key}))`);
-    yield* sql.unsafe(
-      table.live === "orchestration_events"
-        ? `CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_stream_idx ON ardud_events(stream_id, sequence)`
-        : `CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_thread_idx ON ardud_turn_items(thread_id, ordinal, turn_item_id)`,
-    );
-    if (table.live === "orchestration_events") {
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_command_idx ON ardud_events(command_id, sequence)`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_sequence_idx ON ardud_events(sequence)`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_identity_idx ON ardud_events(event_id)`;
-    } else {
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_run_idx ON ardud_turn_items(run_id, ordinal)`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_node_idx ON ardud_turn_items(node_id, ordinal)`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_provider_turn_idx ON ardud_turn_items(provider_turn_id)`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_failed_error_idx
+        yield* sql.unsafe(
+          table.live === "orchestration_events"
+            ? `CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_stream_idx ON ardud_events(stream_id, sequence)`
+            : `CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_thread_idx ON ardud_turn_items(thread_id, ordinal, turn_item_id)`,
+        );
+        if (table.live === "orchestration_events") {
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_command_idx ON ardud_events(command_id, sequence)`;
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_sequence_idx ON ardud_events(sequence)`;
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_identity_idx ON ardud_events(event_id)`;
+        } else {
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_run_idx ON ardud_turn_items(run_id, ordinal)`;
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_node_idx ON ardud_turn_items(node_id, ordinal)`;
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_provider_turn_idx ON ardud_turn_items(provider_turn_id)`;
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_failed_error_idx
         ON ardud_turn_items(thread_id, run_id, node_id, updated_at DESC, ordinal DESC, turn_item_id DESC)
         WHERE type = 'error' AND status = 'failed'`;
-      yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_user_message_idx
+          yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_user_message_idx
         ON ardud_turn_items(thread_id, ordinal, turn_item_id) WHERE type = 'user_message'`;
-    }
-    yield* sql.unsafe(historyViewSql(table));
+        }
+        yield* sql.unsafe(historyViewSql(table));
+      }),
+    );
   }
   for (const view of eventHistoryLookupViews) yield* sql.unsafe(view);
-  yield* initializeShellItemCounts(baseFilename);
+  yield* withStartupPhase("sqlite.archive-shell-counts", initializeShellItemCounts(baseFilename));
   yield* sql`CREATE TABLE IF NOT EXISTS ardud_history_archive_cursor (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), thread_id TEXT NOT NULL)`;
   yield* sql`CREATE TABLE IF NOT EXISTS ardud_history_archive_progress (

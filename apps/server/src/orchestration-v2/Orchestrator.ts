@@ -1419,6 +1419,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       }
 
+      // Recovery commits the cancelled source and its continuation together.
+      // Its terminal-event listener must not run follow-ups ahead of that effect.
+      if (yield* effectOutbox.hasPendingRunContinuation(threadId)) return;
+
       // The limit already stopped this thread. Starting the queue would send
       // every waiting message and drop it from the queue as each one fails.
       const sessionError =

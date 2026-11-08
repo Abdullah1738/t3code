@@ -10,7 +10,7 @@ export interface ContinuationDecision {
   readonly queuedAt?: string;
 }
 
-const bootId = randomUUID();
+export const bootId = randomUUID();
 const report = {
   bootId,
   completedAt: null as string | null,
@@ -66,4 +66,24 @@ export function markContinuationFinished(threadId: string) {
       reason: "continuation_declined",
     };
   }
+}
+
+export function markContinuationDeclined(threadId: string, reason: string) {
+  const index = report.threads.findIndex((thread) => thread.threadId === threadId);
+  // An independent queue wake may wait behind the continuation already sent.
+  if (index >= 0 && !report.threads[index]!.dispatched)
+    report.threads[index] = {
+      ...report.threads[index]!,
+      continued: false,
+      dispatched: false,
+      reason,
+    };
+}
+
+const recoveredQueueRunIds = new Set<string>();
+export function markQueuedRunRecovered(runId: string) {
+  recoveredQueueRunIds.add(runId);
+}
+export function isRecoveredQueueRun(runId: string) {
+  return recoveredQueueRunIds.has(runId);
 }

@@ -7,8 +7,9 @@ const cases = [
   ['commands', 'step', 'invariant', false],
   ['boards', 'step', 'invariant', false],
   ['sync', 'step', 'invariant', false],
-  ['restart', 'step', 'preparationContinues', true],
-  ['restart', 'step', 'nativePreparationContinues', true],
+  ['restart', 'step', 'preparationContinues', false],
+  ['restart', 'step', 'nativePreparationContinues', false],
+  ['restart', 'step', 'queuedContinues', false],
   ['commands', 'stepCurrent', 'currentRecoverable', true],
 ];
 mkdirSync('traces/latest', { recursive: true });

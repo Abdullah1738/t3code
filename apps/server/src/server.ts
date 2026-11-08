@@ -246,10 +246,14 @@ const layerProviderEventLoggers = Layer.effect(
 );
 
 const layerPtyAdapter = NodePtyAdapter.layer;
+const layerSecrets = ServerSecretStore.layer.pipe(
+  StartupPhaseLog.withStartupLayer("server.secrets"),
+);
 
 const layerServerSettings = ServerSettings.layer.pipe(
-  Layer.provide(ServerSecretStore.layer),
+  Layer.provide(layerSecrets),
   Layer.provideMerge(SqlitePersistence.layerConfig),
+  StartupPhaseLog.withStartupLayer("server.settings"),
 );
 
 const layerNativeTelemetry = NativeTelemetryClient.layer.pipe(
@@ -277,6 +281,7 @@ const layerDesktopAppUpdate = DesktopAppUpdate.layer.pipe(
 const layerBackground = BackgroundPolicy.layer.pipe(
   Layer.provide(layerHostPowerMonitor),
   Layer.provideMerge(layerServerSettings),
+  StartupPhaseLog.withStartupLayer("server.background"),
 );
 
 const layerUsage = UsageService.layer.pipe(
@@ -286,9 +291,10 @@ const layerUsage = UsageService.layer.pipe(
       CursorUsageAccounts.layer.pipe(
         Layer.provide(CursorAccountReader.layer.pipe(Layer.provide(CursorKeychain.layer))),
       ),
-    ).pipe(Layer.provide(ProviderHostLive.layer.pipe(Layer.provide(ServerSecretStore.layer)))),
+    ).pipe(Layer.provide(ProviderHostLive.layer.pipe(Layer.provide(layerSecrets)))),
   ),
   Layer.provide(layerServerSettings),
+  StartupPhaseLog.withStartupLayer("server.usage"),
 );
 
 const layerResourceDiagnostics = Layer.mergeAll(
@@ -297,7 +303,7 @@ const layerResourceDiagnostics = Layer.mergeAll(
   ProcessDiagnostics.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessResourceMonitor.layer.pipe(Layer.provide(layerResourceTelemetry)),
   ProcessGroupMetrics.layer.pipe(Layer.provide(layerResourceTelemetry)),
-);
+).pipe(StartupPhaseLog.withStartupLayer("server.diagnostics"));
 
 const layerRelayClient = Layer.unwrap(
   Effect.gen(function* () {
@@ -326,7 +332,7 @@ const layerHttpServer = Layer.unwrap(
       },
     );
   }),
-);
+).pipe(StartupPhaseLog.withStartupLayer("http.listen"));
 
 const layerPlatformServices = NodeServices.layer;
 
@@ -433,6 +439,7 @@ const layerVcs = Layer.empty.pipe(
       ),
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.vcs"),
 );
 
 const layerCheckpointStore = CheckpointStore.layer.pipe(Layer.provide(layerVcsDriverRegistry));
@@ -468,25 +475,29 @@ const layerWorkspace = Layer.mergeAll(
   WorkspacePaths.layer,
   layerWorkspaceEntries,
   layerWorkspaceFileSystem,
-);
+).pipe(StartupPhaseLog.withStartupLayer("server.workspace"));
 
 const layerProjectFaviconResolver = ProjectFaviconResolver.layer.pipe(
   Layer.provide(WorkspacePaths.layer),
   Layer.provide(T3ProjectFileLoader.layer),
 );
 
-const layerServerEnvironment = ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer));
+const layerServerEnvironment = ServerEnvironment.layer.pipe(
+  Layer.provide(layerSecrets),
+  StartupPhaseLog.withStartupLayer("server.environment"),
+);
 
 const layerAuth = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(layerPersistence),
   Layer.provide(layerServerEnvironment),
-  Layer.provide(ServerSecretStore.layer),
+  Layer.provide(layerSecrets),
+  StartupPhaseLog.withStartupLayer("server.auth"),
 );
 
 const layerCloudManagedEndpointRuntime = Layer.mergeAll(
   layerRelayClient,
   CloudManagedEndpointRuntime.layer.pipe(
-    Layer.provide(ServerSecretStore.layer),
+    Layer.provide(layerSecrets),
     Layer.provide(layerRelayClient),
   ),
 );
@@ -526,11 +537,13 @@ const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
       Layer.provide(RuntimeLayer.layerProjectService),
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.orchestration"),
 );
 
 const layerOrchestrationApplication = CheckpointDiffQuery.layer.pipe(
   Layer.provideMerge(layerCheckpointStore),
   Layer.provideMerge(layerOrchestrationV2Runtime),
+  StartupPhaseLog.withStartupLayer("server.application"),
 );
 
 const layerThreadSettlementWorker = Layer.effectDiscard(
@@ -615,11 +628,13 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ProviderUsageLimitsIngestion.layer,
   layerProviderInstallationRefresh,
   ReplayMarkers.layer,
-  ArdudOpenCodeImportLive,
+  ArdudOpenCodeImportLive.pipe(StartupPhaseLog.withStartupLayer("server.opencode-import")),
   // ardud: missions board
-  ArdudKanbanLive,
-  ReadonlyReplica.layer,
-  Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
+  ArdudKanbanLive.pipe(StartupPhaseLog.withStartupLayer("server.kanban")),
+  ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
+  Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
+    StartupPhaseLog.withStartupLayer("server.project-settings-sweep"),
+  ),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
@@ -633,14 +648,21 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(
     Layer.mergeAll(Keybindings.layer, EnvironmentTheme.layer, UsageLimitSources.layer),
   ),
-  Layer.provideMerge(ProviderRegistry.layer),
-  Layer.provideMerge(ProviderInstanceRegistryHydration.layer),
+  Layer.provideMerge(
+    ProviderRegistry.layer.pipe(StartupPhaseLog.withStartupLayer("server.providers")),
+  ),
+  Layer.provideMerge(
+    ProviderInstanceRegistryHydration.layer.pipe(
+      StartupPhaseLog.withStartupLayer("server.provider-hydration"),
+    ),
+  ),
   Layer.provideMerge(
     Layer.mergeAll(
       AntigravityInstallation.AntigravityInstallation.layer,
       CodexInstallation.CodexInstallation.layer,
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.runtime-core-base"),
 );
 
 const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
@@ -673,16 +695,17 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
   Layer.provideMerge(layerRepositoryIdentityResolver),
   Layer.provideMerge(layerServerEnvironment),
   Layer.provideMerge(layerAuth),
-  Layer.provideMerge(ServerSecretStore.layer),
+  Layer.provideMerge(layerSecrets),
   Layer.provideMerge(
     Layer.mergeAll(
       CloudCliTokenManager.layer.pipe(
-        Layer.provide(ServerSecretStore.layer),
+        Layer.provide(layerSecrets),
         Layer.provide(ExternalLauncher.layer),
       ),
       layerCloudManagedEndpointRuntime,
     ),
   ),
+  StartupPhaseLog.withStartupLayer("server.runtime-core"),
 );
 
 const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
@@ -696,6 +719,7 @@ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
   Layer.provideMerge(DirectEndpoints.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
+  StartupPhaseLog.withStartupLayer("server.dependencies"),
 );
 
 const layerCommandReadiness = HttpRouter.middleware(
@@ -1069,6 +1093,7 @@ const layerMakeServer = Layer.unwrap(
       disableLogger: !config.logWebSocketEvents,
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(
+      StartupPhaseLog.withStartupLayer("http.routes"),
       withUntracedRequests,
       Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
     );
@@ -1088,7 +1113,7 @@ const layerMakeServer = Layer.unwrap(
         McpSessionRegistry.layer.pipe(
           Layer.provide(CredentialStore.layer),
           Layer.provide(layerPersistence),
-          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
         ),
       ),
       Layer.provide(layerActivation),
@@ -1101,6 +1126,7 @@ const layerMakeServer = Layer.unwrap(
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(AgentScopeLive.layer),
       Layer.provideMerge(layerPlatformServices),
+      StartupPhaseLog.withStartupLayer("boot"),
       Layer.provide(StartupPhaseLog.layer(config.logsDir)),
     );
   }),

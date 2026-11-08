@@ -16,10 +16,12 @@ import * as ServerConfig from "../config.ts";
 import * as ResourceAttribution from "../resourceTelemetry/ResourceAttribution.ts";
 import * as ServerLogger from "../serverLogger.ts";
 import * as BrowserTraceCollector from "./BrowserTraceCollector.ts";
+import { boundedTraceRetention } from "../ardud/observability/traceRetention.ts";
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
+    const retention = boundedTraceRetention(config.traceMaxBytes, config.traceMaxFiles);
 
     const traces = config.otlpTracesExport;
     const metrics = config.otlpMetricsExport;
@@ -42,8 +44,7 @@ export const layer = Layer.unwrap(
       Effect.gen(function* () {
         const sink = yield* makeTraceSink({
           filePath: config.serverTracePath,
-          maxBytes: config.traceMaxBytes,
-          maxFiles: config.traceMaxFiles,
+          ...retention,
           batchWindowMs: config.traceBatchWindowMs,
           onFlush: (stats) =>
             attribution.record({
@@ -66,8 +67,7 @@ export const layer = Layer.unwrap(
 
         const tracer = yield* makeLocalFileTracer({
           filePath: config.serverTracePath,
-          maxBytes: config.traceMaxBytes,
-          maxFiles: config.traceMaxFiles,
+          ...retention,
           batchWindowMs: config.traceBatchWindowMs,
           sink,
           ...(delegate ? { delegate } : {}),

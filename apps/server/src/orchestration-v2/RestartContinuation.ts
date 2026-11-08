@@ -1,5 +1,7 @@
 import {
   markContinuationDispatched,
+  markQueuedRunRecovered,
+  markContinuationDeclined,
   markContinuationFinished,
 } from "../ardud/fast-install/report.ts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
@@ -128,7 +130,12 @@ export type RestartContinuationSkipReason =
   | "no_session"
   | "session_stopped_or_error"
   | "no_running_turn"
-  | "other";
+  | "no_candidate"
+  | "run_not_resumable"
+  | "provider_changed"
+  | "invalid_provider_thread"
+  | "no_awaited_work"
+  | "already_reconciled";
 
 function preparationCut(
   run: OrchestrationV2Run,
@@ -148,7 +155,7 @@ function preparationCut(
 }
 
 /** A settled run needs a live session, so an older crash cannot wake it. */
-export function restartContinuationDecision(
+function activeRestartContinuationDecision(
   projection: Pick<
     ProjectionRuntimeRecoveryState,
     | "thread"
@@ -170,16 +177,24 @@ export function restartContinuationDecision(
         : latest,
     undefined,
   );
-  if (!run) return { skip: "other" };
+  if (!run) {
+    const queued = projection.runs
+      .filter((candidate) => candidate.status === "queued" && candidate.queueHeld !== true)
+      .toSorted((a, b) => (a.queuePosition ?? a.ordinal) - (b.queuePosition ?? b.ordinal))[0];
+    if (!queued) return { skip: "no_candidate" };
+    if (restartContinuationBlocked(projection, queued, now, true)) return { skip: "blocked" };
+    return { run: queued };
+  }
   const preparedContinuation =
     run.status === "starting" && run.restartContinuationOfRunId !== undefined;
   const settled = run.status === "completed" || run.status === "waiting";
   const beforeProvider = preparationCut(run, projection);
   if (run.status !== "running" && !beforeProvider && !preparedContinuation && !settled)
-    return { skip: "other" };
+    return { skip: "run_not_resumable" };
   if (restartContinuationBlocked(projection, run, now, settled)) return { skip: "blocked" };
   const liveTurnRequired = !preparedContinuation && !settled;
-  if (projection.thread.providerInstanceId !== run.providerInstanceId) return { skip: "other" };
+  if (projection.thread.providerInstanceId !== run.providerInstanceId)
+    return { skip: "provider_changed" };
   if (beforeProvider) return { run };
   const providerThread = projection.providerThreads.find(
     (thread) => thread.id === run.providerThreadId,
@@ -193,7 +208,7 @@ export function restartContinuationDecision(
     providerThread.nativeThreadRef.strength !== "strong" ||
     providerThread.nativeThreadRef.driver !== providerThread.driver
   )
-    return { skip: "other" };
+    return { skip: "invalid_provider_thread" };
   if (
     (liveTurnRequired && providerThread.status !== "active") ||
     providerThread.status === "closed" ||
@@ -217,7 +232,8 @@ export function restartContinuationDecision(
     !(liveTurnRequired && session.capabilities?.sessions.supportsMultipleProviderThreadsPerSession)
   )
     return { skip: "session_stopped_or_error" };
-  if (settled) return hasOpenAwaitedWork(projection, providerThread) ? { run } : { skip: "other" };
+  if (settled)
+    return hasOpenAwaitedWork(projection, providerThread) ? { run } : { skip: "no_awaited_work" };
   if (
     liveTurnRequired &&
     !projection.providerTurns.some(
@@ -231,6 +247,24 @@ export function restartContinuationDecision(
   return { run };
 }
 
+export function restartContinuationDecision(
+  projection: Parameters<typeof activeRestartContinuationDecision>[0],
+  now: DateTime.Utc,
+): ReturnType<typeof activeRestartContinuationDecision> {
+  const decision = activeRestartContinuationDecision(projection, now);
+  if ("run" in decision) return decision;
+  if (
+    projection.runs.some((run) =>
+      ["preparing", "starting", "running", "waiting"].includes(run.status),
+    )
+  )
+    return decision;
+  const queued = projection.runs.filter((run) => run.status === "queued" && run.queueHeld !== true);
+  return queued.length > 0
+    ? activeRestartContinuationDecision({ ...projection, runs: queued }, now)
+    : decision;
+}
+
 export function restartContinuationRun(
   projection: Parameters<typeof restartContinuationDecision>[0],
   now: DateTime.Utc,
@@ -240,7 +274,11 @@ export function restartContinuationRun(
 }
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(
-  function* (input: { readonly threadId: ThreadId; readonly sourceRunId: RunId }) {
+  function* (input: {
+    readonly threadId: ThreadId;
+    readonly sourceRunId: RunId;
+    readonly queued?: boolean | undefined;
+  }) {
     const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
     const fs = yield* Effect.serviceOption(FileSystem.FileSystem);
     const path = yield* Effect.serviceOption(Path.Path);
@@ -272,6 +310,44 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       return;
     if (projection.messages.some((message) => message.id === messageId)) return;
     const source = projection.runs.find((run) => run.id === input.sourceRunId);
+    // A replayed queue wake must never become an in-flight continuation. Those
+    // have separate durable effect IDs so a second crash can still recover it.
+    if (input.queued && source?.status !== "queued") {
+      yield* Effect.sync(() =>
+        source &&
+        ["preparing", "starting", "running", "waiting", "completed"].includes(source.status)
+          ? markContinuationDispatched(input.threadId)
+          : markContinuationDeclined(
+              input.threadId,
+              source ? `queue_source_${source.status}` : "queue_source_missing",
+            ),
+      );
+      return;
+    }
+    if (source?.status === "queued") {
+      if (source.queueHeld === true) return;
+      if (restartContinuationBlocked(projection, source, yield* DateTime.now, true)) return;
+      // Register before dispatch: a worker may reach the actual provider call
+      // immediately after the queue promotion transaction commits.
+      yield* Effect.sync(() => markQueuedRunRecovered(source.id));
+      // Claim the original queued run under the normal per-thread dispatch lock.
+      yield* threads.dispatch({
+        type: "queue.cutover-release",
+        commandId: CommandId.make(`command:restart-queue:${input.sourceRunId}`),
+        threadId: input.threadId,
+      });
+      const current = yield* threads.getThreadRecords(input.threadId, ["runs"]);
+      const promoted = current.runs.find((run) => run.id === source.id);
+      yield* Effect.sync(() =>
+        promoted?.status !== "queued"
+          ? markContinuationDispatched(input.threadId)
+          : markContinuationDeclined(
+              input.threadId,
+              promoted.queueHeld === true ? "queue_held" : "queue_admission_deferred",
+            ),
+      );
+      return;
+    }
     if (
       !source ||
       !isRestartContinuationSource(source, projection.providerTurns) ||
@@ -279,7 +355,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         projection,
         source,
         yield* DateTime.now,
-        isRestartNoteSource(source, projection.providerTurns),
+        isRestartNoteSource(source, projection.providerTurns) || source.status === "interrupted",
       )
     )
       return;

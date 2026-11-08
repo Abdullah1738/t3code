@@ -284,7 +284,7 @@ it.effect.each(["crash", "prepared"] as const)(
 );
 
 it.effect.each(["startup", "shutdown"] as const)(
-  "%s cancels queued buffered wakes and holds durable messages",
+  "%s preserves queued buffered wakes and durable messages",
   (trigger) =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -342,20 +342,23 @@ it.effect.each(["startup", "shutdown"] as const)(
         new Set([...bufferedThreads, ...durableThreads]),
       );
       const summary = yield* recovery.reconcile(trigger);
-      assert.equal(summary.terminalizedRuns, 1);
+      assert.equal(summary.terminalizedRuns, 0);
       for (const threadId of bufferedThreads) {
         const projection = yield* projections.getThreadProjection(threadId);
-        assert.equal(projection.runs[0]?.status, "cancelled");
-        assert.isNotNull(projection.runs[0]?.completedAt);
-        assert.isNull(projection.runs[0]?.queuePosition);
+        assert.equal(projection.runs[0]?.status, "queued");
+        assert.isNull(projection.runs[0]?.completedAt);
+        assert.equal(projection.runs[0]?.queuePosition, 1);
         assert.equal(projection.runs[1]?.status, "completed");
       }
       for (const threadId of durableThreads) {
         const projection = yield* projections.getThreadProjection(threadId);
         assert.equal(projection.runs[0]?.status, "queued");
-        assert.isTrue(projection.runs[0]?.queueHeld);
+        assert.notEqual(projection.runs[0]?.queueHeld, true);
       }
-      assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), []);
+      assert.deepEqual(
+        new Set(yield* projections.getRecoveryThreadIds("runtime")),
+        new Set([...bufferedThreads, ...durableThreads]),
+      );
     }).pipe(Effect.provide(layerRecoveryTest)),
 );
 

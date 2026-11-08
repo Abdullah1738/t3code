@@ -1,4 +1,5 @@
 import {
+  bootId,
   recordContinuationDecision,
   finishContinuationReport,
 } from "../ardud/fast-install/report.ts";
@@ -51,6 +52,12 @@ import {
   mergeRestartCancelledBackgroundWork,
   neverStarted,
 } from "./RestartBackgroundNote.ts";
+
+// Recovery generations scope queue wake identities; original-run admission is
+// still deduplicated by the dispatcher, including overlapping boot effects.
+export class RestartRecoveryBootId extends Context.Reference<string>("t3/RestartRecoveryBootId", {
+  defaultValue: () => bootId,
+}) {}
 
 // Only startup continuation work may bypass global command readiness. The callback
 // runs after the thread's reconciliation transaction commits, never inside it.
@@ -231,6 +238,7 @@ export const make = Effect.gen(function* () {
       stoppedThisPass: ReadonlyMap<string, RecoverySession> = new Map(),
     ) {
       const now = yield* DateTime.now;
+      const recoveryBootId = yield* RestartRecoveryBootId;
       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
         if (run.status === "waiting") {
@@ -325,42 +333,54 @@ export const make = Effect.gen(function* () {
           cancelledBackgroundNativeIds.add(item.nativeItemRef.nativeId);
         }
       };
+      // Queued messages are durable work, including provider notifications. Keep
+      // their identities, delivery order and explicit user holds across restarts.
       const queuedRuns = projection.runs.filter((run) => run.status === "queued");
-      const queuedMessages =
-        queuedRuns.length === 0
-          ? []
-          : (yield* projections
-              .getThreadRecords(projection.thread.id, ["messages"], {
-                messageIds: queuedRuns.map((run) => run.userMessageId),
-              })
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderRuntimeRecoveryError({
-                      operation: "read-projections",
-                      threadId: projection.thread.id,
-                      cause,
-                    }),
-                ),
-              )).messages;
-      const bufferedMessageIds = new Set(
-        queuedMessages.filter(isBufferedProviderNotification).map((message) => message.id),
-      );
-      for (const run of queuedRuns) {
-        if (bufferedMessageIds.has(run.userMessageId)) {
-          runs.push(run);
-          continue;
+      if (trigger === "startup" && continuationSetting !== "enabled") {
+        for (const run of queuedRuns.filter((candidate) => candidate.queueHeld !== true))
+          events.push({
+            id: yield* allocateEventId(),
+            type: "run.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...run, queueHeld: true },
+          });
+      }
+      if (queuedRuns.length > 0) {
+        const queued = yield* projections
+          .getThreadRecords(projection.thread.id, ["messages"], {
+            messageIds: queuedRuns.map((run) => run.userMessageId),
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "read-projections",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
+        for (const message of queued.messages.filter(isBufferedProviderNotification)) {
+          // The provider's in-memory output buffer died with the process. Replaying
+          // a provider-created wake would complete an empty turn (Claude) instead
+          // of sending a prompt. Keep its identity/order and send its durable text.
+          events.push({
+            id: yield* allocateEventId(),
+            type: "message.updated",
+            threadId: projection.thread.id,
+            ...(message.runId === null ? {} : { runId: message.runId }),
+            occurredAt: now,
+            payload: {
+              ...message,
+              creationSource: "server",
+              text: `${message.text}\n\nContinue where you left off.`,
+              updatedAt: now,
+            },
+          });
         }
-        if (run.queueHeld === true) continue;
-        events.push({
-          id: yield* allocateEventId(),
-          type: "run.updated",
-          threadId: projection.thread.id,
-          runId: run.id,
-          providerInstanceId: run.providerInstanceId,
-          occurredAt: now,
-          payload: { ...run, queueHeld: true },
-        });
       }
       for (const request of requests) {
         events.push({
@@ -691,13 +711,58 @@ export const make = Effect.gen(function* () {
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
             {
-              id: `effect:restart-continuation:${continuationRun.id}`,
+              id: `effect:restart-${continuationRun.status === "queued" ? `queue:${recoveryBootId}` : "continuation"}:${continuationRun.id}`,
               commandId,
               threadId: projection.thread.id,
-              request: { type: "provider-runtime.continue", sourceRunId: continuationRun.id },
+              request: {
+                type: "provider-runtime.continue",
+                sourceRunId: continuationRun.id,
+                ...(continuationRun.status === "queued" ? { queued: true } : {}),
+              },
             },
           ]
         : [];
+      // A source continuation can legitimately decline (for example a stale
+      // native turn). Its follow-up queue still needs its own durable wake.
+      if (
+        trigger === "startup" &&
+        continuationSetting === "enabled" &&
+        continuationRun?.status !== "queued"
+      ) {
+        const queued = restartContinuationRun(
+          { ...projection, runs: projection.runs.filter((run) => run.status === "queued") },
+          now,
+        );
+        if (queued)
+          effects.push({
+            id: `effect:restart-queue:${recoveryBootId}:${queued.id}`,
+            commandId,
+            threadId: projection.thread.id,
+            request: { type: "provider-runtime.continue", sourceRunId: queued.id, queued: true },
+          });
+      }
+      // EventSink requires an event-bearing commit. This also makes an otherwise
+      // idle queue's durable wake-up atomic with its recovery decision.
+      if (events.length === 0 && !continuationRun && effects.length > 0) {
+        events.push({
+          id: yield* allocateEventId(),
+          type: "thread.metadata-updated",
+          threadId: projection.thread.id,
+          occurredAt: now,
+          payload: projection.thread,
+        });
+      }
+      if (events.length === 0 && continuationRun) {
+        events.push({
+          id: yield* allocateEventId(),
+          type: "run.updated",
+          threadId: projection.thread.id,
+          runId: continuationRun.id,
+          providerInstanceId: continuationRun.providerInstanceId,
+          occurredAt: now,
+          payload: continuationRun,
+        });
+      }
       const stoppedSessions = projection.providerSessions.filter(
         (candidate) =>
           !stoppedThisPass.has(candidate.id) &&
@@ -718,7 +783,7 @@ export const make = Effect.gen(function* () {
               ),
             )
           : { aborted: 0, failed: 0 };
-      if (events.length === 0) {
+      if (events.length === 0 && effects.length === 0) {
         const retiredEffectIds = yield* outbox
           .cancelUnsettled({
             threadId: projection.thread.id,
@@ -776,7 +841,7 @@ export const make = Effect.gen(function* () {
           continuationDecision && "skip" in continuationDecision
             ? continuationDecision.skip
             : continuationRun && continuationsQueued === 0
-              ? ("other" as const)
+              ? ("already_reconciled" as const)
               : undefined,
       };
     },
@@ -825,7 +890,12 @@ export const make = Effect.gen(function* () {
       no_session: 0,
       session_stopped_or_error: 0,
       no_running_turn: 0,
-      other: 0,
+      no_candidate: 0,
+      run_not_resumable: 0,
+      provider_changed: 0,
+      invalid_provider_thread: 0,
+      no_awaited_work: 0,
+      already_reconciled: 0,
     };
     const stoppedThisPass = new Map<string, RecoverySession>();
     const sharedSessions = yield* projections
@@ -975,6 +1045,7 @@ export const make = Effect.gen(function* () {
   };
 
   const prepareForShutdown = Effect.gen(function* () {
+    const recoveryBootId = yield* RestartRecoveryBootId;
     const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
     if (!enabled) return;
     const threadIds = yield* projections.getRecoveryThreadIds("runtime");
@@ -994,10 +1065,14 @@ export const make = Effect.gen(function* () {
           events: [],
           effects: [
             {
-              id: `effect:restart-continuation:${run.id}`,
+              id: `effect:restart-${run.status === "queued" ? `queue:${recoveryBootId}` : "continuation"}:${run.id}`,
               commandId,
               threadId,
-              request: { type: "provider-runtime.continue", sourceRunId: run.id },
+              request: {
+                type: "provider-runtime.continue",
+                sourceRunId: run.id,
+                ...(run.status === "queued" ? { queued: true } : {}),
+              },
             },
           ],
         });

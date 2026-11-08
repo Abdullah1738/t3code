@@ -32,6 +32,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
+    queued: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -227,6 +228,9 @@ export interface EffectOutboxV2Shape {
   readonly get: (
     effectId: string,
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly hasPendingRunContinuation: (
+    threadId: ThreadId,
+  ) => Effect.Effect<boolean, EffectOutboxError>;
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
@@ -461,6 +465,19 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       awaitAvailable: Queue.take(available),
       awaitControlAvailable: Queue.take(controlAvailable),
       notifyAvailable,
+      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
+        function* (threadId) {
+          const rows = yield* sql`
+          SELECT 1 FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+            AND effect_type = 'provider-runtime.continue'
+            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+          LIMIT 1
+        `;
+          return rows.length > 0;
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      ),
       listByCommandId: (commandId) =>
         sql<EffectRow>`
           SELECT *

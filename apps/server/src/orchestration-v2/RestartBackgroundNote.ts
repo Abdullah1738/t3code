@@ -209,7 +209,7 @@ export function isRestartContinuationSource(
 ): boolean {
   return isRestartNoteSource(source, providerTurns)
     ? (source.restartCancelledBackgroundWork ?? []).some(isAwaitedWork)
-    : source.status === "cancelled";
+    : source.status === "cancelled" || source.status === "interrupted";
 }
 
 /**

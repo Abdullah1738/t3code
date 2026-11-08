@@ -13,6 +13,7 @@ import * as ServerConfig from "../../config.ts";
 import { ensureRunFollowTables } from "../schedules/runFollow.ts";
 import { controlDDL, controlTables } from "./boardsSchema.ts";
 import { kanbanDDL } from "./kanbanSchema.ts";
+import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
 
 export class BoardsDatabase extends Context.Service<
   BoardsDatabase,
@@ -183,16 +184,19 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
       const bypassReady = Context.Reference<boolean>("t3/boards/bypassReady", {
         defaultValue: () => false,
       });
-      const context = yield* Layer.build(
-        NodeSqliteClient.layer({
-          filename: dbPath,
-          readerWorker: true,
-          checkpointWorker: true,
-          beforeAcquire: Effect.flatMap(bypassReady, (bypass) =>
-            bypass ? Effect.void : Deferred.await(ready),
-          ),
-          spanAttributes: { "db.name": path.basename(dbPath) },
-        }),
+      const context = yield* withStartupPhase(
+        "boards.open",
+        Layer.build(
+          NodeSqliteClient.layer({
+            filename: dbPath,
+            readerWorker: true,
+            checkpointWorker: true,
+            beforeAcquire: Effect.flatMap(bypassReady, (bypass) =>
+              bypass ? Effect.void : Deferred.await(ready),
+            ),
+            spanAttributes: { "db.name": path.basename(dbPath) },
+          }),
+        ),
       );
       const sql = Context.get(context, SqlClient.SqlClient);
       const raw = sql;
@@ -232,7 +236,7 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
               yield* Effect.logInfo("Boards database migration complete");
             }),
           );
-          yield* migrate.pipe(
+          yield* withStartupPhase("boards.migrate", migrate).pipe(
             Effect.catchCause((cause) =>
               Cause.hasInterruptsOnly(cause)
                 ? Effect.failCause(cause)
@@ -246,9 +250,9 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
           );
         }
       });
-      yield* setup.pipe(Effect.provideService(bypassReady, true));
+      yield* withStartupPhase("boards.setup", setup).pipe(Effect.provideService(bypassReady, true));
       return BoardsDatabase.of({ sql, ready: Deferred.await(ready), path: dbPath });
-    }),
+    }).pipe((effect) => withStartupPhase("boards.initialize", effect)),
   );
 
 export const layerConfig = Layer.unwrap(

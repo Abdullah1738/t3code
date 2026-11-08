@@ -73,6 +73,7 @@ it.effect.each([
       const events: ServerLifecycleStreamEvent[] = [];
       const records: Array<{ phase: string; outcome: string; durationMs?: number }> = [];
       const logger: StartupPhaseLog.StartupPhaseLog["Service"] = {
+        snapshot: () => ({ bootId: "test-boot", pid: 0, phases: [], droppedRecords: 0, persistenceFailed: false }),
         start: (phase) => {
           records.push({ phase, outcome: "start" });
         },

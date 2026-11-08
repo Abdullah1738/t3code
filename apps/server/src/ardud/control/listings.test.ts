@@ -43,6 +43,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
 
@@ -227,6 +228,7 @@ const makeHarness = (
         ),
       ),
     );
+    const startupLog = StartupPhaseLog.makeStartupPhaseLog(config.logsDir);
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
       getShellSnapshot: (options) =>
         Ref.update(snapshotReads, (count) => count + 1).pipe(
@@ -287,6 +289,7 @@ const makeHarness = (
                   robobBuildCommit: buildCommit,
                 }),
                 Layer.succeed(SqlClient.SqlClient, sql),
+                Layer.succeed(StartupPhaseLog.StartupPhaseLog, startupLog),
               ).pipe(Layer.provideMerge(NodeServices.layer)),
             ),
             Layer.provide(
@@ -319,7 +322,7 @@ const makeHarness = (
             .toSorted();
         }),
       );
-    return { get, threadIds, snapshotReads };
+    return { get, threadIds, snapshotReads, startupLog };
   });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -335,6 +338,33 @@ const run = <A, E>(
   );
 
 describe("control listings", () => {
+  it.effect("includes current boot phase timings in the authenticated install report", () =>
+    run(({ get, startupLog }) =>
+      Effect.gen(function* () {
+        const id = startupLog.start("sqlite.migrations", 1000);
+        startupLog.end("sqlite.migrations", 6000, 5000, "success", undefined, id);
+        const response = yield* get("/install-report");
+        assert.equal(response.status, 200);
+        assert.equal(response.body.bootId, response.body.startup.bootId);
+        assert.includeDeepMembers(response.body.startup.phases, [
+          {
+            id,
+            phase: "sqlite.migrations",
+            startedAt: "1970-01-01T00:00:01.000Z",
+            endedAt: "1970-01-01T00:00:06.000Z",
+            durationMs: 5000,
+            outcome: "success",
+          },
+        ]);
+        assert.isTrue(
+          response.body.startup.phases.some(
+            (phase: { phase: string; outcome: string }) =>
+              phase.phase === "http.control-routes" && phase.outcome === "success",
+          ),
+        );
+      }),
+    ),
+  );
   it.effect("reports a validated build commit captured at startup", () =>
     Effect.gen(function* () {
       for (const [input, expected] of [
@@ -384,10 +414,9 @@ describe("control listings", () => {
           ),
         );
         yield* Deferred.await(held);
-        const response = yield* harness.get("/projects").pipe(
-          Effect.timeout("5 seconds"),
-          Effect.ensuring(Deferred.succeed(release, undefined)),
-        );
+        const response = yield* harness
+          .get("/projects")
+          .pipe(Effect.timeout("5 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
         yield* Fiber.join(writer);
         assert.strictEqual(response.status, 200);
         assert.deepStrictEqual(response.body.projects, [

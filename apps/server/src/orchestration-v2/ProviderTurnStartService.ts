@@ -1,4 +1,4 @@
-import { markInstallLifecycle } from "../ardud/fast-install/report.ts";
+import { isRecoveredQueueRun, markInstallLifecycle } from "../ardud/fast-install/report.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
   CommandId,
@@ -1512,7 +1512,7 @@ export const layer: Layer.Layer<
         appThread: projection.thread,
         providerSessionId,
         session:
-          run.restartContinuationOfRunId === undefined
+          run.restartContinuationOfRunId === undefined && !isRecoveredQueueRun(run.id)
             ? deliverySession
             : {
                 ...deliverySession,

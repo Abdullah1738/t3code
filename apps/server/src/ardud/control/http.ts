@@ -1,4 +1,5 @@
 import { continuationReport } from "../fast-install/report.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
  * crw, CLIs). Thin wrappers over the services the WebSocket RPC and the T3 MCP
@@ -451,6 +452,7 @@ const makeRoutes = Effect.gen(function* () {
       ? candidateBuildCommit
       : null;
   const serverStartedAt = DateTime.formatIso(yield* DateTime.now);
+  const startupLog = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
@@ -1671,7 +1673,10 @@ const makeRoutes = Effect.gen(function* () {
       handle(
         Effect.gen(function* () {
           yield* authenticate(AuthOrchestrationReadScope);
-          return jsonReply(continuationReport());
+          return jsonReply({
+            ...continuationReport(),
+            startup: Option.isSome(startupLog) ? startupLog.value.snapshot() : null,
+          });
         }),
       ),
     ),
@@ -1697,7 +1702,7 @@ const makeRoutes = Effect.gen(function* () {
     HttpRouter.route("POST", `${p}/attachments`, handle(upload)),
     HttpRouter.route("GET", `${p}/events`, handle(events)),
   ] as const;
-});
+}).pipe((effect) => StartupPhaseLog.withStartupPhase("http.control-routes", effect));
 
 // RecoverySnapshot takes ThreadManagementService and ProviderSessionManagerV2
 // from the server runtime, like the other routes here.

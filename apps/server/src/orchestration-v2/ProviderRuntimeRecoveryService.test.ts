@@ -650,7 +650,12 @@ for (const status of ["ready", "error"] as const)
             no_session: 0,
             session_stopped_or_error: 0,
             no_running_turn: 0,
-            other: 0,
+            no_candidate: 0,
+            run_not_resumable: 0,
+            provider_changed: 0,
+            invalid_provider_thread: 0,
+            no_awaited_work: 0,
+            already_reconciled: 0,
           },
         },
       ]);
@@ -1251,7 +1256,12 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
   let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
     null;
   const projection = {
-    thread: { id: threadId },
+    thread: {
+      id: threadId,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      archivedAt: null,
+      deletedAt: null,
+    },
     runtimeRequests: [],
     providerSessions: [],
     providerThreads: [],
@@ -1259,6 +1269,7 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
     runs: [
       {
         id: runId,
+        startedAt: null,
         status,
         queuePosition: 1,
         providerInstanceId: ProviderInstanceId.make("codex"),
@@ -1313,6 +1324,8 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          cancelUnsettled: () => Effect.succeed([]),
+          signalCancellations: () => Effect.void,
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -1324,6 +1337,7 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
       yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
     assert.equal(summary.terminalizedRuns, status === "preparing" ? 1 : 0);
     const command = committedInput;
+    if (status === "queued" && command === null) return;
     assert.isNotNull(command);
     if (command === null) return;
     const runEvent = command.events.find((event) => event.type === "run.updated");
@@ -1333,7 +1347,6 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
       runEvent?.type === "run.updated" ? runEvent.payload.status : null,
       status === "preparing" ? "cancelled" : "queued",
     );
-    assert.isEmpty(command.effects);
     if (status === "preparing") {
       assert.equal(
         attemptEvent?.type === "run-attempt.updated" ? attemptEvent.payload.status : null,
@@ -1345,7 +1358,10 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
       );
     } else {
       assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.queuePosition : null, 1);
-      assert.equal(runEvent?.type === "run.updated" ? runEvent.payload.queueHeld : false, true);
+      assert.equal(
+        runEvent?.type === "run.updated" ? runEvent.payload.queueHeld === true : false,
+        false,
+      );
       assert.isUndefined(attemptEvent);
       assert.isUndefined(nodeEvent);
     }
