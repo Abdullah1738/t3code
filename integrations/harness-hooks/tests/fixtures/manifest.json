@@ -25,6 +25,17 @@
     "source_line_0": 134,
     "workdir": "/Users/ardud/checkouts/edge-otp-home-shard-marker"
   },
+  "crpko-2154-python-offbox-timeout.sh": {
+    "card": 2154,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-021d",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "5b0156e277bae560c56144943224e5b810ceeb32611875d73f8a478f466a4c1d",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-40-53-01a1bce4-7c0d-76d2-bcd3-1bd48652411e.jsonl",
+    "source_call_id": "call_8b26e0e9839d4486a0e69f7d7566ec4b",
+    "source_line_0": 141
+  },
   "crpko-2282-cms-edit-offbox.sh": {
     "card": 2282,
     "cwd": "/Users/ardud/checkouts/cms-publication-check-2282",

@@ -294,6 +294,22 @@ class GuardTests(unittest.TestCase):
                 with self.subTest(flags=flags, reader=delimiter):
                     self.assertEqual(guard.classify(twin, cwd), READ)
 
+    def test_python_setup_then_offbox_timeout_2154(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        command = (fixtures / "crpko-2154-python-offbox-timeout.sh").read_text()
+        cwd = "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-021d"
+        self.assertIsNone(guard.classify(command, cwd))
+        script = Path(os.path.realpath(Path(cwd) / "tmp/hc021d/check.sh"))
+        self.assertIn(script, guard.scripts_in(command, cwd))
+        setup, separator, remote = command.partition("\n offbox run ")
+        self.assertIn("python3 - <<'PY'", setup)
+        self.assertTrue(separator)
+        wrapped = "offbox run " + remote
+        self.write("tmp/hc021d/check.sh", "echo safe\n")
+        self.assertIsNone(self.classify(wrapped))
+        self.write("tmp/hc021d/check.sh", "sqlite3 ~/.robob/userdata/statev2.sqlite .tables\n")
+        self.assertEqual(self.classify(wrapped), SCRIPT)
+
     def test_diagnostics_and_limits(self):
         for command, detail in [
             ("python3 $X", "$X"),
