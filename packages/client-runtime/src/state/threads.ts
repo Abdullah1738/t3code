@@ -333,14 +333,20 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       status: current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
     }));
   });
+  let consecutiveSyncFailures = 0;
   const setStreamError = (message: string) =>
-    Ref.set(awaitingCompletion, false).pipe(
+    Effect.sync(() => {
+      consecutiveSyncFailures += 1;
+    }).pipe(
+      Effect.andThen(Ref.set(awaitingCompletion, false)),
       Effect.andThen(
         SubscriptionRef.update(state, (current) => ({
           ...current,
           status:
             current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
-          error: Option.some(message),
+          error: Option.some(
+            `Could not synchronize the thread. Showing saved history; retrying. ${message}`,
+          ),
         })),
       ),
     );
@@ -366,12 +372,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       return {
         ...previous,
         data: Option.some(thread),
-        status: Option.isSome(previous.error)
-          ? ("cached" as const)
-          : waiting
-            ? ("synchronizing" as const)
-            : ("live" as const),
-        error: previous.error,
+        status: waiting ? ("synchronizing" as const) : ("live" as const),
+        error: Option.none(),
         history,
       };
     });
@@ -553,7 +555,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (item.kind === "synchronized") {
       yield* Ref.set(awaitingCompletion, false);
       yield* SubscriptionRef.update(state, (current) =>
-        Option.isSome(current.data) && current.status !== "deleted" && Option.isNone(current.error)
+        Option.isSome(current.data) && current.status !== "deleted"
           ? { ...current, status: "live" as const, error: Option.none() }
           : current,
       );
@@ -606,6 +608,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           yield* applyItemLocked(item);
         }
         yield* applyEventsLocked(events);
+        if (items.some((item) => item.kind === "snapshot" || item.kind === "synchronized"))
+          consecutiveSyncFailures = 0;
         yield* remember;
       }),
     );
@@ -757,7 +761,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const markSynchronizing = Effect.gen(function* () {
     if (yield* Ref.get(resumingLive)) return;
     yield* SubscriptionRef.update(state, (current) =>
-      current.status === "deleted"
+      current.status === "deleted" || Option.isSome(current.error)
         ? current
         : { ...current, status: "synchronizing" as const, error: Option.none() },
     );
@@ -768,6 +772,11 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     subscribeDynamic(
       ORCHESTRATION_V2_WS_METHODS.subscribeThread,
       Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
+        if (consecutiveSyncFailures > 0) {
+          yield* Effect.sleep(
+            Math.min(1_000 * 2 ** Math.min(consecutiveSyncFailures - 1, 5), 30_000),
+          );
+        }
         let current = yield* SubscriptionRef.get(state);
         // A prior definitive miss (or delete event) already cleared this thread.
         // Park the subscription attempt without opening the socket so we do not
@@ -852,7 +861,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         const sequence = yield* SubscriptionRef.get(lastSequence);
         const canResume = Option.isSome(current.data);
         const acceptBoundedSnapshot = yield* Ref.get(acceptsBoundedSocketSnapshots);
-        if (!supportsCompletionMarker && canResume) {
+        if (!supportsCompletionMarker && canResume && consecutiveSyncFailures === 0) {
           yield* SubscriptionRef.update(state, (value) => ({
             ...value,
             status: value.status === "deleted" ? value.status : ("live" as const),
@@ -889,6 +898,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           return setStreamError(formatThreadError(cause));
         },
         retryExpectedFailureAfter: "250 millis",
+        retryDefects: true,
         resubscribe: foregroundResubscriptions,
       },
     ).pipe(Stream.runForEachArray(applyItems)),

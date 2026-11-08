@@ -276,7 +276,9 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       const response = yield* read(thread.id);
       expect(response.status).toBe(expectedStatus);
       if (expectedStatus === 413) {
-        expect(yield* Effect.promise(() => response.json())).toMatchObject({ error: "reply_too_large" });
+        expect(yield* Effect.promise(() => response.json())).toMatchObject({
+          error: "reply_too_large",
+        });
       }
       if (expectedStatus === 400) {
         const error = yield* Context.get(services, ThreadManagementService.ThreadManagementService)
@@ -294,6 +296,62 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
         });
       }
     }
+
+    const huge = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+      ...items[0],
+      id: "huge-assistant",
+      ordinal: 201,
+      type: "assistant_message",
+      messageId: "huge-answer",
+      text: "x".repeat(18 * 1024 * 1024),
+      streaming: false,
+    });
+    const newest = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+      ...huge,
+      id: "newest-assistant",
+      ordinal: 202,
+      text: "newest",
+    });
+    const collection = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+      ...items[0],
+      id: "huge-search",
+      ordinal: 200,
+      type: "web_search",
+      results: Array.from({ length: 2000 }, (_, index) => ({
+        url: `https://example.com/${index}`,
+        snippet: "x".repeat(10_000),
+      })),
+    });
+    yield* eventSink.write({
+      events: [collection, huge, newest].map((item) => ({
+        id: EventId.make(`create-${item.id}`),
+        type: "turn-item.updated" as const,
+        threadId: thread.id,
+        occurredAt: now,
+        payload: item,
+      })),
+    });
+    const requestPath = (path: string) =>
+      Effect.promise(() =>
+        handler(
+          new Request(`http://localhost/api/orchestration/threads/${thread.id}/${path}`, {
+            headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
+          }),
+        ),
+      );
+    const boundedResponse = yield* requestPath("bounded");
+    expect(boundedResponse.status).toBe(200);
+    const boundedText = yield* Effect.promise(() => boundedResponse.text());
+    expect(Buffer.byteLength(boundedText)).toBeLessThan(1024 * 1024);
+    const bounded = JSON.parse(boundedText) as { historyCursor: string };
+    const historyResponse = yield* requestPath(
+      `history?cursor=${encodeURIComponent(bounded.historyCursor)}`,
+    );
+    expect(historyResponse.status).toBe(200);
+    const historyText = yield* Effect.promise(() => historyResponse.text());
+    expect(Buffer.byteLength(historyText)).toBeLessThan(1024 * 1024);
+    expect(historyText).toContain("truncated for transport");
+    expect(historyText).toContain("This history item is too large");
 
     expect((yield* read(ThreadId.make("missing"))).status).toBe(404);
     allowed = false;

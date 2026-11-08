@@ -163,7 +163,6 @@ export const layer = HttpApiBuilder.group(
                 return yield* failEnvironmentInternal("orchestration_thread_history_failed", error);
               }),
             ),
-            checkJsonReply,
           );
       },
     );
@@ -192,10 +191,12 @@ export const layer = HttpApiBuilder.group(
             args.params.threadId,
             "orchestration_thread_snapshot_failed",
           ).pipe(traceLocalHandlerWork);
-          return yield* checkJsonReply(Effect.succeed({
-            snapshotSequence: snapshot.snapshotSequence,
-            projection: snapshot.projection,
-          }));
+          return yield* checkJsonReply(
+            Effect.succeed({
+              snapshotSequence: snapshot.snapshotSequence,
+              projection: snapshot.projection,
+            }),
+          );
         }),
       )
       .handle(
@@ -236,13 +237,15 @@ export const layer = HttpApiBuilder.group(
             projection: snapshot.projection,
             snapshotSequence: snapshot.snapshotSequence,
           });
-          return yield* checkJsonReply(Effect.succeed({
-            snapshotSequence: snapshot.snapshotSequence,
-            ...boundedSnapshotResponseFields({
-              bounded,
-              compactTurnItems: args.query.compactTurnItems === "1",
+          return yield* checkJsonReply(
+            Effect.succeed({
+              snapshotSequence: snapshot.snapshotSequence,
+              ...boundedSnapshotResponseFields({
+                bounded,
+                compactTurnItems: args.query.compactTurnItems === "1",
+              }),
             }),
-          }));
+          );
         }),
       )
       .handle(

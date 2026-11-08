@@ -31,6 +31,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/http";
 
+import { RpcClientError } from "effect/rpc";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -73,7 +74,7 @@ const BASE_PROJECTION: OrchestrationV2ThreadProjection = {
   thread: { ...v2Projection.thread, title: "Cached thread" },
 };
 
-type TestThreadInput = OrchestrationV2ThreadStreamItem | Error;
+type TestThreadInput = OrchestrationV2ThreadStreamItem | Error | { readonly defect: Error };
 type TestThreadSubscribeInput = {
   readonly afterSequence?: number;
   readonly requestCompletionMarker?: true;
@@ -145,7 +146,11 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const streamFrom = (queue: Queue.Queue<TestThreadInput>) =>
     Stream.fromQueue(queue).pipe(
       Stream.mapEffect((input) =>
-        input instanceof Error ? Effect.fail(input) : Effect.succeed(input),
+        input instanceof Error
+          ? Effect.fail(input)
+          : "defect" in input
+            ? Effect.die(input.defect)
+            : Effect.succeed(input),
       ),
     );
   const client = {
@@ -2289,7 +2294,7 @@ describe("EnvironmentThreads", () => {
       );
 
       expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
-      expect(Option.getOrThrow(state.error)).toBe("stream failed");
+      expect(Option.getOrThrow(state.error)).toContain("stream failed");
       expect(yield* Ref.get(harness.retryCount)).toBe(0);
 
       yield* harness.replaceSession;
@@ -2327,10 +2332,10 @@ describe("EnvironmentThreads", () => {
       const failed = yield* awaitThreadState(harness.observed, (value) =>
         Option.isSome(value.error),
       );
-      expect(Option.getOrThrow(failed.error)).toBe("thread not found yet");
+      expect(Option.getOrThrow(failed.error)).toContain("thread not found yet");
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
 
-      yield* TestClock.adjust("250 millis");
+      yield* TestClock.adjust("1250 millis");
       for (let attempt = 0; attempt < 100; attempt += 1) {
         if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
           break;
@@ -2356,6 +2361,69 @@ describe("EnvironmentThreads", () => {
       expect(Option.isNone(recovered.error)).toBe(true);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
       expect(yield* Ref.get(harness.retryCount)).toBe(0);
+    }),
+  );
+
+  it.effect.each(["domain", "defect", "rpc-defect"] as const)(
+    "backs off repeated %s snapshot failures and keeps cached history visibly stale",
+    (mode) =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness({ cached: BASE_PROJECTION });
+        yield* Queue.take(harness.subscriptions);
+        for (const delay of [1250, 2500, 5000, 10000, 20000, 38000, 46000, 60000, 60000]) {
+          yield* Queue.offer(
+            harness.inputs,
+            mode === "defect"
+              ? { defect: new Error("Reply exceeds the 16 MiB limit") }
+              : mode === "rpc-defect"
+                ? new RpcClientError.RpcClientError({
+                    reason: new RpcClientError.RpcClientDefect({
+                      message: "Reply exceeds the 16 MiB limit",
+                      cause: { _tag: "ReplyTooLarge", message: "Reply exceeds the 16 MiB limit" },
+                    }),
+                  })
+                : new Error(
+                    `Reply exceeds the 16 MiB limit; attempt ${yield* Ref.get(harness.subscriptionCount)}`,
+                  ),
+          );
+          const failed = yield* awaitThreadState(harness.observed, (value) =>
+            Option.isSome(value.error),
+          );
+          expect(failed.status).toBe("cached");
+          expect(Option.getOrThrow(failed.error)).toContain("Showing saved history");
+          expect(Option.getOrThrow(failed.data)).toEqual(BASE_PROJECTION);
+          const count = yield* Ref.get(harness.subscriptionCount);
+          yield* TestClock.adjust("250 millis");
+          expect(yield* Ref.get(harness.subscriptionCount)).toBe(count);
+          yield* TestClock.adjust(delay - 250);
+          yield* Queue.take(harness.subscriptions);
+        }
+        yield* Queue.offer(harness.inputs, snapshot(BASE_PROJECTION));
+        const recovered = yield* awaitThreadState(
+          harness.observed,
+          (value) => value.status === "live",
+        );
+        expect(Option.isNone(recovered.error)).toBe(true);
+      }),
+  );
+
+  it.effect("clears a saved-history error when a reconnect confirms synchronization", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_PROJECTION, completionMarker: true });
+      yield* Queue.take(harness.subscriptions);
+      yield* Queue.offer(harness.inputs, new Error("snapshot failed"));
+      yield* awaitThreadState(harness.observed, (value) => Option.isSome(value.error));
+      yield* harness.replaceSession;
+      yield* TestClock.adjust("250 millis");
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      yield* TestClock.adjust("750 millis");
+      yield* Queue.take(harness.subscriptions);
+      yield* Queue.offer(harness.inputs, { kind: "synchronized" });
+      const recovered = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "live",
+      );
+      expect(Option.isNone(recovered.error)).toBe(true);
     }),
   );
 
