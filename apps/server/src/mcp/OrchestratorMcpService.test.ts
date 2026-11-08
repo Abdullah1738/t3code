@@ -2723,6 +2723,21 @@ describe("OrchestratorMcpService provider resolution", () => {
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
         {
+          name: "inherits a saved standard marker without a fast catalog option",
+          mode: "apply",
+          hideFastDescriptor: true,
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+        },
+        {
           name: "missing flag keeps legacy",
           mode: undefined,
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high" },
@@ -2863,7 +2878,24 @@ describe("OrchestratorMcpService provider resolution", () => {
             }),
           }),
           ServerSettings.layerTest(testCase.mode === undefined ? {} : { ardudHarnessMigration: { selections: testCase.mode } }),
-          providerRegistryLayer(testCase.mode === "apply" ? providers : [legacyProvider, ...providers]),
+          providerRegistryLayer(
+            testCase.mode === "apply"
+              ? "hideFastDescriptor" in testCase
+                ? providers.map((provider) => ({
+                    ...provider,
+                    models: provider.models.map((model) => ({
+                      ...model,
+                      capabilities: {
+                        ...model.capabilities,
+                        optionDescriptors: model.capabilities?.optionDescriptors?.filter(
+                          (option) => option.id !== "fastMode",
+                        ),
+                      },
+                    })),
+                  }))
+                : providers
+              : [legacyProvider, ...providers],
+          ),
           adapterRegistryLayer([opencode, claude, codexInstanceId]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
