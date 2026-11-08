@@ -104,6 +104,37 @@ export async function fileHash(path: string) {
 
 export async function artifactHash(entry: string) {
   const { readdirSync } = await import("node:fs");
+  // Source execution is useful when building an artifact is deliberately forbidden.
+  // Hash the complete source closure, not the empty list of adjacent .mjs files.
+  if (entry.endsWith(".ts")) {
+    const { resolve, relative } = await import("node:path");
+    const { dirname, basename } = await import("node:path");
+    const source = dirname(resolve(entry));
+    if (basename(source) !== "src" || basename(dirname(source)) !== "server")
+      throw new Error("Source entry must be in apps/server/src");
+    const root = resolve(source, "../../..");
+    const files: string[] = [];
+    function visit(directory: string) {
+      for (const item of readdirSync(directory, { withFileTypes: true })) {
+        if (["node_modules", "dist", ".git", "tmp"].includes(item.name)) continue;
+        const path = resolve(directory, item.name);
+        if (item.isDirectory()) visit(path);
+        else if (/\.(?:ts|json)$/.test(item.name)) files.push(path);
+      }
+    }
+    visit(source);
+    visit(resolve(root, "packages"));
+    for (const manifest of [
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "apps/server/package.json",
+    ])
+      files.push(resolve(root, manifest));
+    const parts = [];
+    for (const path of files.sort()) parts.push([relative(root, path), await fileHash(path)]);
+    return hash({ entry: relative(root, resolve(entry)), files: parts });
+  }
   const { dirname, resolve } = await import("node:path");
   const directory = dirname(resolve(entry));
   const parts = [];

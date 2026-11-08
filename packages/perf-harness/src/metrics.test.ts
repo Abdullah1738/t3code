@@ -157,3 +157,42 @@ test("complete relative evidence stays separate from native correctness gaps", (
   assert.equal(result.performanceVerdict, "pass");
   assert.equal(result.budgetVerdict, "incomplete");
 });
+
+test("source artifact identity follows the entry checkout and runtime manifests", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { artifactHash } = await import("./metrics.ts");
+  const temp = mkdtempSync(join(tmpdir(), "source-hash-"));
+  try {
+    const entries = ["one", "two"].map((name) => {
+      const root = join(temp, name);
+      mkdirSync(join(root, "apps/server/src"), { recursive: true });
+      mkdirSync(join(root, "packages"));
+      for (const file of [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "apps/server/package.json",
+      ])
+        writeFileSync(join(root, file), "{}");
+      const entry = join(root, "apps/server/src/bin.ts");
+      writeFileSync(entry, "export const value = 1;");
+      writeFileSync(join(root, "apps/server/src/other.ts"), "export const value = 1;");
+      return { root, entry };
+    });
+    const first = await artifactHash(entries[0]!.entry);
+    assert.equal(first, await artifactHash(entries[1]!.entry));
+    writeFileSync(entries[1]!.entry, "export const value = 2;");
+    assert.notEqual(first, await artifactHash(entries[1]!.entry));
+    assert.equal(first, await artifactHash(entries[0]!.entry));
+    writeFileSync(join(entries[0]!.root, "apps/server/package.json"), '{"version":"changed"}');
+    assert.notEqual(first, await artifactHash(entries[0]!.entry));
+    assert.notEqual(
+      await artifactHash(entries[0]!.entry),
+      await artifactHash(join(entries[0]!.root, "apps/server/src/other.ts")),
+    );
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
