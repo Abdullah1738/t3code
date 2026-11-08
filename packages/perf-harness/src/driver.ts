@@ -6,6 +6,9 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import {
   existsSync,
+  openSync,
+  fsyncSync,
+  closeSync,
   readFileSync,
   mkdirSync,
   createWriteStream,
@@ -40,6 +43,28 @@ import { makeWsRpcProtocolClient } from "../../../packages/client-runtime/src/rp
 import { phaseMetrics, appendLedger, hash, artifactHash, type Run } from "./metrics.ts";
 const token = "synthetic-performance-credential-only";
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ext4 may fall back from FICLONE to a buffered multi-GB copy. Flush both
+// inputs and clones before profiling so preparation writeback cannot contend
+// with the measured WAL/checkpoint workload.
+function flushFixtureDatabases(home: string) {
+  for (const name of ["statev2.sqlite", "boards.sqlite", "archive.sqlite"]) {
+    const fd = openSync(resolve(home, "userdata", name), "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+}
+function dirtyPages() {
+  if (process.platform !== "linux") return undefined;
+  const memory = readFileSync("/proc/meminfo", "utf8");
+  return {
+    dirtyBytes: Number(memory.match(/^Dirty:\s+(\d+)/m)?.[1] ?? 0) * 1024,
+    writebackBytes: Number(memory.match(/^Writeback:\s+(\d+)/m)?.[1] ?? 0) * 1024,
+  };
+}
+
 export async function drive(
   home: string,
   sha: string,
@@ -62,10 +87,26 @@ export async function drive(
   const runHome = mkdtempSync(resolve(tmpdir(), "robob-perf-run-"));
   let prepared = false;
   try {
+    const sourceFixture = JSON.parse(readFileSync(resolve(pristine, "fixture.json"), "utf8"));
+    if (sourceFixture.synthetic !== true) throw new Error("Synthetic fixture marker required");
+    const dirtyBefore = dirtyPages();
+    const syncStarted = performance.now();
+    flushFixtureDatabases(pristine);
+    const sourceSyncMs = performance.now() - syncStarted;
+    const cloneStarted = performance.now();
     cpSync(pristine, runHome, {
       recursive: true,
       mode: constants.COPYFILE_FICLONE,
       filter: (path) => path !== resolve(pristine, "perf"),
+    });
+    const cloneMs = performance.now() - cloneStarted;
+    const dirtyBeforeCloneSync = dirtyPages();
+    const cloneSyncStarted = performance.now();
+    flushFixtureDatabases(runHome);
+    appendLedger(ledger + ".preparation", {
+      sha, repeat, sourceSyncMs, cloneMs,
+      cloneSyncMs: performance.now() - cloneSyncStarted,
+      dirtyBefore, dirtyBeforeCloneSync, dirtyAfterCloneSync: dirtyPages(),
     });
     home = runHome;
     const fixture = JSON.parse(readFileSync(resolve(home, "fixture.json"), "utf8"));
