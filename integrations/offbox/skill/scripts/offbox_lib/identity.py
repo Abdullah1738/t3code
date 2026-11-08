@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -103,6 +104,7 @@ ENV_DRIVERS = (
 # native id, or a control outage) is held only for a short burst, so the next attempt asks C1 again
 # and picks the mapping up as soon as it lands (well inside the 60 s the card requires).
 RESOLVED_TTL = 3600
+STALE_RESOLVED_MAX = 86400
 UNRESOLVED_TTL = 5
 
 
@@ -121,13 +123,15 @@ def caller_native() -> tuple[str | None, str | None]:
 
 
 def identity_for(native: str, driver: str) -> dict:
-    """C1's resolution for one native id. Resolved answers last an hour; anything else, a minute.
+    """C1's resolution for one native id, with a last resolved answer during control outages.
 
     A pending or unavailable answer is never reported as unowned: callers treat it as "not yet".
     """
     con = db()
     key = f"identity:{driver}:{native}"
     row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+    cached = None
+    age = 0
     if row:
         try:
             cached = json.loads(row["v"])
@@ -139,14 +143,38 @@ def identity_for(native: str, driver: str) -> dict:
                 return cached
             if cached.get("resolution") != "resolved" and age <= UNRESOLVED_TTL:
                 return cached
-    st, d = ctl("GET", f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}")
+    path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
+    st, d = ctl("GET", path)
+    if st == 0 or st >= 500:
+        time.sleep(1.5)
+        st, d = ctl("GET", path, timeout=20)
+    if not isinstance(d, dict):
+        d = {}
+    had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
     if st == 200 and isinstance(d.get("identity"), dict):
         ident = dict(d["identity"])
     else:
+        # Only short reason fields belong in diagnostics, never the response body or headers.
+        error = d.get("error")
+        reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
+        err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
+                    if isinstance(v, str) and v), "no error detail")
+        detail = f"status={st} {' '.join(err.split())[:120]}"
+        if row:
+            age = now() - (row["ts"] or 0)
+        if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
+            log(f"identity resolve failed for {driver} {native[:8]} ({detail}); "
+                f"using last resolved identity from {age:.0f}s ago")
+            return cached
+        log(f"identity resolve failed for {driver} {native[:8]}: {detail}")
         ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
                  "executionKind": None, "acceptsMessages": False, "candidates": []}
+        if st != 200:
+            ident["lookupError"] = detail
     ident.update(driver=driver, nativeId=native)
-    kv_set(con, key, ident)
+    # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
+    if st == 200 or not had_resolved:
+        kv_set(con, key, ident)
     return ident
 
 
@@ -313,6 +341,7 @@ def whoami(cwd: str | None = None) -> dict:
         me["session"] = native
         ident = identity_for(native, driver)
         me["resolution"] = ident.get("resolution")
+        me["lookupError"] = ident.get("lookupError")
         me["executionKind"] = ident.get("executionKind")
         me["acceptsMessages"] = ident.get("acceptsMessages")
         # A Claude shell carries only its session id, which a native child shares with its parent. C1 answers a
@@ -336,7 +365,8 @@ def whoami(cwd: str | None = None) -> dict:
             me["parent"] = ident.get("parentThreadId")
         else:
             # Not yet (pending), ambiguous or unavailable: never the unowned local owner.
-            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}")
+            detail = f" ({me['lookupError']})" if me.get("lookupError") else ""
+            log(f"caller {driver} {native[:8]} unresolved: {ident.get('resolution')}{detail}")
         explicit = _explicit_thread(me["thread"], driver, me["executionKind"])
         if explicit is not None:
             me["thread"] = explicit
@@ -362,6 +392,11 @@ def require_proven(me: dict, action: str) -> None:
     must never reach a selector, where it would silently match nothing or the wrong caller's rows.
     """
     if not me.get("proven", True):
+        if me.get("resolution") == "unavailable" and me.get("lookupError"):
+            raise OffboxError(
+                f"{action} refused: this {me.get('driver')} caller can't be proven to be one Robob execution. "
+                f"Robob's control API didn't answer the caller lookup ({me['lookupError']}). "
+                f"Robob may be busy or restarting. Retry in ~30 s. Nothing was changed.", code=2)
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
             f"(resolution={me.get('resolution') or 'none'}). A Claude shell without the hook's signed per-command "

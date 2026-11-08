@@ -24,6 +24,8 @@ OTHER = "thread-unrelated"
 CLAUDE_UUID = "11111111-2222-3333-4444-555555555555"
 CODEX_UUID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 PENDING_UUID = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+ERROR_BODY_SHAPES = {"null": None, "array": [], "string": "service unavailable", "number": 500,
+                     "boolean": False, "object": {}}
 
 
 class StubControl:
@@ -122,6 +124,7 @@ class IdentityTests(unittest.TestCase):
             patch.object(identity, "CTL_CFGS", (cfg, root / "none.json")),
             patch.object(identity, "repo_root", return_value=root),
             patch.object(identity, "repo_key", return_value="repo"),
+            patch.object(identity.time, "sleep"),
         ]
         for p in self.stack:
             p.start()
@@ -217,6 +220,147 @@ class IdentityTests(unittest.TestCase):
         before = len(self.stub.calls)
         self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
         self.assertEqual(len(self.stub.calls), before)
+
+    def test_identity_lookup_retries_transport_and_server_errors_once(self):
+        for status in (0, 500, 503):
+            with self.subTest(status=status), patch.object(identity, "ctl", side_effect=[
+                (status, {"error": "timed out"}), (200, {"identity": resolved(OTHER, driver="codex")})
+            ]) as ctl:
+                ident = identity.identity_for(f"retry-{status}", "codex")
+                self.assertEqual(ident["robobThreadId"], OTHER)
+                self.assertEqual(ident["resolution"], "resolved")
+                self.assertNotIn("lookupError", ident)
+                self.assertEqual(ctl.call_count, 2)
+                self.assertEqual(ctl.call_args.kwargs, {"timeout": 20})
+                self.assertEqual(ctl.call_args_list[0].args, ctl.call_args_list[1].args)
+
+    def test_failed_lookup_carries_detail_to_whoami_logs_and_refusal(self):
+        with patch.object(identity, "ctl", return_value=(0, {"error": "timed out"})) as ctl:
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+            cached = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertEqual(ctl.call_count, 2, "the unavailable answer still has a short cache")
+        self.assertEqual(me["resolution"], "unavailable")
+        self.assertEqual(me["lookupError"], "status=0 timed out")
+        self.assertEqual(cached["lookupError"], me["lookupError"])
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "ssh")
+        self.assertEqual(refused.exception.code, 2)
+        for text in ("control API", "can't be proven", "status=0 timed out", "Nothing was changed"):
+            self.assertIn(text, str(refused.exception))
+        logs = (Path(self.tmp.name) / "log").read_text()
+        self.assertIn(f"identity resolve failed for codex {CODEX_UUID[:8]}: status=0 timed out", logs)
+        self.assertIn(f"caller codex {CODEX_UUID[:8]} unresolved: unavailable (status=0 timed out)", logs)
+
+    def test_client_errors_are_not_retried(self):
+        for status in (401, 404):
+            with self.subTest(status=status), patch.object(identity, "ctl", return_value=(status, {})) as ctl:
+                ident = identity.identity_for(f"client-{status}", "codex")
+            ctl.assert_called_once()
+            self.assertIn(f"status={status}", ident["lookupError"])
+
+    def seed_resolved_identity(self, age):
+        con = common.db()
+        key = f"identity:codex:{CODEX_UUID}"
+        ident = resolved(OTHER, driver="codex")
+        ident["nativeId"] = CODEX_UUID
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?, ?, ?)",
+                    (key, json.dumps(ident), common.now() - age))
+        con.commit()
+        return con, key, ident
+
+    def test_stale_resolved_identity_survives_outage_without_restamping_then_refreshes(self):
+        for status in (0, 500, 503):
+            with self.subTest(status=status):
+                con, key, old = self.seed_resolved_identity(3700)
+                before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
+                with patch.object(identity, "ctl", return_value=(status, {"error": "timed out"})) as ctl:
+                    ident = identity.identity_for(CODEX_UUID, "codex")
+                self.assertEqual(ctl.call_count, 2)
+                self.assertEqual(ident, old)
+                self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
+                with patch.object(identity, "ctl", return_value=(200, {"identity": resolved(OTHER, driver="codex")})) as ctl:
+                    self.assertEqual(identity.identity_for(CODEX_UUID, "codex"), old)
+                ctl.assert_called_once()
+                refreshed = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+                self.assertEqual(json.loads(refreshed["v"]), old)
+                self.assertGreater(refreshed["ts"], before[1])
+        logs = (Path(self.tmp.name) / "log").read_text()
+        self.assertIn("using last resolved identity from 3700s ago", logs)
+
+    def test_stale_resolved_identity_is_limited_to_twenty_four_hours(self):
+        with patch.object(identity, "now", return_value=1000000), patch.object(common, "now", return_value=1000000):
+            for age, expected in ((86400, "resolved"), (86401, "unavailable")):
+                with self.subTest(age=age):
+                    con, key, _ = self.seed_resolved_identity(age)
+                    before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
+                    with patch.object(identity, "ctl", return_value=(0, {"error": "timed out"})):
+                        ident = identity.identity_for(CODEX_UUID, "codex")
+                    self.assertEqual(ident["resolution"], expected)
+                    self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
+
+    def test_stale_resolved_identity_is_not_used_for_client_errors(self):
+        con, key, _ = self.seed_resolved_identity(3700)
+        before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
+        for status in (401, 404):
+            with self.subTest(status=status), patch.object(identity, "ctl", return_value=(status, {})) as ctl:
+                ident = identity.identity_for(CODEX_UUID, "codex")
+            ctl.assert_called_once()
+            self.assertEqual(ident["resolution"], "unavailable")
+            self.assertIn(f"status={status}", ident["lookupError"])
+            self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
+
+    def test_successful_unresolved_answer_replaces_stale_identity_without_outage_message(self):
+        for resolution in ("none", "pending", "ambiguous", "unavailable"):
+            with self.subTest(resolution=resolution):
+                con, key, _ = self.seed_resolved_identity(3700)
+                answer = {"resolution": resolution, "robobThreadId": None}
+                with patch.object(identity, "ctl", return_value=(200, {"identity": answer})) as ctl:
+                    me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+                ctl.assert_called_once()
+                self.assertEqual(me["resolution"], resolution)
+                self.assertIsNone(me["lookupError"])
+                self.assertEqual(common.kv_get(con, key)["resolution"], resolution)
+                with self.assertRaises(OffboxError) as refused:
+                    identity.require_proven(me, "ssh")
+                self.assertNotIn("control API", str(refused.exception))
+                self.assertIn("A Claude shell without the hook's signed per-command", str(refused.exception))
+
+    def test_lookup_error_keeps_short_server_reason_without_headers_or_token(self):
+        cases = (
+            ({"error": "internal", "errorDetail": "identity storage failed"}, "identity storage failed"),
+            ({"error": {"code": "internal", "message": "identity query failed"}}, "identity query failed"),
+            ({"reason": "r" * 200}, "r" * 120),
+        )
+        for index, (body, expected) in enumerate(cases):
+            body.update(headers={"Authorization": "Bearer test-token"}, token="test-token")
+            with self.subTest(index=index), patch.object(identity, "ctl", return_value=(500, body)):
+                ident = identity.identity_for(f"server-{index}", "codex")
+            self.assertEqual(ident["lookupError"], f"status=500 {expected}")
+        logs = (Path(self.tmp.name) / "log").read_text()
+        self.assertNotIn("test-token", logs)
+        self.assertNotIn("Authorization", logs)
+
+    def test_server_error_body_shapes_preserve_stale_identity_and_timestamp(self):
+        for shape, body in ERROR_BODY_SHAPES.items():
+            with self.subTest(shape=shape):
+                con, key, old = self.seed_resolved_identity(3700)
+                before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
+                with patch.object(identity, "ctl", return_value=(500, body)) as ctl:
+                    self.assertEqual(identity.identity_for(CODEX_UUID, "codex"), old)
+                self.assertEqual(ctl.call_count, 2)
+                self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
+
+    def test_server_error_body_shapes_without_cached_identity_refuse_with_detail(self):
+        for shape, body in ERROR_BODY_SHAPES.items():
+            with self.subTest(shape=shape), patch.object(identity, "ctl", return_value=(500, body)) as ctl:
+                ident = identity.identity_for(f"error-body-{shape}", "codex")
+            self.assertEqual(ctl.call_count, 2)
+            self.assertEqual(ident["resolution"], "unavailable")
+            self.assertEqual(ident["lookupError"], "status=500 no error detail")
+            with self.assertRaises(OffboxError) as refused:
+                identity.require_proven({**ident, "proven": False}, "ssh")
+            self.assertEqual(refused.exception.code, 2)
+            self.assertIn("control API", str(refused.exception))
 
     def test_control_outage_is_unresolved_never_unowned(self):
         with patch.object(identity, "CTL_CFGS", (Path(self.tmp.name) / "missing.json",)):
