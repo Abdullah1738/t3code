@@ -918,6 +918,7 @@ const make = Effect.gen(function* () {
       ),
     send: (input) => outside(threadIo.send(input)),
     setModel: (id, model) => outside(threadIo.setModel(id, model)),
+    cancelQueued: (id, run) => outside(threadIo.cancelQueued(id, run)),
     interrupt: (id, reason, cancelQueued) => outside(threadIo.interrupt(id, reason, cancelQueued)),
   };
   // These continuations re-read their exact targets under the reacquired permit;
@@ -3041,6 +3042,7 @@ const make = Effect.gen(function* () {
         ? card.workThreadId
         : card.reviewThreadId;
     let threadId: ThreadId | null = null;
+    let sharingWork = false;
     if (existing !== null) {
       // Do not mistake a failed projection read for a missing work thread.
       const existingRead =
@@ -3105,6 +3107,7 @@ const make = Effect.gen(function* () {
         }
       }
       if (view) {
+        sharingWork = dispatch.joins;
         threadId = existing;
         // The reused thread now runs on this model; its link must say so, or an
         // outage would be read against the old model's pool.
@@ -3125,13 +3128,64 @@ const make = Effect.gen(function* () {
         }
       }
     }
-    const synced = dispatch.role === "review" ? yield* syncPrs(card) : card;
+    const synced = dispatch.role === "review" ? yield * syncPrs(card) : card;
+    const pool = (yield * store.pools(board.id)).find((candidate) => candidate.key === dispatch.pool);
+    // Compare assignment inputs, not board presentation or PR-refresh metadata.
+    const assignmentState = (row: KanbanCard) => ({
+      stage: row.stage,
+      activeThreadId: row.activeThreadId,
+      activeRole: row.activeRole,
+      activePool: row.activePool,
+      workThreadId: row.workThreadId,
+      reviewThreadId: row.reviewThreadId,
+      reviewStep: row.reviewStep,
+      reviewRound: row.reviewRound,
+      projectId: row.projectId,
+      reviewChain: row.reviewChain,
+      model: row.model,
+      models: row.models,
+      stalled: row.stalled,
+      priority: row.priority,
+      settledAt: row.settledAt,
+      blockedBy: row.blockedBy,
+      subtasks: row.subtasks,
+      task: row.prompt.trim() || row.description.trim() || row.title,
+      wakeNote: row.wakeNote,
+    });
+    const boardAssignmentState = (row: KanbanBoard) => ({
+      archivedAt: row.archivedAt,
+      held: row.pause !== null && !row.pause.keep.includes(card.id),
+      settingUp: row.setup?.status === "running",
+      projectId: card.projectId ?? row.defaultProjectId,
+      chain: dispatch.role === "review" ? Rules.chainFor(row, synced) : null,
+      reviewModel: dispatch.role === "review" ? Rules.nextModel(row, synced) : null,
+      instructions:
+        dispatch.role === "review"
+          ? row.instructions.reviewerRouting.trim()
+          : threadId === null
+            ? row.instructions.escalation.trim()
+            : null,
+    });
+    let assignmentCard = synced;
     const assignmentUnchanged = Effect.gen(function* () {
       const currentBoard = (yield* rawStore.boards).find((candidate) => candidate.id === board.id);
-      return (
-        NodeUtil.isDeepStrictEqual(currentBoard, board) &&
-        NodeUtil.isDeepStrictEqual(yield* rawStore.card(card.id), synced)
+      const currentCard = yield* rawStore.card(card.id);
+      const currentPool = (yield* rawStore.pools(board.id)).find(
+        (candidate) => candidate.key === dispatch.pool,
       );
+      const unchanged =
+        currentBoard !== undefined &&
+        currentCard !== null &&
+        NodeUtil.isDeepStrictEqual(boardAssignmentState(currentBoard), boardAssignmentState(board)) &&
+        NodeUtil.isDeepStrictEqual(assignmentState(currentCard), assignmentState(synced)) &&
+        pool !== undefined &&
+        pool.slots > 0 &&
+        currentPool !== undefined &&
+        currentPool.slots >= pool.slots &&
+        NodeUtil.isDeepStrictEqual(currentPool.model, pool.model);
+      // Preserve concurrent comments, link refreshes and other non-assignment edits.
+      if (unchanged) assignmentCard = currentCard;
+      return unchanged;
     });
     let text: string;
     if (dispatch.role === "work") {
@@ -3161,14 +3215,31 @@ const make = Effect.gen(function* () {
       const key = wakeKey(reused, `${card.id}:${at}`);
       yield* locks.outside(
         threadIo.send({ threadId: reused, text, model: dispatch.model, key }),
-        () =>
-          threadIo
-            .send({
-              threadId: reused,
-              key: `${key}:state-changed`,
-              text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
-            })
-            .pipe(Effect.asVoid, Effect.ignore),
+        (runId) =>
+          Effect.gen(function* () {
+            // A joining worker may already carry other cards. Withdraw only its
+            // queued brief; stopping the thread would also stop their work.
+            if (sharingWork) {
+              if (typeof runId === "string" && (yield* threadIo.cancelQueued(reused, runId)))
+                return;
+            } else {
+              yield* threadIo.interrupt(reused, "Board state changed during assignment", true);
+              const readback = yield* Effect.result(threadIo.find(reused));
+              if (
+                readback._tag === "Success" &&
+                (readback.success === null ||
+                  (readback.success.state === "idle" && readback.success.backgroundWork === 0))
+              )
+                return;
+            }
+            yield* threadIo
+              .send({
+                threadId: reused,
+                key: `${key}:state-changed`,
+                text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
+              })
+              .pipe(Effect.asVoid, Effect.ignore);
+          }).pipe(Effect.ignore),
         assignmentUnchanged,
       );
     } else {
@@ -3209,16 +3280,16 @@ const make = Effect.gen(function* () {
     }
     const to: KanbanStage = dispatch.role === "work" ? "working" : "in_review";
     const next: KanbanCard = {
-      ...synced,
+      ...assignmentCard,
       // A weighted card runs on the model that had room; its thread keeps it.
-      model: dispatch.role === "work" ? dispatch.model : synced.model,
+      model: dispatch.role === "work" ? dispatch.model : assignmentCard.model,
       stage: to,
       activeThreadId: threadId,
       activeRole: dispatch.role,
       activePool: dispatch.pool,
-      workThreadId: dispatch.role === "work" ? threadId : synced.workThreadId,
-      reviewThreadId: dispatch.role === "review" ? threadId : synced.reviewThreadId,
-      wakeNote: dispatch.role === "work" ? null : synced.wakeNote,
+      workThreadId: dispatch.role === "work" ? threadId : assignmentCard.workThreadId,
+      reviewThreadId: dispatch.role === "review" ? threadId : assignmentCard.reviewThreadId,
+      wakeNote: dispatch.role === "work" ? null : assignmentCard.wakeNote,
       nudgedAt: null,
       movedAt: at,
       updatedAt: at,
@@ -7414,7 +7485,9 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
-        Effect.tapError((cause) => Effect.logWarning("Board startup recovery will retry", { cause })),
+        Effect.tapError((cause) =>
+          Effect.logWarning("Board startup recovery will retry", { cause }),
+        ),
         Effect.retry(Schedule.spaced("1 second")),
         Effect.andThen(Deferred.succeed(startupReady, undefined)),
       ),

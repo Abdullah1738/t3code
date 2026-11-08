@@ -446,7 +446,15 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
   }).pipe(Effect.provide(dependencies));
 });
 
-it.effect.each(["preparing", "queued"] as const)(
+it.effect.each([
+  "preparing",
+  "queued",
+  "shared queued",
+  "shared active",
+  "shared completed",
+  "shared failed",
+  "shared interrupted",
+] as const)(
   "#566 stopping an abandoned %s launch prevents its pending turn from starting",
   (state) => {
     const db = Sqlite.layerMemory;
@@ -493,7 +501,7 @@ it.effect.each(["preparing", "queued"] as const)(
         createdBy: "system",
         creationSource: "server",
       });
-      const count = state === "queued" ? 2 : 1;
+      const count = state === "preparing" ? 1 : 2;
       for (let i = 0; i < count; i++)
         yield* orchestrator.dispatch({
           type: "message.dispatch",
@@ -513,9 +521,18 @@ it.effect.each(["preparing", "queued"] as const)(
           creationSource: "server",
         });
       expect((yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)?.status).toBe(
-        state,
+        state === "preparing" ? "preparing" : "queued",
       );
       const threads = yield* KanbanThreads;
+      if (state.startsWith("shared")) {
+        const before = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        const target = state === "shared queued" ? before.at(-1)! : before[0]!;
+        expect(yield* threads.cancelQueued(threadId, target.id)).toBe(state === "shared queued");
+        const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
+        expect(after[0]).toEqual(before[0]);
+        expect(after.at(-1)?.status).toBe(state === "shared queued" ? "cancelled" : "queued");
+        return;
+      }
       yield* threads.interrupt(threadId, "Abandoned launch", true);
       const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
       expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
@@ -530,7 +547,37 @@ it.effect.each(["preparing", "queued"] as const)(
     }).pipe(
       Effect.provide(
         layer.pipe(
-          Layer.provideMerge(management),
+          Layer.provideMerge(
+            Layer.effect(
+              ThreadManagementService.ThreadManagementService,
+              Effect.map(ThreadManagementService.ThreadManagementService, (service) =>
+                ThreadManagementService.ThreadManagementService.of({
+                  ...service,
+                  getThreadRecords: (id, fields, filter) =>
+                    Effect.gen(function* () {
+                      const records = yield* service.getThreadRecords(id, fields, filter);
+                      if (
+                        !["shared completed", "shared failed", "shared interrupted"].includes(state)
+                      )
+                        return records;
+                      const { runs } = yield* service.getThreadRecords(id, ["runs"]);
+                      return {
+                        ...records,
+                        runs: runs.map((run) => ({
+                          ...run,
+                          status:
+                            state === "shared completed"
+                              ? ("completed" as const)
+                              : state === "shared failed"
+                                ? ("failed" as const)
+                                : ("interrupted" as const),
+                        })),
+                      };
+                    }),
+                }),
+              ),
+            ).pipe(Layer.provideMerge(management)),
+          ),
           Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         ),
       ),

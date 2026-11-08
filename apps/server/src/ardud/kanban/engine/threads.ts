@@ -131,6 +131,8 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
+  /** Cancels only this queued brief; false means it may already be acting. */
+  readonly cancelQueued: (threadId: ThreadId, runId: string) => Effect.Effect<boolean>;
   /** Abandoned new launches also cancel queued turns instead of only interrupting the active run. */
   readonly interrupt: (
     threadId: ThreadId,
@@ -391,6 +393,26 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const cancelQueued: KanbanThreadsShape["cancelQueued"] = Effect.fn("KanbanThreads.cancelQueued")(
+    function* (threadId, runId) {
+      const run = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      if (run?.status !== "queued") return false;
+      yield* threads.dispatch({
+        type: "queued-run.cancel",
+        commandId: commandId("cancel"),
+        threadId,
+        runId: run.id,
+      });
+      const after = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      return after?.status === "cancelled";
+    },
+    Effect.catchCause(() => Effect.succeed(false)),
+  );
+
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
     function* (threadId, reason, cancelQueued = false) {
       const shell = yield* threads.getThreadShell(threadId);
@@ -437,6 +459,7 @@ const make = Effect.gen(function* () {
     launch,
     send,
     setModel,
+    cancelQueued,
     interrupt,
   });
 });

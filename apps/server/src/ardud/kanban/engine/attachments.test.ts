@@ -74,6 +74,7 @@ const makeFake = Effect.gen(function* () {
       compactRun: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );
