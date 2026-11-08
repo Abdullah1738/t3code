@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import runs
-from offbox_lib import common, misc, pool
+from offbox_lib import common, misc, pool, reap
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_capacity import Isolated
 
@@ -228,6 +228,51 @@ class RepoSetupExitTests(Isolated):
             pool._refresh_background(self.con, 'repo')
         self.assertEqual(self.row()['status'], 'infra')
         self.assertEqual(self.row()['exit_code'], 90)
+        pull.assert_not_called()
+
+    def test_background_terminal_statuses_without_a_local_log(self):
+        self.log.unlink()
+        marker = runs.REPO_SETUP_FAILED_MARKER
+        # Both detached-run settling paths must classify the same exit/marker combinations.
+        cases = [
+            ('setup failure', 98, marker + '\n', 'infra', 90, False),
+            ('user exit 98', 98, '', 'failed', 98, True),
+            ('marker text inside user output', 98, 'prefix ' + marker + '\n', 'failed', 98, True),
+            ('other user failure with marker', 1, marker + '\n', 'failed', 1, True),
+            ('successful command with marker', 0, marker + '\n', 'done', 0, True),
+        ]
+        for path in ('reaper', 'pool'):
+            for label, code, stderr, expected_status, expected_code, expect_pull in cases:
+                with self.subTest(path=path, case=label):
+                    self.con.execute("UPDATE runs SET status='running',exit_code=NULL,pulls='[\"artifacts\"]' "
+                                     "WHERE run_id='run-setup'")
+                    self.con.commit()
+                    status = dict(running=False, status='exited', exitCode=code, stderr=stderr)
+                    with patch.object(runs.api, 'cmd_status', return_value=status), \
+                         patch.object(runs, 'do_pulls') as pull:
+                        if path == 'reaper':
+                            reap._check_unlocked(self.con, 'bx_setup', 'running', False, [])
+                        else:
+                            pool._refresh_background(self.con, 'repo')
+                    self.assertFalse(self.log.exists())
+                    self.assertEqual(self.row()['status'], expected_status)
+                    self.assertEqual(self.row()['exit_code'], expected_code)
+                    self.assertEqual(misc.wait('run-setup', None), expected_code)
+                    if expect_pull:
+                        pull.assert_called_once()
+                        self.assertEqual(pull.call_args.args[2], ['artifacts'])
+                    else:
+                        pull.assert_not_called()
+
+    def test_reaper_setup_failure_dry_run_does_not_change_run_or_pull(self):
+        self.log.unlink()
+        status = dict(running=False, status='exited', exitCode=98, stderr=runs.REPO_SETUP_FAILED_MARKER + '\n')
+        actions = []
+        with patch.object(runs.api, 'cmd_status', return_value=status), patch.object(runs, 'do_pulls') as pull:
+            reap._check_unlocked(self.con, 'bx_setup', 'running', True, actions)
+        self.assertEqual(actions, ['would mark run run-setup infra'])
+        self.assertEqual(self.row()['status'], 'running')
+        self.assertIsNone(self.row()['exit_code'])
         pull.assert_not_called()
 
 
