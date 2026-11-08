@@ -8,6 +8,7 @@
  * is `ambiguous`, never resolved to the newest.
  */
 import type { ModelSelection } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -347,7 +348,9 @@ const make = Effect.gen(function* () {
   );
 
   const resolve: ExecutionIdentityShape["resolve"] = Effect.fn("ExecutionIdentity.resolve")(
-    function* (input) {
+    function* (
+      input: ResolveInput,
+    ): Effect.fn.Return<ExecutionIdentityResult, ExecutionIdentityError> {
       const providers = (yield* providerRowsFor(input.nativeId)).filter(
         (row) =>
           row.thread_id !== null &&
@@ -463,6 +466,9 @@ const make = Effect.gen(function* () {
         candidates: [],
       };
     },
+    // A committed native mapping must remain readable while unrelated writes
+    // are queued. Offbox treats a lookup timeout as an unavailable caller.
+    NodeSqliteClient.readOnly,
   );
 
   const currentNative: ExecutionIdentityShape["currentNative"] = (threadIds) =>
