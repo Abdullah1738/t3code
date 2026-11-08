@@ -83,3 +83,38 @@ it("refuses a boolean value for a select option whose choice ids are 'true' and 
   });
   assert.isNotNull(modelProblem(boolSelect, selection));
 });
+
+it("accepts the enforced standard marker when fast mode is absent from the catalog", () => {
+  const catalog = [
+    {
+      ...opencodeTestProvider(),
+      models: [
+        {
+          slug: "opus/claude-opus-5-5",
+          name: "Claude",
+          isCustom: false,
+          capabilities: { optionDescriptors: [] },
+        },
+      ],
+    },
+  ];
+  const selection = {
+    instanceId: catalog[0]!.instanceId,
+    model: "opus/claude-opus-5-5",
+    options: [{ id: "fastMode", value: false }],
+  };
+  assert.isNull(modelProblem(catalog, selection));
+  for (const value of [true, "false"]) {
+    assert.include(
+      modelProblem(catalog, { ...selection, options: [{ id: "fastMode", value }] }) ?? "",
+      "Unknown option fastMode",
+    );
+  }
+  assert.include(
+    modelProblem(catalog, {
+      ...selection,
+      options: [...selection.options, ...selection.options],
+    }) ?? "",
+    "specified more than once",
+  );
+});

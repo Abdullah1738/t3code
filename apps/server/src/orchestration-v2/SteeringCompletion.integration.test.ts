@@ -1,3 +1,4 @@
+import { standardModelSelection } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -695,7 +696,10 @@ it.effect("starts a steer that missed the turn on the saved next-turn selection"
         assert.deepEqual(steered, []);
         assert.equal(started.length, 2);
         assert.equal(started[1]?.message.messageId, MessageId.make("message:steer"));
-        assert.deepEqual(started[1]?.modelSelection, composerSelection);
+        assert.deepEqual(
+          started[1]?.modelSelection,
+          standardModelSelection(composerSelection, driver),
+        );
         assert.deepEqual(projection.thread.modelSelection, composerSelection);
       }).pipe(Effect.provide(layer));
     }),
