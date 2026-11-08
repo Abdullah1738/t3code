@@ -1,3 +1,4 @@
+import { markInstallLifecycle } from "../ardud/fast-install/report.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
   CommandId,
@@ -1499,7 +1500,24 @@ export const layer: Layer.Layer<
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
         providerSessionId,
-        session: deliverySession,
+        session:
+          run.restartContinuationOfRunId === undefined
+            ? deliverySession
+            : {
+                ...deliverySession,
+                startTurn: (input) =>
+                  Effect.sync(() => markInstallLifecycle("firstResumedProviderRequestAt")).pipe(
+                    Effect.andThen(deliverySession.startTurn(input)),
+                  ),
+                ...(deliverySession.compactThread === undefined
+                  ? {}
+                  : {
+                      compactThread: (input: Parameters<typeof deliverySession.startTurn>[0]) =>
+                        Effect.sync(() =>
+                          markInstallLifecycle("firstResumedProviderRequestAt"),
+                        ).pipe(Effect.andThen(deliverySession.compactThread!(input))),
+                    }),
+              },
         run: runningRun,
         rootNode: runningRootNode,
         checkpointScope,

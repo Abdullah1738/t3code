@@ -158,6 +158,7 @@ export type ProjectionStoreV2Error = typeof ProjectionStoreV2Error.Type;
 
 export type ProjectionRecoveryKind =
   | "queued-runs"
+  | "interrupted-runs"
   | "runtime"
   | "subagent-results"
   | "delegated-completions";
@@ -625,6 +626,10 @@ function needsRecovery(
 ): boolean {
   if (projection.thread.deletedAt !== null) return false;
   switch (kind) {
+    case "interrupted-runs":
+      return projection.runs.some((run) =>
+        ["preparing", "starting", "running", "waiting"].includes(run.status),
+      );
     case "queued-runs":
       return (
         projection.thread.archivedAt === null &&
@@ -4021,6 +4026,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
           switch (kind) {
+            case "interrupted-runs":
+              return sql`
+                SELECT thread_id FROM orchestration_v2_projection_runs
+                WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                  AND status <> 'queued'
+              `;
             case "queued-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs

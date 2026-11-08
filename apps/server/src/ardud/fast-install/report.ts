@@ -1,0 +1,51 @@
+import { randomUUID } from "node:crypto";
+
+export interface ContinuationDecision {
+  readonly threadId: string;
+  readonly continued: boolean;
+  readonly reason?: string;
+  readonly dispatched?: boolean;
+}
+
+const bootId = randomUUID();
+const report = {
+  bootId,
+  completedAt: null as string | null,
+  listeningAt: null as string | null,
+  commandReadyAt: null as string | null,
+  firstResumedProviderRequestAt: null as string | null,
+  threads: [] as ContinuationDecision[],
+};
+export function recordContinuationDecision(decision: ContinuationDecision) {
+  report.threads.push(decision);
+}
+export function finishContinuationReport() {
+  report.completedAt = new Date().toISOString();
+}
+export function continuationReport() {
+  return {
+    ...report,
+    continued: report.threads.filter((thread) => thread.continued).length,
+    skipped: report.threads.filter((thread) => !thread.continued).length,
+    pending: report.threads.filter((thread) => thread.continued && !thread.dispatched).length,
+  };
+}
+
+export function markInstallLifecycle(
+  phase: "listeningAt" | "commandReadyAt" | "firstResumedProviderRequestAt",
+) {
+  report[phase] ??= new Date().toISOString();
+}
+
+export function markContinuationDispatched(threadId: string) {
+  const index = report.threads.findIndex((thread) => thread.threadId === threadId);
+  if (index >= 0) report.threads[index] = { threadId, continued: true, dispatched: true };
+}
+
+export function markContinuationFinished(threadId: string) {
+  const index = report.threads.findIndex((thread) => thread.threadId === threadId);
+  const thread = report.threads[index];
+  if (thread?.continued && !thread.dispatched) {
+    report.threads[index] = { threadId, continued: false, reason: "continuation_declined" };
+  }
+}

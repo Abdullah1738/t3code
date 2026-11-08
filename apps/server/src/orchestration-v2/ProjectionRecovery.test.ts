@@ -1187,3 +1187,26 @@ it.effect("finds unreadable turn items in every history store, page by page", ()
     );
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect.each(["preparing", "starting"] as const)(
+  "persists exactly one preparation continuation across repeated %s recovery",
+  (status) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = yield* createThread(`preparation-${status}`);
+      const runId = yield* createRun(threadId, status, { startedAt: null });
+      // Repeated preparation represents SIGTERM followed by a kill before cleanup.
+      yield* recovery.prepareForShutdown;
+      yield* recovery.prepareForShutdown;
+      yield* recovery.reconcile("startup");
+      yield* recovery.reconcile("startup");
+      const rows = yield* sql<{ effect_id: string }>`
+      SELECT effect_id FROM orchestration_v2_effect_outbox
+      WHERE thread_id = ${threadId} AND effect_type = 'provider-runtime.continue'
+    `;
+      assert.deepEqual(rows, [{ effect_id: `effect:restart-continuation:${runId}` }]);
+      assert.equal((yield* projections.getThreadProjection(threadId)).runs[0]?.status, "cancelled");
+    }).pipe(Effect.provide(layerRecoveryTest)),
+);
