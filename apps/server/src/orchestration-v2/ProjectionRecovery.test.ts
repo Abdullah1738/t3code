@@ -395,7 +395,12 @@ it.effect("stops a session its thread detached, which kept its live status", () 
       occurredAt: now,
       payload: { providerSessionId, detachedAt: now, reason: "Thread settled." },
     });
-    assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), [threadId]);
+    // Shared sessions are reconciled globally, including detached bindings.
+    assert.deepEqual(yield* projections.getRecoveryThreadIds("runtime"), []);
+    assert.deepEqual(
+      (yield* projections.getLiveSharedProviderSessions()).map(({ session }) => session.id),
+      [providerSessionId],
+    );
 
     const summary = yield* recovery.reconcile("startup");
 
@@ -788,8 +793,15 @@ it.effect("includes shared sessions and provider-owned background rosters in rec
     });
     assert.deepEqual(
       new Set(yield* projections.getRecoveryThreadIds("runtime")),
-      new Set([first, second, roster, prepared]),
+      new Set([roster, prepared]),
     );
+    // One global session row, regardless of the number of bound threads.
+    assert.deepEqual(
+      (yield* projections.getLiveSharedProviderSessions()).map(({ session }) => session.id),
+      [providerSessionId],
+    );
+    const rosterState = yield* projections.getRuntimeRecoveryProjection(roster);
+    assert.equal(rosterState.providerThreads[0]?.pendingBackgroundTasks?.[0]?.taskId, "background");
     const preparedState = yield* projections.getRuntimeRecoveryProjection(prepared);
     assert.deepEqual(
       preparedState.providerSessions.map((session) => session.id),
