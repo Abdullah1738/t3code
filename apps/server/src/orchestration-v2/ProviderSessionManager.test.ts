@@ -371,6 +371,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly afterResume?: Effect.Effect<void>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
     readonly driver?: ProviderDriverKind;
@@ -480,7 +481,10 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
             Ref.update(state, (current) => ({
               ...current,
               resumeCount: current.resumeCount + 1,
-            })).pipe(Effect.as(threadInput.providerThread)),
+            })).pipe(
+              Effect.andThen(options.afterResume ?? Effect.void),
+              Effect.as(threadInput.providerThread),
+            ),
           startTurn: () => options.startTurn ?? Effect.void,
           compactThread: () => options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
@@ -512,7 +516,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
 
 function layerTest(input: {
   readonly state: Ref.Ref<TestProviderRuntimeState>;
-  readonly idleTimeoutMs: number;
+  readonly idleTimeoutMs?: number;
   readonly maxIdlePinMs?: number;
   readonly failEventStream?: boolean;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
@@ -538,6 +542,7 @@ function layerTest(input: {
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
   readonly beforeUnload?: Effect.Effect<void>;
+  readonly afterResume?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
@@ -580,6 +585,7 @@ function layerTest(input: {
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
       ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+      ...(input.afterResume === undefined ? {} : { afterResume: input.afterResume }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
       ...(input.scopeCloseReached === undefined
         ? {}
@@ -620,7 +626,7 @@ function layerTest(input: {
     layerConfiguredMcpRegistry,
     McpProviderSessions.layer,
     ProviderSessionManager.layerWithOptions({
-      idleTimeoutMs: input.idleTimeoutMs,
+      ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
       ...(input.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: input.maxIdlePinMs }),
     }).pipe(
       Layer.provide(
@@ -6241,6 +6247,8 @@ function runIdleThreadUnloadScenario(
   options: {
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly idleTimeoutMs?: number | null;
+    readonly afterResume?: Effect.Effect<void>;
   } = {},
 ) {
   return Effect.gen(function* () {
@@ -6358,8 +6366,11 @@ function runIdleThreadUnloadScenario(
       Effect.provide(
         layerTest({
           state,
-          idleTimeoutMs: 1000,
+          ...(options.idleTimeoutMs === null
+            ? {}
+            : { idleTimeoutMs: options.idleTimeoutMs ?? 1000 }),
           ...(options.beforeUnload === undefined ? {} : { beforeUnload: options.beforeUnload }),
+          ...(options.afterResume === undefined ? {} : { afterResume: options.afterResume }),
           ...(options.hasPendingBackgroundWorkForThread === undefined
             ? {}
             : { hasPendingBackgroundWorkForThread: options.hasPendingBackgroundWorkForThread }),
@@ -6640,4 +6651,107 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+it.effect("ProviderSessionManagerV2 defaults to a three minute unload window", () =>
+  runIdleThreadUnloadScenario(
+    "short-default",
+    ({ state, threadA, resume }) =>
+      Effect.gen(function* () {
+        yield* resume(threadA);
+        yield* TestClock.adjust("179 seconds");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* TestClock.adjust("1 second");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+      }),
+    { idleTimeoutMs: null },
+  ),
+);
+
+it.effect("ProviderSessionManagerV2 uses the idle unload environment override", () =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.ROBOB_PROVIDER_IDLE_UNLOAD_MS;
+      process.env.ROBOB_PROVIDER_IDLE_UNLOAD_MS = "2000";
+      return previous;
+    }),
+    () =>
+      runIdleThreadUnloadScenario(
+        "env-window",
+        ({ state, threadA, resume }) =>
+          Effect.gen(function* () {
+            yield* resume(threadA);
+            yield* TestClock.adjust("1 second");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+            yield* TestClock.adjust("1 second");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+              `native-${threadA}`,
+            ]);
+          }),
+        { idleTimeoutMs: null },
+      ),
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env.ROBOB_PROVIDER_IDLE_UNLOAD_MS;
+        else process.env.ROBOB_PROVIDER_IDLE_UNLOAD_MS = previous;
+      }),
+  ),
+);
+
+it("ProviderSessionManagerV2 rejects invalid unload overrides", () => {
+  for (const value of ["", "0", "-1", "NaN", "Infinity", "1.5"]) {
+    assert.equal(ProviderSessionManager.providerIdleUnloadMs(value), 180000);
+  }
+});
+
+it.effect("ProviderSessionManagerV2 unloads a thread whose resume preparation fails", () =>
+  Effect.gen(function* () {
+    const fail = yield* Ref.make(false);
+    yield* runIdleThreadUnloadScenario(
+      "failed-preparation",
+      ({ state, threadA, resume }) =>
+        Effect.gen(function* () {
+          yield* Ref.set(fail, true);
+          const exit = yield* Effect.exit(resume(threadA));
+          assert.isTrue(Exit.isFailure(exit));
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+      {
+        afterResume: Ref.get(fail).pipe(
+          Effect.flatMap((failed) =>
+            failed ? Effect.die("preparation failed after native resume") : Effect.void,
+          ),
+        ),
+      },
+    );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 unloads a thread whose resume preparation is cancelled", () =>
+  Effect.gen(function* () {
+    const block = yield* Ref.make(false);
+    const loaded = yield* Deferred.make<void>();
+    yield* runIdleThreadUnloadScenario(
+      "cancelled-preparation",
+      ({ state, threadA, resume }) =>
+        Effect.gen(function* () {
+          yield* Ref.set(block, true);
+          const fiber = yield* resume(threadA).pipe(Effect.forkChild);
+          yield* Deferred.await(loaded);
+          yield* Fiber.interrupt(fiber);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+      {
+        afterResume: Ref.get(block).pipe(
+          Effect.flatMap((blocked) =>
+            blocked
+              ? Deferred.succeed(loaded, undefined).pipe(Effect.andThen(Effect.never))
+              : Effect.void,
+          ),
+        ),
+      },
+    );
+  }),
 );
