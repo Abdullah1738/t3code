@@ -54,7 +54,7 @@ export const workBrief = (board: KanbanBoard, card: KanbanCard, goal: KanbanGoal
     board.instructions.escalation.trim()
       ? `- When to ask the owner:\n${board.instructions.escalation.trim()}`
       : null,
-    "- Never end a turn while a card of yours is in Working: move it to needs_review, ask with card_ask (blocking when you can't go on), flag it, or keep working. Wait for CI or a deploy inside the turn. Each time you stop with a card in Working you are nudged.",
+    "- While a card of yours is in Working, keep working, move it to needs_review, ask with card_ask (blocking when you can't go on), or flag it. Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on. For a deploy or anything else, wait inside your turn.",
     "- If you can't continue (missing access, broken env), call card_flag with the reason: the card goes back to To Do and the evaluator is told.",
     "- Messages from the card discussion arrive here. Answer them with discussion_post; plain replies in this thread are not seen there.",
     "- Read the board wiki (wiki_read) for lessons that apply to this work.",
