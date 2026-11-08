@@ -643,6 +643,16 @@ export const layer: Layer.Layer<
         projection.providerTurns,
         projection.attempts,
       );
+      // A preparation cut never delivered this input to the native provider. Keep
+      // the original prompt even when the existing native thread has older turns.
+      const restartSource = projection.runs.find(
+        (candidate) => candidate.id === run.restartContinuationOfRunId,
+      );
+      const replayPreparationContinuation =
+        restartSource !== undefined &&
+        !projection.providerTurns.some(
+          (turn) => turn.runAttemptId === restartSource.activeAttemptId,
+        );
       const restartCancelledWork = pendingRestartCancelledBackgroundWork({
         runs: projection.runs,
         providerTurns: projection.providerTurns,
@@ -1434,7 +1444,7 @@ export const layer: Layer.Layer<
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
           yield* start({
-            ...(noteContinuation ? promptedInput : turnInput),
+            ...(noteContinuation || replayPreparationContinuation ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
               text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
@@ -1493,7 +1503,8 @@ export const layer: Layer.Layer<
         effectiveHandoffs.length === 0 &&
         retryHandoff.length === 0 &&
         restartNote === "" &&
-        !noteContinuation
+        !noteContinuation &&
+        !replayPreparationContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       return runExecution.startRootRun({
