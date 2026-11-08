@@ -13,8 +13,10 @@ export function compare(
   const first = base[0]!;
   for (const runs of [base, candidate]) {
     for (const r of runs) {
+      if (r.workloadMode === "legacy-burst") throw new Error("Attribution-only workload cannot pass acceptance");
       for (const key of [
         "fixtureHash",
+        "harnessHash",
         "runtimeHash",
         "hardwareHash",
         "seed",

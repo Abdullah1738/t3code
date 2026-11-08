@@ -1181,6 +1181,19 @@ const make = Effect.fn("makeWithDatabase")(function* (
               const result = statement.run(...(params as any));
               return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
             });
+            // SQLite has returned and released the outer transaction. This marks
+            // each commit, not an atomic receipt for a multi-write service call.
+            try {
+              const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+              if (span?._tag === "Span") {
+                span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
+                span.attribute("db.stmt_status.available", false);
+                if (!db.isTransaction && /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)) {
+                  span.attribute("db.commit.at_ms", fiber.getRef(Clock.Clock).currentTimeMillisUnsafe());
+                  span.attribute("db.commit.boundary", "sqlite-returned");
+                }
+              }
+            } catch { /* Observing a committed write must never change its result. */ }
             result = Exit.succeed(value);
           } catch (cause) {
             result = Exit.fail(

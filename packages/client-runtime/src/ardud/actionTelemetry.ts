@@ -5,6 +5,8 @@ import * as Effect from "effect/Effect";
 import * as RpcClient from "effect/rpc/RpcClient";
 
 export type ActionPhase =
+  | "board-painted"
+  | "discussion-painted"
   | "send"
   | "pending-paint"
   | "durable-ack"
@@ -69,3 +71,31 @@ export const allocateAction = (name: string) =>
         : undefined;
     return startAction(name, id);
   });
+
+// Hosts call this after their render commit; mobile supplies its frame scheduler.
+// Weak keys keep telemetry from retaining snapshots or message payloads.
+const valueActions = new WeakMap<object, Action>();
+export function bindActionValue(value: unknown, action: Action | undefined) {
+  if (value !== null && typeof value === "object" && action) valueActions.set(value, action);
+}
+export function actionForValue(value: unknown): Action | undefined {
+  return value !== null && typeof value === "object" ? valueActions.get(value) : undefined;
+}
+export function carryActionValue(from: unknown, to: unknown) {
+  bindActionValue(to, actionForValue(from));
+}
+const completedPaints = new WeakMap<Action, Set<ActionPhase>>();
+export function paintActionValue(
+  value: unknown,
+  phase: "board-painted" | "discussion-painted" | "pending-paint" | "authoritative-paint",
+  schedule: (callback: () => void) => () => void,
+): () => void {
+  const action = actionForValue(value);
+  return action ? schedule(() => {
+    const phases = completedPaints.get(action) ?? new Set<ActionPhase>();
+    if (phases.has(phase)) return;
+    phases.add(phase);
+    completedPaints.set(action, phases);
+    markAction(action, phase);
+  }) : () => {};
+}

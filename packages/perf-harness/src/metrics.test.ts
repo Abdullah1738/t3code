@@ -42,3 +42,16 @@ test("rejects mixed artifacts under one revision", () => {
   candidate[0]!.serverHash = "different";
   assert.throws(() => compare(runs("base", 100), candidate, { metrics: {} }));
 });
+
+test("event loop p99 budget is enforced independently of response latency", () => {
+  const base = runs("base", 10), candidate = runs("new", 10);
+  for (const run of base) run.metrics["eventLoop.p99.ms"] = 40;
+  for (const run of candidate) run.metrics["eventLoop.p99.ms"] = 51;
+  assert.equal(compare(base, candidate, { metrics: { "eventLoop.p99.ms": { max: 50 } } }).budgetVerdict, "fail");
+});
+
+test("attribution burst runs cannot satisfy acceptance", () => {
+  const base = runs("base", 10), candidate = runs("new", 10);
+  candidate[0]!.workloadMode = "legacy-burst";
+  assert.throws(() => compare(base, candidate, { metrics: {} }), /Attribution-only/);
+});

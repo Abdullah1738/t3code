@@ -21,6 +21,8 @@ export function appendLedger(path: string, value: unknown) {
 export type Run = {
   sha: string;
   serverHash?: string;
+  harnessHash?: string;
+  workloadMode?: "steady" | "legacy-burst";
   fixtureHash: string;
   runtimeHash: string;
   hardwareHash: string;

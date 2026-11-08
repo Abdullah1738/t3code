@@ -33,3 +33,27 @@ it.effect("uses the configured cross-platform crypto service", () =>
     ),
   ),
 );
+
+it("carries an RPC id into a host paint callback and cancels stale renders", async () => {
+  const { bindActionValue, carryActionValue, paintActionValue } = await import("./actionTelemetry.ts");
+  const marks: string[] = [];
+  setActionTelemetrySink(mark => marks.push(`${mark.actionId}:${mark.phase}`));
+  try {
+    const action = startAction("kanban.subscribe", "opaque-board-action");
+    const response = {}, rendered = {};
+    bindActionValue(response, action);
+    carryActionValue(response, rendered);
+    let callback = () => {};
+    const cancel = paintActionValue(rendered, "board-painted", next => {
+      callback = next;
+      return () => { callback = () => {}; };
+    });
+    cancel();
+    callback();
+    assert.equal(marks.length, 1);
+    paintActionValue(rendered, "board-painted", next => { next(); return () => {}; });
+    assert.equal(marks[1], "opaque-board-action:board-painted");
+    paintActionValue(rendered, "board-painted", next => { next(); return () => {}; });
+    assert.equal(marks.length, 2);
+  } finally { setActionTelemetrySink(); }
+});
