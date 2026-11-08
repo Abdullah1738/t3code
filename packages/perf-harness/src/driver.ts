@@ -182,24 +182,24 @@ export async function drive(
     let httpLoadStarted = false;
     const startHttpLoad = () => {
       httpLoadStarted = true;
-            for (let agent = 0; agent < fixture.agents; agent++)
-              background.push(
-                (async () => {
-                  while (!stop) {
-                    await request(
-                      `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
-                      { text: `Synthetic load ${agent}` },
-                      false,
-                    );
-                    await delay(500);
-                  }
-                })(),
+      for (let agent = 0; agent < fixture.agents; agent++)
+        background.push(
+          (async () => {
+            while (!stop) {
+              await request(
+                `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
+                { text: `Synthetic load ${agent}` },
+                false,
               );
-            for (const job of background)
-              void job.catch((error) => {
-                backgroundFailure = error;
-                stop = true;
-              });
+              await delay(500);
+            }
+          })(),
+        );
+      for (const job of background)
+        void job.catch((error) => {
+          backgroundFailure = error;
+          stop = true;
+        });
     };
     try {
       let ticket: string | undefined;
@@ -219,9 +219,15 @@ export async function drive(
       await new Promise<void>((ok, fail) => {
         const timer = setTimeout(() => fail(new Error("Profiler start timeout")), 30000);
         const started = (message: { type?: string }) => {
-          if (message.type === "perf-failed") { clearTimeout(timer); fail(new Error("Sampler start failed")); return; }
+          if (message.type === "perf-failed") {
+            clearTimeout(timer);
+            fail(new Error("Sampler start failed"));
+            return;
+          }
           if (message.type !== "perf-started") return;
-          clearTimeout(timer); child.off("message", started); ok();
+          clearTimeout(timer);
+          child.off("message", started);
+          ok();
         };
         child.on("message", started);
         child.send({ type: "perf-start" });
@@ -259,7 +265,8 @@ export async function drive(
           const client = yield* makeWsRpcProtocolClient;
           // Establish the authenticated socket before introducing HTTP contention.
           yield* client["kanban.messages"]({
-            discussionId: KanbanDiscussionId.make(discussionId), limit: 1,
+            discussionId: KanbanDiscussionId.make(discussionId),
+            limit: 1,
           });
           if (!httpLoadStarted) startHttpLoad();
           const loadFibers = yield* Effect.forEach(
@@ -325,10 +332,16 @@ export async function drive(
           yield* Effect.promise(() =>
             measure("mobile.coldFirstPage", () => request("/api/orchestration/shell?paged=true")),
           );
-          const shapedPage = () => shapedFetch(() => fetch(origin + "/api/orchestration/shell?paged=true", {
-            headers: { authorization: `Bearer ${token}`, [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
-            signal: AbortSignal.timeout(60000),
-          }));
+          const shapedPage = () =>
+            shapedFetch(() =>
+              fetch(origin + "/api/orchestration/shell?paged=true", {
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT,
+                },
+                signal: AbortSignal.timeout(60000),
+              }),
+            );
           yield* Effect.promise(() => measure("mobile.shapedColdFirstPage", shapedPage));
           // Suspension drops the connection/cache in this HTTP-only fallback.
           // Keep the native resume gate missing until its cursor path is driven.
@@ -338,6 +351,49 @@ export async function drive(
           metrics["mobile.resume.p95.ms"] = null;
           stop = true;
           yield* Effect.forEach(loadFibers, Fiber.join, { discard: true });
+          // Quiesce both workloads before capturing the cursor: every scale replays
+          // the same 20 active threads, independently of its background agent count.
+          yield* Effect.promise(() => Promise.all(background));
+          const cursor = (yield* Effect.promise(() =>
+            request("/api/orchestration/shell?paged=true", undefined, false),
+          )).value.snapshotSequence;
+          const changed = Array.from({ length: 24 }, (_, i) => i)
+            .filter((i) => i % 10 !== 9)
+            .slice(0, 20)
+            .map((i) => ThreadId.make(`synthetic-thread-${i}`));
+          for (const threadId of changed) {
+            yield* client["orchestration.dispatchCommand"]({
+              type: "thread.metadata.update",
+              commandId: CommandId.make(randomUUID()),
+              threadId,
+              title: "Fixed scale-law change",
+            });
+          }
+          const replay = yield* client["orchestration.subscribeShell"]({
+            afterSequence: cursor,
+            acceptShellPages: true,
+            requestCompletionMarker: true,
+          }).pipe(
+            Stream.takeUntil((item) => item.kind === "synchronized"),
+            Stream.runCollect,
+          );
+          const updates = replay.filter((item) => item.kind === "thread.updated");
+          const observed = new Set(updates.map((item) => item.thread.id));
+          if (observed.size !== changed.length || changed.some((id) => !observed.has(id)))
+            throw new Error(
+              `Fixed changed-set shell replay mismatch: ${JSON.stringify({ cursor, observed: [...observed], kinds: replay.map((item) => item.kind) })}`,
+            );
+          if (
+            replay.some(
+              (item) =>
+                item.kind === "snapshot" &&
+                (item.snapshot.threads.length || item.snapshot.archivedThreads.length),
+            )
+          )
+            throw new Error("Cursor replay unexpectedly returned a full thread snapshot");
+          metrics["shell.fixedChange.deltaRows"] = updates.length;
+          metrics["shell.fixedChange.deltaBytes"] = Buffer.byteLength(JSON.stringify(replay));
+          metrics["shell.fixedChange.changedThreads"] = changed.length;
         }).pipe(Effect.scoped, Effect.provide(protocol), Effect.timeout("120 seconds")),
       );
       stop = true;
@@ -448,7 +504,10 @@ export async function drive(
       if (!lifetime.exited && !existsSync(resolve(home, "perf", `samples-${repeat}.json`))) {
         await new Promise<void>((ok) => {
           const timer = setTimeout(ok, 30000);
-          child.once("message", () => { clearTimeout(timer); ok(); });
+          child.once("message", () => {
+            clearTimeout(timer);
+            ok();
+          });
           child.send({ type: "perf-stop" });
         });
       }
@@ -461,9 +520,13 @@ export async function drive(
         }
       }
       log.end();
-      cpSync(resolve(home, "perf"), resolve(ledger + ".artifacts", `repeat-${repeat}-${attemptId}`), {
-        recursive: true,
-      });
+      cpSync(
+        resolve(home, "perf"),
+        resolve(ledger + ".artifacts", `repeat-${repeat}-${attemptId}`),
+        {
+          recursive: true,
+        },
+      );
     }
   }
 }
@@ -471,9 +534,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const [home, sha, ledger, repeats = "5", entry = "apps/server/dist/bin.mjs"] =
     process.argv.slice(2);
   for (let i = 0; i < Number(repeats); i++) {
-    try { console.log(await drive(home!, sha!, i, ledger!, entry)); }
-    catch (error) {
-      appendLedger(ledger! + ".failures", { sha, repeat: i, status: "failed", error: String(error) });
+    try {
+      console.log(await drive(home!, sha!, i, ledger!, entry));
+    } catch (error) {
+      appendLedger(ledger! + ".failures", {
+        sha,
+        repeat: i,
+        status: "failed",
+        error: String(error),
+      });
       console.error(error);
       process.exitCode = 1;
     }
