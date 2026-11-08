@@ -1,3 +1,4 @@
+import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -304,11 +305,20 @@ describe("authenticated environment HTTP requests", () => {
             },
           }),
         );
-        const snapshot = yield* fetchEnvironmentShellSnapshot(harness.input).pipe(
-          Effect.provide(harness.httpLayer),
-        );
+        const published: Array<DeferredShellSnapshot> = [];
+        const snapshot = yield* fetchEnvironmentShellSnapshot({
+          ...harness.input,
+          onPage: (page) =>
+            Effect.sync(() => {
+              // Publishing precedes even the second HTTP request.
+              expect(harness.calls).toHaveLength(1);
+              published.push(page);
+            }),
+        }).pipe(Effect.provide(harness.httpLayer));
+        expect(published).toHaveLength(1);
+        expect(published[0]?.page?.nextAfter).toBe("thread:a");
         expect(snapshot.snapshotSequence).toBe(4);
-        expect("page" in snapshot).toBe(false);
+        expect(snapshot.page?.nextAfter).toBeNull();
         expect(harness.calls).toHaveLength(2);
         expect(new URL(harness.calls[1]!.url).searchParams.get("after")).toBe("thread:a");
         expect(harness.proofs[1]!.url).toBe(harness.calls[1]!.url);

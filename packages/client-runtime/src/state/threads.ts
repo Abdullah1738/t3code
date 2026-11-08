@@ -802,6 +802,15 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           const httpResult: ThreadSnapshotLoader.ThreadSnapshotLoadResult =
             yield* snapshotLoader.load(prepared, threadId);
           switch (httpResult._tag) {
+            case "denied": {
+              yield* SubscriptionRef.set(state, {
+                data: Option.none(),
+                status: "no-access",
+                error: Option.none(),
+                history: EMPTY_THREAD_HISTORY_META,
+              });
+              return yield* Effect.never;
+            }
             case "present": {
               if (canLoadHistory && httpResult.history !== undefined) {
                 yield* Ref.set(acceptsBoundedSocketSnapshots, true);
@@ -862,7 +871,23 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       }),
       {
         onDefect: () => setStreamError("Could not synchronize the thread."),
-        onExpectedFailure: (cause) => setStreamError(formatThreadError(cause)),
+        onExpectedFailure: (cause) => {
+          const error = Cause.squash(cause);
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "_tag" in error &&
+            error._tag === "EnvironmentAuthorizationError"
+          ) {
+            return SubscriptionRef.set(state, {
+              data: Option.none(),
+              status: "no-access",
+              error: Option.none(),
+              history: EMPTY_THREAD_HISTORY_META,
+            });
+          }
+          return setStreamError(formatThreadError(cause));
+        },
         retryExpectedFailureAfter: "250 millis",
         resubscribe: foregroundResubscriptions,
       },
@@ -944,3 +969,5 @@ export * from "./threadFeedback.ts";
 export * from "./threadDetail.ts";
 export * from "./threadShell.ts";
 export * from "./threadState.ts";
+
+export { threadDetailToShell } from "./threadDetailShell.ts";
