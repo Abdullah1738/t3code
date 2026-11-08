@@ -24,14 +24,14 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import robob_readonly
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("RECALL_DATA", str(ROOT / "data")))
 MEM_DB = Path(os.environ.get("RECALL_MEM_DB", str(DATA / "memory.db")))
 CATALOG_DB = Path(os.environ.get("RECALL_CATALOG_DB", str(DATA / "recall_catalog.db")))
-OPENCODE_DB = Path(
-    os.environ.get("OPENCODE_DB", str(Path.home() / ".local/share/opencode/opencode.db"))
-)
-STATE_DB = Path(os.environ.get("RECALL_STATE_DB", str(Path.home() / ".robob/userdata/statev2.sqlite")))
+OPENCODE_DB = Path(robob_readonly.opencode_db())
+STATE_DB = Path(robob_readonly.state_db("RECALL_STATE_DB"))
 
 STOP = set(
     """a an and are as at be by can do does for from has have how i in is it its me my of on or our
@@ -86,7 +86,16 @@ class Deadline:
 
 def connect_ro(path: Path) -> sqlite3.Connection:
     # mode=ro without query_only: fts5vocab needs a writable temp schema.
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30, check_same_thread=False)
+    try:
+        if path == OPENCODE_DB:
+            reader = robob_readonly.native_ro
+        elif path == STATE_DB:
+            reader = robob_readonly.state_ro
+        else:
+            reader = robob_readonly.connect_ro
+        con = reader(path, check_same_thread=False)
+    except OSError as exc:
+        raise sqlite3.OperationalError(str(exc)) from exc
     con.execute("PRAGMA temp_store=MEMORY")
     return con
 
@@ -105,26 +114,45 @@ def catalog(write: bool = False) -> sqlite3.Connection:
     key = "catalog_w" if write else "catalog_r"
     con = getattr(_local, key, None)
     if con is None:
+        path = robob_readonly.safe_path(CATALOG_DB)
         if write or not CATALOG_DB.exists():
-            con = sqlite3.connect(str(CATALOG_DB), timeout=30, check_same_thread=False)
+            con = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(CATALOG_SCHEMA)
             con.commit()
         else:
-            con = sqlite3.connect(f"file:{CATALOG_DB}?mode=ro", uri=True, timeout=30, check_same_thread=False)
+            con = robob_readonly.connect_ro(path, check_same_thread=False)
         setattr(_local, key, con)
     return con
 
 
 def opencode_ro() -> sqlite3.Connection | None:
     con = getattr(_local, "opencode", None)
-    if con is None:
-        try:
-            con = connect_ro(OPENCODE_DB)
-            con.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
-        except sqlite3.Error:
-            return None
-        _local.opencode = con
+    fresh = None
+    try:
+        path = robob_readonly.safe_path(OPENCODE_DB)
+        info = path.stat()
+        fresh = connect_ro(OPENCODE_DB)
+        updated = robob_readonly.native_generation(fresh)
+        generation = str(path), info.st_dev, info.st_ino, updated
+        if (con is not None and con.in_transaction
+                and getattr(_local, "opencode_generation", None) == generation
+                and robob_readonly.native_generation(con) == updated):
+            fresh.close()
+        else:
+            fresh.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
+            if con is not None:
+                con.close()
+            con = _local.opencode = fresh
+            _local.opencode_generation = generation
+        fresh = None
+    except (OSError, sqlite3.Error):
+        if fresh is not None:
+            fresh.close()
+        if con is not None:
+            con.close()
+            _local.opencode = None
+        return None
     return con
 
 
@@ -965,8 +993,19 @@ def _alias_table_tree(ids: set[str]) -> set[str]:
 _state_reads = threading.BoundedSemaphore(2)
 _state_refresh_lock = threading.Lock()
 _state_snapshot = None
+_state_snapshot_generation = None
 _STATE_CHUNK = 2000
 _STATE_REFRESH_SECONDS = 60
+
+
+def _state_generation():
+    try:
+        info = robob_readonly.safe_path(STATE_DB).stat()
+        with closing(robob_readonly.state_ro(STATE_DB)) as con:
+            updated = robob_readonly.ready_generation(con)
+    except OSError as exc:
+        raise sqlite3.OperationalError("Robob read-only replica unavailable") from exc
+    return info.st_dev, info.st_ino, updated
 
 
 @dataclass(frozen=True)
@@ -1229,17 +1268,21 @@ def _state_with_changes(con: sqlite3.Connection, snapshot: _StateSnapshot, seque
 
 
 def _state_cache(*, caller: str | None = None, after_sequence: int | None = None) -> _StateSnapshot:
-    global _state_snapshot
+    global _state_snapshot, _state_snapshot_generation
     path = STATE_DB
+    generation = _state_generation()
     snapshot = _state_snapshot
-    if snapshot is None or snapshot.path != path:
+    if snapshot is None or snapshot.path != path or _state_snapshot_generation != generation:
         with _state_refresh_lock:
             snapshot = _state_snapshot
-            if snapshot is None or snapshot.path != path:
+            if snapshot is None or snapshot.path != path or _state_snapshot_generation != generation:
                 with _state_reads, closing(connect_ro(path)) as con:
                     snapshot = _build_state_snapshot(con, path, _state_sequence(con))
                     snapshot = _state_with_changes(con, snapshot, _state_sequence(con))
+                    if _state_generation() != generation:
+                        raise UnknownCaller("read-only replica replaced while being read")
                     _state_snapshot = snapshot
+                    _state_snapshot_generation = generation
     # A missing caller can have appeared since the last build. Serialize its
     # forced incremental refresh without occupying a database-reader slot.
     native = caller.split(":agent:", 1)[0] if caller else None
@@ -1250,7 +1293,7 @@ def _state_cache(*, caller: str | None = None, after_sequence: int | None = None
         if acquired:
             try:
                 current = _state_snapshot
-                if current is not None and current.path == path:
+                if current is not None and current.path == path and _state_snapshot_generation == generation:
                     snapshot = current
                 with _state_reads, closing(connect_ro(path)) as con:
                     sequence = _state_sequence(con)
@@ -1274,12 +1317,15 @@ def _state_cache(*, caller: str | None = None, after_sequence: int | None = None
     if _state_refresh_lock.acquire(blocking=False):
         try:
             current = _state_snapshot
-            if (current is not None and current.path == path and snapshot.sequence > current.sequence
+            if (current is not None and current.path == path and _state_snapshot_generation == generation
+                    and snapshot.sequence > current.sequence
                     and snapshot.built_sequence == current.built_sequence
                     and snapshot.checked_at == current.checked_at):
                 _state_snapshot = snapshot
         finally:
             _state_refresh_lock.release()
+    if _state_generation() != generation:
+        raise UnknownCaller("read-only replica replaced while being read")
     return snapshot
 
 
@@ -1300,6 +1346,7 @@ def _state_tree_checked(ids: set[str], *, caller: str | None = None) -> set[str]
     """Interim D1 reader. State is read-only; it is not a second identity writer."""
     after_sequence = None
     for _ in range(3):
+        generation = _state_generation()
         old_observations = getattr(_local, "state_subagents", None)
         old_read_sequences = getattr(_local, "state_subagent_read_sequence", None)
         if old_observations is not None:
@@ -1317,6 +1364,7 @@ def _state_tree_checked(ids: set[str], *, caller: str | None = None) -> set[str]
         with _state_reads, closing(connect_ro(STATE_DB)) as con:
             end = _state_sequence(con)
             changed = _state_changed(con, snapshot.sequence, end, set(result) | ids, snapshot)
+        changed = changed or _state_generation() != generation
         if not changed:
             if old_observations is not None:
                 for task_id, identities in _local.state_subagents.items():
@@ -1490,6 +1538,7 @@ def _catalog_tree(ids: set[str]) -> set[str]:
 
 def validate_driver(ident: str, driver: str) -> None:
     """Qualifiers must agree with a persisted provider binding."""
+    generation = _state_generation()
     snapshot = _state_cache(caller=ident)
     with _state_reads, closing(connect_ro(STATE_DB)) as con:
         native = ident.split(":agent:", 1)[0]
@@ -1504,6 +1553,8 @@ def validate_driver(ident: str, driver: str) -> None:
             row = con.execute("SELECT 1 FROM ardud_opencode_import WHERE thread_id=? OR native_session_id=?", (ident, native)).fetchone()
         if not row:
             raise UnknownCaller("caller driver does not match")
+    if _state_generation() != generation:
+        raise UnknownCaller("read-only replica replaced while being read")
 
 
 def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
@@ -1516,6 +1567,7 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
     _local.state_subagent_read_sequence = {}
     try:
         for _ in range(3):
+            generation = _state_generation()
             _local.state_subagents = {}
             _local.state_subagent_read_sequence = {}
             snapshot = _state_cache(caller=canonical_or_native_id.strip())
@@ -1529,6 +1581,7 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
             with _state_reads, closing(connect_ro(STATE_DB)) as con:
                 end = _state_sequence(con)
                 changed = _state_changed(con, start, end, set(result) | {canonical_or_native_id.strip()}, snapshot)
+            changed = changed or _state_generation() != generation
             if not changed:
                 if error:
                     raise error

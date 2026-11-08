@@ -227,7 +227,8 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
                   : snapshot,
             });
       if (nextSnapshot === null) continue;
-      if (item.kind === "snapshot") snapshotSession = session;
+      if (item.kind === "snapshot" && item.snapshot.page?.nextAfter == null)
+        snapshotSession = session;
       next = {
         snapshot: Option.some(nextSnapshot),
         status: waiting ? "synchronizing" : "live",
@@ -334,17 +335,26 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         yield* Ref.set(activeSubscriptionSession, session);
         const initialConfig = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
         const supportsCompletionMarker = initialConfig?.shellResumeCompletionMarker === true;
+        const shellPages =
+          initialConfig?.shellSnapshotPagination === true
+            ? { acceptShellPages: true as const }
+            : {};
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
 
         // Only completed in-memory syncs survive a session change. Disk caches and partial
         // loads need a refresh; upgrades can rewrite projections without adding events.
+        const currentState = yield* SubscriptionRef.get(state);
+        const partial =
+          Option.isSome(currentState.snapshot) &&
+          currentState.snapshot.value.page?.nextAfter != null;
         const hasAuthoritativeSnapshot =
-          (yield* Ref.get(lastAuthoritativeSession)) === session ||
-          (supportsCompletionMarker &&
-            (yield* Ref.get(synchronizedSnapshot)) &&
-            (yield* Ref.get(synchronizedServerVersion)) ===
-              initialConfig.environment.serverVersion);
+          !partial &&
+          ((yield* Ref.get(lastAuthoritativeSession)) === session ||
+            (supportsCompletionMarker &&
+              (yield* Ref.get(synchronizedSnapshot)) &&
+              (yield* Ref.get(synchronizedServerVersion)) ===
+                initialConfig.environment.serverVersion));
         yield* Ref.set(synchronizedSnapshot, false);
         let canResume = hasAuthoritativeSnapshot;
         let current = yield* SubscriptionRef.get(state);
@@ -386,7 +396,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         }
 
         if (!canResume || Option.isNone(current.snapshot)) {
-          return supportsCompletionMarker ? { requestCompletionMarker: true as const } : {};
+          return supportsCompletionMarker
+            ? { requestCompletionMarker: true as const, ...shellPages }
+            : shellPages;
         }
         yield* Ref.set(lastAuthoritativeSession, session);
         if (!supportsCompletionMarker) {
@@ -397,6 +409,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           }));
         }
         return {
+          ...shellPages,
           afterSequence: current.snapshot.value.snapshotSequence,
           ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
         };

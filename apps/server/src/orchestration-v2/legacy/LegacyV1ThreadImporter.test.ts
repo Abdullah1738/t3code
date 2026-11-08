@@ -1008,7 +1008,7 @@ it.layer(layerTest)("LegacyV1ThreadImporter transcript lookup", (it) => {
             const query = span.attributes.get("db.query.text");
             if (
               typeof query === "string" &&
-              /^\s*SELECT event_id\s+FROM orchestration_events/.test(query)
+              /^\s*SELECT event_id\s+FROM ardud_thread_history_events\b/.test(query)
             ) {
               statements.push(query);
             }

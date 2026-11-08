@@ -21,6 +21,14 @@ export const OC_URL = (process.env.OPENCODE_SERVICE_URL || 'http://127.0.0.1:493
 export const PROBE_DIRECTORY = process.env.CATALOG_GUARD_DIRECTORY || HOME;
 export const INSTANCE_ID = process.env.CATALOG_GUARD_INSTANCE || 'opencode';
 
+export function configuredWatch(env = process.env) {
+  const required = env.CATALOG_GUARD_REQUIRED === undefined ? undefined : JSON.parse(env.CATALOG_GUARD_REQUIRED);
+  if (required !== undefined && (!Array.isArray(required) || !required.every((s) => typeof s === 'string' && s.length))) {
+    throw new Error('CATALOG_GUARD_REQUIRED must be a JSON array of model slugs');
+  }
+  return { required, prefix: env.CATALOG_GUARD_PREFIX };
+}
+
 const parse = (text) => {
   try {
     return text ? JSON.parse(text) : null;
@@ -71,12 +79,29 @@ function control() {
   };
 }
 
+export async function harnessCutoverStatus({ timeoutMs = 15_000 } = {}) {
+  const { url, token } = control();
+  if (!token) throw new Error('no control token');
+  const response = await fetch(`${url}/api/ardud/control/harness-cutover/status`, {
+    headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs),
+  });
+  const body = parse(await response.text());
+  const cutover = body?.cutover;
+  if (!response.ok || body?.ok !== true || typeof cutover?.active !== 'boolean' || typeof cutover.completed !== 'boolean'
+    || (cutover.retainedOpenCodeModels !== undefined && (!Array.isArray(cutover.retainedOpenCodeModels)
+      || !cutover.retainedOpenCodeModels.every((s) => typeof s === 'string')))) {
+    throw new Error('harness-cutover status unavailable or invalid; catalog refresh held');
+  }
+  return cutover;
+}
+
 /**
  * Robob's targeted provider refresh, the same RPC the web app's refresh button
  * sends. Re-probes one instance; no restart, no OpenCode location reload.
  * Resolves with the refreshed instance's model slugs.
  */
 export function refreshProviders({ instanceId = INSTANCE_ID, timeoutMs = 90_000 } = {}) {
+  if (instanceId !== 'opencode') return Promise.reject(new Error('OpenCode service comparator cannot refresh a native provider'));
   const { url, token } = control();
   if (!token) return Promise.reject(new Error('no control token'));
   const wsUrl = `${url.replace(/^http/, 'ws')}/ws?orchestrationProtocol=2`;

@@ -13,16 +13,19 @@ const [Effect, Stream, Layer, Deferred, Fiber] = await Promise.all(
   ["Effect", "Stream", "Layer", "Deferred", "Fiber"].map(load),
 );
 const app = (file) => import(NodeURL.pathToFileURL(root + "/apps/server/src/" + file + ".ts"));
-const [Prefix, Ws, Threads, Events] = await Promise.all([
+const [Prefix, Ws, Threads, Events, Sessions] = await Promise.all([
   app("rpcInitialItems"),
   app("ws"),
   app("orchestration-v2/ThreadManagementService"),
   app("persistence/OrchestrationEventStore"),
+  app("orchestration-v2/ProviderSessionManager"),
 ]);
 const refs = [];
 const fibers = [];
 const checkpoints = [];
 const deliveredCounts = [];
+let sessionObservers = 0;
+let sessionRefreshes = 0;
 
 function history() {
   const value = JSON.parse(JSON.stringify({ text: NodeCrypto.randomBytes(bytes).toString("hex") }));
@@ -37,6 +40,21 @@ function start(ready) {
     Stream.concat(Stream.never),
   );
   const dependencies = Layer.mergeAll(
+    Layer.mock(Sessions.ProviderSessionManagerV2)({
+      observeThreadSessionUpdates: (threadId) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            NodeAssert.equal(threadId, "synthetic-thread");
+            sessionObservers++;
+          }),
+          () => Effect.sync(() => void sessionObservers--),
+        ),
+      refreshThreadSessionUpdates: (threadId) =>
+        Effect.sync(() => {
+          NodeAssert.equal(threadId, "synthetic-thread");
+          sessionRefreshes++;
+        }),
+    }),
     Layer.mock(Threads.ThreadManagementService)({
       ensureLegacyTranscript: () => Effect.void,
       getThreadSnapshot: () =>
@@ -95,9 +113,10 @@ function start(ready) {
             deliveredCounts[index] = delivered;
           }),
         ),
-        Effect.forkDetach,
       ),
     ),
+    Effect.scoped,
+    Effect.forkDetach,
   );
 }
 
@@ -108,6 +127,8 @@ const result = await Effect.runPromise(
       fibers.push(yield* start(ready));
       yield* Deferred.await(ready);
       NodeAssert.equal(deliveredCounts[i], mode === "prefix" ? 1 : 2);
+      NodeAssert.equal(sessionObservers, mode === "prefix" ? 0 : i + 1);
+      NodeAssert.equal(sessionRefreshes, mode === "replay" ? i + 1 : 0);
       if (i === Math.floor(count / 2) - 1 || i === count - 1) {
         yield* Effect.promise(async () => {
           for (let j = 0; j < 3; j++) {
@@ -124,6 +145,7 @@ const result = await Effect.runPromise(
       }
     }
     for (const fiber of fibers) yield* Fiber.interrupt(fiber);
+    NodeAssert.equal(sessionObservers, 0);
     return { checkpoints };
   }),
 );

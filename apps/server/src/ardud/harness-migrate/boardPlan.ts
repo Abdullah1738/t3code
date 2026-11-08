@@ -5,9 +5,9 @@ import type {
   KanbanThreadLink,
   ModelSelection,
 } from "@t3tools/contracts";
-import { KANBAN_DONE_STAGES } from "@t3tools/contracts";
 
 import * as Rules from "../kanban/engine/rules.ts";
+import { planBoardAgentInstructions } from "./BoardAgentPlan.ts";
 import { planSelection, sameValue, type SelectionPlan } from "./selectionPlan.ts";
 
 /** Everything a board's selections can hold, read once, before any write. */
@@ -76,8 +76,11 @@ const mapOne = (
 export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
   const { board, pools, cards, openLinks } = snapshot;
   const conflicts: Array<BoardConflict> = [];
-  const changes: Array<{ readonly ref: string; readonly before: unknown; readonly after: unknown }> =
-    [];
+  const changes: Array<{
+    readonly ref: string;
+    readonly before: unknown;
+    readonly after: unknown;
+  }> = [];
 
   // Pool keys: each old pool maps to its new key. Two old pools that map to one new key collide.
   const keyOf = new Map<string, string>();
@@ -94,8 +97,18 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
     .filter(([, oldKeys]) => oldKeys.length > 1)
     .map(([newKey, oldKeys]) => ({ newKey, oldKeys }));
 
+  const instructionPlan = planBoardAgentInstructions(board.instructions);
+  if (instructionPlan._tag === "conflict")
+    conflicts.push(
+      ...instructionPlan.conflicts.map(({ field, reason }) => ({
+        field: `instructions.${field}`,
+        reason,
+      })),
+    );
+
   const boardNext: KanbanBoard = {
     ...board,
+    instructions: instructionPlan._tag === "mapped" ? instructionPlan.next : board.instructions,
     managerModel: mapOne(conflicts, "managerModel", board.managerModel),
     evaluatorModel: mapOne(conflicts, "evaluatorModel", board.evaluatorModel),
     defaultCardModel: mapOne(conflicts, "defaultCardModel", board.defaultCardModel),
@@ -110,10 +123,8 @@ export const planBoard = (snapshot: BoardSnapshot): BoardPlan => {
     changes.push({ ref: `board:${board.id}`, before: board, after: boardNext });
   }
 
-  // Cards: every unsettled card. Models and weights stay; occupancy follows the pool key.
+  // Even a settled card can be reopened, so its pinned selections must follow the cutover.
   const cardsNext = cards.map((card) => {
-    const settled = card.settledAt !== null || KANBAN_DONE_STAGES.has(card.stage);
-    if (settled) return card;
     const model = mapOne(conflicts, `card ${card.number} model`, card.model);
     const models = card.models.map((entry) => ({
       ...entry,

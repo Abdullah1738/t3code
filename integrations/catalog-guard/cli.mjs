@@ -2,8 +2,10 @@
 // catalog-guard: notices when Robob's OpenCode model catalog has gone partial
 // (opus/* models missing while the OpenCode service lists them) and asks Robob
 // to re-read it. Run `check` every few minutes (LaunchAgent) or by hand.
-import { assessCache, planRefresh, cachedSlugs, summarize, MIN_REFRESH_GAP_MS } from './lib/check.mjs';
-import * as io from './lib/io.mjs';
+import { assessCache, planRefresh, cachedSlugs, summarize, watchPolicy, MIN_REFRESH_GAP_MS } from './lib/check.mjs';
+import * as realIo from './lib/io.mjs';
+import { pathToFileURL } from 'node:url';
+const io = realIo;
 
 function parseArgs(argv) {
   const [cmd = 'check', ...rest] = argv;
@@ -20,11 +22,13 @@ function parseArgs(argv) {
 
 const log = (...parts) => console.log(new Date().toISOString(), 'catalog-guard', ...parts);
 
-async function check(opts) {
+export async function check(opts, io = realIo) {
+  if (io.INSTANCE_ID !== 'opencode') throw new Error('catalog-guard only compares the OpenCode instance');
   const now = Date.now();
   const state = opts.dryRun ? {} : io.readState();
   const cache = io.readJson(opts.cache);
-  const assessed = assessCache(cache, { now });
+  const policy = watchPolicy(await io.harnessCutoverStatus(), io.configuredWatch());
+  const assessed = assessCache(cache, { now, ...policy });
   const record = (result) => {
     if (!opts.dryRun) io.writeState({ ...state, ...result, lastCheckAt: new Date(now).toISOString() });
   };
@@ -43,7 +47,7 @@ async function check(opts) {
     record({ lastResult: 'service-error' });
     return 1;
   }
-  const plan = planRefresh({ cache, serviceSlugs: service, lastRefreshAt: Date.parse(state.lastRefreshAt ?? '') || 0, now });
+  const plan = planRefresh({ cache, serviceSlugs: service, lastRefreshAt: Date.parse(state.lastRefreshAt ?? '') || 0, now, ...policy });
   const head = `cache ${assessed.count} models, service ${service.length}`;
 
   if (plan.action === 'service-lacks') {
@@ -64,11 +68,15 @@ async function check(opts) {
   }
 
   const refreshAt = new Date().toISOString();
+  // A cutover can begin while the service list is being read. Do not repair an
+  // old requirement after ownership has moved to native harnesses.
+  const freshPolicy = watchPolicy(await io.harnessCutoverStatus(), io.configuredWatch());
+  if (JSON.stringify(policy) !== JSON.stringify(freshPolicy)) return 0;
   io.writeState({ ...state, lastRefreshAt: refreshAt, lastCheckAt: new Date(now).toISOString(), lastResult: 'refreshing' });
   try {
     const reply = await io.refreshProviders();
     const after = io.readJson(opts.cache);
-    const left = planRefresh({ cache: after, serviceSlugs: service, now: Date.now(), lastRefreshAt: 0 }).missing;
+    const left = planRefresh({ cache: after, serviceSlugs: service, now: Date.now(), lastRefreshAt: 0, ...freshPolicy }).missing;
     const result = left.length === 0 ? 'repaired' : 'still-missing';
     log(`${head}, missing ${summarize(plan.missing)}; refreshed (status ${reply.status}, rpc ${reply.slugs.length} models), cache now ${cachedSlugs(after).size} models: ${result}${left.length ? ` (${summarize(left)})` : ''}`);
     io.writeState({ ...state, lastRefreshAt: refreshAt, lastCheckAt: new Date(now).toISOString(), lastResult: result, refreshes: (state.refreshes ?? 0) + 1 });
@@ -96,7 +104,7 @@ async function main() {
   throw new Error(`unknown command ${opts.cmd}`);
 }
 
-main().then(
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main().then(
   (code) => process.exit(code ?? 0),
   (e) => {
     log(`error: ${e.message}`);

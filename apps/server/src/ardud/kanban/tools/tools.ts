@@ -156,8 +156,14 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "The Missions board you work on: board settings and instructions, every card, goals, pools, groups, live thread states and unread counts. Card prompts are left out; card_get returns them. Threads outside a board pass boardId.",
-  { boardId: Schema.optional(TrimmedNonEmptyString) },
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. Threads outside a board pass boardId.",
+  {
+    boardId: Schema.optional(TrimmedNonEmptyString),
+    after: Schema.optional(
+      describe(NonNegativeInt, "Cards numbered after this cursor (default 0)."),
+    ),
+    limit: Schema.optional(describe(PositiveInt, "Page size, default 200, capped at 500.")),
+  },
   { board: Record, prompts: Schema.String },
   { readonly: true },
 );

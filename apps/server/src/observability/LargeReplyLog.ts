@@ -13,9 +13,10 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 /** Metadata only: never the payload. */
 export interface LargeReply {
-  readonly kind: "ws" | "mcp" | "socket" | "pipe" | "tty" | "stream";
+  readonly kind: "ws" | "mcp" | "http" | "socket" | "pipe" | "tty" | "stream";
   readonly name: string;
   readonly bytes: number;
+  readonly rejected?: boolean | undefined;
   readonly threadId?: string | undefined;
   readonly discussionId?: string | undefined;
   /** Call-site frames for raw stream writes, which have no route name. */
@@ -45,11 +46,11 @@ export const make = (filePath: string): LargeReplyRecorder => {
     // Diagnostics must not prevent a server from starting or returning a reply.
   }
   return {
-    record: ({ kind, name, bytes, threadId, discussionId, stack }) => {
+    record: ({ kind, name, bytes, threadId, discussionId, stack, rejected }) => {
       try {
         if (bytes < LARGE_REPLY_BYTES || sink === undefined) return;
         sink.write(
-          `${JSON.stringify({ at: new Date().toISOString(), kind, name, bytes, threadId, discussionId, stack })}\n`,
+          `${JSON.stringify({ at: new Date().toISOString(), kind, name, bytes, threadId, discussionId, stack, rejected })}\n`,
         );
       } catch {
         // A full disk or a failed rotation must not affect a reply.

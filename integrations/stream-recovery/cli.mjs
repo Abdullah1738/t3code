@@ -6,9 +6,12 @@ import {
   assistantText, orphanStatus, sessionFromProviderThread, isNestedThreadId,
   providerThreadFor, robobNativeMessageId, truncate, toMs, hhmm,
 } from './lib/detect.mjs';
-import * as io from './lib/io.mjs';
+import * as realIo from './lib/io.mjs';
+import { pathToFileURL } from 'node:url';
+import { openCodeSession, recoveryOwned } from './lib/harness.mjs';
 import { stallScan } from './lib/stallwatch.mjs';
 import { restartScan } from './lib/restartwatch.mjs';
+const io = realIo;
 
 const SETTLE_MS = 90_000;
 const STALE_HELD_MS = 24 * 3600_000;
@@ -41,7 +44,11 @@ const log = (...parts) => (logToStderr ? console.error : console.log)(new Date()
 
 function topParent(db, threadId) {
   let t = threadId;
-  for (let i = 0; i < 5 && t && isNestedThreadId(t); i++) t = io.subagentParent(db, providerThreadFor(t));
+  const seen = new Set();
+  while (t && isNestedThreadId(t) && !seen.has(t)) {
+    seen.add(t);
+    t = io.subagentParent(db, providerThreadFor(t));
+  }
   return t && !isNestedThreadId(t) ? t : null;
 }
 
@@ -49,15 +56,24 @@ async function safe(fn, fallback) {
   try { return await fn(); } catch { return fallback; }
 }
 
-async function gatherThread({ db, incident, threadId, active, now, verbose }) {
+export async function gatherThread({ db, incident, threadId, active, now, verbose }, io = realIo) {
   const thread = await io.getThread(threadId);
   if (!thread) return null;
   const failed = incident.runs.filter((r) => r.thread_id === threadId);
+  const sourceRuns = [...failed, ...incident.subagents.filter((s) => s.parentThreadId === threadId)].map((r) => r.run_id);
+  const owned = await recoveryOwned(io, threadId, sourceRuns);
+  if (owned || !openCodeSession(thread)) {
+    return { thread, sourceRuns, plan: { threadId, title: thread.title, action: 'skip', resumeQueue: false,
+      reason: owned ? 'harness cutover owns continuation' : 'not a current OpenCode session' },
+    lost: [], reply: null, forms: [], orphans: [], held: [], staleHeld: [] };
+  }
   const maxOrdinal = failed.reduce((m, r) => Math.max(m, r.ordinal), -1);
   const recovered = failed.length > 0
     && io.laterRuns(db, threadId, maxOrdinal).some((r) => r.status === 'running' || r.status === 'completed');
   const queued = io.queuedRuns(db, threadId).filter((r) => r.held);
-  const staleHeld = queued.filter((r) => toMs(r.requested_at) < incident.startMs - STALE_HELD_MS);
+  const staleHeld = queued.filter((r) => toMs(r.requested_at) < incident.startMs - STALE_HELD_MS
+    && r.user_message_id?.startsWith(`ardud-control:send:${threadId}:coord%3A`)
+    && /^\[coord[\] ]/.test(io.messageText(db, r.user_message_id) ?? ''));
   const held = queued.filter((r) => !staleHeld.includes(r))
     .map((r) => ({ ...r, text: io.messageText(db, r.user_message_id) }));
 
@@ -71,7 +87,7 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
     return { thread, plan, failed, recovered, held, staleHeld, lost: [], reply: null, orphans: [], forms: [] };
   }
 
-  const ses = thread.nativeSessionId || null;
+  const ses = openCodeSession(thread);
   let session = null;
   let lost = [];
   let reply = null;
@@ -140,10 +156,10 @@ async function gatherThread({ db, incident, threadId, active, now, verbose }) {
     failedRuns: failed.map((r) => ({ completedAt: r.completed_at })),
     recovered, session, lost, reply, orphans, forms, held,
   });
-  return { thread, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
+  return { thread, sourceRuns, plan, failed, recovered, held, staleHeld, lost, reply, orphans, forms };
 }
 
-async function act({ incident, g, dryRun }) {
+export async function act({ db, incident, g, dryRun }, io = realIo) {
   const { plan } = g;
   const res = { plan, ok: true, queueOk: null, lost: g.lost, reply: g.reply, forms: g.forms, error: null };
   if (plan.action === 'skip' || plan.action === 'report') {
@@ -151,11 +167,32 @@ async function act({ incident, g, dryRun }) {
   }
   if (dryRun) return res;
   try {
+    if (await recoveryOwned(io, plan.threadId, g.sourceRuns)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'harness cutover owns continuation' };
+      return res;
+    }
+    io.assertReplicaFresh(db);
+    const fresh = await io.getThread(plan.threadId);
+    if (!fresh || openCodeSession(fresh) !== openCodeSession(g.thread)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'provider changed during recovery' };
+      return res;
+    }
+    if (fresh.archived || fresh.latestRunId !== g.thread.latestRunId
+      || fresh.nativeSessionId !== g.thread.nativeSessionId || fresh.pendingRequest) {
+      throw new Error('thread changed during recovery; retry next scan');
+    }
+    io.assertThreadInReplica(db, fresh);
+    if (await recoveryOwned(io, plan.threadId, g.sourceRuns)) {
+      res.plan = { ...plan, action: 'skip', resumeQueue: false, reason: 'harness cutover owns continuation' };
+      return res;
+    }
     if (plan.resumeQueue || g.staleHeld.length) {
       for (const r of g.staleHeld) {
+        io.assertReplicaFresh(db);
         await io.dispatchCommand({ type: 'queued-run.cancel', commandId: `${incident.id}:cancel:${r.run_id}`, threadId: plan.threadId, runId: r.run_id });
       }
       if (g.held.length) {
+        io.assertReplicaFresh(db);
         await io.dispatchCommand({ type: 'queue.resume', commandId: `${incident.id}:resume:${plan.threadId}`, threadId: plan.threadId });
       }
       res.queueOk = true;
@@ -165,9 +202,11 @@ async function act({ incident, g, dryRun }) {
         incident, plan, lost: g.lost, reply: g.reply, orphans: g.orphans, forms: g.forms,
         held: g.held, recovered: g.recovered, ocUrl: io.OC_URL,
       });
-      await io.sendToThread(plan.threadId, text, { clientRequestId: incident.id, mode: 'auto' });
+      io.assertReplicaFresh(db);
+      await io.sendToThread(plan.threadId, text, { clientRequestId: incident.id, mode: 'queue' });
     }
   } catch (err) {
+    if (err.code === 'REPLICA_UNAVAILABLE') throw err;
     res.ok = false;
     res.error = String(err?.message || err).slice(0, 300);
     if (res.queueOk === null && (plan.resumeQueue || g.staleHeld.length)) res.queueOk = false;
@@ -175,17 +214,15 @@ async function act({ incident, g, dryRun }) {
   return res;
 }
 
-async function scan(opts) {
-  const now = Date.now();
-  const release = opts.dryRun ? () => {} : io.acquireLock(now);
-  if (!release) { log('another scan is running, skipping'); return; }
+async function recoveryScan({ opts, state, now }) {
+  let db;
   try {
-    const state = io.loadState();
+    const report = [];
     const floor = now - opts.maxAgeHours * 3600_000;
     const last = state.lastScan ? Date.parse(state.lastScan) - 60 * 60_000 : floor;
     const sinceMs = opts.since ? Date.parse(opts.since) : Math.max(floor, last);
     const sinceIso = new Date(sinceMs).toISOString();
-    const db = io.openDb(io.PATHS.db);
+    db = io.openDb(io.PATHS.db);
     // Restart recovery owns failures inside its window. Do it first so a
     // failed run cannot get both a stream-loss note and a restart note.
     const restartSince = opts.since ? sinceIso
@@ -201,7 +238,6 @@ async function scan(opts) {
     ];
     const incidents = findIncidents(signals);
     if (opts.verbose) log(`since ${sinceIso}: ${runs.length} failed runs, ${subs.length} failed subagents, ${incidents.length} incident(s)`);
-    const report = [];
     for (const incident of incidents) {
       const prev = state.handled[incident.id];
       if (prev?.done) { if (opts.verbose) log(`${incident.id}: already handled`); continue; }
@@ -228,12 +264,13 @@ async function scan(opts) {
         try {
           g = await gatherThread({ db, incident, threadId, active, now, verbose: opts.verbose });
         } catch (err) {
+          if (err.code === 'REPLICA_UNAVAILABLE') throw err;
           results.push({ plan: { threadId, title: threadId, action: 'skip', reason: 'error' }, ok: false, error: String(err?.message || err).slice(0, 300), lost: [], forms: [] });
           log(`  ${threadId}: gather failed: ${err?.message || err}`);
           continue;
         }
         if (!g) { if (opts.verbose) log(`  ${threadId}: not found in Robob`); continue; }
-        const res = await act({ incident, g, dryRun: opts.dryRun });
+        const res = await act({ db, incident, g, dryRun: opts.dryRun });
         results.push(res);
         const p = g.plan;
         log(`  ${p.action.padEnd(7)} ${threadId} | ${truncate(p.title || '', 60)} | ${p.reason}`
@@ -241,6 +278,7 @@ async function scan(opts) {
           + `${g.forms.length ? ` | forms ${g.forms.length}` : ''}${g.held.length ? ` | held ${g.held.length}` : ''}${g.staleHeld.length ? ` | stale held ${g.staleHeld.length}` : ''}`
           + `${g.reply ? ' | invisible reply' : ''}${res.error ? ` | ERROR ${res.error}` : ''}`);
       }
+      io.assertReplicaFresh(db);
       const summary = buildSummary({ incident, results });
       if (opts.dryRun) {
         log(`summary (${summary.severity}):\n${summary.text}`);
@@ -258,6 +296,26 @@ async function scan(opts) {
       }
       report.push({ incident: { id: incident.id, startMs: incident.startMs, endMs: incident.endMs, failAllMs: incident.failAllMs }, results });
     }
+    io.assertReplicaFresh(db);
+    return { incidents: report, restarts };
+  } finally {
+    db?.close();
+  }
+}
+
+async function scan(opts) {
+  const now = Date.now();
+  const release = opts.dryRun ? () => {} : io.acquireLock(now);
+  if (!release) { log('another scan is running, skipping'); return; }
+  try {
+    const state = io.loadState();
+    let recovery = { incidents: [], restarts: [] }, recoveryError = null;
+    try {
+      recovery = await recoveryScan({ opts, state, now });
+    } catch (err) {
+      recoveryError = err;
+      log(`recovery deferred: ${err?.message || err}`);
+    }
     let stalls = [];
     // Scans run every 15s so restarts are picked up fast; the stall watch reads
     // every active OpenCode session, so it keeps its once-a-minute pace.
@@ -270,8 +328,13 @@ async function scan(opts) {
         log(`stall watch failed: ${err?.message || err}`);
       }
     }
-    if (!opts.dryRun) { state.lastScan = new Date(now).toISOString(); io.saveState(state, now); }
-    if (opts.json) console.log(JSON.stringify({ incidents: report, restarts, stalls }, null, 2));
+    if (!opts.dryRun) {
+      if (!recoveryError) state.lastScan = new Date(now).toISOString();
+      io.saveState(state, now);
+    }
+    if (opts.json) console.log(JSON.stringify({ ...recovery, stalls,
+      ...(recoveryError ? { recoveryError: String(recoveryError?.message || recoveryError) } : {}) }, null, 2));
+    if (recoveryError) throw recoveryError;
   } finally {
     release();
   }
@@ -291,7 +354,7 @@ function status() {
 const HELP = `usage: stream-recovery scan [--dry-run] [--since ISO] [--max-age-hours N] [--seed] [--json] [--verbose]
        stream-recovery status`;
 
-try {
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) try {
   const opts = parseArgs(process.argv.slice(2));
   logToStderr = opts.json;
   if (opts.cmd === 'scan') await scan(opts);

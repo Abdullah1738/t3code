@@ -1198,6 +1198,7 @@ function codexUsageLimitError(
 }
 
 interface ActiveCodexTurnContext {
+  readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
   latestProviderFailure?: {
     readonly nativeMessage: string;
@@ -2144,6 +2145,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             rootNodeId: input.turnInput.rootNodeId,
             subagent: null,
             startedAt: input.startedAt,
+            // Registration only follows turn/start acknowledgement or turn/started.
+            promptAcceptedAt: yield* DateTime.now,
             itemPositions: new Map(),
             fileChangeKindsByItem: new Map(),
             runningCompactionItemIds: new Set(),
@@ -2177,6 +2180,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ordinal: input.turnInput.providerTurnOrdinal,
               status: "running",
               startedAt: input.startedAt,
+              promptAcceptedAt: context.promptAcceptedAt,
               completedAt: null,
             },
           });
@@ -4566,6 +4570,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ordinal: context.providerTurnOrdinal,
                 status: "running",
                 startedAt: context.startedAt,
+                ...(context.promptAcceptedAt === undefined
+                  ? {}
+                  : { promptAcceptedAt: context.promptAcceptedAt }),
                 completedAt: null,
                 tokenUsage: codexProviderTurnTokenUsage(
                   payload.tokenUsage,
@@ -6112,6 +6119,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ordinal: input.context.providerTurnOrdinal,
                 status: input.status,
                 startedAt: input.context.startedAt,
+                ...(input.context.promptAcceptedAt === undefined
+                  ? {}
+                  : { promptAcceptedAt: input.context.promptAcceptedAt }),
                 completedAt: input.completedAt,
                 turnTokenUsage: completeCodexTurnTokenUsage(
                   usageStateForThread(

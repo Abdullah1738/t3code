@@ -215,6 +215,7 @@ function makeDeterministicAdapter(input: {
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: (sessionInput) =>
       Effect.gen(function* () {
+        const sessionScope = yield* Effect.scope;
         const events = yield* PubSub.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const now = yield* DateTime.now;
         const providerSession: OrchestrationV2ProviderSession = {
@@ -236,6 +237,7 @@ function makeDeterministicAdapter(input: {
           });
         const runOrdinals = new Map<ProviderTurnId, number>();
         const turnInputs = new Map<ProviderTurnId, ProviderAdapter.ProviderAdapterV2TurnInput>();
+        const interruptedAttempts = new Set<ProviderAdapter.ProviderAdapterV2TurnInput["attemptId"]>();
 
         return {
           instanceId: input.instanceId,
@@ -309,71 +311,81 @@ function makeDeterministicAdapter(input: {
                 },
               ]);
               const terminalGate = input.terminalGate?.(turnInput);
-              if (terminalGate !== undefined) {
-                yield* Deferred.await(terminalGate);
-              } else if (!input.shouldComplete(turnInput)) {
+              if (terminalGate === undefined && !input.shouldComplete(turnInput)) {
                 return;
               }
-              const response = input.response(turnInput);
-              yield* publish([
-                {
-                  type: "provider_turn.updated",
-                  driver: input.driver,
-                  providerTurn: {
-                    id: providerTurnId,
-                    providerThreadId: turnInput.providerThread.id,
-                    nodeId: turnInput.rootNodeId,
-                    runAttemptId: turnInput.attemptId,
-                    nativeTurnRef: {
-                      driver: input.driver,
-                      nativeId: `native-turn:${turnInput.threadId}:${turnInput.runOrdinal}`,
-                      strength: "strong",
+              const complete = Effect.suspend(() => {
+                if (interruptedAttempts.has(turnInput.attemptId)) return Effect.void;
+                const response = input.response(turnInput);
+                return publish([
+                  {
+                    type: "provider_turn.updated",
+                    driver: input.driver,
+                    providerTurn: {
+                      id: providerTurnId,
+                      providerThreadId: turnInput.providerThread.id,
+                      nodeId: turnInput.rootNodeId,
+                      runAttemptId: turnInput.attemptId,
+                      nativeTurnRef: {
+                        driver: input.driver,
+                        nativeId: `native-turn:${turnInput.threadId}:${turnInput.runOrdinal}`,
+                        strength: "strong",
+                      },
+                      ordinal: turnInput.providerTurnOrdinal,
+                      status: "completed",
+                      startedAt: eventTime,
+                      completedAt: eventTime,
                     },
-                    ordinal: turnInput.providerTurnOrdinal,
-                    status: "completed",
-                    startedAt: eventTime,
-                    completedAt: eventTime,
                   },
-                },
-                {
-                  type: "turn_item.updated",
-                  driver: input.driver,
-                  turnItem: {
-                    id: TurnItemId.make(
-                      `turn-item:${input.instanceId}:${turnInput.threadId}:${turnInput.runOrdinal}:assistant`,
-                    ),
-                    threadId: turnInput.threadId,
-                    runId: turnInput.runId,
-                    nodeId: turnInput.rootNodeId,
+                  {
+                    type: "turn_item.updated",
+                    driver: input.driver,
+                    turnItem: {
+                      id: TurnItemId.make(
+                        `turn-item:${input.instanceId}:${turnInput.threadId}:${turnInput.runOrdinal}:assistant`,
+                      ),
+                      threadId: turnInput.threadId,
+                      runId: turnInput.runId,
+                      nodeId: turnInput.rootNodeId,
+                      providerThreadId: turnInput.providerThread.id,
+                      providerTurnId,
+                      nativeItemRef: null,
+                      parentItemId: null,
+                      ordinal: turnInput.runOrdinal * 100 + 1,
+                      status: "completed",
+                      title: null,
+                      startedAt: eventTime,
+                      completedAt: eventTime,
+                      updatedAt: eventTime,
+                      type: "assistant_message",
+                      messageId: MessageId.make(
+                        `message:${input.instanceId}:${turnInput.threadId}:${turnInput.runOrdinal}:assistant`,
+                      ),
+                      text: response,
+                      streaming: false,
+                    },
+                  },
+                  {
+                    type: "turn.terminal",
+                    driver: input.driver,
                     providerThreadId: turnInput.providerThread.id,
                     providerTurnId,
-                    nativeItemRef: null,
-                    parentItemId: null,
-                    ordinal: turnInput.runOrdinal * 100 + 1,
+                    runOrdinal: turnInput.runOrdinal,
                     status: "completed",
-                    title: null,
-                    startedAt: eventTime,
-                    completedAt: eventTime,
-                    updatedAt: eventTime,
-                    type: "assistant_message",
-                    messageId: MessageId.make(
-                      `message:${input.instanceId}:${turnInput.threadId}:${turnInput.runOrdinal}:assistant`,
-                    ),
-                    text: response,
-                    streaming: false,
+                    failure: null,
+                    threadDisposition: "reusable",
                   },
-                },
-                {
-                  type: "turn.terminal",
-                  driver: input.driver,
-                  providerThreadId: turnInput.providerThread.id,
-                  providerTurnId,
-                  runOrdinal: turnInput.runOrdinal,
-                  status: "completed",
-                  failure: null,
-                  threadDisposition: "reusable",
-                },
-              ]);
+                ]);
+              });
+              if (terminalGate === undefined) {
+                yield* complete;
+              } else {
+                // Acceptance releases the outbox lane; provider completion arrives later.
+                yield* Deferred.await(terminalGate).pipe(
+                  Effect.andThen(complete),
+                  Effect.forkIn(sessionScope),
+                );
+              }
             }),
           steerTurn: (steer) => {
             const received = input.steerReceived?.(steer);
@@ -386,6 +398,7 @@ function makeDeterministicAdapter(input: {
               const turnInput = turnInputs.get(providerTurnId);
               const completedAt = yield* DateTime.now;
               if (turnInput !== undefined) {
+                interruptedAttempts.add(turnInput.attemptId);
                 yield* publish([
                   {
                     type: "provider_turn.updated",
@@ -436,18 +449,27 @@ function waitForProjection(
   threadId: ThreadId,
   predicate: (projection: OrchestrationV2ThreadProjection) => boolean,
 ) {
+  const timeoutError = new Error(`Timed out waiting for orchestration projection ${threadId}.`);
   return Effect.gen(function* () {
-    for (let attempt = 0; attempt < 1_000; attempt += 1) {
-      const projection = yield* orchestrator.getThreadProjection(threadId);
-      if (predicate(projection)) {
-        return projection;
-      }
-      yield* Effect.sleep("5 millis");
-    }
-    return yield* Effect.die(
-      new Error(`Timed out waiting for orchestration projection ${threadId}.`),
+    // Capture the cursor first so a commit between the read and subscription is replayed.
+    const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    if (predicate(projection)) return projection;
+    return yield* orchestrator.streamStoredEventsFrom({ threadId, afterSequence }).pipe(
+      Stream.mapEffect(() => orchestrator.getThreadProjection(threadId)),
+      Stream.filter(predicate),
+      Stream.runHead,
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.die(new Error(`Orchestration event stream ended for ${threadId}.`)),
+          onSome: Effect.succeed,
+        }),
+      ),
     );
-  });
+  }).pipe(
+    Effect.timeout("5 seconds"),
+    Effect.catchTags({ TimeoutError: () => Effect.die(timeoutError) }),
+  );
 }
 
 const client = McpSchema.McpServerClient.of({

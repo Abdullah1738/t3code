@@ -1,5 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -33,6 +35,8 @@ import {
 } from "@t3tools/contracts";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import { kanbanDDL } from "../../persistence/kanbanSchema.ts";
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
@@ -112,6 +116,99 @@ const withFileStore = <A, E>(
     );
     return yield* effect.pipe(Effect.timeout("15 seconds"), Effect.provide(layer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+it.effect("compact pages read the split boards database, not orchestration storage", () =>
+  Effect.gen(function* () {
+    const main = yield* SqlClient.SqlClient;
+    const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+    const sql = Context.get(context, SqlClient.SqlClient);
+    yield* Effect.forEach(kanbanDDL, (ddl) => sql.unsafe(ddl), { discard: true });
+    const split = BoardsDatabase.BoardsDatabase.of({ sql, ready: Effect.void, path: ":memory:" });
+    yield* Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const detail = "private detail".repeat(1_000);
+      yield* store.putBoard(board);
+      yield* Effect.forEach([1, 3, 8], (number) =>
+        store.putCard({
+          ...card(number, "todo"),
+          description: detail,
+          prompt: detail,
+          wakeNote: detail,
+        }),
+      );
+      yield* store.putGoal({
+        id: KanbanGoalId.make("split-goal"),
+        boardId,
+        name: "Split goal",
+        status: "active",
+        now: null,
+        story: [{ at, text: detail }],
+        createdAt: at,
+      });
+      const first = yield* store.feedCards(boardId, { after: 0, limit: 2 });
+      const next = yield* store.feedCards(boardId, { after: first.at(-1)!.number, limit: 2 });
+      assert.deepStrictEqual(first.map((row) => row.number), [1, 3]);
+      assert.deepStrictEqual(next.map((row) => row.number), [8]);
+      assert.isTrue(
+        first.every(
+          (row) => row.prompt === "" && row.description === "" && row.wakeNote === "pending",
+        ),
+      );
+      assert.strictEqual((yield* store.feedGoals(boardId))[0]!.story[0]!.text.length, 512);
+      assert.strictEqual((yield* store.card(first[0]!.id))!.prompt, detail);
+    }).pipe(
+      Effect.provide(
+        KanbanStore.layer.pipe(Layer.provide(Layer.succeed(BoardsDatabase.BoardsDatabase, split))),
+      ),
+    );
+    assert.deepStrictEqual(
+      yield* main`SELECT name FROM sqlite_schema WHERE name GLOB 'ardud_kanban_*'`,
+      [],
+    );
+  }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("pages big boards without loading card detail or goal histories", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const large = "detail".repeat(200_000);
+    for (let number = 1; number <= 24; number++) {
+      yield* store.putCard({
+        ...card(number, "todo"),
+        description: large,
+        prompt: large,
+        wakeNote: large,
+      });
+    }
+    yield* store.putGoal({
+      id: KanbanGoalId.make("goal-big"),
+      boardId,
+      name: "Big",
+      status: "active",
+      now: null,
+      story: [{ at, text: large }],
+      createdAt: at,
+    });
+    const first = yield* store.feedCards(boardId, { after: 0, limit: 10 });
+    const next = yield* store.feedCards(boardId, { after: first.at(-1)!.number, limit: 10 });
+    assert.deepEqual(
+      first.map((row) => row.number),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    );
+    assert.strictEqual(next[0]!.number, 11);
+    assert.isBelow(Buffer.byteLength(JSON.stringify(first)), 30_000);
+    assert.isTrue(
+      first.every(
+        (row) => row.prompt === "" && row.description === "" && row.wakeNote === "pending",
+      ),
+    );
+    assert.isNull(first[0]!.stalled);
+    assert.lengthOf((yield* store.feedGoals(boardId))[0]!.story, 1);
+    assert.strictEqual((yield* store.feedGoals(boardId))[0]!.story[0]!.text.length, 512);
+    assert.strictEqual((yield* store.card(first[0]!.id))!.prompt, large);
+    assert.lengthOf((yield* store.goals(boardId))[0]!.story, 1);
+  }).pipe(Effect.provide(TestLayer)),
+);
 
 it.live(
   "reads every routed store query while a file database writer is held",

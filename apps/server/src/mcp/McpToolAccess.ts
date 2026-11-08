@@ -16,6 +16,8 @@ import {
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import { jsonExceedsBudget, MAX_REPLY_BYTES, ReplyTooLarge } from "../ardud/http/replyBudget.ts";
+import { ReplyRejection } from "../ardud/http/ReplyRejection.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
 import {
   assertFullAccess,
@@ -67,7 +69,21 @@ export class Declaration<out Handler> {
     this.#handle = handle;
   }
   static {
-    declare = (handle) => new Declaration(builtHere, handle);
+    declare = (handle) =>
+      new Declaration(builtHere, (params) =>
+        handle(params).pipe(
+          Effect.flatMap((result) =>
+            jsonExceedsBudget(result, (MAX_REPLY_BYTES - 4096) / 3)
+              ? Effect.serviceOption(ReplyRejection).pipe(
+                  Effect.flatMap((rejection) => {
+                    if (rejection._tag === "Some") rejection.value.exceeded = true;
+                    return Effect.die(new ReplyTooLarge());
+                  }),
+                )
+              : Effect.succeed(result),
+          ),
+        ),
+      );
     checkedHandler = Struct.lambda<CheckedHandler>((declaration) => declaration.#handle);
   }
 }

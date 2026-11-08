@@ -186,7 +186,9 @@ it.live.each([true, false])(
             ...Array.from({ length: 270 }, (_, index) => event(index)),
           ],
         });
-        const baseline = Array.from(yield* store.read({ threadId: thread.id }).pipe(Stream.runCollect));
+        const baseline = Array.from(
+          yield* store.read({ threadId: thread.id }).pipe(Stream.runCollect),
+        );
         assert.deepEqual(baseline, initial);
         assert.deepEqual(
           Array.from(yield* store.readByCommandId({ commandId }).pipe(Stream.runCollect)),
@@ -195,13 +197,15 @@ it.live.each([true, false])(
         yield* sql`CREATE TABLE reader_test_lock (value INTEGER)`;
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
-        const writer = yield* sql.withTransaction(
-          Effect.gen(function* () {
-            yield* sql`INSERT INTO reader_test_lock VALUES (1)`;
-            yield* Deferred.succeed(held, undefined);
-            yield* Deferred.await(release);
-          }),
-        ).pipe(Effect.forkScoped);
+        const writer = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO reader_test_lock VALUES (1)`;
+              yield* Deferred.succeed(held, undefined);
+              yield* Deferred.await(release);
+            }),
+          )
+          .pipe(Effect.forkScoped);
         yield* Deferred.await(held);
 
         assert.deepEqual(
@@ -260,14 +264,22 @@ it.live.each([true, false])(
         let seenReplay = false;
         const gates: Statement.Transformer = (statement) => {
           const [query] = statement.compile();
-          if (!seenHighWater && query.includes("MAX(sequence)") && query.includes("orchestration_events")) {
+          if (
+            !seenHighWater &&
+            query.includes("MAX(sequence)") &&
+            query.includes("orchestration_events")
+          ) {
             seenHighWater = true;
             return Deferred.succeed(highWaterStarted, undefined).pipe(
               Effect.andThen(Deferred.await(allowHighWater)),
               Effect.as(statement),
             );
           }
-          if (!seenReplay && query.includes("FROM orchestration_events") && query.includes("payload_json")) {
+          if (
+            !seenReplay &&
+            /FROM "?ardud_history_events"?/.test(query) &&
+            query.includes("payload_json")
+          ) {
             seenReplay = true;
             return Deferred.succeed(replayStarted, undefined).pipe(
               Effect.andThen(Deferred.await(allowReplay)),
@@ -276,12 +288,14 @@ it.live.each([true, false])(
           }
           return Effect.succeed(statement);
         };
-        const reader = yield* sink.stream({ threadId: thread.id, bounded }).pipe(
-          Stream.provideService(Statement.CurrentTransformer, gates),
-          Stream.take(4),
-          Stream.runCollect,
-          Effect.forkScoped,
-        );
+        const reader = yield* sink
+          .stream({ threadId: thread.id, bounded })
+          .pipe(
+            Stream.provideService(Statement.CurrentTransformer, gates),
+            Stream.take(4),
+            Stream.runCollect,
+            Effect.forkScoped,
+          );
         yield* Deferred.await(highWaterStarted);
         const betweenSubscribeAndHead = yield* sink.write({ events: [update(1)] });
         yield* Deferred.succeed(allowHighWater, undefined);
@@ -1145,7 +1159,9 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           const blockRead: Statement.Transformer = (statement) => {
             const [query] = statement.compile();
             if (
-              query.includes("FROM orchestration_events") &&
+              (phase === "high-water"
+                ? query.includes("FROM orchestration_events")
+                : /FROM "?ardud_history_events"?/.test(query)) &&
               query.includes("MAX(sequence)") === (phase === "high-water")
             ) {
               return Deferred.succeed(readStarted, undefined).pipe(
@@ -1881,23 +1897,23 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         assert.deepEqual(yield* projections.getTimelinePage(threadId, { limit: 3 }), timeline);
 
         const compacted = yield* events.read({ threadId }).pipe(Stream.runCollect);
-      const replay = (stored: typeof original, client = false) => {
-        const created = stored[0]?.event;
-        if (created?.type !== "thread.created") throw new Error("missing thread creation");
-        return stored
-          .slice(1)
-          .reduce(
-            (state, next) =>
-              client
-                ? (applyOrchestrationV2ProjectionEvent(state, next.event) ?? state)
-                : ProjectionStore.applyToProjection(state, next.event),
-            ProjectionStore.emptyProjection(created),
-          );
-      };
-      const expected = replay(original);
-      assert.deepEqual(replay(compacted), expected);
-      const clientExpected = replay(original, true);
-      assert.deepEqual(replay(compacted, true), clientExpected);
+        const replay = (stored: typeof original, client = false) => {
+          const created = stored[0]?.event;
+          if (created?.type !== "thread.created") throw new Error("missing thread creation");
+          return stored
+            .slice(1)
+            .reduce(
+              (state, next) =>
+                client
+                  ? (applyOrchestrationV2ProjectionEvent(state, next.event) ?? state)
+                  : ProjectionStore.applyToProjection(state, next.event),
+              ProjectionStore.emptyProjection(created),
+            );
+        };
+        const expected = replay(original);
+        assert.deepEqual(replay(compacted), expected);
+        const clientExpected = replay(original, true);
+        assert.deepEqual(replay(compacted, true), clientExpected);
         for (const point of [0, ...original.map((row) => row.sequence)]) {
           const suffix = compacted.filter((row) => row.sequence > point);
           const actualSuffix =
@@ -1910,13 +1926,13 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             actualSuffix.map((row) => row.sequence),
             suffix.map((row) => row.sequence),
           );
-        const prefix = original.filter((row) => row.sequence <= point);
-        assert.deepEqual(replay([...prefix, ...actualSuffix]), expected, `cursor ${point}`);
-        assert.deepEqual(
-          replay([...prefix, ...actualSuffix], true),
-          clientExpected,
-          `client cursor ${point}`,
-        );
+          const prefix = original.filter((row) => row.sequence <= point);
+          assert.deepEqual(replay([...prefix, ...actualSuffix]), expected, `cursor ${point}`);
+          assert.deepEqual(
+            replay([...prefix, ...actualSuffix], true),
+            clientExpected,
+            `client cursor ${point}`,
+          );
         }
         const next = reasoning("item:after-rebuild", "new");
         yield* sink.write({ events: [itemEvent("after-rebuild", next)] });
@@ -2286,7 +2302,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       const pageLimits: Array<number> = [];
       const recordReads: Statement.Transformer = (statement) => {
         const [query, params] = statement.compile();
-        if (query.includes("FROM orchestration_events") && query.includes("command_id")) {
+        if (/FROM "?ardud_command_history_events"?/.test(query) && query.includes("command_id")) {
           const limit = params.at(-1);
           if (typeof limit === "number") {
             pageLimits.push(limit);
@@ -3748,6 +3764,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             Layer.mergeAll(
               ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
               Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getLiveSharedProviderSessions: () => Effect.succeed([]),
                 getRecoveryThreadIds: () => Effect.succeed([threadId]),
                 getRuntimeRecoveryProjection: () => Effect.succeed(projection),
               }),

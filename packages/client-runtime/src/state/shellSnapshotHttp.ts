@@ -1,4 +1,8 @@
-import { EnvironmentHttpCommonError } from "@t3tools/contracts";
+import {
+  EnvironmentHttpCommonError,
+  type ThreadId,
+  type ThreadPullRequestLink,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -19,7 +23,7 @@ import {
   type DeferredShellSnapshot,
 } from "./shellPullRequests.ts";
 
-// On timeout the socket asks the same server for the same full snapshot, so a
+// On timeout the socket asks the same server for the same pages, so a
 // short deadline only throws the first build away. The socket fallback is for
 // setups where /api fails but /ws works, such as a proxy that blocks /api.
 const DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS = 20_000;
@@ -34,20 +38,49 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   >;
   readonly timeoutMs?: number;
 }) {
-  return yield* executeAuthenticatedEnvironmentHttpRequest({
-    ...input,
-    group: "orchestration",
-    method: "GET",
-    url: (urls) => urls.shellSnapshot(),
-    timeoutMs: input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS,
-    request: ({ client, headers }) =>
-      client
-        .shellSnapshot({
-          headers: withOrchestrationProtocolHeader(headers),
-          responseMode: "response-only",
-        })
-        .pipe(Effect.flatMap(decodeShellSnapshotResponse)),
-  });
+  const fetchPage = (after?: string) =>
+    executeAuthenticatedEnvironmentHttpRequest({
+      ...input,
+      group: "orchestration",
+      method: "GET",
+      url: (urls) =>
+        urls.shellSnapshot({ query: { paged: "true", ...(after === undefined ? {} : { after }) } }),
+      timeoutMs: input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS,
+      request: ({ client, headers }) =>
+        client
+          .shellSnapshot({
+            query: { paged: "true", ...(after === undefined ? {} : { after }) },
+            headers: withOrchestrationProtocolHeader(headers),
+            responseMode: "response-only",
+          })
+          .pipe(Effect.flatMap(decodeShellSnapshotResponse)),
+    });
+  let snapshot = yield* fetchPage();
+  const pages: DeferredShellSnapshot[] = [snapshot];
+  const seen = new Set<string>();
+  while (snapshot.page?.nextAfter != null) {
+    const after = snapshot.page.nextAfter;
+    if (seen.has(after))
+      return yield* Effect.die(new Error("Shell snapshot cursor did not advance."));
+    seen.add(after);
+    snapshot = yield* fetchPage(after);
+    pages.push(snapshot);
+  }
+  const { page: _page, ...first } = pages[0]!;
+  return {
+    ...first,
+    threads: pages.flatMap((page) => page.threads),
+    // Resume at the earliest read so concurrent mutations replay after all pages load.
+    snapshotSequence: Math.min(...pages.map((page) => page.snapshotSequence)),
+    loadPullRequests: Effect.all(
+      pages.map(
+        (page) =>
+          page.loadPullRequests ??
+          Effect.succeed(new Map<ThreadId, ReadonlyArray<ThreadPullRequestLink>>()),
+      ),
+      { concurrency: 1 },
+    ).pipe(Effect.map((maps) => new Map(maps.flatMap((map) => [...map])))),
+  } satisfies DeferredShellSnapshot;
 });
 
 const decodeEnvironmentHttpCommonError = Schema.decodeUnknownEffect(

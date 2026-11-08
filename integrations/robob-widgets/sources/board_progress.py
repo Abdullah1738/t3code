@@ -46,10 +46,28 @@ def read_board(board):
     url = urllib.parse.urlunsplit((base.scheme, base.netloc,
                                    "/api/ardud/kanban/boards/" + urllib.parse.quote(board, safe=""),
                                    "", ""))
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
-                                                   "Accept": "application/json"})
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=15) as response:
-        return json.load(response)
+    opener = urllib.request.build_opener(NoRedirect)
+    result = None
+    seen = set()
+    after = None
+    while True:
+        page_url = url if after is None else url + "?after=" + urllib.parse.quote(str(after), safe="")
+        request = urllib.request.Request(page_url, headers={"Authorization": "Bearer " + token,
+                                                            "Accept": "application/json"})
+        with opener.open(request, timeout=15) as response:
+            page = json.load(response)
+        if result is None:
+            result = page
+        else:
+            if page.get("board", {}).get("id") != result.get("board", {}).get("id"):
+                raise ValueError("board changed while paging")
+            result["cards"].extend(page["cards"])
+        after = page.get("page", {}).get("nextAfter")
+        if after is None:
+            return result
+        if after in seen:
+            raise ValueError("board cursor did not advance")
+        seen.add(after)
 
 
 def render(data, board, goal=None):

@@ -69,7 +69,7 @@ const catalog = [
   },
 ] as unknown as ReadonlyArray<ServerProvider>;
 
-const makeHarness = (mode: "off" | "dryrun" | "apply" | "absent", base: ModelSelection = legacy) =>
+const makeHarness = (mode: "off" | "dryrun" | "apply" | "absent", base: ModelSelection = legacy, cutoverComplete = false) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const shell = {
@@ -142,7 +142,7 @@ const makeHarness = (mode: "off" | "dryrun" | "apply" | "absent", base: ModelSel
                   getProviders: Effect.succeed(catalog),
                 }),
                 ServerSettings.layerTest({
-                  ...(mode === "absent" ? {} : { ardudHarnessMigration: { selections: mode } }),
+                  ...(mode === "absent" ? {} : { ardudHarnessMigration: { selections: mode, cutoverComplete } }),
                   defaultModelSelection: base,
                 }),
                 Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
@@ -183,8 +183,11 @@ const makeHarness = (mode: "off" | "dryrun" | "apply" | "absent", base: ModelSel
 const run = <A, E>(
   mode: "off" | "dryrun" | "apply",
   body: (h: Effect.Success<ReturnType<typeof makeHarness>>) => Effect.Effect<A, E>,
+  cutoverComplete = false,
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(mode), body)).pipe(Effect.provide(Sqlite.layerMemory));
+  Effect.scoped(Effect.flatMap(makeHarness(mode, legacy, cutoverComplete), body)).pipe(
+    Effect.provide(Sqlite.layerMemory),
+  );
 
 describe("control resolver routes", () => {
   it.effect(
@@ -223,6 +226,52 @@ describe("control resolver routes", () => {
           );
         }),
       ).pipe(Effect.provide(Sqlite.layerMemory)),
+  );
+
+  it.effect("refuses explicit OpenCode models after cutover before create, send or PATCH", () =>
+    run(
+      "off",
+      ({ request, calls, shell }) =>
+        Effect.gen(function* () {
+          for (const [method, path, body] of [
+            ["POST", "/threads", { projectId: shell.projectId, model: legacy.model }],
+            ["POST", "/threads/thread/send", { text: "hi", model: legacy.model }],
+            ["PATCH", "/threads/thread", { model: legacy.model }],
+          ] as const) {
+            const response = yield* request(method, path, body);
+            assert.strictEqual(response.status, 400);
+            assert.include(JSON.stringify(response.body), "claudeAgent/claude-opus-5-5");
+          }
+          assert.deepStrictEqual(yield* Ref.get(calls), []);
+        }),
+      true,
+    ),
+  );
+
+  it.effect("maps inherited legacy defaults and sends after cutover without an apply flag", () =>
+    run(
+      "off",
+      ({ request, calls, shell }) =>
+        Effect.gen(function* () {
+          assert.strictEqual(
+            (yield* request("POST", "/threads", { projectId: shell.projectId })).status,
+            201,
+          );
+          assert.strictEqual(
+            (yield* request("POST", "/threads/thread/send", { text: "hi" })).status,
+            200,
+          );
+          const recorded = yield* Ref.get(calls);
+          assert.strictEqual(recorded.length, 2);
+          for (const item of recorded) {
+            assert.deepStrictEqual(
+              (item.value as { modelSelection: unknown }).modelSelection,
+              native,
+            );
+          }
+        }),
+      true,
+    ),
   );
 
   it.effect.each(["off", "dryrun", "apply"] as const)("create, send and settings use %s", (mode) =>

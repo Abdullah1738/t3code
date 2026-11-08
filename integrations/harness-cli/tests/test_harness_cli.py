@@ -16,7 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -73,9 +73,19 @@ def passing_codex_home(models: list[str]) -> dict:
             "positiveControlEvidence": ["memories_1.sqlite:stage1_outputs:content"],
             "memoryPromptSeen": False, "positiveControlFired": True, "readControlFired": True,
             "positiveElapsedSeconds": window / 2, "observationComplete": True,
+            "memoryAudit": passing_audit(), "positiveControlAudit": passing_audit(positive=True),
             "observationWindowSeconds": window, "observedSeconds": [window] * len(models),
             "requests": len(models) + 1, "recorderViolations": 0,
-            "models": {model: {"ok": True, "requests": 1} for model in models}}
+            "models": {model: {"ok": True, "requests": 1, "memoryPipelineRequests": 0,
+                                "memorySentinelInRequest": False, "memorySentinelInPrimaryRequest": False,
+                                "memorySectionInRequest": False} for model in models}}
+
+
+def passing_audit(*, positive=False) -> dict:
+    return {"method": "sqlite-triggers-v1", "sourceCommit": hc.CODEX_MEMORY_SOURCE, "identityVerified": True,
+            "stores": {name: {"rowCounts": {"jobs": int(positive), "stage1_outputs": int(positive)},
+                               "activity": {"jobs": 1, "stage1_outputs": 1} if positive else {},
+                               "consolidationProgress": [[1, 0]]} for name in hc.CODEX_MEMORY_DATABASES}}
 
 
 def passing_codex_result() -> dict:
@@ -84,8 +94,31 @@ def passing_codex_result() -> dict:
 
 def passing_claude_result() -> dict:
     return {"memoryCanaryChecked": True, "memoryCanaryLeaked": False, "thinkingCheckChecked": True,
+            "thinkingSettingsChecked": True, "thinkingInconclusive": False,
+            "thinkingAttempts": [{"status": "passed", "settingsChecked": True, "turn1ThinkingBlocks": 1}],
             "thinkingReplayed": True, "inputTransformationsEmpty": True, "requests": 3,
             "recorderViolations": 0, **{model: {"ok": True} for model in hc.MODEL_CANARIES["claude"]}}
+
+
+COMPANION_BYTES = {"codex-code-mode-host": b"#!/bin/sh\n# code-mode-host\nexit 0\n",
+                   "rg": b"#!/bin/sh\n# rg\nexit 0\n"}
+
+
+def ensure_codex_companions(version: str) -> dict:
+    """Give a hand-built codex tree its companions at the package layout plus a stage record,
+    the way stage() leaves it. A tree that already has a record is left as it is."""
+    if hc.recorded_companions("codex", version) is None:
+        target = hc.version_dir("codex", version)
+        hashes = {}
+        for spec in hc.companion_specs("codex"):
+            path = target / spec["dest"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(COMPANION_BYTES[spec["name"]])
+            path.chmod(0o555)
+            hashes[spec["name"]] = hc.sha256_file(path)
+        hc.write_record("stage", "codex", version, "staged",
+                        binarySha256=hc.sha256_file(target / "bin" / "codex"), companions=hashes)
+    return hc.verify_companions("codex", version)
 
 
 class FakeCliTestCase(unittest.TestCase):
@@ -105,6 +138,7 @@ class FakeCliTestCase(unittest.TestCase):
         self.env_patch = mock.patch.dict(os.environ, {
             "HARNESS_CLI_HOME": str(self.root),
             "HARNESS_CLI_NPM": str(self.bin / "npm"),
+            "HARNESS_CLI_PYTHON": sys.executable,
             "HARNESS_CLI_MODEL_MANIFEST": str(self.manifest),
             "HARNESS_CLI_HOMES": str(self.tmp / "live-homes"),
             "FAKE_NPM_DB": str(self.npm_db),
@@ -206,15 +240,17 @@ if "--resume" in sys.argv and session.exists():
     messages.append({"role": "assistant", "content": [json.loads(session.read_text())]})
 if LEAK:
     messages.append({"role": "user", "content": "ROBOB-MEMCANARY-7f3a91"})
-body = {"messages": messages, "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
+messages[0]["content"] = sys.argv[sys.argv.index("-p") + 1]
+body = {"messages": messages, "thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}, "context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
 req = urllib.request.Request(base + "/v1/messages", data=json.dumps(body).encode(),
                              headers={"content-type": "application/json", "anthropic-beta": "context-management-test"})
 response = json.loads(urllib.request.urlopen(req, timeout=10).read())
 if "--session-id" in sys.argv:
     session.write_text(json.dumps(response["content"][0]))
-print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK")
+print("ROBOB-THINK-4417" if "--resume" in sys.argv else "OK 11440 407")
 '''
-        return script.replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode()
+        return (script.replace("/opt/homebrew/bin/python3", sys.executable)
+                .replace("VERSION", version).replace("LEAK", str("ROBOB-MEMCANARY" in body_extra)).encode())
 
     def fake_codex_binary(self, version: str, body_extra: str = "", *, leak_read: bool = False) -> bytes:
         script = r'''#!/opt/homebrew/bin/python3
@@ -235,7 +271,8 @@ if (config.get("features", {}).get("memories") and (home / "fixture-id").exists(
     conn = sqlite3.connect(home / "memories_1.sqlite")
     conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)")
-    conn.execute("INSERT INTO stage1_outputs VALUES (?, 'extracted preference', '')", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.execute("INSERT OR REPLACE INTO stage1_outputs (thread_id,source_updated_at,raw_memory,rollout_summary,generated_at) VALUES (?,0,'extracted preference','',0)", ((home / "fixture-id").read_text() if (home / "fixture-id").exists() else "fake",))
+    conn.execute("INSERT OR REPLACE INTO jobs (kind,job_key,status,retry_remaining) VALUES ('memory_stage1','fixture','done',0)")
     conn.commit(); conn.close()
 enabled = config.get("features", {}).get("memories")
 input_text = (home / "memories" / "MEMORY.md").read_text() if enabled else "hello"
@@ -250,13 +287,23 @@ req = urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", da
 urllib.request.urlopen(req, timeout=10).read()
 print("OK")
 '''
-        return (script.replace("VERSION", version).replace("LEAK_READ", str(leak_read))
+        return (script.replace("/opt/homebrew/bin/python3", sys.executable)
+                .replace("VERSION", version).replace("LEAK_READ", str(leak_read))
                 .replace("LEAK", str(bool(body_extra))).encode())
 
-    def package_tgz(self, name: str, tool: str, version: str, binary: bytes) -> Path:
+    def package_tgz(self, name: str, tool: str, version: str, binary: bytes, *,
+                    omit: tuple[str, ...] = ()) -> Path:
         path = self.tmp / f"{name}.tgz"
         rel = hc.TOOLS[tool]["binary_in_native"]
-        make_tgz(path, {rel: binary}, modes={rel: 0o755})
+        members = {rel: binary}
+        modes = {rel: 0o755}
+        for spec in hc.companion_specs(tool):
+            if spec["name"] in omit:
+                continue
+            member = os.path.normpath(os.path.join(os.path.dirname(rel), spec["source"]))
+            members[member] = COMPANION_BYTES[spec["name"]]
+            modes[member] = 0o755
+        make_tgz(path, members, modes=modes)
         return path
 
 
@@ -282,6 +329,52 @@ class StageTests(FakeCliTestCase):
         self.assertTrue((target / "bin" / "claude").is_file())
         self.assertFalse(os.stat(target / "bin" / "claude").st_mode & stat.S_IWUSR)
         self.assertEqual(result["binarySha256"], hc.sha256_file(target / "bin" / "claude"))
+
+    def test_codex_stage_copies_companions_in_the_package_layout(self) -> None:
+        self.publish("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
+        result = hc.stage("codex", "0.166.0")
+        target = self.root / "codex" / "0.166.0"
+        # Same three paths CodexInstallation.ts checks: bin/codex, bin/codex-code-mode-host, codex-path/rg.
+        for rel in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+            self.assertTrue((target / rel).is_file(), rel)
+            self.assertTrue(os.stat(target / rel).st_mode & stat.S_IXUSR, rel)
+            self.assertFalse(os.stat(target / rel).st_mode & stat.S_IWUSR, rel)
+        self.assertFalse((target / "bin" / "rg").exists())
+        self.assertFalse(os.stat(target / "codex-path").st_mode & stat.S_IWUSR)
+        self.assertEqual(result["companions"], {
+            "codex-code-mode-host": hc.sha256_file(target / "bin" / "codex-code-mode-host"),
+            "rg": hc.sha256_file(target / "codex-path" / "rg")})
+        self.assertEqual(hc.recorded_companions("codex", "0.166.0"), result["companions"])
+        self.assertEqual(hc.verify_companions("codex", "0.166.0"), result["companions"])
+
+    def test_codex_stage_without_rg_warns_and_records_null(self) -> None:
+        pkg = hc.pack_spec("codex", "0.166.0")
+        tgz = self.package_tgz("codex-no-rg", "codex", "0.166.0", self.fake_codex_binary("0.166.0"), omit=("rg",))
+        self.set_npm(latest={pkg: "0.166.0"}, tarballs={pkg: tgz}, integrity={pkg: sri(tgz.read_bytes())})
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            result = hc.stage("codex", "0.166.0")
+        target = self.root / "codex" / "0.166.0"
+        self.assertIn("optional companion rg", err.getvalue())
+        self.assertIsNone(result["companions"]["rg"])
+        self.assertTrue((target / "bin" / "codex-code-mode-host").is_file())
+        self.assertFalse((target / "codex-path").exists())
+        stage_record = [r for r in hc.tool_records("codex", "0.166.0") if r["action"] == "stage"][-1]
+        self.assertIsNone(stage_record["companions"]["rg"])
+        self.assertTrue(stage_record["warnings"])
+        # Null is accepted by verification; a required companion still has to be there.
+        self.assertIsNone(hc.verify_companions("codex", "0.166.0")["rg"])
+
+    def test_codex_stage_refuses_a_package_without_its_code_mode_host(self) -> None:
+        pkg = hc.pack_spec("codex", "0.166.0")
+        tgz = self.tmp / "codex-missing.tgz"
+        rel = hc.TOOLS["codex"]["binary_in_native"]
+        make_tgz(tgz, {rel: self.fake_codex_binary("0.166.0")}, modes={rel: 0o755})
+        self.set_npm(latest={pkg: "0.166.0"}, tarballs={pkg: tgz}, integrity={pkg: sri(tgz.read_bytes())})
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.stage("codex", "0.166.0")
+        self.assertIn("companion", str(ctx.exception))
+        self.assertFalse((self.root / "codex" / "0.166.0").exists())
 
     def test_integrity_mismatch_refuses_stage_and_writes_nothing(self) -> None:
         self.publish("claude", "2.1.316", self.fake_claude_binary("2.1.316"), lie=True)
@@ -474,35 +567,32 @@ class PromoteRollbackTests(FakeCliTestCase):
 
 
 class CodexRotationTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        # Rotation tests exercise behavior after an independently verified canary.
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
-
     def install_codex(self, version: str) -> None:
         bin_dir = self.root / "codex" / version / "bin"
         bin_dir.mkdir(parents=True)
         (bin_dir / "codex").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
         (bin_dir / "codex").chmod(0o555)
+        ensure_codex_companions(version)
 
     def record_codex_canary(self, version: str) -> None:
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
                         canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
+                        companions=ensure_codex_companions(version),
                         canary=passing_codex_result())
 
     def test_incomplete_or_corrupt_codex_proof_cannot_promote(self) -> None:
         self.install_codex("0.166.0")
         for target in ("plain", "cu"):
             for field in ("memorySentinelSeen", "memoryPipelineRan", "memoryPromptSeen", "models",
-                          "observedSeconds", "positiveElapsedSeconds", "recorderViolations"):
+                          "observedSeconds", "positiveElapsedSeconds", "recorderViolations",
+                          "memoryAudit", "positiveControlAudit"):
                 with self.subTest(target=target, field=field):
                     proof = passing_codex_result()
                     home = proof if target == "plain" else proof["cu"]
                     del home[field]
                     hc.write_record("canary", "codex", "0.166.0", "passed", canary=proof,
+                                    companions=ensure_codex_companions("0.166.0"),
                                     binarySha256=hc.sha256_file(self.root / "codex" / "0.166.0" / "bin" / "codex"),
                                     canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
                     self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
@@ -620,6 +710,13 @@ class CanaryTests(FakeCliTestCase):
         shutil.copytree(PKG.parent / "harness-homes" / "vendor", self.homes_pkg / "vendor")
         shutil.copy(PKG.parent / "harness-homes" / "manifest.json", self.homes_pkg / "manifest.json")
         shutil.copytree(PKG.parent / "harness-homes" / "overlays", self.homes_pkg / "overlays")
+        manifest = json.loads((self.homes_pkg / "manifest.json").read_text(encoding="utf-8"))
+        for sources in manifest.get("paritySources", {}).values():
+            for source in sources:
+                relative = source if isinstance(source, str) else source["source"]
+                destination = self.homes_pkg / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(PKG.parent / "harness-homes" / relative, destination)
         self.canonical = self.tmp / "home" / ".config" / "opencode" / "AGENTS.md"
         self.canonical.parent.mkdir(parents=True, exist_ok=True)
         self.canonical.write_text("# canonical\n", encoding="utf-8")
@@ -665,6 +762,8 @@ class CanaryTests(FakeCliTestCase):
         path = bin_dir / name
         path.write_bytes(body)
         path.chmod(0o755)
+        if tool == "codex":
+            ensure_codex_companions(version)
         return path
 
     def test_canary_passes_on_clean_fake_claude(self) -> None:
@@ -686,6 +785,59 @@ class CanaryTests(FakeCliTestCase):
         self.assertTrue(any("preserved thinking" in r for r in verdict["reasons"]))
         with self.assertRaises(hc.HarnessError):
             hc.promote("claude", "2.1.316")
+
+    def test_no_thinking_retries_once_but_cannot_turn_inconclusive_into_pass(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(
+            b'if "--session-id" in sys.argv:\n    session.write_text',
+            b'if "--session-id" in sys.argv and response["content"]:\n    session.write_text')
+        self.install_binary("claude", "2.1.316", body)
+        capture = hc.Recorder.capture_response
+        seen = []
+        def no_first_thinking(recorder, payload, record):
+            capture(recorder, payload, record)
+            seen.append(record)
+            if len(seen) == 1:
+                record["response_thinking"] = []
+        with mock.patch.object(hc.Recorder, "capture_response", no_first_thinking):
+            verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"], verdict)
+        result = verdict["result"]
+        self.assertTrue(result["thinkingInconclusive"])
+        self.assertEqual([a["status"] for a in result["thinkingAttempts"]], ["inconclusive", "passed"])
+        self.assertTrue(result["thinkingReplayed"])
+        self.assertEqual(json.loads(hc.records_path().read_text().splitlines()[-1])["result"], "inconclusive")
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("claude", "2.1.316")
+
+    def test_thinking_replay_failure_is_not_retried(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(
+            b'if "--resume" in sys.argv and session.exists():', b'if False:')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(verdict["result"]["thinkingInconclusive"])
+        self.assertEqual(len(verdict["result"]["thinkingAttempts"]), 1)
+        self.assertEqual(verdict["result"]["requests"], 3)
+
+    def test_missing_thinking_exhausts_bounded_retry(self) -> None:
+        self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
+        capture = hc.Recorder.capture_response
+        def no_thinking(recorder, payload, record):
+            capture(recorder, payload, record)
+            record["response_thinking"] = []
+        with mock.patch.object(hc.Recorder, "capture_response", no_thinking):
+            verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertEqual([a["status"] for a in verdict["result"]["thinkingAttempts"]],
+                         ["inconclusive", "inconclusive"])
+        self.assertEqual(verdict["result"]["requests"], 4)
+
+    def test_claude_ignored_thinking_effort_flags_block_promotion(self) -> None:
+        body = self.fake_claude_binary("2.1.316").replace(b'"effort": "max"', b'"effort": "high"')
+        self.install_binary("claude", "2.1.316", body)
+        verdict = self.run_canary("claude", "2.1.316")
+        self.assertFalse(verdict["passed"])
+        self.assertFalse(verdict["result"]["thinkingSettingsChecked"])
 
     def test_transformed_or_unreported_thinking_response_fails_closed(self) -> None:
         first = [{"response_thinking": [{"thinking": "t", "signature": "s"}]}]
@@ -737,24 +889,25 @@ class CanaryTests(FakeCliTestCase):
     def test_codex_uses_generated_cu_home_and_memory_positive_control(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         verdict = self.run_canary("codex", "0.166.0")
-        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["passed"], verdict)
         self.assertTrue(verdict["result"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["positiveControlFired"])
         self.assertTrue(verdict["result"]["cu"]["models"]["gpt-6.1-terra"]["ok"])
         for result in (verdict["result"], verdict["result"]["cu"]):
-            self.assertFalse(result["memoryCanaryChecked"])
-            self.assertIn("transient jobs", result["memoryObservationLimitation"])
+            self.assertTrue(result["memoryCanaryChecked"])
+            self.assertTrue(hc.valid_codex_memory_audit(result["memoryAudit"], clean=True))
             self.assertTrue(result["readControlFired"])
             self.assertFalse(result["memorySentinelSeen"])
             self.assertFalse(result["memoryPromptSeen"])
             self.assertIn("memories/MEMORY.md", result["memoryBaseline"])
-            self.assertEqual(result["memoryArtifacts"], [])
-        with self.assertRaises(hc.HarnessError):
-            hc.promote("codex", "0.166.0")
+        hc.promote("codex", "0.166.0")
 
-    def test_synthetic_clean_codex_record_cannot_bypass_observation_limit(self) -> None:
+    def test_clean_codex_record_without_audit_cannot_promote(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         passing_canary("codex", "0.166.0")
+        record = json.loads(hc.records_path().read_text().splitlines()[-1])
+        del record["canary"]["memoryAudit"]
+        hc.append_record(record)
         self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
@@ -799,6 +952,7 @@ class CanaryTests(FakeCliTestCase):
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_bytes(body)
                 binary.chmod(0o755)
+                ensure_codex_companions("0.166.0")
                 verdict = self.run_canary("codex", "0.166.0")
                 self.assertFalse(verdict["passed"], verdict)
                 self.assertEqual(verdict["result"]["memorySentinelSeen"], target == "plain")
@@ -849,6 +1003,7 @@ class CanaryTests(FakeCliTestCase):
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_bytes(body)
                 binary.chmod(0o755)
+                ensure_codex_companions("0.166.0")
                 with mock.patch.object(hc, "CODEX_OBSERVATION_SECONDS", 1.0):
                     verdict = self.run_canary("codex", "0.166.0")
                 self.assertFalse(verdict["passed"], verdict)
@@ -871,6 +1026,7 @@ class CanaryTests(FakeCliTestCase):
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_bytes(body)
                 binary.chmod(0o755)
+                ensure_codex_companions("0.166.0")
                 if change == "no-during-hold-output":
                     with mock.patch.object(hc, "wait_for_codex_fixture", return_value=False):
                         verdict = self.run_canary("codex", "0.166.0")
@@ -899,6 +1055,7 @@ class CanaryTests(FakeCliTestCase):
                     + b':\n    urllib.request.urlopen(urllib.request.Request(os.environ["NINEROUTER_BASE"] + "/v1/responses", data=b\'{"text":{"format":"plain"}}\'), timeout=10).read()\n'
                     b'body = {"input":'))
                 binary.chmod(0o755)
+                ensure_codex_companions("0.166.0")
                 passing_canary("codex", "0.166.0")
                 verdict = self.run_canary("codex", "0.166.0")
                 self.assertFalse(verdict["passed"], verdict)
@@ -986,7 +1143,7 @@ class CanaryTests(FakeCliTestCase):
             b'if not enabled and (home / "fixture-id").exists():\n'
             b'    def queue_job():\n'
             b'        conn = sqlite3.connect(home / "memories_1.sqlite"); conn.execute("CREATE TABLE IF NOT EXISTS stage1_outputs (thread_id TEXT, raw_memory TEXT, rollout_summary TEXT)")\n'
-            b'        conn.execute("CREATE TABLE IF NOT EXISTS jobs (status TEXT)"); conn.execute("INSERT INTO jobs VALUES (\'queued\')"); conn.commit(); conn.close()\n'
+            b'        conn.execute("INSERT INTO jobs (kind,job_key,status,retry_remaining) VALUES (\'memory_stage1\',\'fixture\',\'queued\',0)"); conn.commit(); conn.close()\n'
             b'    timer = threading.Timer(0.20, queue_job); timer.daemon = True; timer.start()\n'
             b'body = {"input":')
         self.install_binary("codex", "0.166.0", body)
@@ -998,10 +1155,27 @@ class CanaryTests(FakeCliTestCase):
         with self.assertRaises(hc.HarnessError):
             hc.promote("codex", "0.166.0")
 
+    def test_job_created_and_deleted_in_one_transaction_blocks_both_homes(self) -> None:
+        body = self.fake_codex_binary("0.166.0").replace(
+            b'body = {"input":',
+            b'if not enabled and (home / "fixture-id").exists():\n'
+            b'    conn = sqlite3.connect(home / "memories_1.sqlite")\n'
+            b'    conn.execute("INSERT INTO jobs (kind,job_key,status,retry_remaining) VALUES (\'memory_stage1\',\'fixture\',\'queued\',0)")\n'
+            b'    conn.execute("DELETE FROM jobs"); conn.commit(); conn.close()\n'
+            b'body = {"input":')
+        self.install_binary("codex", "0.166.0", body)
+        verdict = self.run_canary("codex", "0.166.0")
+        self.assertFalse(verdict["passed"], verdict)
+        for result in (verdict["result"], verdict["result"]["cu"]):
+            self.assertTrue(result["memoryPipelineRan"])
+            self.assertIn("memories_1.sqlite:audit:jobs", result["memoryPipelineEvidence"])
+        with self.assertRaises(hc.HarnessError):
+            hc.promote("codex", "0.166.0")
+
     def test_disabled_memory_probe_seeds_indexed_rollout(self) -> None:
         self.install_binary("codex", "0.166.0", self.fake_codex_binary("0.166.0"))
         verdict = self.run_canary("codex", "0.166.0")
-        self.assertFalse(verdict["passed"], verdict)
+        self.assertTrue(verdict["passed"], verdict)
         self.assertEqual(self.seed_mock.call_count, 4)
 
     def test_codex_memory_sentinel_detects_decoded_nested_text(self) -> None:
@@ -1031,6 +1205,17 @@ class CanaryTests(FakeCliTestCase):
         (home / "raw_memories.md").write_text("new")
         after = hc.codex_memory_snapshot(home)
         self.assertEqual(set(after) - set(before), {"phase2-output", "raw_memories.md"})
+
+    def test_memory_snapshot_does_not_hash_rotating_sqlite_files(self) -> None:
+        home = self.tmp / "rotating-sqlite"
+        home.mkdir()
+        for name in hc.CODEX_MEMORY_DATABASES:
+            for suffix in ("", "-wal", "-shm"):
+                (home / (name + suffix)).touch()
+        with mock.patch.object(hc, "sha256_file", side_effect=FileNotFoundError("WAL rotated")):
+            snapshot = hc.codex_memory_snapshot(home)
+        self.assertEqual(len(snapshot), 6)
+        self.assertEqual(set(snapshot.values()), {"sqlite-store"})
 
     def test_empty_codex_database_does_not_count_as_pipeline_work(self) -> None:
         body = self.fake_codex_binary("0.166.0")
@@ -1064,6 +1249,54 @@ class CanaryTests(FakeCliTestCase):
             conn.commit()
         after = hc.codex_memory_snapshot(home)
         self.assertIn("memories_1.sqlite:stage1_outputs", hc.codex_memory_pipeline_evidence(home, before, after))
+
+    def test_memory_audit_accepts_only_empty_untouched_stores(self) -> None:
+        import sqlite3
+        home = self.tmp / "audited"
+        home.mkdir()
+        audit = hc.CodexMemoryAudit(home, "0.166.0")
+        self.assertTrue(hc.valid_codex_memory_audit(audit.read(), clean=True))
+        for name in hc.CODEX_MEMORY_DATABASES:
+            with self.subTest(store=name):
+                with closing(sqlite3.connect(home / name)) as conn:
+                    conn.execute("INSERT INTO stage1_outputs (thread_id,source_updated_at,raw_memory,rollout_summary,generated_at) VALUES ('fixture',0,'content','',0)")
+                    conn.execute("DELETE FROM stage1_outputs")
+                    conn.commit()
+                result = audit.read()
+                self.assertFalse(hc.valid_codex_memory_audit(result, clean=True))
+                self.assertEqual(result["stores"][name]["rowCounts"]["stage1_outputs"], 0)
+                self.assertEqual(result["stores"][name]["activity"]["stage1_outputs"], 2)
+
+    def test_memory_audit_fails_closed_on_tampering(self) -> None:
+        import sqlite3
+        for change in ("trigger", "identity", "migration", "replaced", "missing"):
+            with self.subTest(change=change):
+                home = self.tmp / f"tampered-{change}"
+                home.mkdir()
+                audit = hc.CodexMemoryAudit(home, "0.166.0")
+                db = home / "memories_1.sqlite"
+                if change in ("replaced", "missing"):
+                    db.rename(db.with_suffix(".backup"))
+                    if change == "replaced":
+                        shutil.copy2(db.with_suffix(".backup"), db)
+                else:
+                    with closing(sqlite3.connect(db)) as conn:
+                        conn.execute({"trigger": "DROP TRIGGER robob_canary_jobs_insert",
+                                      "identity": "DELETE FROM robob_canary_identity",
+                                      "migration": "UPDATE _sqlx_migrations SET checksum=x'00' WHERE version=1"}[change])
+                        conn.commit()
+                with self.assertRaises(hc.HarnessError):
+                    audit.read()
+
+    def test_memory_audit_rejects_unknown_cli_version(self) -> None:
+        with self.assertRaises(hc.HarnessError):
+            hc.CodexMemoryAudit(self.tmp, "0.167.0")
+
+    def test_positive_control_needs_audited_jobs_and_outputs(self) -> None:
+        proof = passing_codex_home(hc.MODEL_CANARIES["codex"])
+        for store in proof["positiveControlAudit"]["stores"].values():
+            store["activity"] = {}
+        self.assertFalse(hc.valid_codex_canary_home(proof, hc.MODEL_CANARIES["codex"]))
 
     def test_jobs_or_consolidation_initialization_is_not_positive_extraction(self) -> None:
         import sqlite3
@@ -1241,7 +1474,8 @@ class CanaryTests(FakeCliTestCase):
 
     def test_incomplete_claude_pass_cannot_promote(self) -> None:
         binary = self.install_binary("claude", "2.1.316", self.fake_claude_binary("2.1.316"))
-        for field in ("memoryCanaryLeaked", "recorderViolations", "requests", "claude-haiku-5-5"):
+        for field in ("memoryCanaryLeaked", "recorderViolations", "requests", "claude-haiku-5-5",
+                      "thinkingSettingsChecked", "thinkingInconclusive", "thinkingAttempts"):
             with self.subTest(field=field):
                 proof = passing_claude_result()
                 del proof[field]
@@ -1295,18 +1529,258 @@ def passing_canary(tool: str, version: str) -> dict:
     body = (passing_claude_result() if tool == "claude"
             else passing_codex_result())
     binary = hc.version_dir(tool, version) / "bin" / tool
+    companions = ensure_codex_companions(version) if tool == "codex" else {}
     hc.write_record("canary", tool, version, "passed", binarySha256=hc.sha256_file(binary), canary=body,
-                    canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
+                    companions=companions, canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
     return {"passed": True, "reasons": [], "result": body}
 
 
-class AutoTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
+class CompanionVerificationTests(FakeCliTestCase):
+    """promote, rollback and canary check every recorded companion next to the binary hash."""
 
+    def install_codex(self, version: str) -> Path:
+        bin_dir = self.root / "codex" / version / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "codex").write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+        (bin_dir / "codex").chmod(0o555)
+        ensure_codex_companions(version)
+        return self.root / "codex" / version
+
+    def tamper(self, path: Path, data: bytes | None) -> None:
+        os.chmod(path.parent, stat.S_IRWXU)
+        if data is None:
+            path.unlink()
+        else:
+            os.chmod(path, stat.S_IRWXU)
+            path.write_bytes(data)
+
+    def test_promote_refuses_changed_or_missing_companion(self) -> None:
+        for companion, data in (("bin/codex-code-mode-host", b"changed"), ("bin/codex-code-mode-host", None),
+                                ("codex-path/rg", b"changed"), ("codex-path/rg", None)):
+            with self.subTest(companion=companion, missing=data is None):
+                hc.remove_tree(self.root)
+                target = self.install_codex("0.166.0")
+                passing_canary("codex", "0.166.0")
+                self.tamper(target / companion, data)
+                with self.assertRaises(hc.HarnessError) as ctx:
+                    hc.promote("codex", "0.166.0")
+                self.assertIn(companion if data is not None else "missing", str(ctx.exception))
+                self.assertFalse((self.root / "codex" / "current").is_symlink())
+
+    def test_promote_refuses_a_canary_that_predates_the_companions(self) -> None:
+        self.install_codex("0.166.0")
+        # The 0.166.0 situation: a passing canary recorded before companions existed.
+        hc.write_record("canary", "codex", "0.166.0", "passed",
+                        binarySha256=hc.sha256_file(self.root / "codex" / "0.166.0" / "bin" / "codex"),
+                        canary=passing_codex_result(), canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.promote("codex", "0.166.0")
+        self.assertIn("companions differ from the canary record", str(ctx.exception))
+
+    def test_promote_refuses_when_no_companions_were_recorded(self) -> None:
+        bin_dir = self.root / "codex" / "0.166.0" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+        hc.write_record("canary", "codex", "0.166.0", "passed",
+                        binarySha256=hc.sha256_file(bin_dir / "codex"), companions={},
+                        canary=passing_codex_result(), canarySchemaVersion=hc.CANARY_SCHEMA_VERSION)
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.promote("codex", "0.166.0")
+        self.assertIn("no companion hashes recorded", str(ctx.exception))
+
+    def test_promote_records_verified_companions(self) -> None:
+        self.install_codex("0.166.0")
+        passing_canary("codex", "0.166.0")
+        hc.promote("codex", "0.166.0")
+        promote_record = [r for r in hc.tool_records("codex", "0.166.0") if r["action"] == "promote"][-1]
+        self.assertEqual(promote_record["companions"], hc.verify_companions("codex", "0.166.0"))
+
+    def test_rollback_refuses_a_last_known_good_with_a_changed_companion(self) -> None:
+        old = self.install_codex("0.166.0")
+        self.install_codex("0.167.0")
+        passing_canary("codex", "0.166.0")
+        passing_canary("codex", "0.167.0")
+        hc.promote("codex", "0.166.0")
+        hc.promote("codex", "0.167.0")
+        self.tamper(old / "bin" / "codex-code-mode-host", b"changed")
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.rollback("codex")
+        self.assertIn("codex-code-mode-host", str(ctx.exception))
+        self.assertEqual(hc.current_version_from_link("codex"), "0.167.0")
+
+    def test_rollback_refuses_a_last_known_good_with_a_changed_binary(self) -> None:
+        old = self.install_codex("0.166.0")
+        self.install_codex("0.167.0")
+        passing_canary("codex", "0.166.0")
+        passing_canary("codex", "0.167.0")
+        hc.promote("codex", "0.166.0")
+        hc.promote("codex", "0.167.0")
+        self.tamper(old / "bin" / "codex", b"#!/bin/sh\necho swapped\n")
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.rollback("codex")
+        self.assertIn("binary differs", str(ctx.exception))
+        self.assertEqual(hc.current_version_from_link("codex"), "0.167.0")
+
+    def test_rollback_with_intact_companions_still_works(self) -> None:
+        self.install_codex("0.166.0")
+        self.install_codex("0.167.0")
+        passing_canary("codex", "0.166.0")
+        passing_canary("codex", "0.167.0")
+        hc.promote("codex", "0.166.0")
+        hc.promote("codex", "0.167.0")
+        hc.rollback("codex")
+        self.assertEqual(hc.current_version_from_link("codex"), "0.166.0")
+
+    def test_canary_fails_closed_on_a_changed_companion_without_running_the_cli(self) -> None:
+        target = self.install_codex("0.166.0")
+        passing_canary("codex", "0.166.0")
+        self.tamper(target / "codex-path" / "rg", b"changed")
+        with mock.patch.object(hc, "canary_codex") as run:
+            verdict = hc.canary("codex", "0.166.0")
+        run.assert_not_called()
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(any("codex-path/rg" in r for r in verdict["reasons"]), verdict)
+        self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
+
+    def test_canary_records_companions_and_catches_a_change_during_the_run(self) -> None:
+        target = self.install_codex("0.166.0")
+        fake = {**passing_codex_home(hc.MODEL_CANARIES["codex"])}
+        cu = passing_codex_home(hc.CODEX_CU_MODELS)
+        homes = mock.patch.multiple(hc, make_throwaway_homes=mock.Mock(return_value=(None, self.tmp)),
+                                    make_codex_cu_home=mock.Mock(return_value=self.tmp))
+        (self.tmp / "config.toml").write_text('model = "gpt-6.1-terra"\n[features]\ncomputer_use = true\n')
+        (self.tmp / "models.json").write_text("{}")
+        (self.tmp / "AGENTS.md").write_text("")
+        with homes, mock.patch.object(hc, "binary_version", return_value="0.166.0"), \
+                mock.patch.object(hc, "canary_codex", side_effect=[fake, cu]):
+            verdict = hc.canary("codex", "0.166.0")
+        self.assertTrue(verdict["passed"], verdict)
+        record = [r for r in hc.tool_records("codex", "0.166.0") if r["action"] == "canary"][-1]
+        self.assertEqual(record["companions"], hc.verify_companions("codex", "0.166.0"))
+
+        calls = []
+
+        def swap_during_run(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                self.tamper(target / "bin" / "codex-code-mode-host", b"swapped mid-run")
+                return fake
+            return cu
+        with homes, mock.patch.object(hc, "binary_version", return_value="0.166.0"), \
+                mock.patch.object(hc, "canary_codex", side_effect=swap_during_run):
+            verdict = hc.canary("codex", "0.166.0")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(any("codex-code-mode-host" in r or "changed during" in r for r in verdict["reasons"]), verdict)
+        self.assertFalse(hc.latest_canary("codex", "0.166.0")["passed"])
+
+
+class RepairCompanionsTests(FakeCliTestCase):
+    """Trees staged by the old flat layout (bin/rg) get rg moved to codex-path/rg."""
+
+    def legacy_tree(self, version: str = "0.166.0") -> Path:
+        target = self.root / "codex" / version
+        bin_dir = target / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "codex").write_text("#!/bin/sh\necho codex\n", encoding="utf-8")
+        hashes = {}
+        for name in ("codex-code-mode-host", "rg"):
+            (bin_dir / name).write_bytes(COMPANION_BYTES[name])
+            hashes[name] = hc.sha256_file(bin_dir / name)
+        digest = hc.sha256_file(bin_dir / "codex")
+        # The real history: a stage record without companions, then a hand-written companions-added one.
+        hc.write_record("stage", "codex", version, "staged", binarySha256=digest)
+        hc.write_record("stage", "codex", version, "companions-added", binarySha256=digest, companions=hashes)
+        for path in bin_dir.iterdir():
+            path.chmod(0o555)
+        bin_dir.chmod(0o555)
+        target.chmod(0o555)
+        return target
+
+    def test_repair_moves_rg_to_codex_path_and_records_it(self) -> None:
+        target = self.legacy_tree()
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.verify_companions("codex", "0.166.0")
+        self.assertIn("repair-companions", str(ctx.exception))
+        out = hc.repair_companions("codex", "0.166.0")
+        self.assertEqual(out["status"], "repaired")
+        self.assertEqual(out["moved"], ["codex-path/rg"])
+        self.assertTrue((target / "codex-path" / "rg").is_file())
+        self.assertFalse((target / "bin" / "rg").exists())
+        self.assertEqual((target / "codex-path" / "rg").read_bytes(), COMPANION_BYTES["rg"])
+        for rel in ("bin/codex", "bin/codex-code-mode-host", "codex-path/rg"):
+            mode = os.stat(target / rel).st_mode
+            self.assertTrue(mode & stat.S_IXUSR and not mode & stat.S_IWUSR, rel)
+        for rel in (".", "bin", "codex-path"):
+            self.assertFalse(os.stat(target / rel).st_mode & stat.S_IWUSR, rel)
+        record = hc.tool_records("codex", "0.166.0")[-1]
+        self.assertEqual(record["action"], "repair-companions")
+        self.assertEqual(record["companions"]["rg"], hc.sha256_file(target / "codex-path" / "rg"))
+        self.assertEqual(hc.verify_companions("codex", "0.166.0"), record["companions"])
+
+    def test_repair_is_idempotent(self) -> None:
+        self.legacy_tree()
+        hc.repair_companions("codex", "0.166.0")
+        count = len(hc.tool_records("codex", "0.166.0"))
+        out = hc.repair_companions("codex", "0.166.0")
+        self.assertEqual(out["status"], "already-ok")
+        self.assertEqual(len(hc.tool_records("codex", "0.166.0")), count)
+
+    def test_repair_refuses_when_binary_differs_from_its_record(self) -> None:
+        target = self.legacy_tree()
+        os.chmod(target / "bin", stat.S_IRWXU)
+        os.chmod(target / "bin" / "codex", stat.S_IRWXU)
+        (target / "bin" / "codex").write_text("#!/bin/sh\necho swapped\n", encoding="utf-8")
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.repair_companions("codex", "0.166.0")
+        self.assertIn("binary differs", str(ctx.exception))
+        self.assertTrue((target / "bin" / "rg").is_file())
+        self.assertFalse((target / "codex-path").exists())
+
+    def test_repair_refuses_when_legacy_rg_differs_from_its_record(self) -> None:
+        target = self.legacy_tree()
+        os.chmod(target / "bin", stat.S_IRWXU)
+        os.chmod(target / "bin" / "rg", stat.S_IRWXU)
+        (target / "bin" / "rg").write_bytes(b"not the recorded rg")
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.repair_companions("codex", "0.166.0")
+        self.assertIn("bin/rg differs", str(ctx.exception))
+        self.assertFalse((target / "codex-path").exists())
+
+    def test_repair_refuses_without_recorded_companions(self) -> None:
+        bin_dir = self.root / "codex" / "0.166.0" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+        hc.write_record("stage", "codex", "0.166.0", "staged", binarySha256=hc.sha256_file(bin_dir / "codex"))
+        with self.assertRaises(hc.HarnessError) as ctx:
+            hc.repair_companions("codex", "0.166.0")
+        self.assertIn("no companion hashes recorded", str(ctx.exception))
+
+    def test_repaired_tree_promotes_after_a_fresh_canary(self) -> None:
+        self.legacy_tree()
+        hc.repair_companions("codex", "0.166.0")
+        passing_canary("codex", "0.166.0")
+        self.assertEqual(hc.promote("codex", "0.166.0")["status"], "promoted, rotation pending")
+
+    def test_repair_cli_takes_the_lock_and_prints_json(self) -> None:
+        self.legacy_tree()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(hc.main(["repair-companions", "codex", "0.166.0"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["status"], "repaired")
+        self.assertTrue((self.root / "lock").exists())
+
+
+class RepoHygieneTests(unittest.TestCase):
+    def test_bytecode_is_ignored_and_not_tracked(self) -> None:
+        ignore = (PKG / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn("__pycache__/", ignore)
+        tracked = subprocess.run(["git", "ls-files", "--", "."], cwd=PKG, capture_output=True, text=True)
+        if tracked.returncode == 0:
+            self.assertFalse([p for p in tracked.stdout.splitlines() if p.endswith(".pyc")])
+
+
+class AutoTests(FakeCliTestCase):
     def publish_both(self, claude_latest: str, codex_latest: str) -> None:
         """Answer npm the way the registry does: the wrapper package's `version` (what discover asks)
         and the native darwin package's dist.integrity and tarball (what stage fetches)."""
@@ -1484,12 +1958,6 @@ class RefreshTests(FakeCliTestCase):
 
 
 class RotationGateTests(FakeCliTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        gate = mock.patch.object(hc, "valid_codex_canary_home", side_effect=hc._valid_codex_canary_home_fields)
-        gate.start()
-        self.addCleanup(gate.stop)
-
     """The standing OK, the snapshot's fail-closed rule, and the rotation path end to end."""
 
     def install_codex(self, version: str = "0.166.0") -> None:
@@ -1497,12 +1965,14 @@ class RotationGateTests(FakeCliTestCase):
         bin_dir.mkdir(parents=True)
         (bin_dir / "codex").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
         (bin_dir / "codex").chmod(0o555)
+        ensure_codex_companions(version)
 
     def pend(self, version: str = "0.166.0") -> None:
         self.install_codex(version)
         hc.write_record("canary", "codex", version, "passed",
                         binarySha256=hc.sha256_file(self.root / "codex" / version / "bin" / "codex"),
                         canarySchemaVersion=hc.CANARY_SCHEMA_VERSION,
+                        companions=ensure_codex_companions(version),
                         canary=passing_codex_result())
         hc.promote("codex", version)
 

@@ -3389,6 +3389,7 @@ interface ActiveClaudeTurnContext {
   readonly promptUuid: string | null;
   promptEcho: "pending" | "confirmed";
   promptStarted: boolean;
+  promptAcceptedAt: DateTime.Utc | undefined;
   nativeWakeStarted: boolean;
   gatedFramesBeforeEcho: number;
   readonly heldRootFrames: Array<SDKMessage>;
@@ -4175,6 +4176,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               startedAt: context.startedAt,
               completedAt: null,
               tokenUsage,
+              ...(context.promptAcceptedAt === undefined
+                ? {}
+                : { promptAcceptedAt: context.promptAcceptedAt }),
             },
           });
         });
@@ -4646,6 +4650,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           status: input.status,
           startedAt: input.context.startedAt,
           completedAt: input.completedAt,
+          ...(input.context.promptAcceptedAt === undefined
+            ? {}
+            : { promptAcceptedAt: input.context.promptAcceptedAt }),
           ...(input.finish === undefined ? {} : { finish: input.finish }),
         });
 
@@ -7724,6 +7731,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   status: "running",
                   startedAt: context.startedAt,
                   completedAt: null,
+                  ...(context.promptAcceptedAt === undefined
+                    ? {}
+                    : { promptAcceptedAt: context.promptAcceptedAt }),
                   tokenUsage: {
                     usedTokens: afterTokenCount,
                     maxTokens,
@@ -8637,6 +8647,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
           );
 
+        const confirmPromptAccepted = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+        ) {
+          if (context.promptAcceptedAt !== undefined) return;
+          context.promptAcceptedAt = yield* DateTime.now;
+          yield* emitProviderEvent({
+            type: "provider_turn.updated",
+            driver: CLAUDE_PROVIDER,
+            providerTurn: providerTurnPayload({ context, status: "running", completedAt: null }),
+          });
+        });
+
         const releaseHeldRootFrames = Effect.fnUntraced(function* (
           context: ActiveClaudeTurnContext,
         ) {
@@ -8675,6 +8697,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
           if (claudeEchoedPromptUuids(message).includes(context.promptUuid)) {
+            yield* confirmPromptAccepted(context);
             if (
               liveQuery.promptEchoMode === "unknown" ||
               liveQuery.promptEchoMode === "acknowledged"
@@ -8695,6 +8718,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             if (lifecycle.state === "started") {
               context.promptStarted = true;
+              yield* confirmPromptAccepted(context);
             }
             // Claude finishes a prompt whose uuid its transcript already
             // holds without starting it, and no turn will ever answer it.
@@ -9457,6 +9481,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               promptUuid,
               promptEcho: isClaudeProviderContinuationTurn(turnInput) ? "confirmed" : "pending",
               promptStarted: false,
+              promptAcceptedAt: undefined,
               nativeWakeStarted: false,
               gatedFramesBeforeEcho: 0,
               heldRootFrames: [],

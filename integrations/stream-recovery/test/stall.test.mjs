@@ -122,7 +122,7 @@ test('observe restarts the clock on first sighting and on any change', () => {
   assert.notEqual(fingerprint([{ a: 1 }]), fingerprint([{ a: 2 }]));
 });
 
-const thread = (over = {}) => ({ threadId: 'ardud-control:thread:x', nativeSessionId: 'ses_x', title: 'T', origin: null, archived: false, activeRunId: 'run:1', pendingRequests: [], ...over });
+const thread = (over = {}) => ({ model: { instanceId: 'opencode' }, threadId: 'ardud-control:thread:x', nativeSessionId: 'ses_x', title: 'T', origin: null, archived: false, activeRunId: 'run:1', pendingRequests: [], ...over });
 const base = { ses: 'ses_x', kind: 'llm', limitMs: LLM_QUIET_MS, quietMs: LLM_QUIET_MS + 1, waiting: false, childActive: false, parentID: undefined, recent: 0 };
 
 test('planStall interrupts a hung top-level thread through Robob with a note', () => {
