@@ -355,6 +355,21 @@ export async function drive(
           // Include sustained activity, not only the first admission burst.
           yield* Effect.sleep("10 seconds");
           for (let sample = 0; sample < 40; sample++) {
+            // HTTP requests re-run SessionStore.verify under the sustained writer
+            // load above; keep their distributions separate from WS RPC timings.
+            yield* Effect.promise(() => measure("auth", () => request("/api/auth/session")));
+            yield* Effect.promise(() =>
+              measure("threadList", () => request("/api/orchestration/shell?paged=true")),
+            );
+
+            yield* Effect.promise(() =>
+              measure("boardGet", () => request("/api/ardud/kanban/boards/synthetic-board-0")),
+            );
+            yield* Effect.promise(() =>
+              measure("discussionGet", () =>
+                request(`/api/ardud/kanban/discussions/${discussionId}/messages`),
+              ),
+            );
             const boardId = KanbanBoardId.make("synthetic-board-0");
             const boardAction = randomUUID(),
               listAction = randomUUID(),
@@ -457,7 +472,8 @@ export async function drive(
         Object.entries(requests).map(([key, values]) => [key, percentiles(values)!]),
       );
       for (const [key, summary] of Object.entries(summaries)) {
-        metrics[key] = summary.p50;
+        // Gate v2 compares the median of per-run request p95, not p50.
+        metrics[key] = summary.p95;
         metrics[key + ".p50"] = summary.p50;
         metrics[key + ".p95"] = summary.p95;
       }

@@ -196,3 +196,34 @@ test("source artifact identity follows the entry checkout and runtime manifests"
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("request p50 companions are informational while primary p95 and pooled p99 stay gated", () => {
+  const base = runs("base", 100),
+    candidate = runs("candidate", 100);
+  for (const [group, low] of [
+    [base, 10],
+    [candidate, 20],
+  ] as const) {
+    for (const run of group) {
+      const values = [...Array(21).fill(low), ...Array(19).fill(100)];
+      const summary = percentiles(values)!;
+      run.metrics["auth.response.ms"] = summary.p95;
+      run.metrics["auth.response.ms.p50"] = summary.p50;
+      run.requests = { "auth.response.ms": values };
+    }
+  }
+  const result = compare(base, candidate, { metrics: {} });
+  assert.partialDeepStrictEqual(result, {
+    metrics: {
+      "auth.response.ms": { verdict: "pass", ratio: 1 },
+      "auth.response.ms.p50": { verdict: "info", ratio: 2 },
+    },
+    tails: { "auth.response.ms": { verdict: "pass", ratio: 1 } },
+  });
+  candidate.forEach((run) => {
+    run.metrics["auth.response.ms"] = 120;
+  });
+  assert.partialDeepStrictEqual(compare(base, candidate, { metrics: {} }), {
+    metrics: { "auth.response.ms": { verdict: "fail", ratio: 1.2 } },
+  });
+});

@@ -762,7 +762,7 @@ export const make = Effect.gen(function* () {
     function* (token) {
       if (devAuth?.matches(token)) {
         const row = yield* authSessions.getById({ sessionId: devAuth.sessionId }).pipe(
-          NodeSqliteClient.readOnly,
+          NodeSqliteClient.authReadOnly,
           Effect.mapError(
             (cause) =>
               new SessionCredentialVerificationError({ sessionId: devAuth.sessionId, cause }),
@@ -826,13 +826,22 @@ export const make = Effect.gen(function* () {
       }
 
       const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
-        NodeSqliteClient.readOnly,
+        NodeSqliteClient.authReadOnly,
         Effect.mapError(
           (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
         ),
       );
       if (Option.isNone(row)) {
         return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+      }
+      // Queueing must not extend a credential's lifetime.
+      const verifiedAt = yield* DateTime.now;
+      if (claims.exp <= verifiedAt.epochMilliseconds) {
+        return yield* new SessionTokenExpiredError({
+          sessionId: claims.sid,
+          expiresAt: expiresAt.value,
+          observedAt: verifiedAt,
+        });
       }
       if (row.value.revokedAt !== null) {
         return yield* new SessionTokenRevokedError({
@@ -928,7 +937,7 @@ export const make = Effect.gen(function* () {
     }
 
     const row = yield* authSessions.getById({ sessionId: claims.sid }).pipe(
-      NodeSqliteClient.readOnly,
+      NodeSqliteClient.authReadOnly,
       Effect.mapError(
         (cause) => new WebSocketTokenVerificationError({ sessionId: claims.sid, cause }),
       ),
@@ -936,11 +945,19 @@ export const make = Effect.gen(function* () {
     if (Option.isNone(row)) {
       return yield* new UnknownWebSocketSessionError({ sessionId: claims.sid });
     }
-    if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+    const verifiedAt = yield* DateTime.now;
+    if (claims.exp <= verifiedAt.epochMilliseconds) {
+      return yield* new WebSocketTokenExpiredError({
+        sessionId: claims.sid,
+        expiresAt: expiresAt.value,
+        observedAt: verifiedAt,
+      });
+    }
+    if (row.value.expiresAt.epochMilliseconds <= verifiedAt.epochMilliseconds) {
       return yield* new WebSocketSessionExpiredError({
         sessionId: claims.sid,
         expiresAt: row.value.expiresAt,
-        observedAt,
+        observedAt: verifiedAt,
       });
     }
     if (row.value.revokedAt !== null) {
