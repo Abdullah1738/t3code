@@ -99,6 +99,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const take = (op: Operation, semaphore: Semaphore.Semaphore, permits: number) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        const started = performance.now();
         while (!(yield* semaphore.takeIfAvailable(permits))) {
           // withPermits owns cancellation cleanup while waiting. The actual transfer
           // happens masked, so an interrupt cannot land between take and ownership.
@@ -106,6 +107,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             Effect.interruptible(wait(op, semaphore.withPermits(permits)(Effect.void))),
           );
         }
+        yield* Effect.annotateCurrentSpan('board.admission_wait_ms', performance.now() - started);
       }),
     );
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
