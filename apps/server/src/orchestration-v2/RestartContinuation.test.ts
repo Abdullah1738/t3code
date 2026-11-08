@@ -1620,3 +1620,60 @@ it.effect("hedges a failed OpenCode probe and keeps the stopped headline off it"
     }
   }),
 );
+
+it.each(["preparing", "starting", "running"] as const)(
+  "restarts original input interrupted during %s before a native thread exists",
+  (status) => {
+    const base = makeProjection();
+    for (const assigned of [false, true]) {
+      const preparing = {
+        ...base,
+        runs: [
+          {
+            ...base.runs[0]!,
+            status,
+            providerThreadId: assigned ? providerThreadId : null,
+            startedAt: null,
+          },
+        ],
+        providerThreads: [],
+        providerSessions: [],
+        providerTurns: [],
+      };
+      assert.equal(restartContinuationRun(preparing, now)?.id, runId);
+      assert.isUndefined(
+        restartContinuationRun(
+          {
+            ...preparing,
+            runs: [{ ...preparing.runs[0]!, status: "cancelled" }],
+          },
+          now,
+        ),
+      );
+    }
+  },
+);
+
+it.effect("replays preparation input and attachments with a durable idempotency key", () =>
+  Effect.gen(function* () {
+    const base = cutMidTurn({ providerThreadId: null, startedAt: null });
+    const original = {
+      id: MessageId.make("message:user"),
+      text: "Implement the migration",
+      context: { selection: "preserve original context" },
+      attachments: [],
+    } as unknown as OrchestrationV2ThreadProjection["messages"][number];
+    const projection = { ...base, providerTurns: [], providerThreads: [], messages: [original] };
+    const commands = yield* continuationDispatches(projection);
+    assert.lengthOf(commands, 1);
+    assert.equal(commands[0]!.text, original.text);
+    assert.deepEqual(commands[0]!.attachments, original.attachments);
+    assert.deepEqual(commands[0]!.context, original.context);
+    assert.equal(commands[0]!.commandId, `command:restart-continuation:${runId}`);
+    const replayed = { ...original, id: commands[0]!.messageId };
+    assert.deepEqual(
+      yield* continuationDispatches({ ...projection, messages: [original, replayed] }),
+      [],
+    );
+  }),
+);

@@ -1,3 +1,4 @@
+import { continuationReport } from "../fast-install/report.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
  * crw, CLIs). Thin wrappers over the services the WebSocket RPC and the T3 MCP
@@ -1664,6 +1665,16 @@ const makeRoutes = Effect.gen(function* () {
   const p = CONTROL_ROUTE_PREFIX;
   return [
     HttpRouter.route("GET", `${p}/health`, handle(health)),
+    HttpRouter.route(
+      "GET",
+      `${p}/install-report`,
+      handle(
+        Effect.gen(function* () {
+          yield* authenticate(AuthOrchestrationReadScope);
+          return jsonReply(continuationReport());
+        }),
+      ),
+    ),
     HttpRouter.route("GET", `${p}/requests`, handle(listRequests)),
     HttpRouter.route("GET", `${p}/projects`, handle(listProjects)),
     HttpRouter.route("GET", `${p}/models`, handle(listModels)),

@@ -1,3 +1,7 @@
+import {
+  markContinuationDispatched,
+  markContinuationFinished,
+} from "../ardud/fast-install/report.ts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -126,6 +130,23 @@ export type RestartContinuationSkipReason =
   | "no_running_turn"
   | "other";
 
+function preparationCut(
+  run: OrchestrationV2Run,
+  projection: Pick<ProjectionRuntimeRecoveryState, "providerThreads" | "providerTurns">,
+): boolean {
+  return (
+    (run.startedAt === null || run.providerThreadId === null) &&
+    !(projection.providerTurns ?? []).some((turn) => turn.runAttemptId === run.activeAttemptId) &&
+    (run.status === "preparing" ||
+      run.status === "starting" ||
+      (run.status === "running" &&
+        !projection.providerThreads.some(
+          (thread) =>
+            thread.id === run.providerThreadId && thread.nativeThreadRef?.strength === "strong",
+        )))
+  );
+}
+
 /** A settled run needs a live session, so an older crash cannot wake it. */
 export function restartContinuationDecision(
   projection: Pick<
@@ -143,7 +164,7 @@ export function restartContinuationDecision(
   const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
     (latest, candidate) =>
       candidate.status !== "queued" &&
-      !neverStarted(candidate) &&
+      (!neverStarted(candidate) || preparationCut(candidate, projection)) &&
       (!latest || runRanAfter(candidate, latest))
         ? candidate
         : latest,
@@ -153,10 +174,13 @@ export function restartContinuationDecision(
   const preparedContinuation =
     run.status === "starting" && run.restartContinuationOfRunId !== undefined;
   const settled = run.status === "completed" || run.status === "waiting";
-  if (run.status !== "running" && !preparedContinuation && !settled) return { skip: "other" };
+  const beforeProvider = preparationCut(run, projection);
+  if (run.status !== "running" && !beforeProvider && !preparedContinuation && !settled)
+    return { skip: "other" };
   if (restartContinuationBlocked(projection, run, now, settled)) return { skip: "blocked" };
   const liveTurnRequired = !preparedContinuation && !settled;
   if (projection.thread.providerInstanceId !== run.providerInstanceId) return { skip: "other" };
+  if (beforeProvider) return { run };
   const providerThread = projection.providerThreads.find(
     (thread) => thread.id === run.providerThreadId,
   );
@@ -309,6 +333,15 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       (message) => message.id === source.userMessageId,
     );
     if (sourceMessage !== undefined && isNativeMaintenanceCommand(sourceMessage)) return;
+    const replayOriginal = !projection.providerTurns.some(
+      (turn) => turn.runAttemptId === source.activeAttemptId,
+    );
+    if (
+      replayOriginal &&
+      sourceMessage === undefined &&
+      source.restartContinuationOfRunId === undefined
+    )
+      return;
     const note = restartContinuationNote(
       source,
       projection.runs,
@@ -332,11 +365,13 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     // ardud: the headline claims "stopped" only when the note kept cancelled work.
     const noteSaysCancelled = summary?.claimsCancelled === true;
     const text =
-      noteText === undefined
-        ? CONTINUE_PROMPT
-        : note.settled
-          ? noteText
-          : `${noteText}\n\n${CONTINUE_PROMPT}`;
+      replayOriginal && sourceMessage !== undefined
+        ? sourceMessage.text
+        : noteText === undefined
+          ? CONTINUE_PROMPT
+          : note.settled
+            ? noteText
+            : `${noteText}\n\n${CONTINUE_PROMPT}`;
     yield* threads
       .dispatch({
         type: "message.dispatch",
@@ -355,7 +390,10 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
               : "T3 Code restarted and resumed this turn",
           detail: text,
         },
-        attachments: [],
+        ...(replayOriginal && sourceMessage?.context !== undefined
+          ? { context: sourceMessage.context }
+          : {}),
+        attachments: replayOriginal ? (sourceMessage?.attachments ?? []) : [],
         modelSelection: source.modelSelection,
         dispatchMode: { type: "start_immediately" },
         createdBy: "agent",
@@ -363,6 +401,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         restartContinuationOfRunId: input.sourceRunId,
       })
       .pipe(
+        Effect.tap(() => Effect.sync(() => markContinuationDispatched(input.threadId))),
         // The project turned this instance off since the restart. No turn
         // resumes, and the success path below still runs so a delegated
         // child waiting on this run is recovered immediately instead of
@@ -383,6 +422,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
   // result. Once a continuation run exists this is a no-op; that run settles it.
   (effect, input) =>
     effect.pipe(
+      Effect.tap(() => Effect.sync(() => markContinuationFinished(input.threadId))),
       Effect.andThen(
         Effect.gen(function* () {
           const threads = yield* ThreadManagementService.ThreadManagementService;

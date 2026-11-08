@@ -1,3 +1,7 @@
+import {
+  recordContinuationDecision,
+  finishContinuationReport,
+} from "../ardud/fast-install/report.ts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -47,6 +51,12 @@ import {
   mergeRestartCancelledBackgroundWork,
   neverStarted,
 } from "./RestartBackgroundNote.ts";
+
+// Only startup continuation work may bypass global command readiness. The callback
+// runs after the thread's reconciliation transaction commits, never inside it.
+export class ReconciledThreadContinuation extends Context.Reference<
+  (threadId: ThreadId) => Effect.Effect<void>
+>("t3/ReconciledThreadContinuation", { defaultValue: () => () => Effect.void }) {}
 
 export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRuntimeRecoveryError>()(
   "ProviderRuntimeRecoveryError",
@@ -625,7 +635,10 @@ export const make = Effect.gen(function* () {
         });
       }
       for (const session of projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       )) {
         events.push({
           id: yield* allocateEventId(),
@@ -686,7 +699,10 @@ export const make = Effect.gen(function* () {
           ]
         : [];
       const stoppedSessions = projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       ).length;
       let retiredEffects: number;
       // ardud: count only continuation effects submitted with a committed reconciliation.
@@ -774,6 +790,14 @@ export const make = Effect.gen(function* () {
       trigger === "startup"
         ? yield* settings.getSettingsWithTrust.pipe(Effect.orElseSucceed(() => null))
         : null;
+    const onReconciled = yield* ReconciledThreadContinuation;
+    // Reset old leases before any new worker starts. Resetting them at the end
+    // would steal claims from continuations already running in this process.
+    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
+      Effect.mapError(
+        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
+      ),
+    );
     const threadIds = yield* projections
       .getRecoveryThreadIds("runtime")
       .pipe(
@@ -845,52 +869,80 @@ export const make = Effect.gen(function* () {
       stoppedSessions++;
     }
 
-    for (const threadId of threadIds) {
-      const projection = yield* projections.getRuntimeRecoveryProjection(threadId).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderRuntimeRecoveryError({
-              operation: "read-projections",
-              threadId,
-              cause,
-            }),
-        ),
-      );
-      // ardud: unreadable settings never enable continuation, even with a project override.
-      const continuationSetting =
-        settingsSnapshot === null || !settingsSnapshot.trusted
-          ? ("settings_unreadable" as const)
-          : resolveProjectSettings(settingsSnapshot.settings, projection.thread.projectId).settings
-                .continueThreadsAfterServerUpdate
-            ? ("enabled" as const)
-            : ("settings_disabled" as const);
-      const result = yield* reconcileProjection(
-        projection,
-        trigger,
-        continuationSetting,
-        stoppedThisPass,
-      );
-      for (const session of projection.providerSessions) {
-        if (session.status !== "stopped" && session.status !== "error") {
-          stoppedThisPass.set(session.id, session);
+    const priority =
+      trigger === "startup"
+        ? yield* projections
+            .getRecoveryThreadIds("interrupted-runs")
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderRuntimeRecoveryError({ operation: "read-projections", cause }),
+              ),
+            )
+        : [];
+    const recoverThread = (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const projection = yield* projections.getRuntimeRecoveryProjection(threadId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderRuntimeRecoveryError({
+                operation: "read-projections",
+                threadId,
+                cause,
+              }),
+          ),
+        );
+        // ardud: unreadable settings never enable continuation, even with a project override.
+        const continuationSetting =
+          settingsSnapshot === null || !settingsSnapshot.trusted
+            ? ("settings_unreadable" as const)
+            : resolveProjectSettings(settingsSnapshot.settings, projection.thread.projectId)
+                  .settings.continueThreadsAfterServerUpdate
+              ? ("enabled" as const)
+              : ("settings_disabled" as const);
+        const result = yield* reconcileProjection(
+          projection,
+          trigger,
+          continuationSetting,
+          stoppedThisPass,
+        );
+        for (const session of projection.providerSessions) {
+          if (
+            !stoppedThisPass.has(session.id) &&
+            session.status !== "stopped" &&
+            session.status !== "error"
+          ) {
+            stoppedThisPass.set(session.id, session);
+          }
         }
-      }
-      terminalizedRuns += result.terminalizedRuns;
-      stoppedSessions += result.stoppedSessions;
-      closedRequests += result.closedRequests;
-      retiredEffects += result.retiredEffects;
-      continuationsQueued += result.continuationsQueued;
-      staleOpenCodeAborted += result.staleOpenCodeAborted;
-      staleOpenCodeAbortFailed += result.staleOpenCodeAbortFailed;
-      if (result.continuationSkip !== undefined) skipped[result.continuationSkip]++;
-    }
-    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
-      Effect.mapError(
-        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
-      ),
+        terminalizedRuns += result.terminalizedRuns;
+        stoppedSessions += result.stoppedSessions;
+        closedRequests += result.closedRequests;
+        retiredEffects += result.retiredEffects;
+        continuationsQueued += result.continuationsQueued;
+        staleOpenCodeAborted += result.staleOpenCodeAborted;
+        staleOpenCodeAbortFailed += result.staleOpenCodeAbortFailed;
+        if (result.continuationSkip !== undefined) skipped[result.continuationSkip]++;
+        if (trigger === "startup")
+          recordContinuationDecision({
+            threadId,
+            continued: result.continuationsQueued > 0,
+            ...(result.continuationsQueued > 0
+              ? {}
+              : { reason: result.continuationSkip ?? "no_candidate" }),
+          });
+        if (trigger === "startup") yield* onReconciled(threadId);
+      });
+    yield* Effect.forEach(priority, recoverThread, { concurrency: 4, discard: true });
+    const priorityIds = new Set(priority);
+    yield* Effect.forEach(
+      threadIds.filter((id) => !priorityIds.has(id)),
+      recoverThread,
+      { concurrency: 4, discard: true },
     );
     // ardud: one startup log, including zero-candidate starts, for post-restart diagnosis.
     if (trigger === "startup") {
+      finishContinuationReport();
       yield* Effect.logInfo("orchestration-v2.restart-continuation.summary", {
         threadsRead: threadIds.length,
         runsCancelled: terminalizedRuns,

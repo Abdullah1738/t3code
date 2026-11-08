@@ -1,3 +1,4 @@
+import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Random from "effect/Random";
@@ -20,7 +21,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
+import { FetchHttpClient, HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -700,7 +701,11 @@ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
 const layerCommandReadiness = HttpRouter.middleware(
   (httpEffect) =>
     Effect.flatMap(ServerRuntimeStartup.ServerRuntimeStartup, (startup) =>
-      startup.awaitCommandReady.pipe(Effect.orDie, Effect.andThen(httpEffect)),
+      Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
+        canServeBeforeRecovery(request.method, request.headers.upgrade)
+          ? httpEffect
+          : startup.awaitCommandReady.pipe(Effect.orDie, Effect.andThen(httpEffect)),
+      ),
     ),
   { global: true },
 );

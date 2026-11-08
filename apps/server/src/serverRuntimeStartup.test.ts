@@ -309,8 +309,8 @@ it.effect("starts without scanning or rebuilding projection history", () =>
     });
 
     assert.deepEqual(yield* Ref.get(calls), [
-      "import",
       "recover",
+      "import",
       "delegated",
       "worker",
       "bootstrap",
@@ -573,4 +573,26 @@ it.effect("enabled startup telemetry records zero counts when projection fails",
       { event: "server.boot.heartbeat", properties: { threadCount: 0, projectCount: 0 } },
     ]);
   }),
+);
+
+it.effect("closes admissions again after a ready server begins shutdown", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const gate = yield* ServerRuntimeStartup.makeCommandGate;
+      yield* gate.signalCommandReady;
+      yield* gate.awaitCommandReady;
+      yield* gate.failCommandReady(
+        new ServerRuntimeStartup.ServerRuntimeStartupError({
+          mode: "web",
+          host: "127.0.0.1",
+          port: 3773,
+          cause: "shutdown",
+        }),
+      );
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(gate.awaitCommandReady)));
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(gate.enqueueCommand(Effect.die("must not run")))),
+      );
+    }),
+  ),
 );
