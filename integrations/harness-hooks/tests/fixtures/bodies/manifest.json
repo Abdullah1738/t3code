@@ -1,0 +1,55 @@
+{
+  "crpko-2743-edit.py": {
+    "card": 2743,
+    "cwd": "/Users/ardud/CrpkoArchitectureBroker/tmp/spot-sell-fee-escrow-settlement",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "7d462682ad084d99e8b7fc3959f00dcbbc578bbbf52aebdcbb31acba18d6e1e2",
+    "source": "/Users/ardud/CrpkoArchitectureBroker/tmp/spot-sell-fee-escrow-settlement/tmp/escrow-settlement/edit.py"
+  },
+  "crpko-2774-make_cancel_probes.py": {
+    "card": 2774,
+    "cwd": "/Volumes/ExternalSSD/board-wt/edge-api-pr215-r3",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "372ce6d529aad0f429303f4a41b49950e256c82e59026e6bbbeeb3e12c490ad0",
+    "source": "/Volumes/ExternalSSD/crpko-devops/tmp/card-1013/astra-r3/probes/make_cancel_probes.py"
+  },
+  "usdtwallet-140-proof.sh": {
+    "card": 140,
+    "cwd": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-bridge-restart-both-trackers",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "1509d8b3278596361b491675e3b252e6dd80cce40a7284a00599e5d0023439df",
+    "source": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-bridge-restart-both-trackers/tmp/card140/proof.sh"
+  },
+  "usdtwallet-142-campaign.py": {
+    "card": 142,
+    "cwd": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-142-fee-recovery-order",
+    "exact": true,
+    "heredoc_target": "tmp/142/campaign.py",
+    "kind": "script-body",
+    "original_path": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-142-fee-recovery-order/tmp/142/campaign.py",
+    "original_path_missing": true,
+    "redactions": [],
+    "sha256": "428d3bc8faf0c86ef7b5a8dde8e893842018c0ff7d225917863214d0ef24c0c7",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/07/rollout-2026-11-07T21-07-30-01a1b6fa-c747-7f40-a6fa-42c378ce6bf3.jsonl",
+    "source_line_0": 162
+  },
+  "usdtwallet-142-loops.sh": {
+    "card": 142,
+    "cwd": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-142-fee-recovery-order",
+    "exact": true,
+    "heredoc_target": "tmp/142/loops.sh",
+    "kind": "script-body",
+    "original_path": "/Users/ardud/.robob/worktrees/usdtwallet-android/test-142-fee-recovery-order/tmp/142/loops.sh",
+    "original_path_missing": true,
+    "redactions": [],
+    "sha256": "35ab5bb8f13015db67803f4526a4b79c27bab772f85ed8111b684c038c16df53",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/07/rollout-2026-11-07T21-07-30-01a1b6fa-c747-7f40-a6fa-42c378ce6bf3.jsonl",
+    "source_line_0": 162
+  }
+}
