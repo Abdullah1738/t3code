@@ -2,6 +2,7 @@ import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -1879,7 +1880,7 @@ it.effect("marks committed writes separately from reads and rolled back writes",
     })).pipe(Effect.ignore);
     yield* sql`SELECT * FROM commits`;
   }).pipe(
-    Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+    Effect.provide(SqliteClient.layer({ filename: ":memory:", statementMetrics: true })),
     Effect.provideService(Statement.SpanPropagationEnabled, true),
     Effect.withTracer(tracer),
     Effect.map(() => {
@@ -1889,3 +1890,37 @@ it.effect("marks committed writes separately from reads and rolled back writes",
     }),
   );
 });
+
+
+it.effect("keeps statement metrics opt-in with explicit configuration taking precedence", () =>
+  Effect.gen(function* () {
+    for (const [option, env, expected] of [
+      [undefined, {}, false],
+      [undefined, { ROBOB_SQL_STATEMENT_METRICS: "true" }, true],
+      [false, { ROBOB_SQL_STATEMENT_METRICS: "true" }, false],
+      [true, {}, true],
+    ] as const) {
+      const spans: Array<Tracer.NativeSpan> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE metrics(value TEXT)`;
+        yield* sql`INSERT INTO metrics VALUES ('committed')`;
+        assert.deepEqual(yield* sql`SELECT * FROM metrics`, [{ value: "committed" }]);
+      }).pipe(
+        Effect.provide(SqliteClient.layer({ filename: ":memory:", statementMetrics: option })),
+        Effect.provideService(Statement.SpanPropagationEnabled, true),
+        Effect.withTracer(tracer),
+        Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+      );
+      assert.equal(spans.some((span) => span.attributes.has("db.commit.at_ms")), expected);
+      assert.equal(spans.some((span) => span.attributes.has("db.rows_returned")), expected);
+    }
+  }),
+);

@@ -4,6 +4,7 @@ import * as NodeWorkerThreads from "node:worker_threads";
 
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -35,6 +36,8 @@ export interface SqliteClientConfig {
   readonly prepareCacheSize?: number | undefined;
   readonly prepareCacheTTL?: Duration.Input | undefined;
   readonly spanAttributes?: Record<string, unknown> | undefined;
+  /** Diagnostic row counts and commit timestamps; off unless explicitly enabled. */
+  readonly statementMetrics?: boolean | undefined;
   readonly transformResultNames?: ((str: string) => string) | undefined;
   readonly transformQueryNames?: ((str: string) => string) | undefined;
   /**
@@ -1024,6 +1027,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
 ): Effect.fn.Return<Client.SqlClient, SqlError, Scope.Scope | Reactivity.Reactivity> {
   yield* checkNodeSqliteCompat();
+  const statementMetrics =
+    options.statementMetrics ??
+    (yield* Config.Boolean("ROBOB_SQL_STATEMENT_METRICS").pipe(
+      Config.withDefault(false),
+      Effect.orDie,
+    ));
 
   const compiler = Statement.makeCompilerSqlite(options.transformQueryNames);
   const isFileDatabase = options.filename !== ":memory:" && options.filename !== "";
@@ -1181,19 +1190,21 @@ const make = Effect.fn("makeWithDatabase")(function* (
               const result = statement.run(...(params as any));
               return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
             });
-            // SQLite has returned and released the outer transaction. This marks
-            // each commit, not an atomic receipt for a multi-write service call.
-            try {
-              const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
-              if (span?._tag === "Span") {
-                span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
-                span.attribute("db.stmt_status.available", false);
-                if (!db.isTransaction && /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)) {
-                  span.attribute("db.commit.at_ms", fiber.getRef(Clock.Clock).currentTimeMillisUnsafe());
-                  span.attribute("db.commit.boundary", "sqlite-returned");
+            if (statementMetrics) {
+              // SQLite has returned and released the outer transaction. This marks
+              // each commit, not an atomic receipt for a multi-write service call.
+              try {
+                const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+                if (span?._tag === "Span") {
+                  span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
+                  span.attribute("db.stmt_status.available", false);
+                  if (!db.isTransaction && /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)) {
+                    span.attribute("db.commit.at_ms", fiber.getRef(Clock.Clock).currentTimeMillisUnsafe());
+                    span.attribute("db.commit.boundary", "sqlite-returned");
+                  }
                 }
-              }
-            } catch { /* Observing a committed write must never change its result. */ }
+              } catch { /* Observing a committed write must never change its result. */ }
+            }
             result = Exit.succeed(value);
           } catch (cause) {
             result = Exit.fail(
