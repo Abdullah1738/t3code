@@ -1,3 +1,4 @@
+import { CurrentAction, allocateAction, markAction } from "../ardud/actionTelemetry.ts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import {
@@ -23,6 +24,7 @@ import {
 export interface EnvironmentHttpAuthHeaders {
   readonly authorization?: string;
   readonly dpop?: string;
+  readonly "x-robob-action-id"?: string;
 }
 
 export function withOrchestrationProtocolHeader(
@@ -137,6 +139,8 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
   RemoteEnvironmentRequestError,
   Effect.Services<ReturnType<typeof makeEnvironmentHttpApiGroupClient<Group>>> | R
 > {
+  const action = (yield* CurrentAction) ?? (yield* allocateAction(`http.${input.group}.${input.method}`));
+  yield* Effect.annotateCurrentSpan({'action.id':action.id});
   let httpBaseUrl = input.prepared.httpBaseUrl;
   const requestUrlFor = (baseUrl: string) =>
     input.url(makeEnvironmentHttpApiUrlBuilder(baseUrl)[input.group]);
@@ -184,7 +188,7 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
       const result = yield* executeEnvironmentHttpRequest(
         requestUrl,
         input.timeoutMs,
-        withEnvironmentCredentials(authorization, input.request({ client, headers })),
+        withEnvironmentCredentials(authorization, input.request({ client, headers: {...headers, "x-robob-action-id":action.id} })),
       ).pipe(Effect.result);
 
       if (Result.isFailure(result)) {
@@ -213,6 +217,7 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
           cause: result.success,
         });
       }
+      yield* Effect.sync(() => markAction(action, 'state-ready'));
       return result.success;
     }
   }).pipe(

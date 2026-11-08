@@ -1,3 +1,4 @@
+import { annotateHttpAction } from "../observability/actionCorrelation.ts";
 /**
  * Small HTTP surface for the Missions board, for scripts and local tools
  * (the board UI uses the WS RPC group). Every write acts as the owner, so it
@@ -233,7 +234,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     const handle = <R>(
       effect: Effect.Effect<HttpServerResponse.HttpServerResponse, KanbanError, R>,
     ) =>
-      effect.pipe(
+      annotateHttpAction.pipe(Effect.andThen(effect),
         Effect.catchTags({
           KanbanError: (error) =>
             Effect.succeed(

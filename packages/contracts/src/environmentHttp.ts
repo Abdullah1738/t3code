@@ -74,11 +74,13 @@ import {
 } from "./relay.ts";
 
 const OptionalBearerHeaders = Schema.Struct({
+  "x-robob-action-id": Schema.optionalKey(Schema.String),
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
 });
 
 const OrchestrationProtocolHeaders = Schema.Struct({
+  "x-robob-action-id": Schema.optionalKey(Schema.String),
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
   [ORCHESTRATION_PROTOCOL_HEADER]: Schema.Literal(ORCHESTRATION_PROTOCOL_VERSION_TEXT),

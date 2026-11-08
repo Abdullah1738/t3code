@@ -1,3 +1,4 @@
+import { actionIdAttributes } from "../ardud/observability/actionCorrelation.ts";
 import {
   // ardud: missions board
   KANBAN_AGGREGATES,
@@ -239,7 +240,7 @@ export class RpcInstrumentation extends RpcMiddleware.Service<RpcInstrumentation
   "t3/server/RpcInstrumentation",
 ) {}
 
-export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc }) => {
+export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect, { rpc, headers }) => {
   const method = rpc._tag;
   const measured = effect.pipe(
     withMetrics({ counter: rpcRequestsTotal, timer: rpcRequestDuration, attributes: { method } }),
@@ -253,6 +254,7 @@ export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect
       attributes: {
         ...DEFAULT_RPC_SPAN_ATTRIBUTES,
         "rpc.method": method,
+        ...actionIdAttributes(headers['x-robob-action-id']),
         "rpc.aggregate": RPC_AGGREGATES[method as WsRpcMethod],
       },
     }),

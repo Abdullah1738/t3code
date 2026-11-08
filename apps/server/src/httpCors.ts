@@ -2,6 +2,7 @@ import { ORCHESTRATION_PROTOCOL_HEADER } from "@t3tools/contracts";
 
 export const browserApiCorsAllowedMethods = ["GET", "POST", "OPTIONS"] as const;
 export const browserApiCorsAllowedHeaders = [
+  "x-robob-action-id",
   "authorization",
   "b3",
   "traceparent",

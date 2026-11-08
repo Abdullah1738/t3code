@@ -1,3 +1,4 @@
+import { CurrentAction, markAction, allocateAction, withAction } from "../ardud/actionTelemetry.ts";
 import {
   EnvironmentAuthorizationError,
   clientRpcRequiredScopes,
@@ -205,7 +206,11 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
     environmentId: supervisor.target.environmentId,
     method: tag,
   });
-  return yield* method(input).pipe(Effect.ensuring(completeObservation));
+  const action = (yield* CurrentAction) ?? (yield* allocateAction(tag));
+  return yield* withAction(method(input), action).pipe(
+    Effect.tap(() => Effect.sync(() => markAction(action, 'state-ready'))),
+    Effect.ensuring(completeObservation),
+  );
 });
 
 export function runStreamGuarded<TTag extends EnvironmentStreamCommandRpcTag>(

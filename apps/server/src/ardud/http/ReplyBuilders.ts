@@ -12,5 +12,17 @@ export const layer = Layer.effect(ReplyBuilders, Semaphore.make(2));
 
 export const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.flatMap(Effect.serviceOption(ReplyBuilders), (builders) =>
-    builders._tag === "Some" ? builders.value.withPermits(1)(effect) : effect,
+    builders._tag === "Some"
+      ? Effect.suspend(() => {
+          const started = performance.now();
+          return builders.value.withPermits(1)(
+            Effect.suspend(() =>
+              Effect.annotateCurrentSpan(
+                "reply_builder.admission_wait_ms",
+                performance.now() - started,
+              ).pipe(Effect.andThen(effect)),
+            ),
+          );
+        })
+      : effect,
   );
