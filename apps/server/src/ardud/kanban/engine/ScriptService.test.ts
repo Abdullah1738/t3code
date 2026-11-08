@@ -522,7 +522,7 @@ it.effect("a legacy script resolves only when enabled and exact pool keys stay u
       instanceId: "claudeAgent",
       model: "claude-opus-5-5",
       effort: "high",
-      options: [{ id: "fastMode", value: true }],
+      options: [{ id: "thinking", value: true }],
     });
     // The mapped default is another level of this model; add an explicit pool so
     // this test also checks the script keeps the selected pool's secondary options.

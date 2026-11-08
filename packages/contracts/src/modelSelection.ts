@@ -52,7 +52,7 @@ const modelSelectionSchema = (normalize: boolean) =>
             }
             return standard;
           }),
-        encode: (value) => {
+        encode: (value: typeof ModelSelectionWire.Encoded) => {
           const base: Record<string, unknown> = {
             instanceId: value.instanceId,
             model: value.model,

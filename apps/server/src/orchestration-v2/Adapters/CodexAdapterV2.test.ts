@@ -1765,6 +1765,7 @@ function codexReplayPreamble(input: {
           input: [{ type: "text", text: input.sentPrompt ?? input.prompt }],
           cwd: "/workspace",
           model: "gpt-5.4",
+          serviceTier: "default",
           approvalPolicy: "never",
           approvalsReviewer: "user",
           sandboxPolicy: { type: "dangerFullAccess" },
@@ -2544,6 +2545,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           model: "gpt-5.4",
           config: {
             "tools.update_plan.enabled": true,
+            service_tier: "default",
             mcp_optional_startup_grace_ms: 10_000,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
@@ -3379,6 +3381,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 input: [{ type: "text", text: turnText(index) }],
                 cwd: "/workspace",
                 model: "gpt-5.4",
+                serviceTier: "default",
                 ...turnPolicies[turnModes[index]!],
                 summary: "detailed",
               },
@@ -4120,6 +4123,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   input: [],
                   cwd: "/workspace",
                   model: "gpt-5.4",
+                  serviceTier: "default",
                   approvalPolicy: "never",
                   approvalsReviewer: "user",
                   sandboxPolicy: { type: "dangerFullAccess" },

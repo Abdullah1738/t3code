@@ -753,6 +753,7 @@ class GenerateTests(HarnessTestCase):
         original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
         expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
                               max_context_window=1050000, auto_compact_token_limit=450000,
+                              default_service_tier="default", service_tiers=[],
                               base_instructions=original["model_messages"]["instructions_template"])
         self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)
         self.assertEqual(cu_models.pop("gpt-6.1-terra"), dict(expected_terra, slug="gpt-6.1-terra"))
