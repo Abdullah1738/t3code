@@ -269,7 +269,27 @@ export function buildServerProvider(input: {
     setup: { canAuthenticate: false, canInstall: false },
     checkedAt: input.checkedAt,
     ...(input.probe.message ? { message: input.probe.message } : {}),
-    models: input.models,
+    models: input.models.map((model) => ({
+      ...model,
+      ...(model.capabilities
+        ? {
+            capabilities: {
+              ...model.capabilities,
+              optionDescriptors: (model.capabilities.optionDescriptors ?? [])
+                .filter((option) => option.id !== "fastMode")
+                .map((option) =>
+                  option.id === "serviceTier" && option.type === "select"
+                    ? {
+                        ...option,
+                        currentValue: "default",
+                        options: [{ id: "default", label: "Standard", isDefault: true }],
+                      }
+                    : option,
+                ),
+            },
+          }
+        : {}),
+    })),
     ...(input.updateRequiredModels?.length
       ? { updateRequiredModels: input.updateRequiredModels }
       : {}),

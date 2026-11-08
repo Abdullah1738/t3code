@@ -222,6 +222,22 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
+  it("overrides fast options, SDK settings and launch flags with standard mode", () => {
+    const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: {
+        ...CLAUDE_TEST_MODEL_SELECTION,
+        options: [{ id: "fastMode", value: true }],
+      },
+      nativeThreadId: "standard-thread",
+      resume: true,
+      cwd: "/workspace",
+      sdkSettings: { fastMode: true },
+      settings: { ...DEFAULT_CLAUDE_SETTINGS, launchArgs: '--fast --settings {"fastMode":true}' },
+    });
+    assert.include(options.settings, { fastMode: false });
+    assert.notProperty(options.extraArgs ?? {}, "fast");
+    assert.notProperty(options.extraArgs ?? {}, "settings");
+  });
   it.each([false, true])("requests thinking summaries with resume=%s", (resume) => {
     const options = ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: CLAUDE_TEST_MODEL_SELECTION,
@@ -3586,9 +3602,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* settle;
           assert.deepEqual(harness.liveSelectionChanges, [
             { model: "claude-opus-5-5" },
-            { effortLevel: "xhigh", fastMode: true, ultracode: true },
+            { effortLevel: "xhigh", fastMode: false, ultracode: true },
             { model: "claude-sonnet-4-6" },
-            { effortLevel: "high", fastMode: null, ultracode: null },
+            { effortLevel: "high", fastMode: false, ultracode: null },
           ]);
           assert.strictEqual(harness.getOpenedOptions(), originalOptions);
           assert.lengthOf(harness.offeredMessages, 4);

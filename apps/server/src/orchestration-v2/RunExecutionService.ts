@@ -1,8 +1,10 @@
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   isOrchestrationV2WorkActive,
   CommandId,
+  standardModelSelection,
   type EventId,
   type ModelSelection,
   type NodeId,
@@ -1531,6 +1533,18 @@ export const layer: Layer.Layer<
           key: `mcp_app_${entry.itemId.replace(/[^\w.-]/g, "_")}`,
           text: entry.text,
         }));
+        const standardSelection = standardModelSelection(
+          input.modelSelection,
+          input.session.driver,
+        );
+        if (!modelSelectionsEqual(standardSelection, input.modelSelection)) {
+          yield* Effect.logWarning("Standard mode enforced before provider turn").pipe(
+            Effect.annotateLogs({
+              provider: input.session.driver,
+              model: input.modelSelection.model,
+            }),
+          );
+        }
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -1549,7 +1563,7 @@ export const layer: Layer.Layer<
           rootNodeId: input.rootNode.id,
           providerThread: input.providerThread,
           message: input.message,
-          modelSelection: input.modelSelection,
+          modelSelection: standardSelection,
           runtimePolicy: input.runtimePolicy,
           ...(appContext.length === 0 ? {} : { appContext }),
         };

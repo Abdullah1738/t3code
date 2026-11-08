@@ -62,7 +62,7 @@ const ModelInputFields = {
   options: Schema.optional(
     describe(
       Schema.Array(ProviderOptionSelection),
-      "Full provider options, including fastMode or serviceTier.",
+      "Provider options. Standard mode only: serviceTier default, fastMode false.",
     ),
   ),
 };

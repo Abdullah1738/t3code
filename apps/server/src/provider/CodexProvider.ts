@@ -104,10 +104,6 @@ const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
 
 const DEFAULT_SERVICE_TIER_ID = "default";
 
-const SERVICE_TIER_DESCRIPTIONS: Readonly<Record<string, string>> = {
-  ultrafast: "Even faster, more expensive",
-};
-
 function reasoningEffortLabel(reasoningEffort: string): string {
   return REASONING_EFFORT_LABELS[reasoningEffort] ?? reasoningEffort;
 }
@@ -190,12 +186,7 @@ export function mapCodexModelCapabilities(
           name: id === "fast" ? "Fast" : id,
           description: "",
         }));
-  const catalogDefaultServiceTier = serviceTiers.some(
-    (tier) => tier.id === model.defaultServiceTier,
-  )
-    ? model.defaultServiceTier
-    : null;
-  const defaultServiceTier = catalogDefaultServiceTier ?? DEFAULT_SERVICE_TIER_ID;
+  const defaultServiceTier = DEFAULT_SERVICE_TIER_ID;
   const optionDescriptors: ProviderOptionDescriptor[] = [];
 
   if (reasoningOptions.length > 0) {
@@ -218,15 +209,6 @@ export function mapCodexModelCapabilities(
           label: "Standard",
           ...(defaultServiceTier === DEFAULT_SERVICE_TIER_ID ? { isDefault: true } : {}),
         },
-        ...serviceTiers.map((tier) => {
-          const description = SERVICE_TIER_DESCRIPTIONS[tier.id] ?? tier.description;
-          return {
-            id: tier.id,
-            label: tier.name,
-            ...(description ? { description } : {}),
-            ...(defaultServiceTier === tier.id ? { isDefault: true } : {}),
-          };
-        }),
       ],
       currentValue: defaultServiceTier,
     });
@@ -274,7 +256,7 @@ function applyConfiguredCodexServiceTier(
   models: ReadonlyArray<ServerProviderModel>,
   serviceTier: string | undefined,
 ): ReadonlyArray<ServerProviderModel> {
-  if (!serviceTier) return models;
+  serviceTier = "default";
   return models.map((model) => {
     if (!model.capabilities?.optionDescriptors) return model;
     return {

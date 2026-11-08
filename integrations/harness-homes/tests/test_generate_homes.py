@@ -454,7 +454,13 @@ class GenerateTests(HarnessTestCase):
         others_raw = [m for m in raw["models"] if m["slug"] not in extended]
         others_gen = [m for m in generated["models"] if m["slug"] not in extended]
         self.assertTrue(others_raw)
+        for model in others_raw:
+            model["default_service_tier"] = "default"
+            model["service_tiers"] = []
         self.assertEqual(others_raw, others_gen)
+        self.assertTrue(all(m["default_service_tier"] == "default" and m["service_tiers"] == [] for m in generated["models"]))
+        self.assertEqual(tomllib.loads((self.codex / "config.toml").read_text())["service_tier"], "default")
+        self.assertIs(json.loads((self.claude / "settings.json").read_text())["fastMode"], False)
 
     def test_models_json_refuses_missing_slug(self) -> None:
         m = self.manifest()

@@ -225,9 +225,15 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
   );
 
   it.effect.each([
-    { thinking: true, settings: '{"disableAllHooks":true,"alwaysThinkingEnabled":true}' },
-    { thinking: false, settings: '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' },
-    { thinking: undefined, settings: '{"disableAllHooks":true}' },
+    {
+      thinking: true,
+      settings: '{"disableAllHooks":true,"alwaysThinkingEnabled":true,"fastMode":false}',
+    },
+    {
+      thinking: false,
+      settings: '{"disableAllHooks":true,"alwaysThinkingEnabled":false,"fastMode":false}',
+    },
+    { thinking: undefined, settings: '{"disableAllHooks":true,"fastMode":false}' },
   ])("forwards only the explicit thinking choice ($thinking)", ({ thinking, settings }) =>
     withFakeClaudeEnv(
       {
@@ -310,7 +316,7 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
               body: "Body",
             },
           }),
-          argsMustContain: `--model ${SYNTHETIC_CLAUDE_CAPABLE_MODEL}[expanded] --effort max --settings {"disableAllHooks":true,"fastMode":true}`,
+          argsMustContain: `--model ${SYNTHETIC_CLAUDE_CAPABLE_MODEL}[expanded] --effort max --settings {"disableAllHooks":true,"fastMode":false}`,
           claudeConfig: { customModels: [SYNTHETIC_CLAUDE_COLLIDING_ALIAS] },
         },
         (textGeneration) =>

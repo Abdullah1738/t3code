@@ -625,7 +625,7 @@ describe("CodexAdapterV2 runtime policy", () => {
 
         assert.equal(params.model, "gpt-5.4");
         assert.equal(params.effort, "xhigh");
-        assert.equal(params.serviceTier, "priority");
+        assert.equal(params.serviceTier, "default");
         assert.equal(params.cwd, "/workspace/model-options");
         assert.equal(params.collaborationMode?.settings.model, "gpt-5.4");
         assert.equal(params.collaborationMode?.mode, interactionMode);
@@ -650,7 +650,7 @@ describe("CodexAdapterV2 runtime policy", () => {
           },
           omitServiceTier: true,
         });
-        assert.equal(managed.serviceTier, undefined);
+        assert.equal(managed.serviceTier, "default");
 
         for (const tier of [undefined, "default"]) {
           const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
@@ -663,8 +663,7 @@ describe("CodexAdapterV2 runtime policy", () => {
               options: tier === undefined ? [] : [{ id: "serviceTier", value: tier }],
             },
           });
-          if (tier === undefined) assert.notProperty(params, "serviceTier");
-          else assert.equal(params.serviceTier, "default");
+          assert.equal(params.serviceTier, "default");
         }
       }),
   );
