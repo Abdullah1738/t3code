@@ -82,6 +82,7 @@ test('stallScan interrupts a child stuck in execute at three minutes, not before
   const log = () => {};
   const messages = [{ type: 'assistant', time: { created: T0 }, content: [tool('execute', 'running', undefined, { code: 'await new Promise(r=>r)' })] }];
   const io = {
+    harnessCutoverStatus: async () => ({ active: false, completed: false, claimedThreadIds: [], claimedRunIds: [] }),
     activeSessions: async () => active,
     ocTail: async () => messages,
     ocSession: async (ses) => ({ title: ses, ...(ses === 'ses_child' ? { parentID: 'ses_parent' } : {}) }),

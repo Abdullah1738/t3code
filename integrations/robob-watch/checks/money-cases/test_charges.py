@@ -530,6 +530,7 @@ class OwnerTexts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'owner.sqlite'
             with sqlite3.connect(path) as db:
+                replica_meta(db)
                 db.execute('CREATE TABLE threads (thread_id, title, updated_at)')
                 db.execute('CREATE VIEW orchestration_v2_projection_threads AS '
                            'SELECT thread_id, title, slow(updated_at) AS updated_at FROM threads')
