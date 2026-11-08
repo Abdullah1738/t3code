@@ -1,4 +1,26 @@
 {
+  "crpko-1061-plan-json-node-test-first.sh": {
+    "card": 1061,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-ei3",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "ae634a292b97bb53683828fc2529cb21b0ed25957dd0484273935fed0db940f7",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-23-04-01a1bcd4-2ecb-7a90-b867-709b2ed1665f.jsonl",
+    "source_call_id": "call_2be757f188d24a42bab60dc3dd20be86",
+    "source_line_0": 471
+  },
+  "crpko-1061-plan-json-node-test-retry.sh": {
+    "card": 1061,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-ei3",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "0152402848274b7a593f751249d7e70fa9ed4b397f230264b83eb4525ccf7672",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-23-04-01a1bcd4-2ecb-7a90-b867-709b2ed1665f.jsonl",
+    "source_call_id": "call_c861be3bda534b009a0e31782fa031bd",
+    "source_line_0": 477
+  },
   "crpko-1245-python-node-stdin.sh": {
     "card": 1245,
     "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-native-init-floors",
@@ -9,6 +31,20 @@
     "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-23-05-01a1bcd4-3093-7163-b3d3-dd37e5c49e33.jsonl",
     "source_call_id": "call_05a6908a26b44a9f8f27abec155d9114",
     "source_line_0": 88
+  },
+  "crpko-1606-append-relative-node-test.sh": {
+    "card": 1606,
+    "cwd": "/Users/ardud/checkouts/edge-otp-terraform-fix",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 1783,
+    "sha256": "d7c984cc851d8c0ff6f6755db13036fd66e513ae2aa2aafc8facb978061142ba",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T17-11-31-01a1bb49-1450-7050-bf7d-ded98cb077ef.jsonl",
+    "source_call_id": "call_b3b89bbc40214279a079afab54433c0b",
+    "source_cmd_index": 0,
+    "source_line_0": 1781,
+    "workdir": "/Users/ardud/checkouts/edge-otp-terraform-fix"
   },
   "crpko-1606-otp-marker-node-check.sh": {
     "card": 1606,
@@ -24,6 +60,48 @@
     "source_cmd_index": 0,
     "source_line_0": 134,
     "workdir": "/Users/ardud/checkouts/edge-otp-home-shard-marker"
+  },
+  "crpko-1606-results-markdown-write.sh": {
+    "card": 1606,
+    "cwd": "/Users/ardud/checkouts/edge-otp-terraform-fix",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 2057,
+    "sha256": "8eae9ae8476f4616bdbf10e0fbe6992ce9fda7ccfe2d25ff9fa99444987aa326",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T17-11-31-01a1bb49-1450-7050-bf7d-ded98cb077ef.jsonl",
+    "source_call_id": "call_c6d175f1cfca46d98257c56fdab517d0",
+    "source_cmd_index": 0,
+    "source_line_0": 2055,
+    "workdir": "/Users/ardud/checkouts/edge-otp-terraform-fix"
+  },
+  "crpko-1606-terraform-create-offbox-node.sh": {
+    "card": 1606,
+    "cwd": "/Users/ardud/checkouts/edge-otp-terraform-fix",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 1723,
+    "sha256": "5cb12ff21598c17e7d12b211874cceb0b28653e97f39239bea3431ae41ab44db",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T17-11-31-01a1bb49-1450-7050-bf7d-ded98cb077ef.jsonl",
+    "source_call_id": "call_66550011f6744b5ea04263d1c645a697",
+    "source_cmd_index": 0,
+    "source_line_0": 1721,
+    "workdir": "/Users/ardud/checkouts/edge-otp-terraform-fix"
+  },
+  "crpko-2037-heredoc-blocker.sh": {
+    "card": 2037,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-041-F03",
+    "event_cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 155,
+    "sha256": "a69229151048fa81293d14d7cfad25271f589c8d409050b6122bddc455518dbd",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-11-01a1bcf6-2928-7503-8d0d-98eccf37e0ee.jsonl",
+    "source_call_id": "call_4402362783f74273960da6a3d49fc911",
+    "source_line_0": 153,
+    "workdir": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-041-F03"
   },
   "crpko-2154-python-offbox-timeout.sh": {
     "card": 2154,
@@ -50,6 +128,18 @@
     "source_cmd_index": 0,
     "source_line_0": 313,
     "workdir": "/Users/ardud/checkouts/cms-publication-check-2282"
+  },
+  "crpko-2282-r1-python-edit-uv-offbox.sh": {
+    "card": 2282,
+    "cwd": "/Users/ardud/checkouts/cms-publication-2282-r1",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "34f2b001b7b64221a133eb732bdb96576c12e77afb19fd961f27a2fd2d569d5c",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T18-39-40-01a1bb99-c862-7dd3-be48-304d97d1138e.jsonl",
+    "source_call_id": "call_ddb499c2b919477891e999d0c9cd7e99",
+    "source_line_0": 2069,
+    "workdir": "/Users/ardud/checkouts/cms-publication-2282-r1"
   },
   "crpko-2359-tests-budget.sh": {
     "card": 2359,
@@ -171,6 +261,22 @@
     "source_line_0": 113,
     "workdir": "/Users/ardud/checkouts/edge-ambiguous-json"
   },
+  "crpko-2586-retained-json-create-relative-python.sh": {
+    "body_fixture": "bodies/crpko-2586-replay.py",
+    "body_sha256": "71b0788defd6a27069e84e22f2ca8d0517d6b01e75a26ce35ced3ad67a8e214d",
+    "card": 2586,
+    "cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact blocked command is the third exec_command call in the custom exec input. The native refusal echoes this cmd byte-for-byte. It creates and runs tmp/card2586/replay.py, not a script under tmp/board-scripts/. The latter is an import directory in the heredoc body. Original exec_command omitted workdir. Cwd is /Volumes/ExternalSSD/crpko-devops from native turn_context/session_meta. Do not represent workdir as explicit. The script reads retained normalized-groups.json and error-rows.json. No retained JSON contents were copied. t3_thread_read activity omitted this failed call and showed the later successful absolute-path creation/run.",
+    "redactions": [],
+    "sha256": "171ef6476e97ae4ec44c9ab3cfaa5fd70f8c8ea112aa126fc33e8bcf38edcec6",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-14-01a1bcf6-361d-7ee1-b112-8c4144f0c63b.jsonl",
+    "source_call_id": "call_75e50f057c674e53ae61220b4cf36d10",
+    "source_cmd_index": 2,
+    "source_line_0": 112,
+    "workdir": null
+  },
   "crpko-2590-verify-carry-ruby.sh": {
     "card": 2590,
     "cwd": "/Users/ardud/checkouts/broker-carry-197-2590",
@@ -215,6 +321,38 @@
     "source_cmd_index": 0,
     "source_line_0": 268,
     "workdir": null
+  },
+  "crpko-2697-facts-heredoc.sh": {
+    "body_fixture": "bodies/crpko-2697-FACTS.md",
+    "body_sha256": "259dc77371068edc9db8b9ae1f2d614ad173d615505155e8ad74a62d74cb4d82",
+    "card": 2697,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact blocked cmd runs mkdir -p then cat to write Markdown. No interpreter is invoked by this shell cmd. Command references inside the Markdown, including node --test, are heredoc data. t3_thread_read activity omitted this failed call and showed the apply_patch fallback.",
+    "redactions": [],
+    "sha256": "bcf4032f034b014c87237ffa5d52248fa669553b953d2faa0a1164d2f5f5e9ff",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-16-01a1bcf6-3bd5-74a2-98ed-5b06f92af8a4.jsonl",
+    "source_call_id": "call_71710e8f316c427ea903e1052bae15cb",
+    "source_cmd_index": 0,
+    "source_line_0": 267,
+    "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc"
+  },
+  "crpko-2697-source-and-test-heredocs.sh": {
+    "body_fixture": "bodies/crpko-2697-gc-private-release-operation-records.mjs",
+    "body_sha256": "4799751f63e1f1b9d90fbada849d2fdcc717fbd3cc806d155dfbab23ce6537ed",
+    "card": 2697,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "This is the whole exact refused shell cmd, not a synthesized pure-cat-only command. Besides writing gc-private-release-operation-records.mjs, it also writes its Node test source and uses a Python stdin heredoc to edit a runbook. The Node source/test bodies are data supplied to cat. The original command has explicit workdir /Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc. t3_thread_read activity omitted this failed call and showed the apply_patch fallback.",
+    "redactions": [],
+    "sha256": "0977bbae70360f8b6c57cfa6af9bfb823b185184739502a2dcdcc6b5b8168d7a",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-16-01a1bcf6-3bd5-74a2-98ed-5b06f92af8a4.jsonl",
+    "source_call_id": "call_e8f24f0308124095852bd865b68c0c11",
+    "source_cmd_index": 0,
+    "source_line_0": 191,
+    "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc"
   },
   "crpko-2708-review.sh": {
     "card": 2708,
@@ -347,6 +485,20 @@
     "source_line_0": 135,
     "workdir": null
   },
+  "crpko-2808-heredoc-relative-node-test.sh": {
+    "card": 2808,
+    "cwd": "/Users/ardud/checkouts/kafka-seeds-2808",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 337,
+    "sha256": "7ceecd0b7e796893029d45ea60ce00885e4384a4778c35e0084da802ed8bb72b",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T02-27-11-01a1bd45-d12e-7591-a6ba-51ed2c13fee8.jsonl",
+    "source_call_id": "call_f8fb35e80e054d4f986bde48e81aa47f",
+    "source_cmd_index": 0,
+    "source_line_0": 335,
+    "workdir": "/Users/ardud/checkouts/kafka-seeds-2808"
+  },
   "crpko-2810-recovery-absolute.sh": {
     "card": 2810,
     "cwd": "/Users/ardud/checkouts/custody-recovery-main",
@@ -394,6 +546,47 @@
     "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T12-37-39-01a1ba4e-5822-7701-bf86-f35dcddfc6f5.jsonl",
     "source_call_id": "call_217586a0a58e4c1f91bb2d2de32b1634",
     "source_line_0": 2074
+  },
+  "crpko-3022-create-run.sh": {
+    "card": 3022,
+    "cwd": "/Users/ardud/checkouts/market-data-registry-3022",
+    "event_cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 145,
+    "sha256": "a49fd639cd2e209ef9b92ad259d703fc9b7f9fb20e29ba081632d54e988198fa",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-19-01a1bcf6-49ee-74e1-b434-bf14d4948668.jsonl",
+    "source_call_id": "call_634f657e2489401cb50e3d651386167f",
+    "source_line_0": 143,
+    "workdir": "/Users/ardud/checkouts/market-data-registry-3022"
+  },
+  "crpko-3022-relative-only-derived.sh": {
+    "card": 3022,
+    "cwd": "/Users/ardud/checkouts/market-data-registry-3022",
+    "exact": false,
+    "kind": "derived-invocation",
+    "redactions": [],
+    "sha256": "76f794fa9e8b61bd8b3701b88527283e88f28f6be1a6036c4b907d56b95ed872",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-19-01a1bcf6-49ee-74e1-b434-bf14d4948668.jsonl",
+    "source_call_id": "call_634f657e2489401cb50e3d651386167f",
+    "source_line_0": 143,
+    "workdir": "/Users/ardud/checkouts/market-data-registry-3022"
+  },
+  "crpko-3041-r1-python-edit.sh": {
+    "card": 3041,
+    "cwd": "/Users/ardud/checkouts/margin-3041-r1-web",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Actual command decoded verbatim from the native JSON refusal echo; input used JavaScript template literals. No JavaScript or fixture command executed.",
+    "redactions": [],
+    "refusal_line_0": 1515,
+    "sha256": "8ff2d42b059d6ba9aab4996972fc859c2f4cb38ce404bc93034e17ce528c7090",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T23-36-25-01a1bca9-77da-7202-99ab-ac7ecb8f8a29.jsonl",
+    "source_call_id": "call_d31b1456a0214210a42f03e6f3100848",
+    "source_cmd_index": 1,
+    "source_line_0": 1513,
+    "workdir": "/Users/ardud/checkouts/margin-3041-r1-web"
   },
   "crpko-3044-history-adoption.sh": {
     "card": 3044,
@@ -575,6 +768,59 @@
     "source_line_0": 123,
     "workdir": "/Users/ardud/checkouts/crp12001-fb2a"
   },
+  "crpko-3122-terraform-python-edit.sh": {
+    "card": 3122,
+    "cwd": "/Users/ardud/checkouts/crp12001-fb2c",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "f43a2180eb887e0fd33bd45866dce6956ef58807a86362f9c947ba5cec0d2bd5",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-49-07-01a1bd22-f693-7003-8823-701a078b6857.jsonl",
+    "source_call_id": "call_ee9b704a3a2b4438afd24d0a135c54c0",
+    "source_line_0": 156,
+    "workdir": "/Users/ardud/checkouts/crp12001-fb2c"
+  },
+  "crpko-3186-leading-cd.sh": {
+    "card": 3186,
+    "cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "event_cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "The refused call omits workdir. Do not replace its native turn-context cwd with the clone directory; the literal leading cd establishes that directory inside the command.",
+    "redactions": [],
+    "refusal_line_0": 261,
+    "sha256": "9661d4842c4484c85c84a2158b7d221c215d0fb442b84e82a17b67a832e84583",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-44-41-01a1bce7-f9df-7893-98c5-eb40352663e6.jsonl",
+    "source_call_id": "call_69d525db46ec4d599243358200436748",
+    "source_line_0": 259,
+    "workdir": null
+  },
+  "crpko-3207-s75-absolute-resolve.sh": {
+    "body_fixture": "bodies/crpko-3207-resolve.before-refused-edit.py",
+    "body_sha256": "fc27eb5a2abb5697f034edfaf81789d89d2e41477c0ef4365c64e473222d196a",
+    "card": 3207,
+    "cwd": "/Users/ardud/checkouts/rewards-nv1-carry",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact refused absolute invocation. The Python stdin heredoc edits an existing resolve.py, then the same cmd runs its absolute path. The earlier refused create-and-run call at raw line 129 uses a relative invocation. A create-and-run call using the absolute invocation was not found. The pre-invocation source body is retained from the successful literal cat write at raw line 135, command index 0. No current checkout file was read. t3_thread_read activity first 100 items contained successful retry execution and the reporter note, but omitted the failed raw calls.",
+    "redactions": [],
+    "sha256": "911312ea519faf09afd46d0defe022a49a01250f84a38cbd4e3fc6e5d73652a1",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-59-58-01a1bcf5-f5ac-72a0-ab03-97f54ac1d652.jsonl",
+    "source_call_id": "call_95f4ca40b4174ac38a9279edef0e7827",
+    "source_cmd_index": 0,
+    "source_line_0": 158,
+    "workdir": "/Users/ardud/checkouts/rewards-nv1-carry"
+  },
+  "crpko-358-markdown-pytest.sh": {
+    "card": 358,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-037",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact command extracted by evaluator; independently decoded exec-input.js and verified matching cmd bytes.",
+    "redactions": [],
+    "sha256": "0f7a34c4519cb6ebd6aafb4c98521cd402a939c1fb8497c7befd2e7665c2ea4f",
+    "source": "/Users/ardud/.robob/board-artifacts/card-624/crpko-358/cmd.txt"
+  },
   "crpko-629-fee-override-tests.sh": {
     "card": 629,
     "cwd": "/Volumes/ExternalSSD/board-wt/backoffice-core-fee-clear",
@@ -604,6 +850,20 @@
     "source_cmd_index": 0,
     "source_line_0": 1404,
     "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-d4"
+  },
+  "robob-540-s78-inline-edit-repo-setup.sh": {
+    "card": 540,
+    "cwd": "/Users/ardud/checkouts/offbox-repo-setup",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact failed cmd edits integrations/offbox/skill/scripts/offbox_lib/runs.py through a Python stdin heredoc, with explicit workdir /Users/ardud/checkouts/offbox-repo-setup. REPO_SETUP holds remote shell/Python as strings in the inline editor; these strings are data in the original local command. Subtask is s78 after renumbering; earlier request called it s77. t3_thread_read activity covered all 74 then-current items and omitted the failed call; the report and successful apply_patch fallback were present. No jq invocation was found in this native rollout through the snapshot of 310 physical records inspected. Parent supplies any synthetic jq --arg text-only DB-filename case.",
+    "redactions": [],
+    "sha256": "01cc7c5a47948b329a9aa82919db239b6c24ede97ecd9034696f9c866a1dfb85",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-23-40-01a1bd0b-a80d-7b80-b6a5-bd40b8d29676.jsonl",
+    "source_call_id": "call_94e4fee6c04a43c38f0b4a20997d9eda",
+    "source_cmd_index": 0,
+    "source_line_0": 116,
+    "workdir": "/Users/ardud/checkouts/offbox-repo-setup"
   },
   "robob-563-charges-edit.sh": {
     "card": 563,
@@ -800,5 +1060,21 @@
     "source_cmd_index": 0,
     "source_line_0": 647,
     "workdir": null
+  },
+  "usdtwallet-162-s76-create-relative-python.sh": {
+    "body_fixture": "bodies/usdtwallet-162-write-red.py",
+    "body_sha256": "13b2d1856b8b3f33fecae83fcc565d1295e9314bbcf80f38211c384bad1e0752",
+    "card": 162,
+    "cwd": "/Users/ardud/checkouts/fix-plain-network-errors",
+    "exact": true,
+    "kind": "exec_command",
+    "note": "Exact failed cmd creates write-red.py through a cat heredoc and then invokes it by relative path with explicit workdir. Native record timestamp is 2026-11-08T21:08:23.882Z (9 Nov 01:08:23.882 Asia/Dubai); the reported approximate UTC time differs. The supplied script body is retained verbatim inside this refused cmd; no current source checkout file was read. The refusal states the command was not run. t3_thread_read activity first 100 items omitted the refused call but contained the surrounding writes and inline Python fallbacks. Correct full thread UUID is ef26680a-96ca-4070-8248-4928147b6549; ef266805 in card prose is a typo.",
+    "redactions": [],
+    "sha256": "4c448d01ab1f291d0282c1133c71421252d5f57ce70856dfa9013b6df2da4d80",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-05-27-01a1bcfa-fb02-72a2-be48-b16c977b0096.jsonl",
+    "source_call_id": "call_14dcc18cacb54471a8956de7faada8d7",
+    "source_cmd_index": 0,
+    "source_line_0": 90,
+    "workdir": "/Users/ardud/checkouts/fix-plain-network-errors"
   }
 }

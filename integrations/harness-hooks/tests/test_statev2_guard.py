@@ -22,6 +22,20 @@ class GuardTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        realpath, path_stat = os.path.realpath, Path.stat
+        # Historical reporter paths must not depend on mounted checkouts.
+        # Retained script bodies are checked separately in temporary directories.
+        def frozen_path(path):
+            return os.path.abspath(os.fspath(path)).startswith("/Users/ardud/checkouts/")
+        def fixture_realpath(path, *args, **kwargs):
+            return os.path.abspath(path) if frozen_path(path) else realpath(path, *args, **kwargs)
+        def fixture_stat(path, *args, **kwargs):
+            if frozen_path(path):
+                raise FileNotFoundError(path)
+            return path_stat(path, *args, **kwargs)
+        for mock in (patch.object(os.path, "realpath", side_effect=fixture_realpath), patch.object(Path, "stat", autospec=True, side_effect=fixture_stat)):
+            mock.start()
+            self.addCleanup(mock.stop)
         (self.root / "tmp").mkdir()
         self.write("tmp/t.py", "print('ok')")
         self.write("tmp/live.py", f"open({LIVE!r}, 'rb').read()")
@@ -181,6 +195,140 @@ class GuardTests(unittest.TestCase):
             "fd -g '*opencode.db*' ~/.local/share/opencode -X cat",
         ]])
 
+    def test_live_shell_assignments_still_block_readers(self):
+        for reader in ("sqlite3", "cat"):
+            for assignment in (f"DB={LIVE};", f"export DB={LIVE};", f"readonly DB={LIVE};", f"env DB={LIVE}"):
+                command = f'{assignment} {reader} "$DB"'
+                with self.subTest(command=command):
+                    self.assertEqual(self.classify(command), READ)
+        self.table([
+            (f'DB={LIVE}; cat "${{DB}}"', READ),
+            (f'DB={LIVE}; COPY=$DB; cat "$COPY"', READ),
+            ('ROOT=/Users/x/.robob/userdata; DB=$ROOT/statev2.sqlite; cat "$DB"', READ),
+            ('ROOT=/Users/x/.robob/userdata; cat "$ROOT/statev2.sqlite"', READ),
+            (f'env DB={LIVE} python3 -c \'import os,sqlite3; sqlite3.connect(os.environ["DB"])\'', READ),
+            (f'DB={LIVE}; env DB=/tmp/safe cat "$DB"', READ),
+            (f'if false; then DB={LIVE}; fi; cat "$DB"', READ),
+            ('ROOT=/Users/x/.robob/userdata; if false; then ROOT=/tmp; fi; cat "$ROOT/statev2.sqlite"', READ),
+            ('ROOT=/Users/x/.robob/worktrees; ROOT=/Users/x/.robob/userdata; cat "$ROOT/statev2.sqlite"', READ),
+            ('ROOT=/Users/x/.robob/userdata; ROOT=/Users/x/.local/share/opencode; cat "$ROOT/opencode.db"', READ),
+            (f'env -S \'DB={LIVE} cat "$DB"\'', READ),
+            ('DB=/tmp/isolated.sqlite; cat "$DB"', None),
+            (f'DB={LIVE}; echo "$DB"', None),
+            (f'cat > note.txt <<\'EOF\'\nDB={LIVE}; cat "$DB"\nEOF', None),
+        ])
+        for operator in (":-", "-", ":=", "=", ":+", "+", ":?", "?"):
+            for default in (LIVE, shlex.quote(LIVE), '"' + LIVE + '"', "${Y:-" + LIVE + "}"):
+                command = "DB=${X" + operator + default + '}; cat "$DB"'
+                with self.subTest(operator=operator, default=default):
+                    self.assertEqual(self.classify(command), READ)
+        self.assertIsNone(self.classify('DB=${X:-"}"}; cat tmp/t.py'))
+        self.assertIsNone(self.classify('DB=${X:-${Y:-/tmp/safe}}; cat "$DB"'))
+        self.assertEqual(self.classify('python3 ${SCRIPT:-tmp/t.py}'), UNRESOLVED)
+        for substitution, expected in [
+            (f"$(cat {LIVE})", READ),
+            (f"`cat {LIVE}`", READ),
+            ("$(python3 tmp/live.py)", SCRIPT),
+            ("$(python3 $SCRIPT)", UNRESOLVED),
+            ("$(git status --short)", None),
+        ]:
+            for quote in ("", '"'):
+                value = "${X:-" + quote + substitution + quote + "}"
+                self.table([(f"OUT={value}", expected), (f"jq --arg x {value} . facts.json", expected)])
+            value = "${X:-'" + substitution + "'}"
+            self.table([(f"OUT={value}", None), (f"jq --arg x {value} . facts.json", None)])
+        for command in ("OUT=${X:-$(cat statev2.sqlite)}", "jq --arg x ${X:-$(cat statev2.sqlite)} . facts.json"):
+            self.assertEqual(self.classify("cd /Users/x/.robob/userdata && " + command), READ)
+        self.write("check.py", f"open({LIVE!r}).read()")
+        nested = self.write("sub/check.py", "print('safe')")
+        command = "cd sub && OUT=${X:-$(python3 check.py)}"
+        self.assertIsNone(self.classify(command))
+        self.write("check.py", "print('safe')")
+        nested.write_text(f"open({LIVE!r}).read()")
+        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_parameter_substitutions_in_headers(self):
+        forms = [
+            ("for item in", "; do :; done"),
+            ("select item in", "; do break; done"),
+            ("case", " in *) :;; esac"),
+            ("case item in", ") :;; esac"),
+            ("case item in other|", ") :;; esac"),
+        ]
+        for prefix, suffix in forms:
+            with self.subTest(header=prefix):
+                command = f"cd /Users/x/.robob/userdata && {prefix} ${{X:-$(cat statev2.sqlite)}}{suffix}"
+                self.assertEqual(self.classify(command), READ)
+                self.assertIsNone(self.classify(f"{prefix} ${{X:-$(git status --short)}}{suffix}"))
+                self.assertIsNone(self.classify(f"{prefix} ${{X:-'$(python3 $SCRIPT)'}}{suffix}"))
+                self.assertIsNone(self.classify(f"{prefix} {LIVE}{suffix}"))
+        self.assertIsNone(self.classify("for item in ${X:-$(python3 tmp/t.py)}; do cd tmp; done"))
+        for pattern in (
+            "${X:-$(cat statev2.sqlite)}", "${X:-$(cat statev2.sqlite)}|other",
+            "other|${X:-$(cat statev2.sqlite)}", "one|${X:-$(cat statev2.sqlite)}|other",
+        ):
+            for earlier_arm in ("", "first) cd /tmp;; "):
+                command = f"cd /Users/x/.robob/userdata && case item in {earlier_arm}{pattern}) :;; esac"
+                with self.subTest(pattern=pattern, earlier_arm=earlier_arm):
+                    self.assertEqual(self.classify(command), READ)
+                    self.assertIsNone(self.classify(command.replace("$(cat statev2.sqlite)", "$(git status --short)")))
+        self.assertIsNone(self.classify("case item in one) cd /tmp;; two) cat tmp/t.py | head -1;; esac"))
+
+    def test_dynamic_python_imports_cannot_get_text_only_exemption(self):
+        bodies = [
+            f'__import__("sqlite3").connect({LIVE!r})',
+            f'import builtins; builtins.__import__("sqlite3").connect({LIVE!r})',
+            f'import importlib; importlib.import_module("sqlite3").connect({LIVE!r})',
+            f'from importlib import import_module as load; load("sqlite3").connect({LIVE!r})',
+            f'load=__import__; load("sqlite3").connect({LIVE!r})',
+            f'getattr(__builtins__, "__import__")("sqlite3").connect({LIVE!r})',
+            f'import builtins; load=getattr(builtins, "__import__"); load("sqlite3").connect({LIVE!r})',
+            f'import importlib; loader=importlib; loader.import_module("sqlite3").connect({LIVE!r})',
+            f'import builtins; loader=builtins; loader.__import__("sqlite3").connect({LIVE!r})',
+            f'from builtins import open as reader; reader({LIVE!r}).read()',
+        ]
+        for body in bodies:
+            self.table([
+                ("python3 -c " + shlex.quote(body), READ),
+                (f"python3 - <<'PY'\n{body}\nPY", READ),
+                (f"cat > dynamic.py <<'PY'\n{body}\nPY\npython3 dynamic.py", SCRIPT),
+            ])
+        self.assertIsNone(self.classify("python3 -c " + shlex.quote(f'print({LIVE!r}, "__import__(sqlite3)")')))
+        self.assertIsNone(self.classify("python3 -c '__import__(\"subprocess\").run([\"git\", \"status\"])'"))
+
+    def test_plain_argv_database_mentions_are_data(self):
+        for text in ("statev2.sqlite", "opencode.db", LIVE, f"Use python3 instead of sqlite3 {LIVE}"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.classify("jq --arg new " + shlex.quote(text) + " '.text=$new' facts.json"))
+        self.assertIsNone(self.classify("jq --argjson new " + shlex.quote(json.dumps(LIVE)) + " '.text=$new' facts.json"))
+        self.assertEqual(self.classify(f"jq . {LIVE}"), READ)
+        self.assertEqual(self.classify(f"jq --rawfile new {LIVE} . facts.json"), READ)
+        for flags in ("-n", "-nc", "--null-input", "--indent 2 -n"):
+            with self.subTest(flags=flags):
+                self.assertIsNone(self.classify(f"jq {flags} " + shlex.quote(json.dumps(LIVE))))
+        self.assertIsNone(self.classify(f"jq -n --args '$ARGS.positional' {LIVE}"))
+        self.assertIsNone(self.classify("jq -n --jsonargs '$ARGS.positional' " + shlex.quote(json.dumps(LIVE))))
+        self.assertIsNone(self.classify("jq --arg x -f -n " + shlex.quote(json.dumps(LIVE))))
+        self.assertIsNone(self.classify(f'DB={LIVE}; jq --arg x "$DB" "." facts.json'))
+        self.assertEqual(self.classify(f'DB={LIVE}; jq . "$DB"'), READ)
+        for flag in ("--args", "--jsonargs"):
+            self.table([
+                (f"jq . {LIVE} {flag} value", READ),
+                (f"jq {flag} . < {LIVE}", READ),
+                (f'DB={LIVE}; jq {flag} . < "$DB"', READ),
+                (f"jq {flag} . < tmp/t.py", None),
+                (f"jq {flag} . {shlex.quote(json.dumps(LIVE))}", None),
+            ])
+        for command in (
+            f"jq -f {LIVE} facts.json", f"jq --from-file={LIVE} facts.json",
+            f"jq --slurpfile data {LIVE} .", f"jq -f filter.jq {LIVE}",
+            f"jq -ffilter.jq {LIVE}", f"jq --run-tests {LIVE}",
+            f"jq -nf {LIVE}", f"jq --arg x --args . {LIVE}",
+            f"jq {shlex.quote(json.dumps(LIVE))} {LIVE}",
+        ):
+            self.assertEqual(self.classify(command), READ)
+        self.assertEqual(self.classify(f"cat {LIVE}"), READ)
+
     def test_wrappers_scripts_and_symlinks(self):
         self.table([
             ("python3 tmp/live.py", SCRIPT),
@@ -233,6 +381,106 @@ class GuardTests(unittest.TestCase):
             with self.subTest(fixture=filename):
                 command = (fixtures / filename).read_text()
                 self.assertIsNone(self.classify(command), guard.classify_detail(command, str(self.root)))
+
+    def test_reporter_workdirs_and_literal_cd(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        manifest = json.loads((fixtures / "manifest.json").read_text())
+        for filename, info in manifest.items():
+            if info["card"] in {1061, 2037, 3022, 3186, 3207, 162, 2586, 2697, 540, 3122, 358, 2282, 3041, 2808, 1606}:
+                with self.subTest(fixture=filename, cwd=info["cwd"]):
+                    command = (fixtures / filename).read_text()
+                    self.assertIsNone(guard.classify(command, info["cwd"]))
+        command = (fixtures / "crpko-3186-leading-cd.sh").read_text()
+        cwd = "/Volumes/ExternalSSD/crpko-devops/tmp/card-3186/repo"
+        paths = guard.scripts_in(command, "/Volumes/ExternalSSD/crpko-devops")
+        for name in ("test-aurora-master-rotation-off.mjs", "test-cutover-command-deny-infra.mjs"):
+            self.assertIn(Path(os.path.realpath(Path(cwd) / "scripts" / name)), paths)
+        for body, expected in [("console.log('safe')", None), (f"require('fs').readFileSync({LIVE!r})", SCRIPT)]:
+            script = self.write("clone/scripts/check.mjs", body)
+            command = f"cd {script.parents[1]} && git log > log.json && node --test scripts/check.mjs > test.log 2>&1"
+            self.assertEqual(self.classify(command), expected)
+        self.write("clone/scripts/first.mjs", "console.log('safe')")
+        self.assertEqual(self.classify(f"cd {self.root}/clone && node --test scripts/first.mjs scripts/check.mjs > test.log 2>&1"), SCRIPT)
+
+    def test_markdown_2037_does_not_hide_a_later_script(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        command = (fixtures / "crpko-2037-heredoc-blocker.sh").read_text()
+        self.assertEqual(guard.scripts_in(command, str(self.root)), [])
+        self.assertEqual(self.classify(command + "\npython3 tmp/live.py"), SCRIPT)
+
+    def test_existing_and_written_script_3022(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        body = (fixtures / "bodies/crpko-3022-existing-edit.py").read_text()
+        script = self.write("tmp/card-3022/edit.py", body)
+        self.assertIsNone(self.classify("python3 tmp/card-3022/edit.py"))
+        self.assertIsNone(self.classify(f"python3 {script}"))
+        script.write_text(f"open({LIVE!r}).read()")
+        self.assertEqual(self.classify("python3 tmp/card-3022/edit.py"), SCRIPT)
+        self.assertEqual(self.classify(f"python3 {script}"), SCRIPT)
+        cwd = "/Users/ardud/checkouts/market-data-registry-3022"
+        target = Path(os.path.realpath(Path(cwd) / "tmp/card-3022/edit.py"))
+        self.assertEqual(guard.scripts_in("python3 tmp/card-3022/edit.py", cwd), [target])
+        command = (fixtures / "crpko-3022-create-run.sh").read_text()
+        self.assertIsNone(guard.classify(command, cwd))
+        twin = command.replace("\nPY\n", f"\nopen({LIVE!r}).read()\nPY\n", 1)
+        self.assertNotEqual(twin, command)
+        self.assertEqual(guard.classify(twin, cwd), SCRIPT)
+
+    def test_absolute_script_3207_and_relative_script_162(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        manifest = json.loads((fixtures / "manifest.json").read_text())
+        for name, target in [
+            ("crpko-3207-s75-absolute-resolve.sh", "/Users/ardud/checkouts/rewards-nv1-carry/tmp/carry-3207/resolve.py"),
+            ("usdtwallet-162-s76-create-relative-python.sh", "tmp/cards/fix-plain-network-errors/write-red.py"),
+        ]:
+            info = manifest[name]
+            body = (fixtures / info["body_fixture"]).read_text()
+            command = (fixtures / name).read_text()
+            with self.subTest(fixture=name):
+                self.assertIsNone(guard.classify(command, info["cwd"]))
+                for extra, expected in [("", None), (f"\nopen({LIVE!r}).read()", SCRIPT)]:
+                    wrapper = f"cat > {target} <<'GUARD_BODY'\n{body}{extra}\nGUARD_BODY\npython3 {target}"
+                    self.assertEqual(guard.classify(wrapper, info["cwd"]), expected)
+                local = self.write("tmp/reporter.py", body)
+                self.assertIsNone(self.classify("python3 tmp/reporter.py"))
+                local.write_text(body + f"\nopen({LIVE!r}).read()")
+                self.assertEqual(self.classify("python3 tmp/reporter.py"), SCRIPT)
+
+    def test_remote_setup_strings_in_python_540(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        command = (fixtures / "robob-540-s78-inline-edit-repo-setup.sh").read_text()
+        cwd = "/Users/ardud/checkouts/offbox-repo-setup"
+        self.assertIsNone(guard.classify(command, cwd))
+        twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
+        self.assertNotEqual(twin, command)
+        self.assertEqual(guard.classify(twin, cwd), READ)
+
+    def test_reporter_edits_and_markdown_keep_db_reads_checked(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        manifest = json.loads((fixtures / "manifest.json").read_text())
+        names = (
+            "crpko-3122-terraform-python-edit.sh", "crpko-358-markdown-pytest.sh",
+            "crpko-3041-r1-python-edit.sh", "crpko-2808-heredoc-relative-node-test.sh",
+            "crpko-1606-terraform-create-offbox-node.sh", "crpko-1606-append-relative-node-test.sh",
+            "crpko-1606-results-markdown-write.sh",
+        )
+        for name in names:
+            command = (fixtures / name).read_text()
+            cwd = manifest[name]["cwd"]
+            self.assertIsNone(guard.classify(command, cwd))
+            written_read = f"\ncat > tmp/read-live.py <<'GUARD_TWIN'\nopen({LIVE!r}).read()\nGUARD_TWIN\npython3 tmp/read-live.py"
+            self.assertEqual(guard.classify(command + written_read, cwd), SCRIPT)
+            if manifest[name]["card"] in {3122, 3041}:
+                twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
+                self.assertNotEqual(twin, command)
+                self.assertEqual(guard.classify(twin, cwd), READ)
+
+    def test_pure_cat_source_and_markdown_2697(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        for name in ("crpko-2697-source-and-test-heredocs.sh", "crpko-2697-facts-heredoc.sh"):
+            command = (fixtures / name).read_text()
+            self.assertEqual(guard.scripts_in(command, str(self.root)), [])
+            self.assertIsNone(self.classify(command))
 
     def test_ovnfs_and_worktree_cwd_resolve_equally(self):
         for cwd in ("/Users/ardud/checkouts/guard-fixture", "/Users/ardud/.robob/worktrees/project/guard-fixture"):

@@ -1,0 +1,1 @@
+python3 tmp/card-3022/edit.py

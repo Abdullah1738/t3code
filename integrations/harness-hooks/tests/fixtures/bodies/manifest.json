@@ -1,4 +1,49 @@
 {
+  "crpko-2037-blocker.md": {
+    "card": 2037,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-041-F03",
+    "exact": true,
+    "kind": "script-body",
+    "note": "exact_heredoc_body",
+    "redactions": [],
+    "sha256": "bb866a5e65b17aab3d100b6e7b18f1581dcde0653c7f9d557fd4b6886d3e5d0f",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-11-01a1bcf6-2928-7503-8d0d-98eccf37e0ee.jsonl",
+    "source_call_id": "call_4402362783f74273960da6a3d49fc911",
+    "source_line_0": 153
+  },
+  "crpko-2586-replay.py": {
+    "card": 2586,
+    "cwd": "/Volumes/ExternalSSD/crpko-devops",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "71b0788defd6a27069e84e22f2ca8d0517d6b01e75a26ce35ced3ad67a8e214d",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-14-01a1bcf6-361d-7ee1-b112-8c4144f0c63b.jsonl",
+    "source_call_id": "call_75e50f057c674e53ae61220b4cf36d10",
+    "source_line_0": 112
+  },
+  "crpko-2697-FACTS.md": {
+    "card": 2697,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "259dc77371068edc9db8b9ae1f2d614ad173d615505155e8ad74a62d74cb4d82",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-16-01a1bcf6-3bd5-74a2-98ed-5b06f92af8a4.jsonl",
+    "source_call_id": "call_71710e8f316c427ea903e1052bae15cb",
+    "source_line_0": 267
+  },
+  "crpko-2697-gc-private-release-operation-records.mjs": {
+    "card": 2697,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "4799751f63e1f1b9d90fbada849d2fdcc717fbd3cc806d155dfbab23ce6537ed",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-16-01a1bcf6-3bd5-74a2-98ed-5b06f92af8a4.jsonl",
+    "source_call_id": "call_e8f24f0308124095852bd865b68c0c11",
+    "source_line_0": 191
+  },
   "crpko-2743-edit.py": {
     "card": 2743,
     "cwd": "/Users/ardud/CrpkoArchitectureBroker/tmp/spot-sell-fee-escrow-settlement",
@@ -16,6 +61,41 @@
     "redactions": [],
     "sha256": "372ce6d529aad0f429303f4a41b49950e256c82e59026e6bbbeeb3e12c490ad0",
     "source": "/Volumes/ExternalSSD/crpko-devops/tmp/card-1013/astra-r3/probes/make_cancel_probes.py"
+  },
+  "crpko-3022-create-run-edit.py": {
+    "card": 3022,
+    "cwd": "/Users/ardud/checkouts/market-data-registry-3022",
+    "exact": true,
+    "kind": "script-body",
+    "note": "exact_heredoc_body",
+    "redactions": [],
+    "sha256": "6943081c1283a72462105fbb31b5d0f559e88e8bd9e1f758eec15ce6a1984bb4",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-19-01a1bcf6-49ee-74e1-b434-bf14d4948668.jsonl",
+    "source_call_id": "call_634f657e2489401cb50e3d651386167f",
+    "source_line_0": 143
+  },
+  "crpko-3022-existing-edit.py": {
+    "card": 3022,
+    "cwd": "/Users/ardud/checkouts/market-data-registry-3022",
+    "exact": true,
+    "kind": "script-body",
+    "note": "exact_existing_script_body",
+    "redactions": [],
+    "sha256": "fdf7dff18081af2100904bf86f151b94d9658f678f9208945daf8d2aa0f8cd9e",
+    "source": "/Users/ardud/checkouts/market-data-registry-3022/tmp/card-3022/edit.py",
+    "source_call_id": "call_fdcab15b4ba749f1b41b9cf3a01b6e66",
+    "source_line_0": 0
+  },
+  "crpko-3207-resolve.before-refused-edit.py": {
+    "card": 3207,
+    "cwd": "/Users/ardud/checkouts/rewards-nv1-carry",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "fc27eb5a2abb5697f034edfaf81789d89d2e41477c0ef4365c64e473222d196a",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-59-58-01a1bcf5-f5ac-72a0-ab03-97f54ac1d652.jsonl",
+    "source_call_id": "call_538f8456edfa401ba387083a31eb2a80",
+    "source_line_0": 135
   },
   "usdtwallet-140-proof.sh": {
     "card": 140,
@@ -51,5 +131,16 @@
     "sha256": "35ab5bb8f13015db67803f4526a4b79c27bab772f85ed8111b684c038c16df53",
     "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/07/rollout-2026-11-07T21-07-30-01a1b6fa-c747-7f40-a6fa-42c378ce6bf3.jsonl",
     "source_line_0": 162
+  },
+  "usdtwallet-162-write-red.py": {
+    "card": 162,
+    "cwd": "/Users/ardud/checkouts/fix-plain-network-errors",
+    "exact": true,
+    "kind": "script-body",
+    "redactions": [],
+    "sha256": "13b2d1856b8b3f33fecae83fcc565d1295e9314bbcf80f38211c384bad1e0752",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-05-27-01a1bcfa-fb02-72a2-be48-b16c977b0096.jsonl",
+    "source_call_id": "call_14dcc18cacb54471a8956de7faada8d7",
+    "source_line_0": 90
   }
 }

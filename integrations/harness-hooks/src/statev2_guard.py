@@ -15,7 +15,7 @@ LIVE = re.compile(
 )
 READER = re.compile(
     r"(?:^|[\s;&|('\"`])(?:\S*/)?(?:sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|"
-    r"datasette|uv|cp|rsync|ditto|dd|cat|strings|grep|rg|xxd|hexdump|tar|zip|restic)"
+    r"datasette|uv|cp|rsync|ditto|dd|cat|strings|grep|rg|jq|xxd|hexdump|tar|zip|restic)"
     r"(?=[\s;&|)`]|$)"
 )
 SCRIPT = re.compile(
@@ -148,6 +148,8 @@ def _python_touches_live(source, directory):
         canonical = ".".join([aliases.get(root, root), *rest])
         if canonical.split(".")[0] in db:
             return True
+        if canonical in {"__import__", "builtins", "importlib", "eval", "exec", "getattr", "__builtins__"} or canonical.startswith(("builtins.", "importlib.", "__builtins__.")):
+            return True
         if changed_directory and canonical == "os.chdir":
             return True
         sensitive = (canonical in {"open", "io.open", "os.open", "Path", "pathlib.Path"} or
@@ -158,10 +160,12 @@ def _python_touches_live(source, directory):
             return True
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             modules = [n.name for n in node.names] if isinstance(node, ast.Import) else [node.module or ""]
-            if any(m.split(".")[0] in db for m in modules):
+            if any(m.split(".")[0] in db | {"builtins", "importlib"} for m in modules):
                 return True
         if not isinstance(node, ast.Call):
             continue
+        if not isinstance(node.func, (ast.Name, ast.Attribute)):
+            return True
         name = _name(node.func)
         root, *rest = name.split(".")
         name = ".".join([aliases.get(root, root), *rest])
@@ -205,18 +209,25 @@ def _token(value):
     return repr(value[:80]).replace("\n", " ")
 
 
-def _substitutions(text):
-    result, index = [], 0
+def _substitutions(text, shell=False):
+    result, index, outer_quote = [], 0, None
     while index < len(text):
-        if text[index] == "\\":
+        if text[index] == "\\" and (not shell or outer_quote != "'"):
             index += 2
+            continue
+        if shell and text[index] in "\"'" and outer_quote in {None, text[index]}:
+            outer_quote = text[index] if outer_quote is None else None
+            index += 1
+            continue
+        if shell and outer_quote == "'":
+            index += 1
             continue
         if text[index] == "`":
             end = index + 1
             while end < len(text) and (text[end] != "`" or text[end - 1] == "\\"):
                 end += 1
             if end == len(text):
-                raise AmbiguousScript("unterminated command substitution in unquoted heredoc")
+                raise AmbiguousScript("unterminated command substitution in " + ("shell parameter expansion" if shell else "unquoted heredoc"))
             result.append(text[index + 1:end])
             index = end + 1
             continue
@@ -238,7 +249,7 @@ def _substitutions(text):
                     nesting -= 1
                 end += 1
             if nesting:
-                raise AmbiguousScript("unterminated command substitution in unquoted heredoc")
+                raise AmbiguousScript("unterminated command substitution in " + ("shell parameter expansion" if shell else "unquoted heredoc"))
             result.append(text[index + 2:end - 1])
             index = end
             continue
@@ -293,10 +304,56 @@ def _heredocs(source):
     return "".join(output), bodies
 
 
+def _jq_read_words(words):
+    result, inputs, index = [words[0]], [], 1
+    program, positional_args, options = False, False, True
+    while index < len(words):
+        word = words[index]
+        if options and word in {"--arg", "--argjson"}:
+            index += 3
+        elif options and word in {"--args", "--jsonargs"}:
+            positional_args = True
+            index += 1
+        elif options and word in {"--rawfile", "--slurpfile", "--argfile"}:
+            result.extend(words[index:index + 3])
+            index += 3
+        elif options and word in {"--from-file", "--run-tests", "-L", "--library-path", "--indent"}:
+            result.extend(words[index:index + 2])
+            program |= word in {"--from-file", "--run-tests"}
+            index += 2
+        elif options and word.startswith("--from-file="):
+            result.append(word)
+            program = True
+            index += 1
+        elif options and re.match(r"^-[A-Za-z]*f", word):
+            result.append(word)
+            if re.fullmatch(r"-[A-Za-z]*f", word) and index + 1 < len(words):
+                result.append(words[index + 1])
+                index += 1
+            program = True
+            index += 1
+        elif options and word == "--":
+            options = False
+            index += 1
+        elif options and word.startswith("-"):
+            result.append(word)
+            index += 1
+        elif not program:
+            program = True
+            index += 1
+        else:
+            if not positional_args:
+                inputs.append(word)
+            index += 1
+    return result + inputs
+
+
 def _read_words(words):
     if not words:
         return words
     binary = os.path.basename(words[0])
+    if binary == "jq":
+        return _jq_read_words(words)
     listing = binary == "rg" and "--files" in words
     fd_listing = binary in {"fd", "fdfind"} and not any(w in {"-x", "-X", "--exec", "--exec-batch"} or w.startswith(("--exec=", "--exec-batch=")) for w in words)
     find_listing = binary == "find" and not any(w in {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls"} or w.startswith("-fprint") for w in words)
@@ -426,6 +483,29 @@ def _quoted_punctuation(source):
             output.append(source[index:index + 2])
             index += 2
             continue
+        if source.startswith("${", index):
+            end, levels = index + 2, [None]
+            while end < len(source) and levels:
+                current, quote = source[end], levels[-1]
+                if current == "\\" and quote != "'":
+                    end += 2
+                    continue
+                if current in "\"'" and quote in {None, current}:
+                    levels[-1] = current if quote is None else None
+                elif quote != "'" and source.startswith("${", end):
+                    levels.append(None)
+                    end += 2
+                    continue
+                elif current == "}" and quote is None:
+                    levels.pop()
+                end += 1
+            if not levels:
+                # Parameter braces belong to the word, not a shell group.
+                key = f"{prefix}{len(quoted)}__"
+                quoted[key] = source[index:end]
+                output.append(key)
+                index = end
+                continue
         if char in "\"'":
             end = index + 1
             while end < len(source):
@@ -455,6 +535,35 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
     written = {}
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
+    shell_values = {"HOME": str(Path.home())}
+    path_values = {}
+    live_assignments = set()
+
+    def expand(value, overrides=None):
+        values = shell_values if overrides is None else {**shell_values, **overrides}
+        return re.sub(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)",
+                      lambda match: values.get(match[1] or match[2], match[0]), value)
+
+    def variants(words):
+        yield [expand(word) for word in words]
+        for name, values in path_values.items():
+            reference = re.compile(r"\$\{" + re.escape(name) + r"\}|\$" + re.escape(name) + r"(?!\w)")
+            if any(reference.search(word) for word in words):
+                for value in values:
+                    yield [expand(word, {name: value}) for word in words]
+
+    def remember_assignment(word, directory):
+        name, _, value = word.partition("=")
+        candidates = [values[0] for values in variants([value])]
+        shell_values[name] = expand(value)
+        for candidate in candidates:
+            path = _literal_path(candidate, directory)
+            if re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", candidate):
+                path_values.setdefault(name, set()).add(candidate)
+            if LIVE.search(candidate) or path is not None and LIVE.search(str(path)):
+                # Branches and env prefixes may not execute; retain possible
+                # bindings rather than letting a later assignment erase them.
+                live_assignments.add(str(path) if path is not None else candidate)
 
     def check_source(source, directory, python=False, rule="live-database-script"):
         if _source_hit(source, directory, python):
@@ -491,13 +600,26 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
         except OSError:
             pass
 
+    def decode_word(value, directory, depth, quoted, checked, cwd_only=False):
+        nonlocal conditional
+        for key, literal in quoted.items():
+            if key in value and key not in checked and literal.startswith("${") and not cwd_only:
+                checked.add(key)
+                for substitution in _substitutions(literal, shell=True):
+                    conditional += 1
+                    try:
+                        scan(substitution, directory, depth + 1)
+                    finally:
+                        conditional -= 1
+            value = value.replace(key, literal)
+        return value
+
     def inspect(words, directory, depth, bodies, quoted, cwd_only=False):
         nonlocal unknown_cause
         words = list(words)
+        checked = set()
         def decode(value):
-            for key, literal in quoted.items():
-                value = value.replace(key, literal)
-            return value
+            return decode_word(value, directory, depth, quoted, checked, cwd_only)
         documents, redirects = [], []
         index = 0
         while index < len(words):
@@ -519,7 +641,9 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
         child_directory = False
         while words:
             binary = os.path.basename(words[0])
-            if re.match(r"^[A-Za-z_]\w*=", words[0]) or binary in {"then", "do", "else", "!"}:
+            if re.match(r"^[A-Za-z_]\w*=", words[0]):
+                remember_assignment(words.pop(0), directory)
+            elif binary in {"then", "do", "else", "!"}:
                 words.pop(0)
             elif binary in {"command", "exec", "nohup", "sudo", "nice", "timeout"}:
                 words.pop(0)
@@ -533,7 +657,9 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 words.pop(0)
                 while words and (words[0].startswith("-") or re.match(r"^[A-Za-z_]\w*=", words[0])):
                     flag = words.pop(0)
-                    if flag in {"-C", "--chdir"}:
+                    if re.match(r"^[A-Za-z_]\w*=", flag):
+                        remember_assignment(flag, directory)
+                    elif flag in {"-C", "--chdir"}:
                         child_directory = True
                         directory = _literal_path(words.pop(0), directory) if words else None
                     elif flag.startswith("--chdir="):
@@ -541,6 +667,10 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                         directory = _literal_path(flag.split("=", 1)[1], directory)
                     elif flag in {"-u", "--unset"} and words:
                         words.pop(0)
+                    elif flag in {"-S", "--split-string"} and words:
+                        scan(words.pop(0), directory, depth + 1)
+                    elif flag.startswith("--split-string="):
+                        scan(flag.split("=", 1)[1], directory, depth + 1)
             elif binary == "uv" and "run" in words[1:]:
                 words.pop(0)
                 while words:
@@ -567,6 +697,11 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             return caller_directory if child_directory else directory
         binary, args = os.path.basename(words[0]), words[1:]
         after = caller_directory if child_directory else directory
+        if binary in {"export", "readonly", "declare", "typeset", "local"}:
+            for arg in args:
+                if re.match(r"^[A-Za-z_]\w*=", arg):
+                    remember_assignment(arg, directory)
+            return after
         if binary == "cd":
             args = [arg for arg in args if arg not in {"--", "-L", "-P"}]
             changed = _literal_path(args[0] if args else str(Path.home()), directory) if len(args) <= 1 else None
@@ -610,7 +745,12 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     check_source(read_words[i + 1], directory, python, "live-database-read")
                     del read_words[i + 1]
                     break
-        if _direct_read(read_words + [v for op, v in redirects if op == "<"], directory):
+        assignment_reads = [] if binary == "jq" else list(live_assignments)
+        if any(_direct_read(values + assignment_reads, directory)
+               for values in variants(read_words)):
+            raise LiveRead("live-database-read")
+        if any(_direct_read(["cat", *values], directory)
+               for values in variants([v for op, v in redirects if op == "<"])):
             raise LiveRead("live-database-read")
         if binary in shells:
             if any(re.fullmatch(r"-[a-z]*n[a-z]*", arg) for arg in args):
@@ -655,7 +795,10 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 if flag == "--":
                     break
             if args and args[0] != "-":
-                add(args[0], directory, binary)
+                targets = args if binary == "node" and "--test" in words else args[:1]
+                for target in targets:
+                    if not target.startswith("-"):
+                        add(target, directory, binary)
         elif words[0].startswith(("/", "./", "../", "~/", "$HOME/", "${HOME}/")) and re.search(r"\.(?:py|mjs|cjs|js|ts|sh)$", words[0]):
             add(words[0], directory, binary)
         return after
@@ -685,7 +828,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 else:
                     tokens.append(token)
         except ValueError:
-            if SCRIPT.search(source) or DIRECT.search(source) or READER.search(source):
+            if SCRIPT.search(source) or DIRECT.search(source) or READER.search(source) or any(value.startswith("${") for value in quoted.values()):
                 raise AmbiguousScript(f"shell text could not be parsed (unbalanced quote near line {lexer.lineno})")
             return None
 
@@ -711,6 +854,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
 
             while index < (len(tokens) if stop is None else stop):
                 token = tokens[index]
+                header_cwd = current
                 if token in {"for", "while", "until", "select"} and not words and not probe:
                     # Any iteration can inherit the cwd left by the preceding
                     # one. Preflight loop bodies before resolving relative paths.
@@ -748,6 +892,14 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     continue
                 if token == closing:
                     return run(words, current), index + 1
+                if branches and branches[-1]["kind"] == "case" and branches[-1].get("pattern") and token == "|":
+                    checked = set()
+                    for word in words:
+                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe)
+                    words = []
+                    current = branches[-1]["cwd"]
+                    index += 1
+                    continue
                 if token in {";", "&&", "||", "|", "&", "\n"}:
                     prior = current
                     current = run(words, current, concurrent=token in {"|", "&"})
@@ -758,14 +910,19 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                     elif words:
                         guarded = False
                     words = []
+                    if token == ";" and index and tokens[index - 1] == ";" and branches and branches[-1]["kind"] == "case":
+                        branches[-1]["pattern"] = True
+                        current = branches[-1]["cwd"]
                 elif token in {"if", "while", "until", "for", "case", "select"} and not words:
-                    branches.append({"cwd": current, "branch_cwd": current, "changed": False, "kind": token})
+                    branches.append({"cwd": current, "branch_cwd": current, "changed": False, "kind": token, "pattern": token == "case"})
                     if token in {"for", "select", "case"}:
                         index += 1
+                        checked = set()
                         while index < len(tokens) and tokens[index] not in {";", "\n", "do"}:
                             # A case header ends at 'in', before its first arm.
                             if token == "case" and tokens[index] == "in":
                                 break
+                            decode_word(tokens[index], header_cwd, depth, quoted, checked, probe)
                             index += 1
                 elif token in {"elif", "else"} and not words and branches:
                     current = branches[-1]["branch_cwd"]
@@ -779,8 +936,12 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                         if frame["changed"]:
                             unknown_cause = "directory changed in a conditional branch or loop"
                 elif branches and branches[-1]["kind"] == "case" and token == ")":
+                    checked = set()
+                    for word in words:
+                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe)
                     words = []
                     current = branches[-1]["cwd"]
+                    branches[-1]["pattern"] = False
                 else:
                     words.append(token)
                 index += 1
