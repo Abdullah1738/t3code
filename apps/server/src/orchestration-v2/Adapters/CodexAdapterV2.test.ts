@@ -626,7 +626,7 @@ describe("CodexAdapterV2 runtime policy", () => {
 
         assert.equal(params.model, "gpt-5.4");
         assert.equal(params.effort, "xhigh");
-        assert.equal(params.serviceTier, "priority");
+        assert.equal(params.serviceTier, "default");
         assert.equal(params.cwd, "/workspace/model-options");
         assert.equal(params.collaborationMode?.settings.model, "gpt-5.4");
         assert.equal(params.collaborationMode?.mode, interactionMode);
@@ -651,7 +651,7 @@ describe("CodexAdapterV2 runtime policy", () => {
           },
           omitServiceTier: true,
         });
-        assert.equal(managed.serviceTier, undefined);
+        assert.equal(managed.serviceTier, "default");
 
         for (const tier of [undefined, "default"]) {
           const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
@@ -664,8 +664,7 @@ describe("CodexAdapterV2 runtime policy", () => {
               options: tier === undefined ? [] : [{ id: "serviceTier", value: tier }],
             },
           });
-          if (tier === undefined) assert.notProperty(params, "serviceTier");
-          else assert.equal(params.serviceTier, "default");
+          assert.equal(params.serviceTier, "default");
         }
       }),
   );
@@ -1767,6 +1766,7 @@ function codexReplayPreamble(input: {
           input: [{ type: "text", text: input.sentPrompt ?? input.prompt }],
           cwd: "/workspace",
           model: "gpt-5.4",
+          serviceTier: "default",
           approvalPolicy: "never",
           approvalsReviewer: "user",
           sandboxPolicy: { type: "dangerFullAccess" },
@@ -2670,6 +2670,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           model: "gpt-5.4",
           config: {
             "tools.update_plan.enabled": true,
+            service_tier: "default",
             mcp_optional_startup_grace_ms: 10_000,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
@@ -3513,6 +3514,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 input: [{ type: "text", text: turnText(index) }],
                 cwd: "/workspace",
                 model: "gpt-5.4",
+                serviceTier: "default",
                 ...turnPolicies[turnModes[index]!],
                 summary: "detailed",
               },
@@ -4254,6 +4256,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   input: [],
                   cwd: "/workspace",
                   model: "gpt-5.4",
+                  serviceTier: "default",
                   approvalPolicy: "never",
                   approvalsReviewer: "user",
                   sandboxPolicy: { type: "dangerFullAccess" },

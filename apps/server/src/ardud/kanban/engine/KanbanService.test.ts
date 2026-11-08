@@ -9559,7 +9559,7 @@ it.effect("new boards fill only missing levels on their matching default models"
                 ...model.capabilities,
                 optionDescriptors: [
                   ...(model.capabilities?.optionDescriptors ?? []),
-                  { id: "fastMode", label: "Fast mode", type: "boolean" },
+                  { id: "thinking", label: "Thinking", type: "boolean" },
                 ],
               },
             }
@@ -9569,7 +9569,7 @@ it.effect("new boards fill only missing levels on their matching default models"
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
       const opus = modelSelectionOf({ model: "opus/claude-opus-5-5" });
-      const withOtherOption = { ...opus, options: [{ id: "fastMode", value: true }] };
+      const withOtherOption = { ...opus, options: [{ id: "thinking", value: true }] };
       const board = yield* kanban.createBoard({
         slug: "picked-defaults",
         name: "Picked defaults",
@@ -9577,7 +9577,7 @@ it.effect("new boards fill only missing levels on their matching default models"
         evaluatorModel: withOtherOption,
       });
       assert.deepStrictEqual(board.evaluatorModel.options, [
-        { id: "fastMode", value: true },
+        { id: "thinking", value: true },
         { id: "variant", value: "high" },
       ]);
       assert.strictEqual(Rules.modelLevel(board.defaultCardModel), "high");
@@ -9681,7 +9681,7 @@ it.effect("new board and setup defaults follow canonical model routing", () =>
                   { id: "xhigh", label: "Xhigh" },
                 ],
               },
-              { id: "fastMode", label: "Fast mode", type: "boolean" },
+              { id: "thinking", label: "Thinking", type: "boolean" },
             ],
           },
         },
@@ -9694,7 +9694,7 @@ it.effect("new board and setup defaults follow canonical model routing", () =>
       const native = {
         instanceId: ProviderInstanceId.make("claudeAgent"),
         model: "claude-opus-5-5",
-        options: [{ id: "fastMode", value: true }],
+        options: [{ id: "thinking", value: true }],
       };
       const unmapped = yield* kanban.createBoard({
         slug: "native-routing-off",

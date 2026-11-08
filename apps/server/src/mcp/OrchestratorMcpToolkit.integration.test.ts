@@ -237,7 +237,9 @@ function makeDeterministicAdapter(input: {
           });
         const runOrdinals = new Map<ProviderTurnId, number>();
         const turnInputs = new Map<ProviderTurnId, ProviderAdapter.ProviderAdapterV2TurnInput>();
-        const interruptedAttempts = new Set<ProviderAdapter.ProviderAdapterV2TurnInput["attemptId"]>();
+        const interruptedAttempts = new Set<
+          ProviderAdapter.ProviderAdapterV2TurnInput["attemptId"]
+        >();
 
         return {
           instanceId: input.instanceId,
@@ -1716,7 +1718,7 @@ describe("orchestrator MCP toolkit", () => {
 
             const delegatedOptions = [
               { id: "effort", value: "max" },
-              { id: "fastMode", value: true },
+              { id: "fastMode", value: false },
             ];
             const delegatedCall = yield* invoke("delegate_task", {
               task: delegatedPrompt,

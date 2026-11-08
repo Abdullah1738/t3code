@@ -5167,3 +5167,80 @@ it.effect("releases ingestion after idle subagent rows and items settle", () =>
     ]);
   }),
 );
+
+it.effect.each([
+  { driverKind: "codex", stale: false, compact: false },
+  { driverKind: "codex", stale: true, compact: false },
+  { driverKind: "codex", stale: true, compact: true },
+  { driverKind: "claudeAgent", stale: false, compact: false },
+  { driverKind: "claudeAgent", stale: true, compact: false },
+  { driverKind: "claudeAgent", stale: true, compact: true },
+])("forces Standard at the unconditional provider boundary: %j", ({ driverKind, stale, compact }) =>
+  Effect.gen(function* () {
+    const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    const started = yield* Deferred.make<ProviderAdapter.ProviderAdapterV2TurnInput>();
+    const threadId = ThreadId.make("thread:run-execution-app-context");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const attemptId = RunAttemptId.make("attempt:run-execution-app-context");
+    const session = {
+      driver: ProviderDriverKind.make(driverKind),
+      events: Stream.never,
+      compactThread: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Deferred.succeed(started, input),
+      startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+        Deferred.succeed(started, input),
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+
+    yield* runExecution.startRootRun({
+      commandId: CommandId.make("command:run-execution-app-context"),
+      appThread: { id: threadId } as OrchestrationV2AppThread,
+      providerSessionId: ProviderSessionId.make("session:run-execution-app-context"),
+      session,
+      run: {
+        id: RunId.make("run:run-execution-app-context"),
+        threadId,
+        ordinal: 1,
+        providerInstanceId,
+      } as OrchestrationV2Run,
+      rootNode: {
+        id: NodeId.make("node:run-execution-app-context"),
+      } as OrchestrationV2ExecutionNode,
+      checkpointScope: {
+        id: CheckpointScopeId.make("checkpoint-scope:run-execution-app-context"),
+      } as OrchestrationV2CheckpointScope,
+      providerThread: {
+        id: ProviderThreadId.make("provider-thread:run-execution-app-context"),
+        driver,
+      } as OrchestrationV2ProviderThread,
+      attempt: { id: attemptId, providerTurnId: null } as OrchestrationV2RunAttempt,
+      attemptId,
+      providerTurnOrdinal: 1,
+      message: {
+        messageId: MessageId.make("message:run-execution-app-context"),
+        text: compact ? "/compact" : "What is on my list?",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      },
+      modelSelection: {
+        instanceId: providerInstanceId,
+        model: "gpt-6-sol",
+        options: stale
+          ? [
+              driverKind === "codex"
+                ? { id: "serviceTier", value: "priority" }
+                : { id: "fastMode", value: true },
+            ]
+          : [],
+      },
+      runtimePolicy: { runtimeMode: "full-access", interactionMode: "default", cwd: process.cwd() },
+    });
+
+    const input = yield* Deferred.await(started);
+    assert.deepEqual(input.modelSelection.options, [
+      driverKind === "codex"
+        ? { id: "serviceTier", value: "default" }
+        : { id: "fastMode", value: false },
+    ]);
+  }).pipe(Effect.provide(layerRunExecutionTest)),
+);

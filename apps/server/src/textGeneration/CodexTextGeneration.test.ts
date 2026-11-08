@@ -273,7 +273,7 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
             subject: "Add important change",
             body: "",
           }),
-          requireServiceTier: "priority",
+          requireServiceTier: "default",
           requireReasoningEffort: "xhigh",
           stdinMustNotContain: "branch must be a short semantic git branch fragment",
         },

@@ -454,7 +454,13 @@ class GenerateTests(HarnessTestCase):
         others_raw = [m for m in raw["models"] if m["slug"] not in extended]
         others_gen = [m for m in generated["models"] if m["slug"] not in extended]
         self.assertTrue(others_raw)
+        for model in others_raw:
+            model["default_service_tier"] = "default"
+            model["service_tiers"] = []
         self.assertEqual(others_raw, others_gen)
+        self.assertTrue(all(m["default_service_tier"] == "default" and m["service_tiers"] == [] for m in generated["models"]))
+        self.assertEqual(tomllib.loads((self.codex / "config.toml").read_text())["service_tier"], "default")
+        self.assertIs(json.loads((self.claude / "settings.json").read_text())["fastMode"], False)
 
     def test_models_json_refuses_missing_slug(self) -> None:
         m = self.manifest()
@@ -747,6 +753,7 @@ class GenerateTests(HarnessTestCase):
         original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
         expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
                               max_context_window=1050000, auto_compact_token_limit=450000,
+                              default_service_tier="default", service_tiers=[],
                               base_instructions=original["model_messages"]["instructions_template"])
         self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)
         self.assertEqual(cu_models.pop("gpt-6.1-terra"), dict(expected_terra, slug="gpt-6.1-terra"))
