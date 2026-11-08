@@ -102,7 +102,6 @@ import {
   selectRecentTimelineWindow,
   boundHistoryRowForTransport,
   THREAD_HISTORY_PAGE_POLICY,
-  OLDER_THREAD_USER_TURN_LIMIT,
 } from "./threadHistoryPaging.ts";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
@@ -5721,7 +5720,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               snapshotSequence,
               policy: {
                 ...THREAD_HISTORY_PAGE_POLICY,
-                maxUserTurns: OLDER_THREAD_USER_TURN_LIMIT,
+                // The index selection already enforced the turn limit, including
+                // the expanded find range. Only transport budgets apply here.
+                maxUserTurns: undefined,
                 maxItems:
                   THREAD_HISTORY_PAGE_POLICY.maxItems * (throughEntryId === undefined ? 1 : 2),
               },
@@ -7461,10 +7462,12 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               return yield* Effect.try({
                 try: () => {
                   const page = selectHistoryPageFromCursor({
-                    items: projection.visibleTurnItems.map((row) => ({
-                      ...row,
-                      item: projectTurnItemForWire(row.item),
-                    })),
+                    items: projection.visibleTurnItems.map((row) =>
+                      boundHistoryRowForTransport({
+                        ...row,
+                        item: projectTurnItemForWire(row.item),
+                      }),
+                    ),
                     cursor,
                     throughEntryId,
                     snapshotSequence,
