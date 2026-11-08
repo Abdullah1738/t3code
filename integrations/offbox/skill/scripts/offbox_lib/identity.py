@@ -362,6 +362,10 @@ def require_proven(me: dict, action: str) -> None:
     must never reach a selector, where it would silently match nothing or the wrong caller's rows.
     """
     if not me.get("proven", True):
+        if me.get("driver") == "claudeAgent":
+            raise OffboxError(
+                f"{action} refused: Claude identity can't be proven because the hook couldn't reach the Robob control API to sign this command. "
+                "Retry in a moment. Nothing was changed.", code=2)
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
             f"(resolution={me.get('resolution') or 'none'}). A Claude shell without the hook's signed per-command "
