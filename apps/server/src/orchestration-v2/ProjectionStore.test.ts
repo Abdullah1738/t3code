@@ -2420,8 +2420,130 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       }),
   );
 
+  it.effect.each([0, 1, 12])(
+    "bounds a SQL thread with %i control turns and large outputs",
+    (personTurns) =>
+      Effect.gen(function* () {
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const nowIso = DateTime.formatIso(now);
+        const storage = `control-${personTurns}`;
+        const threadId = ThreadId.make(`thread:${storage}`);
+        yield* projectionStore.apply({
+          id: EventId.make("event:user-turn-pages:thread"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project:user-turn-pages"),
+            title: "Bounded SQL history",
+            providerInstanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
+        const ids: string[] = [];
+        for (let ordinal = 1; ordinal <= 240; ordinal += 1) {
+          const id = `item:${storage}:${ordinal}`;
+          ids.push(id);
+          const base = {
+            id,
+            threadId,
+            runId: null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal,
+            status: "completed",
+            title: null,
+            startedAt: nowIso,
+            completedAt: nowIso,
+            updatedAt: nowIso,
+          };
+          const item =
+            ordinal <= personTurns
+              ? {
+                  ...base,
+                  type: "user_message",
+                  createdBy: "system",
+                  creationSource: "server",
+                  messageId: `ardud-control:${ordinal}`,
+                  inputIntent: "turn_start",
+                  text: "The robob client has restarted. Please resume…",
+                  attachments: [],
+                }
+              : {
+                  ...base,
+                  type: "command_execution",
+                  input: "i".repeat(12_000),
+                  output: "x".repeat(80_000),
+                  exitCode: 0,
+                };
+          yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert({
+            turn_item_id: id,
+            thread_id: threadId,
+            run_id: null,
+            node_id: null,
+            provider_thread_id: null,
+            provider_turn_id: null,
+            parent_item_id: null,
+            ordinal,
+            type: item.type,
+            status: "completed",
+            updated_at: nowIso,
+            payload_json: encodeUnknownJsonString(item),
+          })}`;
+        }
+        const full = yield* projectionStore.getThreadSnapshot(threadId);
+        const initial = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+          rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+          userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+        });
+        assert.isAtMost(initial.projection.turnItems.length, THREAD_HISTORY_SNAPSHOT_ROW_LIMIT);
+        const bounded = buildBoundedThreadProjection(initial);
+        const before = Buffer.byteLength(JSON.stringify(full.projection));
+        const after = Buffer.byteLength(JSON.stringify(bounded.projection));
+        assert.isAbove(before, 16 * 1024 * 1024);
+        assert.isAtMost(after, THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes);
+        assert.equal(bounded.projection.visibleTurnItems.at(-1)?.sourceItemId, ids.at(-1));
+        const seen = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
+        let cursor = bounded.historyCursor;
+        for (let pages = 0; cursor !== null; pages += 1) {
+          assert.isBelow(pages, ids.length);
+          const page = yield* projectionStore.getThreadHistoryPage(threadId, cursor);
+          assert.isAtMost(page.items.length, THREAD_HISTORY_PAGE_POLICY.maxItems);
+          assert.isBelow(
+            Buffer.byteLength(JSON.stringify(page)),
+            THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+          );
+          seen.unshift(...page.items.map((row) => String(row.sourceItemId)));
+          cursor = page.nextCursor;
+        }
+        assert.deepEqual(seen, ids);
+      }),
+  );
+
   it.effect.each(["hot", "cold", "base"] as const)(
-    "pages complete %s user turns through SQL regardless of tool count or payload size",
+    "caps %s user turns by rows and pages without gaps",
     (storage) =>
       Effect.gen(function* () {
         const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
@@ -2573,16 +2695,17 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           nodePlan.map((row) => row.detail),
           "SEARCH orchestration_v2_projection_nodes USING INDEX orchestration_v2_projection_nodes_live_idx (thread_id=?)",
         );
-        assert.lengthOf(initial.projection.turnItems, 12 * 102);
+        assert.lengthOf(initial.projection.turnItems, 77);
         const bounded = buildBoundedThreadProjection({
           projection: initial.projection,
           snapshotSequence: 0,
         });
-        assert.lengthOf(bounded.projection.visibleTurnItems, 10 * 102);
-        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds[35 * 102]);
+        assert.lengthOf(bounded.projection.visibleTurnItems, 75);
+        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds.at(-75));
         const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
         let cursor = bounded.historyCursor;
-        for (const turns of [20, 15]) {
+        for (let pages = 0; cursor !== null; pages += 1) {
+          assert.isBelow(pages, 100);
           assert.isNotNull(cursor);
           const anchor = decodeThreadHistoryCursor(cursor!);
           const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
@@ -2596,7 +2719,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             cursor: cursor!,
             snapshotSequence: 0,
           });
-          assert.lengthOf(page.items, turns * 102);
+          assert.isAtMost(page.items.length, 75);
           loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
           cursor = page.nextCursor;
         }
@@ -2856,7 +2979,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           .pipe(Effect.withTracer(tracer));
         assert.deepEqual(
           initial.projection.turnItems.map((item) => String(item.id)),
-          allIds.slice(allIds.indexOf(startIds[260]!)),
+          allIds.slice(-77),
         );
         const windowStatement = statements.find((statement) => statement.includes("run_starts"));
         assert.isDefined(windowStatement);
@@ -2885,11 +3008,11 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           projection: initial.projection,
           snapshotSequence: 0,
         });
-        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, startIds[262]);
+        assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds.at(-75));
         const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
         let cursor = bounded.historyCursor;
         for (let pages = 0; cursor !== null; pages += 1) {
-          assert.isBelow(pages, 5);
+          assert.isBelow(pages, 100);
           const anchor = decodeThreadHistoryCursor(cursor);
           const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
             rowLimit: 77,
@@ -2897,7 +3020,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             anchorItemId: TurnItemId.make(anchor.si),
             anchorThreadId: ThreadId.make(anchor.st),
           });
-          assert.isAtMost(snapshot.projection.turnItems.length, 152 * 4 + 1);
+          assert.isAtMost(snapshot.projection.turnItems.length, 77);
           const page = selectHistoryPageFromCursor({
             items: snapshot.projection.visibleTurnItems,
             cursor,

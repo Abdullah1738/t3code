@@ -1,4 +1,10 @@
-import { CurrentAction, bindActionValue, markAction, allocateAction, withAction } from "../ardud/actionTelemetry.ts";
+import {
+  CurrentAction,
+  bindActionValue,
+  markAction,
+  allocateAction,
+  withAction,
+} from "../ardud/actionTelemetry.ts";
 import {
   EnvironmentAuthorizationError,
   clientRpcRequiredScopes,
@@ -208,7 +214,12 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
   });
   const action = (yield* CurrentAction) ?? (yield* allocateAction(tag));
   return yield* withAction(method(input), action).pipe(
-    Effect.tap((value) => Effect.sync(() => { bindActionValue(value, action); markAction(action, 'state-ready'); })),
+    Effect.tap((value) =>
+      Effect.sync(() => {
+        bindActionValue(value, action);
+        markAction(action, "state-ready");
+      }),
+    ),
     Effect.ensuring(completeObservation),
   );
 });
@@ -248,6 +259,7 @@ interface SubscriptionOptions<TTag extends EnvironmentSubscriptionRpcTag> {
     cause: Cause.Cause<EnvironmentRpcStreamFailure<TTag>>,
   ) => Effect.Effect<void, never, never>;
   readonly retryExpectedFailureAfter?: Duration.Input;
+  readonly retryDefects?: boolean;
   readonly resubscribe?: Stream.Stream<unknown, never, never>;
 }
 
@@ -330,7 +342,17 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                       const hasOnlyExpectedFailures =
                         cause.reasons.length > 0 &&
                         cause.reasons.every((reason) => reason._tag === "Fail");
+                      const retryDefect =
+                        options?.retryDefects === true &&
+                        cause.reasons.some(
+                          (reason) =>
+                            reason._tag === "Die" ||
+                            (reason._tag === "Fail" &&
+                              isRpcClientError(reason.error) &&
+                              reason.error.reason._tag === "RpcClientDefect"),
+                        );
                       const isTransportFailure =
+                        !retryDefect &&
                         hasOnlyExpectedFailures &&
                         cause.reasons.every(
                           (reason) => reason._tag === "Fail" && isRpcClientError(reason.error),
@@ -347,10 +369,13 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                           ),
                         ).pipe(Stream.drain);
                       }
-                      if (hasOnlyExpectedFailures && options?.onExpectedFailure !== undefined) {
-                        const handled = Stream.fromEffect(options.onExpectedFailure(cause)).pipe(
-                          Stream.drain,
-                        );
+                      if (
+                        (hasOnlyExpectedFailures || retryDefect) &&
+                        options?.onExpectedFailure !== undefined
+                      ) {
+                        const handled = Stream.fromEffect(
+                          retryDefect ? Effect.void : options.onExpectedFailure(cause),
+                        ).pipe(Stream.drain);
                         const isAuthorizationFailure = cause.reasons.some(
                           (reason) =>
                             reason._tag === "Fail" && isEnvironmentAuthorizationError(reason.error),
