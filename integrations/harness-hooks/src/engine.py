@@ -103,6 +103,7 @@ def _log(**record):
             "cmd": None,
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
+            "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
             "audit_error": audit_error,
         }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -157,16 +158,16 @@ def _control():
     return base, credentials.get("token")
 
 
-def _get(path, *, deadline=None):
+def _get(path, *, deadline=None, timeout=1.2):
     # urlopen's timeout bounds each socket read, not the total response; a
     # slow streaming control response could otherwise exhaust the hook's 10s.
-    deadline = deadline if deadline is not None else time.monotonic() + 1.2
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
     done = threading.Event()
     result = []
 
     def request():
         try:
-            result.append((True, _get_unbounded(path, deadline)))
+            result.append((True, _get_unbounded(path, deadline, timeout=timeout)))
         except Exception as error:
             result.append((False, error))
         finally:
@@ -184,14 +185,14 @@ def _get(path, *, deadline=None):
     return value
 
 
-def _get_unbounded(path, deadline):
+def _get_unbounded(path, deadline, *, timeout=1.2):
     base, token = _control()
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(base + path, headers=headers)
     try:
-        timeout = 1.2 if deadline is None else min(1.2, deadline - time.monotonic())
+        timeout = timeout if deadline is None else min(timeout, deadline - time.monotonic())
         if timeout <= 0:
             raise TimeoutError("control-deadline")
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -428,11 +429,38 @@ def _command_with_context(command, identity, pin):
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
+_CLAUDE_IDENTITY_TTL = 12 * 60 * 60
+_CLAUDE_IDENTITY_BUDGET = 4.5
+_CLAUDE_IDENTITY_CALL_TIMEOUT = 3.0
+
+
+def _identity_transport_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code < 600
+    return isinstance(error, (TimeoutError, ConnectionError, urllib.error.URLError))
+
+
+def _lookup_identity(path, harness):
+    if harness != "claude":
+        return _get(path)
+    # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
+    deadline = time.monotonic() + _CLAUDE_IDENTITY_BUDGET
+    for attempt in range(2):
+        try:
+            return _get(path, deadline=min(deadline, time.monotonic() + _CLAUDE_IDENTITY_CALL_TIMEOUT),
+                        timeout=_CLAUDE_IDENTITY_CALL_TIMEOUT)
+        except Exception as error:
+            if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
+                raise
+
+
 def resolve_identity(event, harness, *, fresh=False):
-    """Resolve exact hook identity; cache only resolved answers, at most 60 seconds.
+    """Resolve exact hook identity; refresh bindings after 60 seconds.
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
+    During transport outages Claude can reuse a binding for 12h, but never its
+    model for a fresh policy check. Authoritative misses invalidate the binding.
     """
     native, agent, driver = _native(event, harness)
     if not isinstance(native, str) or not native or (agent is not None and not isinstance(agent, str)):
@@ -443,22 +471,37 @@ def resolve_identity(event, harness, *, fresh=False):
         key = hashlib.sha256(json.dumps([base, driver, instance, native, agent], separators=(",", ":")).encode()).hexdigest()
         cache_file = _state() / "identity" / (key + ".json")
         cached = _read_json(cache_file, {})
-        age = time.time() - cached.get("at", 0)
-        identity = cached.get("identity")
-        if not fresh and 0 <= age < 60 and isinstance(identity, dict) and identity.get("resolution") == "resolved" and identity.get("robobThreadId"):
-            return identity
+        at = cached.get("at") if isinstance(cached, dict) else None
+        age = time.time() - at if type(at) in (int, float) else float("inf")
+        identity = cached.get("identity") if isinstance(cached, dict) else None
+        valid_cache = (isinstance(identity, dict) and identity.get("resolution") == "resolved" and
+                       bool(identity.get("robobThreadId")) and identity.get("nativeSessionId") == native and
+                       identity.get("nativeAgentId") == agent and identity.get("driver") in (None, driver) and
+                       (not instance or identity.get("providerInstanceId") in (None, instance)))
+        if not fresh and 0 <= age < 60 and valid_cache:
+            return {**identity, "identity_source": "cache"}
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
         if instance:
             params["instance"] = instance
-        resolved = _get("/identity/resolve?" + urllib.parse.urlencode(params)).get("identity")
+        try:
+            resolved = _lookup_identity("/identity/resolve?" + urllib.parse.urlencode(params), harness).get("identity")
+        except Exception as error:
+            fallback_age = time.time() - at if type(at) in (int, float) else float("inf")
+            if harness == "claude" and _identity_transport_error(error) and valid_cache and 0 <= fallback_age < _CLAUDE_IDENTITY_TTL:
+                binding = {**identity, "identity_source": "cache"}
+                binding.pop("model", None)
+                return binding
+            raise
         if not isinstance(resolved, dict):
             raise ValueError("identity-response")
         identity = dict(resolved)
         if identity.get("resolution") == "resolved":
             identity.setdefault("nativeSessionId", native)
             identity.setdefault("nativeAgentId", agent)
+            if identity["nativeSessionId"] != native or identity["nativeAgentId"] != agent:
+                raise ValueError("identity-native-mismatch")
         if identity.get("resolution") == "resolved" and identity.get("driver") not in (None, driver):
             raise ValueError("identity-driver-mismatch")
         if identity.get("resolution") == "resolved" and instance and identity.get("providerInstanceId") not in (None, instance):
@@ -476,7 +519,9 @@ def resolve_identity(event, harness, *, fresh=False):
                         os.unlink(tmp)
             except OSError:
                 pass
-        return identity
+        else:
+            cache_file.unlink(missing_ok=True)
+        return {**identity, "identity_source": "control"}
     except Exception:
         return {"resolution": "unavailable"}
 
@@ -1024,6 +1069,7 @@ def decide(event, harness):
     identity = {}
     error_type = None
     log_tool = None
+    binding_only = False
     result = {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}}
     lineage_nodes = None
     lineage_deadline = None
@@ -1059,9 +1105,17 @@ def decide(event, harness):
             return result
         native, _, _ = _native(event, harness)
         if native:
-            # Do not mistake an unexpired binding cache for a healthy identity
-            # service during an outage: the policy is explicitly fail-open.
-            identity = resolve_identity(event, harness, fresh=True)
+            # Ordinary Claude shell calls only need a binding to sign. Model
+            # policy and shims still refresh rather than trusting a cached model.
+            shell_command = _command(event)
+            binding_only = (harness == "claude" and kind == "PreToolUse" and
+                            _shell_input_field(event, harness) and shell_command and
+                            not classify_coord(shell_command))
+            if binding_only and not tool.startswith("mcp__"):
+                inp = event["tool_input"]
+                shell_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+                binding_only = not approval(shell_command, shell_cwd)
+            identity = resolve_identity(event, harness, fresh=not binding_only)
             if identity.get("resolution") != "resolved":
                 error_type = "identity-" + str(identity.get("resolution", "unavailable"))
         if event.get("hook_event_name") != "PreToolUse":
@@ -1097,7 +1151,8 @@ def decide(event, harness):
                 if result["decision"] != "deny":
                     # The model was refreshed with this event's identity and
                     # is never taken from stdin or an older cached binding.
-                    coord = decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
+                    coord = (decide_coord(command, identity, cwd, approval_allowed=approval_allowed, lineage=lineage)
+                             if not binding_only else {"decision": "allow", "reason": "", "context": {"rule": "no-policy"}})
                     if coord["context"].get("rule") == "coord-unresolved" and not error_type:
                         error_type = "coord-unresolved"
                     if coord["decision"] == "deny":
@@ -1131,6 +1186,7 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
+             identity_source=identity.get("identity_source"),
              command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 

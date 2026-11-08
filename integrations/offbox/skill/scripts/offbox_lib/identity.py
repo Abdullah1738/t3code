@@ -397,6 +397,10 @@ def require_proven(me: dict, action: str) -> None:
                 f"{action} refused: this {me.get('driver')} caller can't be proven to be one Robob execution. "
                 f"Robob's control API didn't answer the caller lookup ({me['lookupError']}). "
                 f"Robob may be busy or restarting. Retry in ~30 s. Nothing was changed.", code=2)
+        if me.get("driver") == "claudeAgent":
+            raise OffboxError(
+                f"{action} refused: Claude identity can't be proven because the hook couldn't reach the Robob control API to sign this command. "
+                "Retry in a moment. Nothing was changed.", code=2)
         raise OffboxError(
             f"{action} refused: this caller ({me.get('driver')}) can't be proven to be one Robob execution yet "
             f"(resolution={me.get('resolution') or 'none'}). A Claude shell without the hook's signed per-command "
