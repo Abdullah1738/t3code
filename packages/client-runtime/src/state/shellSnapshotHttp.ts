@@ -37,6 +37,7 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
     RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]
   >;
   readonly timeoutMs?: number;
+  readonly onPage?: (snapshot: DeferredShellSnapshot) => Effect.Effect<void>;
 }) {
   const fetchPage = (after?: string) =>
     executeAuthenticatedEnvironmentHttpRequest({
@@ -59,6 +60,7 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   const pages: DeferredShellSnapshot[] = [snapshot];
   const seen = new Set<string>();
   while (snapshot.page?.nextAfter != null) {
+    if (input.onPage) yield* input.onPage(mergeHttpShellPages(pages));
     const after = snapshot.page.nextAfter;
     if (seen.has(after))
       return yield* Effect.die(new Error("Shell snapshot cursor did not advance."));
@@ -66,11 +68,29 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
     snapshot = yield* fetchPage(after);
     pages.push(snapshot);
   }
-  const { page: _page, ...first } = pages[0]!;
+  return mergeHttpShellPages(pages);
+});
+
+/**
+ * The current server reads each page in a separate transaction. Keep the earliest
+ * sequence for replay; M3 must pin pages to a server snapshot epoch/watermark.
+ * page.nextAfter explicitly marks cumulative partial coverage until the final page.
+ * Cumulative pages use after:null so the reducer replaces stale cached membership.
+ */
+export function mergeHttpShellPages(
+  pages: ReadonlyArray<DeferredShellSnapshot>,
+): DeferredShellSnapshot {
+  const first = pages[0]!;
+  const last = pages[pages.length - 1]!;
+  const { page: _page, ...base } = first;
   return {
-    ...first,
-    threads: pages.flatMap((page) => page.threads),
-    // Resume at the earliest read so concurrent mutations replay after all pages load.
+    ...base,
+    ...(last.page ? { page: { ...last.page, after: null } } : {}),
+    threads: [
+      ...new Map(
+        pages.flatMap((page) => page.threads.map((thread) => [thread.id, thread] as const)),
+      ).values(),
+    ],
     snapshotSequence: Math.min(...pages.map((page) => page.snapshotSequence)),
     loadPullRequests: Effect.all(
       pages.map(
@@ -80,8 +100,8 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
       ),
       { concurrency: 1 },
     ).pipe(Effect.map((maps) => new Map(maps.flatMap((map) => [...map])))),
-  } satisfies DeferredShellSnapshot;
-});
+  };
+}
 
 const decodeEnvironmentHttpCommonError = Schema.decodeUnknownEffect(
   Schema.toCodecJson(EnvironmentHttpCommonError),
@@ -113,6 +133,7 @@ export class ShellSnapshotLoader extends Context.Service<
   {
     readonly load: (
       prepared: PreparedConnection,
+      onPage?: (snapshot: DeferredShellSnapshot) => Effect.Effect<void>,
     ) => Effect.Effect<Option.Option<DeferredShellSnapshot>>;
   }
 >()("@t3tools/client-runtime/state/shellSnapshotHttp/ShellSnapshotLoader") {}
@@ -128,8 +149,13 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
       RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
     );
     return ShellSnapshotLoader.of({
-      load: (prepared: PreparedConnection) =>
-        fetchEnvironmentShellSnapshot({ prepared, signer, remoteAuthorization }).pipe(
+      load: (prepared: PreparedConnection, onPage) =>
+        fetchEnvironmentShellSnapshot({
+          prepared,
+          signer,
+          remoteAuthorization,
+          ...(onPage ? { onPage } : {}),
+        }).pipe(
           Effect.map(Option.some<DeferredShellSnapshot>),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.catchCause((cause) =>

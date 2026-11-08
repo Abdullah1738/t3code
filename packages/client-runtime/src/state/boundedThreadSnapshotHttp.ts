@@ -82,6 +82,8 @@ export const layer: Layer.Layer<
           })),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.catchTags({
+            EnvironmentScopeRequiredError: () => Effect.succeed({ _tag: "denied" } as const),
+            EnvironmentOperationForbiddenError: () => Effect.succeed({ _tag: "denied" } as const),
             EnvironmentResourceNotFoundError: () =>
               Effect.logDebug(
                 "Full thread snapshot not found over HTTP after bounded fallback; treating the thread as deleted.",
@@ -125,6 +127,8 @@ export const layer: Layer.Layer<
           })),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.catchTags({
+            EnvironmentScopeRequiredError: () => Effect.succeed({ _tag: "denied" } as const),
+            EnvironmentOperationForbiddenError: () => Effect.succeed({ _tag: "denied" } as const),
             EnvironmentResourceNotFoundError: () =>
               Effect.logDebug(
                 "Bounded thread snapshot not found over HTTP; treating the thread as deleted.",

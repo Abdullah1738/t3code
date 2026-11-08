@@ -194,7 +194,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (session !== activeSession) continue;
       if (item.kind === "synchronized") {
         waiting = false;
-        if (Option.isSome(next.snapshot)) {
+        if (Option.isSome(next.snapshot) && next.snapshot.value.page?.nextAfter == null) {
           const serverVersion = yield* session.initialConfig.pipe(
             Effect.map((config) => config.environment.serverVersion),
             Effect.orElseSucceed(() => null),
@@ -231,7 +231,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         snapshotSession = session;
       next = {
         snapshot: Option.some(nextSnapshot),
-        status: waiting ? "synchronizing" : "live",
+        status: waiting || nextSnapshot.page?.nextAfter != null ? "synchronizing" : "live",
         error: Option.none(),
       };
     }
@@ -373,7 +373,12 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               }),
             ),
           );
-          const httpSnapshot = yield* snapshotLoader.load(prepared);
+          const httpSnapshot = yield* snapshotLoader.load(prepared, (page) =>
+            applyItems(
+              [[session, { kind: "snapshot", snapshot: withoutDeferredPullRequests(page) }]],
+              new Set(page.loadPullRequests ? page.threads.map((thread) => thread.id) : []),
+            ),
+          );
           if (Option.isSome(httpSnapshot)) {
             yield* cancelActiveFill;
             const previous = yield* SubscriptionRef.get(state);

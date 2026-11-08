@@ -30,6 +30,7 @@ export type ThreadSnapshotLoadResult =
       readonly snapshot: OrchestrationV2ThreadDetailSnapshot;
       readonly history?: ThreadSnapshotHistoryMeta;
     }
+  | { readonly _tag: "denied" }
   | { readonly _tag: "missing" }
   | { readonly _tag: "unavailable" };
 
