@@ -1,4 +1,15 @@
 {
+  "crpko-1245-python-node-stdin.sh": {
+    "card": 1245,
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-native-init-floors",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "sha256": "dc53f4fb06379d68fd103f651b303b598052518625f7c3d02d3dc0b4a775c614",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T00-23-05-01a1bcd4-3093-7163-b3d3-dd37e5c49e33.jsonl",
+    "source_call_id": "call_05a6908a26b44a9f8f27abec155d9114",
+    "source_line_0": 88
+  },
   "crpko-1606-otp-marker-node-check.sh": {
     "card": 1606,
     "cwd": "/Users/ardud/checkouts/edge-otp-home-shard-marker",

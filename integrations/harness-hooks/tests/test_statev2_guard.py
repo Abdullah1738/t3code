@@ -274,6 +274,26 @@ class GuardTests(unittest.TestCase):
         self.assertIsNone(self.classify("node - <<'NODE'\n" + body + "NODE"))
         self.assertEqual(self.classify("node - <<'NODE'\n" + body.replace("tmp/card-2982/s4-final.json", LIVE) + "NODE"), READ)
 
+    def test_compound_python_node_stdin_1245(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        command = (fixtures / "crpko-1245-python-node-stdin.sh").read_text()
+        cwd = "/Volumes/ExternalSSD/board-wt/crpko-devops-native-init-floors"
+        self.assertIsNone(guard.classify(command, cwd))
+        self.assertIn("node --input-type=module - <<'JS'", command)
+        self.assertIn("npm run validate:plan", command)
+        for flags in ("", "--input-type=module ", "--no-warnings --input-type=module "):
+            variant = command.replace("node --input-type=module -", f"node {flags}-")
+            with self.subTest(flags=flags, reader=None):
+                self.assertIsNone(guard.classify(variant, cwd))
+            for delimiter, read in [
+                ("PY", 'from pathlib import Path; Path("~/.robob/userdata/statev2.sqlite").expanduser().read_bytes()'),
+                ("JS", "const liveDbFs = await import('node:fs'); liveDbFs.readFileSync(process.env.HOME + '/.robob/userdata/statev2.sqlite');"),
+            ]:
+                twin = variant.replace(f"\n{delimiter}\n", f"\n{read}\n{delimiter}\n", 1)
+                self.assertNotEqual(twin, variant)
+                with self.subTest(flags=flags, reader=delimiter):
+                    self.assertEqual(guard.classify(twin, cwd), READ)
+
     def test_diagnostics_and_limits(self):
         for command, detail in [
             ("python3 $X", "$X"),
