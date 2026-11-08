@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import net from "node:net";
 import assert from "node:assert/strict";
+import { addRecoveryHistory } from "./RecoveryShape.fixture.mjs";
 const root = process.cwd();
 const fixtures = path.join(root, "apps/server/src/ardud/fast-install/testing");
 const output = path.resolve(process.argv[2] ?? "tmp/l5-crash");
@@ -101,6 +102,8 @@ for (const [count, active] of [
     [path.join(fixtures, "CrashSeed.fixture.mjs"), home, String(count), String(active)],
     path.join(home, "seed.log"),
   );
+  if (process.env.T3CODE_RECOVERY_SHAPE)
+    addRecoveryHistory(home, Number(process.env.T3CODE_RECOVERY_SHAPE));
   const listenPort = await port();
   const start = Date.now();
   let stdout = "",
@@ -203,6 +206,7 @@ for (const [count, active] of [
         node: process.version,
       },
       seed: 1,
+      unrelatedProviderThreads: Number(process.env.T3CODE_RECOVERY_SHAPE ?? 0),
       threads: count,
       active,
       listenMs: Date.parse(last.listeningAt) - start,
@@ -210,6 +214,9 @@ for (const [count, active] of [
       reconciledMs: Date.parse(settled.completedAt) - start,
       firstQueuedMs:
         Math.min(...last.threads.filter((t) => t.queuedAt).map((t) => Date.parse(t.queuedAt))) -
+        start,
+      lastQueuedMs:
+        Math.max(...last.threads.filter((t) => t.queuedAt).map((t) => Date.parse(t.queuedAt))) -
         start,
       firstProviderRequestMs: Math.min(...turns.map((t) => t.at)) - start,
       lastProviderRequestMs: Math.max(...turns.map((t) => t.at)) - start,
@@ -231,6 +238,7 @@ for (const [count, active] of [
   }
 }
 console.log(JSON.stringify(rows, null, 2));
+if (process.env.T3CODE_RECOVERY_TIMINGS_ONLY === "1") process.exit(0);
 
 // Each case retains the marked home, provider ledger, reports and exact kill trace.
 const cases = [];

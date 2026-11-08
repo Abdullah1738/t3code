@@ -1,3 +1,4 @@
+import { captureOwnedTree, cleanupOwnedTree } from "@t3tools/shared/ownedProcessTree";
 import { shutdownWithinBudget } from "./ardud/fast-install/shutdown.ts";
 import { markInstallLifecycle } from "./ardud/fast-install/report.ts";
 import {
@@ -501,10 +502,27 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
           Effect.ignore,
         );
       }
+      // Capture identities before provider handles can exit and orphan MCP children.
+      const ownedProcesses = yield* Effect.tryPromise((signal) =>
+        captureOwnedTree(process.pid, new Set(), signal),
+      ).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.catchCause(() => Effect.succeed(Option.none())),
+      );
       // Leave runtime facts intact: startup can recover even if preparation is cut short.
       yield* shutdownWithinBudget({
         prepare: providerRuntimeRecovery.prepareForShutdown,
-        closeProviders: providerSessions.shutdown,
+        closeProviders: providerSessions.shutdown.pipe(
+          Effect.interruptible,
+          Effect.timeoutOption("3 seconds"),
+          Effect.ensuring(
+            Option.isSome(ownedProcesses)
+              ? Effect.tryPromise(() => cleanupOwnedTree(ownedProcesses.value, 250)).pipe(
+                  Effect.ignoreCause({ log: true }),
+                )
+              : Effect.void,
+          ),
+        ),
         checkpoint: Option.isSome(sql) ? sql.value`PRAGMA wal_checkpoint(PASSIVE)` : Effect.void,
       });
     }).pipe(
@@ -562,6 +580,10 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
         },
       });
     }
+    // Recovery uses synchronous SQLite on the writer. Even a fork can monopolize
+    // the event loop before the listener is bound; park it until HTTP is serving.
+    yield* Deferred.await(httpListening);
+    yield* Effect.yieldNow;
     const { recovery, bootstrap: bootstrapTargets } = yield* runOrderedV2StartupPhases({
       importLegacyShells: runStartupPhase(
         "orchestration-v2.legacy-v1.import-shells",
