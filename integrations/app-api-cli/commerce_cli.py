@@ -28,6 +28,8 @@ ORDER_CARD_LAST4=order_card.LAST4
 # Owner pause on all ordering: while this file exists, money commands refuse (exit 4).
 PAUSE_FILE=Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home()/'.local/state/ordering-paused')
 PAUSED_COMMANDS=frozenset({'order','test-talabat-shops','await-payment','marketplace-cart','cart','recover-payment'})
+# close-food-captured is excluded: it reads bank/order evidence and closes local
+# ownership only; it has no place, completion, payment or other remote send.
 EXIT_PAUSED=4
 # Only outcomes that clearly mean the card itself was refused.
 CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
@@ -983,6 +985,11 @@ def main(argv=None):
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
     recipient_argument(recover)
+    captured=commands.add_parser('close-food-captured', help='Close a delivered automatic Food capture from bank SMS evidence; never sends money')
+    captured.add_argument('flow_id')
+    captured.add_argument('--bank-msg-id', type=int, required=True)
+    captured.add_argument('--attested-by', choices=('owner',))
+    captured.add_argument('--confirm', action='store_true', help='Commit the evidenced close; omitted means validated dry run')
     track=commands.add_parser('track');track.add_argument('flow_id')
     exact=commands.add_parser('track-exact');exact.add_argument('app',choices=('noon','talabat'))
     exact.add_argument('vertical');exact.add_argument('order')
@@ -1163,6 +1170,9 @@ def main(argv=None):
                 # No decline row (receipt parked before it was journaled): treat it as now.
                 noted=note_card_decline(result,app='talabat',not_before=started,occurred_at=occurred)
                 if noted:result={**result,'card_status':noted}
+        elif args.command=='close-food-captured':
+            from commerce_food_capture import close
+            result=close(args, track_exact)
         elif args.command=='order-status':
             from commerce_order_status import status
             result=status(args.flow_id)

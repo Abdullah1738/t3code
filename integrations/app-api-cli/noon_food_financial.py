@@ -249,7 +249,7 @@ def contract():
                 'null paymentClientSecret; paymentProcessedAt populated; accepted/accepted',
                 'fresh saved-card token matches prepared binding; preparing tracking'],
             'capture_verified':False},
-        'unsupported':['automatic null-intent path has no explicit capture receipt; merchant processing is reported separately',
+        'unsupported':['automatic null-intent capture closes through bank-evidenced close-food-captured after exact delivery; merchant processing alone is not capture proof',
             'unpaid intent status and safe eligibility for first completion; native adapter refuses unknown states',
             'saved-card absent wallet-field serialization and encrypted-CVV request acceptance',
             '3DS challenge/return contract; recovery reads status only and never follows redirect URLs',
