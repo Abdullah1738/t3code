@@ -1,12 +1,27 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import {
+  EventId,
+  ThreadId,
+  ProjectId,
+  ProviderInstanceId,
+  ProviderDriverKind,
+  ProviderThreadId,
+  ProviderSessionId,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ExecutionIdentity from "./ExecutionIdentity.ts";
 
@@ -461,6 +476,130 @@ const runStaleOnly = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.Executio
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ExecutionIdentity", () => {
+  it.live("resolves a started app-managed Codex child while the SQLite writer is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-identity-startup-" });
+      yield* Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const now = yield* DateTime.now;
+        const parentId = ThreadId.make("thread:parent-startup");
+        const childId = ThreadId.make("thread:delegated-task:startup");
+        const instance = ProviderInstanceId.make("codex");
+        const driver = ProviderDriverKind.make("codex");
+        const providerId = ProviderThreadId.make("provider-thread:startup");
+        const nativeId = "11111111-2222-7333-8444-555555555555";
+        // delegate_task creates a child and a provider placeholder. Its app-owned
+        // roster entry has no providerThreadId until completion; resolution must
+        // already work through the child's own startup mapping.
+        yield* store.apply({
+          id: EventId.make("event:child-created"),
+          type: "thread.created",
+          threadId: childId,
+          occurredAt: now,
+          payload: {
+            id: childId,
+            createdBy: "agent",
+            creationSource: "mcp",
+            projectId: ProjectId.make("project"),
+            title: "Delegated startup",
+            providerInstanceId: instance,
+            modelSelection: { instanceId: instance, model: "gpt-6.1-sol" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId: parentId,
+              rootThreadId: parentId,
+              relationshipToParent: "subagent",
+            },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
+        const placeholder = {
+          id: providerId,
+          driver,
+          providerInstanceId: instance,
+          providerSessionId: ProviderSessionId.make("provider-session:startup"),
+          appThreadId: childId,
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          status: "not_loaded" as const,
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        yield* store.apply({
+          id: EventId.make("event:placeholder"),
+          type: "provider-thread.updated",
+          threadId: childId,
+          occurredAt: now,
+          payload: placeholder,
+        });
+        assert.strictEqual((yield* identity.resolve({ nativeId, driver })).resolution, "pending");
+        // ProviderTurnStartService writes this before session.startTurn, in the
+        // same transaction as run.updated and run-attempt.updated. No model
+        // output or terminal/completion event is needed to publish the native id.
+        yield* store.apply({
+          id: EventId.make("event:startup-mapping"),
+          type: "provider-thread.updated",
+          threadId: childId,
+          driver,
+          providerInstanceId: instance,
+          occurredAt: now,
+          payload: {
+            ...placeholder,
+            status: "active",
+            nativeThreadRef: { driver, nativeId, strength: "strong" },
+          },
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const writerHeld = yield* Deferred.make<void>();
+        const releaseWriter = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(writerHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseWriter)),
+            ),
+          ),
+        );
+        yield* Deferred.await(writerHeld);
+        const result = yield* identity
+          .resolve({ nativeId, driver })
+          .pipe(
+            Effect.timeout("2 seconds"),
+            Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+          );
+        yield* Fiber.join(writer);
+        assert.strictEqual(result.resolution, "resolved");
+        assert.strictEqual(result.robobThreadId, childId);
+        assert.strictEqual(result.executionKind, "app-managed-child");
+        assert.strictEqual(result.parentThreadId, parentId);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(ExecutionIdentity.layer, ProjectionStore.layer).pipe(
+            Layer.provideMerge(Sqlite.layerFromPath(path.join(directory, "state.sqlite"))),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect(
     "indexes native-id and pending-provider queries on an existing database idempotently",
     () =>
