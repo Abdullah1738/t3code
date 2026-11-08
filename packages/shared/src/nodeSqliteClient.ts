@@ -1284,6 +1284,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const acquireReader =
     options.readerWorker && isFileDatabase ? yield* makeReader(options) : undefined;
   const readerSemaphore = yield* Semaphore.make(1);
+  const readerLock = bindSemaphore(readerSemaphore);
   const acquireAuth =
     options.readerWorker && isFileDatabase && options.authReaderProcess
       ? yield* makeReaderLanes(() =>
@@ -1313,7 +1314,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           : Effect.map(acquireReader, (readerConnection) =>
               readerConnection === undefined
                 ? writer
-                : { name: "reader" as const, lock: bindSemaphore(readerSemaphore), connection: readerConnection },
+                : { name: "reader" as const, lock: readerLock, connection: readerConnection },
             )
         : Effect.succeed(writer),
     ),
