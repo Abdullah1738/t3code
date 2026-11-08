@@ -31,7 +31,7 @@ export function optionalMcpRegistration(input: {
   let available = false;
   let failedServers: string[] | undefined;
   let registrationAnswered = false;
-  const attempt = Effect.fn("OptionalMcpRegistration.attempt")(function* () {
+  const attempt = Effect.gen(function* () {
     const started = yield* Clock.currentTimeMillis;
     if (closed || pending || available || started < retryAt || input.servers.length === 0) return;
     pending = true;
@@ -82,7 +82,7 @@ export function optionalMcpRegistration(input: {
         .report(status)
         .pipe(Effect.withSpan("mcp.server.registration", { attributes: { ...status } })),
     );
-  })();
+  }).pipe(Effect.withSpan("OptionalMcpRegistration.attempt"));
   return {
     attempt,
     close: Effect.sync(() => {
