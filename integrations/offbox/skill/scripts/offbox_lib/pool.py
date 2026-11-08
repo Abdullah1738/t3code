@@ -511,6 +511,10 @@ def _refresh_background(con, key):
             with file_lock('box-'+row['box_id'], timeout=0):
                 st = api.cmd_status(row['box_id'], row['process_id'])
                 if st and not st.get('running') and st.get('status') == 'exited':
+                    if (st.get('exitCode') == runs.EXIT_REPO_SETUP
+                            and runs.REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
+                        runs.finish(row['run_id'], EXIT_INFRA, 'infra')
+                        continue
                     import json
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:

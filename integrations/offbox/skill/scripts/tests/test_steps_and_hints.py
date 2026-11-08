@@ -220,6 +220,17 @@ class CliStepTests(Isolated):
         self.assertEqual(rc, 97)
         self.assertEqual(lines[-1], 'offbox: remote exit 97')
 
+    def test_repo_setup_98_maps_to_infra_90(self):
+        rc, lines = self.run_cli(['--no-fallback', '--step', 'java -version'], 98,
+                                 'offbox-repo-setup-failed\n')
+        self.assertEqual(rc, 90)
+        self.assertIn('offbox: repo toolchain setup failed (exit 98), not your command', lines)
+
+    def test_user_98_without_marker_stays_98(self):
+        rc, lines = self.run_cli(['--step', 'exit 98'], 98, 'offbox step 1 rc=98: exit 98\n')
+        self.assertEqual(rc, 98)
+        self.assertEqual(lines[-1], 'offbox: remote exit 98')
+
     def test_setup_failure_error_is_infra_code(self):
         self.assertEqual(OffboxError('x', code=EXIT_INFRA).code, 90)
 

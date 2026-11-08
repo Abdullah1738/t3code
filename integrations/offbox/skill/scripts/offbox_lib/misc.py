@@ -365,6 +365,10 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r) -> int:
+    from .runs import repo_setup_failed
+    if repo_setup_failed(r['exit_code'], LOGS_DIR / f"{r['run_id']}.log"):
+        say('repo toolchain setup failed (exit 98), not your command')
+        return EXIT_INFRA
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
@@ -662,7 +666,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 def _finalize(r, code, log_path) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
-    from .runs import do_pulls, finish, go_std_glitch
+    from .runs import do_pulls, finish, go_std_glitch, repo_setup_failed
+    if repo_setup_failed(code, log_path):
+        finish(r['run_id'], EXIT_INFRA, 'infra')
+        say('repo toolchain setup failed (exit 98), not your command')
+        return EXIT_INFRA
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
         con = db()
