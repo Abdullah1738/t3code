@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("RECALL_DATA", str(ROOT / "data")))
 MEM_DB = Path(os.environ.get("RECALL_MEM_DB", str(DATA / "memory.db")))
 HOT_DB = Path(os.environ["RECALL_HOT_DB"]) if os.environ.get("RECALL_HOT_DB") else None
+# Shell callers do not inherit the LaunchAgent's hot-store environment.
+if HOT_DB is None and not os.environ.get("RECALL_MEM_DB") and (DATA / "recall_hot.db").is_file():
+    HOT_DB = DATA / "recall_hot.db"
 CATALOG_DB = Path(os.environ.get("RECALL_CATALOG_DB", str(DATA / "recall_catalog.db")))
 OPENCODE_DB = Path(robob_readonly.opencode_db())
 STATE_DB = Path(robob_readonly.state_db("RECALL_STATE_DB"))
@@ -523,9 +526,12 @@ class Filters:
         return bool(self.source or self.since or self.until or self.exclude)
 
 
-def _fts_rows(con, table: str, match: str, n: int, filters: Filters, limit: int, deadline: Deadline | None) -> tuple[list, str]:
+def _fts_rows(con, table: str, match: str, n: int, filters: Filters, limit: int, deadline: Deadline | None,
+              *, text_only: bool = False) -> tuple[list, str]:
     order = "rank" if n <= RANK_LIMIT else "rowid DESC"
     extra, params = filters.sql(table)
+    if text_only:
+        extra += " AND e.content_type='text' AND e.speaker IN ('user','assistant')"
     # FTS5's MATCH column and bm25() want the bare table name, so no alias for it.
     if table == TEXT_FTS:
         sql = f"SELECT rowid, bm25({table}) FROM {table} WHERE {table} MATCH ?{extra} ORDER BY {order} LIMIT ?"
@@ -591,6 +597,12 @@ def raw_hits(
 ) -> tuple[list[Hit], dict]:
     table = ALL_FTS if include_tools else TEXT_FTS
     info: dict = {"input": text}
+    indexes = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE name IN (?,?)", (TEXT_FTS, ALL_FTS))}
+    if table == TEXT_FTS and TEXT_FTS not in indexes and ALL_FTS in indexes:
+        table = ALL_FTS
+        info["warning"] = "episodic_text_fts missing; falling back to episodic_fts (text only)"
+    if table not in indexes:
+        raise ValueError("search index missing; set RECALL_HOT_DB to the indexed recall_hot.db store")
     if exact:
         toks = [fold(t) for t in TOKEN_RE.findall(text)]
         if not toks:
@@ -603,7 +615,8 @@ def raw_hits(
     tried = 0
     for match, n, terms in candidates:
         tried += 1
-        rows, order = _fts_rows(con, table, match, n, filters, limit, deadline)
+        rows, order = _fts_rows(con, table, match, n, filters, limit, deadline,
+                                text_only=not include_tools and table == ALL_FTS)
         info.update(match=match, hits=n if n <= RANK_LIMIT else f">{RANK_LIMIT}", order=order)
         hits = _hits_from_rows(con, rows, terms, text, include_tools=include_tools, exact=exact)
         # A combination can match only inside stripped boilerplate or filtered

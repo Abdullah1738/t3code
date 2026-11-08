@@ -85,7 +85,9 @@ compaction compatibility and deployment prerequisites.
 
 ## Hot/cold storage and offline migration
 
-Set `RECALL_HOT_DB` explicitly only after offline migration/index bootstrap.
+After offline migration/index bootstrap, recall uses `data/recall_hot.db` when
+present. `RECALL_HOT_DB` overrides that path. An explicit `RECALL_MEM_DB` keeps
+the legacy single-store path unless `RECALL_HOT_DB` is also supplied.
 `MEMORY_DB` / `RECALL_MEM_DB` still select the canonical cold transcript store;
 search uses contentless FTS and bounded previews in `recall_hot.db`. Event IDs
 and transcript references are retained. The server builds bounded index pages

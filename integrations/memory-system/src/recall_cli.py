@@ -206,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
                 limit_sessions=a.n,
                 exact=a.exact,
             )
+            for warning in dict.fromkeys(q["warning"] for q in res["queries"] if q.get("warning")):
+                print(f"recall: {warning}", file=sys.stderr)
             out(res, format_search(res))
         elif a.cmd == "search":
             import recall_ask as ra
