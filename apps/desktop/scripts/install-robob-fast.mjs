@@ -24,6 +24,35 @@ export const INSTALL_PLAN = [
   "continuation-report",
 ];
 
+// Robob builds are Developer ID signed but not notarized, so `spctl --assess`
+// rejects them. Pin the signer instead: bundle id, team and the full chain.
+export const EXPECTED_SIGNATURE = {
+  identifier: "com.ardud.robob",
+  team: "HVG39427R3",
+  authority: "Developer ID Application: Abdullah Rangoonwala (HVG39427R3)",
+};
+
+export function checkSignature(details, expected = EXPECTED_SIGNATURE) {
+  const fields = new Map();
+  const authorities = [];
+  for (const line of details.split("\n")) {
+    const at = line.indexOf("=");
+    if (at < 0) continue;
+    const key = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim();
+    if (key === "Authority") authorities.push(value);
+    else if (!fields.has(key)) fields.set(key, value);
+  }
+  const problems = [];
+  if (fields.get("Identifier") !== expected.identifier)
+    problems.push(`identifier ${fields.get("Identifier") ?? "missing"}`);
+  if (fields.get("TeamIdentifier") !== expected.team)
+    problems.push(`team ${fields.get("TeamIdentifier") ?? "missing"}`);
+  if (authorities[0] !== expected.authority) problems.push(`signer ${authorities[0] ?? "missing"}`);
+  if (authorities.at(-1) !== "Apple Root CA") problems.push("chain does not end at Apple Root CA");
+  if (problems.length) throw new Error(`Unexpected code signature: ${problems.join(", ")}`);
+}
+
 export async function install(ops, { rollback = false } = {}) {
   if (!rollback) {
     await ops.stage();
@@ -131,6 +160,12 @@ async function main(args) {
       [path.join(path.dirname(fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
       35_000,
     );
+  const verifyBundle = async (bundle) => {
+    await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", bundle], 60_000);
+    // codesign -dv prints its details on stderr.
+    const { stderr } = await run("/usr/bin/codesign", ["-dv", "--verbose=2", bundle]);
+    checkSignature(stderr);
+  };
   const ops = {
     phase,
     stage: async () => {
@@ -147,10 +182,7 @@ async function main(args) {
       ownsStaging = true;
       await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
     },
-    verify: async () => {
-      await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", next]);
-      await run("/usr/sbin/spctl", ["--assess", "--type", "execute", next], 60_000);
-    },
+    verify: () => verifyBundle(next),
     migrations: async () => {
       const sandbox = await fs.mkdtemp(path.join(path.dirname(data), ".install-clone-"));
       try {
@@ -183,7 +215,7 @@ async function main(args) {
         await fs.rm(sandbox, { recursive: true, force: true });
       }
     },
-    verifyPrevious: () => run("/usr/bin/codesign", ["--verify", "--deep", "--strict", prev]),
+    verifyPrevious: () => verifyBundle(prev),
     cancelWindow: () => sleep(10_000),
     quit: async () => {
       quitAt = Date.now();

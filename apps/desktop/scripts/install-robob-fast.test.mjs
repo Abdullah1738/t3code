@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rename, rm } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
-import { install } from "./install-robob-fast.mjs";
+import { checkSignature, install } from "./install-robob-fast.mjs";
 
 test("preflights before downtime, swaps sandbox bundles and waits for a new server", async () => {
   const root = await mkdtemp(join(tmpdir(), "install-test-"));
@@ -119,3 +119,51 @@ test("rollback verifies the previous bundle and schema compatibility before quit
   await install(ops, { rollback: true });
   assert.equal(calls[0], "verifyPrevious");
 });
+
+const signed = (overrides = {}) => {
+  const f = {
+    Identifier: "com.ardud.robob",
+    TeamIdentifier: "HVG39427R3",
+    authorities: [
+      "Developer ID Application: Abdullah Rangoonwala (HVG39427R3)",
+      "Developer ID Certification Authority",
+      "Apple Root CA",
+    ],
+    ...overrides,
+  };
+  return [
+    "Executable=/Applications/Robob.app/Contents/MacOS/Robob",
+    f.Identifier === undefined ? "" : `Identifier=${f.Identifier}`,
+    "Format=app bundle with Mach-O thin (arm64)",
+    ...f.authorities.map((a) => `Authority=${a}`),
+    f.TeamIdentifier === undefined ? "" : `TeamIdentifier=${f.TeamIdentifier}`,
+    "Runtime Version=26.5.0",
+  ].join("\n");
+};
+
+test("accepts an un-notarized Developer ID build from the expected team", () => {
+  checkSignature(signed());
+});
+
+for (const [name, overrides, message] of [
+  ["another team", { TeamIdentifier: "AAAAAAAAAA" }, /team AAAAAAAAAA/],
+  ["missing team", { TeamIdentifier: undefined }, /team missing/],
+  ["another bundle", { Identifier: "com.example.app" }, /identifier com.example.app/],
+  [
+    "another signer",
+    { authorities: ["Apple Development: Someone (X)", "Apple Root CA"] },
+    /signer Apple Development/,
+  ],
+  ["ad-hoc", { authorities: [], TeamIdentifier: "not set" }, /signer missing/],
+  [
+    "a chain outside Apple",
+    {
+      authorities: [
+        "Developer ID Application: Abdullah Rangoonwala (HVG39427R3)",
+        "Some Other Root",
+      ],
+    },
+    /Apple Root CA/,
+  ],
+])
+  test(`rejects ${name}`, () => assert.throws(() => checkSignature(signed(overrides)), message));
