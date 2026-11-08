@@ -1,8 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalFetch:off globalDate:off globalConsole:off preferSchemaOverJson:off - Harness process boundaries intentionally measure native I/O and wall time outside the application runtime.
+import { observeExit } from "./process.ts";
+import { shapedFetch } from "./network.ts";
 import { assertRuntime } from "./runtime.ts";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import {
+  existsSync,
   readFileSync,
   mkdirSync,
   createWriteStream,
@@ -43,6 +46,7 @@ export async function drive(
   repeat: number,
   ledger: string,
   serverEntry = "apps/server/dist/bin.mjs",
+  harnessHash?: string,
 ): Promise<Run> {
   assertRuntime();
   const attemptId = randomUUID();
@@ -100,6 +104,7 @@ export async function drive(
     const child = spawn(
       process.execPath,
       [
+        "--max-old-space-size=8192",
         "--import",
         resolve("packages/perf-harness/src/sampler.ts"),
         resolve(serverEntry),
@@ -127,12 +132,14 @@ export async function drive(
         stdio: ["ignore", "pipe", "pipe", "ipc"],
       },
     );
+    const lifetime = observeExit(child);
+    const childExit = lifetime.exit;
     child.stdout?.pipe(log);
     child.stderr?.pipe(log);
     const metrics: Record<string, number | null> = { rowsVisited: null };
     const gaps = [
       "Native paint/device timings unmeasured",
-      "Network shaping unmeasured; loopback transport only",
+      "Driver body-delivery simulation: 10 Mbps / 100 ms RTT; native cursor resume unmeasured",
       "USB SSD/fsync latency unmeasured",
       "Rows visited unavailable from node:sqlite",
       "Durable commit boundary unavailable on base; response includes delivery",
@@ -171,11 +178,34 @@ export async function drive(
     };
     let stop = false;
     const background: Promise<void>[] = [];
+    let backgroundFailure: unknown;
+    let httpLoadStarted = false;
+    const startHttpLoad = () => {
+      httpLoadStarted = true;
+            for (let agent = 0; agent < fixture.agents; agent++)
+              background.push(
+                (async () => {
+                  while (!stop) {
+                    await request(
+                      `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
+                      { text: `Synthetic load ${agent}` },
+                      false,
+                    );
+                    await delay(500);
+                  }
+                })(),
+              );
+            for (const job of background)
+              void job.catch((error) => {
+                backgroundFailure = error;
+                stop = true;
+              });
+    };
     try {
       let ticket: string | undefined;
       const until = Date.now() + 120000;
       while (!ticket && Date.now() < until) {
-        if (child.exitCode !== null)
+        if (lifetime.exited)
           throw new Error(
             `Synthetic server exited ${child.exitCode}; see ${home}/perf/server-${repeat}.log`,
           );
@@ -186,25 +216,21 @@ export async function drive(
         }
       }
       if (!ticket) throw new Error("Synthetic server readiness timed out");
-      child.send({ type: "perf-start" });
+      await new Promise<void>((ok, fail) => {
+        const timer = setTimeout(() => fail(new Error("Profiler start timeout")), 30000);
+        const started = (message: { type?: string }) => {
+          if (message.type === "perf-failed") { clearTimeout(timer); fail(new Error("Sampler start failed")); return; }
+          if (message.type !== "perf-started") return;
+          clearTimeout(timer); child.off("message", started); ok();
+        };
+        child.on("message", started);
+        child.send({ type: "perf-start" });
+      });
       const discussionId = "synthetic-board-0-card-0-discussion";
-      for (let agent = 0; agent < fixture.agents; agent++)
-        background.push(
-          (async () => {
-            while (!stop) {
-              await request(
-                `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
-                { text: `Synthetic load ${agent}` },
-                false,
-              );
-              await delay(500);
-            }
-          })(),
-        );
-      for (const job of background)
-        void job.catch(() => {
-          stop = true;
-        });
+      if (process.env.ROBOB_PERF_LEGACY_BURST === "1") {
+        gaps.push("Attribution-only legacy HTTP burst before WebSocket handshake");
+        startHttpLoad();
+      }
       const socket = Socket.layerWebSocket(
         `${origin.replace("http:", "ws:")}/ws?${ORCHESTRATION_PROTOCOL_QUERY_PARAM}=${ORCHESTRATION_PROTOCOL_VERSION_TEXT}&wsTicket=${encodeURIComponent(ticket)}`,
       ).pipe(
@@ -231,6 +257,11 @@ export async function drive(
       await Effect.runPromise(
         Effect.gen(function* () {
           const client = yield* makeWsRpcProtocolClient;
+          // Establish the authenticated socket before introducing HTTP contention.
+          yield* client["kanban.messages"]({
+            discussionId: KanbanDiscussionId.make(discussionId), limit: 1,
+          });
+          if (!httpLoadStarted) startHttpLoad();
           const loadFibers = yield* Effect.forEach(
             Array.from({ length: fixture.agents }, (_, i) => i),
             (agent) =>
@@ -247,6 +278,8 @@ export async function drive(
                 }
               }).pipe(Effect.forkScoped),
           );
+          // Include sustained activity, not only the first admission burst.
+          yield* Effect.sleep("10 seconds");
           const boardId = KanbanBoardId.make("synthetic-board-0");
           const boardAction = randomUUID(),
             listAction = randomUUID(),
@@ -292,6 +325,15 @@ export async function drive(
           yield* Effect.promise(() =>
             measure("mobile.coldFirstPage", () => request("/api/orchestration/shell?paged=true")),
           );
+          const shapedPage = () => shapedFetch(() => fetch(origin + "/api/orchestration/shell?paged=true", {
+            headers: { authorization: `Bearer ${token}`, [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
+            signal: AbortSignal.timeout(60000),
+          }));
+          yield* Effect.promise(() => measure("mobile.shapedColdFirstPage", shapedPage));
+          // Suspension drops the connection/cache in this HTTP-only fallback.
+          // Keep the native resume gate missing until its cursor path is driven.
+          yield* Effect.sleep("1 second");
+          yield* Effect.promise(() => measure("mobile.shapedFullRefreshResume", shapedPage));
           metrics["mobile.coldFirstPage.p95.ms"] = null;
           metrics["mobile.resume.p95.ms"] = null;
           stop = true;
@@ -300,6 +342,7 @@ export async function drive(
       );
       stop = true;
       await Promise.all(background);
+      if (backgroundFailure) throw backgroundFailure;
       metrics["wal.bytes"] = (() => {
         try {
           return statSync(resolve(home, "userdata/statev2.sqlite-wal")).size;
@@ -308,8 +351,9 @@ export async function drive(
         }
       })();
       await new Promise<void>((ok, fail) => {
-        const timer = setTimeout(() => fail(new Error("Sampler timeout")), 5000);
-        child.once("message", () => {
+        const timer = setTimeout(() => fail(new Error("Sampler timeout")), 30000);
+        child.on("message", (message: { type?: string }) => {
+          if (message.type !== "perf-stopped") return;
           clearTimeout(timer);
           ok();
         });
@@ -320,10 +364,12 @@ export async function drive(
       );
       metrics["eventLoop.p99.ms"] = samples.eventLoopP99Ms;
       metrics["server.rss.bytes"] = samples.rssBytes;
+      metrics["eventLoop.max.ms"] = samples.eventLoopMaxMs;
+      if (samples.profileError) gaps.push(`CPU profile unavailable: ${samples.profileError}`);
       let traceFlushed = true;
       child.kill("SIGTERM");
-      await Promise.race([new Promise((r) => child.once("exit", r)), delay(30000)]);
-      if (child.exitCode === null) {
+      await Promise.race([childExit, delay(30000)]);
+      if (!lifetime.exited) {
         child.kill("SIGKILL");
         gaps.push("Server required forced shutdown; trace phases unmeasured");
         traceFlushed = false;
@@ -364,7 +410,9 @@ export async function drive(
         arch: arch(),
       });
       const run: Run = {
+        workloadMode: process.env.ROBOB_PERF_LEGACY_BURST === "1" ? "legacy-burst" : "steady",
         sha,
+        ...(harnessHash ? { harnessHash } : {}),
         serverHash: await artifactHash(resolve(serverEntry)),
         repeat,
         fixtureHash: fixture.fixtureHash,
@@ -396,13 +444,24 @@ export async function drive(
       });
       stop = true;
       await Promise.allSettled(background);
-      if (child.exitCode === null) {
+      // Preserve CPU evidence on timeouts and failed actions too.
+      if (!lifetime.exited && !existsSync(resolve(home, "perf", `samples-${repeat}.json`))) {
+        await new Promise<void>((ok) => {
+          const timer = setTimeout(ok, 30000);
+          child.once("message", () => { clearTimeout(timer); ok(); });
+          child.send({ type: "perf-stop" });
+        });
+      }
+      if (!lifetime.exited) {
         child.kill("SIGTERM");
-        await Promise.race([new Promise((r) => child.once("exit", r)), delay(30000)]);
-        if (child.exitCode === null) child.kill("SIGKILL");
+        await Promise.race([childExit, delay(30000)]);
+        if (!lifetime.exited) {
+          child.kill("SIGKILL");
+          await childExit;
+        }
       }
       log.end();
-      cpSync(resolve(home, "perf"), resolve(pristine, "perf", `repeat-${repeat}`), {
+      cpSync(resolve(home, "perf"), resolve(ledger + ".artifacts", `repeat-${repeat}-${attemptId}`), {
         recursive: true,
       });
     }
@@ -411,6 +470,12 @@ export async function drive(
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [home, sha, ledger, repeats = "5", entry = "apps/server/dist/bin.mjs"] =
     process.argv.slice(2);
-  for (let i = 0; i < Number(repeats); i++)
-    console.log(await drive(home!, sha!, i, ledger!, entry));
+  for (let i = 0; i < Number(repeats); i++) {
+    try { console.log(await drive(home!, sha!, i, ledger!, entry)); }
+    catch (error) {
+      appendLedger(ledger! + ".failures", { sha, repeat: i, status: "failed", error: String(error) });
+      console.error(error);
+      process.exitCode = 1;
+    }
+  }
 }

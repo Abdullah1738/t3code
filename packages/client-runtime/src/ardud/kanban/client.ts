@@ -1,3 +1,4 @@
+import { carryActionValue } from "../actionTelemetry.ts";
 import { Atom } from "effect/reactivity";
 import {
   KANBAN_WS_METHODS as M,
@@ -312,6 +313,7 @@ export function createKanbanClient(
         (event) => {
           const next = applyKanbanWatchEvent(created.state, event);
           created.state = next === undefined ? next : withPendingReads(boardId, next);
+          carryActionValue(event, created.state);
           for (const listener of Array.from(created.events)) listener(event);
           if (event._tag === "snapshot") resendReads(boardId);
         },
@@ -523,8 +525,12 @@ export function createKanbanClient(
         }
         return full;
       };
-      const show = () => {
-        if (loaded) emit(list.map(view));
+      const show = (trigger?: unknown) => {
+        if (loaded) {
+          const value = list.map(view);
+          carryActionValue(trigger, value);
+          emit(value);
+        }
       };
       // Messages a live change brought while a read was out; they are newer
       // than the read's copies (answers only grow).
@@ -565,7 +571,7 @@ export function createKanbanClient(
         const base = oldestRead > newestHeld + 1 ? [] : list;
         list = mergeMessages(mergeMessages(base, page), [...during.values()]);
         loaded = true;
-        show();
+        show(page);
       });
       let earlier: Promise<void> | null = null;
       const loadEarlier = () => {

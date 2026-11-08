@@ -1,4 +1,4 @@
-import { CurrentAction, markAction, allocateAction, withAction } from "../ardud/actionTelemetry.ts";
+import { CurrentAction, bindActionValue, markAction, allocateAction, withAction } from "../ardud/actionTelemetry.ts";
 import {
   EnvironmentAuthorizationError,
   clientRpcRequiredScopes,
@@ -208,7 +208,7 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
   });
   const action = (yield* CurrentAction) ?? (yield* allocateAction(tag));
   return yield* withAction(method(input), action).pipe(
-    Effect.tap(() => Effect.sync(() => markAction(action, 'state-ready'))),
+    Effect.tap((value) => Effect.sync(() => { bindActionValue(value, action); markAction(action, 'state-ready'); })),
     Effect.ensuring(completeObservation),
   );
 });

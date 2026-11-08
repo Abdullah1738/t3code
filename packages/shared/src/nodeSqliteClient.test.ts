@@ -1856,3 +1856,36 @@ it.effect(
     ),
   20_000,
 );
+
+it.effect("marks committed writes separately from reads and rolled back writes", () => {
+  const spans: Array<Tracer.NativeSpan> = [];
+  const tracer = Tracer.make({ span: options => {
+    const span = new Tracer.NativeSpan(options);
+    const attribute = span.attribute.bind(span);
+    span.attribute = (key, value) => {
+      if (key === "db.commit.boundary") throw new Error("exporter failure");
+      attribute(key, value);
+    };
+    spans.push(span);
+    return span;
+  }});
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE commits(value TEXT)`;
+    yield* sql`INSERT INTO commits VALUES ('committed')`;
+    yield* sql.withTransaction(Effect.gen(function* () {
+      yield* sql`INSERT INTO commits VALUES ('rolled back')`;
+      return yield* Effect.fail("rollback");
+    })).pipe(Effect.ignore);
+    yield* sql`SELECT * FROM commits`;
+  }).pipe(
+    Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+    Effect.provideService(Statement.SpanPropagationEnabled, true),
+    Effect.withTracer(tracer),
+    Effect.map(() => {
+      const commits = spans.filter(span => span.attributes.has("db.commit.at_ms"));
+      assert.equal(commits.length, 1);
+      assert.isNumber(commits[0]!.attributes.get("db.commit.at_ms"));
+    }),
+  );
+});

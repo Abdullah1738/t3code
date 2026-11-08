@@ -1,5 +1,6 @@
+import { paintActionValue } from "@t3tools/client-runtime/ardud/kanban";
 import { useAtomValue } from "@effect/atom-react";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -35,6 +36,18 @@ export const kanban = createKanbanClient(
 
 function useStore<T>(store: SnapshotStore<T>): T | undefined {
   return useSyncExternalStore(store.subscribe, store.get);
+}
+
+// Two frames cross a browser paint opportunity; cleanup cancels stale commits.
+function usePaint(value: unknown, phase: "board-painted" | "discussion-painted") {
+  useEffect(() => paintActionValue(value, phase, (callback) => {
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
+    return () => cancelAnimationFrame(frame);
+  }), [value, phase]);
+  useEffect(() => paintActionValue(value, "authoritative-paint", (callback) => {
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(callback); });
+    return () => cancelAnimationFrame(frame);
+  }), [value]);
 }
 
 /** Every board with its list counts; no board feed opens for them. */
@@ -85,14 +98,18 @@ const NO_OWNER: SnapshotStore<null> = {
 };
 
 export function useBoardState(boardId: string): KanbanBoardState | undefined {
-  return useStore(kanban.board(boardId));
+  const value = useStore(kanban.board(boardId));
+  usePaint(value, "board-painted");
+  return value;
 }
 
 export function useMessages(
   boardId: string,
   discussionId: string,
 ): ReadonlyArray<KanbanMessage> | undefined {
-  return useStore(kanban.messages(boardId, discussionId));
+  const value = useStore(kanban.messages(boardId, discussionId));
+  usePaint(value, "discussion-painted");
+  return value;
 }
 
 export function useCardDetail(boardId: string, cardId: string): KanbanCardDetail | undefined {
