@@ -40,20 +40,33 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION_TEXT,
 } from "@t3tools/contracts";
 import { makeWsRpcProtocolClient } from "../../../packages/client-runtime/src/rpc/protocol.ts";
-import { phaseMetrics, appendLedger, hash, artifactHash, type Run } from "./metrics.ts";
+import {
+  percentiles,
+  phaseMetrics,
+  appendLedger,
+  hash,
+  artifactHash,
+  type Run,
+} from "./metrics.ts";
 const token = "synthetic-performance-credential-only";
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ext4 may fall back from FICLONE to a buffered multi-GB copy. Flush both
 // inputs and clones before profiling so preparation writeback cannot contend
 // with the measured WAL/checkpoint workload.
 function flushFixtureDatabases(home: string) {
-  for (const name of ["statev2.sqlite", "boards.sqlite", "archive.sqlite"]) {
-    const fd = openSync(resolve(home, "userdata", name), "r+");
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+  try {
+    for (const name of ["statev2.sqlite", "boards.sqlite", "archive.sqlite"]) {
+      const fd = openSync(resolve(home, "userdata", name), "r+");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
     }
+  } catch (cause) {
+    throw Object.assign(new Error("Fixture flush failed", { cause }), {
+      code: "PERF_PREPARATION_FLUSH_FAILED",
+    });
   }
 }
 function dirtyPages() {
@@ -104,9 +117,14 @@ export async function drive(
     const cloneSyncStarted = performance.now();
     flushFixtureDatabases(runHome);
     appendLedger(ledger + ".preparation", {
-      sha, repeat, sourceSyncMs, cloneMs,
+      sha,
+      repeat,
+      sourceSyncMs,
+      cloneMs,
       cloneSyncMs: performance.now() - cloneSyncStarted,
-      dirtyBefore, dirtyBeforeCloneSync, dirtyAfterCloneSync: dirtyPages(),
+      dirtyBefore,
+      dirtyBeforeCloneSync,
+      dirtyAfterCloneSync: dirtyPages(),
     });
     home = runHome;
     const fixture = JSON.parse(readFileSync(resolve(home, "fixture.json"), "utf8"));
@@ -185,6 +203,9 @@ export async function drive(
       "Rows visited unavailable from node:sqlite",
       "Durable commit boundary unavailable on base; response includes delivery",
     ];
+    const requests: Record<string, number[]> = {};
+    const record = (key: string, value: number) => (requests[key] ??= []).push(value);
+    let operations = 0;
     const actionIds = new Set<string>();
     const request = async (path: string, body?: unknown, measured = true) => {
       const start = performance.now(),
@@ -202,6 +223,7 @@ export async function drive(
         signal: AbortSignal.timeout(60000),
       });
       const bytes = new Uint8Array(await response.arrayBuffer());
+      operations++;
       if (!response.ok)
         throw new Error(
           `${path}: HTTP ${response.status}: ${new TextDecoder().decode(bytes).slice(0, 500)}`,
@@ -214,6 +236,7 @@ export async function drive(
     };
     const measure = async (key: string, run: () => Promise<{ ms: number; bytes: number }>) => {
       const r = await run();
+      record(key + ".response.ms", r.ms);
       metrics[key + ".response.ms"] = r.ms;
       metrics[key + ".bytes"] = r.bytes;
     };
@@ -223,24 +246,24 @@ export async function drive(
     let httpLoadStarted = false;
     const startHttpLoad = () => {
       httpLoadStarted = true;
-            for (let agent = 0; agent < fixture.agents; agent++)
-              background.push(
-                (async () => {
-                  while (!stop) {
-                    await request(
-                      `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
-                      { text: `Synthetic load ${agent}` },
-                      false,
-                    );
-                    await delay(500);
-                  }
-                })(),
+      for (let agent = 0; agent < fixture.agents; agent++)
+        background.push(
+          (async () => {
+            while (!stop) {
+              await request(
+                `/api/ardud/kanban/discussions/synthetic-board-0-card-${1 + (agent % 3)}-discussion/messages`,
+                { text: `Synthetic load ${agent}` },
+                false,
               );
-            for (const job of background)
-              void job.catch((error) => {
-                backgroundFailure = error;
-                stop = true;
-              });
+              await delay(500);
+            }
+          })(),
+        );
+      for (const job of background)
+        void job.catch((error) => {
+          backgroundFailure = error;
+          stop = true;
+        });
     };
     try {
       let ticket: string | undefined;
@@ -260,13 +283,20 @@ export async function drive(
       await new Promise<void>((ok, fail) => {
         const timer = setTimeout(() => fail(new Error("Profiler start timeout")), 30000);
         const started = (message: { type?: string }) => {
-          if (message.type === "perf-failed") { clearTimeout(timer); fail(new Error("Sampler start failed")); return; }
+          if (message.type === "perf-failed") {
+            clearTimeout(timer);
+            fail(new Error("Sampler start failed"));
+            return;
+          }
           if (message.type !== "perf-started") return;
-          clearTimeout(timer); child.off("message", started); ok();
+          clearTimeout(timer);
+          child.off("message", started);
+          ok();
         };
         child.on("message", started);
         child.send({ type: "perf-start" });
       });
+      operations = 0;
       const discussionId = "synthetic-board-0-card-0-discussion";
       if (process.env.ROBOB_PERF_LEGACY_BURST === "1") {
         gaps.push("Attribution-only legacy HTTP burst before WebSocket handshake");
@@ -300,8 +330,10 @@ export async function drive(
           const client = yield* makeWsRpcProtocolClient;
           // Establish the authenticated socket before introducing HTTP contention.
           yield* client["kanban.messages"]({
-            discussionId: KanbanDiscussionId.make(discussionId), limit: 1,
+            discussionId: KanbanDiscussionId.make(discussionId),
+            limit: 1,
           });
+          operations++;
           if (!httpLoadStarted) startHttpLoad();
           const loadFibers = yield* Effect.forEach(
             Array.from({ length: fixture.agents }, (_, i) => i),
@@ -315,61 +347,79 @@ export async function drive(
                     threadId: ThreadId.make(`synthetic-thread-${agent}`),
                     title: `Synthetic activity ${agent}:${++tick}`,
                   });
+                  operations++;
                   yield* Effect.sleep("500 millis");
                 }
               }).pipe(Effect.forkScoped),
           );
           // Include sustained activity, not only the first admission burst.
           yield* Effect.sleep("10 seconds");
-          const boardId = KanbanBoardId.make("synthetic-board-0");
-          const boardAction = randomUUID(),
-            listAction = randomUUID(),
-            discussionAction = randomUUID();
-          for (const id of [boardAction, listAction, discussionAction]) actionIds.add(id);
-          const startedBoards = performance.now();
-          const boards = yield* Stream.runHead(
-            client["kanban.boards"]({}, { headers: { "x-robob-action-id": listAction } }),
-          );
-          metrics["boards.response.ms"] = performance.now() - startedBoards;
-          metrics["boards.decodedBytes"] = Buffer.byteLength(JSON.stringify(boards));
-          const startedBoard = performance.now();
-          const board = yield* Stream.runHead(
-            client["kanban.subscribe"](
-              { boardId },
-              { headers: { "x-robob-action-id": boardAction } },
-            ),
-          );
-          metrics["board.response.ms"] = performance.now() - startedBoard;
-          metrics["board.decodedBytes"] = Buffer.byteLength(JSON.stringify(board));
-          const started = performance.now();
-          const messages = yield* client["kanban.messages"]({
-            discussionId: KanbanDiscussionId.make(discussionId),
-            limit: 50,
-          }).pipe(RpcClient.withHeaders({ "x-robob-action-id": discussionAction }));
-          metrics["discussion.response.ms"] = performance.now() - started;
-          metrics["discussion.decodedBytes"] = Buffer.byteLength(JSON.stringify(messages));
-          yield* Effect.promise(() =>
-            measure("post", () =>
-              request(`/api/ardud/kanban/discussions/${discussionId}/messages`, {
-                text: `Synthetic repeat ${repeat}`,
-              }),
-            ),
-          );
-          yield* Effect.promise(() =>
-            measure("move", () =>
-              request("/api/ardud/kanban/cards/synthetic-board-0-card-3/move", {
-                to: "needs_owner",
-                question: "Synthetic question",
-              }),
-            ),
-          );
+          for (let sample = 0; sample < 40; sample++) {
+            const boardId = KanbanBoardId.make("synthetic-board-0");
+            const boardAction = randomUUID(),
+              listAction = randomUUID(),
+              discussionAction = randomUUID();
+            for (const id of [boardAction, listAction, discussionAction]) actionIds.add(id);
+            const startedBoards = performance.now();
+            const boards = yield* Stream.runHead(
+              client["kanban.boards"]({}, { headers: { "x-robob-action-id": listAction } }),
+            );
+            metrics["boards.response.ms"] = performance.now() - startedBoards;
+            record("boards.response.ms", metrics["boards.response.ms"]!);
+            operations++;
+            metrics["boards.decodedBytes"] = Buffer.byteLength(JSON.stringify(boards));
+            const startedBoard = performance.now();
+            const board = yield* Stream.runHead(
+              client["kanban.subscribe"](
+                { boardId },
+                { headers: { "x-robob-action-id": boardAction } },
+              ),
+            );
+            metrics["board.response.ms"] = performance.now() - startedBoard;
+            record("board.response.ms", metrics["board.response.ms"]!);
+            operations++;
+            metrics["board.decodedBytes"] = Buffer.byteLength(JSON.stringify(board));
+            const started = performance.now();
+            const messages = yield* client["kanban.messages"]({
+              discussionId: KanbanDiscussionId.make(discussionId),
+              limit: 50,
+            }).pipe(RpcClient.withHeaders({ "x-robob-action-id": discussionAction }));
+            metrics["discussion.response.ms"] = performance.now() - started;
+            record("discussion.response.ms", metrics["discussion.response.ms"]!);
+            operations++;
+            metrics["discussion.decodedBytes"] = Buffer.byteLength(JSON.stringify(messages));
+            yield* Effect.promise(() =>
+              measure("post", () =>
+                request(`/api/ardud/kanban/discussions/${discussionId}/messages`, {
+                  text: `Synthetic repeat ${repeat}`,
+                }),
+              ),
+            );
+            yield* Effect.promise(() =>
+              measure("move", () =>
+                request("/api/ardud/kanban/cards/synthetic-board-0-card-3/move", {
+                  to: sample % 2 === 0 ? "needs_owner" : "needs_review",
+                  question: "Synthetic question",
+                }),
+              ),
+            );
+          }
           yield* Effect.promise(() =>
             measure("mobile.coldFirstPage", () => request("/api/orchestration/shell?paged=true")),
           );
-          const shapedPage = () => shapedFetch(() => fetch(origin + "/api/orchestration/shell?paged=true", {
-            headers: { authorization: `Bearer ${token}`, [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
-            signal: AbortSignal.timeout(60000),
-          }));
+          const shapedPage = async () => {
+            const result = await shapedFetch(() =>
+              fetch(origin + "/api/orchestration/shell?paged=true", {
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT,
+                },
+                signal: AbortSignal.timeout(60000),
+              }),
+            );
+            operations++;
+            return result;
+          };
           yield* Effect.promise(() => measure("mobile.shapedColdFirstPage", shapedPage));
           // Suspension drops the connection/cache in this HTTP-only fallback.
           // Keep the native resume gate missing until its cursor path is driven.
@@ -403,9 +453,23 @@ export async function drive(
       const samples = JSON.parse(
         readFileSync(resolve(home, "perf", `samples-${repeat}.json`), "utf8"),
       );
+      const summaries = Object.fromEntries(
+        Object.entries(requests).map(([key, values]) => [key, percentiles(values)!]),
+      );
+      for (const [key, summary] of Object.entries(summaries)) {
+        metrics[key] = summary.p50;
+        metrics[key + ".p50"] = summary.p50;
+        metrics[key + ".p95"] = summary.p95;
+      }
+      metrics["wal.writeBytesPerOp"] =
+        samples.walWriteBytes === null ? null : samples.walWriteBytes / operations;
+      metrics["wal.writeFramesPerOp"] =
+        samples.walWriteFrames === null ? null : samples.walWriteFrames / operations;
+      metrics["operations"] = operations;
       metrics["eventLoop.p99.ms"] = samples.eventLoopP99Ms;
       metrics["server.rss.bytes"] = samples.rssBytes;
       metrics["eventLoop.max.ms"] = samples.eventLoopMaxMs;
+      if (samples.walError) gaps.push(`WAL counters unavailable: ${samples.walError}`);
       if (samples.profileError) gaps.push(`CPU profile unavailable: ${samples.profileError}`);
       let traceFlushed = true;
       child.kill("SIGTERM");
@@ -451,6 +515,10 @@ export async function drive(
         arch: arch(),
       });
       const run: Run = {
+        gateVersion: "paired-bootstrap-v2",
+        requests,
+        summaries,
+        host: samples.host,
         workloadMode: process.env.ROBOB_PERF_LEGACY_BURST === "1" ? "legacy-burst" : "steady",
         sha,
         ...(harnessHash ? { harnessHash } : {}),
@@ -489,7 +557,10 @@ export async function drive(
       if (!lifetime.exited && !existsSync(resolve(home, "perf", `samples-${repeat}.json`))) {
         await new Promise<void>((ok) => {
           const timer = setTimeout(ok, 30000);
-          child.once("message", () => { clearTimeout(timer); ok(); });
+          child.once("message", () => {
+            clearTimeout(timer);
+            ok();
+          });
           child.send({ type: "perf-stop" });
         });
       }
@@ -502,19 +573,29 @@ export async function drive(
         }
       }
       log.end();
-      cpSync(resolve(home, "perf"), resolve(ledger + ".artifacts", `repeat-${repeat}-${attemptId}`), {
-        recursive: true,
-      });
+      cpSync(
+        resolve(home, "perf"),
+        resolve(ledger + ".artifacts", `repeat-${repeat}-${attemptId}`),
+        {
+          recursive: true,
+        },
+      );
     }
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [home, sha, ledger, repeats = "5", entry = "apps/server/dist/bin.mjs"] =
+  const [home, sha, ledger, repeats = "10", entry = "apps/server/dist/bin.mjs"] =
     process.argv.slice(2);
   for (let i = 0; i < Number(repeats); i++) {
-    try { console.log(await drive(home!, sha!, i, ledger!, entry)); }
-    catch (error) {
-      appendLedger(ledger! + ".failures", { sha, repeat: i, status: "failed", error: String(error) });
+    try {
+      console.log(await drive(home!, sha!, i, ledger!, entry));
+    } catch (error) {
+      appendLedger(ledger! + ".failures", {
+        sha,
+        repeat: i,
+        status: "failed",
+        error: String(error),
+      });
       console.error(error);
       process.exitCode = 1;
     }

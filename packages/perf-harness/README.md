@@ -14,6 +14,17 @@ offbox run --remote --no-fallback -- sh -c 'cd apps/server && pnpm exec vp test 
 offbox run --remote --no-fallback -- node packages/perf-harness/src/compare.ts BASE.jsonl CANDIDATE.jsonl COMPARISON.json
 ```
 
+For acceptance, build both revisions, then run the common controller:
+
+```sh
+offbox run --remote --no-fallback --pull tmp/perf/paired -- node packages/perf-harness/src/paired.ts /tmp/perf-fixture-1x BASE_SHA /path/to/base/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/perf/paired 10
+```
+
+Use a fresh output directory for each experiment. The controller retains every
+attempt and its host counters, retries only the permitted preparation/steal
+failures, and writes accepted pair ledgers and the comparison. Sequential
+`baseline.ts` runs remain useful for diagnostics; acceptance uses `paired.ts`.
+
 Build the revision being measured before running its baseline. Run comparison
 within one scale/load and fixed hardware/runtime. JSONL run records are append-only;
 keep per-action results, trace evidence and fixture identities with the ledger.
@@ -60,3 +71,45 @@ Round 2 measurement support:
 - Pinned node:sqlite exposes neither sqlite3_stmt_status nor scan-status
   counters. `db.stmt_status.available=false` and `rowsVisited=null` preserve
   this gap. Rows returned are recorded separately and never stand in for visits.
+
+Acceptance statistics (`paired-bootstrap-v2`):
+
+- Use at least ten matched interleaved A/B pairs on one worker, alternating
+  AB/BA order. Each fresh, flushed fixture runs the same 32-agent workload.
+  Foreground endpoints are each requested forty times per run. Keep raw request
+  values, nearest-rank p50/p95/p99 and max; never use the largest repeat as p95.
+- Compare the median of each primary per-run value (request p50 and scalar
+  resource/event-loop metrics). Per-run request p95 remains informational;
+  request-tail acceptance uses the pooled policy below. Resample whole matched pairs 10,000
+  times (fixed seed 42) for a percentile 95% confidence interval of the ratio
+  of medians, B/A. Fail when the ratio exceeds 1.10 and the interval excludes
+  1.0. Event-loop p99 fails on any significant increase. Report max separately.
+- Pool all request values for endpoint p95/p99. Bootstrap matched run clusters,
+  preserving all requests in each selected run. Fail a pooled p99 increase over
+  25% only when its interval excludes 1.0. Requests within a run are correlated;
+  they are not independent bootstrap units. These are per-metric intervals,
+  without multiplicity correction. Ten pairs cannot establish equivalence.
+  Require forty samples per run for the five foreground endpoint families;
+  absent/short families are unmeasured. The one-shot mobile cold/resume requests
+  remain diagnostics with unmeasured tails.
+- WAL cost is cumulative frames and frame bytes (page size plus 24-byte frame
+  header) per completed HTTP/WS operation during the sampling interval. Probe
+  SQLite 3.51+ `wal_checkpoint(NOOP)` after statements/commits and inspect WAL
+  header salts to distinguish reused generations. Include every attached schema,
+  deduplicating by database file. Capture SQL duration before probing so probe
+  time is not attributed to SQL. Sampling executes on the
+  writer thread before it can acknowledge a checkpoint-worker truncation.
+  Checkpoint policy remains intact. Probe overhead applies equally to A/B;
+  this measures instrumented relative performance, not absolute native latency.
+  `wal.bytes` remains allocated file size, informational only. Probe failures
+  leave write cost unmeasured. Correctness/device gaps are never changed to pass.
+- Record Linux CPU steal from `/proc/stat` and IO PSI total deltas between
+  `perf-start` and `perf-stop`, excluding fixture preparation and shutdown.
+  Exclude and redo the entire pair only for steal above 15% or failed fixture
+  flush; retain every attempt, reason and command exit. IO pressure is reported,
+  never used for post-hoc removal. Record absolute budgets as information under
+  this relative gate; existing unmeasured fields keep the overall verdict incomplete.
+
+Old metric keys remain in the ledger; foreground response keys now contain each
+run's p50, with explicit `.p50` and `.p95` keys and `requests`/`summaries` alongside.
+Comparisons reject legacy ledgers and unpaired or fewer than ten runs.

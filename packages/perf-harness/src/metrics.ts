@@ -19,6 +19,10 @@ export function appendLedger(path: string, value: unknown) {
   appendFileSync(path, JSON.stringify(value) + "\n", { flag: "a" });
 }
 export type Run = {
+  gateVersion?: string;
+  requests?: Record<string, number[]>;
+  summaries?: Record<string, Distribution>;
+  host?: { stealPct: number; ioSomePct: number; ioFullPct: number };
   sha: string;
   serverHash?: string;
   harnessHash?: string;
