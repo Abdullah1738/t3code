@@ -2673,6 +2673,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             mcp_optional_startup_grace_ms: 10_000,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               tool_timeout_sec: 3_900,
               http_headers: { Authorization: "Bearer secret-codex-token" },
             },
@@ -2751,11 +2753,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...CodexAdapterV2.CODEX_THREAD_CONFIG,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               tool_timeout_sec: 3_900,
               http_headers: { Authorization: "Bearer secret-codex-token" },
             },
             "mcp_servers.recall": {
               url: "http://127.0.0.1:18765/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               http_headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "codex" },
             },
           },
@@ -2767,6 +2773,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...CodexAdapterV2.CODEX_THREAD_CONFIG,
             "mcp_servers.recall": {
               url: "http://127.0.0.1:18765/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               http_headers: { "X-Robob-Thread": childThreadId, "X-Robob-Driver": "codex" },
             },
           },

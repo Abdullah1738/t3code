@@ -1416,6 +1416,8 @@ function codexThreadRuntimeParams(input: {
             // Override only T3's server so launch-argument MCP servers survive.
             "mcp_servers.t3-code": {
               url: mcpSession.endpoint,
+              required: false,
+              startup_timeout_sec: 5,
               tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
               http_headers: {
                 Authorization: mcpSession.authorizationHeader,
@@ -1427,6 +1429,8 @@ function codexThreadRuntimeParams(input: {
         : {
             "mcp_servers.recall": {
               url: input.recall.url,
+              required: false,
+              startup_timeout_sec: 5,
               http_headers: {
                 "X-Robob-Thread": input.recall.threadId,
                 "X-Robob-Driver": CODEX_PROVIDER,
