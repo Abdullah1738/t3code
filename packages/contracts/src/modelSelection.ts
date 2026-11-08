@@ -25,23 +25,26 @@ const modelSelectionSchema = (normalize: boolean) =>
     Schema.decodeTo(
       ModelSelectionWire,
       SchemaTransformation.transformEffect({
-        decode: (raw) =>
-          Effect.gen(function* () {
-            const instanceIdSource =
-              raw.instanceId !== undefined
-                ? raw.instanceId
-                : typeof raw.provider === "string"
-                  ? raw.provider
-                  : undefined;
-            const base: Record<string, unknown> = {
-              instanceId: instanceIdSource,
-              model: raw.model,
-            };
-            if (raw.options !== undefined) base.options = raw.options;
+        decode: (raw) => {
+          const instanceIdSource =
+            raw.instanceId !== undefined
+              ? raw.instanceId
+              : typeof raw.provider === "string"
+                ? raw.provider
+                : undefined;
+          const base: Record<string, unknown> = {
+            instanceId: instanceIdSource,
+            model: raw.model,
+          };
+          if (raw.options !== undefined) base.options = raw.options;
+          // The target schema validates the result. Only executable options
+          // need an earlier decode so normalization sees their canonical shape.
+          if (!normalize || raw.options === undefined)
+            return Effect.succeed(base as typeof ModelSelectionWire.Encoded);
+          return Effect.gen(function* () {
             const decoded = yield* SchemaParser.decodeUnknownEffect(ModelSelectionWire)(base);
-            const standard = normalize ? standardModelSelection(decoded) : decoded;
+            const standard = standardModelSelection(decoded);
             if (
-              normalize &&
               (decoded.options ?? []).some(
                 (o) =>
                   (o.id === "serviceTier" && o.value !== "default") ||
@@ -51,7 +54,8 @@ const modelSelectionSchema = (normalize: boolean) =>
               yield* Effect.logWarning("Standard mode enforced: fast model options replaced");
             }
             return standard;
-          }),
+          });
+        },
         encode: (value: typeof ModelSelectionWire.Encoded) => {
           const base: Record<string, unknown> = {
             instanceId: value.instanceId,

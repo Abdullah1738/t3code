@@ -170,3 +170,26 @@ it.effect("preserves recorded tiers for historical billing", () =>
     assert.deepStrictEqual(executable.options, [{ id: "serviceTier", value: "default" }]);
   }),
 );
+
+
+it.effect("validates option-free executable and recorded selections", () =>
+  Effect.gen(function* () {
+    for (const schema of [ModelSelection, RecordedModelSelection]) {
+      const decode = Schema.decodeUnknownEffect(schema);
+      const valid = yield* decode({ provider: "synthetic", model: "synthetic" });
+      assert.deepStrictEqual(valid, {
+        instanceId: ProviderInstanceId.make("synthetic"),
+        model: "synthetic",
+      });
+      for (const input of [
+        { instanceId: "1invalid", model: "synthetic" },
+        { instanceId: "synthetic", model: null },
+        { instanceId: "synthetic", model: " " },
+        { provider: 42, model: "synthetic" },
+      ]) {
+        const result = yield* Effect.exit(decode(input));
+        assert.strictEqual(result._tag, "Failure");
+      }
+    }
+  }),
+);
