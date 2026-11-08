@@ -70,3 +70,23 @@ Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.
 there; both agents idle until the tunnel exists. One time, after Abdullah ran `cloudflared tunnel login` and
 picked abdullah.fund: `~/.local/bin/cards-tunnel-setup` creates the tunnel (credentials in
 `~/.cloudflared/cards-tunnel.json`, never in this repo), points the DNS name at it and starts it.
+
+`robob-read-watchdog` probes `t3ctl threads --active --limit 5` with a 10-second
+request deadline every 30 seconds. After three minutes of failed reads it sends
+one Telegram alert, then one recovery when reads work again. It clears the
+incident quietly while Robob is closed or `tmux -L restart` has the
+`robob-restart` session. State and stderr live in
+`~/.local/state/robob-read-watchdog/`.
+
+After approval, run `integrations/local-helpers/install.zsh` from the merged,
+pushed checkout (it installs and loads the agent). If it needs loading manually:
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.robob-read-watchdog.plist`.
+Unload with `launchctl bootout gui/$(id -u)/com.ardud.robob-read-watchdog`.
+
+Installers can call `robob-read-watchdog --sustain 300 --every 30 --give-up 1800`
+to require five minutes of consecutive healthy reads. Any failed probe resets
+the healthy window; timeout exits 1. This mode sends no notifications and uses
+no watchdog state. `ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
+`ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
+`ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
+seconds or a command returning epoch seconds for an advancing test clock.
