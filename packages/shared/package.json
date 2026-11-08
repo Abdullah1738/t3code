@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./ownedProcessTree": "./src/ownedProcessTree.ts",
     "./githubMarkdownLinks": {
       "types": "./src/githubMarkdownLinks.ts",
       "import": "./src/githubMarkdownLinks.ts"

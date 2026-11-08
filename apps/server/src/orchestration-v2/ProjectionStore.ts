@@ -4484,6 +4484,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const getRuntimeRecoveryProjection: ProjectionStoreV2Shape["getRuntimeRecoveryProjection"] =
       Effect.fn("ProjectionStore.getRuntimeRecoveryProjection")(
         function* (threadId) {
+          yield* Effect.annotateCurrentSpan("thread.id", threadId);
           const threadRows = yield* sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_threads
             WHERE thread_id = ${threadId}
@@ -4650,15 +4651,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               FROM orchestration_v2_projection_provider_threads AS provider_thread
               WHERE (
                   provider_thread.thread_id = ${threadId}
-                  OR EXISTS (
-                    SELECT 1 FROM orchestration_v2_projection_nodes AS owner
-                    WHERE owner.node_id = provider_thread.owner_node_id
-                      AND owner.thread_id = ${threadId}
+                  OR provider_thread.owner_node_id IN (
+                    SELECT owner.node_id FROM orchestration_v2_projection_nodes AS owner
+                    WHERE owner.thread_id = ${threadId}
                   )
-                  OR EXISTS (
-                    SELECT 1 FROM orchestration_v2_projection_subagents AS subagent
-                    WHERE subagent.provider_thread_id = provider_thread.provider_thread_id
-                      AND subagent.thread_id = ${threadId}
+                  OR provider_thread.provider_thread_id IN (
+                    SELECT subagent.provider_thread_id
+                    FROM orchestration_v2_projection_subagents AS subagent
+                    WHERE subagent.thread_id = ${threadId}
+                      AND subagent.provider_thread_id IS NOT NULL
                   )
                 )
                 AND (

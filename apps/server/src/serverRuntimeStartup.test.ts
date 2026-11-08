@@ -248,6 +248,11 @@ it.effect.each([
       );
       yield* Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+        yield* Effect.yieldNow;
+        assert.isFalse(
+          yield* Deferred.isDone(recoveryStarted),
+          "recovery stays parked before listen",
+        );
         yield* startup.markHttpListening;
         if (scenario === "slow-recovery") {
           yield* Deferred.await(recoveryStarted);

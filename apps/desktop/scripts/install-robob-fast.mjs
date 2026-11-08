@@ -1,3 +1,8 @@
+import {
+  captureOwnedTree,
+  cleanupOwnedTree,
+  survivingOwned,
+} from "../../../packages/shared/src/ownedProcessTree.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
@@ -182,56 +187,30 @@ async function main(args) {
     cancelWindow: () => sleep(10_000),
     quit: async () => {
       quitAt = Date.now();
-      const { stdout } = await run("/usr/bin/lsappinfo", [
-        "info",
-        "-only",
-        "pid",
-        "-app",
-        "com.ardud.robob",
-      ]);
+      const quitAbort = AbortSignal.timeout(15_000);
+      const { stdout } = await run(
+        "/usr/bin/lsappinfo",
+        ["info", "-only", "pid", "-app", "com.ardud.robob"],
+        2000,
+      );
       const pid = Number(stdout.match(/pid[^0-9]*(\d+)/i)?.[1]);
       if (!Number.isSafeInteger(pid) || pid < 2) throw new Error("Cannot identify Robob PID");
-      const table = (await run("/bin/ps", ["-axo", "pid=,ppid=,pgid="])).stdout
-        .trim()
-        .split("\n")
-        .map((line) => line.trim().split(/\s+/).map(Number));
-      const owned = new Set([pid]);
-      for (let changed = true; changed;) {
-        changed = false;
-        for (const [child, parent] of table)
-          if (owned.has(parent) && !owned.has(child)) {
-            owned.add(child);
-            changed = true;
-          }
-      }
-      const group = table.find((row) => row[0] === pid)?.[2];
-      const alive = (p) => {
-        try {
-          process.kill(p, 0);
-          return true;
-        } catch {
-          return false;
-        }
-      };
+      const tree = await captureOwnedTree(
+        pid,
+        new Set(),
+        quitAbort,
+        path.join(app, "Contents/MacOS/Robob"),
+      );
       try {
         await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
       } catch {}
-      while ([...owned].some(alive) && Date.now() - quitAt < 15_000) await sleep(100);
-      if ([...owned].some(alive)) {
-        if (group === pid) {
-          try {
-            process.kill(-group, "SIGKILL");
-          } catch {}
-        }
-        for (const p of [...owned].reverse())
-          if (alive(p)) {
-            try {
-              process.kill(p, "SIGKILL");
-            } catch {}
-          }
-      }
-      for (let i = 0; i < 10 && [...owned].some(alive); i++) await sleep(100);
-      if ([...owned].some(alive)) throw new Error("Robob processes survived the shutdown bound");
+      while ((await survivingOwned(tree, true, quitAbort)).length && Date.now() - quitAt < 12_000)
+        await sleep(100);
+      await cleanupOwnedTree(tree, 250, true, Math.max(1, 15_000 - (Date.now() - quitAt)));
+      for (let i = 0; i < 10 && (await survivingOwned(tree, true, quitAbort)).length; i++)
+        await sleep(100);
+      if ((await survivingOwned(tree, true, quitAbort)).length)
+        throw new Error("Robob processes survived the shutdown bound");
     },
     backup: async () => {
       await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });

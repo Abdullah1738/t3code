@@ -8,7 +8,7 @@ export const shutdownWithinBudget = <E1, R1, E2, R2, E3, R3>(input: {
   Effect.gen(function* () {
     yield* input.prepare.pipe(
       Effect.interruptible,
-      Effect.timeoutOption("3 seconds"),
+      Effect.timeoutOption("2500 millis"),
       Effect.ignoreCause({ log: true }),
     );
     yield* input.closeProviders.pipe(
