@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off -- Synchronous process-local diagnostics, callable outside Effect.
 import { randomUUID } from "node:crypto";
 
 export interface ContinuationDecision {
@@ -5,6 +6,8 @@ export interface ContinuationDecision {
   readonly continued: boolean;
   readonly reason?: string;
   readonly dispatched?: boolean;
+  readonly reconciledAt?: string;
+  readonly queuedAt?: string;
 }
 
 const bootId = randomUUID();
@@ -17,7 +20,11 @@ const report = {
   threads: [] as ContinuationDecision[],
 };
 export function recordContinuationDecision(decision: ContinuationDecision) {
-  report.threads.push(decision);
+  report.threads.push({
+    ...decision,
+    reconciledAt: new Date().toISOString(),
+    ...(decision.continued ? { queuedAt: new Date().toISOString() } : {}),
+  });
 }
 export function finishContinuationReport() {
   report.completedAt = new Date().toISOString();
@@ -39,13 +46,24 @@ export function markInstallLifecycle(
 
 export function markContinuationDispatched(threadId: string) {
   const index = report.threads.findIndex((thread) => thread.threadId === threadId);
-  if (index >= 0) report.threads[index] = { threadId, continued: true, dispatched: true };
+  if (index >= 0)
+    report.threads[index] = {
+      ...report.threads[index],
+      threadId,
+      continued: true,
+      dispatched: true,
+    };
 }
 
 export function markContinuationFinished(threadId: string) {
   const index = report.threads.findIndex((thread) => thread.threadId === threadId);
   const thread = report.threads[index];
   if (thread?.continued && !thread.dispatched) {
-    report.threads[index] = { threadId, continued: false, reason: "continuation_declined" };
+    report.threads[index] = {
+      ...thread,
+      threadId,
+      continued: false,
+      reason: "continuation_declined",
+    };
   }
 }

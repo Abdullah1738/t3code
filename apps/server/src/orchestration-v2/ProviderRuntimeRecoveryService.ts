@@ -52,6 +52,12 @@ import {
   neverStarted,
 } from "./RestartBackgroundNote.ts";
 
+// Only startup continuation work may bypass global command readiness. The callback
+// runs after the thread's reconciliation transaction commits, never inside it.
+export class ReconciledThreadContinuation extends Context.Reference<
+  (threadId: ThreadId) => Effect.Effect<void>
+>("t3/ReconciledThreadContinuation", { defaultValue: () => () => Effect.void }) {}
+
 export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRuntimeRecoveryError>()(
   "ProviderRuntimeRecoveryError",
   {
@@ -629,7 +635,10 @@ export const make = Effect.gen(function* () {
         });
       }
       for (const session of projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       )) {
         events.push({
           id: yield* allocateEventId(),
@@ -690,7 +699,10 @@ export const make = Effect.gen(function* () {
           ]
         : [];
       const stoppedSessions = projection.providerSessions.filter(
-        (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
+        (candidate) =>
+          !stoppedThisPass.has(candidate.id) &&
+          candidate.status !== "stopped" &&
+          candidate.status !== "error",
       ).length;
       let retiredEffects: number;
       // ardud: count only continuation effects submitted with a committed reconciliation.
@@ -778,6 +790,14 @@ export const make = Effect.gen(function* () {
       trigger === "startup"
         ? yield* settings.getSettingsWithTrust.pipe(Effect.orElseSucceed(() => null))
         : null;
+    const onReconciled = yield* ReconciledThreadContinuation;
+    // Reset old leases before any new worker starts. Resetting them at the end
+    // would steal claims from continuations already running in this process.
+    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
+      Effect.mapError(
+        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
+      ),
+    );
     const threadIds = yield* projections
       .getRecoveryThreadIds("runtime")
       .pipe(
@@ -887,7 +907,11 @@ export const make = Effect.gen(function* () {
           stoppedThisPass,
         );
         for (const session of projection.providerSessions) {
-          if (session.status !== "stopped" && session.status !== "error") {
+          if (
+            !stoppedThisPass.has(session.id) &&
+            session.status !== "stopped" &&
+            session.status !== "error"
+          ) {
             stoppedThisPass.set(session.id, session);
           }
         }
@@ -907,6 +931,7 @@ export const make = Effect.gen(function* () {
               ? {}
               : { reason: result.continuationSkip ?? "no_candidate" }),
           });
+        if (trigger === "startup") yield* onReconciled(threadId);
       });
     yield* Effect.forEach(priority, recoverThread, { concurrency: 4, discard: true });
     const priorityIds = new Set(priority);
@@ -914,11 +939,6 @@ export const make = Effect.gen(function* () {
       threadIds.filter((id) => !priorityIds.has(id)),
       recoverThread,
       { concurrency: 4, discard: true },
-    );
-    const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
-      Effect.mapError(
-        (cause) => new ProviderRuntimeRecoveryError({ operation: "drain-outbox", cause }),
-      ),
     );
     // ardud: one startup log, including zero-candidate starts, for post-restart diagnosis.
     if (trigger === "startup") {

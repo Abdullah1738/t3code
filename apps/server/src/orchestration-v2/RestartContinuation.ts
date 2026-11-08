@@ -135,7 +135,8 @@ function preparationCut(
   projection: Pick<ProjectionRuntimeRecoveryState, "providerThreads" | "providerTurns">,
 ): boolean {
   return (
-    !projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId) &&
+    (run.startedAt === null || run.providerThreadId === null) &&
+    !(projection.providerTurns ?? []).some((turn) => turn.runAttemptId === run.activeAttemptId) &&
     (run.status === "preparing" ||
       run.status === "starting" ||
       (run.status === "running" &&
@@ -335,7 +336,12 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     const replayOriginal = !projection.providerTurns.some(
       (turn) => turn.runAttemptId === source.activeAttemptId,
     );
-    if (replayOriginal && sourceMessage === undefined) return;
+    if (
+      replayOriginal &&
+      sourceMessage === undefined &&
+      source.restartContinuationOfRunId === undefined
+    )
+      return;
     const note = restartContinuationNote(
       source,
       projection.runs,

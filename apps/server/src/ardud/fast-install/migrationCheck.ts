@@ -1,8 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off globalConsole:off globalConsoleInEffect:off preferSchemaOverJson:off -- Standalone preflight validates paths before its Effect runtime and writes machine-readable stdout.
 import { reconcileV2PreviewMigration } from "../../persistence/reconcileV2PreviewMigration.ts";
 import { assertMigrationCompatibility } from "./migrationCompatibility.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import { realpathSync, existsSync, lstatSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -61,8 +63,7 @@ export async function runMigrationCheck(directory: string) {
       Effect.gen(function* () {
         yield* (yield* BoardsDatabase.BoardsDatabase).ready;
       }).pipe(
-        Effect.provide(BoardsDatabase.layerFromPaths(join(root, "boards.sqlite"), state)),
-        Effect.provide(NodeServices.layer),
+        Effect.provide(BoardsDatabase.layerFromPaths(join(root, "boards.sqlite"), state).pipe(Layer.provide(NodeServices.layer))),
         Effect.scoped,
         Effect.timeout("20 seconds"),
       ),

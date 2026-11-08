@@ -479,6 +479,8 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
 
   const commandGate = yield* makeCommandGate;
   const httpListening = yield* Deferred.make<void>();
+  const earlyWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+  const startupScope = yield* Effect.scope;
   const effectWorkerFiber = yield* Ref.make<Fiber.Fiber<void, never> | null>(null);
 
   yield* Effect.addFinalizer(() =>
@@ -571,7 +573,29 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
           ),
         ),
       ),
-      recover: runStartupPhase("orchestration-v2.recovery", providerRuntimeRecovery.recover),
+      recover: runStartupPhase(
+        "orchestration-v2.recovery",
+        providerRuntimeRecovery.recover.pipe(
+          Effect.provideService(ProviderRuntimeRecovery.ReconciledThreadContinuation, (threadId) =>
+            Effect.gen(function* () {
+              // Claims use the same durable lease and per-thread ordering as the
+              // normal daemon. Global admissions and auxiliary roots stay parked.
+              while (
+                earlyWorker.runThreadOnce !== undefined &&
+                (yield* earlyWorker.runThreadOnce(threadId))
+              ) {
+                /* drain this reconciled thread */
+              }
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Early continuation worker failed", { threadId, cause }),
+              ),
+              Effect.forkIn(startupScope),
+              Effect.asVoid,
+            ),
+          ),
+        ),
+      ),
       recoverDelegatedTasks: runStartupPhase(
         "orchestration-v2.delegated-tasks.recover",
         orchestrator.recoverDelegatedTasks,
