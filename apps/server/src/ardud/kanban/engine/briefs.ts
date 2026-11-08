@@ -352,7 +352,7 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
 
 export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Wait for CI or a deploy inside your turn instead of ending it.`;
+  return `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.`;
 };
 
 export const runFailedText = (

@@ -46,6 +46,7 @@ import {
   AGING_STEP_MS,
   cardFlow,
   schedule,
+  PR_WATCH_GRACE_MS,
 } from "./rules.ts";
 
 const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
@@ -1563,18 +1564,37 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
   const START = Date.parse("2026-10-25T00:00:00Z");
   const START_ISO = "2026-10-25T00:00:00.000Z";
   const at = (minutes: number) => START + minutes * 60 * 1000;
-  const bg = (state: string, background: number) => ({
+  const bg = (state: string, background: number, prWatches = 0) => ({
     state,
     quietSince: START_ISO,
     backgroundWork: background,
+    prWatches,
   });
 
   it("holds an idle thread with background work for the grace only", () => {
     expect(BACKGROUND_GRACE_MS).toBe(60 * 60 * 1000);
     expect(waitingOnBackground(bg("idle", 1), at(59))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1), at(60))).toBe(false);
     expect(waitingOnBackground(bg("idle", 1), at(61))).toBe(false);
     expect(waitingOnBackground(bg("idle", 0), at(59))).toBe(false);
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
+  });
+
+  it("holds an idle thread with a PR watch for six hours only", () => {
+    expect(PR_WATCH_GRACE_MS).toBe(6 * 60 * 60 * 1000);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(359))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(360))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0, 1), at(361))).toBe(false);
+    expect(waitingOnBackground(bg("running", 0, 1), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("needs-input", 0, 1), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 0), at(359))).toBe(false);
+    expect(waitingOnBackground(bg("idle", 1, 1), at(61))).toBe(true);
+    expect(waitingOnBackground(bg("idle", 1, 1), at(361))).toBe(false);
+  });
+
+  it("restarts the PR-watch grace when a new run finishes", () => {
+    const view = { ...bg("idle", 0, 1), quietSince: "2026-10-25T06:00:00.000Z" };
+    expect(waitingOnBackground(view, at(361))).toBe(true);
   });
 
   const reviewing = card({

@@ -87,6 +87,7 @@ interface FakeThread {
   stuck?: boolean;
   quietSince?: string;
   background?: number;
+  prWatches?: number;
   archived: boolean;
 }
 
@@ -153,6 +154,7 @@ const makeFake = Effect.gen(function* () {
             quietSince: thread.quietSince ?? "2026-10-25T13:00:00.000Z",
             runStartedAt: thread.runStartedAt ?? null,
             backgroundWork: thread.background ?? 0,
+            prWatches: thread.prWatches ?? 0,
             prs: prs.get(threadId) ?? [],
             archived: thread.archived,
           };
@@ -13005,6 +13007,87 @@ it.effect("a worker waiting on its own subagents isn't nudged", () =>
       yield* TestClock.adjust("30 minutes");
       yield* kanban.tick;
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a worker waiting on a PR watch isn't nudged when its turn ends", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const before = (yield* kanban.card(card.id)).card;
+      const thread = before.activeThreadId!;
+      const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+      worker.prWatches = 1;
+      const messages = [...worker.messages];
+      const sends = fake.sends.length;
+      for (let stop = 0; stop < 4; stop += 1) yield* kanban.turnEnded(thread);
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "working");
+      assert.strictEqual(after.activeThreadId, thread);
+      assert.isNull(after.stalled);
+      assert.strictEqual(after.nudgedAt, before.nudgedAt);
+      assert.deepStrictEqual(worker.messages, messages);
+      assert.lengthOf(fake.sends, sends);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([
+  { prWatches: 1, minutes: 31, nudges: 0 },
+  { prWatches: 1, minutes: 359, nudges: 0 },
+  { prWatches: 1, minutes: 361, nudges: 1 },
+  { prWatches: 0, minutes: 31, nudges: 1 },
+])(
+  "the quiet backstop sends $nudges nudges with $prWatches PR watches after $minutes minutes",
+  ({ prWatches, minutes, nudges }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+        worker.prWatches = prWatches;
+        const messages = [...worker.messages];
+        yield* TestClock.adjust(`${minutes} minutes`);
+        yield* kanban.tick;
+        assert.strictEqual(yield* nudgesTo(fake, thread), nudges);
+        const after = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(after.stage, "working");
+        assert.isNull(after.stalled);
+        if (nudges === 0) {
+          assert.isNull(after.nudgedAt);
+          assert.deepStrictEqual(worker.messages, messages);
+        } else assert.isNotNull(after.nudgedAt);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("an unresolved worker turn-end retry waits on its PR watch", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker = (yield* Ref.get(fake.threads)).get(thread)!;
+      worker.prWatches = 1;
+      const messages = [...worker.messages];
+      fake.failFailureReads.left = 1;
+      yield* kanban.turnEnded(thread);
+      yield* kanban.tick;
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
+      assert.isNull((yield* kanban.card(card.id)).card.nudgedAt);
+      assert.deepStrictEqual(worker.messages, messages);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

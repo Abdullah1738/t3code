@@ -11,6 +11,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -30,6 +31,7 @@ import {
   KanbanThreadError,
   KanbanThreads,
   layer,
+  prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
 
@@ -121,6 +123,81 @@ describe("backgroundWorkOf", () => {
 
   it("is zero when the roster is missing (older shells)", () => {
     expect(backgroundWorkOf({})).toBe(0);
+  });
+});
+
+describe("prWatchesOf", () => {
+  const watchedPr = (overrides: Partial<ThreadPullRequestLink> = {}): ThreadPullRequestLink => ({
+    host: "github.com",
+    repository: "x/y",
+    number: 1,
+    url: "https://github.com/x/y/pull/1",
+    source: "agent",
+    linkedAt: FINISHED_AT,
+    stack: null,
+    snapshot: {
+      state: "open",
+      title: "Change",
+      headBranch: "change",
+      baseBranch: "main",
+      isDraft: false,
+      updatedAt: null,
+      syncedAt: FINISHED_AT,
+    },
+    watch: {
+      startedAt: FINISHED_AT,
+      headSha: null,
+      failedChecks: [],
+      passed: false,
+      passedChecks: [],
+      remarksThrough: FINISHED_AT,
+      remarkIds: [],
+      conflicting: false,
+      wakes: 0,
+    },
+    ...overrides,
+  });
+
+  it.each([
+    { name: "open", pr: watchedPr(), count: 1 },
+    {
+      name: "draft",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, isDraft: true } }),
+      count: 1,
+    },
+    { name: "no snapshot yet", pr: watchedPr({ snapshot: null }), count: 1 },
+    { name: "no watch", pr: watchedPr({ watch: undefined }), count: 0 },
+    { name: "stack-dismissed", pr: watchedPr({ source: "stack-dismissed" }), count: 0 },
+    {
+      name: "merged",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "merged" } }),
+      count: 0,
+    },
+    {
+      name: "closed",
+      pr: watchedPr({ snapshot: { ...watchedPr().snapshot!, state: "closed" } }),
+      count: 0,
+    },
+    {
+      name: "ended watch",
+      pr: watchedPr({ watch: undefined, endedWatch: watchedPr().watch }),
+      count: 0,
+    },
+  ])("counts $name links correctly", ({ pr, count }) => {
+    expect(prWatchesOf({ pullRequests: [pr] })).toBe(count);
+  });
+
+  it("counts each eligible link in a mixed roster", () => {
+    expect(
+      prWatchesOf({
+        pullRequests: [watchedPr(), watchedPr({ snapshot: null }), watchedPr({ watch: undefined })],
+      }),
+    ).toBe(2);
+  });
+
+  it("is zero for an empty or missing roster", () => {
+    expect(prWatchesOf({ pullRequests: [] })).toBe(0);
+    expect(prWatchesOf({})).toBe(0);
   });
 });
 

@@ -63,8 +63,10 @@ export interface KanbanThreadView {
   readonly quietSince: string;
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
-  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches don't count: they never end. */
+  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
+  /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
+  readonly prWatches: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
   readonly archived: boolean;
 }
@@ -184,6 +186,14 @@ export const backgroundWorkOf = (
       !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
   ).length;
 
+export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>
+  (shell.pullRequests ?? []).filter(
+    (pr) =>
+      pr.watch !== undefined &&
+      pr.source !== "stack-dismissed" &&
+      (pr.snapshot === null || pr.snapshot.state === "open"),
+  ).length;
+
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
@@ -205,6 +215,7 @@ const make = Effect.gen(function* () {
                 ? DateTime.formatIso(shell.activityRunStartedAt)
                 : null,
               backgroundWork: backgroundWorkOf(shell),
+              prWatches: prWatchesOf(shell),
               archived: shell.archivedAt !== null,
               prs: (shell.pullRequests ?? []).map((pr) => ({
                 url: pr.url,

@@ -124,6 +124,7 @@ const fakeThreads = (
             quietSince: "2026-10-26T08:00:00.000Z",
             runStartedAt: null,
             backgroundWork: 0,
+            prWatches: 0,
             prs: [],
             archived: false,
           };

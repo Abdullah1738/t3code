@@ -255,15 +255,23 @@ export function workerQuietDue(
 /** How long a thread whose turn ended may wait on its own background work before the board treats it as stopped. */
 export const BACKGROUND_GRACE_MS = 60 * 60 * 1000;
 
-/** A thread whose turn ended while its own subagents or background tasks still run, within the grace. */
+export const PR_WATCH_GRACE_MS = 6 * 60 * 60 * 1000;
+
+/** An idle thread waiting on its own background work or PR watch, within that work's grace. */
 export function waitingOnBackground(
-  view: { readonly state: string; readonly quietSince: string; readonly backgroundWork: number },
+  view: {
+    readonly state: string;
+    readonly quietSince: string;
+    readonly backgroundWork: number;
+    readonly prWatches: number;
+  },
   nowMs: number,
 ): boolean {
   return (
     view.state === "idle" &&
-    view.backgroundWork > 0 &&
-    nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS
+    ((view.backgroundWork > 0 && nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS) ||
+      // Reviewers never hold PR watches, so this shared guard needs no role check.
+      (view.prWatches > 0 && nowMs - Date.parse(view.quietSince) < PR_WATCH_GRACE_MS))
   );
 }
 

@@ -7,7 +7,13 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { evaluatorBrief, reviewBrief, workBrief, type EvaluatorPurpose } from "./briefs.ts";
+import {
+  evaluatorBrief,
+  nudgeWorkText,
+  reviewBrief,
+  workBrief,
+  type EvaluatorPurpose,
+} from "./briefs.ts";
 
 const model = { instanceId: ProviderInstanceId.make("opencode"), model: "example" };
 const board: KanbanBoard = {
@@ -68,6 +74,12 @@ const card: KanbanCard = {
 };
 
 describe("board briefs", () => {
+  it("tells workers to watch PR CI and end the turn, and wait inside it for other work", () => {
+    expect(nudgeWorkText([card])).toContain(
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. For a deploy or anything else, wait inside your turn.",
+    );
+  });
+
   it("includes the file-first instructions with a request", () => {
     const brief = evaluatorBrief(board, { kind: "request", text: "Owner's exact request" });
     expect(brief).toContain(
