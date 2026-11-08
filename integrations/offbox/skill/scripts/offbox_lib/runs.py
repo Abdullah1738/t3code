@@ -189,8 +189,21 @@ if rc:
         names = [parts[1] for line in output.decode(errors='replace').splitlines()
                  if len(parts := line.split(None, 1)) == 2 and parts[0].startswith('D')]
         state = f"{len(names)} ({', '.join(names[:5])})" if ps_rc == 0 else 'unknown (ps did not answer)'
+        lock_rc, output = bounded(['sudo', '-n', 'lslocks', '--json', '-o', 'PID,COMMAND,MODE,PATH'], 2, capture=True)
+        holder = 'unknown'
+        try:
+            import json
+            for lock in json.loads(output)['locks'] if lock_rc == 0 else []:
+                # A mode ending in '*' is a waiter, not the process holding the lock.
+                if (lock.get('path') == '/run/offbox-image-restore.lock'
+                        and not lock.get('mode', '').endswith('*') and (lock.get('pid') or 0) > 0):
+                    comm = ' '.join((lock.get('command') or 'unknown').split())
+                    holder = f"{lock['pid']} {comm}"
+                    break
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
         print(f'offbox-box-wedged: kept image restore did not finish in {seconds}s and docker does not answer; '
-              f'D-state: {state}', file=sys.stderr)
+              f'D-state: {state}; lock holder: {holder}', file=sys.stderr)
         sys.exit(97)
 sys.exit(1 if rc == 97 else rc)
 OFFBOX_IMAGE_WAIT

@@ -2,6 +2,7 @@
 import os
 import contextlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import signal
@@ -59,6 +60,7 @@ class ImageWaitFixture:
                            '[ "$FLOCK_TIMEOUT" = 1 ] && exit 1\n'
                            '[ "$HANG" = flock ] && exec sleep 30\nexit 0\n')
         self.tool('docker', DOCKER)
+        self.tool('lslocks', '#!/bin/bash\nprintf \'{"locks": []}\\n\'\n')
         self.tool('zstd', '#!/bin/bash\necho zstd >> "$CALLS"\n'
                           '[ "$HANG" = zstd ] && exec sleep 30\nprintf image\n')
         self.env = dict(os.environ, PATH=f'{self.bins}:/usr/bin:/bin', CALLS=str(self.calls),
@@ -134,6 +136,61 @@ class ImageWaitTests(unittest.TestCase):
             self.assertEqual(result.returncode, 97, result.stderr)
             self.assertNotIn('USER_COMMAND', result.stdout)
             self.assertIn('offbox-box-wedged:', result.stderr)
+            self.assertIn('; lock holder: unknown', result.stderr)
+
+    def test_wedged_evidence_identifies_lock_holder_not_waiter(self):
+        for comm in ('offbox restore', 'unknown', None):
+            with self.subTest(comm=comm), tempfile.TemporaryDirectory() as d:
+                fx = ImageWaitFixture(d)
+                fx.tool('timeout', '#!/bin/bash\nexit 1\n')
+                fx.tool('sudo', '#!/bin/bash\n[ "$1" = -n ] && shift\n'
+                                'if [ "$1" = lslocks ]; then export ROOT_PROBE=1; fi\nexec "$@"\n')
+                locks = [
+                    {'pid': 123, 'command': 'other', 'mode': 'WRITE', 'path': '/run/other.lock'},
+                    {'pid': 35360, 'command': 'flock', 'mode': 'WRITE*', 'path': str(fx.root / 'lock')},
+                    {'pid': 21780, 'command': comm, 'mode': 'WRITE', 'path': str(fx.root / 'lock')},
+                ]
+                fx.tool('lslocks', '#!/bin/bash\n[ "$ROOT_PROBE" = 1 ] || exit 1\n'
+                                  f"printf '%s\\n' '{json.dumps({'locks': locks})}'\n")
+                result = fx.run()
+                self.assertEqual(result.returncode, 97, result.stderr)
+                self.assertNotIn('USER_COMMAND', result.stdout)
+                self.assertIn(f'; lock holder: 21780 {comm or "unknown"}\n', result.stderr)
+
+    def test_lock_holder_probe_failure_falls_back_to_unknown(self):
+        for reply in ('exit 1', 'printf invalid', 'printf \'{"locks": null}\'', 'exec missing-lslocks',
+                      'printf \'{"locks": [null]}\'', 'printf \'{"locks": [{"path": "%s", "mode": null}]}\' "$LOCK_PATH"'):
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as d:
+                fx = ImageWaitFixture(d)
+                fx.tool('timeout', '#!/bin/bash\nexit 1\n')
+                fx.env['LOCK_PATH'] = str(fx.root / 'lock')
+                fx.tool('lslocks', '#!/bin/bash\n' + reply + '\n')
+                result = fx.run()
+                self.assertEqual(result.returncode, 97, result.stderr)
+                self.assertNotIn('USER_COMMAND', result.stdout)
+                self.assertIn('; lock holder: unknown\n', result.stderr)
+
+    def test_lock_holder_probe_is_bounded_when_signals_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = ImageWaitFixture(d)
+            fx.tool('timeout', '#!/bin/bash\nexit 1\n')
+            fx.env['STUCK_PID'] = str(fx.root / 'pid')
+            fx.tool('lslocks', '#!/bin/bash\necho $$ > "$STUCK_PID"\ntrap "" TERM\nexec sleep 30\n')
+            script = fx.script().replace('os.killpg(child.pid, signal.SIGKILL)', 'raise PermissionError("D state")')
+            try:
+                start = time.monotonic()
+                result = subprocess.run(['bash', '-c', script + '\necho USER_COMMAND\n'], env=fx.env,
+                                        capture_output=True, text=True, timeout=6)
+                self.assertLess(time.monotonic() - start, 4)
+                self.assertEqual(result.returncode, 97, result.stderr)
+                self.assertNotIn('USER_COMMAND', result.stdout)
+                self.assertIn('; lock holder: unknown\n', result.stderr)
+            finally:
+                if Path(fx.env['STUCK_PID']).exists():
+                    try:
+                        os.kill(int(Path(fx.env['STUCK_PID']).read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_real_preamble_and_exit_wrapper_do_not_reach_cd_or_query_docker_after_wedge(self):
         with tempfile.TemporaryDirectory() as d:
