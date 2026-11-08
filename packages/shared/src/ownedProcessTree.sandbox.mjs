@@ -150,3 +150,22 @@ test("captured descendants stay owned across PGID changes and newly protected tr
   });
   assert.deepEqual(killed, [root.pid], "protection covers the captured descendant closure");
 });
+
+
+test("cleanup deadline aborts a grace wait and leaves the owned process available for final cleanup", async () => {
+  const child = spawn(process.execPath, ["-e", `process.on('SIGTERM',()=>{});console.log(JSON.stringify(process.pid));setInterval(()=>{},1000)`], {
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const exited = once(child, "exit");
+  try {
+    await line(child.stdout);
+    const tree = await captureOwnedTree(child.pid);
+    const started = performance.now();
+    await assert.rejects(cleanupOwnedTree(tree, 10000, true, 50), /abort|deadline/i);
+    assert.ok(performance.now() - started < 1500, "the total deadline bounds the grace wait");
+  } finally {
+    child.kill("SIGKILL");
+    await exited;
+  }
+});

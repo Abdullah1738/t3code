@@ -2,6 +2,9 @@
 import { execFile } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export interface ProcessIdentity {
   readonly pid: number;
@@ -342,23 +345,26 @@ export async function cleanupOwnedTree(
   timeoutMs = 1500,
 ) {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error("Process cleanup deadline exceeded")),
-    timeoutMs,
+  const timer = Effect.runFork(
+    Effect.sleep(timeoutMs).pipe(
+      Effect.andThen(
+        Effect.sync(() => controller.abort(new Error("Process cleanup deadline exceeded"))),
+      ),
+    ),
   );
   const io = { table: processTable, observe: processIdentity, abort: controller.signal };
   try {
     await signalOwned(tree, "SIGTERM", includeRoot, io);
-    const deadline = Date.now() + graceMs;
+    const deadline = performance.now() + graceMs;
     while (
       (await survivingOwned(tree, includeRoot, controller.signal)).length &&
-      Date.now() < deadline
+      performance.now() < deadline
     ) {
       controller.signal.throwIfAborted();
-      await new Promise((r) => setTimeout(r, 25));
+      await sleep(25, undefined, { signal: controller.signal });
     }
     await signalOwned(tree, "SIGKILL", includeRoot, io);
   } finally {
-    clearTimeout(timer);
+    await Effect.runPromise(Fiber.interrupt(timer));
   }
 }
