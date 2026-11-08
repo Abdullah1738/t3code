@@ -21,17 +21,19 @@ import time
 import unicodedata
 from collections import deque
 from contextlib import closing
+from functools import wraps
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import robob_readonly
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get("RECALL_DATA", str(ROOT / "data")))
 MEM_DB = Path(os.environ.get("RECALL_MEM_DB", str(DATA / "memory.db")))
+HOT_DB = Path(os.environ["RECALL_HOT_DB"]) if os.environ.get("RECALL_HOT_DB") else None
 CATALOG_DB = Path(os.environ.get("RECALL_CATALOG_DB", str(DATA / "recall_catalog.db")))
-OPENCODE_DB = Path(
-    os.environ.get("OPENCODE_DB", str(Path.home() / ".local/share/opencode/opencode.db"))
-)
-STATE_DB = Path(os.environ.get("RECALL_STATE_DB", str(Path.home() / ".robob/userdata/statev2.sqlite")))
+OPENCODE_DB = Path(robob_readonly.opencode_db())
+STATE_DB = Path(robob_readonly.state_db("RECALL_STATE_DB"))
 
 STOP = set(
     """a an and are as at be by can do does for from has have how i in is it its me my of on or our
@@ -61,6 +63,16 @@ REASONING_KINDS = ("reasoning",)
 _local = threading.local()
 
 
+def _interrupted() -> int:
+    deadline = getattr(_local, "deadline", None)
+    return int(deadline is not None and deadline.expired())
+
+
+def _check_budget():
+    if _interrupted():
+        raise Timeout("recall work budget exceeded")
+
+
 class Timeout(Exception):
     pass
 
@@ -86,49 +98,127 @@ class Deadline:
 
 def connect_ro(path: Path) -> sqlite3.Connection:
     # mode=ro without query_only: fts5vocab needs a writable temp schema.
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30, check_same_thread=False)
+    try:
+        if path == OPENCODE_DB:
+            reader = robob_readonly.native_ro
+        elif path == STATE_DB:
+            reader = robob_readonly.state_ro
+        else:
+            reader = robob_readonly.connect_ro
+        con = reader(path, timeout=0.1, check_same_thread=False)
+    except OSError as exc:
+        raise sqlite3.OperationalError(str(exc)) from exc
     con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA busy_timeout=100")
+    con.execute("PRAGMA cache_size=-8192")
+    con.set_progress_handler(_interrupted, 1000)
     return con
 
 
 def mem() -> sqlite3.Connection:
     con = getattr(_local, "mem", None)
     if con is None:
-        con = connect_ro(MEM_DB)
+        con = connect_ro(HOT_DB or MEM_DB)
         con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab_text USING fts5vocab(main, {TEXT_FTS}, row)")
         con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab_all USING fts5vocab(main, {ALL_FTS}, row)")
         _local.mem = con
     return con
 
 
+def cold() -> sqlite3.Connection:
+    if HOT_DB is None:
+        return mem()
+    con = getattr(_local, "cold", None)
+    if con is None:
+        con = connect_ro(MEM_DB)
+        _local.cold = con
+    return con
+
+
+def close_readers() -> None:
+    # Thread pools reuse threads; no reader survives a request or model wait.
+    for key in ("mem", "cold", "catalog_r", "opencode"):
+        con = getattr(_local, key, None)
+        if con is not None:
+            con.close()
+            setattr(_local, key, None)
+
+
+def bounded(seconds: float):
+    """A nested operation shares the caller's budget, including direct SQL."""
+    def decorate(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            previous = getattr(_local, "deadline", None)
+            deadline = kwargs.get("deadline") or Deadline(seconds)
+            if previous is not None and previous.t < deadline.t:
+                deadline = previous
+            _local.deadline = deadline
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "interrupt" in str(exc).lower():
+                    raise Timeout("recall read budget exceeded; narrow the query or use an event reference") from None
+                raise
+            finally:
+                _local.deadline = previous
+                if previous is None:
+                    close_readers()
+        return wrapped
+    return decorate
+
+
 def catalog(write: bool = False) -> sqlite3.Connection:
     key = "catalog_w" if write else "catalog_r"
     con = getattr(_local, key, None)
     if con is None:
+        path = robob_readonly.safe_path(CATALOG_DB)
         if write or not CATALOG_DB.exists():
-            con = sqlite3.connect(str(CATALOG_DB), timeout=30, check_same_thread=False)
+            con = sqlite3.connect(str(path), timeout=0.1, check_same_thread=False)
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(CATALOG_SCHEMA)
             con.commit()
         else:
-            con = sqlite3.connect(f"file:{CATALOG_DB}?mode=ro", uri=True, timeout=30, check_same_thread=False)
+            con = robob_readonly.connect_ro(path, timeout=0.1, check_same_thread=False)
+        con.set_progress_handler(_interrupted, 1000)
         setattr(_local, key, con)
     return con
 
 
 def opencode_ro() -> sqlite3.Connection | None:
     con = getattr(_local, "opencode", None)
-    if con is None:
-        try:
-            con = connect_ro(OPENCODE_DB)
-            con.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
-        except sqlite3.Error:
-            return None
-        _local.opencode = con
+    fresh = None
+    try:
+        path = robob_readonly.safe_path(OPENCODE_DB)
+        info = path.stat()
+        fresh = connect_ro(OPENCODE_DB)
+        updated = robob_readonly.native_generation(fresh)
+        generation = str(path), info.st_dev, info.st_ino, updated
+        if (con is not None and con.in_transaction
+                and getattr(_local, "opencode_generation", None) == generation
+                and robob_readonly.native_generation(con) == updated):
+            fresh.close()
+        else:
+            fresh.execute("SELECT 1 FROM session_v2 LIMIT 1").fetchone()
+            if con is not None:
+                con.close()
+            con = _local.opencode = fresh
+            _local.opencode_generation = generation
+        fresh = None
+    except (OSError, sqlite3.Error):
+        if fresh is not None:
+            fresh.close()
+        if con is not None:
+            con.close()
+            _local.opencode = None
+        return None
     return con
 
 
 def run(con: sqlite3.Connection, sql: str, params=(), deadline: Deadline | None = None) -> list:
+    request_deadline = getattr(_local, "deadline", None)
+    if request_deadline is not None and (deadline is None or request_deadline.t < deadline.t):
+        deadline = request_deadline
     if deadline is not None:
         if deadline.expired():
             raise Timeout()
@@ -142,7 +232,7 @@ def run(con: sqlite3.Connection, sql: str, params=(), deadline: Deadline | None 
         raise
     finally:
         if deadline is not None:
-            con.set_progress_handler(None, 0)
+            con.set_progress_handler(_interrupted, 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +476,7 @@ def fetch_events(con: sqlite3.Connection, ids: list[int], max_chars: int = 30000
             f"SELECT id, source, session_id, speaker, timestamp, content_type, substr(content,1,{max_chars}), metadata_json "
             f"FROM episodic_events WHERE id IN ({q})",
             chunk,
-        ):
+        ).fetchall():
             out[row[0]] = row
     return out
 
@@ -466,6 +556,16 @@ def _hits_from_rows(con, rows: list, terms: list[Term], text: str, *, include_to
         # The FTS row can match inside boilerplate we just stripped; require the
         # terms in what the reader will actually see.
         low = fold_text(cleaned)
+        if HOT_DB and not all(f" {n_} " in low for n_ in needles):
+            # FTS indexes the full archive, while hot rows only keep previews.
+            # Resolve a bounded window by primary key, never a transcript scan.
+            needle = " ".join(terms[0].tokens) if terms else text
+            row = cold().execute(
+                "SELECT substr(content, max(1, instr(lower(content), lower(?))-200), 30000) "
+                "FROM episodic_events WHERE id=?", (needle, rowid)).fetchone()
+            if row:
+                cleaned = clean_text(row[0], speaker) if ctype == "text" else row[0]
+                low = fold_text(cleaned)
         if exact:
             if fold_text(text) not in low:
                 continue
@@ -538,6 +638,7 @@ def snippet(text: str, needles: list[str], width: int = 320) -> str:
     return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
+@bounded(0.8)
 def search(
     queries: list[str] | str,
     *,
@@ -557,7 +658,7 @@ def search(
 ) -> dict:
     """Sessions best-first. `cwd` boosts same-project sessions; `cwd_only` keeps only those."""
     t0 = time.monotonic()
-    deadline = deadline or Deadline(20)
+    deadline = deadline or Deadline(0.8)
     con = mem()
     if isinstance(queries, str):
         queries = [queries]
@@ -680,6 +781,10 @@ AGENTS_FOR_RE = re.compile(r"^# AGENTS\.md instructions for (\S[^\n]{0,400})")
 
 
 def compute_session(con: sqlite3.Connection, session_id: str) -> dict | None:
+    # Legacy stores may lack the session-only index. Never turn a missing index
+    # into a scan of the entire transcript archive during an HTTP request.
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_episodic_session_timestamp'").fetchone():
+        raise sqlite3.OperationalError("session index missing; run the offline recall migration")
     row = con.execute(
         "SELECT min(timestamp), max(timestamp), count(*) FROM episodic_events WHERE session_id=?",
         (session_id,),
@@ -732,7 +837,7 @@ def compute_session(con: sqlite3.Connection, session_id: str) -> dict | None:
     elif source == "muse":
         # sync_muse.py keeps Robob thread titles and parents for Muse sessions.
         try:
-            r = con.execute(
+            r = (cold() if HOT_DB else con).execute(
                 "SELECT title, cwd, parent_id, model FROM muse_sessions WHERE session_id=?", (session_id,)
             ).fetchone()
         except sqlite3.Error:
@@ -790,7 +895,7 @@ def _refresh_muse_meta(con) -> int:
     """Muse titles/parents can arrive after a log goes quiet (Robob maps threads late)."""
     since = int(catalog_meta("muse_meta_at") or 0)
     try:
-        rows = con.execute(
+        rows = (cold() if HOT_DB else con).execute(
             "SELECT session_id, updated_at FROM muse_sessions WHERE updated_at > ?", (since,)
         ).fetchall()
     except sqlite3.Error:
@@ -806,18 +911,42 @@ def refresh_catalog(full: bool = False, progress=None, deadline: Deadline | None
     """Recompute sessions touched since the last watermark (or all of them)."""
     con = mem()
     t0 = time.monotonic()
+    if HOT_DB:
+        turn = int(catalog_meta("hot_reconcile_turn") or 0) + 1
+        set_catalog_meta("hot_reconcile_turn", turn)
+        if turn % 3 == 0:
+            _refresh_hot_catalog(con, deadline)
     max_id = con.execute("SELECT max(id) FROM episodic_events").fetchone()[0] or 0
     wm = 0 if full else int(catalog_meta("watermark") or 0)
     if wm >= max_id:
         n = _refresh_muse_meta(con)
         return {"updated": n, "watermark": wm, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
     if wm == 0:
-        # Full build: every session once, watermark only at the end.
-        ids = [r[0] for r in con.execute("SELECT DISTINCT session_id FROM episodic_events INDEXED BY idx_episodic_session_timestamp")]
-        done = _compute_and_store(con, ids, progress)
-        set_catalog_meta("watermark", max_id)
+        # Bootstrap also resumes. In particular, never scan the archive simply
+        # because a disposable catalog is absent after a crash or migration.
+        last = "" if full else catalog_meta("bootstrap_session") or ""
+        bootstrap_hi = int(catalog_meta("bootstrap_hi") or max_id) if not full else max_id
+        set_catalog_meta("bootstrap_hi", bootstrap_hi)
+        done = 0
+        while deadline is None or not deadline.expired():
+            ids = [r[0] for r in run(con, "SELECT DISTINCT session_id FROM episodic_events "
+                                   "INDEXED BY idx_episodic_session_timestamp WHERE session_id>? "
+                                   "ORDER BY session_id LIMIT 50", (last,), deadline)]
+            if not ids:
+                break
+            for sid in ids:
+                if deadline is not None and deadline.expired():
+                    return {"updated": done, "watermark": 0, "bootstrap_session": last}
+                done += _compute_and_store(con, [sid], progress)
+                last = sid
+                set_catalog_meta("bootstrap_session", last)
+        else:
+            return {"updated": done, "watermark": 0, "bootstrap_session": last}
+        set_catalog_meta("watermark", bootstrap_hi)
+        set_catalog_meta("bootstrap_session", "")
+        set_catalog_meta("bootstrap_hi", 0)
         set_catalog_meta("refreshed_at", int(time.time()))
-        return {"updated": done, "watermark": max_id, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+        return {"updated": done, "watermark": bootstrap_hi, "elapsed_ms": int((time.monotonic() - t0) * 1000)}
     # Incremental: walk event-id windows and move the watermark after each, so a
     # deadline keeps the progress made so far.
     done = 0
@@ -835,6 +964,34 @@ def refresh_catalog(full: bool = False, progress=None, deadline: Deadline | None
 
 
 CATALOG_WINDOW = 50_000
+
+
+def _refresh_hot_catalog(con, deadline):
+    # An UPDATE/deletion can leave max(id) unchanged. Reconcile the small catalog
+    # on a rotating cursor as well as consuming new event ids.
+    cursor = catalog_meta("hot_reconcile_session") or ""
+    rows = run(con, "SELECT DISTINCT session_id FROM episodic_events INDEXED BY idx_episodic_session_timestamp "
+               "WHERE session_id>? ORDER BY session_id LIMIT 20", (cursor,), deadline)
+    for (sid,) in rows:
+        if deadline and deadline.expired():
+            return
+        _compute_and_store(con, [sid])
+        set_catalog_meta("hot_reconcile_session", sid)
+    if not rows:
+        set_catalog_meta("hot_reconcile_session", "")
+    writer = catalog(write=True)
+    # Catalog deletion probes are bounded by a second independent keyset cursor.
+    cursor = catalog_meta("hot_prune_session") or ""
+    rows = writer.execute("SELECT session_id FROM sessions WHERE session_id>? ORDER BY session_id LIMIT 50", (cursor,)).fetchall()
+    for (sid,) in rows:
+        if deadline and deadline.expired():
+            return
+        if not con.execute("SELECT 1 FROM episodic_events INDEXED BY idx_episodic_session_timestamp WHERE session_id=? LIMIT 1", (sid,)).fetchone():
+            writer.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+            writer.commit()
+        set_catalog_meta("hot_prune_session", sid)
+    if not rows:
+        set_catalog_meta("hot_prune_session", "")
 
 
 def _compute_and_store(con, ids: list[str], progress=None) -> int:
@@ -868,18 +1025,11 @@ def catalog_rows(session_ids: list[str]) -> dict[str, dict]:
                 out[row[0]] = dict(zip(cols, row))
     except sqlite3.Error:
         pass
-    # Sessions newer than the last refresh: compute a few on the fly, within a budget.
-    missing = [s for s in session_ids if s not in out]
-    budget = Deadline(1.0)
-    for sid in missing[:30]:
-        if budget.expired():
-            break
-        s = compute_session(mem(), sid)
-        if s:
-            out[sid] = s
+    # Catalog catchup belongs to the background writer, never a tool request.
     return out
 
 
+@bounded(0.8)
 def list_sessions(
     *,
     text: str | None = None,
@@ -938,7 +1088,7 @@ def _members(values: set[str]) -> str:
 
 def _alias_table_tree(ids: set[str]) -> set[str]:
     """Read D1's materialized aliases when available; never cache a changing map."""
-    con = mem()
+    con = cold()
     if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_aliases'").fetchone():
         return set()
     natives = {value.split(":agent:", 1)[0] for value in ids}
@@ -962,11 +1112,47 @@ def _alias_table_tree(ids: set[str]) -> set[str]:
     return out
 
 
-_state_reads = threading.BoundedSemaphore(2)
-_state_refresh_lock = threading.Lock()
+class _BudgetLock:
+    def __init__(self, lock):
+        self.lock = lock
+
+    def acquire(self, blocking=True):
+        if not blocking:
+            return self.lock.acquire(blocking=False)
+        deadline = getattr(_local, "deadline", None)
+        if deadline is None:
+            return self.lock.acquire()
+        if not self.lock.acquire(timeout=max(0, min(0.1, deadline.left()))):
+            raise Timeout("caller identity cache busy; retry")
+        return True
+
+    def release(self):
+        self.lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+_state_reads = _BudgetLock(threading.BoundedSemaphore(2))
+_state_refresh_lock = _BudgetLock(threading.Lock())
 _state_snapshot = None
+_state_snapshot_generation = None
 _STATE_CHUNK = 2000
 _STATE_REFRESH_SECONDS = 60
+
+
+def _state_generation():
+    try:
+        info = robob_readonly.safe_path(STATE_DB).stat()
+        with closing(robob_readonly.state_ro(STATE_DB, timeout=0.1)) as con:
+            updated = robob_readonly.ready_generation(con)
+    except OSError as exc:
+        raise sqlite3.OperationalError("Robob read-only replica unavailable") from exc
+    return info.st_dev, info.st_ino, updated
 
 
 @dataclass(frozen=True)
@@ -1229,17 +1415,21 @@ def _state_with_changes(con: sqlite3.Connection, snapshot: _StateSnapshot, seque
 
 
 def _state_cache(*, caller: str | None = None, after_sequence: int | None = None) -> _StateSnapshot:
-    global _state_snapshot
+    global _state_snapshot, _state_snapshot_generation
     path = STATE_DB
+    generation = _state_generation()
     snapshot = _state_snapshot
-    if snapshot is None or snapshot.path != path:
+    if snapshot is None or snapshot.path != path or _state_snapshot_generation != generation:
         with _state_refresh_lock:
             snapshot = _state_snapshot
-            if snapshot is None or snapshot.path != path:
+            if snapshot is None or snapshot.path != path or _state_snapshot_generation != generation:
                 with _state_reads, closing(connect_ro(path)) as con:
                     snapshot = _build_state_snapshot(con, path, _state_sequence(con))
                     snapshot = _state_with_changes(con, snapshot, _state_sequence(con))
+                    if _state_generation() != generation:
+                        raise UnknownCaller("read-only replica replaced while being read")
                     _state_snapshot = snapshot
+                    _state_snapshot_generation = generation
     # A missing caller can have appeared since the last build. Serialize its
     # forced incremental refresh without occupying a database-reader slot.
     native = caller.split(":agent:", 1)[0] if caller else None
@@ -1250,7 +1440,7 @@ def _state_cache(*, caller: str | None = None, after_sequence: int | None = None
         if acquired:
             try:
                 current = _state_snapshot
-                if current is not None and current.path == path:
+                if current is not None and current.path == path and _state_snapshot_generation == generation:
                     snapshot = current
                 with _state_reads, closing(connect_ro(path)) as con:
                     sequence = _state_sequence(con)
@@ -1274,12 +1464,15 @@ def _state_cache(*, caller: str | None = None, after_sequence: int | None = None
     if _state_refresh_lock.acquire(blocking=False):
         try:
             current = _state_snapshot
-            if (current is not None and current.path == path and snapshot.sequence > current.sequence
+            if (current is not None and current.path == path and _state_snapshot_generation == generation
+                    and snapshot.sequence > current.sequence
                     and snapshot.built_sequence == current.built_sequence
                     and snapshot.checked_at == current.checked_at):
                 _state_snapshot = snapshot
         finally:
             _state_refresh_lock.release()
+    if _state_generation() != generation:
+        raise UnknownCaller("read-only replica replaced while being read")
     return snapshot
 
 
@@ -1300,6 +1493,7 @@ def _state_tree_checked(ids: set[str], *, caller: str | None = None) -> set[str]
     """Interim D1 reader. State is read-only; it is not a second identity writer."""
     after_sequence = None
     for _ in range(3):
+        generation = _state_generation()
         old_observations = getattr(_local, "state_subagents", None)
         old_read_sequences = getattr(_local, "state_subagent_read_sequence", None)
         if old_observations is not None:
@@ -1317,6 +1511,7 @@ def _state_tree_checked(ids: set[str], *, caller: str | None = None) -> set[str]
         with _state_reads, closing(connect_ro(STATE_DB)) as con:
             end = _state_sequence(con)
             changed = _state_changed(con, snapshot.sequence, end, set(result) | ids, snapshot)
+        changed = changed or _state_generation() != generation
         if not changed:
             if old_observations is not None:
                 for task_id, identities in _local.state_subagents.items():
@@ -1375,6 +1570,7 @@ def _state_tree_once(ids: set[str], snapshot: _StateSnapshot) -> set[str]:
         frontier = set(seeds)
         subagents = set()
         while frontier:
+            _check_budget()
             read_sequence = _state_sequence(con)
             rows = con.execute(
                 f"SELECT thread_id,child_thread_id,json_extract(payload_json,'$.nativeTaskRef.nativeId'),subagent_id "
@@ -1465,6 +1661,7 @@ def _opencode_tree(ids: set[str], edges: dict[str, set[str]] | None = None) -> s
         edges = _opencode_edges(con)
     frontier = set(ids)
     while frontier:
+        _check_budget()
         found = set().union(*(edges.get(sid, set()) for sid in frontier))
         frontier = found - out
         out.update(frontier)
@@ -1477,6 +1674,7 @@ def _catalog_tree(ids: set[str]) -> set[str]:
     out = set(ids)
     frontier = set(ids)
     while frontier:
+        _check_budget()
         found = {r[0] for r in con.execute(
             "SELECT parent_id FROM sessions WHERE session_id IN (SELECT value FROM json_each(?))", (_members(frontier),)
         ) if r[0]}
@@ -1490,6 +1688,7 @@ def _catalog_tree(ids: set[str]) -> set[str]:
 
 def validate_driver(ident: str, driver: str) -> None:
     """Qualifiers must agree with a persisted provider binding."""
+    generation = _state_generation()
     snapshot = _state_cache(caller=ident)
     with _state_reads, closing(connect_ro(STATE_DB)) as con:
         native = ident.split(":agent:", 1)[0]
@@ -1504,8 +1703,11 @@ def validate_driver(ident: str, driver: str) -> None:
             row = con.execute("SELECT 1 FROM ardud_opencode_import WHERE thread_id=? OR native_session_id=?", (ident, native)).fetchone()
         if not row:
             raise UnknownCaller("caller driver does not match")
+    if _state_generation() != generation:
+        raise UnknownCaller("read-only replica replaced while being read")
 
 
+@bounded(0.8)
 def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool = False) -> frozenset:
     """All known aliases in the caller's complete root tree, or fail closed."""
     if not canonical_or_native_id or not canonical_or_native_id.strip():
@@ -1516,6 +1718,7 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
     _local.state_subagent_read_sequence = {}
     try:
         for _ in range(3):
+            generation = _state_generation()
             _local.state_subagents = {}
             _local.state_subagent_read_sequence = {}
             snapshot = _state_cache(caller=canonical_or_native_id.strip())
@@ -1529,6 +1732,7 @@ def lineage_exclusions(canonical_or_native_id: str | None, *, fresh_legacy: bool
             with _state_reads, closing(connect_ro(STATE_DB)) as con:
                 end = _state_sequence(con)
                 changed = _state_changed(con, start, end, set(result) | {canonical_or_native_id.strip()}, snapshot)
+            changed = changed or _state_generation() != generation
             if not changed:
                 if error:
                     raise error
@@ -1604,6 +1808,7 @@ def _lineage_exclusions_once(canonical_or_native_id: str | None, *, fresh_legacy
         frontier = set(aliases)
         legacy_checked: set[str] = set()
         while frontier:
+            _check_budget()
             found = _opencode_tree(frontier, edges) | _alias_table_tree(frontier) | _catalog_tree(frontier)
             if state_available:
                 pending_state = frontier - expanded
@@ -1670,6 +1875,7 @@ def _legacy_lineage(session_id: str | None, days: int = 14, *, fresh: bool = Fal
     sources = [catalog()] + ([oc] if oc is not None else [])
     frontier = list(roots)
     while frontier:
+        _check_budget()
         nxt = []
         for i in range(0, len(frontier), 400):
             chunk = frontier[i : i + 400]
@@ -1701,14 +1907,17 @@ def lineage(session_id: str | None) -> frozenset:
         return frozenset()
 
 
+@bounded(0.8)
 def resolve_session(ident: str) -> str | None:
     ident = ident.strip()
     if not ident:
         return None
     ident = ident.split("#", 1)[0].split("@", 1)[0]
-    con = mem()
-    if con.execute("SELECT 1 FROM episodic_events WHERE session_id=? LIMIT 1", (ident,)).fetchone():
+    if catalog().execute("SELECT 1 FROM sessions WHERE session_id=? LIMIT 1", (ident,)).fetchone():
         return ident
+    if cold().execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_episodic_session_timestamp'").fetchone():
+        if cold().execute("SELECT 1 FROM episodic_events INDEXED BY idx_episodic_session_timestamp WHERE session_id=? LIMIT 1", (ident,)).fetchone():
+            return ident
     try:
         rows = catalog().execute(
             "SELECT session_id, title FROM sessions WHERE session_id LIKE ? ORDER BY last_ts DESC LIMIT 6", (ident + "%",)
@@ -1802,6 +2011,7 @@ class _Builder:
                 self.msgs[-1].tools.append(line)
 
 
+@bounded(0.8)
 def session_messages(
     session_id: str,
     include_tools: bool = False,
@@ -1816,7 +2026,7 @@ def session_messages(
     Numbering comes from scanning from the beginning, so huge sessions are capped by
     `max_rows` scanned events; use read_around() to jump to an event instead.
     """
-    con = mem()
+    con = cold()
     b = _Builder(include_tools, include_reasoning)
     after = None
     scanned = 0
@@ -1837,6 +2047,7 @@ def session_messages(
     return msgs[:count] if count else msgs
 
 
+@bounded(0.8)
 def read_around(session_id: str, event_id: int, *, include_tools: bool = False, include_reasoning: bool = False, context: int = 3) -> tuple[list[Message], int | None]:
     """Messages around one event, without numbering the whole session.
 
@@ -1844,7 +2055,7 @@ def read_around(session_id: str, event_id: int, *, include_tools: bool = False, 
     (negative before the hit, 0 at it, positive after) because absolute numbers
     would need a full scan.
     """
-    con = mem()
+    con = cold()
     hit = con.execute("SELECT timestamp, session_id FROM episodic_events WHERE id=?", (event_id,)).fetchone()
     if not hit or hit[1] != session_id:
         return [], None
@@ -1928,9 +2139,10 @@ def session_header(session_id: str, n_messages: int | None = None) -> str:
     return " — ".join(bits) + ("\n" + " · ".join(line2) if line2 else "")
 
 
+@bounded(0.8)
 def excerpt_around(session_id: str, event_id: int, *, before_chars: int = 500, hit_chars: int = 1200, after_chars: int = 900) -> list[tuple[str, int, int, str]]:
     """The hit message plus the neighbor that gives it meaning (question or answer)."""
-    con = mem()
+    con = cold()
     hit = con.execute(
         "SELECT id, timestamp, speaker, content_type, substr(content,1,30000), metadata_json FROM episodic_events WHERE id=?",
         (event_id,),

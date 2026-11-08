@@ -5,6 +5,7 @@ Temp dirs only:  python3 -m unittest discover -s tests -p 'test_native_session_r
 import io
 import hashlib
 import json
+from replica_fixture import ready
 import os
 import shutil
 import sqlite3
@@ -284,6 +285,7 @@ class ReportOnly(unittest.TestCase):
     def test_unknown_state_db_cannot_partially_mark_threads_settled(self):
         state = os.path.join(self.tmp.name, "state.sqlite")
         with closing(sqlite3.connect(state)) as con, con:
+            ready(con)
             con.execute("CREATE TABLE ardud_kanban_cards (json TEXT)")
             con.execute("INSERT INTO ardud_kanban_cards VALUES (?)",
                         (json.dumps({"workThreadId": "th-settled", "settledAt": "today"}),))
@@ -316,6 +318,7 @@ class ReportOnly(unittest.TestCase):
         state = os.path.join(self.tmp.name, "statev2.sqlite")
         ledger_db = self.make_ledger()
         with closing(sqlite3.connect(state)) as con, con:
+            ready(con)
             con.execute("CREATE TABLE ardud_kanban_cards (json TEXT)")
             con.execute("INSERT INTO ardud_kanban_cards VALUES (?)",
                         (json.dumps({"workThreadId": "th-settled", "settledAt": "today"}),))

@@ -2,12 +2,14 @@
 
 import importlib
 import json
+from replica_fixture import ready
 import os
 import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, SRC)
@@ -148,6 +150,14 @@ class MuseSyncTest(unittest.TestCase):
         self.assertEqual(len(rows), 5)
         self.assertEqual(rows[-1][3], "Raised the session timeout; tests pass.")
 
+    def test_partial_line_never_marks_the_whole_file_captured(self):
+        write(self.main, main_log("S1"), partial='{"partial":')
+        self.sync()
+        with sqlite3.connect(self.db) as con:
+            offset, size = con.execute("SELECT offset,size FROM muse_sync_files").fetchone()
+        self.assertLess(offset, os.path.getsize(self.main))
+        self.assertEqual(size, 0)
+
     def test_rewritten_log_is_reprojected(self):
         write(self.main, main_log("S1"))
         self.sync()
@@ -209,12 +219,17 @@ class MuseSyncTest(unittest.TestCase):
     def test_file_error_is_isolated_and_reported(self):
         bad = os.path.join(self.sessions, "2026/10/14/A/session.jsonl")
         write(bad, main_log("A"))
-        os.chmod(bad, 0)  # unreadable
         write(self.main, main_log("S1"))
-        try:
+        real_open = open
+
+        def unreadable(path, *args, **kwargs):
+            if os.fspath(path) == bad:
+                raise PermissionError("unreadable fixture")
+            return real_open(path, *args, **kwargs)
+
+        # VM test runners may be root, where chmod(0) does not deny reads.
+        with patch("builtins.open", side_effect=unreadable):
             stats = self.sync()
-        finally:
-            os.chmod(bad, 0o644)
         self.assertEqual(stats["errors"], 1)
         self.assertEqual(len(self.rows("S1")), 5)
         st = json.load(open(self.status))
@@ -292,10 +307,37 @@ class MuseSyncTest(unittest.TestCase):
         again = self.sync()
         self.assertEqual(again["rows"], 0)
 
+    def test_deadline_inside_file_keeps_only_committed_offset_and_resumes(self):
+        from capture_budget import Budget
+        write(self.main, main_log("S1"))
+        worker = self.sm.MuseSync(types.SimpleNamespace(full=False, only=None, deadline=0))
+        clock = [0]
+        worker.budget = Budget(1, clock=lambda: clock[0])
+        real_save = worker._save
+        offsets = []
+        def save(*args, **kwargs):
+            real_save(*args, **kwargs)
+            offsets.append(args[4])
+            clock[0] = 2
+        worker._save = save
+        with patch.object(self.sm, "CHUNK_BYTES", 200):
+            stats = worker.run()
+        self.assertTrue(stats["partial"])
+        self.assertEqual(len(offsets), 1)
+        with sqlite3.connect(self.db) as con:
+            offset, size = con.execute("SELECT offset,size FROM muse_sync_files").fetchone()
+            self.assertGreater(offset, 0)
+            self.assertLess(offset, os.path.getsize(self.main))
+            self.assertEqual(size, 0)
+        self.sync()
+        self.assertEqual(len(self.rows()), 5)
+        self.assertEqual(self.sync()["rows"], 0)
+
     def test_robob_titles_and_parent_including_late_mapping(self):
         write(self.main, main_log("S1"))
         self.sync()
         con = sqlite3.connect(self.robob_db)
+        ready(con)
         con.executescript("""
             CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT, provider TEXT, payload_json TEXT);
             CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, title TEXT, payload_json TEXT);

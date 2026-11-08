@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import native_identity  # noqa: E402
+import robob_readonly  # noqa: E402
 import transcript_backup_manifest  # noqa: E402
 import transcript_roots  # noqa: E402
 
@@ -79,9 +80,9 @@ def settled_threads(state_db):
     if not state_db or not os.path.isfile(state_db):
         return out
     try:
-        c = sqlite3.connect(f"{Path(os.path.abspath(state_db)).as_uri()}?mode=ro", uri=True, timeout=30)
+        c = robob_readonly.state_ro(state_db)
         try:
-            c.execute("BEGIN")
+            robob_readonly.ready_generation(c)
             for (tid,) in c.execute(
                     "SELECT DISTINCT json_extract(json, '$.workThreadId') FROM ardud_kanban_cards "
                     "WHERE json_extract(json, '$.settledAt') IS NOT NULL"):
@@ -93,7 +94,7 @@ def settled_threads(state_db):
                     out.add(tid)
         finally:
             c.close()
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         return set()
     return out
 
@@ -182,7 +183,7 @@ def load_ledger(path):
     if not path or not os.path.isfile(path):
         return {}
     try:
-        c = sqlite3.connect(f"{Path(os.path.abspath(path)).as_uri()}?mode=ro", uri=True, timeout=30)
+        c = robob_readonly.connect_ro(path)
         try:
             # All file and alias evidence comes from one database snapshot.
             c.execute("BEGIN")
@@ -223,7 +224,7 @@ def main(argv=None):
     ap.add_argument("--days", type=int, default=MIN_AGE_DAYS)
     ap.add_argument("--manifest", help="backup manifest json (default: latest in data/backup-manifests)")
     ap.add_argument("--ledger", default=os.path.join(ROOT, "data/memory.db"))
-    ap.add_argument("--state-db", default=os.path.join(HOME, ".robob/userdata/statev2.sqlite"))
+    ap.add_argument("--state-db", default=robob_readonly.state_db("ROBOB_STATE_DB"))
     args = ap.parse_args(argv)
     if args.manifest:
         try:

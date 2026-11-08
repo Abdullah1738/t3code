@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.abdullah.opencode-readonly</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/nice</string>
+		<string>-n</string>
+		<string>15</string>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/ardud/.local/share/memory-system/src/export_opencode.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/ardud/.local/share/memory-system/logs/native-export.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/ardud/.local/share/memory-system/logs/native-export.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>
