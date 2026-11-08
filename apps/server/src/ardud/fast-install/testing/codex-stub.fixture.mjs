@@ -26,7 +26,10 @@ function nextNative(kind) {
   return `${kind}-${n + 1}`;
 }
 let mcp;
-let delegated = false;
+// The pool may give the child a fresh process instead of reusing the root's.
+// Keep this scenario boundary shared so either process follows the same plan.
+const delegationStarted = path.join(home, ".delegation-started");
+const hasDelegated = () => fs.existsSync(delegationStarted);
 const mode = () => {
   try {
     return JSON.parse(fs.readFileSync(path.join(home, ".crash-plan"), "utf8")).mode;
@@ -104,7 +107,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     (m.method === "thread/start" ? nextNative("native") : `unused-${++sequence}`);
   if (
     m.method === "thread/start" &&
-    (mode() === "preparation" || (mode() === "awaiting" && delegated))
+    (mode() === "preparation" || (mode() === "awaiting" && hasDelegated()))
   ) {
     boundary(mode());
     continue;
@@ -161,8 +164,8 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       );
       if (mode() === "running") boundary("running");
       if (mode() === "awaiting" || mode() === "child") {
-        if (!delegated) {
-          delegated = true;
+        if (!hasDelegated()) {
+          fs.writeFileSync(delegationStarted, "1\n");
           void delegate().catch((e) =>
             fs.writeFileSync(path.join(home, "delegation-error.log"), String(e)),
           );

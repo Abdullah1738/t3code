@@ -13,6 +13,13 @@ const fixtures = path.join(root, "apps/server/src/ardud/fast-install/testing");
 const output = path.resolve(process.argv[2] ?? "tmp/l5-crash");
 fs.mkdirSync(output, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Synthetic workspaces may live below this checkout. Keep checkpoint discovery
+// from treating the enclosing repository as their workspace (150 concurrent
+// baselines otherwise scan the whole checkout instead of measuring recovery).
+const serverEnv = (home) => ({
+  ...process.env,
+  GIT_CEILING_DIRECTORIES: path.dirname(home),
+});
 const sanitizeLog = (text) =>
   text.replace(/Connection string:[\s\S]*?(?=\n\[\d\d:|$)/g, "[synthetic pairing details omitted]");
 async function until(f, label, timeout = 90000) {
@@ -123,7 +130,7 @@ for (const [count, active] of [
       "--port",
       String(listenPort),
     ],
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: root, env: serverEnv(home), stdio: ["ignore", "pipe", "pipe"] },
   );
   child.stdout.on("data", (b) => {
     stdout += b;
@@ -263,7 +270,7 @@ async function boot(home, label, pauseAt) {
       "--port",
       String(listenPort),
     ],
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: root, env: serverEnv(home), stdio: ["ignore", "pipe", "pipe"] },
   );
   child.stdout.on("data", (b) => (stdout += b));
   child.stderr.on("data", (b) => (stderr += b));
