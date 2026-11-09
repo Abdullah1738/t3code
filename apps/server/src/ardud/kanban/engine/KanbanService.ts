@@ -3117,9 +3117,8 @@ const make = Effect.gen(function* () {
     if (row.closed !== undefined) return yield* markOwnerRouteDone(record.id, row.closed);
     return yield* markOwnerRouteDelivered(record);
   });
+  // Rows are written by this module from its own payload types.
   const ownerRoutePayload = (record: OwnerRouteRecord) =>
-    // Rows are written by this module from its own payload types.
-    // @effect-diagnostics-next-line preferSchemaOverJson:off
     JSON.parse(record.json) as OwnerRoutePayload & {
       readonly askers?: SavedOwnerRow["askers"];
     };
