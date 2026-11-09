@@ -106,8 +106,7 @@ class NativeReader:
 
     def bank_capture(self, order):
         from commerce_food_capture import find_bank_capture
-        local=j.inspect(self.flow_id)
-        placed=next(o['created_at'] for o in local['operations'] if o['kind']=='place')
+        placed=j.food_capture_placed_at(self.flow_id)
         bank=find_bank_capture(placed,self.state['review']['payable_minor'],self.state['review']['card_last4'])
         j.claim_food_bank_purchase(self.flow_id,bank)
         return {'paid':True,'order':order,'bank':bank,'source':'exact_native_automatic_and_bank_purchase'}

@@ -93,6 +93,16 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(self.co.recover()['order'],ORDER)
         with self.assertRaises(j.JournalError):self.co.place()
 
+    def test_native_bank_capture_uses_journal_placement_timestamp(self):
+        self.co.place()
+        reader=recovery.NativeReader.__new__(recovery.NativeReader)
+        reader.flow_id=self.flow
+        reader.state={'review':{'payable_minor':4585,'card_last4':'2342'}}
+        bank={'source_id':516800,'amount_minor':4585}
+        with patch('commerce_food_capture.find_bank_capture',return_value=bank) as lookup:
+            self.assertTrue(reader.bank_capture(ORDER)['paid'])
+            lookup.assert_called_once_with(j.food_capture_placed_at(self.flow),4585,'2342')
+
     def test_bank_pending_keeps_order_held(self):
         self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
         self.reader.bank_capture=Mock(side_effect=j.JournalError('pending'))
