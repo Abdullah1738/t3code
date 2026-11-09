@@ -818,32 +818,6 @@ const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDe
   defaultValue: () => undefined,
 });
 
-const evaluatorNoteKey = Context.Reference<string | undefined>("KanbanEvaluatorStepNote", {
-  defaultValue: () => undefined,
-});
-
-const evaluatorLaunchKey = Context.Reference<string | undefined>("KanbanEvaluatorLaunchKey", {
-  defaultValue: () => undefined,
-});
-
-const evaluatorDelivered = Context.Reference<Set<ThreadId> | undefined>(
-  "KanbanEvaluatorStepDelivered",
-  {
-    defaultValue: () => undefined,
-  },
-);
-
-const evaluatorLaunchKeys = Context.Reference<Map<string, string> | undefined>(
-  "KanbanEvaluatorLaunchKeys",
-  {
-    defaultValue: () => undefined,
-  },
-);
-
-const evaluatorLaunched = Context.Reference<Set<ThreadId> | undefined>("KanbanEvaluatorLaunched", {
-  defaultValue: () => undefined,
-});
-
 const make = Effect.gen(function* () {
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
@@ -867,17 +841,8 @@ const make = Effect.gen(function* () {
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
-    function* (
-      input: Parameters<typeof threadIo.launch>[0],
-      id: ThreadId,
-      recovery?: { readonly keys: Map<string, string>; readonly delivered: Set<ThreadId> },
-    ) {
+    function* (input: Parameters<typeof threadIo.launch>[0], id: ThreadId) {
       yield* threadIo.interrupt(id, "Board state changed during launch");
-      if (recovery) {
-        // Replaying the launch command would return its canceled initial turn.
-        recovery.keys.set(input.key, uuid());
-        recovery.delivered.delete(id);
-      }
       const existing = yield* rawStore.threadLink(id);
       const [source, role] = input.key.split(":");
       const card =
@@ -904,7 +869,7 @@ const make = Effect.gen(function* () {
     },
     (effect) => effect.pipe(Effect.ignore),
   );
-  const threads = {
+  const threads: typeof threadIo = {
     view: (id) => locks.outside(threadIo.view(id), undefined, true),
     find: (id) => locks.outside(threadIo.find(id), undefined, true),
     model: (id) => locks.outside(threadIo.model(id), undefined, true),
@@ -912,57 +877,25 @@ const make = Effect.gen(function* () {
     findLastFailure: (id) => locks.outside(threadIo.findLastFailure(id), undefined, true),
     latestRun: (id) => locks.outside(threadIo.latestRun(id), undefined, true),
     compactRun: (id, run) => locks.outside(threadIo.compactRun(id, run)),
-    launch: Effect.fn("KanbanService.launch")(function* (input) {
-      const delivered = yield* evaluatorDelivered;
-      const launched = yield* evaluatorLaunched;
-      const noteKey = yield* evaluatorNoteKey;
-      const launchKey = yield* evaluatorLaunchKey;
-      const keys = yield* evaluatorLaunchKeys;
-      const recovery = keys && delivered ? { keys, delivered } : undefined;
-      const cleanup = (id: ThreadId) => abandonLaunch(input, id, recovery);
-      const replacement = keys?.get(input.key);
-      const id = yield* locks.outside(
-        threadIo
-          .launch(
-            replacement ? { ...input, key: `${input.key}:replacement:${replacement}` } : input,
-          )
-          .pipe(
+    launch: (input) =>
+      locks
+        .outside(
+          threadIo.launch(input).pipe(
             Effect.tap((id) =>
               Effect.gen(function* () {
-                const replayed = launched?.has(id) === true;
-                launched?.add(id);
                 (yield* ownerDelivered)?.add(id);
-                // A replay has no initial turn to start; the reminder must wake or steer it.
-                if (
-                  replayed &&
-                  noteKey !== undefined &&
-                  noteKey !== launchKey &&
-                  !delivered?.has(id)
-                ) {
-                  yield* threadIo.send({
-                    threadId: id,
-                    text: input.text,
-                    model: input.model,
-                    key: `${noteKey}:${id}:answer`,
-                  });
-                }
-                delivered?.add(id);
               }),
             ),
           ),
-        cleanup,
-      );
-      yield* locks.launched(id, cleanup(id));
-      return id;
-    }),
+          (id) => abandonLaunch(input, id),
+        )
+        .pipe(Effect.tap((id) => locks.launched(id, abandonLaunch(input, id)))),
     send: (input) =>
       Effect.gen(function* () {
-        const key = (yield* evaluatorNoteKey) ?? (yield* ownerDeliveryKey);
+        const key = yield* ownerDeliveryKey;
         const delivered = yield* ownerDelivered;
-        const stepDelivered = yield* evaluatorDelivered;
         const answer = input.key === undefined;
-        if (answer && (delivered?.has(input.threadId) || stepDelivered?.has(input.threadId)))
-          return;
+        if (answer && delivered?.has(input.threadId)) return;
         return yield* locks.outside(
           threadIo
             .send({
@@ -974,19 +907,15 @@ const make = Effect.gen(function* () {
             .pipe(
               Effect.tap(() =>
                 Effect.sync(() => {
-                  if (answer) {
-                    delivered?.add(input.threadId);
-                    stepDelivered?.add(input.threadId);
-                  }
+                  if (answer) delivered?.add(input.threadId);
                 }),
               ),
             ),
         );
       }),
     setModel: (id, model) => locks.outside(threadIo.setModel(id, model)),
-    interrupt: (id, reason) =>
-      locks.outside(threadIo.interrupt(id, reason)).pipe(Effect.ignoreCause),
-  } satisfies typeof threadIo;
+    interrupt: (id, reason) => locks.outside(threadIo.interrupt(id, reason)),
+  };
   // Timeout forks a fiber; release the caller's permit before that fiber takes its own.
   const postCommit = <A, E, R>(effect: Effect.Effect<A, E, R>, fallback: A) =>
     locks.outside(SavedWrite.bestEffort(locks.fresh(locks.run(effect)), fallback));
@@ -1087,23 +1016,9 @@ const make = Effect.gen(function* () {
   const stepWaits = yield* Ref.make<
     ReadonlyMap<
       KanbanCard["id"],
-      {
-        readonly key: string;
-        readonly since: number;
-        readonly woken: boolean;
-        readonly retry?: boolean;
-        readonly handoff?: boolean;
-        readonly deliveryKey?: string;
-        readonly delivered: Set<ThreadId>;
-        readonly launchKeys: Map<string, string>;
-        readonly launchKey: string;
-        readonly launched: Set<ThreadId>;
-      }
+      { readonly key: string; readonly since: number; readonly woken: boolean }
     >
   >(new Map());
-  // An in-flight note may fail after its step ended and reopened with the same subtask ids.
-  const stepActivations = new Map<KanbanCardId, { readonly key: string; readonly token: object }>();
-  const savedStepActivations = new WeakMap<KanbanCard, object>();
   const forgetStepWait = (cardId: KanbanCard["id"]) =>
     Ref.update(stepWaits, (all) => {
       if (!all.has(cardId)) return all;
@@ -1413,26 +1328,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* store.putCard(card);
         yield* SavedWrite.record({ kind: "card", card });
-        const key = kanbanEvaluatorStep(card)
-          ? Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator"))
-          : null;
-        if (key === null) stepActivations.delete(card.id);
-        else {
-          let activation = stepActivations.get(card.id);
-          if (activation?.key !== key) {
-            activation = { key, token: {} };
-            stepActivations.set(card.id, activation);
-          }
-          savedStepActivations.set(card, activation.token);
-        }
-        const wait = (yield* Ref.get(stepWaits)).get(card.id);
-        if (
-          card.stalled?.by._tag === "evaluator" ||
-          !kanbanEvaluatorStep(card) ||
-          (wait !== undefined &&
-            wait.key !== Subtasks.subtaskIds(kanbanStepSubtasks(card, "evaluator")))
-        )
-          yield* forgetStepWait(card.id);
+        if (card.stalled?.by._tag === "evaluator") yield* forgetStepWait(card.id);
       }),
     );
     yield* SavedWrite.bestEffort(
@@ -2167,7 +2063,7 @@ const make = Effect.gen(function* () {
       return yield* failWith("invalid", `board ${board.slug} is already in setup`);
     }
     const at = yield* nowIso;
-    const launchKey = (yield* evaluatorLaunchKey) ?? (yield* evaluatorNoteKey) ?? uuid();
+    const launchKey = uuid();
     // The setup evaluator talks in a Setup discussion, so the owner has somewhere to read and reply.
     // An existing discussion can be adopted as the Setup one (boards set up before this existed).
     let setupDiscussion: KanbanDiscussion | null = null;
@@ -2590,51 +2486,11 @@ const make = Effect.gen(function* () {
       yield* toEvaluator(discussion, text, true);
     },
     (effect, _before, after) =>
-      Effect.suspend(() => {
-        const key = Subtasks.subtaskIds(kanbanStepSubtasks(after, "evaluator"));
-        const deliveryKey = `step:${after.id}:${key}:${uuid()}`;
-        const activation = savedStepActivations.get(after);
-        const delivered = new Set<ThreadId>();
-        const launchKeys = new Map<string, string>();
-        const launched = new Set<ThreadId>();
-        return effect.pipe(
-          Effect.provideService(evaluatorLaunched, launched),
-          Effect.provideService(evaluatorLaunchKey, deliveryKey),
-          Effect.provideService(evaluatorLaunchKeys, launchKeys),
-          Effect.provideService(evaluatorDelivered, delivered),
-          Effect.provideService(evaluatorNoteKey, deliveryKey),
-          Effect.onExit((exit) =>
-            exit._tag === "Success"
-              ? Effect.void
-              : Effect.gen(function* () {
-                  const since = yield* nowMillis;
-                  if (
-                    activation !== undefined &&
-                    stepActivations.get(after.id)?.token === activation
-                  )
-                    yield* Ref.update(stepWaits, (all) =>
-                      new Map(all).set(after.id, {
-                        key,
-                        since,
-                        woken: false,
-                        retry: true,
-                        handoff: true,
-                        deliveryKey,
-                        delivered,
-                        launchKeys,
-                        launchKey: deliveryKey,
-                        launched,
-                      }),
-                    );
-                  yield* Effect.logWarning("kanban evaluator step note failed", {
-                    cardId: after.id,
-                    cause: exit.cause,
-                  });
-                }),
-          ),
-          Effect.ignoreCause,
-        );
-      }),
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban evaluator step note failed", { cardId: after.id, cause }),
+        ),
+      ),
   );
 
   /**
@@ -5021,16 +4877,7 @@ const make = Effect.gen(function* () {
               // flag means it is waiting outside the board, so there is nothing to do until the
               // flag clears; the in-memory woken bit would otherwise be lost on a restart.
               for (const card of yield* cardsForPlan) {
-                const pending = (yield* Ref.get(stepWaits)).get(card.id);
-                const retryable =
-                  pending?.handoff &&
-                  card.settledAt === null &&
-                  card.activeThreadId === null &&
-                  card.stalled?.by._tag !== "evaluator" &&
-                  kanbanEvaluatorStep(card) &&
-                  (card.stage === "in_review" ||
-                    (KANBAN_DONE_STAGES.has(card.stage) && card.stage !== "verified"));
-                if (!waitingOnEvaluatorStep(card) && !retryable) {
+                if (!waitingOnEvaluatorStep(card)) {
                   yield* forgetStepWait(card.id);
                   continue;
                 }
@@ -5038,35 +4885,15 @@ const make = Effect.gen(function* () {
                 const wait = (yield* Ref.get(stepWaits)).get(card.id);
                 if (wait === undefined || wait.key !== key) {
                   yield* Ref.update(stepWaits, (all) =>
-                    new Map(all).set(card.id, {
-                      key,
-                      since: now,
-                      woken: false,
-                      delivered: new Set<ThreadId>(),
-                      launchKeys: new Map<string, string>(),
-                      launchKey: `step-launch:${card.id}:${key}:${uuid()}`,
-                      launched: new Set<ThreadId>(),
-                    }),
+                    new Map(all).set(card.id, { key, since: now, woken: false }),
                   );
                   continue;
                 }
                 const limit = card.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS;
-                if (wait.woken || (!wait.retry && now - wait.since < limit)) continue;
+                if (wait.woken || now - wait.since < limit) continue;
                 const current = yield* store.card(card.id);
                 const currentWait = (yield* Ref.get(stepWaits)).get(card.id);
-                if (
-                  current !== null &&
-                  !waitingOnEvaluatorStep(current) &&
-                  !(
-                    wait.handoff &&
-                    current.settledAt === null &&
-                    current.activeThreadId === null &&
-                    current.stalled?.by._tag !== "evaluator" &&
-                    kanbanEvaluatorStep(current) &&
-                    (current.stage === "in_review" ||
-                      (KANBAN_DONE_STAGES.has(current.stage) && current.stage !== "verified"))
-                  )
-                ) {
+                if (current !== null && !waitingOnEvaluatorStep(current)) {
                   yield* forgetStepWait(card.id);
                   continue;
                 }
@@ -5074,20 +4901,9 @@ const make = Effect.gen(function* () {
                   current === null ||
                   Subtasks.subtaskIds(kanbanStepSubtasks(current, "evaluator")) !== key ||
                   currentWait !== wait ||
-                  (!wait.retry &&
-                    now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS))
+                  now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS)
                 )
                   continue;
-                // A reminder gets fresh send state, but an unresolved launch keeps its identity.
-                if (wait.retry)
-                  yield* Ref.update(stepWaits, (all) =>
-                    new Map(all).set(card.id, {
-                      ...wait,
-                      retry: false,
-                      since: now,
-                      delivered: new Set<ThreadId>(),
-                    }),
-                  );
                 const minutes = Math.round((now - wait.since) / 60_000);
                 // A settled or archived discussion is finished: its evaluator isn't woken for it.
                 views.clear();
@@ -5098,19 +4914,9 @@ const make = Effect.gen(function* () {
                       ? Effect.succeed(false)
                       : toEvaluator(
                           discussion,
-                          wait.retry
-                            ? Briefs.evaluatorStepText(current)
-                            : Briefs.evaluatorStepWaitingText(current, minutes),
+                          Briefs.evaluatorStepWaitingText(current, minutes),
                           true,
                         ).pipe(Effect.as(true)),
-                  ),
-                  Effect.provideService(evaluatorLaunched, wait.launched),
-                  Effect.provideService(evaluatorLaunchKey, wait.launchKey),
-                  Effect.provideService(evaluatorLaunchKeys, wait.launchKeys),
-                  Effect.provideService(evaluatorDelivered, wait.delivered),
-                  Effect.provideService(
-                    evaluatorNoteKey,
-                    wait.retry ? wait.deliveryKey : `step-reminder:${card.id}:${key}:${wait.since}`,
                   ),
                   Effect.catchCause((cause) =>
                     Effect.logWarning("kanban evaluator step wake failed", {
