@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { imessageSendOf, isIMessageSendTool, shellCommands } from "./sends.ts";
+import { bridgeAckId, imessageSendOf, isIMessageSendTool, shellCommands } from "./sends.ts";
 
 const at = "2026-11-09T09:00:00.000Z";
 
@@ -76,6 +76,23 @@ describe("imessageSendOf", () => {
         },
       }),
     ).toBeNull();
+  });
+
+  it("reads the bridge outbox id from any result wrapper", () => {
+    const id = `file:${"c".repeat(64)}`;
+    const ack = { id, created: true, chat: "owner" };
+    for (const output of [
+      ack,
+      { structuredContent: ack },
+      { content: [{ type: "text", text: JSON.stringify(ack) }] },
+      [{ type: "text", text: JSON.stringify(ack) }],
+      JSON.stringify({ result: ack }),
+    ]) {
+      expect(bridgeAckId(output)).toBe(id);
+    }
+    expect(bridgeAckId({ id: "send:nothex", created: true })).toBeNull();
+    expect(bridgeAckId({ id, created: "yes" })).toBeNull();
+    expect(bridgeAckId("not json")).toBeNull();
   });
 
   it("marks a tool send still running as sending", () => {

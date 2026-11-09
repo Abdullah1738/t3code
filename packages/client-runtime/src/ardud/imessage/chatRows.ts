@@ -210,6 +210,8 @@ export function buildIMessageChatRows(
   const turns = new Map<string, IMessageTurn>();
   let dayKey = options.previousDayKey;
   let toolMode = options.toolMode ?? false;
+  // Bridge outbox ids already shown: a deduplicated retry is the same message.
+  const shownOutbox = new Set<string>();
 
   for (const turn of splitTurns(entries)) {
     const first = turn.entries[0]!;
@@ -260,6 +262,9 @@ export function buildIMessageChatRows(
       const step = entryStep(entry);
       steps.push(step);
       if (step.send !== undefined) {
+        const outboxId = step.send.outboxId ?? null;
+        if (outboxId !== null && shownOutbox.has(outboxId)) continue;
+        if (outboxId !== null) shownOutbox.add(outboxId);
         const row: IMessageChatRow = {
           kind: "reply",
           level: "conversation",
@@ -330,8 +335,25 @@ export function buildIMessageChatRows(
       }
     }
 
-    const sentCount = steps.filter(
-      (step) => step.send !== undefined && step.send.state !== "failed",
+    // A failed attempt that a later call in this turn sent anyway (same text, file and
+    // chat, e.g. a timeout retried with its dedupe key) is not a failed message.
+    for (const [index, row] of sendRows.entries()) {
+      if (row.kind !== "reply" || row.send.state !== "failed") continue;
+      const retried = sendRows
+        .slice(index + 1)
+        .some(
+          (later) =>
+            later.kind === "reply" &&
+            later.send.state !== "failed" &&
+            later.send.text === row.send.text &&
+            later.send.file === row.send.file &&
+            later.send.to === row.send.to,
+        );
+      if (retried) rows.splice(rows.indexOf(row), 1);
+    }
+    // Sends are counted by message: retries sharing an outbox id count once.
+    const sentCount = sendRows.filter(
+      (row) => row.kind === "reply" && row.send.state !== "failed" && rows.includes(row),
     ).length;
     const outcome: IMessageAgentOutcome = working
       ? "working"

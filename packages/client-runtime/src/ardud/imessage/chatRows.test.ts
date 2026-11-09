@@ -58,7 +58,7 @@ function sendTool(
   id: string,
   runId: string,
   input: Record<string, unknown>,
-  options: { createdAt?: string; status?: string; toolName?: string } = {},
+  options: { createdAt?: string; status?: string; toolName?: string; output?: unknown } = {},
 ): IMessageTimelineEntry {
   const createdAt = options.createdAt ?? morning;
   return {
@@ -75,6 +75,7 @@ function sendTool(
         toolName: options.toolName ?? "mcp__t3-code__imessage_send",
         status: options.status ?? "completed",
         input,
+        ...(options.output === undefined ? {} : { output: options.output }),
         startedAt: null,
         completedAt: null,
       } as never,
@@ -454,6 +455,59 @@ describe("buildIMessageChatRows in tool mode", () => {
 
     expect(kinds(rows)).toEqual(["divider", "time", "incoming", "agent", "reply"]);
     expect(stepsOf(rows[3]).at(-1)).toMatchObject({ label: "Agent text", text: "Checking now" });
+  });
+
+  it("shows retries the bridge deduplicated as one sent message", () => {
+    const outbox = `send:${"a".repeat(64)}`;
+    const ack = (created: boolean) => ({
+      content: [{ type: "text", text: JSON.stringify({ id: outbox, created, chat: "owner" }) }],
+    });
+    const result = buildIMessageChatRows(
+      [
+        message("in", "user", `${TOOL_GUIDANCE}Hi`, "r1"),
+        sendTool("s1", "r1", { text: "On it" }, { output: ack(true) }),
+        sendTool(
+          "s2",
+          "r1",
+          { text: "On it" },
+          { output: { structuredContent: { id: outbox, created: false, chat: "owner" } } },
+        ),
+        message("out", "assistant", "NO_REPLY", "r1"),
+        message("in2", "user", `${TOOL_GUIDANCE}Again?`, "r2", noon),
+        sendTool("s3", "r2", { text: "On it" }, { createdAt: noon, output: ack(false) }),
+        message("out2", "assistant", "NO_REPLY", "r2", noon),
+      ],
+      ownerChat,
+    );
+    const replies = result.rows.filter((row) => row.kind === "reply");
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ send: { outboxId: outbox, state: "sent" } });
+    const [first, second] = [...result.turns.values()];
+    expect(first?.sentCount).toBe(1);
+    // Both attempts stay in the inspector.
+    expect(first?.steps.filter((step) => step.send !== undefined)).toHaveLength(2);
+    expect(second?.sentCount).toBe(0);
+  });
+
+  it("drops a timed-out attempt that a later deduplicated retry sent", () => {
+    const outbox = `send:${"b".repeat(64)}`;
+    const result = buildIMessageChatRows(
+      [
+        message("in", "user", `${TOOL_GUIDANCE}Hi`, "r1"),
+        sendTool("s1", "r1", { text: "On it" }, { status: "failed" }),
+        sendTool(
+          "s2",
+          "r1",
+          { text: "On it" },
+          { output: { id: outbox, created: false, chat: "owner" } },
+        ),
+        message("out", "assistant", "NO_REPLY", "r1"),
+      ],
+      ownerChat,
+    );
+    const replies = result.rows.filter((row) => row.kind === "reply");
+    expect(replies.map((row) => row.kind === "reply" && row.send.state)).toEqual(["sent"]);
+    expect([...result.turns.values()][0]?.sentCount).toBe(1);
   });
 });
 

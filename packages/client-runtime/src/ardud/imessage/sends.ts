@@ -22,6 +22,11 @@ export interface IMessageSend {
   /** How it left: the MCP tool, the bridge CLI, or (before tool mode) the turn's final message. */
   readonly via: "tool" | "cli" | "final";
   readonly createdAt: string;
+  /**
+   * The bridge outbox id from the tool's acknowledgement (`send:<hex>` or `file:<hex>`).
+   * Retries with the same dedupe key get the same id: one message, however many calls.
+   */
+  readonly outboxId?: string | null | undefined;
 }
 
 export interface IMessageSendSource {
@@ -66,7 +71,48 @@ function toolSend(source: IMessageSendSource): IMessageSend | null {
     state: sendState(source.tone, payload.status, payload.output),
     via: "tool",
     createdAt: source.createdAt,
+    outboxId: bridgeAckId(payload.output),
   };
+}
+
+const OUTBOX_ID = /^(?:send|file):[a-f0-9]{64}$/;
+
+/**
+ * The outbox id in a send tool's result, wherever the provider put it: the
+ * structured result, a text block holding its JSON, or a wrapper around either.
+ */
+export function bridgeAckId(output: unknown, depth = 0): string | null {
+  if (depth > 5 || output === null || output === undefined) return null;
+  if (typeof output === "string") {
+    const text = output.trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) return null;
+    try {
+      return bridgeAckId(JSON.parse(text), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      const found = bridgeAckId(item, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  const value = record(output);
+  if (value === null) return null;
+  if (
+    typeof value.id === "string" &&
+    OUTBOX_ID.test(value.id) &&
+    typeof value.created === "boolean"
+  ) {
+    return value.id;
+  }
+  for (const nested of Object.values(value)) {
+    const found = bridgeAckId(nested, depth + 1);
+    if (found !== null) return found;
+  }
+  return null;
 }
 
 function cliSend(source: IMessageSendSource): IMessageSend | null {
