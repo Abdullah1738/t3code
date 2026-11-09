@@ -503,6 +503,19 @@ describe("sidebar thread lineage helpers", () => {
     expect(resolveSidebarRowThreadId(idle.id, environmentId, threads)).toBe(idle.id);
     expect(resolveSidebarRowThreadId(idle.id, environmentId, threads, idle.lineage)).toBe(root.id);
     expect(resolveSidebarRowThreadId(child.id, environmentId, threads, root.lineage)).toBe(root.id);
+    // root -> omitted idle A -> open idle B: B's lineage root stands in for the missing chain.
+    const nestedIdle = makeThreadFixture({
+      id: ThreadId.make("thread-nested-idle"),
+      environmentId,
+      lineage: {
+        rootThreadId: root.id,
+        parentThreadId: ThreadId.make("thread-omitted-middle"),
+        relationshipToParent: "subagent",
+      },
+    });
+    expect(
+      resolveSidebarRowThreadId(nestedIdle.id, environmentId, threads, nestedIdle.lineage),
+    ).toBe(root.id);
   });
 
   it("resolves the parent thread for fork sidebar affordances", () => {

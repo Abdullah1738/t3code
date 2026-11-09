@@ -253,15 +253,16 @@ describe("stageBoard", () => {
     expect(view.running).toBe(false);
   });
 
-  it("keeps known thread states while a reopened feed's thread state is pending", () => {
+  it("does not keep stale thread states while a reopened feed's thread state is pending", () => {
     const t1 = { threadId: ThreadId.make("t1"), title: "w", running: true, needsInput: false, lastActivityAt: null };
     const base = snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]);
     const previous = boardStateFromSnapshot({ ...base, threads: [t1] } as never);
-    const pending = { ...base, threads: [], threadsPending: true } as never;
-    expect(boardStateFromSnapshot(pending, previous).threads.get("t1")).toEqual(t1);
-    // A cold open has nothing to keep; a complete snapshot replaces the states.
-    expect(boardStateFromSnapshot(pending).threads.size).toBe(0);
-    expect(boardStateFromSnapshot({ ...base, threads: [] } as never, previous).threads.size).toBe(0);
+    const pending = boardStateFromSnapshot({ ...base, threads: [], threadsPending: true } as never, previous);
+    // Unknown until the thread change arrives: a thread that ended while disconnected must
+    // not stay "running" if its fill read fails.
+    expect(pending.threads.size).toBe(0);
+    const working = stageBoard(pending, NOW).active.find((column) => column.stage === "working")!;
+    expect(working.cards[0]!.running).toBe(false);
   });
 
   it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {

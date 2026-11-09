@@ -325,3 +325,63 @@ export function archivedShellStreamItemFromThreadShell(input: {
   }
   return null;
 }
+
+const SUBAGENT_ANCESTOR_DEPTH_LIMIT = 16;
+
+/**
+ * Client shells omit idle subagents, but a pending request on a nested subagent is carried to
+ * its root row through the subagent ancestors between them (pendingSubagentRequestsByThread,
+ * child inputs). The initial snapshot keeps that chain; a live update of the asking subagent
+ * would not, so its missing subagent ancestors are sent with it. Only updates that carry a
+ * pending request walk the chain, so streaming updates add no reads.
+ */
+export const withSubagentRequestAncestors = Effect.fn("ShellStream.withSubagentRequestAncestors")(
+  function* <E>(
+    items: ReadonlyArray<Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>>,
+    getThreadShell: (
+      threadId: OrchestrationV2ThreadShell["id"],
+    ) => Effect.Effect<OrchestrationV2ThreadShell | null, E>,
+  ) {
+    const present = new Set<string>();
+    for (const item of items) {
+      if (item.kind === "thread.updated") present.add(item.thread.id);
+      else if (item.kind === "thread.removed") present.add(item.threadId);
+    }
+    const ancestors: Array<Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>> =
+      [];
+    for (const item of items) {
+      if (
+        item.kind !== "thread.updated" ||
+        item.thread.lineage.relationshipToParent !== "subagent" ||
+        item.thread.pendingRuntimeRequest == null
+      ) {
+        continue;
+      }
+      let parentId = item.thread.lineage.parentThreadId;
+      for (
+        let depth = 0;
+        parentId !== null && !present.has(parentId) && depth < SUBAGENT_ANCESTOR_DEPTH_LIMIT;
+        depth++
+      ) {
+        present.add(parentId);
+        const shell = yield* getThreadShell(parentId);
+        // A top-level parent is always in the client shell; only subagents can be missing.
+        if (
+          shell === null ||
+          shell.archivedAt !== null ||
+          shell.lineage.relationshipToParent !== "subagent"
+        ) {
+          break;
+        }
+        ancestors.push({
+          kind: "thread.updated",
+          sequence: item.sequence,
+          location: "active",
+          thread: compactShell(shell),
+        });
+        parentId = shell.lineage.parentThreadId;
+      }
+    }
+    return ancestors.length === 0 ? items : [...ancestors, ...items];
+  },
+);

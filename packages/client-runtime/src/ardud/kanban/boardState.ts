@@ -46,15 +46,9 @@ export function boardStateFromSnapshot(
     goals: byId(snapshot.goals, (goal) => goal.id),
     pools: snapshot.pools,
     groups: snapshot.groups,
-    // Pending thread state follows as thread changes; until then a reopened board keeps
-    // the states it had, which are stale rather than absent.
-    threads:
-      snapshot.threadsPending === true && previous !== undefined
-        ? new Map([
-            ...previous.threads,
-            ...snapshot.threads.map((thread) => [thread.threadId, thread] as const),
-          ])
-        : byId(snapshot.threads, (thread) => thread.threadId),
+    // With threadsPending the states follow as thread changes; until then (or if a read
+    // fails) a thread's state is unknown, never a stale copy from before a reconnect.
+    threads: byId(snapshot.threads, (thread) => thread.threadId),
     // A reconnect replays the snapshot; held discussions stay until the store
     // has read the list again.
     discussions: previous?.discussions ?? new Map(),

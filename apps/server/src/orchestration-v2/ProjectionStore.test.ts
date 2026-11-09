@@ -8281,18 +8281,21 @@ const idleSubagentShellBody = (label: string) =>
   Effect.gen(function* () {
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const now = yield* DateTime.now;
+    // Finished long ago: outside the window in which idle subagents stay in client shells.
+    const old = DateTime.subtract(now, { days: 30 });
     const projectId = ProjectId.make(`project:idle-subagents:${label}`);
     const id = (name: string) => ThreadId.make(`thread:idle-subagents:${name}`);
     const created = (
       threadId: ThreadId,
       parent: ThreadId | null,
       overrides: Record<string, unknown> = {},
+      at = parent === null ? now : old,
     ) =>
       projectionStore.apply({
         id: EventId.make(`event:idle-subagents:${label}:${threadId}`),
         type: "thread.created",
         threadId,
-        occurredAt: now,
+        occurredAt: at,
         payload: {
           createdBy: parent === null ? "user" : "agent",
           creationSource: parent === null ? "web" : "provider",
@@ -8311,8 +8314,8 @@ const idleSubagentShellBody = (label: string) =>
               ? { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId }
               : { parentThreadId: parent, relationshipToParent: "subagent", rootThreadId: parent },
           forkedFrom: null,
-          createdAt: now,
-          updatedAt: now,
+          createdAt: at,
+          updatedAt: at,
           archivedAt: null,
           settledOverride: null,
           settledAt: null,
@@ -8321,7 +8324,7 @@ const idleSubagentShellBody = (label: string) =>
           ...overrides,
         } as never,
       });
-    const run = (threadId: ThreadId, status: "running" | "completed") => {
+    const run = (threadId: ThreadId, status: "running" | "completed", at = old) => {
       const runId = RunId.make(`run:idle-subagents:${threadId}`);
       return projectionStore
         .apply({
@@ -8331,7 +8334,7 @@ const idleSubagentShellBody = (label: string) =>
           runId,
           nodeId: NodeId.make(`node:idle-subagents:${threadId}`),
           driver,
-          occurredAt: now,
+          occurredAt: at,
           payload: {
             id: runId,
             threadId,
@@ -8343,9 +8346,9 @@ const idleSubagentShellBody = (label: string) =>
             rootNodeId: NodeId.make(`node:idle-subagents:${threadId}`),
             activeAttemptId: null,
             status,
-            requestedAt: now,
-            startedAt: now,
-            completedAt: status === "running" ? null : now,
+            requestedAt: at,
+            startedAt: at,
+            completedAt: status === "running" ? null : at,
             checkpointId: null,
             contextHandoffId: null,
           },
@@ -8403,6 +8406,11 @@ const idleSubagentShellBody = (label: string) =>
     } as never);
     expected.add(idleMiddle);
     expected.add(asking);
+    // A subagent that finished recently stays: it is in the user's working set.
+    const recent = id("top-3-recent");
+    yield* created(recent, id("top-3"), {}, now);
+    yield* run(recent, "completed", now);
+    expected.add(recent);
     // An archived subagent is never in the active shell.
     yield* created(id("top-2-archived"), id("top-2"), { archivedAt: now });
 
@@ -8416,9 +8424,9 @@ const idleSubagentShellBody = (label: string) =>
     const fixtureRows = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
       threads.filter((thread) => String(thread.id).startsWith("thread:idle-subagents:"));
 
-    assert.lengthOf(fixtureRows(full.threads), TOP_LEVEL * (1 + IDLE_PER_TOP) + 3);
+    assert.lengthOf(fixtureRows(full.threads), TOP_LEVEL * (1 + IDLE_PER_TOP) + 4);
     assert.deepEqual(ids(fixtureRows(client.threads)), [...expected].toSorted());
-    assert.lengthOf(fixtureRows(client.threads), TOP_LEVEL + 3);
+    assert.lengthOf(fixtureRows(client.threads), TOP_LEVEL + 4);
     // Kept rows are unchanged, and the snapshot point is the same.
     for (const thread of client.threads) {
       assert.deepEqual(

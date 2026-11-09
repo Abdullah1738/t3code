@@ -400,7 +400,16 @@ export interface ShellSnapshotOptions {
    * projection) and returns through live shell deltas when it next changes.
    */
   readonly omitIdleSubagents?: boolean;
+  /** Set by the store from the clock: idle subagents updated since then are kept too. */
+  readonly idleSubagentsUpdatedSince?: string;
 }
+
+/**
+ * Idle subagents touched this recently stay in client shells, so the working set (a queued
+ * follow-up, a nested chain, the sidebar row of an open child) is unaffected; only
+ * long-finished subagents leave.
+ */
+export const IDLE_SUBAGENT_SHELL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface ProjectionStoreV2Shape {
   readonly searchThreadStream: (
@@ -1603,11 +1612,16 @@ function secretRequestAsPendingInput(
 export function omitIdleSubagentShells<
   T extends Pick<
     OrchestrationV2ThreadShell,
-    "id" | "lineage" | "activityRunStatus" | "pendingRuntimeRequest"
+    "id" | "lineage" | "activityRunStatus" | "pendingRuntimeRequest" | "updatedAt"
   >,
->(shells: ReadonlyArray<T>): ReadonlyArray<T> {
+>(shells: ReadonlyArray<T>, updatedSince: DateTime.Utc): ReadonlyArray<T> {
   const byId = new Map(shells.map((shell) => [shell.id, shell] as const));
   const keep = new Set<ThreadId>();
+  const recent = new Set<ThreadId>(
+    shells.flatMap((shell) =>
+      DateTime.isGreaterThanOrEqualTo(shell.updatedAt, updatedSince) ? [shell.id] : [],
+    ),
+  );
   for (const shell of shells) {
     if (shell.activityRunStatus == null && shell.pendingRuntimeRequest == null) continue;
     let current: T | undefined = shell;
@@ -1619,7 +1633,10 @@ export function omitIdleSubagentShells<
     }
   }
   return shells.filter(
-    (shell) => shell.lineage.relationshipToParent !== "subagent" || keep.has(shell.id),
+    (shell) =>
+      shell.lineage.relationshipToParent !== "subagent" ||
+      keep.has(shell.id) ||
+      recent.has(shell.id),
   );
 }
 
@@ -5896,6 +5913,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         unsettledOnly = false,
         pullRequestCandidatesOnly = false,
         omitIdleSubagents = false,
+        idleSubagentsUpdatedSince,
         afterThreadId,
         limit,
       }: ShellSnapshotOptions = {},
@@ -6118,7 +6136,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : sql``
             }${
               omitIdleSubagents
-                ? sql` AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent' OR t.thread_id IN (SELECT thread_id FROM live_lineage))`
+                ? sql` AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent' OR t.thread_id IN (SELECT thread_id FROM live_lineage)${
+                    idleSubagentsUpdatedSince === undefined
+                      ? sql``
+                      : sql` OR t.updated_at >= ${idleSubagentsUpdatedSince}`
+                  })`
                 : sql``
             }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
@@ -6512,8 +6534,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       new ProjectionStoreReadError({ threadId: ThreadId.make("thread:shell"), cause });
 
     const readShellSnapshotRows = Effect.fn("ProjectionStore.readShellSnapshotRows")(function* (
-      options: ShellSnapshotOptions | undefined,
+      requested: ShellSnapshotOptions | undefined,
     ) {
+      const options: ShellSnapshotOptions | undefined = requested?.omitIdleSubagents
+        ? {
+            ...requested,
+            idleSubagentsUpdatedSince: DateTime.formatIso(
+              DateTime.subtract(yield* DateTime.now, { millis: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
+            ),
+          }
+        : requested;
       const targetThreadRows = yield* selectShellThreadRows(undefined, options);
       const targetThreadIds = new Set(targetThreadRows.map((row) => ThreadId.make(row.thread_id)));
       const rowsByThreadId = new Map(
@@ -6821,7 +6851,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
         );
         const undeleted = shells.filter((thread) => thread.deletedAt === null);
         const visible = options?.omitIdleSubagents
-          ? omitIdleSubagentShells(undeleted)
+          ? omitIdleSubagentShells(
+              undeleted,
+              DateTime.subtract(yield* DateTime.now, { millis: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
+            )
           : undeleted;
         return {
           schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,

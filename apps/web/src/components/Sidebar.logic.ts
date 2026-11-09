@@ -539,7 +539,13 @@ export function resolveSidebarRowThreadId(
   while (thread !== undefined && isSidebarSubagentThread(thread)) {
     if (thread.lineage.parentThreadId === null || visited.has(thread.id)) return threadId;
     visited.add(thread.id);
-    thread = findThread(thread.lineage.parentThreadId);
+    const parent = findThread(thread.lineage.parentThreadId);
+    // A long-idle subagent ancestor is not in the client shell; its tree's root usually is.
+    if (parent === undefined) {
+      const root = findThread(thread.lineage.rootThreadId);
+      return root !== undefined && !isSidebarSubagentThread(root) ? root.id : threadId;
+    }
+    thread = parent;
   }
   return thread?.id ?? threadId;
 }
