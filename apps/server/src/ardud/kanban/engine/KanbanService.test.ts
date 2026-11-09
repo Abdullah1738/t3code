@@ -601,6 +601,109 @@ it.effect("a stalled launch holds no board write lock and cannot overwrite a new
   }),
 );
 
+/** Holds only the first launch until `release`, so a test can write the board meanwhile. */
+const holdFirstLaunch = (fake: Effect.Success<typeof makeFake>) =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let launches = 0;
+    const layer = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (threads) =>
+        KanbanThreads.of({
+          ...threads,
+          launch: (input) =>
+            Effect.suspend(() =>
+              (launches += 1) === 1
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(threads.launch(input)),
+                  )
+                : threads.launch(input),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    return { entered, release, layer };
+  });
+
+it.effect("writes to other cards during a launch neither abandon it nor stop the next start", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const { entered, release, layer } = yield* holdFirstLaunch(fake);
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const second = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      // A busy board: other cards are created and commented on while the launch is out.
+      const bystander = yield* kanban.createCard(board.id, { prompt: "C", title: "C" }, owner);
+      yield* kanban.editCard(bystander.id, { comment: "busy" }, owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(dispatch);
+      assert.deepStrictEqual(fake.interrupted, []);
+      for (const id of [first.id, second.id]) {
+        const after = (yield* kanban.card(id)).card;
+        assert.strictEqual(after.stage, "working");
+        assert.isNotNull(after.activeThreadId);
+      }
+    }).pipe(Effect.provide(testLayer(layer)));
+  }),
+);
+
+it.effect("a start abandoned for its own card's edit still lets the rest of the plan start", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const { entered, release, layer } = yield* holdFirstLaunch(fake);
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const first = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const second = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      yield* kanban.editCard(first.id, { description: "Changed during launch" }, owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(dispatch);
+      // The stale start is undone exactly once; the next card still starts in the same pass.
+      assert.strictEqual(fake.interrupted.length, 1);
+      const a = (yield* kanban.card(first.id)).card;
+      assert.strictEqual(a.stage, "todo");
+      assert.isNull(a.activeThreadId);
+      assert.strictEqual(a.description, "Changed during launch");
+      const b = (yield* kanban.card(second.id)).card;
+      assert.strictEqual(b.stage, "working");
+      assert.isNotNull(b.activeThreadId);
+    }).pipe(Effect.provide(testLayer(layer)));
+  }),
+);
+
+it.effect("a planned start re-checks its card and skips one that moved on before it ran", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const { entered, release, layer } = yield* holdFirstLaunch(fake);
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      const second = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+      const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered);
+      // Planned from the earlier snapshot, but stalled before its turn came.
+      yield* kanban.flagCard(second.id, "hold it", owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(dispatch);
+      const b = (yield* kanban.card(second.id)).card;
+      assert.strictEqual(b.stage, "todo");
+      assert.isNull(b.activeThreadId);
+      assert.isNull(b.workThreadId);
+      assert.deepStrictEqual(fake.interrupted, []);
+    }).pipe(Effect.provide(testLayer(layer)));
+  }),
+);
+
 it.effect(
   "an evaluator launch waiting on another service permits board writes and rejects stale setup",
   () =>

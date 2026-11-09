@@ -536,6 +536,51 @@ export function planDispatch(
   return plan;
 }
 
+/**
+ * Whether a planned start still holds against fresh state. A pass plans every
+ * start from one snapshot, then starts each card on its own: a card whose row
+ * changed since the snapshot waits for the next pass, and the board's gates,
+ * the card's blockers and the pool's room are checked again. `holds` must not
+ * count this start's own reservation.
+ */
+export function confirmDispatch(
+  board: KanbanBoard,
+  planned: KanbanCard,
+  cards: ReadonlyArray<KanbanCard>,
+  pools: ReadonlyArray<KanbanPool>,
+  holds: ReadonlyMap<string, string>,
+  dispatch: Dispatch,
+): boolean {
+  if (board.archivedAt !== null || board.setup?.status === "running") return false;
+  if (board.pause && !board.pause.keep.includes(dispatch.cardId)) return false;
+  const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const card = byId.get(dispatch.cardId);
+  if (!card || JSON.stringify(card) !== JSON.stringify(planned)) return false;
+  if (
+    dispatch.role === "work" &&
+    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+  )
+    return false;
+  const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;
+  if (
+    thread !== null &&
+    board.pause &&
+    cards.some((other) => other.activeThreadId === thread && !board.pause!.keep.includes(other.id))
+  )
+    return false;
+  const pool = pools.find((candidate) => candidate.key === dispatch.pool);
+  if (!pool || pool.slots <= 0) return false;
+  const holding = poolThreads(cards, holds).get(dispatch.pool) ?? new Set<string>();
+  if (dispatch.joins) {
+    if (thread === null || !holding.has(thread)) return false;
+    const carrying = cards.filter(
+      (other) => other.activeRole === "work" && other.activeThreadId === thread,
+    ).length;
+    return carrying < MAX_BATCH;
+  }
+  return pool.slots - holding.size > 0;
+}
+
 /** What a work thread brings to a claim. */
 export interface ClaimContext {
   readonly threadId: string | null;
