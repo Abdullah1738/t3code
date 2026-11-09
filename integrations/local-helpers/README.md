@@ -65,6 +65,60 @@ Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
 
+## Quint
+
+`bin/quint` installs as `~/.local/bin/quint`. Run bounded `quint verify` on
+the Mac, rather than offbox. The wrapper checks `java -version` for Java 21+
+in `QUINT_JAVA_HOME` (an invalid explicit override fails), Homebrew's
+`/opt/homebrew/opt/openjdk`, then `/usr/libexec/java_home -v '21+'`.
+Install a missing JDK with `brew install openjdk`. It finds the real CLI via
+`QUINT_BIN`, PATH (skipping itself and symlinks to itself), then
+`~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
+on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
+
+Verify without `--server-endpoint` gets a free localhost port, so concurrent
+cards avoid the shared 8822 default, including with options before `verify`.
+Both `--server-endpoint host:port` and `--server-endpoint=host:port` (also
+the camel-case `--serverEndpoint` alias) are preserved. Other commands pass through.
+The wrapper execs Quint: 0.33.1 already terminates its own Apalache child on
+exit/signals, and leaves an existing server alone. Port allocation releases
+the socket before Quint binds it; a competing process can still win that race.
+
+Use `command -v quint` to confirm the wrapper is selected: some agent PATHs
+put nvm before `~/.local/bin`, which bypasses it. Until PATH precedence is
+changed with owner approval, call `~/.local/bin/quint` explicitly (or this
+checkout's `bin/quint` before installation). Installation and any agent
+configuration changes need approval. This wrapper leaves the Apalache cache
+and JVM options intact. The shared 0.62.4 launcher currently refuses vulnerable
+protobuf reflection code; real verification waits for #787's patched backend
+and #675's pin/guard. Do not disable that guard or replace the shared cache.
+
+Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
+remote calls including one pre-command failure): Quint 0.33.1 downloads
+`https://github.com/apalache-mc/apalache/releases/download/v0.62.4/apalache.tgz`
+without checking the HTTP status before tar extraction. `curl -sSIL` and
+Node fetch both returned **504, text/html, 92 bytes**; `file` identified HTML
+starting with `<html><body><h1>504 Gateway Time-out</h1>`. This reproduces the
+invalid-archive cause: GitHub's error response is passed to tar as a tgz.
+It is independent of Java. Successful downloads on other boxes are consistent
+with an intermittent asset failure. Use the Mac's managed cached backend;
+for diagnosing a fresh download use `curl --fail --location`, then `file`
+and `tar tzf` before extraction. A manual cache transfer must use the approved
+patched distribution, not an unguarded stock 0.62.4 download.
+
+The separate offbox signature `Unrecognized VM option 'G1PeriodicGCInterval'`
+indicates an older JVM (Java 11 in the reports); Apalache requires Java 21+.
+Run verify on the Mac for either signature. The box's apt history records
+`openjdk-11-jdk` in the base image install. Offbox selects `crpko-go` for
+crpko-devops (`skill/scripts/offbox_lib/lease.py`); that template doesn't
+provision Java. Saved pool state explains variation: this probe had an
+additional Ubuntu `openjdk-21-jre-headless` package and Java 21 selected via
+`update-alternatives`; its install provenance wasn't in apt history.
+Proposal only: add `openjdk-21-jdk-headless` to `skill/templates/crpko-go.sh`
+and select its java alternative, then refresh the crpko-devops pool's saved
+template/state. Existing saved boxes need that refresh too. No pool or
+template changes are made here; prefer the Mac unless it proves insufficient.
+
 Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.fund/s/<token>/` from
 127.0.0.1:18793 (its config.json `shareOrigin`). `cards-tunnel` runs the named Cloudflare tunnel that forwards
 there; both agents idle until the tunnel exists. One time, after Abdullah ran `cloudflared tunnel login` and
