@@ -33,6 +33,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backend  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
+from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
@@ -288,10 +289,13 @@ def project(rec, st, rel):
 class Robob:
     """Thread titles and parents for Muse sessions owned by Robob threads."""
 
-    def __init__(self):
+    def __init__(self, budget=None):
         self.by_native = {}
         try:
             self.con = backend.robob_ro()
+            self.con.execute("PRAGMA busy_timeout=100")
+            if budget is not None:
+                budget.install(self.con)
         except (FileNotFoundError, sqlite3.Error):
             self.con = None
             return
@@ -309,20 +313,24 @@ class Robob:
         for thread_id, native, created, title, parent_thread in rows:
             if native:
                 self.by_native[native] = (thread_id, created or "", title, parent_thread)
+        self.parent_rows = {}
+        try:
+            for thread, native, created in self.con.execute(
+                    "SELECT thread_id,json_extract(payload_json,'$.nativeThreadRef.nativeId'),"
+                    " json_extract(payload_json,'$.createdAt') FROM orchestration_v2_projection_provider_threads"):
+                if native:
+                    self.parent_rows.setdefault(thread, []).append((native, created or ""))
+        except sqlite3.Error:
+            self.parent_rows.clear()
+        finally:
+            self.con.close()
+            self.con = None
 
     def parent_session(self, parent_thread, created):
         """The provider session of the parent thread that was live when the child started."""
-        if not self.con or not parent_thread:
+        if not parent_thread:
             return None
-        try:
-            rows = self.con.execute(
-                "SELECT json_extract(payload_json,'$.nativeThreadRef.nativeId'), json_extract(payload_json,'$.createdAt')"
-                " FROM orchestration_v2_projection_provider_threads WHERE thread_id=?",
-                (parent_thread,),
-            ).fetchall()
-        except sqlite3.Error:
-            return None
-        rows = [(n, c or "") for n, c in rows if n]
+        rows = getattr(self, "parent_rows", {}).get(parent_thread, [])
         before = [r for r in rows if r[1] <= created] or rows
         return max(before, key=lambda r: r[1])[0] if before else None
 
@@ -337,15 +345,15 @@ class Robob:
 class MuseSync:
     def __init__(self, args):
         self.args = args
-        self.mem = sqlite3.connect(MEM_DB, timeout=600)
-        self.mem.execute("PRAGMA busy_timeout=600000")
+        self.budget = Budget(args.deadline)
+        self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
         self.mem.executescript(SCHEMA)
         cols = {r[1] for r in self.mem.execute("PRAGMA table_info(muse_sync_files)")}
         if "ino" not in cols:
             self.mem.execute("ALTER TABLE muse_sync_files ADD COLUMN ino INTEGER")
         self.mem.commit()
         allow_muse_source(self.mem)
-        self.robob = Robob()
+        self.robob = Robob(self.budget)
         self.titles = index_titles()
         self.stats = dict(files=0, changed=0, rows=0, skipped_observers=0, reset=0, bad_records=0, errors=0)
         self.errors = []
@@ -392,7 +400,7 @@ class MuseSync:
         if led and led.get("skip") and not reset:
             with_retry(self.mem, lambda: self.mem.execute(
                 "UPDATE muse_sync_files SET size=?, mtime_ns=?, ino=?, synced_at=? WHERE path=?",
-                (stt.st_size, stt.st_mtime_ns, stt.st_ino, int(time.time()), path)))
+                (stt.st_size, stt.st_mtime_ns, stt.st_ino, int(time.time()), path)), budget=self.budget)
             return
         _, title, _ = self.robob.describe(sid)
         title = title or self.titles.get(sid)
@@ -405,8 +413,10 @@ class MuseSync:
             f.seek(offset)
             pos = offset
             while True:
+                self.budget.check()
                 rows, budget = [], CHUNK_BYTES
                 while budget > 0:
+                    self.budget.check()
                     line = f.readline()
                     if not line.endswith(b"\n"):
                         break  # EOF or a line Muse is still writing
@@ -434,7 +444,7 @@ class MuseSync:
                 if len(tools) > 2000:
                     state["tools"] = dict(list(tools.items())[-1000:])
                 meta = self.session_meta(sid, parent, state, rel)
-                size = stt.st_size if done else 0
+                size = stt.st_size if done and pos == stt.st_size else 0
                 self._save(path, sid, parent or sid, pos, size, stt, 0, state, reset and first, meta, rows)
                 first = False
                 if done:
@@ -464,7 +474,7 @@ class MuseSync:
             if meta:
                 self._upsert_meta(meta)
 
-        with_retry(self.mem, write)
+        with_retry(self.mem, write, budget=self.budget)
         self.stats["rows"] += len(rows)
 
     def _upsert_meta(self, meta):
@@ -501,7 +511,7 @@ class MuseSync:
                     (t_id, t_title, t_parent, int(time.time()), sid),
                 )
 
-        with_retry(self.mem, write)
+        with_retry(self.mem, write, budget=self.budget)
         return len(updates)
 
     def write_status(self, ok):
@@ -516,6 +526,13 @@ class MuseSync:
             pass
 
     def run(self):
+        try:
+            return self._run()
+        finally:
+            checkpoint(self.mem)
+            self.mem.close()
+
+    def _run(self):
         t0 = time.time()
         if not os.path.isdir(MUSE_SESSIONS):
             self.write_status(True)
@@ -527,22 +544,36 @@ class MuseSync:
                 continue
             self.stats["files"] += 1
             try:
+                self.budget.check()
                 self.sync_file(path, sid, parent, led.get(path))
+            except Exhausted:
+                self.stats["partial"] = True
+                break
             except FileNotFoundError:
                 continue
             except Exception as e:  # noqa: BLE001 - one bad file must not hold up the rest
+                if self.budget.expired():
+                    self.stats["partial"] = True
+                    break
                 if isinstance(e, sqlite3.OperationalError) and "locked" in str(e):
                     raise
                 self.stats["errors"] += 1
                 self.errors.append(f"{sid}: {type(e).__name__}: {str(e)[:200]}")
                 print(f"error in {path}: {type(e).__name__}: {e}", flush=True)
-            if self.args.deadline and time.time() - t0 > self.args.deadline:
+            if self.budget.expired():
+                self.stats["partial"] = True
                 print(f"soft deadline {self.args.deadline}s reached; rest next run", flush=True)
                 break
         try:
-            self.stats["late_meta"] = self.late_metadata()
+            if not self.budget.expired():
+                self.stats["late_meta"] = self.late_metadata()
+        except Exhausted:
+            self.stats["partial"] = True
         except sqlite3.Error as e:
-            self.errors.append(f"late metadata: {e}")
+            if self.budget.expired():
+                self.stats["partial"] = True
+            else:
+                self.errors.append(f"late metadata: {e}")
         self.stats["secs"] = round(time.time() - t0, 2)
         self.write_status(not self.stats["errors"])
         print("DONE", json.dumps(self.stats), flush=True)

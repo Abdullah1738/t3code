@@ -17,9 +17,8 @@ gh = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gh)
 
 RECALL = "/recall_hook.py"
-CLAUDE_EVENTS = {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "Stop",
-                 "SubagentStop", "SessionEnd"}
-CODEX_EVENTS = {"UserPromptSubmit", "PostToolUse", "SubagentStart", "Stop", "SubagentStop", "SessionEnd"}
+CLAUDE_EVENTS = {"UserPromptSubmit", "PreToolUse", "PreCompact", "SessionStart", "PostToolUse", "PostToolUseFailure"}
+CODEX_EVENTS = {"UserPromptSubmit", "PreToolUse", "PreCompact", "PostCompact", "SessionStart", "PostToolUse"}
 
 
 def recall_events(hooks: dict, harness: str) -> set[str]:
@@ -29,7 +28,7 @@ def recall_events(hooks: dict, harness: str) -> set[str]:
             for handler in group["hooks"]:
                 if RECALL in handler["command"]:
                     assert handler["command"].endswith(f"--harness {harness}"), handler["command"]
-                    assert handler["timeout"] == 15
+                    assert handler["timeout"] == (4 if event == "PreToolUse" else 2)
                     found.add(event)
     return found
 

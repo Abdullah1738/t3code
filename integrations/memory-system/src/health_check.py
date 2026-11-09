@@ -555,6 +555,11 @@ def check_recall():
     lag = st.get("catalog_lag")
     if isinstance(lag, int) and lag > RECALL_MAX_LAG:
         return False, f"recall session catalog {lag} events behind (refresh: {str(st.get('catalog_refresh'))[:120]})"
+    index = st.get("hot_index")
+    if isinstance(index, dict) and (index.get("id_backlog", 0) > RECALL_MAX_LAG or index.get("change_backlog", 0) > RECALL_MAX_LAG):
+        return False, f"recall hot index behind: ids={index.get('id_backlog')} changes={index.get('change_backlog')}"
+    if st.get("rules_ready") is False:
+        return False, "recall standing-rules index missing; run corpus indexing before enabling hooks"
     return True, f"up, catalog lag {lag}"
 
 

@@ -150,6 +150,14 @@ class MuseSyncTest(unittest.TestCase):
         self.assertEqual(len(rows), 5)
         self.assertEqual(rows[-1][3], "Raised the session timeout; tests pass.")
 
+    def test_partial_line_never_marks_the_whole_file_captured(self):
+        write(self.main, main_log("S1"), partial='{"partial":')
+        self.sync()
+        with sqlite3.connect(self.db) as con:
+            offset, size = con.execute("SELECT offset,size FROM muse_sync_files").fetchone()
+        self.assertLess(offset, os.path.getsize(self.main))
+        self.assertEqual(size, 0)
+
     def test_rewritten_log_is_reprojected(self):
         write(self.main, main_log("S1"))
         self.sync()
@@ -298,6 +306,32 @@ class MuseSyncTest(unittest.TestCase):
         self.assertEqual(len(self.rows()), 5)
         again = self.sync()
         self.assertEqual(again["rows"], 0)
+
+    def test_deadline_inside_file_keeps_only_committed_offset_and_resumes(self):
+        from capture_budget import Budget
+        write(self.main, main_log("S1"))
+        worker = self.sm.MuseSync(types.SimpleNamespace(full=False, only=None, deadline=0))
+        clock = [0]
+        worker.budget = Budget(1, clock=lambda: clock[0])
+        real_save = worker._save
+        offsets = []
+        def save(*args, **kwargs):
+            real_save(*args, **kwargs)
+            offsets.append(args[4])
+            clock[0] = 2
+        worker._save = save
+        with patch.object(self.sm, "CHUNK_BYTES", 200):
+            stats = worker.run()
+        self.assertTrue(stats["partial"])
+        self.assertEqual(len(offsets), 1)
+        with sqlite3.connect(self.db) as con:
+            offset, size = con.execute("SELECT offset,size FROM muse_sync_files").fetchone()
+            self.assertGreater(offset, 0)
+            self.assertLess(offset, os.path.getsize(self.main))
+            self.assertEqual(size, 0)
+        self.sync()
+        self.assertEqual(len(self.rows()), 5)
+        self.assertEqual(self.sync()["rows"], 0)
 
     def test_robob_titles_and_parent_including_late_mapping(self):
         write(self.main, main_log("S1"))
