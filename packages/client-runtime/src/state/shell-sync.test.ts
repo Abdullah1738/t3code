@@ -281,6 +281,100 @@ describe("environment shell synchronization", () => {
     }),
   );
 
+  it.live("opts in to idle-subagent omission and keeps ancestors sent at an applied sequence", () =>
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+      const inputs: Array<unknown> = [];
+      const client = {
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input: unknown) => {
+          inputs.push(input);
+          return Stream.fromQueue(events);
+        },
+      } as unknown as WsRpcProtocolClient;
+      const supervisorState = yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE);
+      const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+        Option.some(session(client)),
+      );
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: supervisorState,
+        session: activeSession,
+        prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const cache = Persistence.EnvironmentCacheStore.of({
+        loadShell: () => Effect.succeed(Option.none()),
+        saveShell: () => Effect.void,
+        loadThread: () => Effect.succeed(Option.none()),
+        saveThread: () => Effect.void,
+        removeThread: () => Effect.void,
+        loadServerConfig: () => Effect.succeed(Option.none()),
+        saveServerConfig: () => Effect.void,
+        loadVcsRefs: () => Effect.succeed(Option.none()),
+        saveVcsRefs: () => Effect.void,
+        removeVcsRefs: () => Effect.void,
+        clearVcsRefs: () => Effect.void,
+        clear: () => Effect.void,
+      });
+      const shellState = yield* makeEnvironmentShellState().pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        Effect.provideService(
+          ShellSnapshotLoader.ShellSnapshotLoader,
+          ShellSnapshotLoader.ShellSnapshotLoader.of({ load: () => Effect.succeed(Option.none()) }),
+        ),
+        Effect.provideService(ShellSnapshotLoader.OmitIdleSubagents, true),
+      );
+      yield* SubscriptionRef.set(supervisorState, {
+        desired: true,
+        network: "online",
+        phase: "connected",
+        stage: null,
+        attempt: 1,
+        generation: 1,
+        lastFailure: null,
+        retryAt: null,
+      });
+      const thread = (id: string, parent: string | null) => ({
+        ...v2ThreadShell,
+        id: ThreadId.make(id),
+        lineage: {
+          rootThreadId: ThreadId.make("root"),
+          parentThreadId: parent === null ? null : ThreadId.make(parent),
+          relationshipToParent: parent === null ? null : ("subagent" as const),
+        },
+      });
+      yield* Queue.offer(events, {
+        kind: "snapshot",
+        snapshot: { ...LIVE_SHELL_SNAPSHOT, threads: [thread("root", null)] },
+      });
+      yield* Queue.offer(events, { kind: "synchronized" });
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter((state) => state.status === "live"),
+        Stream.runHead,
+      );
+      expect(inputs[0]).toMatchObject({ omitIdleSubagents: true });
+
+      // The server sends an asking subagent's omitted parent right after it, at its sequence.
+      yield* Queue.offerAll(events, [
+        { kind: "thread.updated", sequence: 2, location: "active", thread: thread("asking", "middle") },
+        { kind: "thread.updated", sequence: 2, location: "active", thread: thread("middle", "root") },
+      ] as never);
+      const settled = yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter(
+          (state) => Option.isSome(state.snapshot) && state.snapshot.value.threads.length === 3,
+        ),
+        Stream.runHead,
+        Effect.timeout("2 seconds"),
+      );
+      const snapshot = Option.getOrThrow(Option.getOrThrow(settled).snapshot);
+      expect(snapshot.snapshotSequence).toBe(2);
+      expect(snapshot.threads.map((t) => t.id).toSorted()).toEqual(["asking", "middle", "root"]);
+    }).pipe(Effect.scoped),
+  );
+
   it.live.each([
     { bufferSize: Infinity, expectedSequences: [51] },
     // RpcClient defaults to a 16-event buffer, which splits larger server chunks.

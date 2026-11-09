@@ -690,6 +690,37 @@ describe("withSubagentRequestAncestors", () => {
     }),
   );
 
+  it.effect("walks through an ancestor the batch already carries to the omitted one above it", () =>
+    Effect.gen(function* () {
+      // root > upper (omitted, idle) > lower (updated in this batch) > deep (asks)
+      const upper = sub("upper", "root");
+      const lower = sub("lower", "upper");
+      const deep = sub("deep", "lower", {
+        pendingRuntimeRequest: { kind: "user_input" } as never,
+      });
+      const shells = new Map([root, upper, lower, deep].map((shell) => [shell.id as string, shell]));
+      for (const batch of [
+        [updated(lower), updated(deep)],
+        [updated(deep), updated(lower)],
+      ]) {
+        const reads: Array<string> = [];
+        const items = yield* withSubagentRequestAncestors(batch, (id) =>
+          Effect.sync(() => {
+            reads.push(id);
+            return shells.get(id) ?? null;
+          }),
+        );
+        const ids = items.map((item) => (item.kind === "thread.updated" ? item.thread.id : null));
+        expect(ids.filter((id) => id === "upper")).toHaveLength(1);
+        expect(ids.filter((id) => id === "lower")).toHaveLength(1);
+        // upper follows deep, the update that needed it.
+        expect(ids.indexOf("upper")).toBe(ids.indexOf("deep") + 1);
+        // lower came from the batch, not a read.
+        expect(reads).toEqual(["upper", "root"]);
+      }
+    }),
+  );
+
   it.effect("skips ancestors already in the batch and stops on cycles", () =>
     Effect.gen(function* () {
       const loopA = sub("loop-a", "loop-b", { pendingRuntimeRequest: { kind: "approval" } as never });

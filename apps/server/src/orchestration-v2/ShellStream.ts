@@ -347,11 +347,15 @@ export const withSubagentRequestAncestors = Effect.fn("ShellStream.withSubagentR
       threadId: OrchestrationV2ThreadShell["id"],
     ) => Effect.Effect<OrchestrationV2ThreadShell | null, E>,
   ) {
-    const present = new Set<string>();
+    // Rows the batch already carries are not resent, but the walk continues through them.
+    const inBatch = new Map<string, OrchestrationV2ThreadShell | null>();
     for (const item of items) {
-      if (item.kind === "thread.updated") present.add(item.thread.id);
-      else if (item.kind === "thread.removed") present.add(item.threadId);
+      if (item.kind === "thread.updated")
+        inBatch.set(item.thread.id, item.location === "active" ? item.thread : null);
+      else if (item.kind === "thread.removed") inBatch.set(item.threadId, null);
     }
+    const read = new Map<string, OrchestrationV2ThreadShell | null>();
+    const emitted = new Set<string>();
     const out: Array<Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>> = [];
     let added = false;
     for (const item of items) {
@@ -363,14 +367,20 @@ export const withSubagentRequestAncestors = Effect.fn("ShellStream.withSubagentR
       ) {
         continue;
       }
+      const visited = new Set<string>([item.thread.id]);
       let parentId = item.thread.lineage.parentThreadId;
       for (
         let depth = 0;
-        parentId !== null && !present.has(parentId) && depth < SUBAGENT_ANCESTOR_DEPTH_LIMIT;
+        parentId !== null && !visited.has(parentId) && depth < SUBAGENT_ANCESTOR_DEPTH_LIMIT;
         depth++
       ) {
-        present.add(parentId);
-        const shell = yield* getThreadShell(parentId);
+        visited.add(parentId);
+        const batched = inBatch.has(parentId);
+        let shell = batched ? inBatch.get(parentId)! : read.get(parentId);
+        if (shell === undefined) {
+          shell = yield* getThreadShell(parentId);
+          read.set(parentId, shell);
+        }
         // A top-level parent is always in the client shell; only subagents can be missing.
         if (
           shell === null ||
@@ -379,13 +389,16 @@ export const withSubagentRequestAncestors = Effect.fn("ShellStream.withSubagentR
         ) {
           break;
         }
-        added = true;
-        out.push({
-          kind: "thread.updated",
-          sequence: item.sequence,
-          location: "active",
-          thread: compactShell(shell),
-        });
+        if (!batched && !emitted.has(parentId)) {
+          emitted.add(parentId);
+          added = true;
+          out.push({
+            kind: "thread.updated",
+            sequence: item.sequence,
+            location: "active",
+            thread: compactShell(shell),
+          });
+        }
         parentId = shell.lineage.parentThreadId;
       }
     }

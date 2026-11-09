@@ -230,10 +230,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               })
             : Option.match(next.snapshot, {
                 onNone: () => null,
-                onSome: (snapshot) =>
-                  item.sequence > snapshot.snapshotSequence
-                    ? applyShellStreamEvent(snapshot, item)
-                    : snapshot,
+                // The reducer decides what an applied sequence still accepts (missing ancestor
+                // rows sent at their asking subagent's sequence).
+                onSome: (snapshot) => applyShellStreamEvent(snapshot, item),
               });
       if (nextSnapshot === null) continue;
       if (item.kind === "snapshot" && item.snapshot.page?.nextAfter == null)
