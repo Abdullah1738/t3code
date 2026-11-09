@@ -132,11 +132,11 @@ function queueSession(store: Store, prefix: string, dedupeKey: string, sessionId
     const operation: OutboxOperation = { id, kind: "conversation", ...content, sessionId: route.id, generation: route.generation };
     const key = `api:${prefix}:${id}`;
     const spec = JSON.stringify(operation);
-    const saved = store.get<{ spec: string }>(key);
+    const saved = store.get<{ spec: string; queuedAt?: number }>(key);
     if (saved && saved.spec !== spec) throw new ApiError(409);
     prepare?.();
     const created = store.enqueue(operation);
-    store.set(key, { spec });
+    store.set(key, { spec, ...(prefix === "send" ? { queuedAt: saved?.queuedAt ?? Date.now() } : {}) });
     return created;
   }).immediate();
   return { id, created };
