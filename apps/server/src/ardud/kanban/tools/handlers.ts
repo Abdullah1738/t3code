@@ -647,6 +647,9 @@ const handlers = {
           return yield* refuse("A backlog card isn't picked up; leave out assignToSelf.");
         }
         const board = yield* boardFor(service, caller, input.boardId);
+        if (isWorker && board.id !== caller.link?.boardId) {
+          return yield* refuse("Work threads create cards only on their own board.");
+        }
         const blockedBy = yield* cardIds(service, caller, input.blockedBy, board.id);
         const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
         const model = input.model ? yield* modelOf(input.model, apply) : undefined;

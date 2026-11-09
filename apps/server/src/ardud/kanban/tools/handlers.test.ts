@@ -1516,3 +1516,158 @@ it.effect(
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect.each([
+  { hint: "omitted", allowed: true, assignToSelf: false },
+  { hint: "own-id", allowed: true, assignToSelf: false },
+  { hint: "own-slug", allowed: true, assignToSelf: false },
+  { hint: "padded-own-id", allowed: true, assignToSelf: false },
+  { hint: "padded-own-slug", allowed: true, assignToSelf: false },
+  { hint: "foreign-id", allowed: false, assignToSelf: false },
+  { hint: "padded-foreign-id", allowed: false, assignToSelf: false },
+  { hint: "foreign-slug", allowed: false, assignToSelf: false },
+  { hint: "padded-foreign-slug", allowed: false, assignToSelf: false },
+  { hint: "unknown", allowed: false, assignToSelf: false },
+  { hint: "omitted", allowed: true, assignToSelf: true },
+  { hint: "own-id", allowed: true, assignToSelf: true },
+  { hint: "own-slug", allowed: true, assignToSelf: true },
+  { hint: "padded-own-id", allowed: true, assignToSelf: true },
+  { hint: "padded-own-slug", allowed: true, assignToSelf: true },
+  { hint: "foreign-id", allowed: false, assignToSelf: true },
+  { hint: "padded-foreign-id", allowed: false, assignToSelf: true },
+  { hint: "foreign-slug", allowed: false, assignToSelf: true },
+  { hint: "padded-foreign-slug", allowed: false, assignToSelf: true },
+  { hint: "unknown", allowed: false, assignToSelf: true },
+] as const)(
+  "worker card_create scope: $hint, assignToSelf=$assignToSelf",
+  ({ hint, allowed, assignToSelf }) => {
+    const { layer, running } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const own = yield* kanban.ensureBoard({
+        slug: "own",
+        name: "Own",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const foreign = yield* kanban.ensureBoard({
+        slug: "foreign",
+        name: "Foreign",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const reviewChain = "Origin review";
+      yield* kanban.updateBoard(own.id, {
+        reviewChains: [{ name: reviewChain, steps: [own.evaluatorModel] }],
+        defaultReviewChain: reviewChain,
+      });
+      const goal = yield* kanban.setGoal(own.id, { name: "Origin goal" });
+      yield* kanban.setPool(own.id, own.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        own.id,
+        { title: "Origin", prompt: "Origin", goalId: goal.id, reviewChain },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const boardId = {
+        omitted: undefined,
+        "own-id": own.id,
+        "own-slug": own.slug,
+        "padded-own-id": `  ${own.id}  `,
+        "padded-own-slug": `  ${own.slug}  `,
+        "foreign-id": foreign.id,
+        "padded-foreign-id": `  ${foreign.id}  `,
+        "foreign-slug": foreign.slug,
+        "padded-foreign-slug": `  ${foreign.slug}  `,
+        unknown: "missing-board",
+      }[hint];
+      const result = yield* call(worker, "card_create", {
+        ...(boardId === undefined ? {} : { boardId }),
+        title: "Follow-up",
+        prompt: "Follow-up",
+        assignToSelf,
+      });
+      assert.strictEqual(result.isError, !allowed, result.text);
+      assert.lengthOf(yield* kanban.cards(foreign.id), 0);
+      if (!allowed) {
+        assert.lengthOf(yield* kanban.cards(own.id), 1);
+        if (hint !== "unknown") assert.include(result.text, "own board");
+        return;
+      }
+      const created = (yield* kanban.cards(own.id)).find((card) => card.id !== origin.id)!;
+      assert.strictEqual(created.boardId, own.id);
+      assert.strictEqual(created.goalId, goal.id);
+      assert.strictEqual(created.reviewChain, reviewChain);
+      if (assignToSelf) assert.strictEqual(created.workThreadId, worker);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each([
+  { discussions: ["a"], candidates: ["a"] },
+  { discussions: ["a", "a"], candidates: ["a"] },
+  { discussions: ["a", "b"], candidates: ["a", "b"] },
+  { discussions: ["a", "a", "b"], candidates: ["a", "b"] },
+  { discussions: ["b", "a"], candidates: ["a", "b"] },
+] as const)("discussion board inference: $discussions", ({ discussions, candidates }) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const a = yield* kanban.ensureBoard({ slug: "a", name: "A", defaultProjectId: null });
+    const b = yield* kanban.ensureBoard({ slug: "b", name: "B", defaultProjectId: null });
+    const unrelated = yield* kanban.ensureBoard({
+      slug: "unrelated",
+      name: "Unrelated",
+      defaultProjectId: null,
+    });
+    const boards = { a, b };
+    const evaluator = ThreadId.make("unlinked-evaluator");
+    for (const [index, key] of discussions.entries()) {
+      const discussion = yield* kanban.createDiscussion(
+        boards[key].id,
+        `Discussion ${index}`,
+        owner,
+      );
+      const posted = yield* call(evaluator, "discussion_post", {
+        discussionId: discussion.id,
+        text: `Taking discussion ${index}`,
+      });
+      assert.isFalse(posted.isError, posted.text);
+      assert.strictEqual((yield* kanban.discussion(discussion.id)).evaluatorThreadId, evaluator);
+    }
+    assert.isNull(yield* kanban.caller(evaluator));
+    const read = yield* call(evaluator, "board_get", {});
+    const created = yield* call(evaluator, "card_create", {
+      title: "Default board",
+      prompt: "Default board",
+    });
+    const ambiguous = candidates.length > 1;
+    assert.strictEqual(read.isError, ambiguous, read.text);
+    assert.strictEqual(created.isError, ambiguous, created.text);
+    if (ambiguous) {
+      assert.include(
+        read.text,
+        `Candidate board ids: ${candidates.map((key) => boards[key].id).join(", ")}`,
+      );
+      assert.notInclude(read.text, unrelated.id);
+      assert.lengthOf(yield* kanban.cards(a.id), 0);
+      assert.lengthOf(yield* kanban.cards(b.id), 0);
+    } else {
+      assert.strictEqual((created.structured.card as { boardId: string }).boardId, a.id);
+    }
+    const explicit = yield* call(evaluator, "card_create", {
+      boardId: b.id,
+      title: "Explicit id",
+      prompt: "Explicit id",
+    });
+    assert.isFalse(explicit.isError, explicit.text);
+    assert.strictEqual((explicit.structured.card as { boardId: string }).boardId, b.id);
+    const bySlug = yield* call(evaluator, "card_create", {
+      boardId: a.slug,
+      title: "Explicit slug",
+      prompt: "Explicit slug",
+    });
+    assert.isFalse(bySlug.isError, bySlug.text);
+    assert.strictEqual((bySlug.structured.card as { boardId: string }).boardId, a.id);
+  }).pipe(Effect.provide(layer));
+});

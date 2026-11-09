@@ -56,6 +56,7 @@ export const wrap = (
     discussions: (id) => locks.access(id, store.discussions(id)),
     discussion: (id) => discussion(id, store.discussion(id)),
     discussionByEvaluator: (id) => thread(id, store.discussionByEvaluator(id)),
+    discussionBoardIdsByEvaluator: (id) => thread(id, store.discussionBoardIdsByEvaluator(id)),
     putDiscussion: (row) => locks.access(row.boardId, store.putDiscussion(row), true),
     messages: (id, options) => discussion(id, store.messages(id, options)),
     ownerWait: (id) => discussion(id, store.ownerWait(id)),

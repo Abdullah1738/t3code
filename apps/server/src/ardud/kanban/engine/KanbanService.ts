@@ -7683,8 +7683,8 @@ const make = Effect.gen(function* () {
           if (link) return yield* boardOf(link.boardId);
           const ids = new Set<string>();
           for (const card of yield* store.cardsByThread(threadId)) ids.add(card.boardId);
-          const discussion = yield* store.discussionByEvaluator(threadId);
-          if (discussion) ids.add(discussion.boardId);
+          for (const boardId of yield* store.discussionBoardIdsByEvaluator(threadId))
+            ids.add(boardId);
           for (const board of boards) if (board.setup?.threadId === threadId) ids.add(board.id);
           if (input.discussionId?.trim())
             ids.add(
