@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - record ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
+import type { ThreadManagementTerminalRunStatus } from "../../../orchestration-v2/ThreadManagementService.ts";
 
 import {
   KANBAN_BACKLOG,
@@ -835,13 +836,20 @@ const ownerRouteRow = Context.Reference<number | undefined>("KanbanOwnerRouteRow
 export type OwnerRouteMode = "deferred" | "await" | "inline";
 /** A route still failing after this long is closed as undeliverable, with a notice. */
 const OWNER_ROUTE_GIVE_UP_MS = 10 * 60_000;
-/** Run states after which a thread no longer acts on its instruction. */
-const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
-  "completed",
-  "failed",
-  "cancelled",
-  "interrupted",
-]);
+/**
+ * Run states after which a thread no longer acts on its instruction: thread
+ * management's terminal states, kept exhaustive by the record's key type.
+ */
+const FINISHED_RUN: Record<ThreadManagementTerminalRunStatus, true> = {
+  completed: true,
+  failed: true,
+  cancelled: true,
+  interrupted: true,
+  rolled_back: true,
+};
+const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set(Object.keys(FINISHED_RUN));
+/** How long a durable owner post's title write may hold its discussion's drain. */
+const OWNER_ROUTE_TITLE_DEADLINE = "20 seconds";
 /** `noticed` value of a route whose give-up is decided but whose notice may not be posted yet. */
 const OWNER_ROUTE_GIVING_UP = 2;
 export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
@@ -3133,9 +3141,11 @@ const make = Effect.gen(function* () {
     JSON.parse(record.json) as OwnerRoutePayload & {
       readonly askers?: SavedOwnerRow["askers"];
     };
-  // The client's first-line title stays when the writer fails.
+  // The client's first-line title stays when the writer fails or runs past its
+  // deadline; the deadline keeps later routes in the discussion from waiting long.
   const writeOwnerTitle = (discussionId: KanbanDiscussion["id"], message: KanbanMessage) =>
     writeDiscussionTitle(discussionId, blocksText(message.blocks, attachments.pathOf)).pipe(
+      Effect.timeout(OWNER_ROUTE_TITLE_DEADLINE),
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
       ),
@@ -3215,7 +3225,7 @@ const make = Effect.gen(function* () {
     const discussionId = KanbanDiscussionId.make(record.discussion_id);
     yield* ownerDeliveryNotice(
       discussionId,
-      `Owner message could not be delivered (${record.route_key}) after 10 minutes of retries. It was not sent; post it again.`,
+      `Owner message delivery could not be confirmed (${record.route_key}) after 10 minutes of retries. Some of it may already have reached an agent, so check the discussion before posting it again.`,
     );
     const payload = ownerRoutePayload(record);
     if (payload.kind === "post" && payload.writeTitle === true) {

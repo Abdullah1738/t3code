@@ -13297,7 +13297,7 @@ it.effect("an owner route that keeps failing is closed as undeliverable, with a 
         message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
       );
       assert.strictEqual(texts.filter((text) => text.includes("delivery pending")).length, 1);
-      assert.strictEqual(texts.filter((text) => text.includes("could not be delivered")).length, 1);
+      assert.strictEqual(texts.filter((text) => text.includes("could not be confirmed")).length, 1);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -13377,7 +13377,7 @@ it.live("a give-up decided before a restart posts its notice on replay and never
       const texts = (yield* kanban.messages(ids.channel)).flatMap((message) =>
         message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
       );
-      assert.strictEqual(texts.filter((text) => text.includes("could not be delivered")).length, 1);
+      assert.strictEqual(texts.filter((text) => text.includes("could not be confirmed")).length, 1);
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
