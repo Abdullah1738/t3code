@@ -2835,33 +2835,36 @@ const make = Effect.gen(function* () {
     readonly launched: string;
     readonly noticed: number;
   }
-  const markOwnerRouteDone = (id: number, outcome: string) =>
-    Effect.gen(function* () {
+  const markOwnerRouteDone = Effect.fn("KanbanService.markOwnerRouteDone")(
+    function* (id: number, outcome: string) {
       const at = yield* nowIso;
       yield* boardSql`
         UPDATE ardud_kanban_owner_routes
         SET done_at = ${at}, json = json_set(json, '$.outcome', ${outcome})
         WHERE id = ${id}
       `;
-    }).pipe(
-      Effect.catchCause((cause) =>
-        // Left pending: the next drain replays it, and its sends are keyed.
-        Effect.logWarning("kanban owner route could not be marked done", { id, cause }),
+    },
+    (effect, id) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          // Left pending: the next drain replays it, and its sends are keyed.
+          Effect.logWarning("kanban owner route could not be marked done", { id, cause }),
+        ),
       ),
-    );
+  );
 
   /**
    * The commit half of an owner answer or post: its routing obligation, in the
    * board database before the message itself, so an acknowledged write always
    * has one. A row whose message never committed is dropped when it is drained.
    */
-  const saveOwnerRoute = (
-    boardId: KanbanBoardId,
-    discussionId: KanbanDiscussion["id"],
-    key: string,
-    payload: OwnerRoutePayload,
-  ) =>
-    Effect.gen(function* () {
+  const saveOwnerRoute = Effect.fn("KanbanService.saveOwnerRoute")(
+    function* (
+      boardId: KanbanBoardId,
+      discussionId: KanbanDiscussion["id"],
+      key: string,
+      payload: OwnerRoutePayload,
+    ) {
       const at = yield* nowIso;
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       const json = JSON.stringify(payload);
@@ -2872,7 +2875,9 @@ const make = Effect.gen(function* () {
         VALUES (${key}, ${boardId}, ${discussionId}, ${json}, ${at})
         ON CONFLICT (route_key) DO UPDATE SET json = excluded.json, done_at = NULL
       `;
-    }).pipe(Effect.mapError(toKanbanError));
+    },
+    (effect) => effect.pipe(Effect.mapError(toKanbanError)),
+  );
   const routeRetainingAskers = <E>(
     discussionId: KanbanDiscussion["id"],
     key: string,
@@ -2938,8 +2943,8 @@ const make = Effect.gen(function* () {
         row,
       );
     }).pipe(Effect.mapError(toKanbanError));
-  const ownerPostRoute = (message: KanbanMessage, key: string, row?: SavedOwnerRow) =>
-    Effect.gen(function* () {
+  const ownerPostRoute = Effect.fn("KanbanService.ownerPostRoute")(
+    function* (message: KanbanMessage, key: string, row?: SavedOwnerRow) {
       const initial = yield* discussionOf(message.discussionId);
       const text = Briefs.ownerMessageText(
         initial.title,
@@ -2956,7 +2961,9 @@ const make = Effect.gen(function* () {
         undefined,
         row,
       );
-    }).pipe(Effect.mapError(toKanbanError));
+    },
+    (effect) => effect.pipe(Effect.mapError(toKanbanError)),
+  );
   const routeOwnerPost = (message: KanbanMessage) =>
     message.author._tag !== "owner"
       ? Effect.void
@@ -3025,50 +3032,51 @@ const make = Effect.gen(function* () {
    * for (a row whose message never committed, or an answer the owner has
    * since changed, is closed without delivery). Delivery marks it done.
    */
-  const runOwnerRoute = (record: OwnerRouteRecord) =>
-    Effect.gen(function* () {
-      // Rows are written by this module from its own payload types.
+  const runOwnerRoute = Effect.fn("KanbanService.runOwnerRoute")(function* (
+    record: OwnerRouteRecord,
+  ) {
+    // Rows are written by this module from its own payload types.
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const payload = JSON.parse(record.json) as OwnerRoutePayload & {
+      readonly askers?: SavedOwnerRow["askers"];
+    };
+    const discussionId = KanbanDiscussionId.make(record.discussion_id);
+    const message = yield* rawStore.message(discussionId, payload.seq);
+    const row: SavedOwnerRow = {
+      id: record.id,
       // @effect-diagnostics-next-line preferSchemaOverJson:off
-      const payload = JSON.parse(record.json) as OwnerRoutePayload & {
-        readonly askers?: SavedOwnerRow["askers"];
-      };
-      const discussionId = KanbanDiscussionId.make(record.discussion_id);
-      const message = yield* rawStore.message(discussionId, payload.seq);
-      const row: SavedOwnerRow = {
-        id: record.id,
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        launched: JSON.parse(record.launched) as ReadonlyArray<string>,
-        noticed: record.noticed === 1,
-        askers: payload.askers ?? null,
-        done: markOwnerRouteDone(record.id, "delivered"),
-      };
-      if (payload.kind === "post") {
-        if (
-          message === null ||
-          message.author._tag !== "owner" ||
-          message.createdAt !== payload.createdAt
-        ) {
-          return yield* markOwnerRouteDone(record.id, "not-saved");
-        }
-        return yield* ownerPostRoute(message, record.route_key, row);
-      }
-      const entry = message?.answers.find(
-        (answer) => answer.blockId === payload.blockId && answer.by._tag === "owner",
-      );
-      if (message === null || entry === undefined) {
+      launched: JSON.parse(record.launched) as ReadonlyArray<string>,
+      noticed: record.noticed === 1,
+      askers: payload.askers ?? null,
+      done: markOwnerRouteDone(record.id, "delivered"),
+    };
+    if (payload.kind === "post") {
+      if (
+        message === null ||
+        message.author._tag !== "owner" ||
+        message.createdAt !== payload.createdAt
+      ) {
         return yield* markOwnerRouteDone(record.id, "not-saved");
       }
-      // The owner changed this answer since: the newer one has its own route.
-      if (entry.at !== payload.at) return yield* markOwnerRouteDone(record.id, "superseded");
-      return yield* ownerAnswerRoute(
-        discussionId,
-        payload.seq,
-        payload.blockId,
-        payload.note,
-        record.route_key,
-        row,
-      );
-    });
+      return yield* ownerPostRoute(message, record.route_key, row);
+    }
+    const entry = message?.answers.find(
+      (answer) => answer.blockId === payload.blockId && answer.by._tag === "owner",
+    );
+    if (message === null || entry === undefined) {
+      return yield* markOwnerRouteDone(record.id, "not-saved");
+    }
+    // The owner changed this answer since: the newer one has its own route.
+    if (entry.at !== payload.at) return yield* markOwnerRouteDone(record.id, "superseded");
+    return yield* ownerAnswerRoute(
+      discussionId,
+      payload.seq,
+      payload.blockId,
+      payload.note,
+      record.route_key,
+      row,
+    );
+  });
 
   /** Saved owner routes of one discussion, oldest first, one at a time. */
   const drainOwnerRoutes = (discussionId: string): Effect.Effect<void> =>
@@ -3120,8 +3128,8 @@ const make = Effect.gen(function* () {
       : drainOwnerRoutes(discussionId);
 
   /** Replays pending owner routes; `minAgeMs` leaves fresh ones to their own drain. */
-  const sweepOwnerRoutes = (minAgeMs: number) =>
-    Effect.gen(function* () {
+  const sweepOwnerRoutes = Effect.fn("KanbanService.sweepOwnerRoutes")(
+    function* (minAgeMs: number) {
       const before = DateTime.formatIso(
         DateTime.subtract(yield* DateTime.now, { milliseconds: minAgeMs }),
       );
@@ -3130,9 +3138,14 @@ const make = Effect.gen(function* () {
         WHERE done_at IS NULL AND created_at <= ${before}
       `.pipe(NodeSqliteClient.readOnly);
       for (const row of pending) yield* drainOwnerRoutes(row.discussion_id);
-    }).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("kanban owner route sweep failed", { cause })),
-    );
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban owner route sweep failed", { cause }),
+        ),
+      ),
+  );
 
   /** Internal posts, including asks that own a sequence, must not deduplicate. */
   const postUnlocked = Effect.fn("KanbanService.postUnlocked")(function* (
@@ -7780,9 +7793,7 @@ const make = Effect.gen(function* () {
     yield* Deferred.await(startupReady).pipe(
       Effect.andThen(
         Effect.gen(function* () {
-          const cutoff = DateTime.formatIso(
-            DateTime.subtract(yield* DateTime.now, { days: 7 }),
-          );
+          const cutoff = DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { days: 7 }));
           yield* boardSql`
             DELETE FROM ardud_kanban_owner_routes WHERE done_at IS NOT NULL AND done_at < ${cutoff}
           `.pipe(
@@ -7793,10 +7804,7 @@ const make = Effect.gen(function* () {
           yield* sweepOwnerRoutes(0);
           // `await` delivers inside the reply, so only the restart replay is needed there.
           if (ownerRouteMode !== "deferred") return;
-          return yield* sweepOwnerRoutes(30_000).pipe(
-            Effect.delay("1 minute"),
-            Effect.forever,
-          );
+          return yield* sweepOwnerRoutes(30_000).pipe(Effect.delay("1 minute"), Effect.forever);
         }),
       ),
       Effect.forkIn(scope),

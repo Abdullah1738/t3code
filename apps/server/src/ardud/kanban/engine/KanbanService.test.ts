@@ -12978,7 +12978,9 @@ it.live("a deferred owner post replies once committed; delivery follows from its
         { _tag: "md", text: "Ready" },
       ]);
       // The reply returns while the evaluator's send is still blocked.
-      const posted = yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Deferred reply" }]);
+      const posted = yield* kanban.post(channel.id, owner, [
+        { _tag: "md", text: "Deferred reply" },
+      ]);
       assert.strictEqual(posted.author._tag, "owner");
       yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
       assert.deepStrictEqual(
