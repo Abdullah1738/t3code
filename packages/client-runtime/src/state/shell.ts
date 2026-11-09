@@ -32,9 +32,11 @@ import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
 import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import {
   applyShellStreamEvent,
+  mergeShellSnapshotPage,
   mergeShellSnapshotProjects,
   reuseUnchangedThreadShells,
   sameThreadPullRequests,
+  type ShellPageCoverage,
 } from "./shellReducer.ts";
 import { type EnvironmentCatalogState, enabledEnvironmentIds } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -95,6 +97,8 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   const synchronizedServerVersion = yield* Ref.make<string | null>(null);
   const lastAuthoritativeSession = yield* Ref.make<RpcSession | null>(null);
   const activeSubscriptionSession = yield* Ref.make<RpcSession | null>(null);
+  // Rows the paged load in progress has delivered; see mergeShellSnapshotPage.
+  const pageCoverage = yield* Ref.make<ShellPageCoverage>(null);
   const latestLiveSnapshot = yield* Ref.make<Option.Option<OrchestrationV2ShellSnapshot>>(
     Option.none(),
   );
@@ -188,6 +192,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     const initial = yield* SubscriptionRef.get(state);
     const activeSession = yield* Ref.get(activeSubscriptionSession);
     let waiting = yield* Ref.get(awaitingCompletion);
+    let coverage = yield* Ref.get(pageCoverage);
     let next = initial;
     let snapshotSession: RpcSession | null = null;
     for (const [session, item] of items) {
@@ -208,24 +213,27 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined) {
         yield* Ref.set(synchronizedSnapshot, false);
       }
-      const nextSnapshot =
-        item.kind === "snapshot"
-          ? mergeShellSnapshotProjects(
-              Option.getOrNull(next.snapshot),
-              item.snapshot,
-              item.resolvedRepositoryIdentityRoots === undefined
-                ? undefined
-                : {
-                    resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots,
-                  },
-            )
-          : Option.match(next.snapshot, {
-              onNone: () => null,
-              onSome: (snapshot) =>
-                item.sequence > snapshot.snapshotSequence
-                  ? applyShellStreamEvent(snapshot, item)
-                  : snapshot,
-            });
+      let nextSnapshot: OrchestrationV2ShellSnapshot | null;
+      if (item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined) {
+        const page = mergeShellSnapshotPage(
+          Option.getOrNull(next.snapshot),
+          item.snapshot,
+          coverage,
+        );
+        coverage = page.coverage;
+        nextSnapshot = page.snapshot;
+      } else
+        nextSnapshot =
+          item.kind === "snapshot"
+            ? mergeShellSnapshotProjects(Option.getOrNull(next.snapshot), item.snapshot, {
+                resolvedRepositoryIdentityRoots: item.resolvedRepositoryIdentityRoots ?? [],
+              })
+            : Option.match(next.snapshot, {
+                onNone: () => null,
+                // The reducer decides what an applied sequence still accepts (missing ancestor
+                // rows sent at their asking subagent's sequence).
+                onSome: (snapshot) => applyShellStreamEvent(snapshot, item),
+              });
       if (nextSnapshot === null) continue;
       if (item.kind === "snapshot" && item.snapshot.page?.nextAfter == null)
         snapshotSession = session;
@@ -236,6 +244,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       };
     }
     yield* Ref.set(awaitingCompletion, waiting);
+    yield* Ref.set(pageCoverage, coverage);
     if (next === initial) return;
     if (pendingLinkIds !== undefined && Option.isSome(next.snapshot)) {
       pendingLinkRows = new Set(
@@ -335,10 +344,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         yield* Ref.set(activeSubscriptionSession, session);
         const initialConfig = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
         const supportsCompletionMarker = initialConfig?.shellResumeCompletionMarker === true;
-        const shellPages =
-          initialConfig?.shellSnapshotPagination === true
+        const omitIdleSubagents = yield* ShellSnapshotLoader.OmitIdleSubagents;
+        const shellPages = {
+          ...(initialConfig?.shellSnapshotPagination === true
             ? { acceptShellPages: true as const }
-            : {};
+            : {}),
+          ...(omitIdleSubagents ? { omitIdleSubagents: true as const } : {}),
+        };
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
 

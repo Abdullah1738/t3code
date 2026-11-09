@@ -8276,3 +8276,191 @@ it.effect("latest authored timestamp follows message replacement and removal", (
     assert.equal(yield* readBoth, "2026-03-05T00:00:00.000Z");
   }).pipe(Effect.provide(layerTest)),
 );
+
+const idleSubagentShellBody = (label: string) =>
+  Effect.gen(function* () {
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    // Finished long ago: outside the window in which idle subagents stay in client shells.
+    const old = DateTime.subtract(now, { days: 30 });
+    const projectId = ProjectId.make(`project:idle-subagents:${label}`);
+    const id = (name: string) => ThreadId.make(`thread:idle-subagents:${name}`);
+    const created = (
+      threadId: ThreadId,
+      parent: ThreadId | null,
+      overrides: Record<string, unknown> = {},
+      at = parent === null ? now : old,
+    ) =>
+      projectionStore.apply({
+        id: EventId.make(`event:idle-subagents:${label}:${threadId}`),
+        type: "thread.created",
+        threadId,
+        occurredAt: at,
+        payload: {
+          createdBy: parent === null ? "user" : "agent",
+          creationSource: parent === null ? "web" : "provider",
+          id: threadId,
+          projectId,
+          title: threadId,
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage:
+            parent === null
+              ? { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId }
+              : { parentThreadId: parent, relationshipToParent: "subagent", rootThreadId: parent },
+          forkedFrom: null,
+          createdAt: at,
+          updatedAt: at,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+          ...overrides,
+        } as never,
+      });
+    const run = (threadId: ThreadId, status: "running" | "completed", at = old) => {
+      const runId = RunId.make(`run:idle-subagents:${threadId}`);
+      return projectionStore
+        .apply({
+          id: EventId.make(`event:idle-subagents:${label}:run:${threadId}`),
+          type: "run.created",
+          threadId,
+          runId,
+          nodeId: NodeId.make(`node:idle-subagents:${threadId}`),
+          driver,
+          occurredAt: at,
+          payload: {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId,
+            modelSelection,
+            providerThreadId: null,
+            userMessageId: MessageId.make(`message:idle-subagents:${threadId}`),
+            rootNodeId: NodeId.make(`node:idle-subagents:${threadId}`),
+            activeAttemptId: null,
+            status,
+            requestedAt: at,
+            startedAt: at,
+            completedAt: status === "running" ? null : at,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        } as never)
+        .pipe(Effect.as(runId));
+    };
+
+    // Production shape: top-level threads with many finished subagents (archiving a parent
+    // never archives them; the OpenCode importer creates them unarchived), a few live ones.
+    const TOP_LEVEL = 20;
+    const IDLE_PER_TOP = 12;
+    const expected = new Set<ThreadId>();
+    for (let top = 0; top < TOP_LEVEL; top++) {
+      const topId = id(`top-${top}`);
+      yield* created(topId, null);
+      expected.add(topId);
+      for (let child = 0; child < IDLE_PER_TOP; child++) {
+        const childId = id(`top-${top}-idle-${child}`);
+        yield* created(childId, topId);
+        yield* run(childId, "completed");
+      }
+    }
+    // A live subagent stays.
+    const live = id("top-0-live");
+    yield* created(live, id("top-0"));
+    yield* run(live, "running");
+    expected.add(live);
+    // A nested request under an idle (async-delegating) subagent keeps the whole chain, so
+    // pendingSubagentRequestsByThread can still carry it to the root row.
+    const idleMiddle = id("top-1-middle");
+    const asking = id("top-1-middle-asking");
+    yield* created(idleMiddle, id("top-1"));
+    yield* run(idleMiddle, "completed");
+    yield* created(asking, idleMiddle);
+    const askingRun = yield* run(asking, "running");
+    yield* projectionStore.apply({
+      id: EventId.make(`event:idle-subagents:${label}:request`),
+      type: "runtime-request.updated",
+      threadId: asking,
+      runId: askingRun,
+      nodeId: NodeId.make(`node:idle-subagents:${asking}`),
+      driver,
+      occurredAt: now,
+      payload: {
+        id: RuntimeRequestId.make(`request:idle-subagents:${label}`),
+        nodeId: NodeId.make(`node:idle-subagents:${asking}`),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input",
+        status: "pending",
+        responseCapability: { type: "message" },
+        createdAt: now,
+        resolvedAt: null,
+      },
+    } as never);
+    expected.add(idleMiddle);
+    expected.add(asking);
+    // A subagent that finished three days ago stays: it is in the user's working set.
+    const recent = id("top-3-recent");
+    const threeDaysAgo = DateTime.subtract(now, { days: 3 });
+    yield* created(recent, id("top-3"), {}, threeDaysAgo);
+    yield* run(recent, "completed", threeDaysAgo);
+    expected.add(recent);
+    // An archived subagent is never in the active shell.
+    yield* created(id("top-2-archived"), id("top-2"), { archivedAt: now });
+
+    const full = yield* projectionStore.getShellSnapshot({ location: "active" });
+    const client = yield* projectionStore.getShellSnapshot({
+      location: "active",
+      omitIdleSubagents: true,
+    });
+    const ids = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
+      threads.map((thread) => thread.id).toSorted();
+    const fixtureRows = (threads: ReadonlyArray<{ readonly id: ThreadId }>) =>
+      threads.filter((thread) => String(thread.id).startsWith("thread:idle-subagents:"));
+
+    assert.lengthOf(fixtureRows(full.threads), TOP_LEVEL * (1 + IDLE_PER_TOP) + 4);
+    assert.deepEqual(ids(fixtureRows(client.threads)), [...expected].toSorted());
+    assert.lengthOf(fixtureRows(client.threads), TOP_LEVEL + 4);
+    // Kept rows are unchanged, and the snapshot point is the same.
+    for (const thread of client.threads) {
+      assert.deepEqual(
+        thread,
+        full.threads.find((candidate) => candidate.id === thread.id),
+      );
+    }
+    assert.strictEqual(client.snapshotSequence, full.snapshotSequence);
+    return { full, client, expected };
+  });
+
+it.effect("memory client shell omits idle subagents but keeps live ones and their chain", () =>
+  idleSubagentShellBody("memory").pipe(Effect.asVoid, Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("SQL client shell omits idle subagents but keeps live ones and their chain", () =>
+  Effect.gen(function* () {
+    const { expected } = yield* idleSubagentShellBody("SQL");
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    // Keyset pages over the filtered rows reach the same set without repeats.
+    const paged: Array<ThreadId> = [];
+    let after: string | undefined;
+    for (let guard = 0; guard < 100; guard++) {
+      const page = yield* projectionStore.getShellSnapshot({
+        location: "active",
+        omitIdleSubagents: true,
+        limit: 4,
+        ...(after === undefined ? {} : { afterThreadId: after }),
+      });
+      paged.push(...page.threads.map((thread) => thread.id));
+      if (page.threads.length < 4) break;
+      after = page.threads.at(-1)!.id;
+    }
+    assert.deepEqual(paged, [...expected].toSorted());
+  }).pipe(Effect.provide(layerTest)),
+);

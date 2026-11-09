@@ -524,15 +524,28 @@ export function resolveSidebarRowThreadId(
   threadId: ThreadId,
   environmentId: EnvironmentId,
   threads: readonly Pick<SidebarThreadSummary, "id" | "environmentId" | "lineage">[],
+  // Idle subagents are not in the client shell; the open thread's loaded detail
+  // still knows its parent.
+  routeThreadLineage?: SidebarThreadSummary["lineage"] | null,
 ): ThreadId {
   const findThread = (id: ThreadId) =>
     threads.find((thread) => thread.id === id && thread.environmentId === environmentId);
   const visited = new Set<ThreadId>();
-  let thread = findThread(threadId);
+  let thread =
+    findThread(threadId) ??
+    (routeThreadLineage == null
+      ? undefined
+      : { id: threadId, environmentId, lineage: routeThreadLineage });
   while (thread !== undefined && isSidebarSubagentThread(thread)) {
     if (thread.lineage.parentThreadId === null || visited.has(thread.id)) return threadId;
     visited.add(thread.id);
-    thread = findThread(thread.lineage.parentThreadId);
+    const parent = findThread(thread.lineage.parentThreadId);
+    // A long-idle subagent ancestor is not in the client shell; its tree's root usually is.
+    if (parent === undefined) {
+      const root = findThread(thread.lineage.rootThreadId);
+      return root !== undefined && !isSidebarSubagentThread(root) ? root.id : threadId;
+    }
+    thread = parent;
   }
   return thread?.id ?? threadId;
 }

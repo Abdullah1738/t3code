@@ -79,12 +79,14 @@ export const layer = HttpApiBuilder.group(
     const loadShellSnapshot = Effect.fn("http.orchestration.loadShellSnapshot")(function* (
       after?: string,
       paged = false,
+      omitIdleSubagents = false,
     ) {
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
+            ...(omitIdleSubagents ? { omitIdleSubagents: true } : {}),
             ...(paged ? { limit: 501 } : {}),
             ...(after === undefined ? {} : { afterThreadId: after }),
           }),
@@ -173,7 +175,11 @@ export const layer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          return yield* loadShellSnapshot(args.query.after, args.query.paged === "true").pipe(
+          return yield* loadShellSnapshot(
+            args.query.after,
+            args.query.paged === "true",
+            args.query.omitIdleSubagents === "true",
+          ).pipe(
             checkJsonReply,
             traceLocalHandlerWork,
             Effect.catch((cause) =>

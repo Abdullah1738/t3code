@@ -170,7 +170,7 @@ import { environmentPresentations } from "../state/presentation";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import { environmentProjects } from "../state/projects";
 import { vcsEnvironment } from "../state/vcs";
-import { threadEnvironment } from "../state/threads";
+import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { useEnvironmentQuery } from "../state/query";
 import { useThreadSearch } from "../state/queries";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
@@ -466,6 +466,14 @@ function useSidebarThreads(input: {
   const threads = withoutIMessageThreads(
     withoutBoardThreads(useThreadShells(), useBoardThreadIds()),
   );
+  // Same atom the thread route reads, so this adds no subscription.
+  const routeThreadLineage =
+    Option.getOrNull(
+      useEnvironmentThread(
+        routeThreadRef?.environmentId ?? null,
+        routeThreadRef?.threadId ?? null,
+      ).data,
+    )?.thread.lineage ?? null;
   const routeRowThreadKey =
     routeThreadRef === null
       ? null
@@ -476,6 +484,7 @@ function useSidebarThreads(input: {
               routeThreadRef.threadId,
               routeThreadRef.environmentId,
               threads,
+              routeThreadLineage,
             ),
           ),
         );

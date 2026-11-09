@@ -19,6 +19,8 @@ const layerSnapshotLoader = Layer.mergeAll(
   ShellSnapshotLoader.layer,
   ThreadHistoryController.layer,
   PullRequestDiffLoader.layer,
+  // The sidebar never lists long-idle subagents; leave them out of the shell (mobile keeps them).
+  Layer.succeed(ShellSnapshotLoader.OmitIdleSubagents, true),
 );
 
 type ConnectionLayerSource =

@@ -4,6 +4,7 @@ import {
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -27,6 +28,28 @@ import {
 // short deadline only throws the first build away. The socket fallback is for
 // setups where /api fails but /ws works, such as a proxy that blocks /api.
 const DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS = 20_000;
+// A page that times out is asked for again with a longer deadline: page time on a busy
+// server is reader queueing, and throwing the load away restarted it from page one.
+const SHELL_PAGE_ATTEMPTS = 3;
+// Progress kept across reconnects is reused only while it is this fresh; replaying the
+// events since an older first page costs about as much as a new load.
+export const SHELL_LOAD_RESUME_MAX_AGE_MS = 5 * 60_000;
+
+/** Pages a paged load has delivered so far, and the cursor to continue from. */
+export interface ShellLoadProgress {
+  readonly pages: ReadonlyArray<DeferredShellSnapshot>;
+  readonly nextAfter: string;
+  readonly updatedAt: number;
+}
+
+/**
+ * Ask the server to leave out subagents idle for a week with no live descendant. Only clients
+ * whose screens never list such rows (the web sidebar) turn it on; they stay readable by id.
+ */
+export const OmitIdleSubagents = Context.Reference<boolean>(
+  "@t3tools/client-runtime/state/shellSnapshotHttp/OmitIdleSubagents",
+  { defaultValue: () => false },
+);
 
 export const fetchEnvironmentShellSnapshot = Effect.fn(
   "clientRuntime.state.fetchEnvironmentShellSnapshot",
@@ -38,30 +61,59 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   >;
   readonly timeoutMs?: number;
   readonly onPage?: (snapshot: DeferredShellSnapshot) => Effect.Effect<void>;
+  /** Continue an interrupted load from its last delivered cursor. */
+  readonly resume?: ShellLoadProgress;
+  /** Called after every page that leaves the load unfinished. */
+  readonly onProgress?: (progress: ShellLoadProgress) => Effect.Effect<void>;
+  readonly pageAttempts?: number;
+  readonly omitIdleSubagents?: boolean;
 }) {
-  const fetchPage = (after?: string) =>
+  const baseTimeoutMs = input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS;
+  const query = (after: string | undefined) => ({
+    paged: "true",
+    ...(after === undefined ? {} : { after }),
+    ...(input.omitIdleSubagents === true ? { omitIdleSubagents: "true" } : {}),
+  });
+  const fetchPageOnce = (after: string | undefined, timeoutMs: number) =>
     executeAuthenticatedEnvironmentHttpRequest({
       ...input,
       group: "orchestration",
       method: "GET",
-      url: (urls) =>
-        urls.shellSnapshot({ query: { paged: "true", ...(after === undefined ? {} : { after }) } }),
-      timeoutMs: input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS,
+      url: (urls) => urls.shellSnapshot({ query: query(after) }),
+      timeoutMs,
       request: ({ client, headers }) =>
         client
           .shellSnapshot({
-            query: { paged: "true", ...(after === undefined ? {} : { after }) },
+            query: query(after),
             headers: withOrchestrationProtocolHeader(headers),
             responseMode: "response-only",
           })
           .pipe(Effect.flatMap(decodeShellSnapshotResponse)),
     });
-  let snapshot = yield* fetchPage();
-  const pages: DeferredShellSnapshot[] = [snapshot];
-  const seen = new Set<string>();
+  const attempts = Math.max(1, input.pageAttempts ?? SHELL_PAGE_ATTEMPTS);
+  const fetchPage = (after?: string) => {
+    const attempt = (n: number): ReturnType<typeof fetchPageOnce> =>
+      n + 1 >= attempts
+        ? fetchPageOnce(after, baseTimeoutMs * (n + 1))
+        : fetchPageOnce(after, baseTimeoutMs * (n + 1)).pipe(
+            // Only a timeout says "busy, ask again"; other failures repeat themselves.
+            Effect.catchTag("RemoteEnvironmentAuthTimeoutError", () => attempt(n + 1)),
+          );
+    return attempt(0);
+  };
+  const pages: DeferredShellSnapshot[] = [...(input.resume?.pages ?? [])];
+  const seen = new Set<string>(input.resume === undefined ? [] : [input.resume.nextAfter]);
+  let snapshot = yield* fetchPage(input.resume?.nextAfter);
+  pages.push(snapshot);
   while (snapshot.page?.nextAfter != null) {
-    if (input.onPage) yield* input.onPage(mergeHttpShellPages(pages));
     const after = snapshot.page.nextAfter;
+    if (input.onProgress)
+      yield* input.onProgress({
+        pages: [...pages],
+        nextAfter: after,
+        updatedAt: yield* Clock.currentTimeMillis,
+      });
+    if (input.onPage) yield* input.onPage(mergeHttpShellPages(pages));
     if (seen.has(after))
       return yield* Effect.die(new Error("Shell snapshot cursor did not advance."));
     seen.add(after);
@@ -75,7 +127,8 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
  * The current server reads each page in a separate transaction. Keep the earliest
  * sequence for replay; M3 must pin pages to a server snapshot epoch/watermark.
  * page.nextAfter explicitly marks cumulative partial coverage until the final page.
- * Cumulative pages use after:null so the reducer replaces stale cached membership.
+ * Cumulative pages use after:null: each one restarts the reducer's page coverage, and the
+ * complete result replaces stale cached membership (partial ones keep unreached rows).
  */
 export function mergeHttpShellPages(
   pages: ReadonlyArray<DeferredShellSnapshot>,
@@ -148,14 +201,47 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
     const remoteAuthorization = yield* Effect.serviceOption(
       RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
     );
+    // Survives a session change or a failed load, so the next load continues from the
+    // last delivered cursor instead of page one. Keyed by server build: an upgrade can
+    // rewrite projections without new events, so its pages must be read again.
+    const progressByConnection = new Map<string, ShellLoadProgress>();
+    const progressKey = (prepared: PreparedConnection, omitIdleSubagents: boolean) =>
+      [
+        prepared.environmentId,
+        prepared.httpBaseUrl,
+        prepared.verifiedDescriptor?.descriptor.serverVersion ?? "",
+        omitIdleSubagents ? "omit-idle-subagents" : "",
+      ].join("\u001f");
     return ShellSnapshotLoader.of({
-      load: (prepared: PreparedConnection, onPage) =>
-        fetchEnvironmentShellSnapshot({
+      load: Effect.fnUntraced(function* (prepared: PreparedConnection, onPage) {
+        const omitIdleSubagents = yield* OmitIdleSubagents;
+        const key = progressKey(prepared, omitIdleSubagents);
+        const saved = progressByConnection.get(key);
+        const now = yield* Clock.currentTimeMillis;
+        const resume =
+          saved !== undefined && now - saved.updatedAt <= SHELL_LOAD_RESUME_MAX_AGE_MS
+            ? saved
+            : undefined;
+        // Valid progress stays until the load finishes or newer progress replaces it, so a
+        // resumed load that fails before its next page still resumes next time.
+        if (saved !== undefined && resume === undefined) progressByConnection.delete(key);
+        return yield* fetchEnvironmentShellSnapshot({
           prepared,
           signer,
           remoteAuthorization,
+          ...(omitIdleSubagents ? { omitIdleSubagents } : {}),
           ...(onPage ? { onPage } : {}),
+          ...(resume ? { resume } : {}),
+          onProgress: (progress) =>
+            Effect.sync(() => {
+              progressByConnection.set(key, progress);
+            }),
         }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              progressByConnection.delete(key);
+            }),
+          ),
           Effect.map(Option.some<DeferredShellSnapshot>),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.catchCause((cause) =>
@@ -166,7 +252,8 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
               Effect.as(Option.none<DeferredShellSnapshot>()),
             ),
           ),
-        ),
+        );
+      }),
     });
   }),
 );

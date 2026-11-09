@@ -140,6 +140,22 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
           occurredAt: now,
           payload: thread,
         },
+        {
+          // Finished weeks ago: only clients that opt in leave it out of the shell.
+          id: EventId.make("create-idle-subagent"),
+          type: "thread.created",
+          threadId: ThreadId.make("idle-subagent"),
+          occurredAt: now,
+          payload: {
+            ...thread,
+            id: ThreadId.make("idle-subagent"),
+            lineage: {
+              parentThreadId: thread.id,
+              relationshipToParent: "subagent",
+              rootThreadId: thread.id,
+            },
+          },
+        },
       ],
     });
     const routes = HttpApiBuilder.layer(TranscriptTestApi).pipe(
@@ -212,11 +228,11 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     expect(firstPage.page.nextAfter).toBe(firstPage.threads.at(-1)!.id);
     const lastShell = yield* shellRequest(firstPage.page.nextAfter!);
     const lastPage = (yield* Effect.promise(() => lastShell.json())) as typeof firstPage;
-    expect(lastPage.threads).toHaveLength(6);
+    expect(lastPage.threads).toHaveLength(7);
     expect(lastPage.page.nextAfter).toBeNull();
     expect(
       new Set([...firstPage.threads, ...lastPage.threads].map((thread) => thread.id)).size,
-    ).toBe(506);
+    ).toBe(507);
     const legacyShell = yield* Effect.promise(() =>
       handler(
         new Request("http://localhost/api/orchestration/shell", {
@@ -225,8 +241,25 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       ),
     );
     const legacyData = (yield* Effect.promise(() => legacyShell.json())) as typeof firstPage;
-    expect(legacyData.threads).toHaveLength(506);
+    expect(legacyData.threads).toHaveLength(507);
     expect(legacyData.page).toBeUndefined();
+    const sidebarPage = (after?: string) =>
+      Effect.promise(async () => {
+        const response = await handler(
+          new Request(
+            `http://localhost/api/orchestration/shell?paged=true&omitIdleSubagents=true${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`,
+            { headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT } },
+          ),
+        );
+        return (await response.json()) as typeof firstPage;
+      });
+    const sidebarFirst = yield* sidebarPage();
+    const sidebarLast = yield* sidebarPage(sidebarFirst.page.nextAfter!);
+    const sidebarIds = [...sidebarFirst.threads, ...sidebarLast.threads].map((thread) => thread.id);
+    expect(sidebarLast.page.nextAfter).toBeNull();
+    expect(sidebarIds).toHaveLength(506);
+    expect(sidebarIds).not.toContain("idle-subagent");
+    expect(legacyData.threads.map((thread) => thread.id)).toContain("idle-subagent");
     yield* eventSink.write({
       events: items.map((item) => ({
         id: EventId.make(`create-${item.id}`),

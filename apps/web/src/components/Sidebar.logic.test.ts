@@ -497,6 +497,25 @@ describe("sidebar thread lineage helpers", () => {
     const loopA = subagentOf("thread-loop-a", ThreadId.make("thread-loop-b"));
     const loopB = subagentOf("thread-loop-b", loopA.id);
     expect(resolveSidebarRowThreadId(loopA.id, environmentId, [loopA, loopB])).toBe(loopA.id);
+    // Idle subagents are omitted from the client shell: the open thread's detail lineage
+    // still resolves it to its parent row (and through shell-present subagent ancestors).
+    const idle = subagentOf("thread-idle", child.id);
+    expect(resolveSidebarRowThreadId(idle.id, environmentId, threads)).toBe(idle.id);
+    expect(resolveSidebarRowThreadId(idle.id, environmentId, threads, idle.lineage)).toBe(root.id);
+    expect(resolveSidebarRowThreadId(child.id, environmentId, threads, root.lineage)).toBe(root.id);
+    // root -> omitted idle A -> open idle B: B's lineage root stands in for the missing chain.
+    const nestedIdle = makeThreadFixture({
+      id: ThreadId.make("thread-nested-idle"),
+      environmentId,
+      lineage: {
+        rootThreadId: root.id,
+        parentThreadId: ThreadId.make("thread-omitted-middle"),
+        relationshipToParent: "subagent",
+      },
+    });
+    expect(
+      resolveSidebarRowThreadId(nestedIdle.id, environmentId, threads, nestedIdle.lineage),
+    ).toBe(root.id);
   });
 
   it("resolves the parent thread for fork sidebar affordances", () => {

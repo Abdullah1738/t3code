@@ -3394,6 +3394,11 @@ export type OrchestrationV2GetThreadProjectionInput =
 
 export const OrchestrationV2SubscribeShellInput = Schema.Struct({
   acceptShellPages: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Leave out subagents idle for a week with no live descendant (the web sidebar never lists
+   * them; they stay readable by id). Clients that need every thread row omit it.
+   */
+  omitIdleSubagents: Schema.optionalKey(Schema.Boolean),
   afterSequence: Schema.optionalKey(NonNegativeInt),
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });

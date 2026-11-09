@@ -96,6 +96,20 @@ import * as PullRequestReadCache from "./PullRequestReadCache.ts";
 import * as PullRequestProviderRegistry from "./PullRequestProviderRegistry.ts";
 import * as ViewedFiles from "./pullRequestViewedFiles.ts";
 
+
+type ProjectShellRead = ReturnType<ProjectService.ProjectService["Service"]["getShell"]>;
+
+/**
+ * Every PR read resolves its project (canonicalRef, the read cache key), and the background
+ * sync made ~95% of all ProjectService.getShell calls that way: one per PR per sweep, each
+ * queued on the shared orchestration reader. A sweep provides a fresh memo so each project is
+ * read once per sweep; nothing is kept across sweeps, and other callers read fresh.
+ */
+export const SweepProjectShells = Context.Reference<Map<ProjectId, ProjectShellRead> | null>(
+  "@t3tools/server/pullRequest/PullRequestService/SweepProjectShells",
+  { defaultValue: () => null },
+);
+
 export interface PullRequestMergeEvent extends PullRequestRef {
   readonly mergedAt: string;
 }
@@ -664,6 +678,18 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.map((resolved) => new Map(resolved)));
   };
 
+  const projectShell = (projectId: ProjectId): ProjectShellRead =>
+    Effect.gen(function* () {
+      const memo = yield* SweepProjectShells;
+      if (memo === null) return yield* projects.getShell(projectId);
+      let read = memo.get(projectId);
+      if (read === undefined) {
+        read = yield* Effect.cached(projects.getShell(projectId));
+        memo.set(projectId, read);
+      }
+      return yield* read;
+    });
+
   const listWorkspaceProjects = (
     filter: Pick<PullRequestListInput, "projectId" | "projectIds" | "host">,
   ): Effect.Effect<WorkspaceProjects, PullRequestError> =>
@@ -671,7 +697,7 @@ export const make = Effect.gen(function* () {
       ? projects.listShells(
           filter.projectIds === undefined ? undefined : { projectIds: filter.projectIds },
         )
-      : projects.getShell(filter.projectId).pipe(Effect.map(Option.toArray))
+      : projectShell(filter.projectId).pipe(Effect.map(Option.toArray))
     ).pipe(
       Effect.mapError(
         (error) =>
@@ -811,7 +837,7 @@ export const make = Effect.gen(function* () {
                   : null;
                 const api = provider === null ? null : registry.get(provider.kind);
                 if (api !== null) {
-                  const selected = yield* projects.getShell(ref.projectId).pipe(
+                  const selected = yield* projectShell(ref.projectId).pipe(
                     Effect.mapError(
                       (cause) =>
                         new PullRequestOperationError({

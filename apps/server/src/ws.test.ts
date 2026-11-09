@@ -717,6 +717,47 @@ it.live(
           baseline[1]?.kind === "project.updated" ? baseline[1].sequence : 0,
           fixture.projectEvent.sequence,
         );
+        // Clients that omit idle subagents resume from the cursor event itself, so ancestor rows
+        // sent at an already-applied sequence come again; everything after it is unchanged.
+        const optedIn = Array.from(
+          yield* subscribeOrchestrationV2Shell({ ...input, omitIdleSubagents: true }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.scoped,
+            Effect.provide(fixture.services),
+          ),
+        );
+        assert.equal(
+          optedIn[0] !== undefined && "sequence" in optedIn[0] ? optedIn[0].sequence : -1,
+          fixture.cursor,
+        );
+        assert.deepEqual(optedIn.slice(1), baseline);
+        // The replay budget covers the cursor event too: when it alone is over budget the
+        // opted-in client gets a snapshot, not a replay.
+        const overBudgetAtCursor = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          getReplayStats: (range) =>
+            fixture.application.getReplayStats(range).pipe(
+              Effect.map((stats) =>
+                range.afterSequence < fixture.cursor
+                  ? { ...stats, rawPayloadBytes: Number.MAX_SAFE_INTEGER }
+                  : stats,
+              ),
+            ),
+        });
+        const [firstOverBudget] = yield* subscribeOrchestrationV2Shell({
+          ...input,
+          omitIdleSubagents: true,
+        }).pipe(
+          Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
+          Effect.scoped,
+          Effect.provide(Layer.mergeAll(fixture.services, overBudgetAtCursor)),
+        );
+        assert.equal(firstOverBudget?.kind, "snapshot");
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const writer = yield* fixture.sql

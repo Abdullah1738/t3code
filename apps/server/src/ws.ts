@@ -142,6 +142,7 @@ import {
   loadShellSnapshotParts,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
+  withSubagentRequestAncestors,
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
@@ -973,6 +974,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     readonly afterSequence?: number;
     readonly requestCompletionMarker?: boolean;
     readonly acceptShellPages?: boolean;
+    readonly omitIdleSubagents?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -1005,6 +1007,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
+            ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
             ...(input.acceptShellPages === true ? { limit: 501 } : {}),
             ...(after === undefined ? {} : { afterThreadId: after }),
           }),
@@ -1059,7 +1062,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
-      return yield* Effect.forEach(
+      const items = yield* Effect.forEach(
         coalesceShellApplicationEvents(events),
         (stored) =>
           Effect.gen(function* () {
@@ -1071,6 +1074,9 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           }),
         { concurrency: 8 },
       );
+      return input.omitIdleSubagents === true
+        ? yield* withSubagentRequestAncestors(items, threadManagement.getThreadShell)
+        : items;
     });
 
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>
@@ -1178,14 +1184,29 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       }
 
       const highWater = yield* applicationEvents.latestApplicationSequence;
-      if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
+      // Opted-in clients also get the cursor event again: ancestor rows sent right after an
+      // asking subagent's update share its sequence, so a drop between the two would otherwise
+      // never resend them. The client takes only rows it lacks at that sequence. The budget
+      // covers exactly what is replayed; a cursor past the head still means a fresh snapshot.
+      const replayAfter =
+        input.omitIdleSubagents === true && input.afterSequence > 0
+          ? input.afterSequence - 1
+          : input.afterSequence;
+      if (
+        input.afterSequence > highWater ||
+        !(yield* canReplayPersistedRange(
+          replayAfter,
+          highWater,
+          SHELL_RESUME_MAX_GAP + (input.afterSequence - replayAfter),
+        ))
+      ) {
         return yield* snapshotThenLive();
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
       const replay = toShellStream(
         applicationEvents.readApplicationEvents({
-          afterSequence: input.afterSequence,
+          afterSequence: replayAfter,
           throughSequence: highWater,
           // A row a newer build wrote (e.g. after a downgrade) must not fail
           // every shell resubscribe. The live tail below resumes from
