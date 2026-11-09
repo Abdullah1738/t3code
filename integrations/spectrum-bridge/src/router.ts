@@ -2985,8 +2985,38 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
+        const failAfterEarlier = (text: string, reason: DropReason, immediate = false) => {
+          this.store.db.transaction(() => {
+            const said = earlier.map(reply => ({ reply, text: replyText(assistantText(reply)) })).filter(item => item.text);
+            for (const { reply, text } of said) this.store.enqueue({
+              id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
+              ...this.replyTarget(turn!.inboundId),
+            });
+            if (said.length) this.noteGroupReply(turn!.inboundId, said.map(item => item.text));
+            const successful = new Set<string>();
+            let prompts = start >= 0 && messages[start]!.type === "user" ? [messages[start]!.id] : [];
+            for (const record of scope) {
+              if (record.type === "user") prompts.push(record.id);
+              if (record.type === "idle") {
+                if (record.outcome === "succeeded" && !record.modelError) for (const id of prompts) successful.add(id);
+                prompts = [];
+              }
+            }
+            for (const row of this.store.pendingInbound()) {
+              const steering = row.state === "processing" && this.steering(row.id)
+                || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
+              if (steering && successful.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn!);
+            }
+            // The tracked leader can belong to an earlier successful run, rather than the last failed run.
+            const completed = turn!.inboundId && successful.has(turn!.messageId)
+              ? this.store.get<NormalizedInbound | null>(`batch:${turn!.inboundId}`)?.batchIds ?? [turn!.inboundId] : [];
+            this.fail(turn!, text, idle.id, reason, immediate);
+            for (const id of completed) this.store.updateInbound(id, "done");
+          }).immediate();
+          if (earlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
+        };
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
-          this.fail(turn, firstFailureText(idle.modelError || priorFailure?.modelError), idle.id, "failed", true);
+          failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);
           return;
         }
         // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
@@ -2994,7 +3024,7 @@ export class Router {
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
           ? (await this.backend.runToolEvidence(turn.id, turn.directory, turn.startedAt)) !== "none"
           : false);
-        this.fail(turn, "Something went wrong on my end with that one. Mind trying again?", idle.id, ran ? "failed" : "errored");
+        failAfterEarlier("Something went wrong on my end with that one. Mind trying again?", ran ? "failed" : "errored");
         return;
       }
       // `start >= 0`: the watermark record is on the page read, so `after` is

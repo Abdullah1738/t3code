@@ -5397,3 +5397,93 @@ test.each(["question", "approval"].flatMap(kind => ["missing-record", "page-erro
   expect(h.conversations().map(op => op.text)).toEqual(["Both answered"]);
   expect(h.store.get<object | null>("activeTurn")).toBeNull();
 });
+
+test("review633r3: a failed late steer does not discard an earlier completed reply", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  for (const inbound of ["second", "third"]) {
+    h.input(inbound, `${inbound} question`);
+    await h.router.tick();
+  }
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of ["second", "third"]) {
+        const call = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (inbound === "second") h.backend.final("Second successful answer");
+        else h.backend.failed();
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Second successful answer"]);
+});
+
+test.each(["generic", "model-error", "first-turn-failure", "atomic-rollback"])("failure settlement preserves earlier replies and completed batch members (%s)", async kind => {
+  const h = setup(":memory:", { failureNoticeMs: 0, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("second", "Second question");
+  h.input("second-member", "Another part of the successful question");
+  await h.router.tick();
+  h.input("third", "Third question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  let lastIdle = "";
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of ["second", "third"]) {
+        const call = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+        if (inbound === "second") h.backend.final("Second successful answer");
+        else {
+          h.backend.failed();
+          const idle = h.backend.records.at(-1)!;
+          if (idle.type === "idle") {
+            if (kind === "model-error") idle.modelError = true;
+            if (kind === "first-turn-failure") idle.firstTurnFailure = true;
+          }
+          lastIdle = idle.id;
+        }
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  if (kind === "atomic-rollback") {
+    const before = h.store.get<object>("watermark");
+    const set = h.store.set.bind(h.store);
+    const failWatermark = spyOn(h.store, "set").mockImplementation((key, value) => {
+      if (key === "watermark") throw new Error("watermark write failed");
+      set(key, value);
+    });
+    try { await h.router.tick(); } finally { failWatermark.mockRestore(); }
+    expect(h.conversations().map(op => op.text)).toEqual(["Original answer"]);
+    expect(h.store.get<object>("watermark")).toEqual(before);
+    expect(h.store.get<object>("activeTurn")).toMatchObject({ phase: "running" });
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Second successful answer"]);
+  expect(inbounds(h.store).filter(row => ["second", "second-member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  expect(h.store.get<object>("watermark")).toMatchObject({ id: lastIdle });
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
