@@ -21,7 +21,7 @@ import {
   type KanbanBoard,
   type KanbanBoardListEntry,
   type KanbanBoardSnapshot,
-  type KanbanCard,
+  KanbanCard,
   type KanbanSubtask,
   type KanbanCardEvent,
   type KanbanCardModel,
@@ -260,6 +260,23 @@ export interface KanbanServiceShape {
     boardId: KanbanBoard["id"],
     page?: { readonly after: number; readonly limit: number },
   ) => Effect.Effect<KanbanBoardSnapshot, KanbanError>;
+  readonly cardPage: (input: {
+    readonly board: KanbanBoardId;
+    readonly after?: number;
+    readonly limit?: number;
+    readonly open?: boolean;
+    readonly fields?: ReadonlyArray<string>;
+  }) => Effect.Effect<
+    {
+      readonly cards: ReadonlyArray<Partial<KanbanCard>>;
+      readonly page: {
+        readonly limit: number;
+        readonly hasMore: boolean;
+        readonly nextAfter: number | null;
+      };
+    },
+    KanbanError
+  >;
   readonly watch: (boardId: KanbanBoard["id"]) => Stream.Stream<KanbanWatchEvent, KanbanError>;
   /** Every board with its list counts, then what changed whenever a count, board or thread does. */
   readonly boardSummaries: Stream.Stream<ReadonlyArray<KanbanBoardListEntry>, KanbanError>;
@@ -7547,6 +7564,44 @@ const make = Effect.gen(function* () {
     updateBoard,
     snapshot: (boardId) => readDb(snapshotOf(boardId)),
     replySnapshot: (boardId, page) => readDb(snapshotOf(boardId, true, page)),
+    cardPage: Effect.fn("KanbanService.cardPage")(function* (input) {
+      const after = input.after ?? 0;
+      const requested = input.limit ?? 200;
+      if (
+        !Number.isSafeInteger(after) ||
+        after < 0 ||
+        !Number.isSafeInteger(requested) ||
+        requested < 0
+      )
+        return yield* failWith("invalid", "after and limit must be nonnegative integers.");
+      const limit = Math.min(requested || 200, 500);
+      const valid = Object.keys(KanbanCard.fields);
+      const fields = input.fields ?? valid;
+      if (fields.some((field) => !Object.hasOwn(KanbanCard.fields, field)))
+        return yield* failWith("invalid", `fields must be KanbanCard keys: ${valid.join(",")}`);
+      const keys = new Set(["id", "number", "updatedAt", ...fields]);
+      const rows = yield* readDb(
+        rawStore.cardPage(input.board, { after, limit: limit + 1, open: input.open ?? false }),
+      );
+      const cards: Array<Partial<KanbanCard>> = [];
+      let bytes = 0;
+      for (const row of rows.slice(0, limit)) {
+        const card = Object.fromEntries(Object.entries(row).filter(([key]) => keys.has(key)));
+        cards.push(card);
+        // @effect-diagnostics-next-line preferSchemaOverJson:off -- Count the exact wire bytes of this dynamic projection.
+        bytes += Buffer.byteLength(JSON.stringify(card), "utf8");
+        // Include the crossing row so even one oversized card advances the cursor.
+        if (bytes > 4 * 1024 * 1024) break;
+      }
+      return {
+        cards,
+        page: {
+          limit,
+          hasMore: rows.length > cards.length,
+          nextAfter: cards.at(-1)?.number ?? null,
+        },
+      };
+    }),
     watch,
     boardSummaries,
     announce: (boardId, change) => Effect.asVoid(publish(boardId, change)),
