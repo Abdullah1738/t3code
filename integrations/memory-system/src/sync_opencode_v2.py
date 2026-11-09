@@ -4,9 +4,9 @@
 Reads session_v2 / session_message from an OpenCode-owned export and
 keeps two things current:
 
-1. data/opencode_raw.db  - exact copy of every native session_message.data and
+1. data/opencode_raw.db  - card-redacted copy of every native session_message.data and
    session_v2 row (zlib), upserted whenever the source row changes. This is the
-   lossless archive; migrated (codex/hermes) sessions are skipped because their
+   archive; migrated (codex/hermes) sessions are skipped because their
    canonical copies live in codex_raw.db / the hermes import.
 2. memory.db episodic_events - searchable projection, source='opencode'.
    Per message: main row turn_id=<msg_id>; extra rows <msg_id>.r (reasoning),
@@ -47,6 +47,7 @@ import time
 import traceback
 import zlib
 
+from card_mask import mask_json_text, mask_text
 import robob_readonly
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer, with_retry
 
@@ -128,6 +129,7 @@ def text_of(items):
 
 
 def clean_text(s):
+    s = mask_text(s)
     # json.loads turns a lone \udXXX escape into a lone surrogate, which sqlite
     # can't encode; re-pair valid halves and replace lone ones with U+FFFD
     try:
@@ -360,8 +362,8 @@ class Sync:
                 "SELECT id,type,seq,time_created,time_updated FROM session_message"
                 " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?", (sid, last, MESSAGE_PAGE)).fetchall()
             if not msgs:
-                srow = json.dumps({k: v for k, v in sess.items() if not k.startswith("_")},
-                                 ensure_ascii=False).encode("utf-8")
+                srow = mask_json_text(json.dumps({k: v for k, v in sess.items() if not k.startswith("_")},
+                                 ensure_ascii=False)).encode("utf-8")
                 with_retry(self.raw, lambda: self.raw.execute("INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
                            (sid, sess["time_updated"], zlib.compress(self.redactor.raw(srow, sid, sid), 6))), budget=self.budget)
                 def finish():
@@ -390,7 +392,7 @@ class Sync:
                     data, tu = row
                     b = data.encode("utf-8")
                     consumed_bytes += len(b)
-                    safe_raw = self.redactor.raw(b, mid, sid)
+                    safe_raw = mask_json_text(self.redactor.raw(b, mid, sid).decode("utf-8", "replace")).encode("utf-8")
                     digest = hashlib.sha256(safe_raw).hexdigest()
                     if have != (tu, digest):
                         raw_row = (mid, sid, mtype, seq, tc, tu, digest, len(safe_raw), zlib.compress(safe_raw, 6))

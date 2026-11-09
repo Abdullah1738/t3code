@@ -36,6 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_mask import mask_json_text, mask_text  # noqa: E402
 import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
@@ -424,14 +425,14 @@ class CodexSync:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
                     [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
-                     for line, ln in raw for safe_line in [self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)))]],
+                     for line, ln in raw for safe_line in [mask_json_text(self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line))).decode("utf-8", "replace")).encode("utf-8")]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                     [(SOURCE, event_session, tid, ts or int(time.time()), spk, safe_content, ctype, model, safe_meta)
+                     [(SOURCE, event_session, tid, ts or int(time.time()), spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
                       for event_session, capture_id, tid, spk, ctype, text, model, m, ts in events
                       for safe_content, safe_meta in [self.redactor.event(
                           SOURCE, event_session, tid, text, json.dumps(m, ensure_ascii=False), capture_id=(SOURCE,capture_id))]],

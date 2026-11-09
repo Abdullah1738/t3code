@@ -32,6 +32,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_mask import mask_json_text, mask_text
 import backend  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
@@ -464,7 +465,7 @@ class MuseSync:
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, sid, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                    [(SOURCE, sid, tid, ts, spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
                      for tid, ts, spk, ctype, content, model, m in rows
                      for safe_content, safe_meta in [self.redactor.event(
                          SOURCE, sid, tid, content, json.dumps(m, ensure_ascii=False))]],
@@ -473,7 +474,7 @@ class MuseSync:
                 "INSERT OR REPLACE INTO muse_sync_files(path, session_id, root_id, offset, size, mtime_ns, head_sha,"
                 " skip, state_json, synced_at, ino) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (path, sid, root_id, offset, size, stt.st_mtime_ns, sha, skip,
-                 json.dumps(state, ensure_ascii=False), int(time.time()), stt.st_ino),
+                 mask_json_text(json.dumps(state, ensure_ascii=False)), int(time.time()), stt.st_ino),
             )
             if meta:
                 self._upsert_meta(meta)

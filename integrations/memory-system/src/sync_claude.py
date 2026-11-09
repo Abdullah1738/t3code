@@ -6,7 +6,7 @@ Layout per root (transcript_roots.json, driver claudeAgent):
 
 Every child record carries the PARENT sessionId and its own agentId, so a child
 is keyed by "<sessionId>:agent:<agentId>" from its file, never by the bare
-sessionId. Each line is also kept verbatim in native_capture_raw.
+sessionId. Each line is also kept in native_capture_raw with card data masked.
 
 Projection: user/assistant text -> 'text'; thinking -> 'text' (metadata kind
 "thinking"); tool_use -> 'tool_call'; tool_result -> 'tool_result' ('error' when
@@ -24,6 +24,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_mask import mask_json_text, mask_text  # noqa: E402
 import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
@@ -354,14 +355,14 @@ class ClaudeSync:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
                     [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
-                     for line, ln in raw for safe_line in [self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)))]],
+                     for line, ln in raw for safe_line in [mask_json_text(self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line))).decode("utf-8", "replace")).encode("utf-8")]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, key, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                    [(SOURCE, key, tid, ts, spk, mask_text(safe_content), ctype, model, mask_json_text(safe_meta))
                      for tid, ts, spk, ctype, content, model, m, key in events
                      for safe_content, safe_meta in [self.redactor.event(
                          SOURCE, key, tid, content, json.dumps(m, ensure_ascii=False))]],

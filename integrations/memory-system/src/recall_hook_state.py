@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from recall_note import bounded_note
+from card_mask import mask_value
 
 
 class Store:
@@ -42,7 +43,7 @@ class Store:
 
     def save(self, key: str, state: dict):
         self.db.execute("INSERT INTO check_sessions VALUES (?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",
-                        (key, json.dumps(state)))
+                        (key, json.dumps(mask_value(state)[0])))
 
     def claim_first(self, key: str, task: str, eligible: bool) -> int | None:
         with self.transaction():
