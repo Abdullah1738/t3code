@@ -755,8 +755,7 @@ it.live(
         }).pipe(
           Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
           Effect.scoped,
-          Effect.provide(overBudgetAtCursor),
-          Effect.provide(fixture.services),
+          Effect.provide(Layer.mergeAll(fixture.services, overBudgetAtCursor)),
         );
         assert.equal(firstOverBudget?.kind, "snapshot");
         const held = yield* Deferred.make<void>();
