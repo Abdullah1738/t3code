@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 """Read-only collectors -> free filters -> one Haiku call -> durable watcher event.
 
-No message sends, except the owner's Telegram alert when a source keeps failing (live runs
-only). Live state is relative to WATCH_DIR, including under robob-watch test.
+Owner Telegram alerts cover repeated source failures and urgent inbox items while chat is down
+(live runs only). Live state is relative to WATCH_DIR, including under robob-watch test.
 Mail auth reuses mailsearch/mail_oauth; each account is isolated in a timed child.
 """
 import argparse
@@ -38,6 +38,8 @@ COMMERCE = HOME / '.local/bin/commerce'
 PHONE_LOCK = HOME / '.local/share/phone-lock'
 BUN = HOME / '.bun/bin/bun'
 TELEGRAM_CLI = HOME / '.local/share/telegram-bridge/src/cli.ts'
+SPECTRUM_CLI = HOME / '.local/share/spectrum-bridge/src/cli.ts'
+DUBAI = dt.timezone(dt.timedelta(hours=4))
 # A source is reported once it fails 3 runs in a row or 5 times in an hour, then at most
 # every 6 hours while it stays broken. Over 19-25 Oct 2026 that was 4 alerts.
 HEALTH_STREAK, HEALTH_FAILS, HEALTH_WINDOW, HEALTH_REALERT = 3, 5, 3600, 6 * 3600
@@ -917,6 +919,195 @@ def work_line(work):
     return 'In flight: ' + '; '.join(parts) + '.' if parts else None
 
 
+def urgent_kind(hit):
+    text = ' '.join(str(hit.get(k) or '') for k in ('sender', 'subject', 'preview'))
+    if str(hit.get('reason', '')).lower().startswith('security:') or re.search(
+            r'\b(?:new (?:login|sign[- ]in|device)|login attempt|password changed|(?:2fa|two[- ]factor)(?: authentication)? disabled)\b', text, re.I):
+        return 'security'
+    if is_withdrawal(hit):
+        return 'withdrawal'
+    if hit.get('charge_question') or re.search(r'\b(?:decline[ds]?|card transaction alert)\b', text, re.I):
+        return 'card'
+    if hit.get('source') in ('whatsapp', 'imessage', 'sms') and re.search(
+            r'\b(?:at your door|outside|arrived|no answer)\b', text, re.I) and re.search(
+            r'\b(?:noon|careem|driver|rider|courier|delivery)\b', text, re.I):
+        return 'driver'
+    return None
+
+
+def is_withdrawal(hit):
+    text = ' '.join(str(hit.get(k) or '') for k in ('sender', 'subject', 'preview'))
+    return bool(re.search(r'\bwithdraw(?:al|n|ing)?\b', text, re.I) and re.search(
+        r'\b(?:crypto|exchange|btc|eth|trx|usdt|usdc|bitcoin|ethereum|tron|btse|binance|okx|bybit|kraken|coinbase)\b', text, re.I))
+
+
+def chat_down(timeout=3):
+    stub = os.environ.get('INBOX_TRIAGE_SPECTRUM_CLI')
+    if (os.environ.get('ROBOB_TEST') or os.environ.get('NODE_ENV') == 'test' or os.environ.get('PYTEST_CURRENT_TEST')) and not stub:
+        return True, 'bridge health refused: test run needs a stub'
+    try:
+        out = subprocess.run([str(BUN), stub or str(SPECTRUM_CLI), 'health'], capture_output=True,
+                             text=True, timeout=min(3, timeout),
+                             env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
+        if out.returncode:
+            return True, f'bridge health exit {out.returncode}'
+        data = json.loads(out.stdout)
+        if not isinstance(data, dict):
+            return True, 'bridge health invalid JSON object'
+        if data.get('ready') is not True or data.get('openchamberConnected') is not True:
+            return True, 'bridge health: chat not ready or backend disconnected'
+        return False, ''
+    except subprocess.TimeoutExpired:
+        return True, 'bridge health timed out'
+    except (OSError, ValueError):
+        # Health output can include private connection details; never echo it into an alert/log.
+        return True, 'bridge health unavailable or invalid JSON'
+
+
+def dubai_time(ts):
+    if isinstance(ts, str):
+        ts = dt.datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+    return dt.datetime.fromtimestamp(ts, DUBAI).strftime('%H:%M')
+
+
+def withdrawal_refs(item):
+    text = ' '.join(str(item.get(k) or '') for k in ('subject', 'preview'))
+    return set(m.group().lower() for m in re.finditer(
+        r'\b(?:0x[0-9a-f]{64}|[0-9a-f]{64}|\d{10,})\b', text, re.I))
+
+
+def withdrawal_statuses(hits, items, now, deadline=None):
+    # Share one three-second archive budget across the batch, rather than three seconds per hit.
+    deadline = min(deadline, time.time() + 3) if deadline is not None else time.time() + 3
+    cached = {}
+    for hit in hits:
+        if not is_withdrawal(hit):
+            continue
+        hit['reason'] = hit['reason'].split('; latest status for ref ', 1)[0]
+        refs = withdrawal_refs(hit)
+        hit['latest_status'] = 'not checked'
+        if not refs:
+            continue
+        rows = list(items)
+        found = latest_withdrawal_status(hit, refs, rows)
+        if not found:
+            try:
+                mc = load_module('triage_withdrawal_cases', MONEY_CASES)
+                for ref in sorted(refs):
+                    if ref not in cached:
+                        start = dt.datetime.fromtimestamp(now - 86400, DUBAI).date().isoformat()
+                        checked = []
+                        result = mc.charges.search('"' + ref + '"', start, source='email', n=20, deadline=deadline)
+                        for row in sorted(result, key=lambda r: r.get('ts', 0), reverse=True):
+                            if now - 86400 <= row.get('ts', 0) <= now and not row.get('from_me'):
+                                # Search snippets are highlighted and can omit the status or reference.
+                                body = mc.charges.show(row, deadline=deadline)
+                                checked.append({**row, 'preview': body})
+                                if ref in withdrawal_refs(checked[-1]):
+                                    break
+                        cached[ref] = checked
+                    rows += cached[ref]
+                found = latest_withdrawal_status(hit, refs, rows)
+                if not found:
+                    hit['latest_status'] = 'not found'
+            except Exception:
+                continue
+        if found:
+            row, ref, status = found
+            hit['latest_status'] = {'status': status, 'at': stamp(row['ts']), 'id': row['id']}
+            hit['reason'] += f'; latest status for ref {ref}: {status} at {dubai_time(row["ts"])}'
+
+
+def latest_withdrawal_status(hit, refs, rows):
+    matches = [row for row in rows if row.get('id') != hit['id'] and not row.get('from_me')
+               and row.get('ts', 0) >= hit.get('ts', 0) and refs & withdrawal_refs(row)]
+    if not matches:
+        return None
+    row = max(matches, key=lambda r: r['ts'])
+    status = withdrawal_terminal_status(row)
+    return (row, sorted(refs & withdrawal_refs(row))[0], status) if status else None
+
+
+def withdrawal_terminal_status(row):
+    terminal = r'(completed|success(?:ful)?|failed|cancelled|canceled|rejected)'
+    for field in ('subject', 'preview'):
+        for clause in re.split(r'[;\n.!]', str(row.get(field) or '')):
+            if re.search(r'\b(?:not|if|when|once|until)\b', clause, re.I):
+                continue
+            if re.search(r'\bwithdrawal[\s:-]+(?:(?:identity|security|address|email|request)[\s:-]+)?'
+                         r'(?:verification|confirmation|authentication|validation)\b', clause, re.I):
+                continue
+            status = (re.fullmatch(r'\s*(?:status\s*[:=-]\s*)?' + terminal + r'\s*', clause, re.I)
+                      or re.search(r'\bwithdrawal\b[\s:=-]+(?:(?:is|was|has|been|successfully|request|status)[\s:=-]+){0,5}'
+                                   + terminal + r'\b', clause, re.I)
+                      or re.search(r'\b' + terminal + r'\s+(?:(?:your|crypto|trx|eth|btc|usdt)\s+){0,2}withdrawal\b', clause, re.I))
+            if status:
+                value = status[1].capitalize()
+                return 'Cancelled' if value == 'Canceled' else value
+    return None
+
+
+def urgent_alerts(state, report, wd, now, dry=False, deadline=None):
+    sent = state['telegram_sent'] = {i: at for i, at in state.get('telegram_sent', {}).items() if now - at < 48 * 3600}
+    attempts = state.setdefault('telegram_pending', {})
+    hits = report['hits']
+    urgent = [(hit, urgent_kind(hit)) for hit in hits]
+    urgent = [(hit, kind) for hit, kind in urgent if kind]
+    for hit, _ in urgent:
+        if hit['id'] in sent:
+            hit['telegram_sent_at'] = stamp(sent[hit['id']])
+    if not urgent:
+        return {}
+    down, why = chat_down()
+    if not down:
+        return {}
+    report['chat_down'] = why
+    pending = [(h, k) for h, k in urgent if h['id'] not in sent and not h.get('telegram_sent_at')]
+    if dry or wd.resolve() != LIVE.resolve():
+        report['telegram_would_send'] = [h['id'] for h, _ in pending]
+        return {'telegram_would_send': report['telegram_would_send'], 'chat_down': why}
+    stub = os.environ.get('ROBOB_WATCH_TELEGRAM_CLI')
+    testing = os.environ.get('ROBOB_TEST') or os.environ.get('NODE_ENV') == 'test' or os.environ.get('PYTEST_CURRENT_TEST')
+    errors, delivered = {}, []
+    for hit, kind in pending:
+        if testing and not stub:
+            errors[hit['id']] = 'refused: test run; telegram notify would reach a real app'
+            continue
+        seconds = min(4, deadline - time.time()) if deadline is not None else 4
+        if seconds <= 0:
+            errors[hit['id']] = 'time budget; telegram notify not attempted'
+            continue
+        sender = clean(hit.get('sender'), 50)
+        summary = clean(hit.get('subject') or hit.get('preview'), 110)
+        reason = clean(hit['reason'], 110)
+        text = clean(f'{kind.capitalize()}: {sender} — {summary} — {reason}', 300)
+        key = 'inbox-triage:urgent:' + hashlib.sha256(hit['id'].encode()).hexdigest()[:16]
+        # Telegram rejects changed text under an existing key, including after a lost response.
+        if hit['id'] not in attempts:
+            attempts[hit['id']] = {'text': text, 'at': now}
+            atomic(wd / 'cursor.json', state)
+        text = attempts[hit['id']]['text']
+        try:
+            out = subprocess.run([str(BUN), stub or str(TELEGRAM_CLI), 'notify', '--source', 'Inbox triage',
+                                  '--severity', 'attention', '--text', text, '--key', key],
+                                 capture_output=True, text=True, timeout=seconds,
+                                 env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
+            if out.returncode:
+                errors[hit['id']] = f'telegram notify exit {out.returncode}'
+                continue
+        except (OSError, subprocess.TimeoutExpired) as e:
+            errors[hit['id']] = type(e).__name__
+            continue
+        sent[hit['id']] = now
+        attempts.pop(hit['id'], None)
+        hit['telegram_sent_at'] = stamp(now)
+        # Commit each success before the next external call; retries also keep the same Telegram key.
+        atomic(wd / 'cursor.json', state)
+        delivered.append(hit['id'])
+    return {'chat_down': why, **({'telegram_sent': delivered} if delivered else {}),
+            **({'urgent_alert_error': errors} if errors else {})}
+
+
 def event_text(path, hits, errors, work=None):
     lines = [f'Inbox triage: {len(hits)} candidate(s). Read full batch: {path}']
     if errors:
@@ -924,13 +1115,23 @@ def event_text(path, hits, errors, work=None):
     if work_line(work):
         lines.append(work_line(work))
     for item in hits[:10]:
-        lines.append(f'[{item["urgency"]}] {item["source"]} {item["sender"]}: {item["subject"] or item["preview"][:100]} — {item["reason"]} ({item["id"]})')
+        note = (f" (already sent to Telegram at {dubai_time(item['telegram_sent_at'])} Dubai; don't alert again, follow up only if something changed)"
+                if item.get('telegram_sent_at') else '')
+        lines.append(f'[{item["urgency"]}] {item["source"]} {item["sender"]}: {item["subject"] or item["preview"][:100]} — {item["reason"]} ({item["id"]}){note}')
     if len(hits) > 10:
         lines.append(f'Plus {len(hits) - 10} more in the batch JSON.')
     return '\n'.join(lines)[:5500]
 
 
+def defer_for_chat(state, hits):
+    by_id = {i['id']: i for i in state['queue']}
+    for hit in hits:
+        by_id[hit['id']] = {**hit, 'chat_deferred': True}
+    state['queue'] = list(by_id.values())
+
+
 def replay_outbox(state, wd, run):
+    started = time.time()
     out = state.get('outbox')
     if not out:
         return None
@@ -944,7 +1145,7 @@ def replay_outbox(state, wd, run):
     try:
         report = read_json(Path(out['batch']), None) if out.get('batch') else None
         hits = report['hits'] if report else None
-        done = handled(hits, time.time() + LATE_BY)[0] if hits else {}
+        done = handled(hits, started + LATE_BY)[0] if hits else {}
     except (OSError, ValueError, KeyError, TypeError):
         report, done = None, {}
     if report is not None and isinstance(report.get('hits'), list):
@@ -956,6 +1157,18 @@ def replay_outbox(state, wd, run):
             state.pop('outbox')
             atomic(wd / 'cursor.json', state)
             return None
+        now = time.time()
+        withdrawal_statuses(report['hits'], report['hits'] + state.get('queue', []), now, deadline=started + 50)
+        urgent = urgent_alerts(state, report, wd, now, deadline=started + 57)
+        atomic(Path(out['batch']), report)
+        if urgent:
+            log_run(wd, {'replay': True, **urgent})
+        if urgent.get('chat_down'):
+            # A printed wake would fall back to Telegram again when the bridge itself is down.
+            defer_for_chat(state, report['hits'])
+            state.pop('outbox')
+            atomic(wd / 'cursor.json', state)
+            return ''
         out['event'] = event_text(out['batch'], report['hits'], report.get('source_errors'), report.get('live_work'))
     out['run'] = run
     atomic(wd / 'cursor.json', state)
@@ -1101,9 +1314,10 @@ def run(args):
     if not dry:
         pending = bool(state.get('outbox'))
         replay = replay_outbox(state, wd, run_id)
-        if replay:
+        if replay is not None:
             log_run(wd, {'replay': True, 'cost_usd': 0})
-            print(replay, flush=True)
+            if replay:
+                print(replay, flush=True)
             return 0
         # Collection can take ~30 s by itself, so after a slow replay that cleared its batch
         # the next run collects instead of this one being killed half way.
@@ -1133,6 +1347,9 @@ def run(args):
     for item in state['queue']:
         redact_item(item)
         reason = prefilter(item, now, rules)
+        # A selected login alert still needs attention after its embedded OTP expires.
+        if reason == 'stale_otp' and item.get('chat_deferred') and urgent_kind(item) == 'security':
+            reason = None
         if reason:
             drops[reason] += 1
             dropped.append([item['id'], reason])
@@ -1158,14 +1375,15 @@ def run(args):
             atomic(wd / 'cursor.json', state)
     # A live run classifies one batch and leaves the rest queued for the next tick; a
     # replay has no next tick, so it classifies every candidate, a batch at a time.
-    ready = [i for i in state['queue'] if i['id'] not in held]
+    ready = sorted([i for i in state['queue'] if i['id'] not in held], key=lambda i: bool(i.get('chat_deferred')))
     items = ready if dry else ready[:MAX_BATCH]
     meta = {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0}
-    hits = []
     context = build_context(items, watchers, now) if items else {}
-    for n in range(0, len(items), MAX_BATCH):
+    classify_items = [i for i in items if not i.get('chat_deferred')]
+    hits = [{'id': i['id'], 'reason': i['reason'], 'urgency': i['urgency']} for i in items if i.get('chat_deferred')]
+    for n in range(0, len(classify_items), MAX_BATCH):
         seconds = 20 if dry else min(20, now + CLASSIFY_BY - time.time())
-        got, used = classify_batch(items[n:n + MAX_BATCH], context, seconds)
+        got, used = classify_batch(classify_items[n:n + MAX_BATCH], context, seconds)
         hits += got
         meta['model'] = used.get('model', meta['model'])
         for k in ('input_tokens', 'output_tokens'):
@@ -1197,6 +1415,9 @@ def run(args):
         report['charge_check_errors'] = charge_error
     if held:
         report['held_for_receipt'] = sorted(held)
+    withdrawal_statuses(selected, items + state['queue'] + [i for r in results.values() for i in r['items']],
+                        now, deadline=now + 50 if not dry else None)
+    urgent = urgent_alerts(state, report, wd, now, dry, deadline=now + 57)
     if dry:
         report['dropped_ids'] = dropped
         report['candidates'] = items
@@ -1207,14 +1428,19 @@ def run(args):
         return 1 if errors or meta.get('classifier_error') else 0
     classified = {i['id'] for i in items}
     state['queue'] = [i for i in state['queue'] if i['id'] not in classified]
+    deferred = bool(urgent.get('chat_down'))
+    if deferred:
+        defer_for_chat(state, selected)
+        report['deferred_for_chat'] = True
     event = None
     if selected:
         batch_id = hashlib.sha256('|'.join(i['id'] for i in items).encode()).hexdigest()[:16]
         root = DATA if wd.resolve() == LIVE.resolve() else wd / 'diagnostics'
         path = root / 'batches' / (dt.datetime.fromtimestamp(now, UTC).strftime('%Y%m%dT%H%M%S') + '-' + batch_id + '.json')
         atomic(path, report)
-        event = event_text(path, selected, errors, report.get('live_work'))
-        state['outbox'] = {'run': run_id, 'event': event, 'batch': str(path)}
+        if not deferred:
+            event = event_text(path, selected, errors, report.get('live_work'))
+            state['outbox'] = {'run': run_id, 'event': event, 'batch': str(path)}
     atomic(wd / 'cursor.json', state)
     raised_error = charges_raised(items, selected, now, wd)
     if raised_error:
@@ -1223,7 +1449,7 @@ def run(args):
                  'hits': len(selected), 'queued': len(state['queue']), 'source_errors': errors,
                  **({'answer_check_errors': answer_errors} if answer_errors else {}),
                  **({'charge_check_errors': charge_error} if charge_error else {}),
-                 **({'held_for_receipt': len(held)} if held else {}), **health,
+                 **({'held_for_receipt': len(held)} if held else {}), **health, **urgent,
                  'ms': round((time.time() - now) * 1000), **meta})
     if event:
         print(event, flush=True)
