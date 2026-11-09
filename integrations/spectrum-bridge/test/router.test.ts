@@ -4848,3 +4848,197 @@ test("a held failure notice is sent once the grace passes with no recovery", asy
   await h.router.tick();
   expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
 });
+
+test("review633: a late uncertain steer cannot consume a newer batched message", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response, still in flight"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  h.input("followup", "Earlier follow-up");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST");
+  h.backend.promptBehavior = async call => {
+    if (call.messageId === messageId("followup")) {
+      // The original steer commits after negative readback. The fallback POST
+      // replays that ID, so its newly appended words are not admitted.
+      const old = steers[0]!;
+      h.backend.records.push({ id: old.messageId, type: "user", text: old.text, time: { created: Date.now() } });
+    } else h.backend.accept(call);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  await h.router.tick();
+  const newer = inbounds(h.store).find(row => row.id === "newer")!;
+  const admitted = h.backend.records.filter(m => m.type === "user");
+  expect({ newerState: newer.state, newerAdmitted: admitted.some(m => m.type === "user" && m.text.includes("UNIQUE_NEWER_REQUEST")) })
+    .not.toEqual({ newerState: "done", newerAdmitted: false });
+});
+
+
+test.each(["single", "multi", "restart", "busy", "status", "quoted", "file", "refused", "absent", "rotation", "context"])("sealed steer fallback keeps newer input separate (%s)", async kind => {
+  const h = filesSetup(kind === "rotation" ? { rotateAfterMs: 1 } : {});
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => {
+    if (kind === "refused") return "refused";
+    throw new Error("lost response, still in flight");
+  });
+  if (kind === "quoted") {
+    h.input("target", "Original quoted text");
+    h.store.updateInbound("target", "done");
+  }
+  h.input("first", "Original work");
+  await h.router.tick();
+  const reply = kind === "quoted" ? { replyTo: "target" } : {};
+  h.input("followup", "Earlier follow-up", { ...reply, source: "typed" });
+  if (kind === "multi" || kind === "restart") h.input("member", "Second original line", reply);
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const sealed = h.store.get<NormalizedInbound>("batch:followup")!;
+  const originalBody = steers[0]!.text;
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST", { ...reply, attachments: kind === "file" ? [attachment()] : [] });
+  if (kind === "quoted") h.store.updateInbound("target", "done", { ...inbounds(h.store).find(row => row.id === "target")!.payload as NormalizedInbound, text: "Changed quote" });
+  if (kind === "file") h.transport.downloadAttachment = async () => ({ data: tinyPng, mimeType: "image/png", name: "newer.png" });
+  if (kind === "context") h.store.set("missedSynthetic", [{ id: "wake:missed", text: "UNIQUE_MISSED_UPDATE" }]);
+  let armed = true;
+  if (kind === "busy" || kind === "status") h.backend.onStatuses = () => {
+    if (!armed || h.store.get("batch-phase:followup") !== "preparing") return;
+    armed = false;
+    if (kind === "busy") h.backend.states[steers[0]!.id] = { type: "busy" };
+    else h.input("status", "/status");
+  };
+  h.backend.promptBehavior = async call => {
+    if (call.messageId === messageId("followup") && kind !== "absent" && kind !== "refused") {
+      // The original steer commits after negative readback; the idempotent fallback replays it.
+      if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.records.push({ id: call.messageId, type: "user", text: originalBody, time: { created: Date.now() } });
+    } else h.backend.accept(call);
+  };
+  let router = kind === "restart" ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  setSystemTime(start + 120_000);
+  await router.tick();
+  if (kind === "busy" || kind === "status") {
+    expect(h.store.get<NormalizedInbound>("batch:followup")).toEqual(sealed);
+    expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+    h.backend.states = {};
+    router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+    await router.tick();
+  }
+  const fallback = h.backend.prompts.find(prompt => prompt.messageId === messageId("followup"))!;
+  expect(fallback).toMatchObject({ id: steers[0]!.id, text: originalBody, files: [] });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(sealed.batchIds);
+  expect(inbounds(h.store).find(row => row.id === "newer")?.state).toBe("pending");
+  for (const id of sealed.batchIds!) expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("done");
+  if (kind === "context") {
+    expect(fallback.system).not.toContain("UNIQUE_MISSED_UPDATE");
+    expect(h.store.get<unknown[]>("missedSynthetic")).toHaveLength(1);
+  }
+  h.backend.onStatuses = undefined;
+  h.backend.final("Follow-up answer");
+  await router.tick();
+  const newer = h.backend.prompts.find(prompt => prompt.messageId === messageId("newer"))!;
+  expect(newer.text).toContain("UNIQUE_NEWER_REQUEST");
+  expect(newer.messageId).not.toBe(fallback.messageId);
+  expect(newer.files).toHaveLength(kind === "file" ? 1 : 0);
+  if (kind === "context") {
+    expect(newer.system).toContain("UNIQUE_MISSED_UPDATE");
+    expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([]);
+  }
+  expect(inbounds(h.store).find(row => row.id === "newer")?.state).toBe("done");
+  expect(h.backend.records.some(record => record.type === "user" && record.id === messageId("newer") && record.text.includes("UNIQUE_NEWER_REQUEST"))).toBe(true);
+});
+
+
+test("queued steer fallback survives reopening the store with its original members and body", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-steer-fallback-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path);
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  h.input("followup", "Earlier follow-up");
+  h.input("member", "Another original line");
+  await h.router.tick();
+  const original = steers[0]!;
+  h.backend.final("Original answer");
+  h.input("newer", "UNIQUE_NEWER_REQUEST");
+  h.backend.onStatuses = () => {
+    if (h.store.get("batch-phase:followup") === "preparing") h.backend.states[original.id] = { type: "busy" };
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+  h.backend.onStatuses = undefined;
+  h.backend.states = {};
+  h.store.close();
+  const reopened = new Store(path);
+  stores.push(reopened);
+  const restarted = new Router(reopened, h.backend, h.transport, options);
+  h.backend.promptBehavior = async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  };
+  await restarted.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ id: original.id, messageId: original.messageId, text: original.text });
+  expect(reopened.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(["followup", "member"]);
+  expect(inbounds(reopened).filter(row => ["followup", "member", "newer"].includes(row.id)).map(row => row.state)).toEqual(["done", "done", "pending"]);
+});
+
+test.each(["wake", "secret"])("an intervening %s cannot rotate an unresolved steer into a second execution", async kind => {
+  const h = setup(":memory:", { rotateAfterMs: 1, watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const records = new Map<string, MessageRecord[]>();
+  const admitted = new Set<string>();
+  h.backend.createBehavior = async () => {
+    const id = `ses_${h.backend.creates.length}`;
+    h.backend.records = [];
+    records.set(id, h.backend.records);
+    return { id, directory: `/Chats/${id}` };
+  };
+  h.backend.messages = async id => records.get(id) ?? [];
+  h.backend.promptAccepted = async (id, _directory, messageId) => admitted.has(`${id}:${messageId}`);
+  h.backend.promptBehavior = async call => {
+    const key = `${call.id}:${call.messageId}`;
+    if (admitted.has(key)) return;
+    admitted.add(key);
+    records.get(call.id)!.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+  };
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original work");
+  await h.router.tick();
+  const syntheticBody = kind === "wake" ? wakeBody() : "Filled in the secure form callback";
+  h.input(`${kind}:before-steer`, syntheticBody);
+  h.input("followup", "Earlier follow-up");
+  h.input("member", "Another original line");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const original = steers[0]!;
+  h.backend.final("NO_REPLY");
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  const watcher = h.backend.prompts.at(-1)!;
+  expect(watcher.text).toBe(syntheticBody);
+  // The old steer commits after its readback, while the intervening watcher runs.
+  admitted.add(`${original.id}:${original.messageId}`);
+  records.get(original.id)!.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.records = records.get(watcher.id)!;
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  const deliveries = [...records].flatMap(([id, rows]) => rows.filter(row => row.type === "user" && row.id === original.messageId).map(() => id));
+  expect(deliveries).toEqual([original.id]);
+  expect(h.backend.prompts.find(prompt => prompt.messageId === original.messageId)).toMatchObject({ id: original.id, text: original.text });
+  expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  // Once the steer is accepted, ordinary future turns may rotate again.
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  h.input("later", "New work");
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.id).not.toBe(original.id);
+});

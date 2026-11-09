@@ -1345,3 +1345,50 @@ test("owner, Moni and group outages each get one notice, with held messages orde
   }
   setSystemTime();
 });
+
+
+test.each(["dm", "group"] as const)("late steer fallback in %s preserves named members and holds newer context", async kind => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(_id: string, _directory: string, messageId: string, text: string) {
+    steers.push({ messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original work", "+971585933213");
+  await h.router.tick();
+  h.input("followup", "robob earlier follow-up", "+971585933213");
+  h.input("member", "robob second original line", "+447700900123");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  const sealed = h.store.get<NormalizedInbound>("batch:followup")!;
+  const original = steers[0]!;
+  expect(original.text).toContain("Moni:");
+  expect(original.text).toContain("Tom (+447700900123):");
+  h.backend.final("Original answer");
+  h.input("newer", "robob UNIQUE_NEWER_REQUEST", "+971585933213");
+  if (kind === "group") h.store.set("group-observed", ["UNIQUE_OBSERVED_CONTEXT"]);
+  const prompt = h.backend.prompt.bind(h.backend);
+  let fallbackText: string | undefined;
+  h.backend.prompt = async (...args) => {
+    if (args[2] === original.messageId) {
+      fallbackText = args[3];
+      h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    } else await prompt(...args);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(fallbackText).toBe(original.text);
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(sealed.batchIds);
+  expect(h.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get("newer")!.state).toBe("pending");
+  if (kind === "group") expect(h.store.get<string[]>("group-observed")).toEqual(["UNIQUE_OBSERVED_CONTEXT"]);
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  const newer = h.backend.records.find(record => record.type === "user" && record.id !== original.messageId && record.text.includes("UNIQUE_NEWER_REQUEST"));
+  expect(newer).toBeDefined();
+  if (kind === "group") {
+    expect(newer!.type === "user" && newer!.text).toContain("UNIQUE_OBSERVED_CONTEXT");
+    expect(h.store.get<string[]>("group-observed")).toEqual([]);
+  }
+});
