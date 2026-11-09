@@ -260,8 +260,8 @@ export async function fixture(directory: string, scale: keyof typeof scales, see
   seedOwnerAnswers(boards);
   boards.close();
   const manifest = {
-    version: 2,
-    ownerAnswers: ownerAnswerWorkload,
+    version: 3,
+    ownerWrites: ownerAnswerWorkload,
     synthetic: true,
     seed,
     scale,

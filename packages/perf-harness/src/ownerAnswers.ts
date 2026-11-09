@@ -1,6 +1,6 @@
 import type { KanbanCard, KanbanMessage } from "@t3tools/contracts";
 
-export const ownerAnswerWorkload = "owner-answers-v2";
+export const ownerAnswerWorkload = "owner-writes-v3";
 export const ownerAnswerSamples = 40;
 export type OwnerAnswerRoute = "worker" | "evaluator" | "fallback" | "launch";
 
@@ -30,13 +30,13 @@ export function ownerAnswerCases() {
 }
 export type OwnerAnswerCase = ReturnType<typeof ownerAnswerCases>[number];
 
-export function mockAnswerDelivery(raw: string) {
+export function mockAnswerDelivery(raw: string, samples: ReadonlyArray<Pick<OwnerAnswerCase, "sample" | "marker">> = ownerAnswerCases()) {
   // A concurrent append may leave the final record incomplete until the next poll.
   const prompts = raw.split("\n").slice(0, -1).filter(Boolean).map((line) => JSON.parse(line))
     .filter((request) => request.method === "session/prompt");
-  const missing = ownerAnswerCases().filter((sample) =>
+  const missing = samples.filter((sample) =>
     !prompts.some((request) => JSON.stringify(request.params?.prompt).includes(sample.marker)));
-  return { observed: ownerAnswerSamples - missing.length, missing: missing.map((sample) => sample.sample) };
+  return { observed: samples.length - missing.length, missing: missing.map((sample) => sample.sample) };
 }
 
 export function ownerAnswerRequest(sample: OwnerAnswerCase) {

@@ -33,7 +33,7 @@ A missing metric or correctness check prevents a passing verdict.
 Driver measurements cover loopback responses and simulated 10 Mbps/100 ms
 body delivery; native paint and device latency remain unmeasured. Post response includes delivery on the old server;
 it is not a durable-ACK measurement. Concurrent activity uses HTTP board writes and WS metadata commands through the
-real event sink. Owner answers use the existing local ACP mock with no provider credentials;
+real event sink. Owner writes use the existing local ACP mock with no provider credentials;
 real provider token streaming and true cursor resume are not implemented. No work pool is added.
 TB/USB storage performance
 requires a separate, capacity-checked storage workload. No cloud result certifies
@@ -91,7 +91,7 @@ Acceptance statistics (`paired-bootstrap-v2`):
   25% only when its interval excludes 1.0. Requests within a run are correlated;
   they are not independent bootstrap units. These are per-metric intervals,
   without multiplicity correction. Ten pairs cannot establish equivalence.
-  Require forty samples per run for the six foreground endpoint families;
+  Require forty samples per run for the seven foreground endpoint families;
   absent/short families are unmeasured. The one-shot mobile cold/resume requests
   remain diagnostics with unmeasured tails.
 - WAL cost is cumulative frames and frame bytes (page size plus 24-byte frame
@@ -116,19 +116,32 @@ Old metric keys remain in the ledger; foreground response keys contain each
 run's p95, with explicit `.p50` and `.p95` keys and `requests`/`summaries` alongside.
 Comparisons reject legacy ledgers and unpaired or fewer than ten runs.
 
-Owner-answer workload (`owner-answers-v2`):
+Owner-write workload (`owner-writes-v3`):
 
 - Each run makes forty `kanban.answer` WebSocket RPCs against distinct persisted
   open asks under the sustained HTTP and WS writers. Ten each target a worker, an evaluator, an existing evaluator
   after its worker has moved on, and a newly launched evaluator after the original
   asker was archived. Twenty submit freeform text on a choice block, and twenty
-  pick an option. Plain discussion posts are measured separately. Each pick
+  pick an option. Each pick
   targets `q2` at message 22 and must leave the independent `q1` at message 21 open.
   HTTP preparation and closure checks are outside `answer.response.ms`.
+- Each run also makes forty actual `kanban.message.post` WebSocket RPCs on a
+  separate set of forty fresh discussions. Ten each target an asking worker,
+  evaluator, stale-worker fallback and new evaluator launch. The returned and
+  read-back message must match the owner, exact text and next sequence; the
+  original ask must close separately. Reply markers are absent from seeded
+  questions and card titles, so those cannot count as provider delivery.
+- `messagePost.response.ms` contains only those forty WS post timings. The old
+  `post.response.ms` remains the separate HTTP post workload. Neither HTTP post
+  latency nor answer latency can fill the WS post distribution or coverage.
 - `answer.response.ms` retains all forty response values, p50/p95/p99 and max.
   Gate v2 applies the existing per-run p95 and pooled p99 regression checks. At
   5x the candidate's pooled answer p95 must also be strictly below 500 ms. This
   target can fail even when the relative comparison passes.
+- The separate WS post target also requires candidate pooled p95 strictly below
+  500 ms at 5x. Its existing-style primary p95 and clustered pooled p99 regression
+  gates use only `messagePost.response.ms`. Missing or repeated samples, missing
+  persisted sequence evidence, or open asks prevent a passing WS post target.
 - A disposable clone's `synthetic` provider uses `acpRegistry` with the existing
   `apps/server/scripts/acp-mock-agent.ts` local command. Its HOME, settings,
   project workspace and request log belong to that clone. No credentials or
@@ -138,34 +151,49 @@ Owner-answer workload (`owner-answers-v2`):
   discussion evaluator links. Missing evidence leaves coverage unmeasured;
   live provider delivery is always unmeasured. Core service tests remain the
   independent proof of launch semantics.
+- `ownerMessagePostCoverage` reports persistence, ask closure and mock delivery
+  independently. Post delivery requires forty unique reply markers in ACP prompts,
+  forty expected-recipient messages and ten new evaluator links for the post
+  discussions, separate from the answer evidence. Live delivery remains unmeasured.
 - Raw per-sample open/closed evidence and provider requests live in each run's
   retained artifacts. Answer trace phases use the originating action IDs;
   `serial.queue`, `serial.key` and `serial.wait_ms` identify routing and evaluator
   admission waits when the server supplies them. Older builds leave these
   admission phases unmeasured.
+- Both owner RPCs have a 60-second request timeout. The collection window allows
+  90 minutes because forty posts taking the reported 10–43 seconds each cannot
+  complete within the earlier two-minute read workload window. This is a failure
+  bound for a slow baseline; the response budgets remain 500 ms. Both artifacts
+  run with the same harness, fixture and bounds.
 
-Reuse a complete, closed M1a synthetic fixture by copying and upgrading it; never
+Reuse a complete, closed M1a or unconsumed `owner-answers-v2` synthetic fixture by copying and upgrading it; never
 modify the pristine source. The helper copies only the synthetic databases,
 adds the asks, repairs only the answer recipients' opaque history nodes, and
 includes the updated main/boards hashes and workload version in the
 new fixture identity:
 
 ```sh
-node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/1x /home/user/owner-answer-fixtures/1x
-node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/5x /home/user/owner-answer-fixtures/5x
+node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/1x /home/user/owner-writes-v3-fixtures/1x
+node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/5x /home/user/owner-writes-v3-fixtures/5x
 ```
+
+For v2 sources, substitute the pristine v2 fixture directory. Its forty answer
+cards remain byte-for-byte unchanged and forty post cards are added. Consumed,
+unsupported or already-v3 fixtures are rejected by the upgrade command. Existing
+v2 manifests and old ledgers cannot certify v3. Generate fresh v3 fixtures with
+`fixture.ts NEW_DIRECTORY 1x|5x 42` when no reusable source is available.
 
 Run the same harness checkout against the exact base artifact and the integrated
 candidate, on one offbox worker. Replace the artifact paths and candidate SHA
 with their verified values. Use separate fresh output directories:
 
 ```sh
-node packages/perf-harness/src/paired.ts /home/user/owner-answer-fixtures/1x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-answer/paired-1x 10
-node packages/perf-harness/src/paired.ts /home/user/owner-answer-fixtures/5x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-answer/paired-5x 10
+node packages/perf-harness/src/paired.ts /home/user/owner-writes-v3-fixtures/1x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-writes-v3/paired-1x 10
+node packages/perf-harness/src/paired.ts /home/user/owner-writes-v3-fixtures/5x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-writes-v3/paired-5x 10
 ```
 
 These are remote commands: invoke them with `offbox run --remote` from that
 checkout, or place them in an included script run through that command. Keep
 both scales' ledgers, comparison.json and artifact directories. Ten accepted
 interleaved pairs per scale are required. Native/device/correctness gaps can keep
-the controller exit nonzero even when relative performance and the answer target pass.
+the controller exit nonzero even when relative performance and both owner-write targets pass.

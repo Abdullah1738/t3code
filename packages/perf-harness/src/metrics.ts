@@ -28,6 +28,7 @@ export type Run = {
   harnessHash?: string;
   workloadMode?: "steady" | "legacy-burst";
   ownerAnswers?: { workload: string; rpcAnswers: number; consumedAsks: number; routedAsks: number; launchedEvaluators: number; mockProvider: "acp-local"; mockDelivered: number; liveDelivery: "unmeasured" };
+  ownerMessagePosts?: { workload: string; rpcPosts: number; persistedPosts: number; consumedAsks: number; routedPosts: number; launchedEvaluators: number; mockProvider: "acp-local"; mockDelivered: number; liveDelivery: "unmeasured" };
   fixtureHash: string;
   runtimeHash: string;
   hardwareHash: string;

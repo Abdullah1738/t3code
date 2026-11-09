@@ -15,7 +15,8 @@ const runs = (sha: string, value: number | null): Run[] =>
     agents: 32,
     scale: "1x",
     correctness: "pass",
-    ownerAnswers: { workload: "owner-answers-v2", rpcAnswers: 40, consumedAsks: 40, routedAsks: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
+    ownerAnswers: { workload: "owner-writes-v3", rpcAnswers: 40, consumedAsks: 40, routedAsks: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
+    ownerMessagePosts: { workload: "owner-writes-v3", rpcPosts: 40, persistedPosts: 40, consumedAsks: 40, routedPosts: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
     metrics: { latency: value },
     gaps: [],
   }));
@@ -132,7 +133,7 @@ test("twenty percent tail change respects pooled twenty-five percent threshold",
     b = runs("new", 100);
   for (const r of [...a, ...b])
     r.requests = Object.fromEntries(
-      ["boards", "board", "discussion", "post", "move", "answer"].map((n) => [
+      ["boards", "board", "discussion", "post", "move", "answer", "messagePost"].map((n) => [
         n + ".response.ms",
         Array(40).fill(100),
       ]),
@@ -154,7 +155,7 @@ test("complete relative evidence stays separate from native correctness gaps", (
     b = runs("new", 100);
   for (const r of [...a, ...b]) {
     r.requests = Object.fromEntries(
-      ["boards", "board", "discussion", "post", "move", "answer"].map((n) => [
+      ["boards", "board", "discussion", "post", "move", "answer", "messagePost"].map((n) => [
         n + ".response.ms",
         Array(40).fill(100),
       ]),

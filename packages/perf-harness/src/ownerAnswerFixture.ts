@@ -10,7 +10,8 @@ import * as Schema from "effect/Schema";
 import { KanbanCard, KanbanDiscussion, KanbanMessage, OrchestrationV2ExecutionNodeJson } from "@t3tools/contracts";
 import { assertRuntime } from "./runtime.ts";
 import { fileHash, hash } from "./metrics.ts";
-import { ownerAnswerCases, ownerAnswerWorkload } from "./ownerAnswers.ts";
+import { assertOpenOwnerAsk, ownerAnswerCases, ownerAnswerSamples, ownerAnswerWorkload, type OwnerAnswerCase } from "./ownerAnswers.ts";
+import { ownerMessagePostCases } from "./ownerMessagePosts.ts";
 
 const at = "2026-01-01T00:00:00.000Z";
 const model = { instanceId: "synthetic", model: "default" };
@@ -40,7 +41,7 @@ export function repairOwnerAnswerHistory(main: NodeSqlite.DatabaseSync) {
   }
 }
 
-export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync) {
+export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync, family: "all" | "answers" | "messagePosts" = "all") {
   const template = JSON.parse(String(boards.prepare("SELECT json FROM ardud_kanban_cards LIMIT 1").get()!.json));
   const discussionTemplate = JSON.parse(String(boards.prepare("SELECT json FROM ardud_kanban_discussions LIMIT 1").get()!.json));
   const boardId = "synthetic-board-0";
@@ -51,13 +52,17 @@ export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync) {
     boards.prepare("UPDATE ardud_kanban_boards SET json=? WHERE id=?").run(
       JSON.stringify({ ...board, defaultProjectId: "synthetic-project", evaluatorModel: model }), boardId,
     );
-    for (const sample of ownerAnswerCases()) {
+    const answers = family === "messagePosts" ? [] : ownerAnswerCases().map((sample) => ({ ...sample,
+      title: sample.marker, question: `${sample.marker} May this change proceed?`, number: 501 + sample.sample }));
+    const posts = family === "answers" ? [] : ownerMessagePostCases().map((sample) => ({ ...sample,
+      title: sample.question, number: 501 + ownerAnswerSamples + sample.sample }));
+    for (const sample of [...answers, ...posts]) {
       const by = { _tag: sample.route === "worker" || sample.route === "fallback" ? "thread" : "evaluator", threadId: sample.askerThreadId };
-      const ask = { id: sample.askId, text: `${sample.marker} May this change proceed?`, by,
+      const ask = { id: sample.askId, text: sample.question, by,
         blocking: sample.route !== "worker", seq: sample.seq, at, closedAt: null };
       const companion = { ...ask, id: "q1", text: "Keep this separate question open.", blocking: false, seq: 21 };
       const card = decodeCard({ ...template,
-        id: sample.cardId, boardId, number: 501 + sample.sample, title: sample.marker,
+        id: sample.cardId, boardId, number: sample.number, title: sample.title,
         discussionId: sample.discussionId, stage: ask.blocking ? "needs_owner" : "working",
         model, projectId: "synthetic-project", activeThreadId: sample.route === "worker" ? sample.askerThreadId : null,
         activeRole: sample.route === "worker" ? "work" : null, activePool: null,
@@ -65,7 +70,7 @@ export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync) {
         question: ask.blocking ? ask.text : null, asks: sample.kind === "pick" ? [companion, ask] : [ask],
       });
       const discussion = decodeDiscussion({ ...discussionTemplate,
-        id: sample.discussionId, boardId, cardId: sample.cardId, title: sample.marker,
+        id: sample.discussionId, boardId, cardId: sample.cardId, title: sample.title,
         evaluatorThreadId: sample.route === "launch" || sample.route === "worker" ? null : "synthetic-thread-21",
         participants: [], lastSeq: sample.seq, lastMessageAt: at,
       });
@@ -78,7 +83,7 @@ export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync) {
       for (const entry of card.asks) {
         const message = decodeMessage({ discussionId: discussion.id,
           seq: entry.seq, author: entry.by, authorName: entry.by._tag === "thread" ? "Worker" : "Evaluator",
-          blocks: entry.id === sample.askId ? [{ _tag: "choice", id: entry.id,
+          blocks: sample.kind !== "post" && entry.id === sample.askId ? [{ _tag: "choice", id: entry.id,
             style: "pick", question: entry.text, options: [{ id: "o1", label: "Hold" }, { id: "o2", label: "Proceed" }], multi: false,
           }] : [{ _tag: "md", text: entry.text }], answers: [], createdAt: at,
         });
@@ -122,9 +127,10 @@ export function configureOwnerAnswerMock(home: string, mockScript: string) {
   }));
 }
 
-export function ownerAnswerRoutingEvidence(boards: NodeSqlite.DatabaseSync, main: NodeSqlite.DatabaseSync) {
+export function ownerAnswerRoutingEvidence(boards: NodeSqlite.DatabaseSync, main: NodeSqlite.DatabaseSync,
+  samples: ReadonlyArray<Pick<OwnerAnswerCase, "discussionId" | "recipientThreadId" | "route" | "marker">> = ownerAnswerCases()) {
   let routedAsks = 0, launchedEvaluators = 0;
-  for (const sample of ownerAnswerCases()) {
+  for (const sample of samples) {
     const row = boards.prepare("SELECT json FROM ardud_kanban_discussions WHERE id=?").get(sample.discussionId);
     const discussion = row ? JSON.parse(String(row.json)) : null;
     const recipient = sample.recipientThreadId ?? discussion?.evaluatorThreadId;
@@ -144,13 +150,27 @@ export function ownerAnswerRoutingEvidence(boards: NodeSqlite.DatabaseSync, main
   return { routedAsks, launchedEvaluators };
 }
 
+export function migrateOwnerWriteBoards(boards: NodeSqlite.DatabaseSync, previousWorkload?: string) {
+  if (previousWorkload === undefined) return seedOwnerAnswers(boards);
+  if (previousWorkload !== "owner-answers-v2") throw new Error("Unsupported owner-write fixture version");
+  // A consumed fixture must never turn answered asks back into fresh samples.
+  for (const sample of ownerAnswerCases()) {
+    const card = boards.prepare("SELECT json FROM ardud_kanban_cards WHERE id=?").get(sample.cardId);
+    const message = boards.prepare("SELECT json FROM ardud_kanban_messages WHERE discussion_id=? AND seq=?").get(sample.discussionId, sample.seq);
+    if (!card || !message) throw new Error("Incomplete owner-answer fixture");
+    assertOpenOwnerAsk(sample, decodeCard(JSON.parse(String(card.json))), decodeMessage(JSON.parse(String(message.json))));
+  }
+  seedOwnerAnswers(boards, "messagePosts");
+}
+
 // Upgrade retained synthetic scale fixtures without rebuilding millions of rows.
 // The source is immutable and only the new, credential-free destination opens RW.
 export async function ownerAnswerFixture(source: string, destination: string) {
   assertRuntime();
   const meta = JSON.parse(readFileSync(resolve(source, "fixture.json"), "utf8"));
-  if (meta.synthetic !== true || meta.ownerAnswers !== undefined)
-    throw new Error("A pristine synthetic fixture without owner answers is required");
+  if (meta.synthetic !== true || meta.ownerWrites !== undefined ||
+    (meta.ownerAnswers !== undefined && meta.ownerAnswers !== "owner-answers-v2"))
+    throw new Error("A pristine synthetic fixture or unconsumed owner-answers-v2 fixture is required");
   if (existsSync(destination)) throw new Error("Fixture destination must not exist");
   mkdirSync(resolve(destination, "userdata"), { recursive: true });
   for (const name of ["statev2.sqlite", "boards.sqlite", "archive.sqlite"]) {
@@ -162,9 +182,9 @@ export async function ownerAnswerFixture(source: string, destination: string) {
   const main = new NodeSqlite.DatabaseSync(resolve(destination, "userdata/statev2.sqlite"));
   try { repairOwnerAnswerHistory(main); } finally { main.close(); }
   const db = new NodeSqlite.DatabaseSync(resolve(destination, "userdata/boards.sqlite"));
-  try { seedOwnerAnswers(db); } finally { db.close(); }
-  const { fixtureHash: _oldHash, ...previous } = meta;
-  const manifest = { ...previous, version: 2, ownerAnswers: ownerAnswerWorkload,
+  try { migrateOwnerWriteBoards(db, meta.ownerAnswers); } finally { db.close(); }
+  const { fixtureHash: _oldHash, ownerAnswers: _oldWorkload, ...previous } = meta;
+  const manifest = { ...previous, version: 3, ownerWrites: ownerAnswerWorkload,
     files: { ...meta.files, main: await fileHash(resolve(destination, "userdata/statev2.sqlite")),
       boards: await fileHash(resolve(destination, "userdata/boards.sqlite")) },
   };
