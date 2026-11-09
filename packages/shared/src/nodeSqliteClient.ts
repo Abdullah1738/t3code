@@ -238,12 +238,18 @@ const prepare = (sql, cached) => {
   statements.set(sql, statement);
   return statement;
 };
-const abandoned = new Int32Array(workerData.abandoned);
+const claims = new Int32Array(workerData.claims);
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
-  // The caller gave up while this waited behind other reads; skip it so a
-  // backlog of timed-out requests cannot keep the reader busy after a stall.
-  if (Atomics.load(abandoned, id & workerData.abandonedMask) === (id % 0x7fffffff) + 1) {
-    parentPort.postMessage({ id, rows: [] });
+  // Claim the request before running it. The parent cancels a request whose
+  // caller gave up, so a backlog of timed-out requests cannot keep the reader
+  // busy after a stall, and cancels the rest when it retires this worker.
+  const tag = (id % 0x7fffffff) + 1;
+  if (Atomics.compareExchange(claims, id & workerData.claimsMask, tag, -tag) !== tag) {
+    // Its caller is gone; should a live one ever see this, it must not read as empty rows.
+    parentPort.postMessage({
+      id,
+      error: { operation: "execute", message: "reader request was cancelled before it ran", notStarted: true },
+    });
     return;
   }
   parentPort.postMessage({ started: id });
@@ -303,10 +309,13 @@ type ReaderReply =
       };
     };
 
-// Slots for abandoned request ids, shared with the reader worker. A slot holds
-// the id it marks, so a stale mark never matches a later request.
-const ABANDONED_SLOTS = 4096;
-const abandonedTag = (id: number) => (id % 0x7fffffff) + 1;
+// Request claims, shared with the reader worker. A slot holds `tag` while its
+// request is queued; the worker swaps it for `-tag` before running it, and the
+// parent swaps it for 0 to cancel. Exactly one side wins, so a request either
+// ran or never will. A slot holds its own request's tag, so a stale claim
+// never matches a later request.
+const CLAIM_SLOTS = 65536;
+const claimTag = (id: number) => (id % 0x7fffffff) + 1;
 // Transaction control must reach the worker even after its caller gave up.
 const isTransactionControl = (sql: string) =>
   /^\s*(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql);
@@ -375,9 +384,11 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
   let unavailable = false;
   let closing = false;
   let nextRequestId = 0;
-  // When recent workers stopped; bounds how often reads move to a replacement.
+  // When recent workers stopped. Past the budget, reads that never ran fail
+  // instead of moving, and no new worker starts until the window clears.
   let retiredAt: Array<number> = [];
-  const requeueAllowed = () => {
+  let coolingDown = false;
+  const withinStopBudget = () => {
     const now = performance.now();
     retiredAt = retiredAt.filter((at) => now - at < REQUEUE_RETIREMENT_WINDOW_MS);
     return retiredAt.length <= REQUEUE_RETIREMENT_BUDGET;
@@ -388,8 +399,11 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       : undefined;
 
   const start = () => {
-    const abandonedBuffer = new SharedArrayBuffer(ABANDONED_SLOTS * Int32Array.BYTES_PER_ELEMENT);
-    const abandoned = new Int32Array(abandonedBuffer);
+    const claimsBuffer = new SharedArrayBuffer(CLAIM_SLOTS * Int32Array.BYTES_PER_ELEMENT);
+    const claims = new Int32Array(claimsBuffer);
+    // True when the parent took the request back before the worker claimed it.
+    const cancel = (id: number) =>
+      Atomics.compareExchange(claims, id & (CLAIM_SLOTS - 1), claimTag(id), 0) === claimTag(id);
     const worker = new NodeWorkerThreads.Worker(readerWorkerSource, {
       eval: true,
       workerData: {
@@ -397,8 +411,8 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         allowExtension: options.allowExtension ?? false,
         prepareCacheSize: options.prepareCacheSize ?? 200,
         initializationSql: options.readerInitializationSql ?? [],
-        abandoned: abandonedBuffer,
-        abandonedMask: ABANDONED_SLOTS - 1,
+        claims: claimsBuffer,
+        claimsMask: CLAIM_SLOTS - 1,
       },
     });
     let announce: (startup: ReaderStartup) => void = () => {};
@@ -414,6 +428,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         readonly resume: (reply: ReaderReply) => void;
         startedAt?: number;
         reported?: boolean;
+        abandoned?: boolean;
       }
     >();
     // The worker runs one statement at a time; this is the one it last started.
@@ -464,8 +479,8 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         retiredAt.push(performance.now());
         runFork(Metric.update(Metric.withAttributes(readerRetirements, { reason }), 1));
       }
-      // The worker runs statements in order, so one it never started is still
-      // queued behind the one that stopped it: only that one has run.
+      // Take back every request the worker has not claimed: those never ran
+      // and never will, so another worker may run them. The rest have run.
       const entries = [...pending];
       pending.clear();
       for (const [id, request] of entries) {
@@ -473,7 +488,9 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
           request.resume({ id, rows: [] });
           continue;
         }
-        const started = request.startedAt !== undefined;
+        // An abandoned request has no caller left to fail or move.
+        if (request.abandoned) continue;
+        const started = !cancel(id);
         if (started) outcome.failed++;
         else outcome.requeueable++;
         request.resume({
@@ -523,6 +540,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
             readonly sql: string;
             readonly resume: (reply: ReaderReply) => void;
             startedAt?: number;
+            abandoned?: boolean;
           } = {
             endsTransaction,
             sql: input.sql,
@@ -542,17 +560,16 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
             },
           };
           pending.set(id, entry);
+          Atomics.store(claims, id & (CLAIM_SLOTS - 1), claimTag(id));
           if (pending.size === 1) worker.ref();
           const cached = input.cached && !hasLargeBinding(input.params);
           // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
           worker.postMessage({ id, safeIntegers, ...input, cached });
           // An interrupted caller (an HTTP timeout, say) leaves its request
-          // queued in the worker. Mark it so the worker skips it if it has not
+          // queued in the worker. Cancel it so the worker skips it if it has not
           // started; the entry stays until the worker answers.
           return Effect.sync(() => {
-            if (entry.startedAt === undefined && !isTransactionControl(input.sql)) {
-              Atomics.store(abandoned, id & (ABANDONED_SLOTS - 1), abandonedTag(id));
-            }
+            if (!isTransactionControl(input.sql) && cancel(id)) entry.abandoned = true;
           });
         });
       });
@@ -696,6 +713,17 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
 
   const acquireWorker = Effect.suspend((): Effect.Effect<Connection | undefined> => {
     if (unavailable) return Effect.succeed(undefined);
+    // Workers that keep stopping must not be respawned for every read: reads
+    // use the main connection, as for an unavailable reader, until it cools.
+    if (current === undefined && !withinStopBudget()) {
+      if (coolingDown) return Effect.succeed(undefined);
+      coolingDown = true;
+      return Effect.logWarning(
+        "SQLite reader workers keep stopping; reads use the main connection for a while",
+        { stops: retiredAt.length, windowMs: REQUEUE_RETIREMENT_WINDOW_MS },
+      ).pipe(Effect.as(undefined));
+    }
+    coolingDown = false;
     let reader: NonNullable<typeof current>;
     try {
       reader = current ?? start();
@@ -754,7 +782,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         let refused: "pinned" | "moved" | "budget" | undefined;
         if (pinned) refused = "pinned";
         else if (moved) refused = "moved";
-        else if (!requeueAllowed()) refused = "budget";
+        else if (!withinStopBudget()) refused = "budget";
         if (refused !== undefined) {
           countFailed(refused);
           return Effect.fail(error);
