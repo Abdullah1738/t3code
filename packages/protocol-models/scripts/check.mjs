@@ -7,6 +7,7 @@ const cases = [
   ['commands', 'step', 'invariant', false],
   ['boards', 'step', 'invariant', false],
   ['sync', 'step', 'invariant', false],
+  ['readers', 'step', 'invariant', false],
   ['restart', 'step', 'preparationContinues', false],
   ['restart', 'step', 'nativePreparationContinues', false],
   ['restart', 'step', 'queuedContinues', false],
@@ -45,7 +46,7 @@ for (const [spec, step, invariant, expectedFailure] of selected) {
   if (!ok) console.log(output.slice(-10000));
 }
 if (mode === 'run') {
-  for (const spec of ['restart', 'commands', 'boards', 'sync']) {
+  for (const spec of ['restart', 'commands', 'boards', 'sync', 'readers']) {
     const result = spawnSync('quint', ['test', `${spec}.qnt`], { encoding: 'utf8' });
     writeFileSync(`traces/latest/test-${spec}.log`, `${result.stdout}${result.stderr}`);
     console.log(`${result.status === 0 ? 'PASS' : 'FAIL'} witnesses ${spec}`);

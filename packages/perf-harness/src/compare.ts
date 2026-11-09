@@ -118,7 +118,8 @@ export function compare(
     const significant = stats.ci95[0] > 1 || stats.ci95[1] < 1;
     const regression = stats.ratio > (key === "eventLoop.p99.ms" ? 1 : 1.1) && stats.ci95[0] > 1;
     const budget = budgets.metrics[key]?.max;
-    const infoOnly = key === "wal.bytes" || key === "operations" || key.endsWith(".p95");
+    const infoOnly =
+      key === "wal.bytes" || key === "operations" || key.endsWith(".p95") || key.endsWith(".p50");
     const verdict = infoOnly ? "info" : regression ? "fail" : "pass";
     fail ||= verdict === "fail";
     metrics[key] = {

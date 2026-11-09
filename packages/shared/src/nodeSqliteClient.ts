@@ -27,10 +27,16 @@ import type { Borrower, Connection } from "effect/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 
+import { makeAuthReader, ReadOnly, retireAuthReader } from "./nodeSqliteAuthReader.ts";
+import { makeReaderLanes, ReaderLane, bindSemaphore } from "./nodeSqliteReaderLanes.ts";
+
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
 export interface SqliteClientConfig {
   readonly filename: string;
+  /** Reserve a bounded process for fresh session lookups. */
+  readonly authReaderProcess?: boolean | undefined;
+
   readonly readonly?: boolean | undefined;
   readonly allowExtension?: boolean | undefined;
   readonly prepareCacheSize?: number | undefined;
@@ -67,11 +73,6 @@ export interface SqliteClientConfig {
 }
 
 // SqlClient masks transaction acquisition, so readOnly carries the caller's interruption policy.
-const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
-  "@t3tools/shared/nodeSqliteClient/ReadOnly",
-  { defaultValue: () => undefined },
-);
-
 /**
  * Wrap the whole transaction, as in
  * `sql.withTransaction(reads).pipe(readOnly)`. Inside an open write transaction
@@ -96,7 +97,7 @@ const annotateAcquired = (fiber: Fiber.Fiber<unknown, unknown>, acquired: Acquir
 };
 
 const TransactionAcquire = Context.Reference<
-  { acquired?: Acquired; restore: typeof Effect.interruptible | undefined } | undefined
+  { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } | undefined
 >("@t3tools/shared/nodeSqliteClient/TransactionAcquire", { defaultValue: () => undefined });
 
 export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
@@ -119,6 +120,10 @@ export class UnsupportedNodeSqliteOperationError extends Schema.TaggedError<Unsu
     return "Node SQLite does not support executeStream.";
   }
 }
+
+/** Fresh committed auth lookup, isolated from the base reader queue. */
+export const authReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  readOnly(Effect.provideService(effect, ReaderLane, "auth"));
 
 const checkNodeSqliteCompat = () => {
   const parts = process.versions.node.split(".").map(Number);
@@ -1279,8 +1284,18 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const acquireReader =
     options.readerWorker && isFileDatabase ? yield* makeReader(options) : undefined;
   const readerSemaphore = yield* Semaphore.make(1);
+  const readerLock = bindSemaphore(readerSemaphore);
+  const acquireAuth =
+    options.readerWorker && isFileDatabase && options.authReaderProcess
+      ? yield* makeReaderLanes(() =>
+          makeAuthReader({
+            ...options,
+            readerStatementLimit: options.readerStatementLimit ?? "5 seconds",
+          }),
+        )
+      : undefined;
 
-  const writer = { name: "writer" as const, lock: semaphore, connection };
+  const writer = { name: "writer" as const, lock: bindSemaphore(semaphore), connection };
   const admission = Effect.withFiber((fiber) => {
     const wait = options.beforeAcquire ?? Effect.void;
     const restore = fiber.getRef(TransactionAcquire)?.restore;
@@ -1288,13 +1303,19 @@ const make = Effect.fn("makeWithDatabase")(function* (
   });
   const route = Effect.andThen(
     admission,
-    Effect.withFiber((fiber) =>
+    Effect.withFiber<{
+      name: "writer" | "reader";
+      connection: Connection;
+      lock: typeof writer.lock | Effect.Success<NonNullable<typeof acquireAuth>>["lock"];
+    }, SqlError>((fiber) =>
       acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
-        ? Effect.map(acquireReader, (readerConnection) =>
-            readerConnection === undefined
-              ? writer
-              : { name: "reader" as const, lock: readerSemaphore, connection: readerConnection },
-          )
+        ? acquireAuth !== undefined && Context.get(fiber.context, ReaderLane) === "auth"
+          ? Effect.map(acquireAuth, (reader) => ({ name: "reader" as const, ...reader }))
+          : Effect.map(acquireReader, (readerConnection) =>
+              readerConnection === undefined
+                ? writer
+                : { name: "reader" as const, lock: readerLock, connection: readerConnection },
+            )
         : Effect.succeed(writer),
     ),
   );
@@ -1310,9 +1331,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const writerBorrowBatchSize = 16;
   let writerBorrowsSinceYield = 0;
-  const borrower: Borrower = (use) =>
+  const borrower: Borrower = <A, E, R>(use: (connection: Connection) => Effect.Effect<A, E, R>) =>
     Effect.flatMap(route, (target) =>
-      Effect.withFiber((fiber) => {
+      Effect.withFiber<A, E | SqlError, R>((fiber) => {
         const clock = fiber.getRef(Clock.Clock);
         const start = clock.monotonicTimeNanosUnsafe();
         const useConnection = Effect.suspend(() => {
@@ -1361,6 +1382,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const clock = fiber.getRef(Clock.Clock);
       const start = clock.monotonicTimeNanosUnsafe();
       const pending = fiber.getRef(TransactionAcquire);
+      if (pending !== undefined && acquireAuth !== undefined && target.name === "reader" && Context.get(fiber.context, ReaderLane) === "auth")
+        pending.retire = retireAuthReader(target.connection);
       const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
         if (pending !== undefined) pending.acquired = acquired(target, clock, start);
         return Scope.addFinalizer(scope, target.lock.release(1));
@@ -1393,13 +1416,28 @@ const make = Effect.fn("makeWithDatabase")(function* (
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {
         // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
-        const pending: { acquired?: Acquired; restore: typeof Effect.interruptible | undefined } = {
+        const pending: { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } = {
           restore,
         };
-        const body = Effect.withFiber<A, E, R>((fiber) => {
+        const body = Effect.withFiber<A, E | SqlError, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired);
           pending.restore = undefined;
-          return effect;
+          return acquireAuth !== undefined &&
+            Context.get(fiber.context, ReaderLane) === "auth" &&
+            pending.acquired?.connection === "reader"
+            ? Effect.timeoutOrElse(effect, {
+                duration: options.readerStatementLimit ?? "5 seconds",
+                orElse: () =>
+                  Effect.fail(
+                    new SqlError({
+                      reason: classifySqliteError(new Error("Auth snapshot expired"), {
+                        operation: "readerSnapshot",
+                        message: "Auth snapshot expired",
+                      }),
+                    }),
+                  ),
+              }).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? pending.retire ?? Effect.void : Effect.void))
+            : effect;
         });
         return restore(
           withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending)),

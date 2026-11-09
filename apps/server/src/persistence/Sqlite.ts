@@ -149,6 +149,7 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
           NodeSqliteClient.layer({
             filename: dbPath,
             readerWorker: true,
+            authReaderProcess: true,
             readerInitializationSql: historyReaderSql(dbPath, baseFilename),
             readerSnapshotSql: [
               "SELECT rootpage FROM main.sqlite_schema LIMIT 1",
