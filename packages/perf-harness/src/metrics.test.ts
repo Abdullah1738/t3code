@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { percentiles } from "./metrics.ts";
+import { percentiles, phaseMetrics } from "./metrics.ts";
 import { compare, median, pairedBootstrap } from "./compare.ts";
 import type { Run } from "./metrics.ts";
 const runs = (sha: string, value: number | null): Run[] =>
@@ -15,6 +15,7 @@ const runs = (sha: string, value: number | null): Run[] =>
     agents: 32,
     scale: "1x",
     correctness: "pass",
+    ownerAnswers: { workload: "owner-answers-v2", rpcAnswers: 40, consumedAsks: 40, routedAsks: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
     metrics: { latency: value },
     gaps: [],
   }));
@@ -22,6 +23,17 @@ test("nearest rank handles small samples and rejects invalid timings", () => {
   assert.equal(percentiles([5, 1, 3, 2, 4])?.p95, 5);
   assert.equal(percentiles([]), null);
   assert.throws(() => percentiles([NaN]));
+});
+test("Kanban serial admission waits stay separate from total span duration", () => {
+  const phases = phaseMetrics([
+    { name: "KanbanService.serial", spanId: "r", durationMs: 200,
+      attributes: { "serial.queue": "routing", "serial.key": "discussion-1", "serial.wait_ms": 15 } },
+    { name: "KanbanService.serial", spanId: "e", durationMs: 900,
+      attributes: { "serial.queue": "evaluating", "serial.key": "board-0:discussion-1", "serial.wait_ms": 30 } },
+  ]);
+  assert.equal(phases.kanbanRoutingAdmission?.p95, 15);
+  assert.equal(phases.kanbanEvaluatingAdmission?.p95, 30);
+  assert.equal(phaseMetrics([]).kanbanRoutingAdmission, null);
 });
 test("missing metrics cannot pass; regressions fail even within an absolute budget", () => {
   const budgets = { metrics: { latency: { max: 200 } } };
@@ -120,7 +132,7 @@ test("twenty percent tail change respects pooled twenty-five percent threshold",
     b = runs("new", 100);
   for (const r of [...a, ...b])
     r.requests = Object.fromEntries(
-      ["boards", "board", "discussion", "post", "move"].map((n) => [
+      ["boards", "board", "discussion", "post", "move", "answer"].map((n) => [
         n + ".response.ms",
         Array(40).fill(100),
       ]),
@@ -142,7 +154,7 @@ test("complete relative evidence stays separate from native correctness gaps", (
     b = runs("new", 100);
   for (const r of [...a, ...b]) {
     r.requests = Object.fromEntries(
-      ["boards", "board", "discussion", "post", "move"].map((n) => [
+      ["boards", "board", "discussion", "post", "move", "answer"].map((n) => [
         n + ".response.ms",
         Array(40).fill(100),
       ]),

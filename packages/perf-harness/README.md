@@ -33,8 +33,9 @@ A missing metric or correctness check prevents a passing verdict.
 Driver measurements cover loopback responses and simulated 10 Mbps/100 ms
 body delivery; native paint and device latency remain unmeasured. Post response includes delivery on the old server;
 it is not a durable-ACK measurement. Concurrent activity uses HTTP board writes and WS metadata commands through the
-real event sink. Provider token streaming and true cursor resume are not implemented. The compact fixture has
-no real provider credentials and no schedulable work. TB/USB storage performance
+real event sink. Owner answers use the existing local ACP mock with no provider credentials;
+real provider token streaming and true cursor resume are not implemented. No work pool is added.
+TB/USB storage performance
 requires a separate, capacity-checked storage workload. No cloud result certifies
 USB SSD latency.
 
@@ -75,12 +76,13 @@ Round 2 measurement support:
 Acceptance statistics (`paired-bootstrap-v2`):
 
 - Use at least ten matched interleaved A/B pairs on one worker, alternating
-  AB/BA order. Each fresh, flushed fixture runs the same 32-agent workload.
+  AB/BA order. Each fresh, flushed fixture runs its configured writer workload
+  (32 at 1x, 128 at 5x), unchanged between the two revisions.
   Foreground endpoints are each requested forty times per run. Keep raw request
   values, nearest-rank p50/p95/p99 and max; never use the largest repeat as p95.
-- Compare the median of each primary per-run value (request p50 and scalar
-  resource/event-loop metrics). Per-run request p95 remains informational;
-  request-tail acceptance uses the pooled policy below. Resample whole matched pairs 10,000
+- Compare the median of each primary per-run value (request p95 and scalar
+  resource/event-loop metrics). Request p50 companions remain informational;
+  request-tail acceptance also uses the pooled policy below. Resample whole matched pairs 10,000
   times (fixed seed 42) for a percentile 95% confidence interval of the ratio
   of medians, B/A. Fail when the ratio exceeds 1.10 and the interval excludes
   1.0. Event-loop p99 fails on any significant increase. Report max separately.
@@ -89,7 +91,7 @@ Acceptance statistics (`paired-bootstrap-v2`):
   25% only when its interval excludes 1.0. Requests within a run are correlated;
   they are not independent bootstrap units. These are per-metric intervals,
   without multiplicity correction. Ten pairs cannot establish equivalence.
-  Require forty samples per run for the five foreground endpoint families;
+  Require forty samples per run for the six foreground endpoint families;
   absent/short families are unmeasured. The one-shot mobile cold/resume requests
   remain diagnostics with unmeasured tails.
 - WAL cost is cumulative frames and frame bytes (page size plus 24-byte frame
@@ -110,6 +112,60 @@ Acceptance statistics (`paired-bootstrap-v2`):
   never used for post-hoc removal. Record absolute budgets as information under
   this relative gate; existing unmeasured fields keep the overall verdict incomplete.
 
-Old metric keys remain in the ledger; foreground response keys now contain each
-run's p50, with explicit `.p50` and `.p95` keys and `requests`/`summaries` alongside.
+Old metric keys remain in the ledger; foreground response keys contain each
+run's p95, with explicit `.p50` and `.p95` keys and `requests`/`summaries` alongside.
 Comparisons reject legacy ledgers and unpaired or fewer than ten runs.
+
+Owner-answer workload (`owner-answers-v2`):
+
+- Each run makes forty `kanban.answer` WebSocket RPCs against distinct persisted
+  open asks under the sustained HTTP and WS writers. Ten each target a worker, an evaluator, an existing evaluator
+  after its worker has moved on, and a newly launched evaluator after the original
+  asker was archived. Twenty submit freeform text on a choice block, and twenty
+  pick an option. Plain discussion posts are measured separately. Each pick
+  targets `q2` at message 22 and must leave the independent `q1` at message 21 open.
+  HTTP preparation and closure checks are outside `answer.response.ms`.
+- `answer.response.ms` retains all forty response values, p50/p95/p99 and max.
+  Gate v2 applies the existing per-run p95 and pooled p99 regression checks. At
+  5x the candidate's pooled answer p95 must also be strictly below 500 ms. This
+  target can fail even when the relative comparison passes.
+- A disposable clone's `synthetic` provider uses `acpRegistry` with the existing
+  `apps/server/scripts/acp-mock-agent.ts` local command. Its HOME, settings,
+  project workspace and request log belong to that clone. No credentials or
+  live provider are used. `ownerAnswerCoverage` reports ask consumption and mock
+  delivery separately. Mock delivery requires all forty unique markers in ACP
+  prompts, persisted messages on the intended recipient threads, and ten new
+  discussion evaluator links. Missing evidence leaves coverage unmeasured;
+  live provider delivery is always unmeasured. Core service tests remain the
+  independent proof of launch semantics.
+- Raw per-sample open/closed evidence and provider requests live in each run's
+  retained artifacts. Answer trace phases use the originating action IDs;
+  `serial.queue`, `serial.key` and `serial.wait_ms` identify routing and evaluator
+  admission waits when the server supplies them. Older builds leave these
+  admission phases unmeasured.
+
+Reuse a complete, closed M1a synthetic fixture by copying and upgrading it; never
+modify the pristine source. The helper copies only the synthetic databases,
+adds the asks, repairs only the answer recipients' opaque history nodes, and
+includes the updated main/boards hashes and workload version in the
+new fixture identity:
+
+```sh
+node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/1x /home/user/owner-answer-fixtures/1x
+node packages/perf-harness/src/ownerAnswerFixture.ts /home/user/m1a-r7-fixtures/5x /home/user/owner-answer-fixtures/5x
+```
+
+Run the same harness checkout against the exact base artifact and the integrated
+candidate, on one offbox worker. Replace the artifact paths and candidate SHA
+with their verified values. Use separate fresh output directories:
+
+```sh
+node packages/perf-harness/src/paired.ts /home/user/owner-answer-fixtures/1x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-answer/paired-1x 10
+node packages/perf-harness/src/paired.ts /home/user/owner-answer-fixtures/5x 491bad873e8c933e9a0344b34e5e2ba299076d62 /path/to/491bad873e/bin.mjs CANDIDATE_SHA /path/to/candidate/bin.mjs tmp/owner-answer/paired-5x 10
+```
+
+These are remote commands: invoke them with `offbox run --remote` from that
+checkout, or place them in an included script run through that command. Keep
+both scales' ledgers, comparison.json and artifact directories. Ten accepted
+interleaved pairs per scale are required. Native/device/correctness gaps can keep
+the controller exit nonzero even when relative performance and the answer target pass.
