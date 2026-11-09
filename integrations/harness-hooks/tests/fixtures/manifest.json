@@ -547,6 +547,20 @@
     "source_call_id": "call_217586a0a58e4c1f91bb2d2de32b1634",
     "source_line_0": 2074
   },
+  "crpko-2996-python-edit-gofmt-offbox.sh": {
+    "card": 2996,
+    "cwd": "/Users/ardud/checkouts/risk-r2-followon1",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 1281,
+    "sha256": "58c5fb3a16d3d06d9788749a6c7c3b903c01520ebaabf5a22324c31116949e9f",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T07-35-13-01a1be5f-d41a-7892-baa6-7f5262e46e58.jsonl",
+    "source_call_id": "call_b00af4da11e34ef292b551ef4caf486c",
+    "source_cmd_index": 0,
+    "source_line_0": 1279,
+    "workdir": "/Users/ardud/checkouts/risk-r2-followon1"
+  },
   "crpko-3022-create-run.sh": {
     "card": 3022,
     "cwd": "/Users/ardud/checkouts/market-data-registry-3022",
@@ -633,6 +647,15 @@
     "source_line_0": 127,
     "workdir": "/Users/ardud/CrpkoArchitectureBroker/tmp/card-3057-ovr-fence"
   },
+  "crpko-3060-code-mode.js": {
+    "card": 3060,
+    "cwd": "/Volumes/ExternalSSD/crpko-devops/tmp/revoke-3060-validation",
+    "exact": true,
+    "kind": "codex-code-mode",
+    "redactions": [],
+    "sha256": "bbfe2b1a296cafdbb7e6a51a7dff15b8e7af5d5cc1dc0ce0f27e847218c19e3b",
+    "source": "/Users/ardud/.robob/board-artifacts/card-624/crpko-3060/cmd.txt"
+  },
   "crpko-3062-registry-edit.sh": {
     "card": 3062,
     "cwd": "/Users/ardud/checkouts/md-registry-bootstrap",
@@ -692,6 +715,19 @@
     "source_cmd_index": 0,
     "source_line_0": 206,
     "workdir": "/Volumes/ExternalSSD/board-wt/devops-fee-vip-v2"
+  },
+  "crpko-3070-python-setup-offbox.sh": {
+    "card": 3070,
+    "cwd": "/Volumes/ExternalSSD/board-wt/backoffice-fee-planner-cleanup",
+    "exact": true,
+    "kind": "exec_command",
+    "redactions": [],
+    "refusal_line_0": 2250,
+    "sha256": "aacc2ae09f58f834e4c6b95d558ed29f0ed8f55fdecf2ef607c99319816ad499",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T23-37-10-01a1bcaa-2832-7882-b3af-82835ee34d22.jsonl",
+    "source_call_id": "call_aff4ed9782b74f119d92972a4768ecba",
+    "source_line_0": 2248,
+    "workdir": "/Volumes/ExternalSSD/board-wt/backoffice-fee-planner-cleanup"
   },
   "crpko-3077-reconcile-edit-test.sh": {
     "card": 3077,
@@ -1076,5 +1112,14 @@
     "source_cmd_index": 0,
     "source_line_0": 90,
     "workdir": "/Users/ardud/checkouts/fix-plain-network-errors"
+  },
+  "usdtwallet-165-code-mode.js": {
+    "card": 165,
+    "cwd": "/Users/ardud/checkouts/race-gate-hold-pairs",
+    "exact": true,
+    "kind": "codex-code-mode",
+    "redactions": [],
+    "sha256": "cf95929030c0717bdd883b88408a5ff84fe088802f60f18413b9727954ee2dc1",
+    "source": "/Users/ardud/.robob/board-artifacts/card-624/usdt-165/exec.js"
   }
 }

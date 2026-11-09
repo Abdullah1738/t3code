@@ -129,11 +129,25 @@ def source_touches_live(source: str) -> bool:
         return False
 
 
+def _relative_source_live(source, directory):
+    if directory is None:
+        return False
+    names = [name for name in ("statev2.sqlite", "opencode.db") if name in source]
+    if not names:
+        return False
+    for match in re.finditer(r"['\"]([^'\"\n]+)['\"]", source):
+        path = _literal_path(match[1], directory)
+        if path is not None and (LIVE.search(str(path)) or any(LIVE.search(str(path / name)) for name in names)):
+            return True
+    return False
+
+
 def _python_touches_live(source, directory):
-    mentions = source_touches_live(source)
+    relative_live = _relative_source_live(source, directory)
+    mentions = source_touches_live(source) or relative_live
     changed_directory = bool(re.search(r"\bchdir\b", source) and
                              ("statev2.sqlite" in source or "opencode.db" in source) and
-                             re.search(r"\.robob|robob-data|userdata|\.local/share/opencode|opencode-data", source))
+                             (relative_live or re.search(r"\.robob|robob-data|\.local/share/opencode|opencode-data", source)))
     if not mentions and not changed_directory and not (directory is not None and any(LIVE.search(str(directory / name)) for name in {"statev2.sqlite", "opencode.db"})):
         return False
     try:
@@ -191,8 +205,8 @@ def _source_hit(source, directory, python=False):
         return _python_touches_live(source, directory)
     # Other languages have no text-only AST exemption. Preserve their existing
     # conservative treatment of paths split across variables or join calls.
-    return bool(source_touches_live(source) or
-                "statev2.sqlite" in source and re.search(r"\.robob|robob-data|userdata", source) or
+    return bool(source_touches_live(source) or _relative_source_live(source, directory) or
+                "statev2.sqlite" in source and re.search(r"\.robob|robob-data", source) or
                 "opencode.db" in source and re.search(r"\.local/share|opencode-data|[\"']opencode[\"']", source))
 
 
@@ -209,9 +223,13 @@ def _token(value):
     return repr(value[:80]).replace("\n", " ")
 
 
-def _substitutions(text, shell=False):
-    result, index, outer_quote = [], 0, None
+def _substitutions(text, shell=False, spans=False):
+    result, index, outer_quote, parameters = [], 0, None, 0
     while index < len(text):
+        if shell and not parameters and outer_quote is None and text[index] == "#" and (index == 0 or text[index - 1].isspace() or text[index - 1] in ";&|(){}"):
+            end = text.find("\n", index)
+            index = len(text) if end == -1 else end
+            continue
         if text[index] == "\\" and (not shell or outer_quote != "'"):
             index += 2
             continue
@@ -222,13 +240,19 @@ def _substitutions(text, shell=False):
         if shell and outer_quote == "'":
             index += 1
             continue
+        if shell and text.startswith("${", index):
+            parameters += 1
+            index += 2
+            continue
+        if shell and text[index] == "}" and parameters:
+            parameters -= 1
         if text[index] == "`":
             end = index + 1
             while end < len(text) and (text[end] != "`" or text[end - 1] == "\\"):
                 end += 1
             if end == len(text):
-                raise AmbiguousScript("unterminated command substitution in " + ("shell parameter expansion" if shell else "unquoted heredoc"))
-            result.append(text[index + 1:end])
+                raise AmbiguousScript("unterminated command substitution in " + ("shell text" if shell else "unquoted heredoc"))
+            result.append((index, end + 1, text[index + 1:end]) if spans else text[index + 1:end])
             index = end + 1
             continue
         if text.startswith("$(", index) and not text.startswith("$((", index):
@@ -243,28 +267,32 @@ def _substitutions(text, shell=False):
                         quote = None
                 elif char in "\"'":
                     quote = char
+                elif shell and char == "#" and (end == 0 or text[end - 1].isspace() or text[end - 1] in ";&|(){}"):
+                    newline = text.find("\n", end)
+                    end = len(text) if newline == -1 else newline
+                    continue
                 elif char == "(":
                     nesting += 1
                 elif char == ")":
                     nesting -= 1
                 end += 1
             if nesting:
-                raise AmbiguousScript("unterminated command substitution in " + ("shell parameter expansion" if shell else "unquoted heredoc"))
-            result.append(text[index + 2:end - 1])
+                raise AmbiguousScript("unterminated command substitution in " + ("shell text" if shell else "unquoted heredoc"))
+            result.append((index, end, text[index + 2:end - 1]) if spans else text[index + 2:end - 1])
             index = end
             continue
         index += 1
     return result
 
 
-def _heredocs(source):
+def _heredocs(source, offset=0, known=()):
     lines = source.splitlines(keepends=True)
     output, bodies = [], {}
     index = 0
     while index < len(lines):
         line = lines[index]
         index += 1
-        matches, quote, escaped = [], None, False
+        matches, quote, escaped, substitutions = [], None, False, []
         i = 0
         while i < len(line):
             char = line[i]
@@ -272,9 +300,19 @@ def _heredocs(source):
                 escaped = False
             elif char == "\\" and quote != "'":
                 escaped = True
+            elif quote != "'" and line.startswith("$(", i) and not line.startswith("$((", i):
+                substitutions.append([quote, 1])
+                quote = None
+                i += 1
             elif quote:
                 if char == quote:
                     quote = None
+            elif substitutions and char == "(":
+                substitutions[-1][1] += 1
+            elif substitutions and char == ")":
+                substitutions[-1][1] -= 1
+                if not substitutions[-1][1]:
+                    quote = substitutions.pop()[0]
             elif char in "\"'":
                 quote = char
             elif char == "#" and (i == 0 or line[i-1].isspace()):
@@ -282,8 +320,10 @@ def _heredocs(source):
             elif line.startswith("<<", i) and not line.startswith("<<<", i):
                 match = re.match(r"<<(-)?[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|<>()'\"]+))", line[i:])
                 if match:
-                    key = f"__guard_heredoc_{len(bodies) + len(matches)}__"
-                    matches.append((i, i + match.end(), bool(match[1]), next(x for x in match.groups()[1:] if x is not None), key, match[2] is not None or match[3] is not None))
+                    delimiter = next(x for x in match.groups()[1:] if x is not None)
+                    if delimiter not in known:
+                        key = f"__guard_heredoc_{offset + len(bodies) + len(matches)}__"
+                        matches.append((i, i + match.end(), bool(match[1]), delimiter, key, match[2] is not None or match[3] is not None))
                     i += match.end() - 1
             i += 1
         for start, end, tabs, delimiter, key, quoted in reversed(matches):
@@ -471,6 +511,14 @@ def _quoted_punctuation(source):
     # Reserved markers therefore cannot collide with an input filename.
     prefix = "\0guard_quoted_"
     output, quoted, index = [], {}, 0
+    # Keep executed substitutions intact until the walker knows this word's cwd.
+    pieces, end = [], 0
+    for start, stop, _ in _substitutions(source, shell=True, spans=True):
+        key = f"{prefix}{len(quoted)}__"
+        quoted[key] = source[start:stop]
+        pieces.extend([source[end:start], key])
+        end = stop
+    source = "".join([*pieces, source[end:]])
     while index < len(source):
         char = source[index]
         if char == "#" and (index == 0 or source[index - 1].isspace() or source[index - 1] in ";&|(){}"):
@@ -600,15 +648,15 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
         except OSError:
             pass
 
-    def decode_word(value, directory, depth, quoted, checked, cwd_only=False):
+    def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None):
         nonlocal conditional
-        for key, literal in quoted.items():
-            if key in value and key not in checked and literal.startswith("${") and not cwd_only:
+        for key, literal in reversed(quoted.items()):
+            if key in value and key not in checked and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
                     conditional += 1
                     try:
-                        scan(substitution, directory, depth + 1)
+                        scan(substitution, directory, depth + 1, inherited_bodies=bodies)
                     finally:
                         conditional -= 1
             value = value.replace(key, literal)
@@ -619,7 +667,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
         words = list(words)
         checked = set()
         def decode(value):
-            return decode_word(value, directory, depth, quoted, checked, cwd_only)
+            return decode_word(value, directory, depth, quoted, checked, cwd_only, bodies)
         documents, redirects = [], []
         index = 0
         while index < len(words):
@@ -803,13 +851,14 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             add(words[0], directory, binary)
         return after
 
-    def scan(source, directory, depth=0, cwd_only=False):
+    def scan(source, directory, depth=0, cwd_only=False, inherited_bodies=None):
         if depth > MAX_SHELL_DEPTH:
             if SCRIPT.search(source) or DIRECT.search(source) or READER.search(source):
                 raise AmbiguousScript(f"shell nesting deeper than MAX_SHELL_DEPTH ({MAX_SHELL_DEPTH})")
             return None
         try:
-            source, bodies = _heredocs(source)
+            source, bodies = _heredocs(source, len(inherited_bodies or {}), inherited_bodies or ())
+            bodies = {**(inherited_bodies or {}), **bodies}
         except AmbiguousScript:
             if (SCRIPT.search(source) or DIRECT.search(source) or
                     re.search(r"(?:^|[\s;&|])(?:python[\d.]*|bash|sh|zsh|node)\s+[^<\s]", source) or
@@ -895,7 +944,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 if branches and branches[-1]["kind"] == "case" and branches[-1].get("pattern") and token == "|":
                     checked = set()
                     for word in words:
-                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe)
+                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe, bodies)
                     words = []
                     current = branches[-1]["cwd"]
                     index += 1
@@ -922,7 +971,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                             # A case header ends at 'in', before its first arm.
                             if token == "case" and tokens[index] == "in":
                                 break
-                            decode_word(tokens[index], header_cwd, depth, quoted, checked, probe)
+                            decode_word(tokens[index], header_cwd, depth, quoted, checked, probe, bodies)
                             index += 1
                 elif token in {"elif", "else"} and not words and branches:
                     current = branches[-1]["branch_cwd"]
@@ -938,7 +987,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
                 elif branches and branches[-1]["kind"] == "case" and token == ")":
                     checked = set()
                     for word in words:
-                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe)
+                        decode_word(word, branches[-1]["cwd"], depth, quoted, checked, probe, bodies)
                     words = []
                     current = branches[-1]["cwd"]
                     branches[-1]["pattern"] = False

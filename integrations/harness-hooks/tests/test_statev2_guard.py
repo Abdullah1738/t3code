@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import engine
 import statev2_guard as guard
+import code_mode_fixture
 
 LIVE = "/Users/x/.robob/userdata/statev2.sqlite"
 READ = "live-database-read"
@@ -274,6 +275,57 @@ class GuardTests(unittest.TestCase):
                     self.assertIsNone(self.classify(command.replace("$(cat statev2.sqlite)", "$(git status --short)")))
         self.assertIsNone(self.classify("case item in one) cd /tmp;; two) cat tmp/t.py | head -1;; esac"))
 
+    def test_ordinary_substitutions_in_headers(self):
+        forms = [("for x in", '; do echo "$x"; done'), ("select x in", "; do break; done"),
+                 ("case", " in *) :;; esac"), ("case x in", ") :;; esac"),
+                 ("case x in first) cd /tmp;;", "|other) :;; esac")]
+        for prefix, suffix in forms:
+            for substitution in (f"$(cat {LIVE})", f"`cat {LIVE}`", '$(cat "' + LIVE + '")'):
+                for quote in ("", '"'):
+                    with self.subTest(form=prefix, substitution=substitution, quote=quote):
+                        self.assertEqual(self.classify(f"{prefix} {quote}{substitution}{quote}{suffix}"), READ)
+                self.assertIsNone(self.classify(f"{prefix} '{substitution}'{suffix}"))
+            for value in ("$(git status --short)", "`git status --short`", r"\$(python3 tmp/live.py)"):
+                self.assertIsNone(self.classify(f"{prefix} {value}{suffix}"))
+            self.assertEqual(self.classify(f"cd /Users/x/.robob/userdata && {prefix} $(cat statev2.sqlite){suffix}"), READ)
+        self.assertIsNone(self.classify("cat > note.md <<'EOF'\nfor x in $(python3 $X); do :; done\nEOF"))
+        self.assertEqual(self.classify(f"for x in $(python3 - <<'PY'\nopen({LIVE!r}).read()\nPY\n); do :; done"), READ)
+        self.assertIsNone(self.classify(f"for x in $(cat <<'TXT'\n{LIVE}\nTXT\n); do :; done"))
+        self.assertEqual(self.classify(f"for x in ${{X:- # $(cat {LIVE})}}; do :; done"), READ)
+        self.assertIsNone(self.classify(f"# $(cat {LIVE})\nfor x in $(git status --short); do :; done"))
+        for body in ("# )\nprint('safe')", "# it's a ) comment\nprint('safe')"):
+            command = 'result="$(python3 - <<\'PY\'\n' + body + '\nPY\n)"'
+            self.assertIsNone(self.classify(command))
+            self.assertEqual(self.classify(command.replace("print('safe')", f"open({LIVE!r}).read()")), READ)
+        for body in (")", "it's $(python3 $X)", "for x in a; do ( : ); done"):
+            command = 'result="$(cat <<\'TEXT\'\n' + body + '\nTEXT\n)"'
+            self.assertIsNone(self.classify(command))
+
+    def test_isolated_userdata_paths(self):
+        paths = ["/var/folders/x/T/sync-smoke-639-ab/fixture/userdata/statev2.sqlite",
+                 str(self.root / ".t3/userdata/statev2.sqlite"), "fixture/userdata/statev2.sqlite"]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIsNone(self.classify(f"sqlite3 {path} 'SELECT count(*) FROM threads'"))
+                self.assertIsNone(self.classify("python3 -c " + shlex.quote(f"import sqlite3; sqlite3.connect({path!r})")))
+                self.assertIsNone(self.classify("node -e " + shlex.quote(f"require('fs').readFileSync({path!r})")))
+                self.assertIsNone(self.classify("python3 -c " + shlex.quote(f"import os; os.chdir('fixture/userdata'); open('statev2.sqlite').read()")))
+        fake_live = self.write("home/.robob/userdata/statev2.sqlite", "fixture")
+        alias = self.root / "fixture-alias.sqlite"
+        alias.symlink_to(fake_live)
+        with patch.object(Path, "open", side_effect=AssertionError("must not read DB symlink")):
+            self.assertEqual(self.classify(f"sqlite3 {alias} .tables"), READ)
+        self.table([(f"sqlite3 {LIVE} .tables", READ), ("sqlite3 ~/.robob/userdata/statev2.sqlite .tables", READ),
+                    ('sqlite3 "$HOME/.robob/userdata/statev2.sqlite" .tables', READ),
+                    ('ROOT=$HOME/.robob/userdata; sqlite3 "$ROOT/statev2.sqlite" .tables', READ)])
+        for cwd, target in (("/Users/x/.robob", "userdata"), ("/Users/x/.robob/worktrees", "../userdata")):
+            for source, interpreter in [
+                (f"import os; os.chdir({target!r}); open('statev2.sqlite').read()", "python3 -c "),
+                (f"process.chdir({target!r}); require('fs').readFileSync('statev2.sqlite')", "node -e "),
+            ]:
+                with self.subTest(cwd=cwd, source=source):
+                    self.assertEqual(guard.classify(interpreter + shlex.quote(source), cwd), READ)
+
     def test_dynamic_python_imports_cannot_get_text_only_exemption(self):
         bodies = [
             f'__import__("sqlite3").connect({LIVE!r})',
@@ -378,6 +430,8 @@ class GuardTests(unittest.TestCase):
         fixtures = Path(__file__).with_name("fixtures")
         manifest = json.loads((fixtures / "manifest.json").read_text())
         for filename in manifest:
+            if manifest[filename]["kind"] == "codex-code-mode":
+                continue
             with self.subTest(fixture=filename):
                 command = (fixtures / filename).read_text()
                 self.assertIsNone(self.classify(command), guard.classify_detail(command, str(self.root)))
@@ -386,7 +440,9 @@ class GuardTests(unittest.TestCase):
         fixtures = Path(__file__).with_name("fixtures")
         manifest = json.loads((fixtures / "manifest.json").read_text())
         for filename, info in manifest.items():
-            if info["card"] in {1061, 2037, 3022, 3186, 3207, 162, 2586, 2697, 540, 3122, 358, 2282, 3041, 2808, 1606}:
+            if info["kind"] == "codex-code-mode":
+                continue
+            if info["card"] in {1061, 2037, 3022, 3186, 3207, 162, 2586, 2697, 540, 3122, 358, 2282, 3041, 2808, 1606, 2996, 3070}:
                 with self.subTest(fixture=filename, cwd=info["cwd"]):
                     command = (fixtures / filename).read_text()
                     self.assertIsNone(guard.classify(command, info["cwd"]))
@@ -461,6 +517,8 @@ class GuardTests(unittest.TestCase):
         names = (
             "crpko-3122-terraform-python-edit.sh", "crpko-358-markdown-pytest.sh",
             "crpko-3041-r1-python-edit.sh", "crpko-2808-heredoc-relative-node-test.sh",
+            "crpko-2996-python-edit-gofmt-offbox.sh",
+            "crpko-3070-python-setup-offbox.sh",
             "crpko-1606-terraform-create-offbox-node.sh", "crpko-1606-append-relative-node-test.sh",
             "crpko-1606-results-markdown-write.sh",
         )
@@ -470,7 +528,7 @@ class GuardTests(unittest.TestCase):
             self.assertIsNone(guard.classify(command, cwd))
             written_read = f"\ncat > tmp/read-live.py <<'GUARD_TWIN'\nopen({LIVE!r}).read()\nGUARD_TWIN\npython3 tmp/read-live.py"
             self.assertEqual(guard.classify(command + written_read, cwd), SCRIPT)
-            if manifest[name]["card"] in {3122, 3041}:
+            if manifest[name]["card"] in {3122, 3041, 2996}:
                 twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
                 self.assertNotEqual(twin, command)
                 self.assertEqual(guard.classify(twin, cwd), READ)
@@ -586,6 +644,48 @@ class GuardTests(unittest.TestCase):
             result = engine.decide(event, "codex")
             self.assertEqual(result["decision"], "deny")
             self.assertEqual(result["context"]["rule"], "live-database-unavailable")
+
+    def test_codex_code_mode_reporter_events(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        manifest = json.loads((fixtures / "manifest.json").read_text())
+        for name in ("crpko-3060-code-mode.js", "usdtwallet-165-code-mode.js"):
+            source = (fixtures / name).read_text()
+            calls = code_mode_fixture.commands(source, "/unrelated/event/cwd")
+            self.assertEqual(len(calls), 1)
+            command, cwd = calls[0]
+            self.assertEqual(cwd, manifest[name]["cwd"])
+            self.assertIsNone(guard.classify(command, cwd))
+            twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
+            self.assertNotEqual(twin, command)
+            for cmd, expected in ((command, None), (twin, READ if manifest[name]["card"] == 3060 else SCRIPT)):
+                # Codex 0.166 normalizes each nested exec_command this way.
+                event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}
+                with self.subTest(fixture=name, expected=expected), patch.object(engine, "_log"):
+                    result = engine.decide(event, "codex")
+                    self.assertEqual(result["decision"], "deny" if expected else "allow")
+                    if expected:
+                        self.assertEqual(result["context"]["rule"], expected)
+            for checkout in ("/Users/ardud/checkouts/devops-timeline-identity", "/Users/ardud/checkouts/race-gate-hold-pairs"):
+                self.assertIsNone(guard.classify("python3 - <<'PY'\nfrom pathlib import Path\nPath('plan.json').write_text('{}')\nPY", checkout))
+
+    def test_code_mode_fixture_extraction(self):
+        safe, unsafe = self.write("safe/task.py", "print('safe')"), self.write("unsafe/task.py", f"open({LIVE!r}).read()")
+        cell = (f"text(await tools.exec_command({{cmd:'python3 task.py', 'workdir':{json.dumps(str(safe.parent))}}}));\n"
+                "const status = await tools.mcp__t3_code__task_status({taskId:'other'});\n"
+                f"await tools.exec_command({{\"cmd\":'python3 task.py',workdir:{json.dumps(str(unsafe.parent))}}});\n"
+                "text(await tools.write_stdin({session_id:123,chars:''}));")
+        calls = code_mode_fixture.commands(cell, str(self.root))
+        self.assertEqual([guard.classify(cmd, cwd) for cmd, cwd in calls], [None, SCRIPT])
+        self.assertEqual(code_mode_fixture.commands("// tools.exec_command({cmd:secret})\nconst s='tools.exec_command({cmd:secret})';", str(self.root)), [])
+        self.assertEqual(code_mode_fixture.commands("tools.exec_command({cmd:`python3 tmp/t.py`,cwd:'/tmp'});", str(self.root)), [("python3 tmp/t.py", "/tmp")])
+        for source in (
+            "tools.exec_command({cmd:command,workdir:'/tmp'})", "tools.exec_command({cmd:'python3 t.py',workdir:directory})",
+            "tools.exec_command(args)", "tools.exec_command({cmd:`python3 ${script}`,workdir:'/tmp'})",
+            "tools.exec_command({cmd:'safe',...args})", "tools.exec_command({cmd:'safe',['cmd']:command})",
+            "tools.exec_command({cmd:'safe',cmd:command})", "tools.exec_command({cmd:'safe'} || args)",
+        ):
+            with self.subTest(source=source), self.assertRaises(code_mode_fixture.Unresolved):
+                code_mode_fixture.commands(source, str(self.root))
 
     def test_engine_entrypoints_and_cwd(self):
         for harness, tool, field in [("codex", "exec_command", "cmd"), ("codex", "shell_command", "command"), ("claude", "Bash", "command"), ("codex", "mcp__x__bash", "cmd"), ("codex", "shell", "command"), ("claude", "mcp__x__shell", "command")]:
