@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Scheduler from "effect/Scheduler";
 import type * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as SqlError from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
@@ -1806,16 +1807,12 @@ it.effect(
             slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
           );
           yield* realPause(100);
-          const queued = yield* Effect.forkChild(
-            countEntries(sql).pipe(SqliteClient.readOnly, Effect.flip),
-          );
+          const queued = yield* Effect.forkChild(countEntries(sql).pipe(SqliteClient.readOnly));
           const stuckError = yield* Fiber.join(stuck);
           assert.include(String(stuckError.reason.cause), "Database reader retired");
-          assert.include(
-            String((yield* Fiber.join(queued)).reason.cause),
-            "Database reader retired",
-          );
-          // The next read starts a new worker instead of waiting for the old one.
+          // The queued read never ran on the retired worker, so it ran on the new one.
+          assert.equal(yield* Fiber.join(queued), 1);
+          // Later reads use the new worker instead of waiting for the old one.
           assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
           assert.equal(startedWorkers.length, startedBefore + 1);
           const slow = warnings.find((warning) =>
@@ -1856,6 +1853,188 @@ it.effect(
       }),
     ),
   20_000,
+);
+
+it.effect(
+  "fails only the overrunning read when its reader retires, and runs queued reads in order on the new worker",
+  () =>
+    withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
+      Effect.gen(function* () {
+        yield* countEntries(sql).pipe(SqliteClient.readOnly);
+        const startedBefore = startedWorkers.length;
+        const stuck = yield* Effect.forkChild(
+          slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
+        );
+        yield* realPause(100);
+        // Each of these resolves the busy worker, then waits for the reader lock.
+        const finished: Array<number> = [];
+        const queued: Array<Fiber.Fiber<number | undefined, SqlError.SqlError>> = [];
+        for (let index = 0; index < 12; index++) {
+          const read =
+            index % 4 === 3
+              ? // A read-only transaction that never began on the old worker moves too.
+                sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly)
+              : countEntries(sql).pipe(SqliteClient.readOnly);
+          queued.push(
+            yield* Effect.forkChild(
+              read.pipe(Effect.tap(() => Effect.sync(() => finished.push(index)))),
+            ),
+          );
+          yield* realPause(5);
+        }
+        // A caller that gives up while queued still ends at its own deadline.
+        const abandoned = yield* Effect.forkChild(countEntries(sql).pipe(SqliteClient.readOnly));
+        yield* realPause(5);
+        yield* Fiber.interrupt(abandoned);
+
+        const stuckError = yield* Fiber.join(stuck);
+        assert.include(String(stuckError.reason.cause), "Database reader retired");
+        for (const fiber of queued) assert.equal(yield* Fiber.join(fiber), 1);
+        assert.deepEqual(
+          finished,
+          Array.from({ length: 12 }, (_, index) => index),
+        );
+        // One replacement served every queued read.
+        assert.equal(startedWorkers.length, startedBefore + 1);
+      }),
+    ),
+  20_000,
+);
+
+it.effect(
+  "moves a read the worker had queued behind an abandoned overrunning read",
+  () =>
+    withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
+      Effect.gen(function* () {
+        yield* countEntries(sql).pipe(SqliteClient.readOnly);
+        const startedBefore = startedWorkers.length;
+        // The caller gives up, which frees the lock, but the worker keeps running it.
+        const overrunning = yield* Effect.forkChild(
+          slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly),
+        );
+        yield* realPause(100);
+        yield* Fiber.interrupt(overrunning);
+        // Posted to the worker, which has not reached it when the limit retires it.
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+        assert.equal(startedWorkers.length, startedBefore + 1);
+      }),
+    ),
+  20_000,
+);
+
+it.effect(
+  "does not replay a read the worker started while the parent was too busy to hear about it",
+  () =>
+    withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
+      Effect.gen(function* () {
+        yield* countEntries(sql).pipe(SqliteClient.readOnly);
+        const startedBefore = startedWorkers.length;
+        // About 1 s; its caller gives up, so the next read is posted behind it.
+        const first = yield* Effect.forkChild(
+          slowRead(sql, 12_000_000).pipe(SqliteClient.readOnly),
+        );
+        yield* realPause(100);
+        yield* Fiber.interrupt(first);
+        // About 30 s, queued in the worker behind the first.
+        const second = yield* Effect.forkChild(
+          slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
+        );
+        yield* realPause(50);
+        // Block this thread past the limit: the worker finishes the first read
+        // and starts the second before the parent reads either message, so the
+        // watchdog may still think the first is running when it retires it.
+        yield* Effect.sync(() => {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+        });
+        assert.include(String((yield* Fiber.join(second)).reason.cause), "Database reader retired");
+        // Had the second read moved, a replacement would have run it too.
+        assert.equal(startedWorkers.length, startedBefore);
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+        assert.equal(startedWorkers.length, startedBefore + 1);
+      }),
+    ),
+  20_000,
+);
+
+it.effect(
+  "fails a transaction's queued read when its reader retires instead of replaying it",
+  () =>
+    withWatchedReader({ slow: 60_000, limit: 1500 }, (sql) =>
+      Effect.gen(function* () {
+        yield* countEntries(sql).pipe(SqliteClient.readOnly);
+        const startedBefore = startedWorkers.length;
+        const error = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              assert.equal(yield* countEntries(sql), 1);
+              // Inside the transaction both statements go straight to its worker.
+              const overrunning = yield* Effect.forkChild(
+                slowRead(sql, 400_000_000).pipe(Effect.flip),
+              );
+              yield* realPause(100);
+              const queued = yield* countEntries(sql).pipe(Effect.flip);
+              yield* Fiber.join(overrunning);
+              return queued;
+            }),
+          )
+          .pipe(SqliteClient.readOnly);
+        assert.include(String(error.reason.cause), "Database reader retired");
+        // Nothing from the transaction ran on a replacement.
+        assert.equal(startedWorkers.length, startedBefore);
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+        assert.equal(startedWorkers.length, startedBefore + 1);
+      }),
+    ),
+  20_000,
+);
+
+it.effect("stops moving queued reads and respawning readers when they keep stopping", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const outcomes: Array<string> = [];
+      const workers: Array<number> = [];
+      for (let round = 0; round < 6; round++) {
+        workers.push(startedWorkers.length);
+        const holding = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const transaction = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* countEntries(sql);
+              yield* Deferred.succeed(holding, undefined);
+              yield* Deferred.await(release);
+            }),
+          )
+          .pipe(SqliteClient.readOnly, Effect.forkChild);
+        yield* Deferred.await(holding);
+        // Resolves the transaction's worker, then waits for the reader lock.
+        const queued = yield* Effect.forkChild(countEntries(sql).pipe(SqliteClient.readOnly));
+        yield* realPause(20);
+        yield* Effect.promise(() => startedWorkers.at(-1)!.terminate());
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(transaction);
+        const exit = yield* Fiber.await(queued);
+        outcomes.push(exit._tag);
+      }
+      // Four stops a minute may move reads; the fifth read that never ran fails.
+      assert.deepEqual(outcomes, [
+        "Success",
+        "Success",
+        "Success",
+        "Success",
+        "Failure",
+        "Success",
+      ]);
+      // Each move started one replacement; after the fifth stop no worker
+      // starts, and reads use the main connection instead.
+      assert.deepEqual(
+        workers.map((count) => count - workers[0]!),
+        [0, 2, 3, 4, 5, 5],
+      );
+      assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+      assert.equal(startedWorkers.length - workers[0]!, 5);
+    }),
+  ),
 );
 
 it.effect("marks committed writes separately from reads and rolled back writes", () => {

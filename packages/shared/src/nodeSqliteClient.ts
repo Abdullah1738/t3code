@@ -11,6 +11,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as References from "effect/References";
@@ -59,9 +60,9 @@ export interface SqliteClientConfig {
   /** A reader statement running this long is logged once with its SQL. Default 10 s. */
   readonly readerSlowStatement?: Duration.Input | undefined;
   /**
-   * A reader statement running this long retires its worker: queued reads fail
-   * and the next read starts a fresh worker, instead of every read in the
-   * process waiting behind one statement. Default 2 minutes.
+   * A reader statement running this long retires its worker: that statement
+   * fails, and reads that had not started move to a fresh worker, instead of
+   * every read in the process waiting behind one statement. Default 2 minutes.
    */
   readonly readerStatementLimit?: Duration.Input | undefined;
   /**
@@ -237,12 +238,18 @@ const prepare = (sql, cached) => {
   statements.set(sql, statement);
   return statement;
 };
-const abandoned = new Int32Array(workerData.abandoned);
+const claims = new Int32Array(workerData.claims);
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
-  // The caller gave up while this waited behind other reads; skip it so a
-  // backlog of timed-out requests cannot keep the reader busy after a stall.
-  if (Atomics.load(abandoned, id & workerData.abandonedMask) === (id % 0x7fffffff) + 1) {
-    parentPort.postMessage({ id, rows: [] });
+  // Claim the request before running it. The parent cancels a request whose
+  // caller gave up, so a backlog of timed-out requests cannot keep the reader
+  // busy after a stall, and cancels the rest when it retires this worker.
+  const tag = (id % 0x7fffffff) + 1;
+  if (Atomics.compareExchange(claims, id & workerData.claimsMask, tag, -tag) !== tag) {
+    // Its caller is gone; should a live one ever see this, it must not read as empty rows.
+    parentPort.postMessage({
+      id,
+      error: { operation: "execute", message: "reader request was cancelled before it ran", notStarted: true },
+    });
     return;
   }
   parentPort.postMessage({ started: id });
@@ -297,13 +304,18 @@ type ReaderReply =
         readonly code?: unknown;
         readonly errcode?: unknown;
         readonly errstr?: unknown;
+        /** The worker stopped before it started this statement. */
+        readonly notStarted?: boolean;
       };
     };
 
-// Slots for abandoned request ids, shared with the reader worker. A slot holds
-// the id it marks, so a stale mark never matches a later request.
-const ABANDONED_SLOTS = 4096;
-const abandonedTag = (id: number) => (id % 0x7fffffff) + 1;
+// Request claims, shared with the reader worker. A slot holds `tag` while its
+// request is queued; the worker swaps it for `-tag` before running it, and the
+// parent swaps it for 0 to cancel. Exactly one side wins, so a request either
+// ran or never will. A slot holds its own request's tag, so a stale claim
+// never matches a later request.
+const CLAIM_SLOTS = 65536;
+const claimTag = (id: number) => (id % 0x7fffffff) + 1;
 // Transaction control must reach the worker even after its caller gave up.
 const isTransactionControl = (sql: string) =>
   /^\s*(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql);
@@ -317,6 +329,28 @@ const readerFailureMessages = {
 const failed = (cause: unknown, message: string, operation: string) =>
   new SqlError({ reason: classifyError(cause, message, operation) });
 
+// Reads a stopped worker never started. Nothing ran, so another worker may run them.
+const notStarted = new WeakSet<SqlError>();
+
+const readerRetirements = Metric.counter("t3_sqlite_reader_retirements_total", {
+  description: "Reader workers stopped by the statement limit, a worker error or an exit.",
+});
+const readerRequeued = Metric.counter("t3_sqlite_reader_requeued_total", {
+  description: "Reads moved to a replacement worker after theirs stopped before running them.",
+});
+const readerRetireFailed = Metric.counter("t3_sqlite_reader_retire_failed_total", {
+  description: "Reads failed by a reader worker stopping, by reason.",
+});
+
+const neverRan = (exit: Exit.Exit<unknown, SqlError>) =>
+  Exit.isFailure(exit) &&
+  Option.exists(Exit.findErrorOption(exit), (error) => notStarted.has(error));
+
+// A worker that keeps stopping must not keep restarting reads that never ran:
+// past this many stops in the window, those reads fail as before.
+const REQUEUE_RETIREMENT_BUDGET = 4;
+const REQUEUE_RETIREMENT_WINDOW_MS = 60_000;
+
 // COMMIT, ROLLBACK and ROLLBACK TO SAVEPOINT. On a reader they change nothing,
 // so they succeed once the worker is gone instead of failing the cleanup.
 const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test(sql);
@@ -325,6 +359,11 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  * Each worker gets its own `Connection`, so a transaction stays on the worker
  * it began on: once that worker exits, its statements fail rather than silently
  * continuing outside the transaction on a replacement.
+ *
+ * Callers get a lease over that connection. A route resolves its worker before
+ * it waits for the reader lock, so a worker can stop while reads queue behind
+ * it. A lease whose worker stopped before running anything for it moves to the
+ * replacement once; after any statement reached the worker it stays pinned.
  */
 const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
   const snapshotLock = options.readerSnapshotLock ?? (yield* Semaphore.make(1));
@@ -343,11 +382,28 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       }
     | undefined;
   let unavailable = false;
+  let closing = false;
   let nextRequestId = 0;
+  // When recent workers stopped. Past the budget, reads that never ran fail
+  // instead of moving, and no new worker starts until the window clears.
+  let retiredAt: Array<number> = [];
+  let coolingDown = false;
+  const withinStopBudget = () => {
+    const now = performance.now();
+    retiredAt = retiredAt.filter((at) => now - at < REQUEUE_RETIREMENT_WINDOW_MS);
+    return retiredAt.length <= REQUEUE_RETIREMENT_BUDGET;
+  };
+  const countFailed = (reason: string, amount = 1) =>
+    amount > 0
+      ? runFork(Metric.update(Metric.withAttributes(readerRetireFailed, { reason }), amount))
+      : undefined;
 
   const start = () => {
-    const abandonedBuffer = new SharedArrayBuffer(ABANDONED_SLOTS * Int32Array.BYTES_PER_ELEMENT);
-    const abandoned = new Int32Array(abandonedBuffer);
+    const claimsBuffer = new SharedArrayBuffer(CLAIM_SLOTS * Int32Array.BYTES_PER_ELEMENT);
+    const claims = new Int32Array(claimsBuffer);
+    // True when the parent took the request back before the worker claimed it.
+    const cancel = (id: number) =>
+      Atomics.compareExchange(claims, id & (CLAIM_SLOTS - 1), claimTag(id), 0) === claimTag(id);
     const worker = new NodeWorkerThreads.Worker(readerWorkerSource, {
       eval: true,
       workerData: {
@@ -355,8 +411,8 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         allowExtension: options.allowExtension ?? false,
         prepareCacheSize: options.prepareCacheSize ?? 200,
         initializationSql: options.readerInitializationSql ?? [],
-        abandoned: abandonedBuffer,
-        abandonedMask: ABANDONED_SLOTS - 1,
+        claims: claimsBuffer,
+        claimsMask: CLAIM_SLOTS - 1,
       },
     });
     let announce: (startup: ReaderStartup) => void = () => {};
@@ -372,6 +428,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         readonly resume: (reply: ReaderReply) => void;
         startedAt?: number;
         reported?: boolean;
+        abandoned?: boolean;
       }
     >();
     // The worker runs one statement at a time; this is the one it last started.
@@ -391,13 +448,17 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         queued: pending.size - 1,
       };
       if (elapsedMs >= statementLimitMs) {
-        runFork(
-          Effect.logError(
-            "SQLite reader statement exceeded its limit; reader worker retired",
-            details,
-          ),
+        const outcome = stop(
+          `Database reader retired: a statement ran longer than ${statementLimitMs} ms`,
+          "limit",
         );
-        stop(`Database reader retired: a statement ran longer than ${statementLimitMs} ms`);
+        runFork(
+          Effect.logError("SQLite reader statement exceeded its limit; reader worker retired", {
+            ...details,
+            failed: outcome.failed,
+            requeueable: outcome.requeueable,
+          }),
+        );
         void worker.terminate();
       } else if (elapsedMs >= slowStatementMs && !request.reported) {
         request.reported = true;
@@ -405,20 +466,40 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       }
     }, 1000);
     watchdog.unref();
-    const stop = (message: string) => {
+    const stop = (message: string, reason: "limit" | "error" | "exit") => {
+      const outcome = { failed: 0, requeueable: 0 };
+      // A retirement terminates the worker, whose exit then reports here too.
+      if (stoppedMessage !== undefined) return outcome;
       clearInterval(watchdog);
       running = undefined;
       stoppedMessage = message;
       announce({ type: "unavailable", message });
       if (current?.worker === worker) current = undefined;
-      for (const [id, request] of pending) {
-        request.resume(
-          request.endsTransaction
-            ? { id, rows: [] }
-            : { id, error: { operation: "execute", message } },
-        );
+      if (!closing) {
+        retiredAt.push(performance.now());
+        runFork(Metric.update(Metric.withAttributes(readerRetirements, { reason }), 1));
       }
+      // Take back every request the worker has not claimed: those never ran
+      // and never will, so another worker may run them. The rest have run.
+      const entries = [...pending];
       pending.clear();
+      for (const [id, request] of entries) {
+        if (request.endsTransaction) {
+          request.resume({ id, rows: [] });
+          continue;
+        }
+        // An abandoned request has no caller left to fail or move.
+        if (request.abandoned) continue;
+        const started = !cancel(id);
+        if (started) outcome.failed++;
+        else outcome.requeueable++;
+        request.resume({
+          id,
+          error: { operation: "execute", message, ...(started ? {} : { notStarted: true }) },
+        });
+      }
+      if (!closing) countFailed("started", outcome.failed);
+      return outcome;
     };
     worker.on("message", (reply: ReaderReply | ReaderStartup | { readonly started: number }) => {
       if ("type" in reply) {
@@ -439,27 +520,44 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       if (pending.size === 0) worker.unref();
       request.resume(reply);
     });
-    worker.on("error", (cause) => stop(`Database reader failed: ${cause.message}`));
-    worker.on("exit", (code) => stop(`Database reader exited with code ${code}`));
+    worker.on("error", (cause) => void stop(`Database reader failed: ${cause.message}`, "error"));
+    worker.on("exit", (code) => void stop(`Database reader exited with code ${code}`, "exit"));
 
     const request = (input: ReaderRequest) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
         const endsTransaction = endsReadTransaction(input.sql);
         if (stoppedMessage !== undefined) {
-          return endsTransaction
-            ? Effect.succeed([])
-            : Effect.fail(
-                failed(new Error(stoppedMessage), readerFailureMessages.execute, "execute"),
-              );
+          if (endsTransaction) return Effect.succeed([]);
+          const error = failed(new Error(stoppedMessage), readerFailureMessages.execute, "execute");
+          notStarted.add(error);
+          return Effect.fail(error);
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
-          const id = nextRequestId++;
+          let id = nextRequestId++;
+          // A slot still holding a queued request is not reused, or the worker
+          // would skip that request; claimed and cancelled slots are free.
+          for (let tries = 1; Atomics.load(claims, id & (CLAIM_SLOTS - 1)) > 0; tries++) {
+            if (tries >= CLAIM_SLOTS) {
+              resume(
+                Effect.fail(
+                  failed(
+                    new Error("Reader request queue full"),
+                    "Reader request queue full",
+                    "readerAdmission",
+                  ),
+                ),
+              );
+              return;
+            }
+            id = nextRequestId++;
+          }
           const entry: {
             readonly endsTransaction: boolean;
             readonly sql: string;
             readonly resume: (reply: ReaderReply) => void;
             startedAt?: number;
+            abandoned?: boolean;
           } = {
             endsTransaction,
             sql: input.sql,
@@ -468,30 +566,27 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
                 resume(Effect.succeed(reply.rows));
                 return;
               }
-              const { operation, message, ...codes } = reply.error;
-              resume(
-                Effect.fail(
-                  failed(
-                    Object.assign(new Error(message), codes),
-                    readerFailureMessages[operation],
-                    operation,
-                  ),
-                ),
+              const { operation, message, notStarted: neverRan, ...codes } = reply.error;
+              const error = failed(
+                Object.assign(new Error(message), codes),
+                readerFailureMessages[operation],
+                operation,
               );
+              if (neverRan === true) notStarted.add(error);
+              resume(Effect.fail(error));
             },
           };
           pending.set(id, entry);
+          Atomics.store(claims, id & (CLAIM_SLOTS - 1), claimTag(id));
           if (pending.size === 1) worker.ref();
           const cached = input.cached && !hasLargeBinding(input.params);
           // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
           worker.postMessage({ id, safeIntegers, ...input, cached });
           // An interrupted caller (an HTTP timeout, say) leaves its request
-          // queued in the worker. Mark it so the worker skips it if it has not
+          // queued in the worker. Cancel it so the worker skips it if it has not
           // started; the entry stays until the worker answers.
           return Effect.sync(() => {
-            if (entry.startedAt === undefined && !isTransactionControl(input.sql)) {
-              Atomics.store(abandoned, id & (ABANDONED_SLOTS - 1), abandonedTag(id));
-            }
+            if (!isTransactionControl(input.sql) && cancel(id)) entry.abandoned = true;
           });
         });
       });
@@ -611,6 +706,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
 
   yield* Effect.addFinalizer(() =>
     Effect.promise(async () => {
+      closing = true;
       await current?.worker.terminate();
     }),
   );
@@ -632,8 +728,19 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
       }).pipe(Effect.as(undefined));
     });
 
-  return Effect.suspend((): Effect.Effect<Connection | undefined> => {
+  const acquireWorker = Effect.suspend((): Effect.Effect<Connection | undefined> => {
     if (unavailable) return Effect.succeed(undefined);
+    // Workers that keep stopping must not be respawned for every read: reads
+    // use the main connection, as for an unavailable reader, until it cools.
+    if (current === undefined && !withinStopBudget()) {
+      if (coolingDown) return Effect.succeed(undefined);
+      coolingDown = true;
+      return Effect.logWarning(
+        "SQLite reader workers keep stopping; reads use the main connection for a while",
+        { stops: retiredAt.length, windowMs: REQUEUE_RETIREMENT_WINDOW_MS },
+      ).pipe(Effect.as(undefined));
+    }
+    coolingDown = false;
     let reader: NonNullable<typeof current>;
     try {
       reader = current ?? start();
@@ -665,6 +772,67 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
               ),
     );
   });
+
+  const lease = (initial: Connection): Connection => {
+    let bound = initial;
+    // Set once a statement got past "never started": from then on this lease
+    // may hold transaction or snapshot state on its worker, so it never moves.
+    let pinned = false;
+    let moved = false;
+    const run = <A>(call: (connection: Connection) => Effect.Effect<A, SqlError>) =>
+      Effect.suspend(() => call(bound)).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (!neverRan(exit)) pinned = true;
+          }),
+        ),
+        Effect.catchIf(
+          (error: SqlError) => notStarted.has(error),
+          (error) => requeue(error, call),
+        ),
+      );
+    const requeue = <A>(
+      error: SqlError,
+      call: (connection: Connection) => Effect.Effect<A, SqlError>,
+    ): Effect.Effect<A, SqlError> =>
+      Effect.suspend(() => {
+        let refused: "pinned" | "moved" | "budget" | undefined;
+        if (pinned) refused = "pinned";
+        else if (moved) refused = "moved";
+        else if (!withinStopBudget()) refused = "budget";
+        if (refused !== undefined) {
+          countFailed(refused);
+          return Effect.fail(error);
+        }
+        moved = true;
+        return Effect.flatMap(acquireWorker, (next) => {
+          if (next === undefined || next === bound) {
+            countFailed("unavailable");
+            return Effect.fail(error);
+          }
+          bound = next;
+          return Metric.update(readerRequeued, 1).pipe(
+            Effect.andThen(Effect.annotateCurrentSpan("db.reader.requeued", true)),
+            Effect.andThen(run(call)),
+          );
+        });
+      });
+    return {
+      execute: (sql, params, rowTransform) =>
+        run((connection) => connection.execute(sql, params, rowTransform)),
+      executeRaw: (sql, params) => run((connection) => connection.executeRaw(sql, params)),
+      executeValues: (sql, params) => run((connection) => connection.executeValues(sql, params)),
+      executeValuesUnprepared: (sql, params) =>
+        run((connection) => connection.executeValuesUnprepared(sql, params)),
+      executeUnprepared: (sql, params, rowTransform) =>
+        run((connection) => connection.executeUnprepared(sql, params, rowTransform)),
+      executeStream: (sql, params, rowTransform) => bound.executeStream(sql, params, rowTransform),
+    };
+  };
+
+  return Effect.map(acquireWorker, (connection) =>
+    connection === undefined ? undefined : lease(connection),
+  );
 });
 
 const CHECKPOINT_FRAMES = 1000;
