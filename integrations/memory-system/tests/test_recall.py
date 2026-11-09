@@ -23,6 +23,7 @@ sys.path.insert(0, SRC)
 import build_text_fts  # noqa: E402
 import recall_ask as ra  # noqa: E402
 import recall_core as rc  # noqa: E402
+from replica_fixture import ready
 
 SCHEMA = """
 CREATE TABLE episodic_events (
@@ -94,6 +95,8 @@ def build_fixture(root: Path) -> Fixture:
     f.add("opencode", "ses_resume_new", "user", "risk lane continue", ts=NOW - 100, meta=rmeta)
     f.close()
     oc = sqlite3.connect(root / "opencode.db")
+    oc.execute("PRAGMA journal_mode=WAL")
+    ready(oc)
     oc.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, metadata TEXT)")
     oc.execute("INSERT INTO session_v2 VALUES ('ses_parent1', NULL, '/Users/ardud/crpko', 'Negative balance bug', NULL)")
     oc.execute("INSERT INTO session_v2 VALUES ('ses_child1', 'ses_parent1', '/Users/ardud/crpko', 'subagent', NULL)")
@@ -107,6 +110,8 @@ def build_fixture(root: Path) -> Fixture:
     oc.commit()
     oc.close()
     state = sqlite3.connect(root / "statev2.sqlite")
+    state.execute("PRAGMA journal_mode=WAL")
+    ready(state)
     state.executescript("""
       CREATE TABLE orchestration_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, stream_id TEXT, payload_json TEXT);
       CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
@@ -159,7 +164,8 @@ def build_fixture(root: Path) -> Fixture:
 def _oracle_state_tree(ids: set[str]) -> set[str]:
     """Interim D1 reader. State is read-only; it is not a second identity writer."""
     with closing(rc.connect_ro(rc.STATE_DB)) as con:
-        con.execute("BEGIN")
+        if not con.in_transaction:
+            con.execute("BEGIN")
         thread_table = "orchestration_v2_projection_threads"
         provider_table = "orchestration_v2_projection_provider_threads"
         subagent_table = "orchestration_v2_projection_subagents"
@@ -414,7 +420,7 @@ class RecallTest(unittest.TestCase):
             second = rc._state_tree({"thread-other"}, caller="thread-other")
         self.assertEqual(first, second)
         self.assertFalse(any("WHERE rowid>" in sql for sql in statements), statements)
-        self.assertFalse(any(sql.strip().upper().startswith("BEGIN") for sql in statements), statements)
+        # Each replica connection pins one completed export; no live WAL reader.
         self.assertFalse(any("FROM orchestration_events WHERE sequence>" in sql for sql in statements), statements)
         for con in opened:
             with self.assertRaises(sqlite3.ProgrammingError):
@@ -1812,6 +1818,24 @@ class RecallTest(unittest.TestCase):
         hit = rc.search("KRaft")["sessions"][0]["hits"][0]
         out = cli.format_view(f"019e-kafka#e{hit['event_id']}")
         self.assertIn(">> hit", out)
+
+
+class CliEntryTest(unittest.TestCase):
+    def test_cli_parser_builds_and_remember_writes_rules_db(self):
+        # `recall <anything>` builds the full parser first; a NameError there
+        # broke every CLI command, which no format-only test noticed.
+        import io
+        from contextlib import redirect_stdout
+        import recall_cli as cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "recall_rules.db"
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"RECALL_RULES_DB": str(db)}), redirect_stdout(buf):
+                rc_ = cli.main(["remember", "Crpko deploys use main-dev, never main", "--scope", "crpko"])
+            self.assertEqual(rc_, 0)
+            self.assertIn("main-dev", buf.getvalue())
+            self.assertTrue(db.exists())
 
 
 class GateTest(unittest.TestCase):

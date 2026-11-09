@@ -10,10 +10,12 @@ MEMORY_BACKEND picks the backend (default openchamber until the Robob cutover):
                OPENCODE_PASSWORD_FILE, default ~/.config/opencode-service/password),
                plus the Robob control API (T3_CONTROL_URL/T3_CONTROL_TOKEN, or
                T3_CONTROL_TOKEN_FILE, else ~/.robob/components/memory.json) and
-               the Robob state DB read-only (ROBOB_STATE_DB, default
-               ~/.robob/userdata/statev2.sqlite).
+               the server-owned replica (ROBOB_READONLY_DB, default
+               ~/.robob/userdata/readonly/state.sqlite; ROBOB_STATE_DB overrides it).
 
-OPENCODE_DB overrides the OpenCode DB path the reapers read (read-only).
+OPENCODE_READONLY_DB selects the separate native OpenCode export (default
+~/.robob/userdata/readonly/opencode.sqlite). Legacy OPENCODE_DB overrides it,
+but live database paths and aliases are refused.
 Stdlib only: the reapers run on the system python.
 """
 import base64
@@ -23,6 +25,8 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import robob_readonly
 
 HOME = os.path.expanduser("~")
 BACKENDS = ("openchamber", "robob")
@@ -45,7 +49,7 @@ def label():
 
 
 def opencode_db():
-    return os.environ.get("OPENCODE_DB") or os.path.join(HOME, ".local/share/opencode/opencode.db")
+    return robob_readonly.opencode_db()
 
 
 # ------------------------------------------------------------------ OpenCode
@@ -182,14 +186,12 @@ def _err(body):
 
 # ------------------------------------------------------------------ Robob state DB (read-only)
 def robob_state_db():
-    return os.environ.get("ROBOB_STATE_DB") or os.path.join(HOME, ".robob/userdata/statev2.sqlite")
+    return robob_readonly.state_db("ROBOB_STATE_DB")
 
 
 def robob_ro():
-    path = robob_state_db()
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Robob state DB {path} not found")
-    c = sqlite3.connect("file:{}?mode=ro".format(path), uri=True, timeout=30)
+    # Reapers must not delete against an export left behind by a stopped server.
+    c = robob_readonly.state_ro(robob_state_db())
     c.execute("PRAGMA busy_timeout=30000")
     return c
 
