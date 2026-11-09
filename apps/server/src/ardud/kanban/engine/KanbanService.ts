@@ -506,6 +506,14 @@ export interface KanbanServiceShape {
     purpose: Briefs.EvaluatorPurpose,
     text?: string,
   ) => Effect.Effect<ThreadId, KanbanError>;
+  readonly resolveBoard: (
+    threadId: ThreadId,
+    input: {
+      readonly boardId?: string | undefined;
+      readonly card?: string | undefined;
+      readonly discussionId?: string | undefined;
+    },
+  ) => Effect.Effect<KanbanBoard, KanbanError>;
   /** The board link of a calling thread, or null for threads the board did not start. */
   readonly caller: (threadId: string) => Effect.Effect<KanbanThreadLink | null, KanbanError>;
   /** Cards a work thread is working on right now. */
@@ -5300,8 +5308,13 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const guardReady = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
-    locks.run(boardId === undefined ? effect : locks.access(boardId, effect), cardId).pipe(
+  const guardReady = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    cardId?: string,
+    boardId?: string,
+    retry = false,
+  ) =>
+    locks.run(boardId === undefined ? effect : locks.access(boardId, effect), cardId, retry).pipe(
       Effect.catchDefect((defect) =>
         defect instanceof BoardLocks.BoardStateChanged
           ? failWith(
@@ -5318,6 +5331,9 @@ const make = Effect.gen(function* () {
     );
   const guard = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
     Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect, cardId, boardId)));
+  // A new operation re-reads every validation and releases the failed permit first.
+  const retryWrite = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
+    Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect, cardId, boardId, true)));
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Deferred.await(startupReady).pipe(Effect.andThen(effect), Effect.mapError(toKanbanError));
   // Pure SELECTs. On the reader they don't queue behind the one SQLite writer,
@@ -5821,7 +5837,7 @@ const make = Effect.gen(function* () {
   });
 
   const claimCard: KanbanServiceShape["claimCard"] = (threadId, cardId) =>
-    guard(
+    retryWrite(
       Effect.gen(function* () {
         const thread = yield* workThreadOf(threadId);
         const card = yield* cardOf(cardId);
@@ -5942,7 +5958,7 @@ const make = Effect.gen(function* () {
   });
 
   const editCard: KanbanServiceShape["editCard"] = (cardId, patch, actor) =>
-    guard(
+    retryWrite(
       Effect.gen(function* () {
         yield* checkText(cardTextFields(patch));
         const card = yield* cardOf(cardId);
@@ -6076,7 +6092,7 @@ const make = Effect.gen(function* () {
     );
 
   const moveCard: KanbanServiceShape["moveCard"] = (cardId, to, role, actor, options) =>
-    guard(
+    retryWrite(
       Effect.gen(function* () {
         yield* checkText([
           ["note", options?.note],
@@ -6304,7 +6320,7 @@ const make = Effect.gen(function* () {
     );
 
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
-    guard(
+    retryWrite(
       Effect.gen(function* () {
         yield* checkText([["reason", reason]]);
         const card = yield* cardOf(cardId);
@@ -6391,7 +6407,7 @@ const make = Effect.gen(function* () {
     actor,
     role,
   ) =>
-    guard(
+    retryWrite(
       Effect.gen(function* () {
         yield* checkText([["note", note]]);
         const card = yield* cardOf(cardId);
@@ -7584,9 +7600,9 @@ const make = Effect.gen(function* () {
         }),
       ),
     post: (discussionId, author, blocks) =>
-      guard(postUnlocked(discussionId, author, blocks, true, true)),
+      retryWrite(postUnlocked(discussionId, author, blocks, true, true)),
     postToCard: (cardId, author, blocks) =>
-      guard(
+      retryWrite(
         Effect.gen(function* () {
           const discussion = yield* cardDiscussionUnlocked(cardId);
           return yield* postUnlocked(discussion.id, author, blocks, true, true);
@@ -7627,7 +7643,7 @@ const make = Effect.gen(function* () {
         }),
       ),
     startEvaluator: (boardId, purpose, text) =>
-      guard(
+      retryWrite(
         Effect.gen(function* () {
           yield* checkText([
             ["text", text],
@@ -7654,6 +7670,45 @@ const make = Effect.gen(function* () {
           return yield* startEvaluatorUnlocked(board, purpose, { text });
         }),
       ),
+    resolveBoard: Effect.fn("KanbanService.resolveBoard")(function* (threadId, input) {
+      return yield* readDb(
+        Effect.gen(function* () {
+          const boards = yield* store.boards;
+          const explicit = input.boardId?.trim();
+          if (explicit) {
+            const board = boards.find((board) => board.id === explicit || board.slug === explicit);
+            return board ?? (yield* failWith("invalid", `No Missions board "${explicit}".`));
+          }
+          const link = yield* store.threadLink(threadId);
+          if (link) return yield* boardOf(link.boardId);
+          const ids = new Set<string>();
+          for (const card of yield* store.cardsByThread(threadId)) ids.add(card.boardId);
+          const discussion = yield* store.discussionByEvaluator(threadId);
+          if (discussion) ids.add(discussion.boardId);
+          for (const board of boards) if (board.setup?.threadId === threadId) ids.add(board.id);
+          if (input.discussionId?.trim())
+            ids.add(
+              (yield* discussionOf(KanbanDiscussionId.make(input.discussionId.trim()))).boardId,
+            );
+          const ref = input.card?.trim();
+          if (ref && !/^#?\d+$/.test(ref)) ids.add((yield* cardOf(KanbanCardId.make(ref))).boardId);
+          if (ids.size === 0 && ref && /^#?\d+$/.test(ref)) {
+            for (const board of boards.filter((board) => board.archivedAt === null)) {
+              if (yield* store.cardByNumber(board.id, Number(ref.replace(/^#/, ""))))
+                ids.add(board.id);
+            }
+          }
+          const candidates = boards.filter((board) => ids.has(board.id));
+          if (candidates.length === 1) return candidates[0]!;
+          const open = boards.filter((board) => board.archivedAt === null);
+          if (ids.size === 0 && open.length === 1) return open[0]!;
+          return yield* failWith(
+            "invalid",
+            `Pass boardId: this thread is not on a unique board. Candidate board ids: ${(candidates.length ? candidates : open).map((board) => board.id).join(", ") || "none"}.`,
+          );
+        }),
+      );
+    }),
     caller: (threadId) => readDb(store.threadLink(threadId)),
     carried: (threadId) => readDb(store.cardsByThread(threadId)),
     ownCards: (threadId) =>

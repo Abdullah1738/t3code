@@ -65,6 +65,7 @@ import {
   modelSelectionOf,
 } from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import * as BoardLocks from "./boardLocks.ts";
 import * as KanbanService from "./KanbanService.ts";
 import type { KanbanScriptsShape } from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -318,11 +319,12 @@ const testLayer = (
   fake: Layer.Layer<KanbanThreads>,
   models: Layer.Layer<KanbanModels.KanbanModels> = KanbanModels.layerTest(null),
   providers: ReadonlyArray<ServerProvider> = [opencodeTestProvider()],
+  storeLayer = KanbanStore.layer,
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
     Layer.provideMerge(models),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(storeLayer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -13926,4 +13928,103 @@ it.effect("a read already marked never waits on the board lock", () =>
       yield* Fiber.join(dispatch);
     }).pipe(Effect.provide(testLayer(blockedThreads)));
   }),
+);
+
+it.effect.each([
+  { operation: "claim", committed: false, conflicts: 1 },
+  { operation: "edit", committed: false, conflicts: 1 },
+  { operation: "edit", committed: false, conflicts: 2 },
+  { operation: "claim", committed: true, conflicts: 1 },
+] as const)(
+  "#638 $operation conflict committed=$committed failures=$conflicts",
+  ({ operation, committed, conflicts }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let target: KanbanCardId | undefined;
+      let failures = 0;
+      let targetFiber: number | undefined;
+      const faulted = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (store) =>
+          KanbanStore.KanbanStore.of({
+            ...store,
+            threadLink: (id) =>
+              Effect.gen(function* () {
+                if (
+                  operation === "claim" &&
+                  !committed &&
+                  target &&
+                  (yield* Effect.fiberId) === targetFiber &&
+                  failures < conflicts
+                ) {
+                  failures++;
+                  const card = yield* store.card(target);
+                  if (card) yield* store.putCard({ ...card, description: "Concurrent edit" });
+                  return yield* Effect.die(new BoardLocks.BoardStateChanged(false));
+                }
+                return yield* store.threadLink(id);
+              }),
+            card: (id) =>
+              Effect.gen(function* () {
+                const card = yield* store.card(id);
+                if (
+                  (operation !== "claim" || committed) &&
+                  id === target &&
+                  (yield* Effect.fiberId) === targetFiber &&
+                  failures < conflicts &&
+                  card
+                ) {
+                  failures++;
+                  // Another writer changed the snapshot before this operation could commit.
+                  yield* store.putCard({ ...card, description: "Concurrent edit" });
+                  return yield* Effect.die(new BoardLocks.BoardStateChanged(committed));
+                }
+                return card;
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const first = yield* kanban.createCard(
+          board.id,
+          { title: "First", prompt: "First" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(first.id)).card.workThreadId!;
+        const next = yield* kanban.createCard(board.id, { title: "Next", prompt: "Next" }, owner);
+        target = next.id;
+        targetFiber = yield* Effect.fiberId;
+        const result = yield* Effect.result(
+          operation === "claim"
+            ? kanban.claimCard(thread, next.id).pipe(Effect.map((result) => result.card))
+            : kanban.editCard(next.id, { comment: "Once" }, { _tag: "thread", threadId: thread }),
+        );
+        assert.strictEqual(failures, committed ? 1 : conflicts);
+        if (committed || conflicts === 2) {
+          assert.strictEqual(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.strictEqual(result.failure.code, "conflict");
+            assert.include(
+              result.failure.detail,
+              committed ? "may have been applied" : "Re-read its state",
+            );
+          }
+          return;
+        }
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success")
+          assert.strictEqual(result.success.description, "Concurrent edit");
+        const detail = yield* kanban.card(next.id);
+        assert.lengthOf(
+          detail.events.filter((event) =>
+            operation === "claim"
+              ? event.kind === "moved" && event.toStage === "working"
+              : event.kind === "comment" && event.body === "Once",
+          ),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, faulted)));
+    }),
 );

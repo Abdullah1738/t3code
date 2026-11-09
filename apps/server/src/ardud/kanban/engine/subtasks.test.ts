@@ -63,7 +63,7 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }])).toMatchObject({
       ok: false,
-      reason: "the card has no subtask s9",
+      reason: "the card has no subtask s9. Existing subtask ids: none",
     });
     const subtasks = planned();
     expect(

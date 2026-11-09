@@ -10,8 +10,8 @@ import {
   type KanbanSubtask,
 } from "@t3tools/contracts";
 
-const MAX_SUBTASKS = 30;
-const MAX_TEXT = 500;
+export const MAX_SUBTASKS = 30;
+export const MAX_TEXT = 500;
 
 export interface SubtaskInput {
   /** An existing subtask's id keeps its state; leave out for a new one. */
@@ -97,7 +97,11 @@ export function planSubtasks(
     const id = input.id?.trim();
     if (id) {
       const known = byId.get(id);
-      if (!known) return { ok: false, reason: `the card has no subtask ${id}` };
+      if (!known)
+        return {
+          ok: false,
+          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
+        };
       if (listed.has(id)) return { ok: false, reason: `subtask ${id} is listed twice` };
       listed.add(id);
       const { script: _old, ...rest } = known;
@@ -135,7 +139,11 @@ export function checkMark(
   scriptName: string | null = null,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
-  if (!subtask) return { ok: false, reason: `card #${card.number} has no subtask ${id}` };
+  if (!subtask)
+    return {
+      ok: false,
+      reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
+    };
   if (subtask.state === state) return { ok: false, reason: `subtask ${id} is already ${state}` };
   if (state === "skipped" && !note?.trim()) {
     return { ok: false, reason: "say why the subtask is skipped" };
@@ -178,7 +186,11 @@ export function checkHandBack(
   note: string,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
-  if (!subtask) return { ok: false, reason: `card #${card.number} has no subtask ${id}` };
+  if (!subtask)
+    return {
+      ok: false,
+      reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
+    };
   if (!note.trim()) return { ok: false, reason: "say what failed or didn't match" };
   if (subtask.owner !== "script") return { ok: false, reason: `subtask ${id} isn't a script's` };
   if (subtask.state !== "open") {

@@ -122,17 +122,10 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
   explicit?: string,
+  card?: string,
+  discussionId?: string,
 ) {
-  const boards = yield* service.boards;
-  const wanted = explicit?.trim() || caller.link?.boardId;
-  if (wanted) {
-    const board = boards.find((candidate) => candidate.id === wanted || candidate.slug === wanted);
-    if (board) return board;
-    return yield* invalid(`No Missions board "${wanted}".`);
-  }
-  const open = boards.filter((board) => board.archivedAt === null);
-  if (open.length === 1 && open[0]) return open[0];
-  return yield* invalid("Pass boardId: this thread is not on a board.");
+  return yield* service.resolveBoard(caller.threadId, { boardId: explicit, card, discussionId });
 });
 
 /**
@@ -179,7 +172,7 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   if (!trimmed) return yield* defaultCard(service, caller);
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
-    const board = yield* boardFor(service, caller, boardId);
+    const board = yield* boardFor(service, caller, boardId, trimmed);
     const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
     return card;
@@ -259,10 +252,11 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   caller: Caller,
   explicit: string | undefined,
   cardRef?: string | undefined,
+  boardId?: string | undefined,
 ) {
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (cardRef?.trim()) {
-    const card = yield* cardFor(service, caller, cardRef);
+    const card = yield* cardFor(service, caller, cardRef, boardId);
     yield* ownCard(caller, card);
     return yield* service.cardDiscussion(card.id);
   }
@@ -290,11 +284,12 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   caller: Caller,
   explicit: string | undefined,
   cardRef: string | undefined,
+  boardId?: string | undefined,
 ) {
   if (explicit?.trim())
     return { kind: "discussion" as const, id: KanbanDiscussionId.make(explicit.trim()) };
   if (cardRef?.trim()) {
-    const card = yield* cardFor(service, caller, cardRef);
+    const card = yield* cardFor(service, caller, cardRef, boardId);
     yield* ownCard(caller, card);
     return { kind: "card" as const, id: card.id };
   }
@@ -319,6 +314,7 @@ const cardIds = (
   service: KanbanService["Service"],
   caller: Caller,
   refs: ReadonlyArray<string> | undefined,
+  boardId?: string,
 ): Effect.Effect<
   ReadonlyArray<KanbanCard["id"]> | undefined,
   KanbanError | OrchestratorMcpFailure
@@ -326,7 +322,7 @@ const cardIds = (
   refs === undefined
     ? Effect.void.pipe(Effect.as(undefined))
     : Effect.forEach(refs, (ref) =>
-        cardFor(service, caller, ref).pipe(Effect.map((card) => card.id)),
+        cardFor(service, caller, ref, boardId).pipe(Effect.map((card) => card.id)),
       );
 
 const SEARCH_LIMIT = 20;
@@ -419,7 +415,7 @@ const handlers = {
   card_get: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         const detail = yield* service.card(card.id);
         return { card: detail.card, events: detail.events, threads: detail.threads };
       }),
@@ -429,7 +425,7 @@ const handlers = {
   card_update: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         const updated = yield* service.editCard(
           card.id,
@@ -448,7 +444,7 @@ const handlers = {
   card_move: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads record their verdict with card_review_result.");
@@ -468,7 +464,7 @@ const handlers = {
   card_ask: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
@@ -492,7 +488,7 @@ const handlers = {
   card_ask_change: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
@@ -514,7 +510,7 @@ const handlers = {
       Effect.gen(function* () {
         const problem = textProblem([["reason", input.reason]]);
         if (problem) return yield* invalid(problem);
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
         return { card: yield* service.flagCard(card.id, reason, caller.actor) };
@@ -556,7 +552,13 @@ const handlers = {
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
-        const target = yield* postTargetFor(service, caller, input.discussionId, input.card);
+        const target = yield* postTargetFor(
+          service,
+          caller,
+          input.discussionId,
+          input.card,
+          input.boardId,
+        );
         return {
           message: yield* target.kind === "card"
             ? service.postToCard(target.id, caller.actor, blocks)
@@ -569,7 +571,13 @@ const handlers = {
   discussion_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
+        const discussion = yield* discussionFor(
+          service,
+          caller,
+          input.discussionId,
+          input.card,
+          input.boardId,
+        );
         let messages: ReadonlyArray<KanbanMessage>;
         let note: string | undefined;
         if (input.seq !== undefined) {
@@ -618,7 +626,7 @@ const handlers = {
   wiki_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const pages = yield* service.wiki(board.id);
         return { pages: input.slug ? pages.filter((page) => page.slug === input.slug) : pages };
       }),
@@ -638,8 +646,8 @@ const handlers = {
         if (input.assignToSelf && input.priority === KANBAN_BACKLOG) {
           return yield* refuse("A backlog card isn't picked up; leave out assignToSelf.");
         }
-        const board = yield* boardFor(service, caller);
-        const blockedBy = yield* cardIds(service, caller, input.blockedBy);
+        const board = yield* boardFor(service, caller, input.boardId);
+        const blockedBy = yield* cardIds(service, caller, input.blockedBy, board.id);
         const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
         const model = input.model ? yield* modelOf(input.model, apply) : undefined;
         const models = yield* modelsOf(input.models, apply);
@@ -682,7 +690,7 @@ const handlers = {
         if (caller.link?.role !== "work") {
           return yield* refuse("Only a card's work thread takes cards into its run.");
         }
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         return yield* service.claimCard(caller.threadId, card.id);
       }),
     ),
@@ -716,8 +724,8 @@ const handlers = {
   card_edit: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
-        const blockedBy = yield* cardIds(service, caller, input.blockedBy);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
+        const blockedBy = yield* cardIds(service, caller, input.blockedBy, card.boardId);
         const apply = input.model || input.models ? yield* selectionRoutingEnabled : false;
         const model = input.model ? yield* modelOf(input.model, apply) : undefined;
         const models = yield* modelsOf(input.models, apply);
@@ -754,7 +762,7 @@ const handlers = {
   subtask_done: McpToolAccess.actsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         yield* ownCard(caller, card);
         const role =
           caller.link?.role === "work" || caller.link?.role === "review"
@@ -777,7 +785,7 @@ const handlers = {
   card_thread: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId);
         return {
           card: yield* service.cardThread(card.id, input.action, input.text ?? "", caller.actor),
         };
@@ -788,7 +796,7 @@ const handlers = {
   pool_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
         return {
@@ -803,7 +811,7 @@ const handlers = {
   pool_remove: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
         return { pools: yield* service.removePool(board.id, model) };
@@ -814,7 +822,7 @@ const handlers = {
   goal_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const goal = yield* service.setGoal(board.id, {
           id: input.id ? KanbanGoalId.make(input.id) : undefined,
           name: input.name,
@@ -830,9 +838,9 @@ const handlers = {
   group_set: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const groups = yield* Effect.forEach(input.groups, (group) =>
-          cardIds(service, caller, group.cards).pipe(
+          cardIds(service, caller, group.cards, board.id).pipe(
             Effect.map((ids) => ({
               id: group.id,
               name: group.name,
@@ -856,7 +864,7 @@ const handlers = {
         ]);
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         return {
           discussion: yield* service.createDiscussion(board.id, input.title, caller.actor, blocks),
         };
@@ -867,7 +875,7 @@ const handlers = {
   wiki_write: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         const page = yield* service.writeWiki(
           board.id,
           { slug: input.slug, title: input.title, body: input.body },
@@ -892,10 +900,10 @@ const handlers = {
     ),
   ),
 
-  setup_done: McpToolAccess.actsAsCaller(() =>
+  setup_done: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId);
         return { board: yield* service.endSetup(board.id, caller.actor) };
       }),
     ),
@@ -935,7 +943,13 @@ const handlers = {
             'Card threads can start only a request evaluator (kind "request"), for example to hand a broken tool to the Robob board.',
           );
         }
-        const board = yield* boardFor(service, caller, input.boardId);
+        const board = yield* boardFor(
+          service,
+          caller,
+          input.boardId,
+          undefined,
+          input.discussionId,
+        );
         const text = input.text?.trim() ?? "";
         let purpose: EvaluatorPurpose;
         if (input.kind === "setup" || input.kind === "request") {

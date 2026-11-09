@@ -326,3 +326,73 @@ it.effect(
       yield* locks.board("a", Effect.void);
     }),
 );
+
+it.effect("#638 retries an uncommitted stale snapshot once with new versions", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    yield* locks.board("a", Effect.void);
+    let attempts = 0;
+    const result = yield* locks.run(
+      Effect.gen(function* () {
+        attempts++;
+        yield* locks.observe(Effect.void);
+        if (attempts === 1) yield* locks.exclusive(Effect.void);
+        return yield* locks.access("a", Effect.succeed("saved"), true);
+      }),
+      undefined,
+      true,
+    );
+    assert.strictEqual(result, "saved");
+    assert.strictEqual(attempts, 2);
+    attempts = 0;
+    const failed = yield* Effect.exit(
+      locks.run(
+        Effect.gen(function* () {
+          attempts++;
+          yield* locks.observe(Effect.void);
+          yield* locks.exclusive(Effect.void);
+          yield* locks.access("a", Effect.void, true);
+        }),
+        undefined,
+        true,
+      ),
+    );
+    assert.isTrue(Exit.isFailure(failed));
+    assert.strictEqual(attempts, 2);
+  }),
+);
+
+it.effect.each(["saved", "external"] as const)(
+  "#638 never retries after %s work and a stale permit",
+  (kind) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let attempts = 0;
+      const result = yield* Effect.exit(
+        locks.run(
+          Effect.gen(function* () {
+            attempts++;
+            if (kind === "saved") yield* locks.access("a", Effect.void, true);
+            else yield* locks.outside(Effect.void);
+            // Even an incorrectly classified later defect cannot override the operation's commit state.
+            return yield* Effect.die(new BoardLocks.BoardStateChanged(false));
+          }),
+          undefined,
+          true,
+        ),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      assert.strictEqual(attempts, 1);
+      attempts = 0;
+      yield* Effect.exit(
+        locks.run(
+          Effect.sync(() => {
+            attempts++;
+          }).pipe(Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true)))),
+          undefined,
+          true,
+        ),
+      );
+      assert.strictEqual(attempts, 1);
+    }),
+);

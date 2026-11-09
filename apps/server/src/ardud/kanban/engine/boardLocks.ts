@@ -157,7 +157,11 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       }),
     );
 
-  const run = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string): Effect.Effect<A, E, R> =>
+  const run = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    cardId?: string,
+    retry = false,
+  ): Effect.Effect<A, E, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const parent = yield* operation;
@@ -183,6 +187,13 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
                 ),
               ),
             ),
+          ),
+          Effect.catchDefect((defect) =>
+            retry && defect instanceof BoardStateChanged && !defect.committed && !op.committed
+              ? Effect.logInfo("kanban retrying uncommitted board conflict", { cardId }).pipe(
+                  Effect.andThen(run(effect, cardId)),
+                )
+              : Effect.die(defect),
           ),
         );
       }),

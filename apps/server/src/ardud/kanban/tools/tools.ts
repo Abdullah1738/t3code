@@ -21,6 +21,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
+import { MAX_SUBTASKS, MAX_TEXT } from "../engine/subtasks.ts";
 import { MAX_BATCH } from "../engine/rules.ts";
 
 const dependencies = [
@@ -36,6 +37,11 @@ const RawBoardText = Schema.toType(TrimmedNonEmptyString);
 
 const describe = <S extends Schema.Top>(schema: S, description: string) =>
   schema.annotate({ description });
+
+const BoardRef = describe(
+  TrimmedNonEmptyString,
+  "Board id or slug. Defaults to the board identified by this thread or the card/discussion reference; pass explicitly when ambiguous.",
+);
 
 const CardRef = describe(
   TrimmedNonEmptyString,
@@ -86,7 +92,10 @@ const SubtasksInput = describe(
   Schema.Array(
     Schema.Struct({
       id: Schema.optional(
-        describe(TrimmedNonEmptyString, "An existing subtask's id (s1, s2...) to keep it."),
+        describe(
+          TrimmedNonEmptyString,
+          "Existing s<N> id from card_get to keep it; omit id for a new subtask.",
+        ),
       ),
       step: Schema.optional(
         describe(
@@ -94,7 +103,10 @@ const SubtasksInput = describe(
           "Subtasks with the same step go in any order. Leave out for the step after the previous entry.",
         ),
       ),
-      text: RawBoardText,
+      text: describe(
+        RawBoardText.check(Schema.isMaxLength(MAX_TEXT)),
+        `Subtask text, at most ${MAX_TEXT} characters.`,
+      ),
       owner: describe(
         Schema.Literals(["work", "review", "evaluator", "script"]),
         "Who does it: the worker, the reviewer (ticked when the review passes), an evaluator, or a board script (the script ticks it from its output; the evaluator hears about it only if the script hands it back).",
@@ -107,7 +119,7 @@ const SubtasksInput = describe(
       ),
     }),
   ),
-  "The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: listed ids keep their state, open ones left out go, done ones stay.",
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: listed ids keep their state, open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -156,9 +168,9 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. Threads outside a board pass boardId.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
-    boardId: Schema.optional(TrimmedNonEmptyString),
+    boardId: Schema.optional(BoardRef),
     after: Schema.optional(
       describe(NonNegativeInt, "Cards numbered after this cursor (default 0)."),
     ),
@@ -173,7 +185,7 @@ const CardSearch = tool(
   "Search cards",
   "Find cards on a board by words in their title, description, prompt or links, or by #number. Settled cards are left out unless includeSettled. Returns short rows, newest first; read one in full with card_get.",
   {
-    boardId: Schema.optional(TrimmedNonEmptyString),
+    boardId: Schema.optional(BoardRef),
     query: describe(Schema.String, "Words to match (all of them), or #12. Empty lists every card."),
     stage: Schema.optional(KanbanStage),
     includeSettled: Schema.optional(Schema.Boolean),
@@ -187,7 +199,7 @@ const CardGet = tool(
   "card_get",
   "Read a card",
   "One card with its history (moves, edits, comments, review verdicts) and every thread it has had.",
-  { card: Schema.optional(CardRef) },
+  { boardId: Schema.optional(BoardRef), card: Schema.optional(CardRef) },
   { card: Record, events: Records, threads: Records },
   { readonly: true },
 );
@@ -195,8 +207,9 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "For a card's work thread: change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     description: Schema.optional(Schema.String),
     links: Schema.optional(Schema.Array(LinkInput)),
@@ -209,8 +222,9 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     to: KanbanStage,
     note: Schema.optional(describe(Schema.String, "One line for the card history.")),
@@ -227,6 +241,7 @@ const CardAsk = tool(
   "Ask the owner",
   "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick; multi lets him tick several.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     question: Schema.String,
     blocking: Schema.optional(Schema.Boolean),
@@ -249,6 +264,7 @@ const CardAskChange = tool(
   "Change an open ask",
   "Make an open async ask (q1, q2... on the card) blocking, or drop one that is no longer needed. A work thread changes only its own card's asks.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     ask: Schema.String,
     action: Schema.Literals(["block", "drop"]),
@@ -262,6 +278,7 @@ const CardFlag = tool(
   "Flag a card stalled",
   "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A card thread flagging its own card gives up its slot.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     stalled: Schema.Boolean,
     reason: Schema.optional(Schema.String),
@@ -294,6 +311,7 @@ const DiscussionPost = tool(
   "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     ...BlocksInput,
   },
@@ -307,6 +325,7 @@ const DiscussionRead = tool(
   "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
@@ -330,7 +349,7 @@ const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
   "The board's shared lessons. Without slug: every page.",
-  { slug: Schema.optional(TrimmedNonEmptyString) },
+  { boardId: Schema.optional(BoardRef), slug: Schema.optional(TrimmedNonEmptyString) },
   { pages: Records },
   { readonly: true },
 );
@@ -340,6 +359,7 @@ const CardCreate = tool(
   "Create a card",
   "Create a card in todo (the dispatcher starts it when a slot is free) or, for evaluators, needs_owner (with the question). A card's work thread can pass assignToSelf to take the new card into its own run at once (same model pool; it shares the thread's slot; you get its task back as brief). A work thread's new cards keep the review chain of its card. The prompt is what the work thread gets; from an evaluator it is the packet (scope, files, steps, tests, when it's done). A card a thread makes without assignToSelf waits for an evaluator to write its packet. Title and description are written for you when left out. Refused when an open card on the board has the same title or the same source link (not card, PR or Linear links).",
   {
+    boardId: Schema.optional(BoardRef),
     prompt: Schema.String,
     assignToSelf: Schema.optional(
       describe(
@@ -376,7 +396,7 @@ const CardClaim = tool(
   "card_claim",
   "Take a todo card",
   `Work threads: take a todo card into this thread to reuse your context. It must run on your model and project, not be blocked by work outside this thread or kept for another work thread, and you can carry at most ${MAX_BATCH} cards. The card moves to working on this thread; you get its task back.`,
-  { card: CardRef },
+  { boardId: Schema.optional(BoardRef), card: CardRef },
   { card: Record, brief: Schema.String },
   { readonly: false },
 );
@@ -395,6 +415,7 @@ const CardEdit = tool(
   "Edit a card",
   "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
   {
+    boardId: Schema.optional(BoardRef),
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
@@ -426,8 +447,12 @@ const SubtaskDone = tool(
   "Mark a subtask",
   "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent.",
   {
+    boardId: Schema.optional(BoardRef),
     card: Schema.optional(CardRef),
-    subtask: describe(TrimmedNonEmptyString, "Subtask id, e.g. s2."),
+    subtask: describe(
+      TrimmedNonEmptyString,
+      "Existing s<N> id from card_get, e.g. s2; do not invent ids.",
+    ),
     state: Schema.Literals(["done", "skipped", "open"]),
     note: Schema.optional(Schema.String),
   },
@@ -440,6 +465,7 @@ const CardThread = tool(
   "Steer, stop, wake or reset a card thread",
   "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
   {
+    boardId: Schema.optional(BoardRef),
     card: CardRef,
     action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
@@ -453,6 +479,7 @@ const PoolSet = tool(
   "Set a model pool",
   "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
   {
+    boardId: Schema.optional(BoardRef),
     model: ModelInput,
     slots: Schema.optional(NonNegativeInt),
     replaces: Schema.optional(
@@ -470,7 +497,7 @@ const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
   "Evaluators: drop a pool at 0 slots that nothing on the board uses. Name the variant when the model has pools at several levels.",
-  { model: ModelInput },
+  { boardId: Schema.optional(BoardRef), model: ModelInput },
   { pools: Records },
   { readonly: false, destructive: true },
 );
@@ -480,6 +507,7 @@ const GoalSet = tool(
   "Create or update a goal",
   "Evaluators: create a goal (name) or update one (id): status, Now (current status, plain words) and a new Story entry (appended to the numbered story for a non-technical reader).",
   {
+    boardId: Schema.optional(BoardRef),
     id: Schema.optional(TrimmedNonEmptyString),
     name: Schema.optional(Schema.String),
     status: Schema.optional(Schema.Literals(["active", "done"])),
@@ -495,6 +523,7 @@ const GroupSet = tool(
   "Set the similar-card groups",
   "Evaluators and the scribe: replace the board's view-only groups of similar cards, each with a plain summary a busy reader understands.",
   {
+    boardId: Schema.optional(BoardRef),
     groups: Schema.Array(
       Schema.Struct({
         id: TrimmedNonEmptyString,
@@ -512,7 +541,7 @@ const DiscussionCreate = tool(
   "discussion_create",
   "Open a discussion",
   "Evaluators: open a new discussion channel with the owner, then post into it with discussion_post.",
-  { title: RawBoardText, ...BlocksInput },
+  { boardId: Schema.optional(BoardRef), title: RawBoardText, ...BlocksInput },
   { discussion: Record },
   { readonly: false },
 );
@@ -521,7 +550,12 @@ const WikiWrite = tool(
   "wiki_write",
   "Write a wiki page",
   "Evaluators: create or replace a wiki page of lessons future threads should know.",
-  { slug: TrimmedNonEmptyString, title: RawBoardText, body: Schema.String },
+  {
+    boardId: Schema.optional(BoardRef),
+    slug: TrimmedNonEmptyString,
+    title: RawBoardText,
+    body: Schema.String,
+  },
   { page: Record },
   { readonly: false },
 );
@@ -545,7 +579,7 @@ const EvaluatorStart = tool(
   "Start an evaluator",
   "Start an evaluator thread on a board for a job: setup or request (text required), or a sweep: stalled, completed, deployed, check (optional text is added to its brief). A board runs one sweep of each kind at a time; starting another while one runs fails and names it. To give one card or job to a new evaluator, use kind request with text. Card threads may start only kind request (for example to hand a broken tool to the Robob board); their text is stamped with their board, card and thread.",
   {
-    boardId: TrimmedNonEmptyString,
+    boardId: Schema.optional(BoardRef),
     kind: Schema.Literals(["setup", "request", "stalled", "completed", "deployed", "check"]),
     text: Schema.optional(Schema.String),
     /** For setup: an existing discussion on this board to use as the Setup discussion. */
@@ -559,7 +593,7 @@ const SetupDone = tool(
   "setup_done",
   "End board setup",
   "Only the board's setup evaluator calls this, once the board's wiki and setup are complete. It lifts the setup hold: card work and review resume, and one line is posted in the Setup discussion.",
-  {},
+  { boardId: Schema.optional(BoardRef) },
   { board: Record },
   { readonly: false },
 );
@@ -569,7 +603,7 @@ const BoardPause = tool(
   "Pause or resume a board",
   "Evaluators: pause the whole board or lift it. While paused, the dispatcher starts no card work or review except the kept cards (keep: #numbers). Threads already running keep running; stop them with card_thread stop if they must stop now. clear:true lifts it. Use this instead of per-card stalled flags.",
   {
-    boardId: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+    boardId: Schema.optional(Schema.NullOr(BoardRef)),
     keep: Schema.optional(Schema.NullOr(Schema.Array(TrimmedNonEmptyString))),
     reason: Schema.optional(Schema.NullOr(Schema.String)),
     clear: Schema.optional(Schema.NullOr(Schema.Boolean)),

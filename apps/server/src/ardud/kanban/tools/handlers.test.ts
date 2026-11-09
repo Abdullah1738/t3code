@@ -1368,3 +1368,151 @@ it.effect("discussion_read keeps blocks whole, caps a reply near 1 MB and reads 
     assert.isUndefined(one.structured.earlierBefore);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("board defaults follow the work thread; unbound callers must disambiguate", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "bound",
+      name: "Bound",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const other = yield* kanban.ensureBoard({
+      slug: "other",
+      name: "Other",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { title: "Work", prompt: "Work" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(card.id)).card.workThreadId!;
+    const updated = yield* call(thread, "card_update", {
+      card: `#${card.number}`,
+      comment: "Saved without boardId",
+    });
+    assert.isFalse(updated.isError, updated.text);
+    assert.strictEqual((updated.structured.card as { id: string }).id, card.id);
+    const unbound = ThreadId.make("unbound");
+    const refused = yield* call(unbound, "board_get", {});
+    assert.isTrue(refused.isError);
+    assert.include(refused.text, "Candidate board ids:");
+    assert.include(refused.text, board.id);
+    assert.include(refused.text, other.id);
+    // The card reference itself is enough when its number occurs on one board only.
+    const found = yield* call(unbound, "card_get", { card: `#${card.number}` });
+    assert.isFalse(found.isError, found.text);
+    yield* kanban.createCard(other.id, { title: "Other work", prompt: "Other work" }, owner);
+    assert.isTrue((yield* call(unbound, "card_get", { card: `#${card.number}` })).isError);
+    const explicit = yield* call(unbound, "card_get", {
+      boardId: board.id,
+      card: `#${card.number}`,
+    });
+    assert.isFalse(explicit.isError, explicit.text);
+    // Knowing the other board does not grant a worker evaluator powers or another card.
+    assert.isTrue((yield* call(thread, "card_edit", { card: card.id, title: "No" })).isError);
+    const foreign = (yield* kanban.cards(other.id))[0]!;
+    const dependent = yield* kanban.createCard(
+      other.id,
+      { title: "Dependent", prompt: "Dependent" },
+      owner,
+    );
+    const edited = yield* call(unbound, "card_edit", {
+      card: dependent.id,
+      blockedBy: [`#${foreign.number}`],
+    });
+    assert.isFalse(edited.isError, edited.text);
+    assert.deepStrictEqual((edited.structured.card as { blockedBy: string[] }).blockedBy, [
+      foreign.id,
+    ]);
+
+    assert.isTrue(
+      (yield* call(thread, "card_update", {
+        boardId: other.id,
+        card: `#${foreign.number}`,
+        comment: "No",
+      })).isError,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "board lookup recovers from card ownership and a discussion evaluator without a link",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const board = yield* kanban.ensureBoard({
+        slug: "inferred",
+        name: "Inferred",
+        defaultProjectId: null,
+      });
+      yield* kanban.ensureBoard({ slug: "unrelated", name: "Unrelated", defaultProjectId: null });
+      const card = yield* kanban.createCard(board.id, { title: "Work", prompt: "Work" }, owner);
+      const worker = ThreadId.make("unlinked-worker");
+      yield* store.putCard({
+        ...card,
+        activeThreadId: worker,
+        workThreadId: worker,
+        activeRole: "work",
+      });
+      const result = yield* call(worker, "board_get", {});
+      assert.isFalse(result.isError, result.text);
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const evaluator = ThreadId.make("unlinked-discussion-evaluator");
+      yield* store.putDiscussion({ ...discussion, evaluatorThreadId: evaluator });
+      const inferred = yield* call(evaluator, "board_get", {});
+      assert.isFalse(inferred.isError, inferred.text);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect(
+  "subtasks advertise their limit, reject long text in the schema and list existing ids",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "limits",
+        name: "Limits",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Work",
+          prompt: "Work",
+          subtasks: [
+            { text: "First", owner: "work" },
+            { text: "Second", owner: "review" },
+          ],
+        },
+        owner,
+      );
+      const evaluator = ThreadId.make("evaluator");
+      const missing = yield* call(evaluator, "subtask_done", {
+        card: card.id,
+        subtask: "s9",
+        state: "done",
+      });
+      assert.isTrue(missing.isError);
+      assert.include(missing.text, "Existing subtask ids: s1, s2");
+      const parameters = KanbanToolkit.tools.card_edit.parametersSchema;
+      const tooLong = Schema.decodeUnknownExit(parameters)({
+        card: card.id,
+        subtasks: [{ text: "x".repeat(501), owner: "work" }],
+      });
+      assert.strictEqual(tooLong._tag, "Failure");
+      assert.strictEqual(
+        Schema.decodeUnknownExit(parameters)({
+          card: card.id,
+          subtasks: [{ text: "x".repeat(500), owner: "work" }],
+        })._tag,
+        "Success",
+      );
+      assert.include(JSON.stringify(Schema.toJsonSchemaDocument(parameters)), '"maxLength":500');
+    }).pipe(Effect.provide(layer));
+  },
+);
