@@ -471,9 +471,8 @@ const make = Effect.gen(function* () {
         candidates: [],
       };
     },
-    // A committed native mapping must remain readable while unrelated writes
-    // are queued. Offbox treats a lookup timeout as an unavailable caller.
-    NodeSqliteClient.readOnly,
+    // Both writes and large shell snapshots can outlast offbox's lookup timeout.
+    NodeSqliteClient.identityReadOnly,
   );
 
   const currentNative: ExecutionIdentityShape["currentNative"] = (threadIds) =>

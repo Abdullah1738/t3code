@@ -52,6 +52,11 @@ type Turn = Route & {
   steered?: string[];
   /** When the last steer was sent, bounding how long a steer that never shows up holds the reply. */
   steeredAt?: number;
+  /** The first reply already queued while this turn was still running, including a matching /send. */
+  earlySent?: string;
+  earlyText?: string;
+  /** Physical outbox row, whether the router or /send queued it first. */
+  earlyOutbox?: string;
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
 type ResendBody = {
@@ -231,6 +236,8 @@ const REQUEST_TURN_GRACE = 15_000;
 const SENDBLUE_QUIET_MS = 2_000;
 /** Sendblue mode: how often our typing bubble is renewed while a turn runs; each start lasts 60 s. */
 const SENDBLUE_TYPING_REFRESH_MS = 20_000;
+// A final normally reaches idle within seconds; 20 seconds without idle means work is continuing.
+const EARLY_REPLY_MS = 20_000;
 /** Sendblue mode: a typing sender holds the batch back, but never past this from its oldest member. */
 const SENDBLUE_TYPING_CAP_MS = 90_000;
 /** After a refused steer the run is ending; give it this long to settle before steering again. */
@@ -2794,10 +2801,10 @@ export class Router {
       const final = replies.at(-1);
       // The last word of each earlier run still goes out, ahead of the final
       // one, and so does a step the model stopped on before a steered text
-      // came in (`answer`, see opencode-steps.ts). Narration never does.
+      // came in (`answer`, see opencode-steps.ts). Other narration stays quiet.
       // One message written as several text blocks is judged whole: a NO_REPLY
       // at its end keeps every block of it out of the chat.
-      const scope = end < 0 ? [] : after.slice(0, end);
+      const scope = end < 0 ? after : after.slice(0, end);
       const quiet = quietMessages(scope);
       const failedReplies = new Set<string>();
       let priorFailure: Extract<MessageRecord, { type: "idle" }> | undefined;
@@ -2814,12 +2821,41 @@ export class Router {
       let last: MessageRecord | undefined;
       for (const m of scope) {
         // A run's last word goes out ahead of the final one unless it is proven narration (answer false),
-        // which never goes to the chat. An unknown last word is forwarded, as the final one is.
+        // which only the early-reply path may forward. An unknown last word is forwarded, as the final one is.
         if (m.type === "idle" && last?.type === "assistant" && last.answer !== false && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
         if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
-      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id) || failedReplies.has(earlier[i]!.id)) earlier.splice(i, 1);
+      for (let i = earlier.length - 1; i >= 0; i--) if (earlier[i]!.id === turn.earlySent || quiet.has(earlier[i]!.id) || failedReplies.has(earlier[i]!.id)) earlier.splice(i, 1);
+      if (turn.phase === "running" && !turn.background && turn.inboundId && !synthetic(turn.inboundId)
+        && !this.isGroup() && !turn.earlySent && found < 0
+        // A later run must not overtake an earlier answer still waiting for the steered turn to settle.
+        && !earlier.some(reply => after.indexOf(reply) <= steered && !!replyText(assistantText(reply)))
+        && !after.some(m => m.type === "idle" && (m.outcome !== "succeeded" || m.modelError))) {
+        const candidate = after.slice(steered + 1).find((record): record is Extract<MessageRecord, { type: "assistant" }> =>
+          record.type === "assistant" && record.time.completed !== undefined && !record.error
+          && !providerRefusal(record) && !quiet.has(record.id) && !!replyText(assistantText(record))
+          && (record.continued || record.finish === "tool-calls" || after.indexOf(record) < after.length - 1
+            || Date.now() - record.time.completed >= EARLY_REPLY_MS));
+        if (candidate) {
+          const text = replyText(assistantText(candidate));
+          const enqueued = this.store.db.transaction(() => {
+            if (!this.current(turn!)) return false;
+            const sent = this.store.queuedSends(turn!.id, turn!.generation, turn!.startedAt)
+              .find(op => replyText(op.text).trim() === text.trim());
+            const id = sent?.id ?? `reply:${turn!.generation}:${candidate.id}`;
+            // TODO(#728): run the final-reply check here too
+            const created = !sent && this.store.enqueue({
+              id, kind: "conversation", text,
+              sessionId: turn!.id, generation: turn!.generation, ...this.replyTarget(turn!.inboundId),
+            });
+            turn = { ...turn!, earlySent: candidate.id, earlyText: text, earlyOutbox: id };
+            this.store.set("activeTurn", turn);
+            return created;
+          }).immediate();
+          if (enqueued) this.stage("early-reply-enqueued", turn.inboundId!);
+        }
+      }
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);
@@ -2883,12 +2919,14 @@ export class Router {
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
       if (turn.phase !== "running") return;
       if (runningTools || !idle) return;
-      // A final that has not completed, or that stopped to call tools, keeps the turn open. Narration
+      // An unsent final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
-      if (final && (final.time.completed === undefined || final.finish === "tool-calls")) return;
-      // Narration (text before a tool call, `answer` false) never goes to the chat. A final whose phase
+      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) return;
+      // Unsent narration (text before a tool call, `answer` false) stays quiet. A final whose phase
       // is unknown still does, as before: the owner chose to keep forwarding unknown finals.
-      const text = final && final.answer !== false ? replyText(assistantText(final)) : "";
+      const early = replies.find(reply => reply.id === turn!.earlySent);
+      if (early && replyText(assistantText(early)) !== turn.earlyText) this.stage("early-reply-text-changed", turn.inboundId!);
+      const text = final && final.id !== turn.earlySent && final.answer !== false ? replyText(assistantText(final)) : "";
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
@@ -2907,7 +2945,7 @@ export class Router {
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
           ...this.replyTarget(turn!.inboundId),
         });
-        const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
+        const said = [turn!.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
         if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
