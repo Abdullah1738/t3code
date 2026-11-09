@@ -1184,20 +1184,29 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       }
 
       const highWater = yield* applicationEvents.latestApplicationSequence;
-      if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
+      // Opted-in clients also get the cursor event again: ancestor rows sent right after an
+      // asking subagent's update share its sequence, so a drop between the two would otherwise
+      // never resend them. The client takes only rows it lacks at that sequence. The budget
+      // covers exactly what is replayed; a cursor past the head still means a fresh snapshot.
+      const replayAfter =
+        input.omitIdleSubagents === true && input.afterSequence > 0
+          ? input.afterSequence - 1
+          : input.afterSequence;
+      if (
+        input.afterSequence > highWater ||
+        !(yield* canReplayPersistedRange(
+          replayAfter,
+          highWater,
+          SHELL_RESUME_MAX_GAP + (input.afterSequence - replayAfter),
+        ))
+      ) {
         return yield* snapshotThenLive();
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
       const replay = toShellStream(
         applicationEvents.readApplicationEvents({
-          // Opted-in clients also get the cursor event again: ancestor rows sent right after
-          // an asking subagent's update share its sequence, so a drop between the two would
-          // otherwise never resend them. The client takes only rows it lacks at that sequence.
-          afterSequence:
-            input.omitIdleSubagents === true && input.afterSequence > 0
-              ? input.afterSequence - 1
-              : input.afterSequence,
+          afterSequence: replayAfter,
           throughSequence: highWater,
           // A row a newer build wrote (e.g. after a downgrade) must not fail
           // every shell resubscribe. The live tail below resumes from
