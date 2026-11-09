@@ -409,6 +409,25 @@ LDCACHE_REPAIR = r'''(
   fi
 ) || true'''
 
+# Root processes can write foreign-owned leaf files inside user-owned buckets,
+# so checking only cache parents misses poisoned entries.
+CACHE_OWNER_REPAIR = r'''(
+  _offbox_user=$(id -un) || exit 0
+  _offbox_group=$(id -gn) || exit 0
+  _offbox_box=__OFFBOX_BOX__
+  for _offbox_root in "$HOME/.npm" "$HOME/.cache" "$HOME/.local/share/pnpm" "$HOME/.yarn"; do
+    [ -d "$_offbox_root" ] && [ ! -L "$_offbox_root" ] || continue
+    _offbox_owner=$(find "$_offbox_root" ! -user "$_offbox_user" -printf '%u\n' -quit 2>/dev/null)
+    [ -n "$_offbox_owner" ] || continue
+    if sudo -n chown -h -R "$_offbox_user:$_offbox_group" -- "$_offbox_root" >/dev/null 2>&1; then
+      echo "offbox: gave $_offbox_root back to $_offbox_user (foreign-owned entries left by an earlier run)" >&2
+    else
+      printf 'offbox: %s has entries owned by %s and sudo -n chown failed; run: offbox ssh %q -- sudo chown -h -R %q -- %q\n' \
+        "$_offbox_root" "$_offbox_owner" "$_offbox_box" "$_offbox_user:$_offbox_group" "$_offbox_root" >&2
+    fi
+  done
+) || true'''
+
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 # boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
 # A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
@@ -695,7 +714,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
-                  image_wait: int = 180, repo_key: str = "") -> str:
+                  image_wait: int = 180, repo_key: str = "", box_id: str = "<box>") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -703,6 +722,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
              f'export OFFBOX_RUN_ID={run_id}',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
+              CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
@@ -787,7 +807,7 @@ class Runner:
             node_block = ""
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"])
+                               repo_key=me["repo_key"], box_id=self.box)
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
