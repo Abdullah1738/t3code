@@ -24,7 +24,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from card_mask import mask_json_text, mask_text  # noqa: E402
+from card_mask import mask_json_text, mask_recall_value, mask_text  # noqa: E402
 import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
@@ -201,11 +201,13 @@ def project(rec, path, line_no):
             rows.append((tid, ts or int(time.time()), "assistant", "text", clip(b["thinking"]), model,
                          dict(base, kind="thinking"), key))
         elif t == "tool_use":
+            b, _ = mask_recall_value(b)
             name = b.get("name") if isinstance(b.get("name"), str) else ""
             args = json.dumps(b.get("input"), ensure_ascii=False) if b.get("input") is not None else ""
             rows.append((tid, ts or int(time.time()), "assistant", "tool_call", clip(name + "\n" + args), model,
                          dict(base, kind="tool_call", tool=name, call_id=b.get("id")), key))
         elif t == "tool_result":
+            b, _ = mask_recall_value(b)
             text = _tool_result_text(b)
             if not text:
                 continue

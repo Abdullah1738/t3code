@@ -32,7 +32,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from card_mask import mask_json_text, mask_text
+from card_mask import mask_json_text, mask_recall_value, mask_text
 import backend  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
@@ -257,6 +257,7 @@ def project(rec, st, rel):
             return []
         return [(rid, ts, "assistant", "text", clip(text), model, dict(base, kind="reasoning"))]
     if kind == "assistant_tool_calls_committed":
+        ev, _ = mask_recall_value(ev)
         rows = []
         for i, c in enumerate(_l(ev.get("tool_calls"))):
             if not isinstance(c, dict):
@@ -269,6 +270,7 @@ def project(rec, st, rel):
                          model, dict(base, kind="tool_call", tool=name, call_id=cid)))
         return rows
     if kind == "tool_result_batch_committed":
+        ev, _ = mask_recall_value(ev)
         rows = []
         tools = st.setdefault("tools", {})
         for i, r in enumerate(_l(ev.get("results"))):

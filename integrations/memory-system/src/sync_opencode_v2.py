@@ -47,7 +47,7 @@ import time
 import traceback
 import zlib
 
-from card_mask import mask_json_text, mask_text
+from card_mask import mask_json_text, mask_recall_value, mask_text
 import robob_readonly
 from capture_budget import Budget, Exhausted, checkpoint, setup_writer, with_retry
 
@@ -183,7 +183,7 @@ def project(msg_id, mtype, data, sess, att):
             elif t == "reasoning" and it.get("text"):
                 reasons.append(it["text"])
             elif t == "tool":
-                st = it.get("state") or {}
+                st, _ = mask_recall_value(it.get("state") or {})
                 name = it.get("name") or ""
                 inp = st.get("input")
                 call = name + "\n" + (json.dumps(inp, ensure_ascii=False)

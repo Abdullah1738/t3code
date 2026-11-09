@@ -20,6 +20,27 @@ SECRET = PAN + ' CVV: 123 expiry: 12/25'
 MASKED = '•••• 1111 CVV: ••• expiry: ••/••'
 
 
+# All representations of the numeric-secret class share the ingest matrix.
+PROJECTION_CASES = [
+    ('exponent', '{"cvv":1.23e2}', {'cvv': '•••'}),
+    ('integer', '{"cvv":123}', {'cvv': '•••'}),
+    ('decimal', '{"cvv":123.0}', {'cvv': '•••'}),
+    ('upper_exponent', '{"cvc":1.234E+3}', {'cvc': '•••'}),
+    ('negative_exponent', '{"csc":12300e-2}', {'csc': '•••'}),
+    ('nested', '{"fields":[{"cvn":1.23e2,"security code":123.0}]}',
+     {'fields': [{'cvn': '•••', 'security code': '•••'}]}),
+    ('pan_exponent', '{"number":4.111111111111111e15,"expiry":"12/25"}',
+     {'number': '•••• 1111', 'expiry': '••/••'}),
+    ('encoded_json', json.dumps({'arguments': '{"cvv":1.23e2}'}),
+     {'arguments': '{"cvv": "•••"}'}),
+]
+PROJECTION_CASES = [
+    (name, text[:-1] + ',"case":' + json.dumps(name) + ',"count":123,"ok":true}',
+     dict(expected, case=name, count=123, ok=True))
+    for name, text, expected in PROJECTION_CASES
+]
+
+
 class CardMaskCaptureTests(unittest.TestCase):
     def assert_masked(self, text):
         self.assertNotIn(PAN, text)
@@ -136,6 +157,98 @@ class CardMaskCaptureTests(unittest.TestCase):
                             self.assertEqual(row, (MASKED, 'fixture-parent', 'fixture-thread'))
                     finally:
                         f.tearDown()
+
+    def assert_tool_projections(self, path, expected_rows, expected_payloads):
+        expected = {value['case']: value for value in expected_payloads}
+        with sqlite3.connect(path) as db:
+            rows = db.execute("SELECT content_type,content FROM episodic_events "
+                              "WHERE content_type IN ('tool_call','tool_result','error')").fetchall()
+        self.assertEqual(len(rows), expected_rows)
+        seen = set()
+        for ctype, content in rows:
+            if ctype == 'tool_call':
+                name, content = content.split('\n', 1)
+                self.assertEqual(name, 'fixture')
+            for text in content.splitlines():
+                text = text.removeprefix('[error] ')
+                value = json.loads(text)
+                self.assertEqual(value, expected[value['case']])
+                seen.add(value['case'])
+        self.assertEqual(seen, set(expected))
+
+    def test_codex_numeric_tool_projection_matrix(self):
+        import test_sync_codex as fixture
+        f = fixture.CodexSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        records = [fixture.meta(fixture.CHILD_ID, fixture.ROOT_ID)]
+        for name, text, _ in PROJECTION_CASES:
+            for kind in ['function', 'custom_tool']:
+                for form in [text, json.loads(text)]:
+                    records.extend([
+                        {'type': 'response_item', 'payload': {'type': kind + '_call', 'name': 'fixture',
+                         'arguments' if kind == 'function' else 'input': form, 'call_id': name}},
+                        {'type': 'response_item', 'payload': {'type': kind + '_call_output', 'output': form,
+                         'call_id': name}},
+                    ])
+        fixture.write_rollout(f.rollout, records)
+        f.sync()
+        self.assert_tool_projections(f.db, len(PROJECTION_CASES) * 8, [v for _, _, v in PROJECTION_CASES])
+
+    def test_claude_numeric_tool_projection_matrix(self):
+        import test_sync_claude as fixture
+        f = fixture.ClaudeSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        records = []
+        for name, text, _ in PROJECTION_CASES:
+            records.append(fixture.rec(name + '-call', 'assistant', '', block=[
+                {'type': 'tool_use', 'id': name, 'name': 'fixture', 'input': json.loads(text)}]))
+            for idx, content in enumerate([text, json.loads(text), [{'type': 'text', 'text': text}] * 2]):
+                for error in [False, True]:
+                    records.append(fixture.rec(name + f'-result-{idx}-{error}', 'user', '', block=[
+                        {'type': 'tool_result', 'tool_use_id': name, 'content': content, 'is_error': error}]))
+        fixture.write_lines(f.top, records)
+        f.sync()
+        self.assert_tool_projections(f.db, len(PROJECTION_CASES) * 7, [v for _, _, v in PROJECTION_CASES])
+
+    def test_muse_numeric_tool_projection_matrix(self):
+        import test_sync_muse as fixture
+        f = fixture.MuseSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        records = fixture.main_log('S1')[:4]
+        seq = 20
+        for name, text, _ in PROJECTION_CASES:
+            for form in [text, json.loads(text)]:
+                records.extend([
+                    fixture.run(seq, {'kind': 'assistant_tool_calls_committed',
+                                     'tool_calls': [{'call_id': name, 'name': 'fixture', 'args': form}]}, 'S1'),
+                    fixture.run(seq + 1, {'kind': 'tool_result_batch_committed',
+                                         'results': [{'tool_call_id': name, 'text': form}]}, 'S1'),
+                ])
+                seq += 2
+        fixture.write(f.main, records)
+        f.sync()
+        self.assert_tool_projections(f.db, len(PROJECTION_CASES) * 4, [v for _, _, v in PROJECTION_CASES])
+
+    def test_opencode_numeric_tool_projection_matrix(self):
+        import test_sync_opencode as fixture
+        f = fixture.SyncOpencodeTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        tools = []
+        for name, text, _ in PROJECTION_CASES:
+            for form in [text, json.loads(text)]:
+                tools.append({'type': 'tool', 'id': name, 'name': 'fixture', 'state': {
+                    'status': 'completed', 'input': form,
+                    'content': [{'type': 'text', 'text': text}] * 2, 'error': form}})
+        data = {'content': tools, 'time': {'completed': fixture.NOW - 20000}}
+        f.src.execute("INSERT INTO session_message VALUES ('numeric','ses_a','assistant',2,?,?,?)",
+                      (fixture.NOW - 30000, fixture.NOW - 20000, json.dumps(data)))
+        f.src.commit()
+        f.run_sync(f.load())
+        self.assert_tool_projections(f.mem_path, len(PROJECTION_CASES) * 4, [v for _, _, v in PROJECTION_CASES])
 
     def test_recall_hook_masks_persisted_task_before_clipping(self):
         spec = importlib.util.spec_from_file_location('card_mask_recall_hook', ROOT / 'hooks/recall_hook.py')

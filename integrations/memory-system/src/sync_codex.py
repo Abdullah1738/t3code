@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from card_mask import mask_json_text, mask_text  # noqa: E402
+from card_mask import mask_json_text, mask_recall_value, mask_text  # noqa: E402
 import schema_migrations  # noqa: E402
 import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
@@ -211,12 +211,14 @@ class CodexProjector:
                 role = payload["role"]
                 rows.append(self._row(line_no, 0, role, "text", text, {"kind": role}, ts))
         elif ptype in ("function_call", "custom_tool_call"):
+            payload, _ = mask_recall_value(payload)
             args = payload.get("arguments") if ptype == "function_call" else payload.get("input")
             name = payload.get("name") if isinstance(payload.get("name"), str) else ""
             rows.append(self._row(line_no, 0, "assistant", "tool_call",
                                   name + "\n" + (args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)),
                                   {"kind": "tool_call", "tool": name, "call_id": payload.get("call_id")}, ts))
         elif ptype in ("function_call_output", "custom_tool_call_output"):
+            payload, _ = mask_recall_value(payload)
             out = payload.get("output")
             text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
             if text:
