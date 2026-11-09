@@ -1,3 +1,4 @@
+import * as SavedBoardReply from "../ardud/kanban/tools/savedReply.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -1004,7 +1005,7 @@ const withToolAnalytics =
               const result = options
                 .handle(payload)
                 .pipe(Effect.provideService(ReplyRejection, rejection));
-              return yield* (
+              const completed = (
                 LARGE_READ_TOOLS.has(options.tool.name) ? ReplyBuilders.bounded(result) : result
               ).pipe(
                 Effect.catchCauseIf(
@@ -1059,6 +1060,9 @@ const withToolAnalytics =
                   );
                 }),
               );
+              return yield* SavedBoardReply.TOOLS.has(options.tool.name)
+                ? SavedBoardReply.protect(completed, options.tool.name)
+                : completed;
             }),
         }),
     });
