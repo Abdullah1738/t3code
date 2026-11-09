@@ -829,12 +829,15 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(dispatch);
       assert.lengthOf(launches, 1);
+      // A discussion and another board changed nothing this card's start depends on,
+      // so the launch is kept rather than abandoned.
       const after = yield* kanban.card(card.id);
-      assert.deepStrictEqual(after.card, before.card);
-      assert.deepStrictEqual(after.events, before.events);
+      assert.strictEqual(before.card.stage, "todo");
+      assert.strictEqual(after.card.stage, "working");
+      assert.strictEqual(after.card.activeThreadId, ThreadId.make("thread-1"));
       assert.lengthOf(after.threads, 1);
       assert.strictEqual(after.threads[0]!.threadId, ThreadId.make("thread-1"));
-      assert.isNotNull(after.threads[0]!.endedAt);
+      assert.isNull(after.threads[0]!.endedAt);
       assert.deepStrictEqual(yield* kanban.discussions(board.id), discussions);
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
       assert.deepStrictEqual(yield* kanban.boards, boards);
