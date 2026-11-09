@@ -835,6 +835,13 @@ const ownerRouteRow = Context.Reference<number | undefined>("KanbanOwnerRouteRow
 export type OwnerRouteMode = "deferred" | "await" | "inline";
 /** A route still failing after this long is closed as undeliverable, with a notice. */
 const OWNER_ROUTE_GIVE_UP_MS = 10 * 60_000;
+/** Run states after which a thread no longer acts on its instruction. */
+const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
 /** `noticed` value of a route whose give-up is decided but whose notice may not be posted yet. */
 const OWNER_ROUTE_GIVING_UP = 2;
 export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
@@ -2177,11 +2184,15 @@ const make = Effect.gen(function* () {
         const link = yield* rawStore.threadLink(launched);
         if (link === null || link.endedAt === null) threadId = launched;
         // The ended link is written before its interrupt; a restart between the two
-        // leaves the abandoned evaluator running, so stop it before starting the next.
-        else
-          yield* threads
-            .interrupt(launched, "Board state changed during launch")
-            .pipe(Effect.ignore);
+        // leaves the abandoned evaluator running. It must be seen stopped before the
+        // next one starts with the same instruction; otherwise the route retries.
+        else {
+          yield* threads.interrupt(launched, "Board state changed during launch");
+          const run = yield* threads.latestRun(launched).pipe(Effect.mapError(toKanbanError));
+          if (run !== null && !FINISHED_RUN_STATUSES.has(run.status)) {
+            return yield* failWith("failed", `abandoned evaluator ${launched} is still running`);
+          }
+        }
       }
     }
     if (threadId === undefined) return yield* failWith("failed", "evaluator launch gave no thread");
@@ -3101,9 +3112,9 @@ const make = Effect.gen(function* () {
     if (payload.kind === "post") {
       yield* ownerPostRoute(message, record.route_key, row);
       if (row.closed !== undefined) return yield* markOwnerRouteDone(record.id, row.closed);
-      // As inline: the title is written once routing has attached the evaluator,
-      // and before the route closes, so a restart in between writes it on replay.
-      if (payload.writeTitle === true) yield* forkOwnerTitle(discussionId, message);
+      // As inline: the title is written once routing has attached the evaluator.
+      // It completes before the route closes, so a restart in between writes it on replay.
+      if (payload.writeTitle === true) yield* writeOwnerTitle(discussionId, message);
       return yield* markOwnerRouteDelivered(record);
     }
     yield* ownerAnswerRoute(
@@ -3122,8 +3133,13 @@ const make = Effect.gen(function* () {
     JSON.parse(record.json) as OwnerRoutePayload & {
       readonly askers?: SavedOwnerRow["askers"];
     };
-  const forkOwnerTitle = (discussionId: KanbanDiscussion["id"], message: KanbanMessage) =>
-    forkDiscussionTitle(discussionId, blocksText(message.blocks, attachments.pathOf));
+  // The client's first-line title stays when the writer fails.
+  const writeOwnerTitle = (discussionId: KanbanDiscussion["id"], message: KanbanMessage) =>
+    writeDiscussionTitle(discussionId, blocksText(message.blocks, attachments.pathOf)).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
+      ),
+    );
   const markOwnerRouteDelivered = (record: OwnerRouteRecord) =>
     markOwnerRouteDone(record.id, "delivered").pipe(
       Effect.ensuring(Effect.sync(() => ownerDeliveries.delete(record.route_key))),
@@ -3206,7 +3222,7 @@ const make = Effect.gen(function* () {
       // The post stays in the discussion, so its title is still written.
       const message = yield* rawStore.message(discussionId, payload.seq);
       if (message !== null && message.createdAt === payload.createdAt) {
-        yield* forkOwnerTitle(discussionId, message);
+        yield* writeOwnerTitle(discussionId, message);
       }
     }
     yield* markOwnerRouteDone(record.id, "undeliverable");
@@ -3219,6 +3235,8 @@ const make = Effect.gen(function* () {
    */
   interface OwnerDrain {
     dirty: boolean;
+    /** The route at its head has fallen back to slow retries. */
+    slow: boolean;
     readonly waiters: Array<Deferred.Deferred<void>>;
   }
   const ownerRouteDrains = new Map<string, OwnerDrain>();
@@ -3237,7 +3255,16 @@ const make = Effect.gen(function* () {
           SELECT id FROM ardud_kanban_owner_routes
           WHERE discussion_id = ${discussionId} AND done_at IS NULL ORDER BY id
         `.pipe(NodeSqliteClient.readOnly);
-        for (const row of rows) yield* deliverOwnerRoute(row.id, releaseOwnerWaiters(state));
+        for (const row of rows) {
+          yield* deliverOwnerRoute(
+            row.id,
+            Effect.suspend(() => {
+              state.slow = true;
+              return releaseOwnerWaiters(state);
+            }),
+          );
+          state.slow = false;
+        }
         // Checked and released in one step, so a route saved meanwhile is never missed.
         const finished = yield* Effect.sync(() => {
           if (state.dirty) return false;
@@ -3270,14 +3297,17 @@ const make = Effect.gen(function* () {
         const active = ownerRouteDrains.get(discussionId);
         if (active) {
           active.dirty = true;
-          active.waiters.push(waiter);
-          return null;
+          // Behind a route in slow retries, a caller waits for no attempt of its own.
+          if (!active.slow) active.waiters.push(waiter);
+          return active.slow ? "settled" : null;
         }
-        const started: OwnerDrain = { dirty: false, waiters: [waiter] };
+        const started: OwnerDrain = { dirty: false, slow: false, waiters: [waiter] };
         ownerRouteDrains.set(discussionId, started);
         return started;
       });
-      if (state !== null) yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
+      if (state === "settled") yield* Deferred.succeed(waiter, undefined);
+      else if (state !== null)
+        yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
       return waiter;
     },
   );
