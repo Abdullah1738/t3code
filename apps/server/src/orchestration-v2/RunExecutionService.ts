@@ -51,6 +51,10 @@ import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
 } from "@t3tools/provider-core/server/failure";
+import {
+  isTransientSqliteReadFailure,
+  transientReadRetrySchedule,
+} from "../ardud/durability/transientSqliteRead.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
@@ -1254,6 +1258,26 @@ export const layer: Layer.Layer<
         // Ends once the root turn and the children it drives settle. Background commands such
         // as a dev server keep this consumer alive afterwards and must not pin preview focus.
         const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
+        // ardud: stop a provider turn whose events nobody reads any more.
+        // Only while no root terminal arrived: a settled turn has nothing left.
+        const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
+          function* (providerThread: OrchestrationV2ProviderThread) {
+            if (yield* Ref.get(rootTerminalSeen)) return;
+            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+            if (providerTurnId === null) return;
+            yield* input.session.interruptTurn({ providerThread, providerTurnId }).pipe(
+              Effect.timeout("30 seconds"),
+              Effect.catchCause((interruptCause) =>
+                Effect.logWarning("orchestration V2 could not stop an orphaned provider turn", {
+                  runId: input.run.id,
+                  threadId: input.run.threadId,
+                  providerTurnId,
+                  cause: interruptCause,
+                }),
+              ),
+            );
+          },
+        );
         const providerEventFiber = yield* eventSubscription.events.pipe(
           Stream.mapEffect((event) =>
             Effect.gen(function* () {
@@ -1389,11 +1413,20 @@ export const layer: Layer.Layer<
                 event.turnItem.streaming &&
                 !reservedHeldTurnItemIds.has(event.turnItem.id)
               ) {
-                yield* turnItemPositions.allocate({
-                  threadId: event.turnItem.threadId,
-                  turnItemId: event.turnItem.id,
-                  runId: event.turnItem.runId,
-                });
+                yield* turnItemPositions
+                  .allocate({
+                    threadId: event.turnItem.threadId,
+                    turnItemId: event.turnItem.id,
+                    runId: event.turnItem.runId,
+                  })
+                  .pipe(
+                    // ardud: idempotent (it reads before it inserts), so a
+                    // retired reader must not fail the live run.
+                    Effect.retry({
+                      schedule: transientReadRetrySchedule(),
+                      while: isTransientSqliteReadFailure,
+                    }),
+                  );
                 reservedHeldTurnItemIds.add(event.turnItem.id);
               }
               if (event.type === "provider_thread.updated") {
@@ -1449,57 +1482,53 @@ export const layer: Layer.Layer<
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
-              Ref.get(rootRunFinalized).pipe(
-                Effect.flatMap((finalized) =>
-                  Effect.logWarning("orchestration V2 provider event ingestion failed", {
-                    runId: input.run.id,
-                    cause,
-                  }).pipe(
-                    Effect.andThen(
-                      finalized
-                        ? Effect.void
-                        : Ref.get(latestProviderThread).pipe(
-                            Effect.flatMap((providerThread) =>
-                              Ref.get(latestTurnItemOrdinal).pipe(
-                                Effect.flatMap((latestItemOrdinal) =>
-                                  Ref.get(openRunOwnedSubagents).pipe(
-                                    Effect.flatMap((openSubagents) =>
-                                      writeFinalRunEvents({
-                                        run: input.run,
-                                        rootNode: input.rootNode,
-                                        checkpointScope: input.checkpointScope,
-                                        providerThread,
-                                        attempt: input.attempt,
-                                        writeIfRunCurrent: {
-                                          activeAttemptId: input.attempt.id,
-                                          expectedStatus: "running",
-                                        },
-                                        openRunOwnedSubagents: openSubagents,
-                                        terminal: makeFailedTerminalEvent(
-                                          makeProviderFailure({
-                                            cause: Cause.squash(cause),
-                                            class: "unknown",
-                                          }),
-                                          latestItemOrdinal + 1,
-                                        ),
-                                        failureItemPersisted: false,
-                                        refreshAfterTurn,
-                                      }),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                    ),
-                    Effect.mapError(
-                      (writeCause) =>
-                        new RunExecutionIngestError({
-                          runId: input.run.id,
-                          cause: { ingest: cause, write: writeCause },
-                        }),
-                    ),
+              Effect.gen(function* () {
+                const finalized = yield* Ref.get(rootRunFinalized);
+                yield* Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                  runId: input.run.id,
+                  threadId: input.run.threadId,
+                  finalized,
+                  cause,
+                });
+                if (finalized) return;
+                const providerThread = yield* Ref.get(latestProviderThread);
+                const latestItemOrdinal = yield* Ref.get(latestTurnItemOrdinal);
+                const openSubagents = yield* Ref.get(openRunOwnedSubagents);
+                yield* writeFinalRunEvents({
+                  run: input.run,
+                  rootNode: input.rootNode,
+                  checkpointScope: input.checkpointScope,
+                  providerThread,
+                  attempt: input.attempt,
+                  writeIfRunCurrent: {
+                    activeAttemptId: input.attempt.id,
+                    expectedStatus: "running",
+                  },
+                  openRunOwnedSubagents: openSubagents,
+                  terminal: makeFailedTerminalEvent(
+                    makeProviderFailure({
+                      cause: Cause.squash(cause),
+                      class: "unknown",
+                    }),
+                    latestItemOrdinal + 1,
                   ),
+                  failureItemPersisted: false,
+                  refreshAfterTurn,
+                }).pipe(
+                  // ardud: the run is failed now, but the provider turn may
+                  // still be running with nobody reading its events. Stop it
+                  // so its process does not run on orphaned and the next send
+                  // is not refused as "previous turn is still running"
+                  // (9 Nov incident). Runs even if the write failed.
+                  Effect.ensuring(stopOrphanedProviderTurn(providerThread)),
+                );
+              }).pipe(
+                Effect.mapError(
+                  (writeCause) =>
+                    new RunExecutionIngestError({
+                      runId: input.run.id,
+                      cause: { ingest: cause, write: writeCause },
+                    }),
                 ),
               ),
           ),

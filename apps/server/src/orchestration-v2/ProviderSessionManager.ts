@@ -641,6 +641,14 @@ export const layerWithOptions = (
           cause: detail,
         });
         const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_id": String(entry.runtime.providerSessionId),
+          "provider.driver": String(entry.runtime.driver),
+          "provider.thread_ids": Array.from(entry.attachedThreadIds, String).join(","),
+          "provider.busy_turns": entry.busyTurns.size,
+          "provider.subscribers": subscribers.size,
+          "provider.release_detail": detail,
+        });
         yield* Effect.forEach(
           subscribers.values(),
           (queue) =>
@@ -1053,6 +1061,15 @@ export const layerWithOptions = (
             DateTime.now,
           ).pipe(candidate.requestEventPermit.withPermits(1));
           const [outcome, releasedAt] = removed;
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_id": String(input.providerSessionId),
+            "provider.thread_ids": Array.from(candidate.attachedThreadIds, String).join(","),
+            "provider.busy_turns": candidate.busyTurns.size,
+            "provider.remove_outcome": outcome,
+            ...(input.onlyIfIdleGeneration === undefined
+              ? {}
+              : { "provider.idle_generation": input.onlyIfIdleGeneration }),
+          });
           if (outcome === "changed") return yield* removeLiveEntry(input);
           return [
             outcome === "removed" ? Option.some(candidate) : Option.none<LiveSessionEntry>(),
@@ -1067,6 +1084,10 @@ export const layerWithOptions = (
         scope: Scope.Closeable,
         annotations: { readonly providerSessionId?: ProviderSessionId; readonly reason: string },
       ) {
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_id": String(annotations.providerSessionId ?? ""),
+          "provider.release_reason": annotations.reason,
+        });
         const closeFiber = yield* Scope.close(scope, Exit.void).pipe(
           Effect.exit,
           Effect.forkDetach({ startImmediately: true }),
@@ -1224,6 +1245,18 @@ export const layerWithOptions = (
           const current = yield* Ref.get(sessions);
           const key = sessionKey(input.providerSessionId);
           const entry = current.get(key);
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_id": String(input.providerSessionId),
+            "provider.idle_generation": input.generation,
+            "provider.live": entry !== undefined,
+            ...(entry === undefined
+              ? {}
+              : {
+                  "provider.thread_ids": Array.from(entry.attachedThreadIds, String).join(","),
+                  "provider.busy_turns": entry.busyTurns.size,
+                  "provider.current_generation": entry.idleGeneration,
+                }),
+          });
           if (
             entry === undefined ||
             entry.busyTurns.size > 0 ||
@@ -1702,6 +1735,11 @@ export const layerWithOptions = (
           readonly threadId: ThreadId;
           readonly generation: number;
         }): Effect.fn.Return<void> {
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_id": String(input.providerSessionId),
+            "thread.id": String(input.threadId),
+            "provider.idle_generation": input.generation,
+          });
           const outcome = yield* threadAttachment.withLock(
             threadAttachmentKey(input),
             Effect.gen(function* () {
@@ -1769,6 +1807,7 @@ export const layerWithOptions = (
               return "unloaded" as const;
             }),
           );
+          yield* Effect.annotateCurrentSpan("provider.unload_outcome", outcome);
           // Re-check on this fiber after another idle window, outside the
           // lock so the thread's next attach is not held up meanwhile.
           if (outcome === "deferred") {
