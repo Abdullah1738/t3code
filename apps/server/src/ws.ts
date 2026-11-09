@@ -1191,7 +1191,13 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
       const replay = toShellStream(
         applicationEvents.readApplicationEvents({
-          afterSequence: input.afterSequence,
+          // Opted-in clients also get the cursor event again: ancestor rows sent right after
+          // an asking subagent's update share its sequence, so a drop between the two would
+          // otherwise never resend them. The client takes only rows it lacks at that sequence.
+          afterSequence:
+            input.omitIdleSubagents === true && input.afterSequence > 0
+              ? input.afterSequence - 1
+              : input.afterSequence,
           throughSequence: highWater,
           // A row a newer build wrote (e.g. after a downgrade) must not fail
           // every shell resubscribe. The live tail below resumes from

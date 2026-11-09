@@ -717,6 +717,25 @@ it.live(
           baseline[1]?.kind === "project.updated" ? baseline[1].sequence : 0,
           fixture.projectEvent.sequence,
         );
+        // Clients that omit idle subagents resume from the cursor event itself, so ancestor rows
+        // sent at an already-applied sequence come again; everything after it is unchanged.
+        const optedIn = Array.from(
+          yield* subscribeOrchestrationV2Shell({ ...input, omitIdleSubagents: true }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.scoped,
+            Effect.provide(fixture.services),
+          ),
+        );
+        assert.equal(
+          optedIn[0]?.kind === "synchronized" ? -1 : optedIn[0]?.sequence,
+          fixture.cursor,
+        );
+        assert.deepEqual(optedIn.slice(1), baseline);
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const writer = yield* fixture.sql
