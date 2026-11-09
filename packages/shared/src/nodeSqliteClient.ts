@@ -69,6 +69,11 @@ const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
   { defaultValue: () => undefined },
 );
 
+const IdentityReader = Context.Reference<boolean>(
+  "@t3tools/shared/nodeSqliteClient/IdentityReader",
+  { defaultValue: () => false },
+);
+
 /**
  * Wrap the whole transaction, as in
  * `sql.withTransaction(reads).pipe(readOnly)`. Inside an open write transaction
@@ -80,8 +85,12 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
     restore(Effect.provideService(effect, ReadOnly, restore)),
   );
 
+/** Identity lookups must not wait behind a shell snapshot's read transaction. */
+export const identityReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  readOnly(Effect.provideService(effect, IdentityReader, true));
+
 interface Acquired {
-  readonly connection: "writer" | "reader";
+  readonly connection: "writer" | "reader" | "identity-reader";
   readonly lockWaitMs: number;
 }
 
@@ -1255,6 +1264,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const acquireReader =
     options.readerWorker && isFileDatabase ? yield* makeReader(options) : undefined;
   const readerSemaphore = yield* Semaphore.make(1);
+  const acquireIdentityReader =
+    options.readerWorker && isFileDatabase ? yield* makeReader(options) : undefined;
+  const identityReaderSemaphore = yield* Semaphore.make(1);
 
   const writer = { name: "writer" as const, lock: semaphore, connection };
   const admission = Effect.withFiber((fiber) => {
@@ -1264,15 +1276,21 @@ const make = Effect.fn("makeWithDatabase")(function* (
   });
   const route = Effect.andThen(
     admission,
-    Effect.withFiber((fiber) =>
-      acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
-        ? Effect.map(acquireReader, (readerConnection) =>
+    Effect.withFiber((fiber) => {
+      const identity = Context.get(fiber.context, IdentityReader);
+      const acquire = identity ? acquireIdentityReader : acquireReader;
+      return acquire !== undefined && Context.get(fiber.context, ReadOnly)
+        ? Effect.map(acquire, (readerConnection) =>
             readerConnection === undefined
               ? writer
-              : { name: "reader" as const, lock: readerSemaphore, connection: readerConnection },
+              : {
+                  name: identity ? ("identity-reader" as const) : ("reader" as const),
+                  lock: identity ? identityReaderSemaphore : readerSemaphore,
+                  connection: readerConnection,
+                },
           )
-        : Effect.succeed(writer),
-    ),
+        : Effect.succeed(writer);
+    }),
   );
 
   const acquired = (

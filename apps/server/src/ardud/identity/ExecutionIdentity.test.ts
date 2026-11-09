@@ -476,6 +476,98 @@ const runStaleOnly = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.Executio
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ExecutionIdentity", () => {
+  it.live.each(["resumed", "fresh", "adopted"] as const)(
+    "resolves a %s Codex thread while a shell snapshot holds the reader",
+    (scenario) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-identity-reader-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const identity = yield* ExecutionIdentity.ExecutionIdentity;
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const threadId = "thread:reader-test";
+          const providerId = "provider-thread:reader-test";
+          const oldNative = "11111111-2222-7333-8444-555555555555";
+          const nativeId = "22222222-2222-7333-8444-555555555555";
+          const unknownId = "33333333-2222-7333-8444-555555555555";
+          yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
+            thread(threadId, providerId, { parentThreadId: null, rootThreadId: threadId }),
+          )}`;
+          const initial = provider(
+            providerId,
+            threadId,
+            "codex",
+            scenario === "resumed" ? oldNative : null,
+            now,
+          );
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(initial)}`;
+          if (scenario === "adopted") {
+            yield* sql`INSERT INTO ardud_opencode_import ${sql.insert({
+              native_session_id: "ses_reader_import",
+              thread_id: threadId,
+              imported_at: now,
+            })}`;
+            yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+              provider("provider-thread:source", threadId, "opencode", "ses_reader_import", now),
+            )}`;
+          }
+
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const snapshot = yield* Effect.forkChild(
+            sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`SELECT payload_json FROM orchestration_v2_projection_provider_threads`;
+                  yield* Deferred.succeed(held, undefined);
+                  yield* Deferred.await(release);
+                }),
+              )
+              .pipe(NodeSqliteClient.readOnly),
+          );
+          yield* Deferred.await(held);
+          yield* Effect.gen(function* () {
+            if (scenario !== "resumed") {
+              const pending = yield* identity.resolve({ nativeId, driver: "codex" });
+              assert.strictEqual(pending.resolution, "pending");
+              assert.strictEqual(pending.robobThreadId, null);
+            }
+            // Commit the startup/native replacement while the other reader still
+            // pins its old view. Identity must see this commit before tools run.
+            const mapped = provider(providerId, threadId, "codex", nativeId, now);
+            yield* sql`UPDATE orchestration_v2_projection_provider_threads
+              SET payload_json = ${mapped.payload_json} WHERE provider_thread_id = ${providerId}`;
+            const resolved = yield* identity.resolve({ nativeId, driver: "codex" });
+            assert.strictEqual(resolved.resolution, "resolved");
+            assert.strictEqual(resolved.robobThreadId, threadId);
+            assert.strictEqual(resolved.executionKind, "top-level");
+            const unknown = yield* identity.resolve({ nativeId: unknownId, driver: "codex" });
+            assert.strictEqual(unknown.resolution, "unavailable");
+            assert.strictEqual(unknown.robobThreadId, null);
+            if (scenario === "adopted") {
+              const imported = yield* identity.resolve({
+                nativeId: "ses_reader_import",
+                driver: "opencode",
+              });
+              assert.strictEqual(imported.robobThreadId, threadId);
+            }
+          }).pipe(
+            Effect.timeout("2 seconds"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+          yield* Fiber.join(snapshot);
+        }).pipe(
+          Effect.provide(
+            ExecutionIdentity.layer.pipe(
+              Layer.provideMerge(Sqlite.layerFromPath(path.join(directory, "state.sqlite"))),
+            ),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("resolves a started app-managed Codex child while the SQLite writer is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
