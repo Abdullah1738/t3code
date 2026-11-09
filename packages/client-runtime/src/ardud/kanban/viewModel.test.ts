@@ -253,6 +253,17 @@ describe("stageBoard", () => {
     expect(view.running).toBe(false);
   });
 
+  it("keeps known thread states while a reopened feed's thread state is pending", () => {
+    const t1 = { threadId: ThreadId.make("t1"), title: "w", running: true, needsInput: false, lastActivityAt: null };
+    const base = snapshot([card(1, { stage: "working", activeThreadId: ThreadId.make("t1") })]);
+    const previous = boardStateFromSnapshot({ ...base, threads: [t1] } as never);
+    const pending = { ...base, threads: [], threadsPending: true } as never;
+    expect(boardStateFromSnapshot(pending, previous).threads.get("t1")).toEqual(t1);
+    // A cold open has nothing to keep; a complete snapshot replaces the states.
+    expect(boardStateFromSnapshot(pending).threads.size).toBe(0);
+    expect(boardStateFromSnapshot({ ...base, threads: [] } as never, previous).threads.size).toBe(0);
+  });
+
   it("lists cards with open async asks under Needs Owner too, after the waiting ones", () => {
     const ask = (id: string, text: string, blocking: boolean, closedAt: string | null = null) => ({
       id,

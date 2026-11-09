@@ -1271,17 +1271,23 @@ const make = Effect.gen(function* () {
     return [...running, ...ended];
   });
 
+  const liveThreadIds = (cards: ReadonlyArray<Pick<KanbanCard, "activeThreadId">>) => [
+    ...new Set(cards.flatMap((card) => (card.activeThreadId ? [card.activeThreadId] : []))),
+  ];
+
   const snapshotOf = Effect.fn("KanbanService.snapshotOf")(function* (
     boardId: KanbanBoard["id"],
     feed = false,
     page?: { readonly after: number; readonly limit: number },
+    // The board feed fills thread state after its first frame (see watch).
+    deferThreads = false,
   ) {
     const board = yield* boardOf(boardId);
     const cards = yield* feed ? store.feedCards(boardId, page) : store.cards(boardId);
-    const live = [
-      ...new Set(cards.flatMap((card) => (card.activeThreadId ? [card.activeThreadId] : []))),
-    ];
-    const states = yield* Effect.forEach(live, threadState, { concurrency: 8 });
+    const live = liveThreadIds(cards);
+    const states = deferThreads
+      ? []
+      : yield* Effect.forEach(live, threadState, { concurrency: 8 });
     const discussions = yield* store.discussions(boardId);
     const unread = discussions.flatMap((discussion) => {
       const owner = discussion.participants.find(
@@ -1299,6 +1305,7 @@ const make = Effect.gen(function* () {
       pools: yield* store.pools(boardId),
       groups: yield* store.groups(boardId),
       threads: states.flat(),
+      ...(deferThreads && live.length > 0 ? { threadsPending: true } : {}),
       unread,
     } satisfies KanbanBoardSnapshot;
   });
@@ -7331,8 +7338,32 @@ const make = Effect.gen(function* () {
     Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
+        // The first frame comes from the boards store alone. Thread state reads the
+        // orchestration store, whose reader queue held board opens for up to 14 s, so it
+        // follows as thread changes. They are read after subscribing and sent before the
+        // buffered live changes, so a newer live state always lands last.
         const snapshot = yield* read(
-          ReplyBuilders.interactive(snapshotOf(boardId, true).pipe(NodeSqliteClient.readOnly)),
+          ReplyBuilders.interactive(
+            snapshotOf(boardId, true, undefined, true).pipe(NodeSqliteClient.readOnly),
+          ),
+        );
+        const fill = Stream.fromIterable(liveThreadIds(snapshot.cards)).pipe(
+          Stream.mapEffect(
+            (threadId) =>
+              threadState(threadId).pipe(
+                NodeSqliteClient.readOnly,
+                // A thread that can't be read stays unknown, like a missing one.
+                Effect.orElseSucceed((): ReadonlyArray<KanbanThreadState> => []),
+              ),
+            { concurrency: 8 },
+          ),
+          Stream.flatMap(Stream.fromIterable),
+          Stream.map(
+            (thread): KanbanWatchEvent => ({
+              _tag: "change",
+              change: { _tag: "thread", thread },
+            }),
+          ),
         );
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),
@@ -7346,7 +7377,7 @@ const make = Effect.gen(function* () {
             _tag: "snapshot",
             snapshot,
           }),
-          live,
+          Stream.concat(fill, live),
         );
       }),
     );

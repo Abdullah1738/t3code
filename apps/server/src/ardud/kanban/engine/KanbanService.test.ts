@@ -3362,6 +3362,50 @@ it.effect("the board feed leaves prompts out; card reads and snapshots keep them
   }),
 );
 
+it.effect("the board feed's first frame does not wait on thread state", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      yield* Ref.update(fake.threads, (all) => {
+        all.get(thread)!.running = true;
+        return all;
+      });
+      // Thread reads stall, like the orchestration reader queue on a busy server.
+      const release = yield* Deferred.make<void>();
+      fake.findControl.beforeRead = (id) =>
+        id === thread ? Deferred.await(release) : Effect.void;
+
+      const pull = yield* Stream.toPull(kanban.watch(board.id));
+      const first = Array.from(yield* pull);
+      const snapshotEvent = first.find((event) => event._tag === "snapshot");
+      assert.isDefined(snapshotEvent);
+      if (snapshotEvent?._tag !== "snapshot") return;
+      assert.strictEqual(snapshotEvent.snapshot.cards[0]!.activeThreadId, thread);
+      assert.deepStrictEqual(snapshotEvent.snapshot.threads, []);
+      assert.isTrue(snapshotEvent.snapshot.threadsPending);
+      assert.isFalse(yield* Deferred.isDone(release));
+
+      yield* Deferred.succeed(release, undefined);
+      const filled = Array.from(yield* pull).find(
+        (event) => event._tag === "change" && event.change._tag === "thread",
+      );
+      assert.isDefined(filled);
+      if (filled?._tag !== "change" || filled.change._tag !== "thread") return;
+      assert.strictEqual(filled.change.thread.threadId, thread);
+      assert.isTrue(filled.change.thread.running);
+
+      // The full snapshot still carries thread state inline.
+      const full = yield* kanban.snapshot(board.id);
+      assert.isUndefined(full.threadsPending);
+      assert.strictEqual(full.threads[0]?.threadId, thread);
+    }).pipe(Effect.scoped, Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a thread can't reword or replace a flag someone else set", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

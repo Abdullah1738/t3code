@@ -824,6 +824,12 @@ export const KanbanBoardSnapshot = Schema.Struct({
   pools: Schema.Array(KanbanPool),
   groups: Schema.Array(KanbanGroup),
   threads: Schema.Array(KanbanThreadState),
+  /**
+   * The board feed sends its first frame before reading thread state, which waits on the
+   * orchestration store: `threads` is then empty and each active thread's state follows as
+   * a `thread` change. Absent or false means `threads` is complete.
+   */
+  threadsPending: Schema.optionalKey(Schema.Boolean),
   /** Unread owner messages per discussion. */
   unread: Schema.Array(Schema.Struct({ discussionId: KanbanDiscussionId, count: NonNegativeInt })),
 });

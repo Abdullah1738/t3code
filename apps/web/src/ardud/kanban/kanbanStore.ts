@@ -31,7 +31,9 @@ export const kanban = createKanbanClient(
     registry: appAtomRegistry,
     environmentId: primaryEnvironmentIdAtom,
   }),
-  { keepAliveMs: 2 * 60_000 },
+  // Reopening after the feed closed waits on a new board snapshot (seconds on a busy
+  // server, ~11 MB), so a board or discussion stays live for ten minutes after leaving it.
+  { keepAliveMs: 10 * 60_000 },
 );
 
 function useStore<T>(store: SnapshotStore<T>): T | undefined {
