@@ -434,9 +434,10 @@ def _command_with_context(command, identity, pin):
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
+_IDENTITY_BINDING_TTL = 30 * 60
 _CLAUDE_IDENTITY_TTL = 12 * 60 * 60
-_CLAUDE_IDENTITY_BUDGET = 4.5
-_CLAUDE_IDENTITY_CALL_TIMEOUT = 3.0
+_IDENTITY_LOOKUP_BUDGET = 4.5
+_IDENTITY_CALL_TIMEOUT = 3.0
 
 
 def _identity_transport_error(error):
@@ -446,21 +447,19 @@ def _identity_transport_error(error):
 
 
 def _lookup_identity(path, harness):
-    if harness != "claude":
-        return _get(path)
     # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
-    deadline = time.monotonic() + _CLAUDE_IDENTITY_BUDGET
+    deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
     for attempt in range(2):
         try:
-            return _get(path, deadline=min(deadline, time.monotonic() + _CLAUDE_IDENTITY_CALL_TIMEOUT),
-                        timeout=_CLAUDE_IDENTITY_CALL_TIMEOUT)
+            return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
+                        timeout=_IDENTITY_CALL_TIMEOUT)
         except Exception as error:
             if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
                 raise
 
 
 def resolve_identity(event, harness, *, fresh=False):
-    """Resolve exact hook identity; refresh bindings after 60 seconds.
+    """Resolve exact hook identity; cache binding-only lookups for 30 minutes.
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
@@ -483,8 +482,12 @@ def resolve_identity(event, harness, *, fresh=False):
                        bool(identity.get("robobThreadId")) and identity.get("nativeSessionId") == native and
                        identity.get("nativeAgentId") == agent and identity.get("driver") in (None, driver) and
                        (not instance or identity.get("providerInstanceId") in (None, instance)))
-        if not fresh and 0 <= age < 60 and valid_cache:
-            return {**identity, "identity_source": "cache"}
+        if not fresh and 0 <= age < _IDENTITY_BINDING_TTL and valid_cache:
+            binding = {**identity, "identity_source": "cache"}
+            # Binding stability does not imply model-policy stability.
+            if age >= 60:
+                binding.pop("model", None)
+            return binding
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
