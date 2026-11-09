@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import { ModelSelection, ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 
 import { modelProblem } from "./modelCheck.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
@@ -48,6 +48,83 @@ it("skips descriptor checks when the model has no descriptors", () => {
   ];
   assert.isNull(modelProblem(bare, sel("opus/gpt-6-astra", "high")));
 });
+
+it.each([false, true, "false"] as const)(
+  "only treats an unadvertised fastMode:false as a no-op (%s)",
+  (value) => {
+    const selection = ModelSelection.make({
+      instanceId: ProviderInstanceId.make("opencode"),
+      model: "opus/gpt-6-astra",
+      options: [
+        { id: "variant", value: "xhigh" },
+        { id: "fastMode", value },
+      ],
+    });
+    const problem = modelProblem(providers, selection);
+    if (value === false) assert.isNull(problem);
+    else assert.include(problem ?? "", "Unknown option fastMode");
+  },
+);
+
+it("still refuses other unknown options alongside fastMode:false", () => {
+  const selection = ModelSelection.make({
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "opus/gpt-6-astra",
+    options: [
+      { id: "fastMode", value: false },
+      { id: "missing", value: false },
+    ],
+  });
+  assert.include(modelProblem(providers, selection) ?? "", "Unknown option missing");
+});
+
+it.each([
+  ["claudeAgent", "claude-opus-5-5", "effort"],
+  ["codex", "gpt-6.1-sol", "reasoningEffort"],
+] as const)(
+  "accepts standard mode on %s/%s without a fastMode descriptor",
+  (driver, model, effortId) => {
+    const instanceId = ProviderInstanceId.make(driver);
+    const provider = {
+      ...opencodeTestProvider(),
+      instanceId,
+      driver: ProviderDriverKind.make(driver),
+      models: [
+        {
+          slug: model,
+          name: model,
+          isCustom: false,
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: effortId,
+                label: "Effort",
+                type: "select" as const,
+                options: [{ id: "high", label: "High" }],
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const selection = ModelSelection.make({
+      instanceId,
+      model,
+      options: [
+        { id: effortId, value: "high" },
+        { id: "fastMode", value: false },
+      ],
+    });
+    assert.isNull(modelProblem([provider], selection));
+    assert.include(
+      modelProblem([provider], {
+        ...selection,
+        options: [{ id: "fastMode", value: true }],
+      }) ?? "",
+      "Unknown option fastMode",
+    );
+  },
+);
 
 it("refuses a boolean value for a select option whose choice ids are 'true' and 'false'", () => {
   const base = opencodeTestProvider();
