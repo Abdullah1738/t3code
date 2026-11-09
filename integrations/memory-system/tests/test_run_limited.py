@@ -14,8 +14,20 @@ RUNNER = SRC / "run_limited.py"
 
 class RunLimitedTest(unittest.TestCase):
     def test_exit_and_output_passthrough_with_background_policy(self):
+        entry = f"import runpy; runpy.run_path({str(RUNNER)!r}, run_name='__main__')"
+        if sys.platform != "darwin":
+            # taskpolicy is macOS-only; assert its arguments before emulating it.
+            # --background keeps default I/O and only lowers CPU priority.
+            prefix = ["/usr/sbin/taskpolicy", "-d", "default", "/usr/bin/nice", "-n", "10"]
+            entry = (
+                f"import sys; sys.path.insert(0, {str(SRC)!r}); import run_limited as r; "
+                f"original=r.run; prefix={prefix!r}; "
+                "def_background=lambda cmd, secs: original(cmd[len(prefix):], secs) if cmd[:len(prefix)]==prefix else 99; "
+                "r.run=def_background; sys.exit(r.main())"
+            )
         result = subprocess.run(
-            [sys.executable, str(RUNNER), "--seconds", "5", "--background", "--",
+            [sys.executable, "-c", entry,
+             "--seconds", "5", "--background", "--",
              sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)"],
             capture_output=True, text=True, timeout=10,
         )

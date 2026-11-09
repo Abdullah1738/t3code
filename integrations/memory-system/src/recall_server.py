@@ -8,11 +8,13 @@ A background thread keeps the session catalog current.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import threading
 import time
+import functools
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recall_ask as ra  # noqa: E402
 import recall_cli as cli  # noqa: E402
 import recall_core as rc  # noqa: E402
+from recall_admission import OptionalLane, CheckLane, DirectToolLane, cheap_note  # noqa: E402
+from recall_engine import CheckEngine  # noqa: E402
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.requests import Request  # noqa: E402
@@ -28,6 +32,22 @@ from starlette.responses import JSONResponse, Response  # noqa: E402
 LOG_DIR = Path(os.environ.get("RECALL_LOG_DIR", rc.ROOT / "logs"))
 INJECT_LOG = LOG_DIR / "recall-inject.jsonl"
 _log_lock = threading.Lock()
+_optional = OptionalLane()
+_check_lane = CheckLane()
+_engine = CheckEngine()
+_tool_lane = DirectToolLane()
+_ask_lane = DirectToolLane(workers=2, budget=32)
+_answers = threading.BoundedSemaphore(2)
+
+
+def _answer(work):
+    if not _answers.acquire(blocking=False):
+        raise RuntimeError("answer lane busy; use recall_search or retry later")
+    try:
+        return work()
+    finally:
+        rc.close_readers()
+        _answers.release()
 
 INSTRUCTIONS = """Recall searches every past agent session the user has had (Codex, Hermes, OpenCode, Muse Code; 28k+ sessions since 2025-08).
 - recall_ask: a question in plain words -> short cited answer (Haiku reads the matching sessions). Start here.
@@ -41,6 +61,13 @@ server = MCPServer("recall", instructions=INSTRUCTIONS)
 
 def _err(e: Exception) -> str:
     return f"error: {e}"
+
+
+def _async_tool(fn, lane):
+    @functools.wraps(fn)
+    async def call(*args, **kwargs):
+        return await lane.run(lambda: fn(*args, **kwargs))
+    return call
 
 
 def _caller_exclusions(ctx: Context | None, caller_thread: str = "", caller_native: str = "",
@@ -74,7 +101,7 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
     try:
         recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
         exclude = recheck()
-        res = ra.ask(
+        res = _answer(lambda: ra.ask(
             question,
             cwd=cwd or None,
             cwd_only=bool(cwd),
@@ -83,8 +110,8 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
             source=source or None,
             exclude=list(exclude),
             recheck_exclusions=recheck if exclude else None,
-            timeout=max(8, min(int(timeout or 30), 90)),
-        )
+            timeout=max(8, min(int(timeout or 30), 30)),
+        ))
     except Exception as e:  # noqa: BLE001
         return _err(e)
     out = [res["answer"]]
@@ -94,6 +121,7 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
 
 
 @server.tool()
+@rc.bounded(0.8)
 def recall_search(
     query: str,
     include_tools: bool = False,
@@ -128,7 +156,7 @@ def recall_search(
             cwd_only=bool(cwd),
             exact=exact,
             limit_sessions=max(1, min(int(limit or 10), 30)),
-            deadline=rc.Deadline(20),
+            deadline=rc.Deadline(0.8),
         )
         if exclude:
             excluded = exclude | recheck()
@@ -141,6 +169,7 @@ def recall_search(
 
 
 @server.tool()
+@rc.bounded(0.8)
 def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool = False, max_chars: int = 40000,
                 caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
                 ctx: Context = None) -> str:
@@ -168,6 +197,7 @@ def recall_read(ref: str, include_tools: bool = False, include_reasoning: bool =
 
 
 @server.tool()
+@rc.bounded(0.8)
 def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = "", until: str = "", include_subagents: bool = False, limit: int = 20,
                 caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
                 ctx: Context = None) -> str:
@@ -198,6 +228,18 @@ def recall_list(text: str = "", cwd: str = "", source: str = "", since: str = ""
 
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+async def _body(request):
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > 65536:
+            raise ValueError("request too large")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise ValueError("expected object")
+    return value
 
 
 def _foreign(request: Request) -> Response | None:
@@ -232,63 +274,106 @@ def _log_inject(entry: dict) -> None:
         pass
 
 
+@server.custom_route("/api/check", methods=["POST"])
+async def api_check(request: Request) -> Response:
+    if bad := _foreign(request):
+        return bad
+    try:
+        body = await _body(request)
+    except ValueError:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+    # Transport identity cannot be overwritten by tool argument text.
+    for field in ("thread", "native", "driver", "agent"):
+        if request.headers.get(f"x-robob-{field}"):
+            body[f"caller_{field}"] = request.headers[f"x-robob-{field}"]
+    try:
+        # Preflight is never shed behind optional transcript jobs. Message fact
+        # checks may use Jev; keep that bounded I/O off the server event loop.
+        preflight = await asyncio.to_thread(_engine.preflight, body)
+        if preflight[2]:
+            return JSONResponse(preflight[2])
+        result = await _check_lane.run(lambda: _engine.cached_check(body, preflight))
+    except Exception as exc:
+        preflight = ([], None, None)
+        result = {"decision": "allow", "note": None, "sources": [], "skipped": f"engine error: {type(exc).__name__}"}
+    if "trigger" not in result:
+        # Log overload/timeouts too, not only checks that reached a worker.
+        result = _engine.fallback(body, result, preflight[0])
+    return JSONResponse(result)
+
+
+@server.tool()
+def recall_remember(text: str, scope: str = "", recipient: str = "", action: str = "", source_session: str = "") -> str:
+    """Save an explicit owner instruction for future checks; cite the source session and narrow its scope."""
+    from recall_rules import RuleIndex
+    index = RuleIndex(_engine.rules_path)
+    try:
+        return json.dumps(index.remember(text[:8000], scope=scope[:1000], actions=[action] if action else None,
+                                         recipient=recipient[:300], source_session=source_session[:300]))
+    finally:
+        close = getattr(index, "close", None)
+        if close:
+            close()
+
+
+@server.custom_route("/api/remember", methods=["POST"])
+async def api_remember(request: Request) -> Response:
+    if bad := _foreign(request):
+        return bad
+    try:
+        body = await _body(request)
+        result = await run_in_threadpool(recall_remember, str(body.get("text") or ""), str(body.get("scope") or ""),
+                                         str(body.get("recipient") or ""), str(body.get("action") or ""),
+                                         str(body.get("source_session") or ""))
+        return JSONResponse(json.loads(result))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 @server.custom_route("/api/inject", methods=["POST"])
 async def api_inject(request: Request) -> Response:
     if bad := _foreign(request):
         return bad
     try:
-        body = await request.json()
+        body = await _body(request)
     except ValueError:
         return JSONResponse({"error": "bad json"}, status_code=400)
-    prompt = str(body.get("prompt") or "")
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "expected object"}, status_code=400)
+    prompt = str(body.get("prompt") or "")[:16000]
     mode = "work" if body.get("mode") == "work" else "prompt"
     t0 = time.time()
     common = dict(
         session_id=body.get("session_id") or None,
         parent_id=body.get("parent_id") or None,
         cwd=body.get("cwd") or None,
-        already=[str(x) for x in body.get("already") or []],
-        timeout=float(body.get("timeout") or 12),
         caller_thread=request.headers.get("x-robob-thread") or body.get("caller_thread") or None,
         caller_native=request.headers.get("x-robob-native") or body.get("caller_native") or None,
         caller_driver=request.headers.get("x-robob-driver") or body.get("caller_driver") or None,
         caller_agent=request.headers.get("x-robob-agent") or body.get("caller_agent") or None,
     )
 
-    known = [str(x) for x in body.get("known") or []]
-
     def work() -> dict:
         if mode == "work":
-            errors = body.get("errors")
-            return ra.work_check(
-                prompt,
-                str(body.get("activity") or ""),
-                errors=[str(x) for x in errors] if isinstance(errors, list) else None,
-                known=known,
-                **common,
-            )
-        return ra.inject(prompt, context=str(body.get("context") or ""), known=known, **common)
+            return {"note": None, "sources": [], "skipped": "mid-work checks retired"}
+        try:
+            res = cheap_note(prompt, **common)
+            _log_inject({"t": int(t0), "mode": mode, "session": common["session_id"],
+                         "skipped": res.get("skipped"), "elapsed_ms": int((time.time() - t0) * 1000)})
+            return res
+        finally:
+            rc.close_readers()
 
     try:
-        res = await run_in_threadpool(work)
+        sid = common["session_id"]
+        if not isinstance(sid, str) or not sid or len(sid) > 300:
+            res = {"note": None, "sources": [], "skipped": "session identity required"}
+        elif common["parent_id"] or body.get("automation") or body.get("thread_kind") in ("board", "review", "evaluator", "subagent"):
+            res = {"note": None, "sources": [], "skipped": "automation or child"}
+        else:
+            res = await _optional.run(sid, work)
     except Exception as e:  # noqa: BLE001
         res = {"note": None, "skipped": f"error: {str(e)[:200]}", "sources": []}
-    _log_inject(
-        {
-            "t": int(t0),
-            "mode": mode,
-            "session": body.get("session_id"),
-            "cwd": body.get("cwd"),
-            "prompt": rc.squash(rc.clean_text(prompt, "user"))[:300],
-            "activity": rc.squash(str(body.get("activity") or ""))[-300:] if mode == "work" else None,
-            "skipped": res.get("skipped"),
-            "queries": res.get("queries"),
-            "note": res.get("note"),
-            "gate_raw": res.get("gate_raw"),
-            "dropped": res.get("dropped"),
-            "timings": res.get("timings"),
-        }
-    )
     return JSONResponse(res)
 
 
@@ -297,7 +382,7 @@ async def api_ask(request: Request) -> Response:
     if bad := _foreign(request):
         return bad
     try:
-        body = await request.json()
+        body = await _body(request)
     except ValueError:
         return JSONResponse({"error": "bad json"}, status_code=400)
 
@@ -308,7 +393,7 @@ async def api_ask(request: Request) -> Response:
                                              headers.get("x-robob-driver") or body.get("caller_driver") or "",
                                              headers.get("x-robob-agent") or body.get("caller_agent") or "")
         exclude = recheck()
-        return ra.ask(
+        return _answer(lambda: ra.ask(
             str(body.get("question") or ""),
             cwd=body.get("cwd") or None,
             cwd_only=bool(body.get("cwd")),
@@ -317,8 +402,8 @@ async def api_ask(request: Request) -> Response:
             source=body.get("source") or None,
             exclude=list(exclude),
             recheck_exclusions=recheck if exclude else None,
-            timeout=float(body.get("timeout") or 30),
-        )
+            timeout=max(8, min(float(body.get("timeout") or 30), 30)),
+        ))
 
     try:
         return JSONResponse(await run_in_threadpool(work))
@@ -331,10 +416,16 @@ _status: dict = {"started_at": int(time.time())}
 
 @server.custom_route("/api/health", methods=["GET"])
 async def api_health(request: Request) -> Response:
+    @rc.bounded(0.5)
     def work() -> dict:
         max_id = rc.mem().execute("SELECT max(id) FROM episodic_events").fetchone()[0]
         wm = int(rc.catalog_meta("watermark") or 0)
-        return {"ok": True, "max_event_id": max_id, "catalog_watermark": wm, "catalog_lag": max_id - wm, **_status}
+        index = None
+        if rc.HOT_DB:
+            from recall_storage import index_health
+            index = index_health(rc.HOT_DB)
+        return {"ok": True, "max_event_id": max_id, "catalog_watermark": wm, "catalog_lag": (max_id or 0) - wm,
+                "optional": dict(_optional.stats), "hot_index": index, "rules_ready": _engine.rules_path.exists(), **_status}
 
     try:
         return JSONResponse(await run_in_threadpool(work))
@@ -345,12 +436,27 @@ async def api_health(request: Request) -> Response:
 def _refresh_loop(every: float) -> None:
     while True:
         try:
+            if rc.HOT_DB:
+                from recall_storage import build_index
+                _status["index_refresh"] = build_index(rc.MEM_DB, rc.HOT_DB, max_rows=5000, seconds=2)
             # Watermark advances per window, so a deadline only defers the rest.
-            res = rc.refresh_catalog(deadline=rc.Deadline(max(30.0, every)))
+            @rc.bounded(2.0)
+            def refresh():
+                return rc.refresh_catalog(deadline=rc.Deadline(2.0))
+            res = refresh()
             _status["catalog_refresh"] = {"at": int(time.time()), **res}
         except Exception as e:  # noqa: BLE001
             _status["catalog_refresh"] = {"at": int(time.time()), "error": str(e)[:300]}
+        finally:
+            rc.close_readers()
         time.sleep(every)
+
+
+# Preserve synchronous functions for CLI/fixtures while registering asynchronous
+# transport wrappers, so answer calls cannot fill the fast tools' threadpool.
+for _fn, _lane in ((recall_search, _tool_lane), (recall_read, _tool_lane), (recall_list, _tool_lane), (recall_ask, _ask_lane)):
+    server.remove_tool(_fn.__name__)
+    server.add_tool(_async_tool(_fn, _lane))
 
 
 def _no_standalone_sse(app, path: str = "/mcp"):
@@ -378,7 +484,8 @@ def main() -> None:
     import uvicorn
 
     app = server.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True, host=args.host)
-    uvicorn.run(_no_standalone_sse(app), host=args.host, port=args.port, log_level="warning", timeout_keep_alive=5, limit_concurrency=200)
+    uvicorn.run(_no_standalone_sse(app), host=args.host, port=args.port, log_level="warning", timeout_keep_alive=2,
+                backlog=128)
 
 
 if __name__ == "__main__":

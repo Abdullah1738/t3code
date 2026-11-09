@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -160,11 +161,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--full", action="store_true")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("remember", help="save an explicit owner instruction for later pre-action checks")
+    p.add_argument("text")
+    p.add_argument("--scope", default="")
+    p.add_argument("--action", default="")
+    p.add_argument("--recipient", default="")
+    p.add_argument("--source-session", default="")
+    p.add_argument("--rules-db", default=os.environ.get("RECALL_RULES_DB", str(rc.DATA / "recall_rules.db")))
+
     a = ap.parse_args(argv)
     out = lambda obj, text: print(json.dumps(obj, indent=1, default=str) if a.json else text)  # noqa: E731
 
     try:
-        if a.cmd == "list":
+        if a.cmd == "remember":
+            from recall_rules import RuleIndex
+            index = RuleIndex(a.rules_db)
+            try:
+                print(json.dumps(index.remember(a.text, scope=a.scope, actions=[a.action] if a.action else None,
+                                                 recipient=a.recipient, source_session=a.source_session)))
+            finally:
+                close = getattr(index, "close", None)
+                if close:
+                    close()
+        elif a.cmd == "list":
             rows = rc.list_sessions(
                 text=" ".join(a.words) or None,
                 source=a.source,
@@ -187,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
                 limit_sessions=a.n,
                 exact=a.exact,
             )
+            for warning in dict.fromkeys(q["warning"] for q in res["queries"] if q.get("warning")):
+                print(f"recall: {warning}", file=sys.stderr)
             out(res, format_search(res))
         elif a.cmd == "search":
             import recall_ask as ra

@@ -286,6 +286,7 @@ export class ProviderAdapterTurnStartError extends Schema.TaggedError<ProviderAd
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
     runId: RunId,
+    code: Schema.optional(Schema.Literal("provider_prompt_not_sent")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

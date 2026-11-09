@@ -35,11 +35,12 @@ import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
 import { textProblem } from "./engine/text.ts";
+import * as BoardReplies from "./engine/boardReplies.ts";
+import { jsonReply } from "../http/jsonReply.ts";
 
 export const KANBAN_ROUTE_PREFIX = "/api/ardud/kanban";
 
 const OWNER = { _tag: "owner" } as const;
-const NO_STORE = { "cache-control": "no-store" } as const;
 
 const STATUS: Record<KanbanError["code"], number> = {
   "not-found": 404,
@@ -49,8 +50,7 @@ const STATUS: Record<KanbanError["code"], number> = {
   failed: 500,
 };
 
-const json = (body: unknown, status = 200) =>
-  HttpServerResponse.jsonUnsafe(body, { status, headers: NO_STORE });
+const json = (body: unknown, status = 200) => jsonReply(body, status);
 
 const fail = (code: KanbanError["code"], detail: string) => new KanbanError({ code, detail });
 
@@ -212,8 +212,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       if (split > 0 && /^\d+$/.test(ref.slice(split + 1))) {
         const board = yield* boardOf(ref.slice(0, split));
         const number = Number(ref.slice(split + 1));
-        const snapshot = yield* service.snapshot(board.id);
-        const card = snapshot.cards.find((entry) => entry.number === number);
+        const card = yield* service.cardByNumber(board.id, number);
         if (!card) return yield* fail("not-found", `No card #${number} on ${board.slug}.`);
         return card;
       }
@@ -287,7 +286,26 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     const getBoard = read(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
-        return yield* service.snapshot(board.id);
+        const after = Number(yield* query("after"));
+        const requested = Number(yield* query("limit"));
+        if (
+          !Number.isSafeInteger(after) ||
+          after < 0 ||
+          !Number.isSafeInteger(requested) ||
+          requested < 0
+        )
+          return yield* fail("invalid", "after and limit must be nonnegative integers.");
+        const limit = Math.min(
+          requested || BoardReplies.BOARD_PAGE_LIMIT,
+          BoardReplies.BOARD_PAGE_MAX,
+        );
+        const snapshot = yield* service.replySnapshot(board.id, { after, limit: limit + 1 });
+        const hasMore = snapshot.cards.length > limit;
+        const cards = snapshot.cards.slice(0, limit);
+        return {
+          ...BoardReplies.compactBoard({ ...snapshot, cards }),
+          page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
+        };
       }),
     );
 

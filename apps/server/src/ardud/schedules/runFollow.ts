@@ -325,8 +325,13 @@ const decodeInteractionMode = Schema.decodeUnknownOption(ProviderInteractionMode
 export const readBlockRetry = Effect.fn("ScheduledTaskRunFollow.readBlockRetry")(function* (
   sql: SqlClient.SqlClient,
   task: Pick<ScheduledTask, "id" | "createdAt">,
+  options?: { readonly readOnly: boolean },
 ): Effect.fn.Return<BlockRetry | null, SqlError.SqlError> {
-  yield* ensureRunFollowTables(sql);
+  if (options?.readOnly) {
+    const exists =
+      yield* sql`SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'ardud_scheduled_task_block_retry'`;
+    if (exists.length === 0) return null;
+  } else yield* ensureRunFollowTables(sql);
   // created_at ties the opt-in to this task, not a later one reusing its id.
   const rows = yield* sql<{
     readonly fallbacks_json: string;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Continuous importer for native OpenCode 2 sessions.
 
-Reads session_v2 / session_message from the live opencode.db (read-only) and
+Reads session_v2 / session_message from an OpenCode-owned export and
 keeps two things current:
 
 1. data/opencode_raw.db  - exact copy of every native session_message.data and
@@ -14,15 +14,16 @@ keeps two things current:
 
 Messages mutate while streaming, so only settled messages are projected
 (user/system types, assistant with time.completed or error, or untouched for
-SETTLE_SECS). A message is re-projected when its time_updated changes; facts
-pointing at replaced rows are re-linked.
+SETTLE_SECS). A message is re-projected when its payload or time_updated changes,
+or its session export fence has not finished projecting.
 
-A session is rescanned when its time_updated changes OR its message count or max
-seq changes (session_v2.time_updated does not move when messages are appended,
-so the fingerprint in opencode_sync_progress is what catches them). That table
-starts empty, so the first runs rescan every session once. This is resumable:
-each finished session is recorded as it completes, and --deadline still stops
-between sessions.
+Sessions are reconciled in durable rotating pages, including quiet sessions:
+session_v2.time_updated does not reliably move when a message changes. Message
+metadata is paged first; unchanged payloads are not fetched. Large sessions keep
+a durable sequence checkpoint between ticks. Completion is stamped only at EOF;
+unsettled messages leave an incomplete stamp and are revisited on the next sweep.
+Each continuation is fenced by the native export's applied sequence. A new
+sequence also checks payload hashes, catching same-millisecond message rewrites.
 
 One failing session is logged and not stamped (so the next run retries it), the
 run continues with the rest, and the process exits 1.
@@ -45,14 +46,19 @@ import time
 import traceback
 import zlib
 
+import robob_readonly
+from capture_budget import Budget, Exhausted, checkpoint, setup_writer, with_retry
+
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
 RAW_DB = os.environ.get("OPENCODE_RAW_DB", os.path.join(HOME, ".local/share/memory-system/data/opencode_raw.db"))
-SRC_DB = os.environ.get("OPENCODE_DB", os.path.join(HOME, ".local/share/opencode/opencode.db"))
+SRC_DB = robob_readonly.opencode_db()
 SOURCE = "opencode"
 SETTLE_SECS = 600
 IMAGE_MIN_LEN = 256
-BATCH_MESSAGES = 200
+SESSION_PAGE = 100
+MESSAGE_PAGE = 100
+PAGE_BYTES = 8 << 20
 
 
 def now_ms():
@@ -216,32 +222,17 @@ def project(msg_id, mtype, data, sess, att):
     return rows
 
 
-def with_retry(db, fn, tries=120):
-    for i in range(tries):
-        try:
-            if db.in_transaction:
-                db.commit()
-            db.execute("BEGIN IMMEDIATE")
-            r = fn()
-            db.commit()
-            return r
-        except Exception as e:
-            if db.in_transaction:
-                db.rollback()  # never leave the write lock held on a failure
-            if not isinstance(e, sqlite3.OperationalError) or ("locked" not in str(e) and "busy" not in str(e)):
-                raise
-            time.sleep(min(1 + i, 20))
-    raise RuntimeError("database busy after retries")
-
-
 class Sync:
     def __init__(self, args):
         self.args = args
-        self.src = sqlite3.connect("file:{}?mode=ro".format(SRC_DB), uri=True, timeout=60)
-        self.src.execute("PRAGMA busy_timeout=60000")
-        self.raw = sqlite3.connect(RAW_DB, timeout=600)
+        self.budget = Budget(getattr(args, "deadline", 0))
+        # OpenCode's session/message schema is separate from the Robob export.
+        # Neither native OpenCode nor Robob live DB aliases are allowed here.
+        self.src = robob_readonly.native_ro(SRC_DB, timeout=0.1)
+        self.src.execute("PRAGMA busy_timeout=100")
+        self.budget.install(self.src)
+        self.raw = setup_writer(sqlite3.connect(RAW_DB, timeout=0.1), self.budget)
         self.raw.execute("PRAGMA journal_mode=WAL")
-        self.raw.execute("PRAGMA busy_timeout=600000")
         self.raw.executescript("""
             CREATE TABLE IF NOT EXISTS raw_messages(
               id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
@@ -252,8 +243,7 @@ class Sync:
             CREATE TABLE IF NOT EXISTS raw_sessions(
               id TEXT PRIMARY KEY, time_updated INTEGER, row_json_zlib BLOB);
         """)
-        self.mem = sqlite3.connect(MEM_DB, timeout=600)
-        self.mem.execute("PRAGMA busy_timeout=600000")
+        self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
         self.mem.executescript("""
             CREATE TABLE IF NOT EXISTS opencode_sync_messages(
               msg_id TEXT PRIMARY KEY, session_id TEXT, time_updated INTEGER,
@@ -266,7 +256,19 @@ class Sync:
             CREATE TABLE IF NOT EXISTS opencode_sync_progress(
               session_id TEXT PRIMARY KEY, max_seq INTEGER NOT NULL,
               msg_count INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS opencode_sync_export_progress(
+              session_id TEXT PRIMARY KEY, applied_seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS opencode_sync_payloads(
+              msg_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS opencode_capture_cursor(
+              key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS opencode_capture_scan(
+              session_id TEXT PRIMARY KEY, session_updated INTEGER NOT NULL,
+              last_seq INTEGER NOT NULL, msg_count INTEGER NOT NULL,
+              unsettled INTEGER NOT NULL, export_seq INTEGER);
         """)
+        if "export_seq" not in {row[1] for row in self.mem.execute("PRAGMA table_info(opencode_capture_scan)")}:
+            self.mem.execute("ALTER TABLE opencode_capture_scan ADD COLUMN export_seq INTEGER")
         self.mem.commit()
         self.att = Attachments(self.mem)
         self.stats = dict(sessions=0, raw_upserts=0, projected=0, reprojected=0,
@@ -274,101 +276,149 @@ class Sync:
 
     # ------------------------------------------------------------ source reads
     def changed_sessions(self):
+        """Rotate through bounded completed exports, including quiet sessions."""
+        self.budget.check()
+        robob_readonly.refresh_native(self.src)
         cols = [r[1] for r in self.src.execute("PRAGMA table_info(session_v2)")]
-        rows = self.src.execute("SELECT * FROM session_v2").fetchall()
-        self.src.commit()
-        known = dict(self.mem.execute(
-            "SELECT session_id, time_updated FROM opencode_sync_sessions").fetchall())
-        # session_v2.time_updated does not move when messages are appended, so
-        # the (max seq, message count) fingerprint is what catches new messages
-        src_fp = {sid: (mx, n) for sid, mx, n in self.src.execute(
-            "SELECT session_id, MAX(seq), COUNT(*) FROM session_message GROUP BY session_id")
-            .fetchall()}
-        self.src.commit()
-        have_fp = {sid: (mx, n) for sid, mx, n in self.mem.execute(
-            "SELECT session_id, max_seq, msg_count FROM opencode_sync_progress").fetchall()}
-        out = []
-        for r in rows:
-            d = dict(zip(cols, r))
-            fp = src_fp.get(d["id"], (0, 0))
-            if (known.get(d["id"]) == d["time_updated"] and have_fp.get(d["id"]) == fp
-                    and not self.args.full):
-                continue
-            d["_fp"] = fp
-            out.append(d)
-        return out
+        select = ("SELECT s.*,e.applied_seq FROM session_v2 s JOIN ardud_native_sessions e ON e.id=s.id"
+                  " WHERE e.applied_seq IS NOT NULL AND e.dirty=0")
+        limit = min(self.args.limit or SESSION_PAGE, SESSION_PAGE)
+        if self.args.only:
+            ids = sorted(set(self.args.only))[:limit]
+            rows = self.src.execute(
+                select + " AND s.id IN (%s) ORDER BY s.id" % ",".join("?" * len(ids)), ids).fetchall()
+        else:
+            row = self.mem.execute("SELECT value FROM opencode_capture_cursor WHERE key='session'").fetchone()
+            after = row[0] if row else ""
+            rows = self.src.execute(select + " AND s.id>? ORDER BY s.id LIMIT ?", (after, limit)).fetchall()
+            if not rows and after:
+                rows = self.src.execute(select + " ORDER BY s.id LIMIT ?", (limit,)).fetchall()
+        return [dict(zip(cols + ["_export_seq"], row)) for row in rows]
 
-    def session_messages(self, sid, page=300):
-        """Yield pages ordered by seq; some sessions carry 500+ MB of data."""
+    def _validate_export(self, sid, export_seq):
+        self.budget.check()
+        robob_readonly.refresh_native(self.src)
+        current = robob_readonly.native_capture_generation(self.src, sid)
+        if current != export_seq:
+            raise robob_readonly.UnsafeStateDatabase("native session export changed during capture; retry next run")
+
+    def session_messages(self, sid, page=300, export_seq=None):
+        """Compatibility payload iterator; each bounded page pins a fresh ready fence."""
         last = -1
         while True:
+            if export_seq is None:
+                robob_readonly.refresh_native(self.src)
+                export_seq = robob_readonly.native_capture_generation(self.src, sid)
+            self._validate_export(sid, export_seq)
             rows = self.src.execute(
-                "SELECT id, type, seq, time_created, time_updated, data FROM session_message"
-                " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
-                (sid, last, page)).fetchall()
-            self.src.commit()
+                "SELECT id,type,seq,time_created,time_updated,data FROM session_message"
+                " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?", (sid, last, page)).fetchall()
+            self.src.rollback()
             if not rows:
                 return
             yield rows
             last = rows[-1][2]
 
+    def _cursor(self, sid):
+        if not self.args.only:
+            self.mem.execute("INSERT INTO opencode_capture_cursor VALUES('session',?)"
+                             " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sid,))
+
+    def _save_scan(self, sid, updated, last, count, unsettled, export_seq):
+        self._validate_export(sid, export_seq)
+        self.mem.execute("INSERT OR REPLACE INTO opencode_capture_scan VALUES(?,?,?,?,?,?)",
+                         (sid, updated, last, count, int(unsettled), export_seq))
+        self._cursor(sid)
+
     # ------------------------------------------------------------ processing
     def sync_session(self, sess):
         sid = sess["id"]
+        robob_readonly.refresh_native(self.src)
+        export_seq = robob_readonly.native_capture_generation(self.src, sid)
+        if export_seq != sess.get("_export_seq", export_seq):
+            raise robob_readonly.UnsafeStateDatabase("native session export changed since planning; retry next run")
         native = is_native(sess.get("metadata"))
-        fp = sess.get("_fp") or (0, 0)
         if not native:
-            with_retry(self.mem, lambda: self._stamp(sid, 0, sess["time_updated"], fp))
-            return
-        self.stats["sessions"] += 1
-        ledger = dict((m, (tu, p, lg)) for m, tu, p, lg in self.mem.execute(
-            "SELECT msg_id, time_updated, projected, legacy FROM opencode_sync_messages"
-            " WHERE session_id=?", (sid,)).fetchall())
-        raw_have = dict(self.raw.execute(
-            "SELECT id, time_updated FROM raw_messages WHERE session_id=?", (sid,)).fetchall())
-        all_settled = True
-        for msgs in self.session_messages(sid):
-            # raw archive (every native message, settled or not)
-            raw_batch = []
-            for mid, mtype, seq, tc, tu, data in msgs:
-                if raw_have.get(mid) != tu:
-                    b = data.encode("utf-8")
-                    raw_batch.append((mid, sid, mtype, seq, tc, tu,
-                                      hashlib.sha256(b).hexdigest(), len(b),
-                                      zlib.compress(b, 6)))
-            if raw_batch:
-                with_retry(self.raw, lambda: self.raw.executemany(
-                    "INSERT OR REPLACE INTO raw_messages VALUES (?,?,?,?,?,?,?,?,?)",
-                    raw_batch))
-                self.stats["raw_upserts"] += len(raw_batch)
-            # projection
-            todo = []
-            for mid, mtype, seq, tc, tu, data in msgs:
+            with_retry(self.mem, lambda: (self._stamp(sid, 0, sess["time_updated"], (0, 0), export_seq), self._cursor(sid)),
+                       budget=self.budget)
+            return True
+        scan = self.mem.execute("SELECT session_updated,last_seq,msg_count,unsettled,export_seq"
+                                " FROM opencode_capture_scan WHERE session_id=?", (sid,)).fetchone()
+        previous_export = self.mem.execute(
+            "SELECT applied_seq FROM opencode_sync_export_progress WHERE session_id=?", (sid,)).fetchone()
+        verify_payloads = previous_export is None or previous_export[0] != export_seq
+        last, count, unsettled_seen = (scan[1:4] if scan and scan[0] == sess["time_updated"]
+                                       and scan[4] == export_seq else (-1, 0, 0))
+        self.stats["sessions"] += int(verify_payloads or scan is not None)
+        with_retry(self.mem, lambda: self._stamp(sid, 1, -1, (0, 0), export_seq), budget=self.budget)
+        # A large session gets a share, not the entire tick. Its next pass resumes at last_seq.
+        for _ in range(8):
+            self._validate_export(sid, export_seq)
+            msgs = self.src.execute(
+                "SELECT id,type,seq,time_created,time_updated FROM session_message"
+                " WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?", (sid, last, MESSAGE_PAGE)).fetchall()
+            if not msgs:
+                srow = json.dumps({k: v for k, v in sess.items() if not k.startswith("_")},
+                                 ensure_ascii=False).encode("utf-8")
+                with_retry(self.raw, lambda: self.raw.execute("INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
+                           (sid, sess["time_updated"], zlib.compress(srow, 6))), budget=self.budget)
+                def finish():
+                    self._stamp(sid, 1, -1 if unsettled_seen else sess["time_updated"], (max(last, 0), count), export_seq)
+                    self.mem.execute("DELETE FROM opencode_capture_scan WHERE session_id=?", (sid,))
+                    self._cursor(sid)
+                with_retry(self.mem, finish, budget=self.budget)
+                return True
+            ids = [m[0] for m in msgs]
+            marks = ",".join("?" * len(ids))
+            ledger = {m: (tu, p, lg) for m, tu, p, lg in self.mem.execute(
+                f"SELECT msg_id,time_updated,projected,legacy FROM opencode_sync_messages WHERE msg_id IN ({marks})", ids)}
+            raw_have = {mid: (tu, sha) for mid, tu, sha in self.raw.execute(
+                f"SELECT id,time_updated,sha256 FROM raw_messages WHERE id IN ({marks})", ids)}
+            projected_hashes = dict(self.mem.execute(
+                f"SELECT msg_id,sha256 FROM opencode_sync_payloads WHERE msg_id IN ({marks})", ids))
+            consumed_bytes = 0
+            for mid, mtype, seq, tc, tu in msgs:
+                self.budget.check()
                 led = ledger.get(mid)
-                if led and led[0] == tu:
-                    continue
-                try:
-                    d = json.loads(data)
-                except ValueError:
-                    d = {"unparsed": data}
-                if not settled(mtype, d, tu):
-                    self.stats["unsettled"] += 1
-                    all_settled = False
-                    continue
-                todo.append((mid, mtype, seq, tc, tu, d, led))
-            for i in range(0, len(todo), BATCH_MESSAGES):
-                chunk = todo[i:i + BATCH_MESSAGES]
-                with_retry(self.mem, lambda: self._project_chunk(sid, sess, chunk))
-        srow = json.dumps(sess, ensure_ascii=False).encode("utf-8")
-        with_retry(self.raw, lambda: self.raw.execute(
-            "INSERT OR REPLACE INTO raw_sessions VALUES (?,?,?)",
-            (sid, sess["time_updated"], zlib.compress(srow, 6))))
-        stamp = sess["time_updated"] if all_settled else -1
-        with_retry(self.mem, lambda: self._stamp(sid, 1, stamp, fp))
+                have = raw_have.get(mid)
+                if verify_payloads or not have or have[0] != tu or not led or led[0] != tu:
+                    row = self.src.execute("SELECT data,time_updated FROM session_message WHERE id=?", (mid,)).fetchone()
+                    if not row:
+                        break  # export changed; revisit this sequence on the next page
+                    data, tu = row
+                    b = data.encode("utf-8")
+                    consumed_bytes += len(b)
+                    digest = hashlib.sha256(b).hexdigest()
+                    if have != (tu, digest):
+                        raw_row = (mid, sid, mtype, seq, tc, tu, digest, len(b), zlib.compress(b, 6))
+                        with_retry(self.raw, lambda: self.raw.execute("INSERT OR REPLACE INTO raw_messages VALUES (?,?,?,?,?,?,?,?,?)",
+                                   raw_row), budget=self.budget)
+                        self.stats["raw_upserts"] += 1
+                    if not led or led[0] != tu or projected_hashes.get(mid) != digest:
+                        try:
+                            d = json.loads(data)
+                        except ValueError:
+                            d = {"unparsed": data}
+                        if settled(mtype, d, tu):
+                            def project_message():
+                                self._project_chunk(sid, sess, [(mid, mtype, seq, tc, tu, d, led)])
+                                self.mem.execute("INSERT OR REPLACE INTO opencode_sync_payloads VALUES(?,?)", (mid, digest))
+                                self._validate_export(sid, export_seq)
+                            with_retry(self.mem, project_message, budget=self.budget)
+                        else:
+                            unsettled_seen = 1
+                            self.stats["unsettled"] += 1
+                last, count = seq, count + 1
+                if consumed_bytes >= PAGE_BYTES:
+                    break
+            with_retry(self.mem, lambda: self._save_scan(sid, sess["time_updated"], last, count, unsettled_seen, export_seq),
+                       budget=self.budget)
+        return False
 
-    def _stamp(self, sid, native, stamp, fp):
+    def _stamp(self, sid, native, stamp, fp, export_seq):
         # Caller holds BEGIN IMMEDIATE. A -1 stamp (unsettled message) writes no
         # progress row, so the session is retried on the next run.
+        self._validate_export(sid, export_seq)
         self.mem.execute(
             "INSERT OR REPLACE INTO opencode_sync_sessions VALUES (?,?,?,?)",
             (sid, native, stamp, int(time.time())))
@@ -376,6 +426,12 @@ class Sync:
             self.mem.execute(
                 "INSERT OR REPLACE INTO opencode_sync_progress VALUES (?,?,?)",
                 (sid, fp[0], fp[1]))
+            self.mem.execute(
+                "INSERT OR REPLACE INTO opencode_sync_export_progress VALUES (?,?)", (sid, export_seq))
+        else:
+            self.mem.execute("DELETE FROM opencode_sync_progress WHERE session_id=?", (sid,))
+        # A generation change during the callback must roll the completion stamp back.
+        self._validate_export(sid, export_seq)
 
     def _project_chunk(self, sid, sess, chunk):
         m = self.mem
@@ -427,13 +483,24 @@ class Sync:
         os.replace(tmp, path)
 
     def run(self):
+        try:
+            return self._run()
+        finally:
+            checkpoint(self.mem)
+            checkpoint(self.raw)
+
+    def _run(self):
         t0 = time.time()
-        sessions = self.changed_sessions()
+        try:
+            sessions = self.changed_sessions()
+        except (Exhausted, sqlite3.OperationalError):
+            if not self.budget.expired():
+                raise
+            sessions = []
+            self.stats["budget_exhausted"] = True
         print("changed sessions: {}".format(len(sessions)), flush=True)
         if self.args.only:
             sessions = [s for s in sessions if s["id"] in self.args.only]
-        # oldest change first, so a backlog drains in order across runs
-        sessions.sort(key=lambda s: s.get("time_updated") or 0)
         if self.args.limit:
             sessions = sessions[:self.args.limit]
         self.stats["remaining"] = 0
@@ -442,13 +509,24 @@ class Sync:
             # one bad session must not stop the rest: it is not stamped, so the
             # next run retries it, and the run exits 1 (see main)
             try:
-                self.sync_session(s)
+                if not self.sync_session(s):
+                    self.stats["partial_sessions"] = self.stats.get("partial_sessions", 0) + 1
+            except (Exhausted, sqlite3.OperationalError) as e:
+                if isinstance(e, Exhausted) or self.budget.expired():
+                    self.stats["remaining"] = len(sessions) - i + 1
+                    self.stats["budget_exhausted"] = True
+                    break
+                self.stats["errors"] += 1
+                self.stats["failed"].append(s["id"])
+                print(f"session {s['id']} failed: {e}", flush=True)
             except Exception as e:
                 self.stats["errors"] += 1
                 if len(self.stats["failed"]) < 20:
                     self.stats["failed"].append(s["id"])
                 print("session {} failed: {}: {}".format(s["id"], type(e).__name__, e), flush=True)
                 print(traceback.format_exc(), flush=True)
+                # Retry on the next sweep, without trapping discovery on a corrupt first page.
+                with_retry(self.mem, lambda: self._cursor(s["id"]), budget=self.budget)
                 if self.stats["errors"] >= 20:
                     print("too many failed sessions, stopping", flush=True)
                     break
@@ -456,7 +534,7 @@ class Sync:
                 print("  {}/{} {}".format(i, len(sessions), self.stats), flush=True)
             if i % 10 == 0:
                 self.write_progress(i, len(sessions), t0)
-            if self.args.deadline and time.time() - t0 > self.args.deadline and i < len(sessions):
+            if self.budget.expired() and i < len(sessions):
                 self.stats["remaining"] = len(sessions) - i
                 print("soft deadline {}s reached after {}/{} sessions; rest next run"
                       .format(self.args.deadline, i, len(sessions)), flush=True)
@@ -471,15 +549,21 @@ class Sync:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--full", action="store_true",
-                   help="rescan every session regardless of time_updated")
+                   help="compatibility flag; all selected sessions are reconciled on every pass")
     p.add_argument("--only", nargs="*", help="session ids")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--deadline", type=int, default=0,
-                   help="soft deadline (secs): stop starting new sessions after this")
+                   help="cooperative deadline (secs), checked between messages and commits")
     p.add_argument("--progress", default="",
                    help="write a JSON progress marker here every 10 sessions")
     args = p.parse_args()
-    stats = Sync(args).run()
+    worker = Sync(args)
+    try:
+        stats = worker.run()
+    finally:
+        worker.src.close()
+        worker.mem.close()
+        worker.raw.close()
     sys.exit(1 if stats.get("errors") else 0)
 
 

@@ -39,6 +39,7 @@ import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { issueAttachmentUploadUrl } from "../../assets/AttachmentUpload.ts";
+import { jsonReply } from "../http/jsonReply.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
@@ -157,10 +158,7 @@ const archiveFailureCode = (
   }
 };
 
-const NO_STORE = { "cache-control": "no-store" } as const;
-
-const json = (body: unknown, status = 200) =>
-  HttpServerResponse.jsonUnsafe(body, { status, headers: NO_STORE });
+const json = (body: unknown, status = 200) => jsonReply(body, status);
 
 const errorResponse = (error: ControlError) =>
   json({ ok: false, error: { code: error.code, message: error.message } }, STATUS[error.code]);

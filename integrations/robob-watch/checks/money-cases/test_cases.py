@@ -21,6 +21,12 @@ spec.loader.exec_module(mc)
 TZ = mc.TZ
 
 
+def replica_meta(db):
+    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
+                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
+
+
 def at(text):
     return dt.datetime.fromisoformat(text).replace(tzinfo=TZ)
 
@@ -458,6 +464,7 @@ class CheckEntry(Base):
         mc.write_json(self.data / 'questions.json', book)
         replica = self.tmp / 'owner.sqlite'
         with sqlite3.connect(replica) as db:
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
         fake = self.tmp / 'msgs'
@@ -1295,6 +1302,7 @@ class CheckBudget(Base):
         self.seed(times)
         path = self.tmp / 'owner.sqlite'
         with sqlite3.connect(path) as db:
+            replica_meta(db)
             db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
             db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
             db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)',

@@ -180,8 +180,8 @@ const make = Effect.gen(function* () {
   // One run per script. A slot is taken, and handed to the next run, in one
   // step, so nothing can land between a run ending and the next one starting.
   const slots = yield* Ref.make<Slots>(new Map());
-  // Script records are written whole, so a toggle and a run ending take turns.
-  const writes = yield* Semaphore.make(1);
+  // Whole-record writes take turns on their board, without blocking other boards.
+  const writes = new Map<KanbanBoard["id"], Semaphore.Semaphore>();
 
   const io = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(asKanbanError));
@@ -253,15 +253,25 @@ const make = Effect.gen(function* () {
     command: Scripts.PoolCommand,
   ) {
     const pools = yield* io(store.pools(script.boardId));
+    const exact = pools.filter((entry) => entry.key === command.model);
+    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
+    const keyedPool = exact[0];
     const apply = yield* routingEnabled;
-    const selected = modelSelectionResult(command, apply);
+    // A stored pool key names its captured selection, not an OpenCode model id.
+    const selected = modelSelectionResult(
+      keyedPool === undefined
+        ? command
+        : {
+            ...command,
+            model: keyedPool.model.model,
+            instanceId: command.instanceId ?? keyedPool.model.instanceId,
+          },
+      apply,
+    );
     if (selected.kind === "conflict") {
       return `Couldn't resize the ${command.model} pool: ${selected.reason}`;
     }
-    const exact = pools.filter((entry) => entry.key === command.model);
-    if (exact.length > 1) return `More than one pool has key ${command.model}.`;
     const namedLevel = selectionEffort(selected.selection);
-    const keyedPool = exact[0];
     if (
       keyedPool &&
       ((command.instanceId !== undefined && command.instanceId !== keyedPool.model.instanceId) ||
@@ -427,9 +437,24 @@ const make = Effect.gen(function* () {
     scriptId: KanbanScript["id"],
     change: (script: KanbanScript) => KanbanScript,
   ) {
-    return yield* writes.withPermits(1)(
-      scriptOf(scriptId).pipe(Effect.flatMap((script) => save(change(script)))),
+    // A script stays on its registered board; this read only chooses the lock.
+    const { boardId } = yield* scriptOf(scriptId);
+    let lock = writes.get(boardId);
+    if (lock === undefined) {
+      lock = Semaphore.makeUnsafe(1);
+      writes.set(boardId, lock);
+    }
+    const { script, changed } = yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const latest = yield* scriptOf(scriptId);
+        const next = change(latest);
+        if (next !== latest) yield* io(store.putScript(next));
+        return { script: withZone(next), changed: next !== latest };
+      }),
     );
+    // Publishing must not extend the read/modify/write critical section.
+    if (changed) yield* service.announce(boardId, { _tag: "script", script });
+    return script;
   });
 
   const open = Effect.fn("KanbanScripts.open")(function* (script: KanbanScript, trigger: string) {
@@ -686,8 +711,6 @@ const make = Effect.gen(function* () {
 
   const setEnabled: KanbanScriptsShape["setEnabled"] = Effect.fn("KanbanScripts.setEnabled")(
     function* (scriptId, enabled) {
-      const script = yield* scriptOf(scriptId);
-      if (script.enabled === enabled) return script;
       if (!enabled) {
         // The run going now finishes; the one asked for after it doesn't happen.
         yield* Ref.update(slots, (map) => {
@@ -696,7 +719,9 @@ const make = Effect.gen(function* () {
           return new Map(map).set(scriptId, { ...slot, next: null });
         });
       }
-      return yield* update(scriptId, (latest) => ({ ...latest, enabled }));
+      return yield* update(scriptId, (latest) =>
+        latest.enabled === enabled ? latest : { ...latest, enabled },
+      );
     },
   );
 

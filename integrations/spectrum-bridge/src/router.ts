@@ -32,7 +32,7 @@ type Turn = Route & {
   phase: "submitting" | "running" | "unknown" | "held" | "failed";
   background?: boolean;
   /**
-   * `"request"`: opened by the idle watch only to relay a subagent's request.
+   * `"request"`: follows requests after a reply or when the idle watch finds one.
    * Nothing guarantees the root resumes afterwards (the child may be aborted,
    * fail, or have its request answered elsewhere), so poll() closes it once
    * nothing is asked and the route has stayed quiet for a short grace.
@@ -2859,74 +2859,97 @@ export class Router {
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
-      const statuses = await this.statusesFor(turn);
-      const [page, requests] = await Promise.all([
-        bounded(this.backend.messages(turn.id, turn.directory, turn.background
-          ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
-        this.requests(turn, statuses),
-      ]);
+      let messages = await bounded(this.backend.messages(turn.id, turn.directory, turn.background
+        ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 }));
       if (!this.current(turn)) return;
-      if (!page || !statuses) throw new Error();
-      let messages = page;
       if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
         await this.reconcile(turn, messages);
         const accepted = this.store.get<Turn | null>("activeTurn");
         if (!accepted || accepted.phase !== "running" || !this.current(accepted)) return;
         turn = accepted;
       }
-      const entries = this.pending();
+      const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []]);
+      let lastPrompt = -1;
+      messages.forEach((record, index) => {
+        if (ownedPrompts.has(record.id) && (turn!.background || record.type === "user")) lastPrompt = index;
+      });
+      const settled = lastPrompt >= 0 && messages.slice(lastPrompt + 1).some(record => record.type === "idle");
+      let entries = this.pending();
       const live = new Set<string>();
-      for (const { request, directory } of requests) {
-        const kind = "questions" in request ? "question" : "permission";
-        const operationId = `request:${turn.generation}:${kind}:${hash(request.id)}`;
-        live.add(operationId);
-        if (entries.some(p => p.operationId === operationId)) continue;
-        entries.push({
-          id: request.id, sessionId: turn.id, generation: turn.generation, kind, operationId,
-          signature: this.signature(request), state: "pending", firstSeen: Date.now(),
-          ...(directory === undefined ? {} : { requestSessionId: request.sessionID, requestDirectory: directory }),
-        });
-        this.store.db.transaction(() => {
-          this.store.set(`request-body:${operationId}`, request);
-          this.store.set("pendingApprovals", entries);
-        }).immediate();
-      }
-      for (const entry of entries) {
-        if (!live.has(entry.operationId)) {
-          if (entry.state === "pending") entry.state = "expired";
-          // An answer handed over for a request that is no longer open either
-          // landed or no longer matters. Once the resubmit window has passed,
-          // nothing can come of it; while inside it, a restart could still
-          // show the request open again and ask anew.
-          else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-            entry.state = "expired";
-          }
-        } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-          // The request is still open long after an answer was handed over (for
-          // example across a restart), so that answer never landed: ask again.
-          const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
-          if (body && this.signature(body) === entry.signature) {
-            entry.state = "pending";
-            entry.prompt = undefined;
+      let statuses: Record<string, SessionStatus> = {};
+      let refreshed = false;
+      const refreshRequestsOnce = async () => {
+        if (refreshed) return;
+        refreshed = true;
+        const currentTurn = turn!;
+        statuses = await this.statusesFor(currentTurn);
+        const requests = await this.requests(currentTurn, statuses);
+        if (!this.current(currentTurn)) return;
+        for (const { request, directory } of requests) {
+          const kind = "questions" in request ? "question" : "permission";
+          const operationId = `request:${currentTurn.generation}:${kind}:${hash(request.id)}`;
+          live.add(operationId);
+          if (entries.some(p => p.operationId === operationId)) continue;
+          entries.push({
+            id: request.id, sessionId: currentTurn.id, generation: currentTurn.generation, kind, operationId,
+            signature: this.signature(request), state: "pending", firstSeen: Date.now(),
+            ...(directory === undefined ? {} : { requestSessionId: request.sessionID, requestDirectory: directory }),
+          });
+          this.store.db.transaction(() => {
+            this.store.set(`request-body:${operationId}`, request);
+            this.store.set("pendingApprovals", entries);
+          }).immediate();
+        }
+        for (const entry of entries) {
+          if (!live.has(entry.operationId)) {
+            if (entry.state === "pending") entry.state = "expired";
+            // An answer handed over for a request that is no longer open either
+            // landed or no longer matters. Once the resubmit window has passed,
+            // nothing can come of it; while inside it, a restart could still
+            // show the request open again and ask anew.
+            else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+              entry.state = "expired";
+            }
+          } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+            // The request is still open long after an answer was handed over (for
+            // example across a restart), so that answer never landed: ask again.
+            const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
+            if (body && this.signature(body) === entry.signature) {
+              entry.state = "pending";
+              entry.prompt = undefined;
+            }
           }
         }
-      }
-      this.store.set("pendingApprovals", entries);
-      this.advance(turn);
+        this.store.set("pendingApprovals", entries);
+        this.advance(currentTurn);
+        entries = this.pending();
+      };
+      // A candidate completion skips child discovery unless full record coverage disproves it.
+      if (!settled) await refreshRequestsOnce();
+      if (!this.current(turn)) return;
       // A late accepted steer can precede the adopted prompt by more than the backend's page size.
-      for (const id of [turn.messageId, ...turn.steered ?? []]) {
-        if (messages.some(record => record.id === id)) continue;
-        const extended = await bounded(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
-        if (!this.current(turn)) return;
-        if (extended.some(record => record.id === id)) {
-          const owned = new Set([turn.messageId, ...turn.steered ?? []]);
-          const kept = messages.filter(record => record.type === "user" && owned.has(record.id));
-          if (kept.some(record => !extended.some(next => next.id === record.id))) return;
-          messages = extended;
-        } else if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) {
-          // Acceptance without a readable record is not permission to discard its reply after the grace period.
-          return;
+      let expansionHeld = false;
+      try {
+        for (const id of [turn.messageId, ...turn.steered ?? []]) {
+          if (messages.some(record => record.id === id)) continue;
+          const extended = await bounded(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
+          if (!this.current(turn)) return;
+          if (extended.some(record => record.id === id)) {
+            const owned = new Set([turn.messageId, ...turn.steered ?? []]);
+            const kept = messages.filter(record => record.type === "user" && owned.has(record.id));
+            if (kept.some(record => !extended.some(next => next.id === record.id))) {
+              expansionHeld = true;
+              break;
+            }
+            messages = extended;
+          } else if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) {
+            // Acceptance without a readable record is not permission to discard its reply after the grace period.
+            expansionHeld = true;
+            break;
+          }
         }
+      } catch {
+        expansionHeld = true;
       }
       if (!this.current(turn)) return;
       // OpenCode 2 records carry no parent link. A turn is every record after
@@ -2935,7 +2958,6 @@ export class Router {
       // execution settles (succeeded, failed or interrupted).
       // Admission can reverse the order of uncertain steers. The adopted prompt keeps its identity,
       // but reply ownership starts at the earliest accepted prompt this turn tracks.
-      const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []]);
       const start = messages.findIndex(m => m.type === "user" && ownedPrompts.has(m.id)
         || turn!.background && m.id === turn!.messageId);
       const after = start < 0 ? [] : messages.slice(start + 1);
@@ -2947,6 +2969,10 @@ export class Router {
       const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
       const end = missing || found < 0 ? -1 : steered + 1 + found;
       const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
+      if (expansionHeld || !idle) {
+        await refreshRequestsOnce();
+        if (!this.current(turn) || expansionHeld) return;
+      }
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
@@ -3067,10 +3093,18 @@ export class Router {
         }).immediate();
         return;
       }
+      // Busy activity may belong to an older run whose records precede this watermark.
+      // Once it stops, there is no later idle marker for this empty background turn.
+      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size) {
+        this.store.db.transaction(() => {
+          this.store.set("activeTurn", null);
+          this.store.set("pendingApprovals", null);
+        }).immediate();
+        return;
+      }
       const tools = replies.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p?.type === "tool") : []);
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
-      // An active session is still working even after an idle marker.
-      if (turn.phase !== "running" || live.size || statuses[turn.id] !== undefined) return;
+      if (turn.phase !== "running") return;
       if (runningTools || !idle) return;
       // A final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
@@ -3119,8 +3153,13 @@ export class Router {
         }
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
         this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
-        this.store.set("activeTurn", null);
-        this.store.set("pendingApprovals", null);
+        const waiting = entries.filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
+        // Keep already-asked requests answerable without rediscovering their run or child.
+        this.store.set("activeTurn", waiting.length ? {
+          id: turn!.id, directory: turn!.directory, generation: turn!.generation,
+          messageId: idle.id, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
+        } satisfies Turn : null);
+        this.store.set("pendingApprovals", waiting.length ? waiting : null);
         this.store.set("settledAt", Date.now());
       }).immediate();
       if (text || earlier.length) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);

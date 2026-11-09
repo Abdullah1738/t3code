@@ -11,6 +11,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, SRC)
@@ -81,6 +82,29 @@ class CodexSyncTest(unittest.TestCase):
                           " WHERE source='codex' ORDER BY id").fetchall()
         con.close()
         return out
+
+    def test_expiry_after_committed_chunk_resumes_without_false_complete(self):
+        from capture_budget import Budget
+        write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "first"), msg("assistant", "second")])
+        worker = self.sx.CodexSync(types.SimpleNamespace(deadline=0), roots=self.roots)
+        clock = [0]
+        worker.budget = Budget(1, clock=lambda: clock[0])
+        original = worker._write
+        def expire(*args, **kwargs):
+            original(*args, **kwargs)
+            clock[0] = 2
+        worker._write = expire
+        with patch.object(self.sx.tc, "BATCH_BYTES", 1):
+            stats = worker.run()
+        self.assertTrue(stats["partial"])
+        with sqlite3.connect(self.db) as con:
+            offset, complete = con.execute("SELECT offset,complete FROM native_capture_files").fetchone()
+            self.assertGreater(offset, 0)
+            self.assertLess(offset, os.path.getsize(self.rollout))
+            self.assertEqual(complete, 0)
+            self.assertEqual(con.execute("SELECT count(*) FROM native_capture_roots").fetchone(), (0,))
+        self.sync()
+        self.assertEqual(len(self.rows()), 2)
 
     def test_child_keyed_by_thread_id_with_root_in_metadata(self):
         write_rollout(self.rollout, [meta(CHILD_ID, ROOT_ID), msg("user", "child job"),

@@ -194,9 +194,8 @@ export const make = Effect.gen(function* () {
   const staleOpenCode = yield* Effect.serviceOption(StaleOpenCodeSessions);
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
   /**
-   * A session shared by several threads (one Codex app server) is stopped by the
-   * first thread recovery reaches. It was live when the server went down, so a
-   * later thread still decides its wake as if it were.
+   * Shared sessions are stopped once before thread recovery. Restore their live
+   * status when deciding whether each running thread should continue.
    */
   const sessionsLiveAtStart = (
     projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -805,6 +804,47 @@ export const make = Effect.gen(function* () {
       other: 0,
     };
     const stoppedThisPass = new Map<string, RecoverySession>();
+    const sharedSessions = yield* projections
+      .getLiveSharedProviderSessions()
+      .pipe(
+        Effect.mapError(
+          (cause) => new ProviderRuntimeRecoveryError({ operation: "read-projections", cause }),
+        ),
+      );
+    // Preserve live status for continuation decisions before stopping global rows.
+    for (const { threadId, session } of sharedSessions) {
+      stoppedThisPass.set(session.id, session);
+      const now = yield* DateTime.now;
+      const commandId = CommandId.make(
+        `command:runtime-reconcile:${trigger}:session:${session.id}:${DateTime.formatIso(now)}`,
+      );
+      yield* Effect.gen(function* () {
+        yield* eventSink.commitCommand({
+          commandId,
+          threadId,
+          commandType: "provider-runtime.reconcile",
+          acceptedAt: now,
+          events: [
+            {
+              id: yield* ids.allocate.event({ threadId, commandId }),
+              type: "provider-session.updated",
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: now,
+              payload: { ...session, status: "stopped", updatedAt: now, lastError: null },
+            },
+          ],
+          effects: [],
+        });
+      }).pipe(
+        Effect.mapError(
+          (cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", threadId, cause }),
+        ),
+      );
+      stoppedSessions++;
+    }
+
     for (const threadId of threadIds) {
       const projection = yield* projections.getRuntimeRecoveryProjection(threadId).pipe(
         Effect.mapError(

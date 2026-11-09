@@ -32,6 +32,7 @@ import {
 } from "../engine/messagePages.ts";
 import { selectionRoutingEnabled } from "../engine/selectionSettings.ts";
 import { KanbanToolkit, type ModelInput } from "./tools.ts";
+import * as BoardReplies from "../engine/boardReplies.ts";
 
 const toolFailure = (error: KanbanError) =>
   new OrchestratorMcpFailure({
@@ -360,9 +361,21 @@ const handlers = {
     withCaller((service, caller) =>
       Effect.gen(function* () {
         const board = yield* boardFor(service, caller, input.boardId);
-        const snapshot = yield* service.snapshot(board.id);
+        const limit = Math.min(
+          input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
+          BoardReplies.BOARD_PAGE_MAX,
+        );
+        const snapshot = yield* service.replySnapshot(board.id, {
+          after: input.after ?? 0,
+          limit: limit + 1,
+        });
+        const hasMore = snapshot.cards.length > limit;
+        const cards = snapshot.cards.slice(0, limit);
         return {
-          board: { ...snapshot, cards: snapshot.cards.map((card) => ({ ...card, prompt: "" })) },
+          board: {
+            ...BoardReplies.compactBoard({ ...snapshot, cards }),
+            page: { limit, hasMore, nextAfter: hasMore ? cards.at(-1)!.number : null },
+          },
           prompts: "omitted; card_get returns a card's prompt",
         };
       }),

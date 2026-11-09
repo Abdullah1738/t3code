@@ -730,6 +730,9 @@ class SendApprovalTest(unittest.TestCase):
 
     def app_db(self, rows):
         con = sqlite3.connect(self.state_db)
+        con.execute('create table ardud_readonly_meta(key text primary key, value text not null)')
+        con.executemany('insert into ardud_readonly_meta values (?,?)',
+                        [('ready', '1'), ('updated_at', iso(NOW)), ('schema_version', '1')])
         con.executescript(
             "create table orchestration_v2_projection_provider_threads(provider_thread_id text primary key, thread_id"
             " text, updated_at text, payload_json text);"
@@ -939,6 +942,9 @@ class SendApprovalTest(unittest.TestCase):
         The messages must sit on the resolved thread: the helper reads the history of the thread C1 names.
         """
         con = sqlite3.connect(self.state_db)
+        con.execute('create table ardud_readonly_meta(key text primary key, value text not null)')
+        con.executemany('insert into ardud_readonly_meta values (?,?)',
+                        [('ready', '1'), ('updated_at', iso(NOW)), ('schema_version', '1')])
         con.executescript(
             "create table orchestration_v2_projection_provider_threads(provider_thread_id text primary key, thread_id"
             " text, updated_at text, payload_json text);"

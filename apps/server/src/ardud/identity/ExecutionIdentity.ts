@@ -17,6 +17,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+
 export class ExecutionIdentityError extends Schema.TaggedError<ExecutionIdentityError>()(
   "ExecutionIdentityError",
   { operation: Schema.String, cause: Schema.Defect() },
@@ -146,17 +148,20 @@ const unresolved = (
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   const fail = (operation: string) => (cause: unknown) =>
     new ExecutionIdentityError({ operation, cause });
 
   // Same DDL as ControlStore (the shared fork contract), created idempotently.
-  yield* sql`
+  yield* BoardsDatabase.initialize(
+    controlSql`
     CREATE TABLE IF NOT EXISTS ardud_opencode_import (
       native_session_id TEXT PRIMARY KEY,
       thread_id         TEXT NOT NULL UNIQUE,
       imported_at       TEXT NOT NULL
     )
-  `.pipe(Effect.mapError(fail("ensure-opencode-import")));
+  `.pipe(Effect.mapError(fail("ensure-opencode-import"))),
+  );
 
   // Sqlite setup runs migrations first; index failures must not prevent startup.
   for (const ensureIndex of [
@@ -206,7 +211,7 @@ const make = Effect.gen(function* () {
     `.pipe(Effect.mapError(fail("read-thread-provider-rows")));
 
   const importedThreadsFor = (nativeId: string) =>
-    sql<{ readonly thread_id: string }>`
+    controlSql<{ readonly thread_id: string }>`
       SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
     `.pipe(
       Effect.map((rows) => rows.map((row) => row.thread_id)),
@@ -214,7 +219,7 @@ const make = Effect.gen(function* () {
     );
 
   const importedNativesFor = (threadId: string) =>
-    sql<{ readonly native_session_id: string }>`
+    controlSql<{ readonly native_session_id: string }>`
       SELECT native_session_id FROM ardud_opencode_import WHERE thread_id = ${threadId}
     `.pipe(
       Effect.map((rows) => rows.map((row) => row.native_session_id)),

@@ -40,6 +40,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -353,7 +354,7 @@ const decodeRow = Effect.fnUntraced(
 export const listDueTasks = Effect.fn("ScheduledTaskService.listDueTasks")(function* (
   now: DateTime.DateTime,
 ) {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   // ardud schedules: a dispatched run that is only being followed doesn't
   // block the next occurrence, same as upstream's dispatch-time success.
   yield* ensureRunFollowTables(sql);
@@ -395,7 +396,7 @@ export const listDueTasks = Effect.fn("ScheduledTaskService.listDueTasks")(funct
 export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
+    const sql = yield* BoardsDatabase.client;
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -988,6 +989,7 @@ export const layer = Layer.effect(
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
       const now = yield* localNow;
       const tasks = yield* listDueTasks(now).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
       const due = tasks.flatMap((task) =>
@@ -1013,25 +1015,26 @@ export const layer = Layer.effect(
 
     // Recover from a crash or hard shutdown mid-run: rows stuck in 'running'
     // would otherwise be skipped by the due-task filter forever.
-    yield* Effect.gen(function* () {
-      const rows = yield* selectAllRows();
-      // ardud schedules: a dispatched run that is being followed survives the
-      // restart; the follower settles it.
-      const followed = yield* runFollower.followedKeys;
-      const stuck = rows.filter(
-        (row) =>
-          row.last_run_status === "running" &&
-          !followed.has(followKey(row.task_id, row.last_run_at)),
-      );
-      if (stuck.length === 0) return;
-      const now = yield* localNow;
-      yield* Effect.forEach(
-        stuck,
-        (row) =>
-          Effect.gen(function* () {
-            const decoded = yield* Effect.result(decodeRow(row));
-            if (Result.isSuccess(decoded)) {
-              yield* sql`
+    const recovery = yield* Effect.cached(
+      Effect.gen(function* () {
+        const rows = yield* selectAllRows();
+        // ardud schedules: a dispatched run that is being followed survives the
+        // restart; the follower settles it.
+        const followed = yield* runFollower.followedKeys;
+        const stuck = rows.filter(
+          (row) =>
+            row.last_run_status === "running" &&
+            !followed.has(followKey(row.task_id, row.last_run_at)),
+        );
+        if (stuck.length === 0) return;
+        const now = yield* localNow;
+        yield* Effect.forEach(
+          stuck,
+          (row) =>
+            Effect.gen(function* () {
+              const decoded = yield* Effect.result(decodeRow(row));
+              if (Result.isSuccess(decoded)) {
+                yield* sql`
                 UPDATE scheduled_tasks
                 SET last_run_status = 'failed',
                     last_run_error = 'Run was interrupted by a server restart.',
@@ -1040,13 +1043,13 @@ export const layer = Layer.effect(
                     run_count = run_count + 1
                 WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
               `;
-              return;
-            }
-            yield* Effect.logWarning(
-              "Recovering undecodable schedule task row without rescheduling",
-              { taskId: row.task_id, cause: decoded.failure },
-            );
-            yield* sql`
+                return;
+              }
+              yield* Effect.logWarning(
+                "Recovering undecodable schedule task row without rescheduling",
+                { taskId: row.task_id, cause: decoded.failure },
+              );
+              yield* sql`
               UPDATE scheduled_tasks
               SET last_run_status = 'failed',
                   last_run_error = 'Run was interrupted by a server restart.',
@@ -1054,19 +1057,24 @@ export const layer = Layer.effect(
                   run_count = run_count + 1
               WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
             `;
-          }),
-        { concurrency: 1, discard: true },
-      );
-      yield* notifyChanged;
-    }).pipe(
-      Effect.catch((cause) =>
-        Effect.logWarning("Could not reset interrupted schedule task runs", { cause }),
+            }),
+          { concurrency: 1, discard: true },
+        );
+        yield* notifyChanged;
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not reset interrupted schedule task runs", { cause }),
+        ),
       ),
     );
+    yield* BoardsDatabase.onReady(recovery);
 
-    yield* scheduler.register("scheduled-tasks", runDueTasks());
+    yield* scheduler.register("scheduled-tasks", recovery.pipe(Effect.andThen(runDueTasks())));
     // ardud schedules: settle followed runs once their work is done.
-    yield* scheduler.register("scheduled-task-follows", runFollower.sweep);
+    yield* scheduler.register(
+      "scheduled-task-follows",
+      recovery.pipe(Effect.andThen(runFollower.sweep)),
+    );
 
     const list: ScheduledTaskService["Service"]["list"] = () =>
       listRows().pipe(
@@ -1819,18 +1827,18 @@ export const layer = Layer.effect(
     });
 
     return ScheduledTaskService.of({
-      list,
-      subscribeList,
-      upsert,
-      setEnabled,
-      migrateModelSelection,
-      delete: deleteTask,
-      deleteForThread,
-      runNow,
-      rotateWebhookToken,
-      listWebhookDeliveries,
-      getWebhookDelivery,
-      triggerWebhook,
+      list: () => recovery.pipe(Effect.andThen(list())),
+      subscribeList: () => Stream.unwrap(recovery.pipe(Effect.as(subscribeList()))),
+      upsert: (input) => recovery.pipe(Effect.andThen(upsert(input))),
+      setEnabled: (input) => recovery.pipe(Effect.andThen(setEnabled(input))),
+      migrateModelSelection: (input) => recovery.pipe(Effect.andThen(migrateModelSelection(input))),
+      delete: (input) => recovery.pipe(Effect.andThen(deleteTask(input))),
+      deleteForThread: (threadId) => recovery.pipe(Effect.andThen(deleteForThread(threadId))),
+      runNow: (input) => recovery.pipe(Effect.andThen(runNow(input))),
+      rotateWebhookToken: (input) => recovery.pipe(Effect.andThen(rotateWebhookToken(input))),
+      listWebhookDeliveries: (input) => recovery.pipe(Effect.andThen(listWebhookDeliveries(input))),
+      getWebhookDelivery: (input) => recovery.pipe(Effect.andThen(getWebhookDelivery(input))),
+      triggerWebhook: (input) => recovery.pipe(Effect.andThen(triggerWebhook(input))),
     });
   }),
 );

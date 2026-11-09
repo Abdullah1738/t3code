@@ -27,6 +27,31 @@ const otherIdentity = {
 };
 
 describe("applyShellStreamEvent", () => {
+  it("appends bounded initial pages without losing rows or advancing past replay", () => {
+    const first = {
+      ...v2ShellSnapshot,
+      snapshotSequence: 4,
+      threads: [{ ...v2ThreadShell, id: ThreadId.make("a") }],
+      page: { after: null, nextAfter: "a" },
+    };
+    const second = {
+      ...v2ShellSnapshot,
+      snapshotSequence: 7,
+      threads: [{ ...v2ThreadShell, id: ThreadId.make("b") }],
+      page: { after: "a", nextAfter: null },
+    };
+    const merged = mergeShellSnapshotProjects(first, second);
+    expect(merged.threads.map((thread) => thread.id)).toEqual(["a", "b"]);
+    expect(merged.snapshotSequence).toBe(4);
+    expect(
+      applyShellStreamEvent(merged, {
+        kind: "thread.removed",
+        sequence: 5,
+        location: "active",
+        threadId: ThreadId.make("a"),
+      }).threads.map((thread) => thread.id),
+    ).toEqual(["b"]);
+  });
   it("updates a thread in place without moving its siblings", () => {
     const threads = ["a", "b", "c"].map((id) => ({ ...v2ThreadShell, id: ThreadId.make(id) }));
     const updated = { ...threads[1]!, title: "Streaming" };

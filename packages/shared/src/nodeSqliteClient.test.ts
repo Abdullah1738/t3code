@@ -1753,3 +1753,106 @@ it.effect.each(["successful", "failed"] as const)(
     ),
   { skip: !supportsNoopCheckpoint },
 );
+
+// Lets the reader worker's own thread make progress; the test clock does not move it.
+const realPause = (ms: number) =>
+  // @effect-diagnostics-next-line globalTimers:off -- waits on a real worker thread, not on fibers.
+  Effect.promise(() => new Promise((resolve) => setTimeout(resolve, ms)));
+
+// CPU-bound reads of a known length: about 80 ns a row in SQLite.
+const slowRead = (sql: SqlClient.SqlClient, rows: number) =>
+  sql.unsafe<{ last: number }>(
+    `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ${rows}) SELECT max(x) AS last FROM c`,
+  );
+
+const withWatchedReader = <A, E>(
+  options: { readonly slow: number; readonly limit: number },
+  use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E, SqlClient.SqlClient>,
+  logger?: Layer.Layer<never>,
+) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-watchdog-" });
+    const filename = path.join(directory, "state.sqlite");
+    const client = SqliteClient.layer({
+      filename,
+      readerWorker: true,
+      readerSlowStatement: options.slow,
+      readerStatementLimit: options.limit,
+    });
+    return yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA journal_mode = WAL`;
+      yield* sql`CREATE TABLE entries(name TEXT NOT NULL)`;
+      yield* sql`INSERT INTO entries VALUES ('first')`;
+      return yield* use(sql);
+    }).pipe(Effect.provide(logger === undefined ? client : Layer.provide(client, logger)));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+it.effect(
+  "retires a reader stuck on one statement so later reads use a fresh worker",
+  () => {
+    const { warnings, layer: logger } = captureWarnings();
+    return withWatchedReader(
+      { slow: 300, limit: 1500 },
+      (sql) =>
+        Effect.gen(function* () {
+          yield* countEntries(sql).pipe(SqliteClient.readOnly);
+          const startedBefore = startedWorkers.length;
+          // About 30 s of work, far past the 1.5 s limit.
+          const stuck = yield* Effect.forkChild(
+            slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly, Effect.flip),
+          );
+          yield* realPause(100);
+          const queued = yield* Effect.forkChild(
+            countEntries(sql).pipe(SqliteClient.readOnly, Effect.flip),
+          );
+          const stuckError = yield* Fiber.join(stuck);
+          assert.include(String(stuckError.reason.cause), "Database reader retired");
+          assert.include(
+            String((yield* Fiber.join(queued)).reason.cause),
+            "Database reader retired",
+          );
+          // The next read starts a new worker instead of waiting for the old one.
+          assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+          assert.equal(startedWorkers.length, startedBefore + 1);
+          const slow = warnings.find((warning) =>
+            JSON.stringify(warning).includes("SQLite reader statement is slow"),
+          );
+          // The warning names the statement, so a stall can be traced to its query.
+          assert.include(JSON.stringify(slow), "WITH RECURSIVE c(x)");
+        }),
+      logger,
+    );
+  },
+  20_000,
+);
+
+it.effect(
+  "skips a queued read whose caller gave up before the worker reached it",
+  () =>
+    withWatchedReader({ slow: 60_000, limit: 120_000 }, (sql) =>
+      Effect.gen(function* () {
+        yield* countEntries(sql).pipe(SqliteClient.readOnly);
+        // About 1 s, then a queued read of about 30 s that is abandoned.
+        const first = yield* Effect.forkChild(
+          slowRead(sql, 12_000_000).pipe(SqliteClient.readOnly),
+        );
+        yield* realPause(100);
+        const abandoned = yield* Effect.forkChild(
+          slowRead(sql, 400_000_000).pipe(SqliteClient.readOnly),
+        );
+        yield* realPause(100);
+        yield* Fiber.interrupt(abandoned);
+        assert.equal((yield* Fiber.join(first))[0]?.last, 12_000_000);
+        // Had the worker run the abandoned read, this would wait about 30 s.
+        // @effect-diagnostics-next-line globalDateInEffect:off -- measures real time spent in the worker thread.
+        const started = Date.now();
+        assert.equal(yield* countEntries(sql).pipe(SqliteClient.readOnly), 1);
+        // @effect-diagnostics-next-line globalDateInEffect:off -- measures real time spent in the worker thread.
+        assert.isBelow(Date.now() - started, 5_000);
+      }),
+    ),
+  20_000,
+);

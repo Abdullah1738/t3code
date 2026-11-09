@@ -179,6 +179,13 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
     expect(result.thread.status).toBe("running");
     expect(result.thread.latestRunId).toBe(cancelledRunId);
     expect(result.thread.activeRunId).toBe(activeRunId);
+    // Native harnesses don't know their own thread id: omitting it reads the caller's thread.
+    const own = yield* service.readThread(makeScope(), {});
+    expect(own.thread.threadId).toBe(parentThreadId);
+    const anonymous = yield* service
+      .readThread({ ...makeScope(), thread: undefined }, {})
+      .pipe(Effect.flip);
+    expect(anonymous.code).toBe("invalid_request");
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 

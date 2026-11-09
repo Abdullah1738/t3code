@@ -326,7 +326,7 @@ it.effect("does not spin on due starts and wakes at the next control deadline", 
       ),
       Effect.scoped,
     );
-  }).pipe(Effect.provide(layerOutbox), Effect.provide(TestClock.layer())),
+  }).pipe(Effect.provide(Layer.merge(layerOutbox, TestClock.layer()))),
 );
 
 it.effect("completes five controls and five starts exactly once with four general workers and one control worker", () =>

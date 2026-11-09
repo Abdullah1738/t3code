@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,7 @@ type Call = { method: string; path: string; body?: any; auth: string | null };
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const stores: Store[] = [];
 const dirs: string[] = [];
+beforeEach(() => { setSystemTime(); });
 afterEach(async () => {
   await Promise.all(servers.splice(0).map(server => server.stop(true)));
   for (const store of stores.splice(0)) store.db.close();
@@ -123,8 +124,9 @@ function fakeControl() {
           return ok({ threadId: thread.threadId, messageId, delivery: "steered" });
         }
         if (!thread.messages.some(message => message.messageId === messageId)) {
-          const runId = `run:thread:${thread.threadId}:ordinal:${thread.runs.length + 1}`;
-          thread.runs.push({ runId, ordinal: thread.runs.length + 1, status: "running", requestedAt: now() });
+          const ordinal = Math.max(0, ...thread.runs.map(run => run.ordinal)) + 1;
+          const runId = `run:thread:${thread.threadId}:ordinal:${ordinal}`;
+          thread.runs.push({ runId, ordinal, status: "running", requestedAt: now() });
           // Robob records a relay as the owner's only when it verified the inbound.
           thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false,
             createdBy: body.inboundId ? "user" : "system", createdAt: now(), updatedAt: now() });
@@ -1341,7 +1343,9 @@ test("a background run's answer before two steered texts reaches the chat along 
 });
 
 
-test.each([0, 94, 95, 99, 100, 101, 250])("owned late-steer replies cross the real backend page boundary (%s narration records)", async count => {
+test.each([0, 94, 95, 99, 100, 101, 250].flatMap(count =>
+  ["available", "unavailable", "question", "permission"].map(child => ({ count, child })),
+))("owned late-steer replies cross the real backend page boundary ($count narration records, child $child)", async ({ count, child }) => {
   const start = Date.now();
   setSystemTime(start);
   const control = fakeControl();
@@ -1359,6 +1363,28 @@ test.each([0, 94, 95, 99, 100, 101, 250])("owned late-steer replies cross the re
   });
   setSystemTime(start + 2_000);
   control.reply(chat.id, "Second answer", "completed");
+  const asking = child === "question" || child === "permission";
+  const delegated: Thread = { ...thread, threadId: "page-child", parentThreadId: chat.id, runtimeMode: "approval-required",
+    runs: [{ runId: "child-run", ordinal: 1, status: "running" }], messages: [], pending: child === "question" ? [{
+      requestId: "page-question", kind: "question", requestKind: "user_input", canRespond: true,
+      questions: [{ id: "choice", header: "Pick", question: "Which option?", options: [{ label: "A" }, { label: "B" }] }],
+    }] : child === "permission" ? [{
+      requestId: "page-permission", kind: "approval", requestKind: "command", title: "bash", prompt: "git status", canRespond: true,
+    }] : [] };
+  control.threads.set(delegated.threadId, delegated);
+  if (child === "unavailable") backend.children = async () => { throw new Error("child listing unavailable"); };
+  if (asking) {
+    const messages = backend.messages.bind(backend);
+    let firstPage = true;
+    backend.messages = async (id, directory, options) => {
+      const records = await messages(id, directory, options);
+      if (firstPage && options?.until === promptId("second")) {
+        firstPage = false;
+        return records.filter(record => record.id === promptId("second"));
+      }
+      return records;
+    };
+  }
   const store = new Store(":memory:");
   stores.push(store);
   for (const id of ["second", "third"]) {
@@ -1373,8 +1399,177 @@ test.each([0, 94, 95, 99, 100, 101, 250])("owned late-steer replies cross the re
   });
   setSystemTime(start + 120_000);
   await router.tick();
+  if (asking) {
+    const requests = store.pendingOutbox().filter(op => op.id.startsWith("request:"));
+    expect(requests).toHaveLength(1);
+    expect(await router.beforeSend(requests[0]!)).toBe("send");
+  }
   await router.tick();
   expect(store.pendingOutbox().filter(op => op.kind === "conversation").map(op => op.text)).toEqual(["Third answer", "Second answer"]);
-  expect(store.get<object | null>("activeTurn")).toBeNull();
+  if (asking) {
+    expect(store.get<object | null>("activeTurn")).toMatchObject({ background: true, origin: "request" });
+    expect(store.pendingOutbox().filter(op => op.id.startsWith("request:"))).toHaveLength(1);
+  } else expect(store.get<object | null>("activeTurn")).toBeNull();
   expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
+});
+
+
+function delegatedRouter() {
+  const control = fakeControl();
+  const backend = control.backend();
+  const store = new Store(":memory:");
+  stores.push(store);
+  const router = new Router(store, backend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/private/test/skill.md",
+    alertSkillPath: "/private/test/alert.md", alertSocketPath: "/private/test/telegram.sock", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0,
+  });
+  return { control, backend, store, router };
+}
+
+test.each([false, true])("a completed parent replies before its delegated child, even with older busy work (%s)", async olderBusy => {
+  const { control, backend, store, router } = delegatedRouter();
+  store.acceptInbound("parent-76", { id: "parent-76", text: "Did it go through?", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string; generation: number }>("route")!;
+  const parent = control.threads.get(route.id)!;
+  parent.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  const run = parent.runs.at(-1)!;
+  run.runId = `run:thread:${route.id}:ordinal:76`;
+  run.ordinal = 76;
+  parent.messages[0]!.runId = run.runId;
+  if (olderBusy) parent.runs.unshift({ runId: `run:thread:${route.id}:ordinal:75`, ordinal: 75, status: "running" });
+  const child = { ...parent, threadId: "delegated-child", parentThreadId: route.id,
+    runs: [{ runId: "child-run", ordinal: 1, status: "running" }], messages: [], pending: [] };
+  control.threads.set(child.threadId, child);
+  control.reply(route.id, "It went through.", "completed");
+  expect(await backend.statuses()).toHaveProperty(child.threadId);
+  await router.tick();
+  const replies = () => store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text);
+  expect(replies()).toEqual(["It went through."]);
+  expect(inbounds(store)).toContainEqual({ id: "parent-76", state: "done" });
+  expect(store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: route.id, id: `idle:${run.runId}` });
+
+  child.runs[0]!.status = "completed";
+  if (olderBusy) parent.runs[0]!.status = "completed";
+  // Robob resumes the route for the delegated completion; its agent-authored
+  // user notice is hidden by recordsFromThread, leaving the reply after the watermark.
+  const wakeRun = { runId: `run:thread:${route.id}:ordinal:77`, ordinal: 77, status: "running" };
+  parent.runs.push(wakeRun);
+  const at = new Date(Date.now() + 1000).toISOString();
+  parent.messages.push({ messageId: "delegated-completion", runId: wakeRun.runId, role: "user", text: "Delegated task finished", streaming: false, createdBy: "agent", createdAt: at, updatedAt: at });
+  control.reply(route.id, "Child result delivered.", "completed");
+  for (let i = 0; i < 3; i++) await router.tick();
+  expect(replies()).toEqual(["It went through.", "Child result delivered."]);
+  expect(store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: route.id, id: `idle:${wakeRun.runId}` });
+  expect(store.get("activeTurn")).toBeNull();
+  expect(inbounds(store)).toEqual([{ id: "parent-76", state: "done" }]);
+});
+
+
+test.each([
+  { scope: "child", kind: "permission", unavailable: false, steps: 1 },
+  { scope: "child", kind: "question", unavailable: false, steps: 1 },
+  { scope: "child", kind: "permission", unavailable: true, steps: 1 },
+  { scope: "child", kind: "question", unavailable: true, steps: 1 },
+  { scope: "root", kind: "permission", unavailable: false, steps: 1 },
+  { scope: "root", kind: "question", unavailable: false, steps: 1 },
+  { scope: "child", kind: "question", unavailable: true, steps: 2 },
+  { scope: "root", kind: "question", unavailable: false, steps: 2 },
+])("requests survive an earlier parent completion without blocking its reply (%j)", async ({ scope, kind, unavailable, steps }) => {
+  const { control, backend, store, router } = delegatedRouter();
+  store.acceptInbound("request-parent", { id: "request-parent", text: "Start work", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  const parent = control.threads.get(route.id)!;
+  const run = parent.runs.at(-1)!;
+  parent.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  const request: PendingRequest = kind === "question" ? {
+    requestId: "work-question", kind: "question", requestKind: "user_input", canRespond: true, questions: [
+      { id: "choice", header: "Pick", question: "Which option?", options: [{ label: "A" }, { label: "B" }] },
+      ...steps === 2 ? [{ id: "second", header: "Next", question: "Which next?", options: [{ label: "A" }, { label: "B" }] }] : [],
+    ],
+  } : { requestId: "work-permission", kind: "approval", requestKind: "command", title: "bash", prompt: "git status", canRespond: true };
+  const asking: Thread = scope === "child" ? { ...parent, threadId: "asking-child", parentThreadId: route.id,
+    runs: [{ runId: "child-run", ordinal: 1, status: "running" }], messages: [], pending: [request] } : parent;
+  if (scope === "child") control.threads.set(asking.threadId, asking);
+  else {
+    parent.runs.push({ runId: `run:thread:${route.id}:ordinal:2`, ordinal: 2, status: "running" });
+    parent.pending = [request];
+  }
+  await router.tick();
+  expect(router.routerStatus().pending).toMatchObject([{ sessionId: asking.threadId, kind, state: "pending" }]);
+  expect(store.pendingOutbox().some(item => item.id.startsWith("request:"))).toBe(true);
+  expect(store.pendingOutbox().filter(item => item.kind === "conversation")).toEqual([]);
+  for (const item of store.pendingOutbox().filter(item => item.id.startsWith("request:"))) store.outboxState(item.id, "sent", `sent:${item.id}`);
+  if (steps === 2) {
+    store.acceptInbound("first-step", { id: "first-step", text: "1", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+    await router.tick();
+    for (const item of store.pendingOutbox().filter(item => item.id.startsWith("request:"))) store.outboxState(item.id, "sent", `sent:${item.id}`);
+  }
+  const children = backend.children.bind(backend);
+  if (unavailable) backend.children = async () => { throw new Error("child listing unavailable"); };
+  const at = new Date(Date.now() + 1000).toISOString();
+  parent.messages.push({ messageId: "parent-reply", runId: run.runId, role: "assistant", text: "Parent finished.", phase: "answer", streaming: false, createdBy: "agent", createdAt: at, updatedAt: at });
+  run.status = "completed";
+  await router.tick();
+  const replies = () => store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text);
+  expect(replies()).toEqual(["Parent finished."]);
+  expect(inbounds(store)).toContainEqual({ id: "request-parent", state: "done" });
+  expect(store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: route.id, id: `idle:${run.runId}` });
+  for (let i = 0; i < 3; i++) await router.tick();
+  const prompts = store.db.query<{ id: string }, []>("SELECT id FROM outbox WHERE id LIKE 'request:%'").all();
+  expect(prompts).toHaveLength(steps);
+  expect(router.routerStatus().pending).toMatchObject([{ sessionId: asking.threadId, state: "pending" }]);
+  store.acceptInbound("request-answer", { id: "request-answer", text: kind === "permission" ? "yes" : steps === 2 ? "2" : "1", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  expect(asking.pending).toEqual([]);
+  if (steps === 2) expect(control.calls.find(call => call.path.includes(`/threads/${asking.threadId}/requests/`))!.body.answers).toEqual({ choice: "A", second: "B" });
+  expect(control.calls.filter(call => call.path.includes(`/threads/${asking.threadId}/requests/`))).toHaveLength(1);
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(1);
+  backend.children = children;
+  if (scope === "child") {
+    asking.runs[0]!.status = "completed";
+    parent.runs.push({ runId: `run:thread:${route.id}:ordinal:2`, ordinal: 2, status: "running" });
+  }
+  const next = parent.runs.at(-1)!;
+  control.reply(route.id, "Follow-up finished.", "completed");
+  for (let i = 0; i < 4; i++) await router.tick();
+  expect(replies()).toEqual(["Parent finished.", "Follow-up finished."]);
+  expect(store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: route.id, id: `idle:${next.runId}` });
+  expect(store.get("activeTurn")).toBeNull();
+});
+
+
+test.each([false, true])("an older busy run finishing without a later wake frees the next inbound (%s)", async olderAnswer => {
+  const { control, backend, store, router } = delegatedRouter();
+  store.acceptInbound("parent-76", { id: "parent-76", text: "Did it go through?", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  const parent = control.threads.get(route.id)!;
+  parent.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  const run = parent.runs.at(-1)!;
+  run.runId = `run:thread:${route.id}:ordinal:76`;
+  run.ordinal = 76;
+  parent.messages[0]!.runId = run.runId;
+  const older = { runId: `run:thread:${route.id}:ordinal:75`, ordinal: 75, status: "running" };
+  parent.runs.unshift(older);
+  control.reply(route.id, "Parent finished.", "completed");
+  await router.tick();
+  expect(store.pendingOutbox().filter(item => item.kind === "conversation").map(item => item.text)).toEqual(["Parent finished."]);
+  expect(store.get("activeTurn")).toMatchObject({ background: true, messageId: `idle:${run.runId}` });
+  older.status = "completed";
+  if (olderAnswer) {
+    const at = new Date(Date.now() + 1000).toISOString();
+    parent.messages.push({ messageId: "older-answer", runId: older.runId, role: "assistant", text: "Older work finished.", phase: "answer", streaming: false, createdBy: "agent", createdAt: at, updatedAt: at });
+  }
+  expect(await backend.statuses()).toEqual({});
+  for (let i = 0; i < 5; i++) await router.tick();
+  expect(store.get("activeTurn")).toBeNull();
+  expect(store.get<{ sessionId: string; id: string }>("watermark")).toEqual({ sessionId: route.id, id: `idle:${run.runId}` });
+  store.acceptInbound("next", { id: "next", text: "Next question", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() } satisfies NormalizedInbound);
+  await router.tick();
+  expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Did it go through?", "Next question"]);
+  expect(inbounds(store)).toContainEqual({ id: "next", state: "done" });
 });
