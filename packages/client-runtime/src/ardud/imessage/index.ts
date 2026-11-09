@@ -26,12 +26,29 @@ export type {
   IMessageUserMessage,
   IMessageUserMessageInput,
 } from "./messageKinds.ts";
-export { buildIMessageChatRows, formatIMessageDuration, imessageAgentSummary } from "./chatRows.ts";
+export {
+  buildIMessageChatRows,
+  formatIMessageDuration,
+  IMESSAGE_ROW_LEVELS,
+  imessageAgentSummary,
+  imessageRowsAtLevel,
+} from "./chatRows.ts";
+export {
+  IMESSAGE_TOOL_MODE_MARKER,
+  imessageSendOf,
+  isIMessageSendTool,
+  shellCommands,
+} from "./sends.ts";
+export type { IMessageSend, IMessageSendSource, IMessageSendState } from "./sends.ts";
 export type {
   IMessageAgentOutcome,
   IMessageAgentStep,
   IMessageChatRow,
   IMessageChatRowOptions,
+  IMessageChatRowsResult,
+  IMessageRowLevel,
+  IMessageStepGroup,
+  IMessageTurn,
   IMessageTimelineEntry,
   IMessageTimelineMessage,
   IMessageTimelineWork,
