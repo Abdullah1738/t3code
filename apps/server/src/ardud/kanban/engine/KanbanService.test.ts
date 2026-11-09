@@ -13356,8 +13356,14 @@ it.live("a give-up decided before a restart posts its notice on replay and never
         { _tag: "md", text: "Ready" },
       ]);
       yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Decided lost" }]);
-      yield* eventually(routeOutcomes, (all) => all.length === 1);
-      // As if the process stopped right after deciding to give up.
+      // Once it is in slow retries, as if the process stopped right after deciding to give up.
+      yield* eventually(kanban.messages(channel.id), (all) =>
+        all.some((message) =>
+          message.blocks.some(
+            (block) => block._tag === "md" && block.text.includes("delivery pending"),
+          ),
+        ),
+      );
       yield* sql`UPDATE ardud_kanban_owner_routes SET noticed = 2`;
       return { evaluator, channel: channel.id };
     }).pipe(Effect.provide(layer));
