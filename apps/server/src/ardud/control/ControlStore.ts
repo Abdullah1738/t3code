@@ -70,7 +70,7 @@ export interface ControlStoreShape {
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /**
-   * Undeleted threads whose updated_at sorts after `sinceIso`, newest first, with the fields
+   * Undeleted threads whose updated_at sorts after `sinceIso`, newest first (ties by thread id, as the full listing orders them), with the fields
    * listings filter on, from ardud_v2_threads_updated_idx: no shell is built. A string range,
    * so callers widen it and compare `updatedAt` exactly.
    */
@@ -292,7 +292,7 @@ export const make = Effect.gen(function* () {
         json_extract(payload_json, '$.creationSource') AS creation_source
       FROM orchestration_v2_projection_threads
       WHERE deleted_at IS NULL AND updated_at > ${sinceIso}
-      ORDER BY updated_at DESC, thread_id DESC
+      ORDER BY updated_at DESC, thread_id ASC
     `.pipe(
       NodeSqliteClient.readOnly,
       Effect.map((rows) =>

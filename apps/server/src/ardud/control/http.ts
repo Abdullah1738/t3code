@@ -970,11 +970,7 @@ const makeRoutes = Effect.gen(function* () {
       }
       const needsState = active !== undefined || states !== undefined;
       // Shells are re-read, so a thread that moved since the range read is filtered again.
-      let shells = (yield* shellsFor(
-        (needsState ? matched : matched.slice(0, limit)).map((row) => row.threadId),
-        location,
-      )).filter(
-        (shell) =>
+      const stillMatches = (shell: OrchestrationV2ThreadShell) =>
           DateTime.toEpochMillis(shell.updatedAt) > since &&
           (input.includeSubagents ||
             parentThreadId !== null ||
@@ -982,8 +978,25 @@ const makeRoutes = Effect.gen(function* () {
           (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
           (projectId === null || shell.projectId === projectId) &&
           (input.creationSources === undefined ||
-            input.creationSources.includes(shell.creationSource)),
-      );
+            input.creationSources.includes(shell.creationSource));
+      let shells: Array<OrchestrationV2ThreadShell> = [];
+      // Candidates archived, deleted or moved between the two reads drop out of the page and of
+      // total; the next candidates refill the page.
+      let dropped = 0;
+      let offset = 0;
+      while (offset < matched.length && (needsState || shells.length < limit)) {
+        const batch = matched.slice(
+          offset,
+          needsState ? matched.length : offset + limit - shells.length,
+        );
+        offset += batch.length;
+        const loaded = (yield* shellsFor(
+          batch.map((row) => row.threadId),
+          location,
+        )).filter(stillMatches);
+        dropped += batch.length - loaded.length;
+        shells.push(...loaded);
+      }
       if (active !== undefined) {
         shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
       }
@@ -997,7 +1010,7 @@ const makeRoutes = Effect.gen(function* () {
       const summaries = yield* summarize(needsState ? shells : shells.slice(0, limit));
       return json({
         ok: true,
-        total: needsState ? shells.length : matched.length,
+        total: needsState ? shells.length : matched.length - dropped,
         threads: summaries.slice(0, limit),
       });
     });

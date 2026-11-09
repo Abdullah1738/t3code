@@ -215,6 +215,8 @@ const snapshotFor = (
 const makeHarness = (
   buildCommit?: string,
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  // Shells deleted after their projection row was read: the row stays, the shell read is null.
+  vanished: ReadonlySet<string> = new Set(),
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -260,7 +262,9 @@ const makeHarness = (
         ),
       getThreadShell: (threadId) =>
         Effect.succeed(
-          [...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null,
+          vanished.has(threadId)
+            ? null
+            : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null),
         ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
@@ -356,8 +360,9 @@ const run = <A, E>(
   body: (h: Harness) => Effect.Effect<A, E>,
   buildCommit?: string,
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  vanished: ReadonlySet<string> = new Set(),
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells), body)).pipe(
+  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells, vanished), body)).pipe(
     Effect.provide(Sqlite.layerMemory),
   );
 
@@ -648,6 +653,64 @@ describe("control listings", () => {
         }),
       undefined,
       extra,
+    );
+  });
+
+  it.effect("orders /threads?updatedSince ties by thread id and refills vanished candidates", () => {
+    const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+    const tied = (id: string) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at,
+        lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null },
+      });
+    const since = Date.parse("2026-03-01T00:00:00.000Z");
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const page = (limit: number) =>
+            get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
+              Effect.map((response) => ({
+                total: response.body.total as number,
+                ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                  (thread) => thread.threadId,
+                ),
+              })),
+            );
+          // Equal timestamps keep the full listing's thread id order; tie-a vanished after
+          // the range read, so tie-b fills its place and total drops it.
+          assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
+          assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
+        }),
+      undefined,
+      [tied("tie-c"), tied("tie-a"), tied("tie-b")],
+      new Set(["tie-a"]),
+    );
+  });
+
+  it.effect("orders /threads?updatedSince ties by thread id like the full listing", () => {
+    const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+    const tied = (id: string) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at,
+        lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null },
+      });
+    const since = Date.parse("2026-03-01T00:00:00.000Z");
+    return run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get(`/threads?updatedSince=${since}&limit=2`);
+          assert.deepStrictEqual(
+            (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+              (thread) => thread.threadId,
+            ),
+            ["tie-a", "tie-b"],
+          );
+          assert.strictEqual(response.body.total, 3);
+        }),
+      undefined,
+      [tied("tie-c"), tied("tie-a"), tied("tie-b")],
     );
   });
 

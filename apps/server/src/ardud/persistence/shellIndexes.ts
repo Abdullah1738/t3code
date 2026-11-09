@@ -21,7 +21,7 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
   // and quietly reorder or replan unrelated reads.
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_threads_updated_idx
-    ON orchestration_v2_projection_threads(updated_at DESC, thread_id DESC)
+    ON orchestration_v2_projection_threads(updated_at DESC, thread_id ASC)
   `;
   // Only unfinished running turns need the second range scan.
   yield* sql`
