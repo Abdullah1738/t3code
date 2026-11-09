@@ -413,3 +413,42 @@ it.effect("a stale read-only operation reruns before any write or external side 
     assert.strictEqual(sent, 1);
   }),
 );
+
+it.effect.each([false, true])(
+  "compensation releases permits even with a stale snapshot: %s",
+  (stale) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let compensated = false;
+      const writer = locks.run(locks.access("board", Effect.void, true));
+      const result = yield* Effect.exit(
+        locks.run(
+          Effect.gen(function* () {
+            yield* locks.access("board", Effect.void);
+            if (stale)
+              yield* locks.outside(Effect.forkChild(writer).pipe(Effect.flatMap(Fiber.join)));
+          }).pipe(
+            Effect.ensuring(
+              locks.unlock.pipe(
+                Effect.andThen(
+                  Effect.forkChild(
+                    locks.run(
+                      locks.access(
+                        "board",
+                        Effect.sync(() => {
+                          compensated = true;
+                        }),
+                        true,
+                      ),
+                    ),
+                  ).pipe(Effect.flatMap(Fiber.join)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.isTrue(compensated);
+      assert.strictEqual(Exit.isFailure(result), stale);
+    }),
+);

@@ -246,6 +246,40 @@ describe("applyReviewResult", () => {
 });
 
 describe("planDispatch", () => {
+  it("skips attempted candidates without losing their blockers or occupied slots", () => {
+    const failed = card({ priority: 1 });
+    const blocked = card({ blockedBy: [failed.id] });
+    const next = card({ priority: 3 });
+    const attempted = new Set<string>([failed.id]);
+    expect(
+      planDispatch(
+        board,
+        [failed, blocked, next],
+        pools([[opus, 1]]),
+        new Map(),
+        () => 0,
+        attempted,
+      ),
+    ).toMatchObject([{ cardId: next.id }]);
+    const running = card({
+      stage: "working",
+      activeRole: "work",
+      activeThreadId: ThreadId.make("busy"),
+      activePool: poolKey(opus),
+    });
+    attempted.add(running.id);
+    expect(
+      planDispatch(
+        board,
+        [failed, running, next],
+        pools([[opus, 1]]),
+        new Map(),
+        () => 0,
+        attempted,
+      ),
+    ).toEqual([]);
+  });
+
   it("starts no card work or review while the board's setup runs", () => {
     const setupRunning: KanbanBoard = {
       ...board,

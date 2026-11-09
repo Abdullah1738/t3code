@@ -460,6 +460,7 @@ export function planDispatch(
   pools: ReadonlyArray<KanbanPool>,
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
+  attempted: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -477,6 +478,7 @@ export function planDispatch(
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const waiting = cards.filter(
     (card) =>
+      !attempted.has(card.id) &&
       (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&

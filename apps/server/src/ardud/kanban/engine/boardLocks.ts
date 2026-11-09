@@ -310,6 +310,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     run,
     access,
     outside,
+    // Compensation must run without permits even after the snapshot became stale.
+    unlock: Effect.flatMap(operation, (op) => (op ? release(op) : Effect.void)),
     launched: Effect.fn("KanbanBoardLocks.launched")(function* (
       id: string,
       cleanup: Effect.Effect<void>,
