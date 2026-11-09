@@ -537,6 +537,73 @@ const fileReplayFixture = Effect.gen(function* () {
   };
 });
 
+it.live("streams a synthetic large shell as bounded pages before synchronizing", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-shell-pages-" });
+    yield* Effect.gen(function* () {
+      const fixture = yield* fileReplayFixture;
+      const base = (yield* fixture.orchestrator.getThreadShell(fixture.threadId))!;
+      const rows = Array.from({ length: 1101 }, (_, index) => ({
+        ...base,
+        id: ThreadId.make(`thread:${String(index).padStart(5, "0")}`),
+        lastError: "x".repeat(16_000),
+      }));
+      const cursors: Array<string | undefined> = [];
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const events = yield* subscribeOrchestrationV2Shell({
+          requestCompletionMarker: true,
+          acceptShellPages: true,
+        }).pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+          Effect.provideService(ThreadManagement.ThreadManagementService, {
+            ...threads,
+            readShellSnapshot: (options) => {
+              cursors.push(options?.afterThreadId);
+              const selected = rows
+                .filter(
+                  (row) => options?.afterThreadId === undefined || row.id > options.afterThreadId,
+                )
+                .slice(0, options?.limit);
+              return Effect.succeed(
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 0,
+                  threads: selected,
+                  archivedThreads: [],
+                }),
+              );
+            },
+          }),
+        );
+        const pages = Array.from(events).filter(
+          (item): item is Extract<OrchestrationV2ShellStreamItem, { kind: "snapshot" }> =>
+            item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined,
+        );
+        assert.deepEqual(
+          pages.map((item) => item.snapshot.threads.length),
+          [500, 500, 101],
+        );
+        assert.deepEqual(
+          pages.flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        assert.isTrue(
+          pages.every((item) => Buffer.byteLength(JSON.stringify(item)) < 2 * 1024 * 1024),
+        );
+        assert.deepEqual(cursors, [undefined, rows[499]!.id, rows[999]!.id]);
+      }).pipe(Effect.provide(fixture.services));
+    }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live.each([false, true])(
   "valid file-DB thread replay bypasses a held writer (bounded=%s)",
   (acceptBoundedSnapshot) =>

@@ -339,11 +339,19 @@ describe("t3 pair", () => {
           expect(db.prepare("SELECT COUNT(*) AS n FROM auth_pairing_links").get()).toEqual({
             n: 2,
           });
-          expect(db.prepare("SELECT COUNT(*) AS n FROM ardud_mission_owner_grants").get()).toEqual({
-            n: 0,
-          });
         } finally {
           db.close();
+        }
+        const boards = new NodeSqlite.DatabaseSync(
+          NodePath.join(baseDir, "userdata", "boards.sqlite"),
+          { readOnly: true },
+        );
+        try {
+          expect(
+            boards.prepare("SELECT COUNT(*) AS n FROM ardud_mission_owner_grants").get(),
+          ).toEqual({ n: 0 });
+        } finally {
+          boards.close();
         }
       }),
     ).pipe(Effect.provide(NodeServices.layer)),

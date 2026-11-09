@@ -4,6 +4,7 @@ import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -11,6 +12,8 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
+import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
@@ -18,6 +21,12 @@ import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenanc
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as DatabaseStorage from "./DatabaseStorage.ts";
 import * as Sqlite from "./Sqlite.ts";
+
+// Long clock jumps below test daily compaction, not the 25ms archive loop.
+vi.mock("../ardud/persistence/HistoryArchive.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../ardud/persistence/HistoryArchive.ts")>()),
+  archiveHistoryPass: () => Effect.never,
+}));
 
 const freePages = Effect.map(
   Effect.flatMap(
@@ -44,7 +53,7 @@ const currentStatus = Effect.flatMap(DatabaseStorage.DatabaseStorage, (storage) 
   storage.status.pipe(Stream.take(1), Stream.runHead),
 );
 
-it.effect("a new database returns freed pages online without losing data", () =>
+it.effect("reclaims at most sixteen pages per pass without losing data", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const storage = yield* DatabaseStorage.DatabaseStorage;
@@ -54,10 +63,47 @@ it.effect("a new database returns freed pages online without losing data", () =>
     yield* sql`CREATE TABLE discarded (value BLOB)`;
     yield* sql`INSERT INTO discarded VALUES (zeroblob(1048576))`;
     yield* sql`DROP TABLE discarded`;
-    assert.isAbove(yield* freePages, 0);
-    yield* storage.reclaim;
-    assert.equal(yield* freePages, 0);
+    const before = yield* freePages;
+    assert.isAbove(before, 16);
+    const pass = yield* storage.reclaim.pipe(Effect.forkChild);
+    yield* TestClock.adjust("100 millis");
+    yield* Fiber.join(pass);
+    assert.equal(yield* freePages, before - 16);
     assert.deepEqual(yield* sql`SELECT value FROM retained`, [{ value: "keep" }]);
+  }).pipe(Effect.provide(storageLayer(testConfig))),
+);
+
+it.effect("stops reclamation after a slow page consumes the time budget", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const storage = yield* DatabaseStorage.DatabaseStorage;
+    yield* sql`CREATE TABLE discarded (value BLOB)`;
+    yield* sql`INSERT INTO discarded VALUES (zeroblob(1048576))`;
+    yield* sql`DROP TABLE discarded`;
+    const before = yield* freePages;
+    const started = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let vacuumStatements = 0;
+    const slowPage: Statement.Transformer = (statement) => {
+      if (!/PRAGMA incremental_vacuum/.test(statement.compile()[0]))
+        return Effect.succeed(statement);
+      vacuumStatements++;
+      return Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.as(statement),
+      );
+    };
+    const pass = yield* storage.reclaim.pipe(
+      Effect.provideService(Statement.CurrentTransformer, slowPage),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(started);
+    yield* TestClock.adjust("100 millis");
+    yield* Deferred.succeed(release, undefined);
+    yield* TestClock.adjust("2 millis");
+    yield* Fiber.join(pass);
+    assert.equal(vacuumStatements, 1);
+    assert.equal(yield* freePages, before - 1);
   }).pipe(Effect.provide(storageLayer(testConfig))),
 );
 
@@ -80,14 +126,15 @@ it.effect("publishes file accounting and the doctor command after each pass", ()
     // The next reclaim pass frees the dropped table and republishes.
     yield* sql`DROP TABLE discarded`;
     yield* TestClock.adjust("1 minute");
+    yield* TestClock.adjust("100 millis");
     const storage = yield* DatabaseStorage.DatabaseStorage;
     const after = yield* storage.status.pipe(
       Stream.filter((status) => status !== null && status.databaseBytes < before!.databaseBytes),
       Stream.runHead,
       Effect.map(Option.getOrThrow),
     );
-    assert.isAtMost(after!.databaseBytes, before!.databaseBytes - 1048576);
-    assert.equal(after!.reclaimableBytes, 0);
+    assert.isBelow(after!.databaseBytes, before!.databaseBytes);
+    assert.isAbove(after!.reclaimableBytes, 0);
   }).pipe(Effect.provide(storageLayer(testConfig))),
 );
 
@@ -119,8 +166,14 @@ const compactionLayer = (
     Layer.provide(
       Layer.succeed(ProjectionMaintenance.ProjectionMaintenanceV2, {
         compactEventStore: Effect.die("background compaction must be paced"),
-        compactEventStoreWith: ({ minPageIntervalMs }) => {
-          assert.equal(minPageIntervalMs, 25);
+        compactEventStoreWith: (options) => {
+          assert.deepEqual(options, {
+            minPageIntervalMs: 25,
+            minDeleteIntervalMs: 5,
+            maxPagesPerScan: 20,
+            maxDurationMs: 2_000,
+            maxDeletePayloadBytes: 64 * 1024,
+          });
           return compactEventStore;
         },
         verify: Effect.die("unexpected verification"),

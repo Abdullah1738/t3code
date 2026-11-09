@@ -2028,7 +2028,7 @@ describe("CodexAdapterV2 session initialize", () => {
         assert.equal(result.failure._tag, "ProviderAdapterEnsureThreadError");
         assert.propertyVal(result.failure.cause, "_tag", "ProviderAdapterProtocolError");
         assert.propertyVal(result.failure.cause, "detail", "Moved history could not be delivered.");
-          if (Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(result.failure.cause)) {
+        if (Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(result.failure.cause)) {
           assert.equal(
             result.failure.cause.cause instanceof CodexHistoryNotSentError,
             !injectExpected,
@@ -2899,9 +2899,14 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ],
       });
       let interruptSent = false;
+      const promptAccepted = yield* Deferred.make<void>();
       const harness = yield* makeCodexReplayHarness(
         transcript,
-        () => Effect.void,
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId
+            ? Deferred.succeed(promptAccepted, undefined)
+            : Effect.void,
         (method) =>
           Effect.sync(() => {
             if (method === "turn/interrupt") interruptSent = true;
@@ -2916,6 +2921,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           text: prompt,
         }),
       );
+      yield* Deferred.await(promptAccepted);
+      const acknowledged = harness.events.find(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+      );
+      assert.isTrue(
+        acknowledged?.type === "provider_turn.updated" &&
+          acknowledged.providerTurn.promptAcceptedAt !== undefined,
+      );
       const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
         driver: CodexAdapterV2.CODEX_DRIVER_KIND,
         nativeTurnId,
@@ -2929,6 +2944,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Fiber.join(interrupt);
       yield* harness.firstTerminal;
       assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+      const terminalTurn = harness.events.findLast(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+      );
+      assert.isTrue(
+        terminalTurn?.type === "provider_turn.updated" &&
+          terminalTurn.providerTurn.promptAcceptedAt !== undefined,
+      );
       assert.lengthOf(harness.terminalEvents(), 1);
       assert.isFalse(yield* harness.hasPendingBackgroundWork);
     }).pipe(
@@ -3015,6 +3039,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Fiber.join(interrupt);
       yield* harness.firstTerminal;
       assert.equal(harness.terminalEvents()[0]?.status, "failed");
+      const terminalTurn = harness.events.findLast(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+      );
+      assert.isTrue(
+        terminalTurn?.type === "provider_turn.updated" &&
+          terminalTurn.providerTurn.promptAcceptedAt !== undefined,
+      );
       assert.lengthOf(harness.terminalEvents(), 1);
       assert.isFalse(interruptSent, "A terminal native turn must not receive turn/interrupt");
       assert.isFalse(yield* harness.hasPendingBackgroundWork);
@@ -3277,6 +3310,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         );
         assert.equal(contextReport?.type, "provider_turn.updated");
         if (contextReport?.type === "provider_turn.updated") {
+          assert.isDefined(contextReport.providerTurn.promptAcceptedAt);
           assert.equal(
             contextReport.providerTurn.runAttemptId,
             RunAttemptId.make("async-question-attempt"),
@@ -3291,6 +3325,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         );
         assert.equal(completed?.type, "provider_turn.updated");
         if (completed?.type === "provider_turn.updated") {
+          assert.isDefined(completed.providerTurn.promptAcceptedAt);
           assert.deepEqual(completed.providerTurn.turnTokenUsage, {
             usageStatus: "complete",
             usageScope: "main_agent",

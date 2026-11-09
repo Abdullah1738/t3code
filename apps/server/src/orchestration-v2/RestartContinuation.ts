@@ -10,6 +10,11 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Option from "effect/Option";
+import * as ServerConfig from "../config.ts";
+import { preparedCutoverOwns } from "../ardud/harness-migrate/cutoverClaim.ts";
 import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
 
 import * as ServerSettings from "../serverSettings.ts";
@@ -212,6 +217,20 @@ export function restartContinuationRun(
 
 export const continueRestartedRun = Effect.fn("RestartContinuation.continueRestartedRun")(
   function* (input: { readonly threadId: ThreadId; readonly sourceRunId: RunId }) {
+    const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+    const fs = yield* Effect.serviceOption(FileSystem.FileSystem);
+    const path = yield* Effect.serviceOption(Path.Path);
+    if (
+      Option.isSome(config) &&
+      Option.isSome(fs) &&
+      Option.isSome(path) &&
+      (yield* preparedCutoverOwns(input.threadId, input.sourceRunId).pipe(
+        Effect.provideService(ServerConfig.ServerConfig, config.value),
+        Effect.provideService(FileSystem.FileSystem, fs.value),
+        Effect.provideService(Path.Path, path.value),
+      ))
+    )
+      return;
     const settings = yield* ServerSettings.ServerSettingsService;
     const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
     if (!enabled) return;
@@ -330,9 +349,10 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
           outcome: "updated",
           // ardud: the headline claims "stopped" only when the note itself says work was cancelled;
           // a checked-running, finished or unknown OpenCode child must not get that claim.
-          summary: note.settled && noteSaysCancelled
-            ? "T3 Code restarted and stopped background work"
-            : "T3 Code restarted and resumed this turn",
+          summary:
+            note.settled && noteSaysCancelled
+              ? "T3 Code restarted and stopped background work"
+              : "T3 Code restarted and resumed this turn",
           detail: text,
         },
         attachments: [],

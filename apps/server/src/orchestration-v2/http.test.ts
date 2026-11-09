@@ -30,6 +30,7 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { middleware as replyMiddleware } from "../ardud/http/replyMiddleware.ts";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import { ProjectEnrichmentService } from "../project/ProjectEnrichmentService.ts";
@@ -118,6 +119,18 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     );
     const eventSink = Context.get(services, EventSinkV2);
     yield* eventSink.write({
+      events: Array.from({ length: 505 }, (_, index) => {
+        const id = ThreadId.make(`paged-${String(index).padStart(4, "0")}`);
+        return {
+          id: EventId.make(`created-${id}`),
+          type: "thread.created" as const,
+          threadId: id,
+          occurredAt: now,
+          payload: { ...thread, id },
+        };
+      }),
+    });
+    yield* eventSink.write({
       events: [
         {
           id: EventId.make("create-source"),
@@ -155,7 +168,15 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       Layer.provide(Etag.layerWeak),
       Layer.provide(NodeServices.layer),
     );
-    const { handler, dispose } = HttpRouter.toWebHandler(routes, { disableLogger: true });
+    const { handler, dispose } = HttpRouter.toWebHandler(
+      routes.pipe(
+        Layer.provide(HttpRouter.middleware(replyMiddleware, { global: true })),
+        Layer.provide(HttpPlatform.layer),
+        Layer.provide(Etag.layerWeak),
+        Layer.provide(NodeServices.layer),
+      ),
+      { disableLogger: true },
+    );
     yield* Effect.addFinalizer(() => Effect.promise(dispose));
     const read = (threadId: ThreadId) =>
       Effect.promise(() =>
@@ -171,6 +192,40 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     expect(
       (yield* decodeTranscript(yield* Effect.promise(() => emptyResponse.json()))).items,
     ).toEqual([]);
+    const shellRequest = (after?: string) =>
+      Effect.promise(() =>
+        handler(
+          new Request(
+            `http://localhost/api/orchestration/shell?paged=true${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`,
+            { headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT } },
+          ),
+        ),
+      );
+    const firstShell = yield* shellRequest();
+    expect(firstShell.status).toBe(200);
+    const firstPage = (yield* Effect.promise(() => firstShell.json())) as {
+      threads: Array<{ id: string }>;
+      page: { nextAfter: string | null };
+    };
+    expect(firstPage.threads).toHaveLength(500);
+    expect(firstPage.page.nextAfter).toBe(firstPage.threads.at(-1)!.id);
+    const lastShell = yield* shellRequest(firstPage.page.nextAfter!);
+    const lastPage = (yield* Effect.promise(() => lastShell.json())) as typeof firstPage;
+    expect(lastPage.threads).toHaveLength(6);
+    expect(lastPage.page.nextAfter).toBeNull();
+    expect(
+      new Set([...firstPage.threads, ...lastPage.threads].map((thread) => thread.id)).size,
+    ).toBe(506);
+    const legacyShell = yield* Effect.promise(() =>
+      handler(
+        new Request("http://localhost/api/orchestration/shell", {
+          headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT },
+        }),
+      ),
+    );
+    const legacyData = (yield* Effect.promise(() => legacyShell.json())) as typeof firstPage;
+    expect(legacyData.threads).toHaveLength(506);
+    expect(legacyData.page).toBeUndefined();
     yield* eventSink.write({
       events: items.map((item) => ({
         id: EventId.make(`create-${item.id}`),
@@ -201,7 +256,7 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       );
     const boundaryOutput = "界" + "x".repeat(PROVIDER_SEND_TURN_MAX_FILE_BYTES - baseSize - 3);
     for (const [suffix, expectedStatus] of [
-      ["", 200],
+      ["", 413],
       ["x", 400],
     ] as const) {
       yield* eventSink.write({
@@ -220,6 +275,9 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       });
       const response = yield* read(thread.id);
       expect(response.status).toBe(expectedStatus);
+      if (expectedStatus === 413) {
+        expect(yield* Effect.promise(() => response.json())).toMatchObject({ error: "reply_too_large" });
+      }
       if (expectedStatus === 400) {
         const error = yield* Context.get(services, ThreadManagementService.ThreadManagementService)
           .getThreadTranscript(thread.id)

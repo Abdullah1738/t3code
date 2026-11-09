@@ -1733,27 +1733,31 @@ export const layerWithOptions = (
                   latest.loadedProviderThreadKeyByThread,
                 );
                 loadedProviderThreadKeyByThread.delete(input.threadId);
-                const idleThreadUnloads = new Map(latest.idleThreadUnloads);
-                idleThreadUnloads.delete(input.threadId);
                 const updated = new Map(current);
                 updated.set(key, {
                   ...latest,
                   loadedProviderThreadKeyByThread,
-                  idleThreadUnloads,
                 });
                 return [true, updated] as const;
               });
               if (!unloading) return "skipped" as const;
-              yield* unloadThread({ providerThread: pending.providerThread }).pipe(
+              const unloaded = yield* unloadThread({ providerThread: pending.providerThread }).pipe(
                 Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
+                Effect.as(true),
                 Effect.catchCause((cause) =>
                   Effect.logWarning("orchestration-v2.driver-session.idle-unload-failed", {
                     providerSessionId: input.providerSessionId,
                     threadId: input.threadId,
                     providerThreadId: pending.providerThread.id,
                     cause,
-                  }),
+                  }).pipe(Effect.as(false)),
                 ),
+              );
+              // Keep the generation and timer on failure so a transient request
+              // error cannot strand a loaded thread for the session's lifetime.
+              if (!unloaded) return "deferred" as const;
+              yield* updateIdleThreadUnload(input.providerSessionId, input.threadId, (current) =>
+                current?.generation === input.generation ? undefined : current,
               );
               return "unloaded" as const;
             }),
@@ -1837,6 +1841,75 @@ export const layerWithOptions = (
               modelFamily: normalizeModelMetricLabel(model),
             },
           });
+        const runTurn = (
+          input: ProviderAdapter.ProviderAdapterV2TurnInput,
+          start: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"],
+        ) =>
+          observeActivity(
+            providerSessionId,
+            ensureThreadAttached({
+              providerSessionId,
+              threadId: input.threadId,
+              providerInstanceId: runtime.instanceId,
+            }),
+          ).pipe(
+            // A start that fails or is stopped may never emit turn.terminal,
+            // so it clears its own turn or the session never goes idle.
+            Effect.andThen(
+              holdThreadLoaded({
+                providerSessionId,
+                threadId: input.threadId,
+                providerThread: input.providerThread,
+              }),
+            ),
+            Effect.andThen(
+              Effect.acquireUseRelease(
+                observeActivity(
+                  providerSessionId,
+                  markBusy(
+                    providerSessionId,
+                    busyTurnKey(input.providerThread.id, input.runOrdinal),
+                    input.threadId,
+                  ),
+                ),
+                () =>
+                  Effect.gen(function* () {
+                    const entry = (yield* Ref.get(sessions)).get(sessionKey(providerSessionId));
+                    // Preparation may outlast the unload timer armed by resume.
+                    // Busy protection is already held, so reload before sending.
+                    if (
+                      entry?.supportsMultipleProviderThreads &&
+                      input.providerThread.nativeThreadRef !== null &&
+                      !entry.loadedProviderThreadKeyByThread.has(input.threadId)
+                    ) {
+                      const providerThread = yield* runtime.resumeThread({
+                        providerThread: input.providerThread,
+                        threadId: input.threadId,
+                        modelSelection: input.modelSelection,
+                        runtimePolicy: input.runtimePolicy,
+                      });
+                      yield* markProviderThreadLoaded({
+                        providerSessionId,
+                        threadId: input.threadId,
+                        providerThreadKey: providerThreadLoadKey({
+                          providerThread,
+                          modelSelection: input.modelSelection,
+                          runtimePolicy: input.runtimePolicy,
+                        }),
+                      });
+                    }
+                    yield* start(input).pipe(turnMetrics("send", input.modelSelection.model));
+                  }),
+                (_, exit) =>
+                  Exit.isFailure(exit)
+                    ? observeActivity(
+                        providerSessionId,
+                        markIdle(providerSessionId, input.providerThread.id, input.runOrdinal),
+                      )
+                    : Effect.void,
+              ),
+            ),
+          );
         return {
           ...runtime,
           get providerSession() {
@@ -1866,6 +1939,13 @@ export const layerWithOptions = (
                     runtimePolicy: input.runtimePolicy,
                   }),
                 }),
+              ),
+              Effect.tap((providerThread) =>
+                holdThreadLoaded({
+                  providerSessionId,
+                  threadId: input.threadId,
+                  providerThread,
+                }).pipe(Effect.andThen(scheduleThreadUnload(providerSessionId, providerThread.id))),
               ),
             ),
           resumeThread: (input) => {
@@ -1916,6 +1996,13 @@ export const layerWithOptions = (
                   }),
                 }),
               ),
+              Effect.tap((providerThread) =>
+                holdThreadLoaded({
+                  providerSessionId,
+                  threadId,
+                  providerThread,
+                }).pipe(Effect.andThen(scheduleThreadUnload(providerSessionId, providerThread.id))),
+              ),
             );
           },
           forkThread: (input) =>
@@ -1943,47 +2030,21 @@ export const layerWithOptions = (
                   }),
                 }),
               ),
-            ),
-          startTurn: (input) =>
-            observeActivity(
-              providerSessionId,
-              ensureThreadAttached({
-                providerSessionId,
-                threadId: input.threadId,
-                providerInstanceId: runtime.instanceId,
-              }),
-            ).pipe(
-              // A start that fails or is stopped may never emit turn.terminal,
-              // so it clears its own turn or the session never goes idle.
-              Effect.andThen(
+              Effect.tap((providerThread) =>
                 holdThreadLoaded({
                   providerSessionId,
-                  threadId: input.threadId,
-                  providerThread: input.providerThread,
-                }),
-              ),
-              Effect.andThen(
-                Effect.acquireUseRelease(
-                  observeActivity(
-                    providerSessionId,
-                    markBusy(
-                      providerSessionId,
-                      busyTurnKey(input.providerThread.id, input.runOrdinal),
-                      input.threadId,
-                    ),
-                  ),
-                  () =>
-                    runtime.startTurn(input).pipe(turnMetrics("send", input.modelSelection.model)),
-                  (_, exit) =>
-                    Exit.isFailure(exit)
-                      ? observeActivity(
-                          providerSessionId,
-                          markIdle(providerSessionId, input.providerThread.id, input.runOrdinal),
-                        )
-                      : Effect.void,
-                ),
+                  threadId: input.targetThreadId,
+                  providerThread,
+                }).pipe(Effect.andThen(scheduleThreadUnload(providerSessionId, providerThread.id))),
               ),
             ),
+          startTurn: (input) => runTurn(input, runtime.startTurn),
+          ...(runtime.compactThread === undefined
+            ? {}
+            : {
+                compactThread: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                  runTurn(input, runtime.compactThread!),
+              }),
           steerTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
               Effect.andThen(runtime.steerTurn(input).pipe(turnMetrics("steer"))),
@@ -2447,7 +2508,7 @@ export const layerWithOptions = (
             if (entry === undefined) {
               return Option.none<ProviderAdapter.ProviderAdapterV2SessionRuntime>();
             }
-            yield* touchActivity(providerSessionId);
+            // Inspection (including background-work polling) is not provider activity.
             return Option.some(entry.exposedRuntime);
           },
           (effect, providerSessionId) =>

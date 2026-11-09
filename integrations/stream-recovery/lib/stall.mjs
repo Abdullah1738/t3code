@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 import { hhmm, isNestedThreadId, toMs, truncate } from "./detect.mjs";
 import { neverSettles } from "./codemode-never-settles.mjs";
+import { openCodeSession } from './harness.mjs';
 
 // Opus (our slowest silent thinker) may sit silent up to its 15 min
 // chunkTimeout, so a model wait counts as dead after twice that. Providers
@@ -104,8 +105,8 @@ export const GHOST_LABEL = "Robob showed the turn running, but its OpenCode sess
 // threads: control-API live threads; active: Set of OpenCode active session ids.
 export function ghostCandidates(threads, active) {
   return threads.filter((t) =>
-    t.state === "running" && Boolean(t.activeRunId) && typeof t.nativeSessionId === "string"
-    && t.nativeSessionId.startsWith("ses_") && !t.pendingRequest && !t.archived && !active.has(t.nativeSessionId));
+    t.state === "running" && Boolean(t.activeRunId) && openCodeSession(t) !== null
+    && openCodeSession(t) === t.nativeSessionId && !t.pendingRequest && !t.archived && !active.has(t.nativeSessionId));
 }
 
 // Keeps `since` while the same run and session stay a candidate.
@@ -144,6 +145,9 @@ export function planStall(input) {
     return { action: "opencode", note: false, reason: "subagent session" };
   }
   if (!thread) return { action: "opencode", note: false, reason: "no Robob thread for this session" };
+  if (openCodeSession(thread) !== ses) {
+    return { action: 'opencode', note: false, reason: 'old session of a thread that moved on' };
+  }
   // The thread moved on to a newer session; interrupting Robob would stop that
   // one instead.
   if (thread.nativeSessionId && thread.nativeSessionId !== ses) {

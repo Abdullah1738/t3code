@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { controlConfig } from '../lib/io.mjs';
+import { controlConfig, harnessCutoverStatus, interruptThread } from '../lib/io.mjs';
 
 const home = () => {
   const dir = mkdtempSync(join(tmpdir(), 'stream-recovery-control-'));
@@ -53,4 +53,29 @@ test('a malformed token file fails loudly, and env alone needs no file', () => {
   const loose = write(join(dir, '.robob/ardud-control.json'), { token: 'shared' }, 0o644);
   assert.ok(loose);
   assert.deepEqual(controlConfig({ T3_CONTROL_URL: 'http://h:1', T3_CONTROL_TOKEN: 'env' }, dir), { url: 'http://h:1', token: 'env' });
+});
+
+test('status reads authenticate and guarded interrupts forward the observed source run', async (t) => {
+  const before = { url: process.env.T3_CONTROL_URL, token: process.env.T3_CONTROL_TOKEN };
+  process.env.T3_CONTROL_URL = 'http://fixture';
+  process.env.T3_CONTROL_TOKEN = 'fixture-token';
+  t.after(() => {
+    if (before.url === undefined) delete process.env.T3_CONTROL_URL;
+    else process.env.T3_CONTROL_URL = before.url;
+    if (before.token === undefined) delete process.env.T3_CONTROL_TOKEN;
+    else process.env.T3_CONTROL_TOKEN = before.token;
+  });
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push({ url, init });
+    return Response.json({ ok: true, cutover: { active: true, completed: false, claimedThreadIds: ['t'],
+      claimedRuns: [{ threadId: 't', runId: 'old' }] } });
+  });
+  assert.equal((await harnessCutoverStatus()).claimedRuns[0].runId, 'old');
+  assert.equal(calls[0].url, 'http://fixture/api/ardud/control/harness-cutover/status');
+  assert.equal(calls[0].init.headers.authorization, 'Bearer fixture-token');
+  await interruptThread('t', { expectedRunId: 'old', clientRequestId: 'receipt' });
+  assert.deepEqual(JSON.parse(calls[1].init.body), { expectedRunId: 'old', clientRequestId: 'receipt' });
+  t.mock.method(globalThis, 'fetch', async () => new Response('<html>fallback</html>'));
+  await assert.rejects(() => harnessCutoverStatus(), /invalid harness-cutover status/);
 });

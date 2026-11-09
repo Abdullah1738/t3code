@@ -12,6 +12,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -41,6 +42,8 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
+import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -191,6 +194,81 @@ it("normalizes empty successful notification responses to accepted", () => {
   );
   expect(resultResponse.status).toBe(200);
 });
+
+it.effect("returns a clear bounded tool error before serializing a giant result", () => {
+  const BigToolkit = Toolkit.make(
+    Tool.make("big_board", {
+      description: "Synthetic board.",
+      success: Schema.Struct({
+        cards: Schema.Array(Schema.Struct({ description: Schema.String })),
+      }),
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
+  );
+  const layer = McpHttpServer.toolkitRegistration(
+    BigToolkit,
+    McpToolAccess.toLayer(BigToolkit, {
+      big_board: McpToolAccess.reads(() =>
+        Effect.succeed({ cards: Array(40).fill({ description: "x".repeat(1024 * 1024) }) }),
+      ),
+    }),
+  ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+  return callTool("big_board", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result)).toContain("16 MiB limit");
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(1024);
+      }),
+    ),
+    Effect.provide(layer),
+  );
+});
+
+it.effect("board tool readiness waits leave the shared reply builders available", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let waiting = 0;
+    const ready = Effect.suspend(() => {
+      waiting++;
+      return (waiting === 2 ? Deferred.succeed(entered, undefined) : Effect.void).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
+    });
+    const ReadToolkit = Toolkit.make(
+      Tool.make("board_get", {
+        description: "Read a synthetic board.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      ReadToolkit,
+      McpToolAccess.toLayer(ReadToolkit, {
+        board_get: McpToolAccess.reads(() => Effect.succeed({ ready: true })),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(ReplyBuilders.layer),
+      Layer.provide(Layer.mock(KanbanService)({ ready, attachmentPath: () => null })),
+    );
+    yield* Effect.gen(function* () {
+      const requests = yield* Effect.forEach([1, 2], () =>
+        callTool("board_get", {}).pipe(Effect.forkScoped),
+      );
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      expect(yield* builders.takeIfAvailable(2)).toBe(true);
+      yield* builders.release(2);
+      yield* ReplyBuilders.bounded(Effect.void);
+      yield* Deferred.succeed(release, undefined);
+      for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped),
+);
 
 it.effect.each([{}, { includeImage: false }])(
   "returns bounded structural preview snapshot failures %#",

@@ -1116,3 +1116,74 @@ it.effect("marks fork descendants unreadable when their source is missing or cor
     );
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("finds unreadable turn items in every history store, page by page", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const coldThread = yield* createThread("cold-unreadable");
+    const baseThread = yield* createThread("base-unreadable");
+    const hiddenThread = yield* createThread("base-hidden-by-hot");
+    const now = yield* DateTime.now;
+    // A readable payload to copy into the archive stores.
+    yield* projections.apply({
+      id: EventId.make("event:unreadable-stores:template"),
+      type: "turn-item.updated",
+      threadId: hiddenThread,
+      occurredAt: now,
+      payload: {
+        id: TurnItemId.make("item:hidden"),
+        threadId: hiddenThread,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        type: "dynamic_tool",
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        toolName: "template",
+        input: null,
+        output: null,
+      },
+    });
+    const [template] = yield* sql<{ readonly payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE turn_item_id = 'item:hidden'
+    `;
+    assert.isDefined(template);
+    const insert = (
+      store: string,
+      id: string,
+      threadId: string,
+      ordinal: number,
+      payload: string,
+    ) =>
+      sql.unsafe(
+        `INSERT INTO ${store} (turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json)
+         VALUES (?, ?, NULL, ?, 'dynamic_tool', 'completed', '2026-01-01', ?)`,
+        [id, threadId, ordinal, payload],
+      );
+    const base = "ardud_base.orchestration_v2_projection_turn_items";
+    const cold = "ardud_archive.ardud_turn_items";
+    // Readable rows span several 500-row pages in both archive stores.
+    for (let index = 0; index < 1_200; index += 1) {
+      yield* insert(base, `base:${index}`, baseThread, index + 10, template.payload_json);
+      yield* insert(cold, `cold:${index}`, coldThread, index + 10, template.payload_json);
+    }
+    // A corrupt base copy of an item main still holds is not read.
+    yield* insert(base, "item:hidden", hiddenThread, 1, "{broken");
+    assert.deepEqual(yield* projections.getUnreadableThreadIds(), []);
+
+    yield* insert(cold, "cold:broken", coldThread, 5_000, "{broken");
+    yield* insert(base, "base:broken", baseThread, 5_000, "{broken");
+    assert.deepEqual(
+      new Set(yield* projections.getUnreadableThreadIds()),
+      new Set([coldThread, baseThread]),
+    );
+  }).pipe(Effect.provide(layerTest)),
+);

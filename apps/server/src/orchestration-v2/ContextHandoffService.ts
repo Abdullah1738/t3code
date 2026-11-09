@@ -48,6 +48,7 @@ export interface ContextHandoffServiceV2Shape {
     readonly toProviderThreadId: ProviderThreadId;
     readonly toProviderInstanceId: ProviderInstanceId;
     readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
+    readonly promptOnly?: boolean;
     readonly createdAt: DateTime.Utc;
   }) => Effect.Effect<OrchestrationV2ContextHandoff, ContextHandoffServiceV2Error>;
   readonly prepare: (input: {
@@ -79,6 +80,7 @@ export interface ContextHandoffServiceV2Shape {
     readonly toProviderInstanceId: ProviderInstanceId;
     readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
     readonly runs?: ReadonlyArray<OrchestrationV2Run>;
+    readonly promptOnly?: boolean;
     readonly strategy: Extract<
       OrchestrationV2ContextHandoff["strategy"],
       "delta_since_target_last_seen" | "full_thread_summary"
@@ -240,6 +242,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         readonly toProviderThreadId: ProviderThreadId;
         readonly toProviderInstanceId: ProviderInstanceId;
         readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
+        readonly promptOnly?: boolean;
         readonly createdAt: DateTime.Utc;
       }) {
         const handoffId = yield* idAllocator.allocate
@@ -281,6 +284,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           status: "ready",
           summaryMessageId: null,
           summaryText: makeLegacyImportSummary(input.items),
+          ...(input.promptOnly ? { deliveryMode: "prompt" as const } : {}),
           history: {
             messages: selected.messages,
             coverage,
@@ -419,6 +423,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       readonly toProviderInstanceId: ProviderInstanceId;
       readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
       readonly runs?: ReadonlyArray<OrchestrationV2Run>;
+      readonly promptOnly?: boolean;
       readonly strategy: Extract<
         OrchestrationV2ContextHandoff["strategy"],
         "delta_since_target_last_seen" | "full_thread_summary"
@@ -445,7 +450,14 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           ),
         );
       const runStatuses = new Map(input.runs?.map((run) => [run.id, run.status]));
-      const coverage = handoffCoverage(input);
+      const coverage = [
+        ...(input.promptOnly
+          ? [
+              "Recent conversation excerpt only, not a complete session migration. Older runs and excess items are intentionally omitted; individual messages may be clipped.",
+            ]
+          : []),
+        handoffCoverage(input),
+      ].join("\n");
       const selected = selectHistory({
         messages: input.items.flatMap((item) => {
           const message = historicalMessage(item);
@@ -473,6 +485,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         status: "ready",
         summaryMessageId: null,
         summaryText: renderHistory(selected.messages, selected.context),
+        ...(input.promptOnly ? { deliveryMode: "prompt" as const } : {}),
         history: {
           messages: selected.messages,
           coverage,
