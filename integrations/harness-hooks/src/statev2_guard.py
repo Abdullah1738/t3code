@@ -203,10 +203,24 @@ def _python_touches_live(source, directory):
 def _source_hit(source, directory, python=False):
     if python:
         return _python_touches_live(source, directory)
+    if source_touches_live(source) or _relative_source_live(source, directory):
+        return True
+    def isolated_literal(match):
+        value = match[2]
+        # A direct absolute argument stays fixed even if the program changes cwd.
+        # Receivers, assignments and helper-call operands may be transformed.
+        if (re.search(r"(?:statev2\.sqlite|opencode\.db)(?:-(?:wal|shm|journal))?$", value) and
+                Path(value).is_absolute() and
+                re.search(r"\b(?:readFile(?:Sync)?|open(?:Sync)?|createReadStream)\s*\(\s*$", source[:match.start()]) and
+                re.match(r"\s*[,)]", source[match.end():]) and
+                _literal_path(value, directory) is not None and
+                not _direct_read(["cat", value], directory)):
+            return "''"
+        return match[0]
+    source = re.sub(r"(['\"])([^'\"\\\n]+)\1", isolated_literal, source)
     # Other languages have no text-only AST exemption. Preserve their existing
     # conservative treatment of paths split across variables or join calls.
-    return bool(source_touches_live(source) or _relative_source_live(source, directory) or
-                "statev2.sqlite" in source and re.search(r"\.robob|robob-data", source) or
+    return bool("statev2.sqlite" in source and re.search(r"\.robob|robob-data", source) or
                 "opencode.db" in source and re.search(r"\.local/share|opencode-data|[\"']opencode[\"']", source))
 
 

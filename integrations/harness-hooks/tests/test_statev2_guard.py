@@ -326,6 +326,63 @@ class GuardTests(unittest.TestCase):
                 with self.subTest(cwd=cwd, source=source):
                     self.assertEqual(guard.classify(interpreter + shlex.quote(source), cwd), READ)
 
+    def test_node_isolated_paths_inside_robob_workspaces(self):
+        workspace = "/Users/x/.robob/worktrees/project/review"
+        for basename in ("statev2.sqlite", "opencode.db"):
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                for folder in (".t3/userdata", "tmp/fixture/userdata"):
+                    target = f"{workspace}/{folder}/{basename}{suffix}"
+                    for quote in ("'", '"'):
+                        with self.subTest(target=target, quote=quote):
+                            command = "node -e " + shlex.quote(f"require('fs').readFileSync({quote}{target}{quote})")
+                            self.assertIsNone(guard.classify(command, workspace))
+        live = self.write("home/.robob/userdata/statev2.sqlite", "fixture")
+        alias = self.root / "copy/userdata/statev2.sqlite"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(live)
+        opencode = self.write("home/.local/share/opencode/opencode.db", "fixture")
+        oc_alias = self.root / "copy/opencode.db"
+        oc_alias.symlink_to(opencode)
+        rows = [
+            (f"require('fs').readFileSync({LIVE!r})", workspace),
+            ("require('fs').readFileSync('../userdata/statev2.sqlite')", "/Users/x/.robob/worktrees"),
+            ("require('fs').readFileSync('opencode.db')", "/Users/x/.local/share/opencode"),
+            ("process.chdir('/Users/x/.robob'); require('fs').readFileSync('userdata/statev2.sqlite')", workspace),
+            ("process.chdir('/Users/x/.local/share'); require('fs').readFileSync('opencode/opencode.db')", workspace),
+            (f"require('fs').readFileSync({str(alias)!r})", workspace),
+            (f"require('fs').readFileSync({str(oc_alias)!r})", workspace),
+            ("require('fs').readFileSync(path.join(os.homedir(), '.robob', 'userdata', 'statev2.sqlite'))", workspace),
+            ("require('fs').readFileSync(path.join(os.homedir(), '.robob', 'userdata/statev2.sqlite'))", workspace),
+            ("require('fs').readFileSync(path.join(os.homedir(), '.local/share/opencode', 'opencode.db'))", workspace),
+            (f"require('fs').readFileSync(path.join('{workspace}/tmp/fixture/userdata/statev2.sqlite', '../../../../../../../userdata/statev2.sqlite'))", workspace),
+            ("const p = root + '/userdata/statev2.sqlite'; const root = '.robob'; require('fs').readFileSync(p)", workspace),
+        ]
+        with patch.object(Path, "open", side_effect=AssertionError("must not open DB")):
+            for source, cwd in rows:
+                with self.subTest(source=source, cwd=cwd):
+                    self.assertEqual(guard.classify("node -e " + shlex.quote(source), cwd), READ)
+        paths = [
+            (f"{workspace}/.t3/userdata/statev2.sqlite", "/worktrees/project/review/.t3"),
+            ("/Users/x/.local/share/fixture/opencode/opencode.db", "/fixture"),
+        ]
+        for target, removed in paths:
+            for reader in ("readFileSync", "readFile", "openSync", "open", "createReadStream"):
+                with self.subTest(target=target, reader=reader):
+                    self.assertIsNone(guard.classify("node -e " + shlex.quote(f"require('fs').{reader}({target!r})"), workspace))
+            for expression in (
+                f"{target!r}.replace({removed!r}, '')",
+                f"{target!r} .replaceAll({removed!r}, '')",
+                f"{target!r} /* path transform */ .replace({removed!r}, '')",
+                f"{target!r}['replace']({removed!r}, '')",
+                f"{target!r}.split({removed!r}).join('')",
+                f"normalize({target!r})",
+                f"{target!r} + '/../../userdata/statev2.sqlite'",
+            ):
+                with self.subTest(expression=expression):
+                    self.assertEqual(guard.classify("node -e " + shlex.quote(f"require('fs').readFileSync({expression})"), workspace), READ)
+            bound = f"const p={target!r}; require('fs').readFileSync(p.replace({removed!r}, ''))"
+            self.assertEqual(guard.classify("node -e " + shlex.quote(bound), workspace), READ)
+
     def test_dynamic_python_imports_cannot_get_text_only_exemption(self):
         bodies = [
             f'__import__("sqlite3").connect({LIVE!r})',
@@ -532,6 +589,47 @@ class GuardTests(unittest.TestCase):
                 twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
                 self.assertNotEqual(twin, command)
                 self.assertEqual(guard.classify(twin, cwd), READ)
+
+    def test_new_inline_and_absolute_reporters(self):
+        fixtures = Path(__file__).with_name("fixtures")
+        manifest = json.loads((fixtures / "manifest.json").read_text())
+        for name in ("crpko-2147-inline-test-edit.sh", "robob-712-heredoc-absolute-no-workdir.sh"):
+            command = (fixtures / name).read_text()
+            info = manifest[name]
+            self.assertIsNone(guard.classify(command, info["cwd"]))
+            if info["card"] == 2147:
+                twin = command.replace("\nPY", f"\nopen({LIVE!r}).read()\nPY", 1)
+                expected = READ
+            else:
+                header, rest = command.split("\n", 1)
+                _, invoke = rest.rsplit("\nPY\n", 1)
+                twin = header + f"\nopen({LIVE!r}).read()\nPY\n" + invoke
+                expected = SCRIPT
+                self.assertIsNone(info["workdir"])
+                for cwd in (info["cwd"], None):
+                    self.assertIsNone(guard.classify(command, cwd))
+                    self.assertEqual(guard.classify(twin, cwd), SCRIPT)
+            self.assertNotEqual(twin, command)
+            self.assertEqual(guard.classify(twin, info["cwd"]), expected)
+            for harness, tool, field in (("codex", "exec_command", "cmd"), ("codex", "Bash", "command"), ("claude", "Bash", "command")):
+                for cmd, rule in ((command, None), (twin, expected)):
+                    event = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {field: cmd}, "cwd": info["cwd"]}
+                    with self.subTest(fixture=name, harness=harness, tool=tool, rule=rule), patch.object(engine, "_log"):
+                        result = engine.decide(event, harness)
+                        self.assertEqual(result["decision"], "deny" if rule else "allow")
+                        if rule:
+                            self.assertEqual(result["context"]["rule"], rule)
+
+    def test_2147_text_search_filters(self):
+        search = "rg -l -i 'qa-access|audit_qualify|harness-qa-audit-reader|reader.grants'"
+        roots = "/Users/ardud/.robob/harness-homes/codex/skills /Users/ardud/.config/robob-watch /Users/ardud/.local/share/robob-watch"
+        self.table([
+            (search + " -g '*.md' -g '*.json' -g '*.yaml' -g '*.yml' " + roots, None),
+            (search + " -g '!node_modules' -g '!logs' -g '!*.sqlite*' -g '!opencode.db' -g '!statev2.sqlite' " + roots, None),
+            (search + " -g '*statev2.sqlite*' " + roots, READ),
+            (search + " -g '*opencode.db*' " + roots, READ),
+            (search + " " + LIVE, READ),
+        ])
 
     def test_pure_cat_source_and_markdown_2697(self):
         fixtures = Path(__file__).with_name("fixtures")

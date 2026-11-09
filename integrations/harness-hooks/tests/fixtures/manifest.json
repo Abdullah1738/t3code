@@ -103,6 +103,20 @@
     "source_line_0": 153,
     "workdir": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-041-F03"
   },
+  "crpko-2147-inline-test-edit.sh": {
+    "card": 2147,
+    "kind": "exec_command",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-022-R2",
+    "workdir": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-022-R2",
+    "exact": true,
+    "redactions": [],
+    "sha256": "f51cea184ccf52d1cb7d474695afd5bdbd10553922b00232798099184d0048be",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T06-30-19-01a1be24-6676-78c0-96db-4ee4c4a5aab6.jsonl",
+    "source_line_0": 2151,
+    "source_call_id": "call_b6748db9897040e6b1232e410801f833",
+    "refusal_line_0": 2153,
+    "cwd_source": "exec_command.workdir"
+  },
   "crpko-2154-python-offbox-timeout.sh": {
     "card": 2154,
     "cwd": "/Volumes/ExternalSSD/board-wt/crpko-integration-harness-HC-021d",
@@ -930,6 +944,20 @@
     "source_cmd_index": 0,
     "source_line_0": 186,
     "workdir": "/Users/ardud/checkouts/recall-649"
+  },
+  "robob-712-heredoc-absolute-no-workdir.sh": {
+    "card": 712,
+    "kind": "exec_command",
+    "cwd": "/Volumes/ExternalSSD/t3code-fork",
+    "workdir": null,
+    "exact": true,
+    "redactions": [],
+    "sha256": "eb7e77e648e307b07b6ab7a5df6a555aa79e6a98f1bde4fabb382a6544a839fd",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T10-29-27-01a1beff-5526-7573-aca8-a452ded77c99.jsonl",
+    "source_line_0": 147,
+    "source_call_id": "call_c7cd380586d3458d8beb0754f805f6bd",
+    "refusal_line_0": 149,
+    "cwd_source": "turn_context.payload.cwd"
   },
   "torssh-2-bootstrap-offbox.sh": {
     "card": "TorSSH #2",
