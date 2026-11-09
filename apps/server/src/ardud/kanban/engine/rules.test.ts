@@ -278,9 +278,9 @@ describe("planDispatch", () => {
       pause: { reason: "Ship the fix", keep: [kept.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     const available = pools([[opus, 3]]);
-    expect(planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role])).toEqual(
-      [[kept.id, "work"]],
-    );
+    expect(
+      planDispatch(paused, cards, available).map((entry) => [entry.cardId, entry.role]),
+    ).toEqual([[kept.id, "work"]]);
     const ctx = {
       threadId: "t1",
       pool: poolKey(opus),
@@ -490,6 +490,46 @@ describe("confirmDispatch", () => {
     expect(ok(paused, [blocker, waiting])).toBe(false);
     expect(ok(board, [{ ...blocker, stage: "working" as const }, waiting])).toBe(false);
   });
+
+  it("refuses a review whose chain or step model changed after planning", () => {
+    const review = card({ stage: "needs_review" });
+    const all = pools([
+      [opus, 2],
+      [sol, 2],
+    ]);
+    const [start] = planDispatch(board, [review], all);
+    expect(start?.model).toEqual(opus);
+    const ok = (b: KanbanBoard) => confirmDispatch(b, review, [review], all, new Map(), start!);
+    expect(ok(board)).toBe(true);
+    // Key order alone is not a change.
+    expect(
+      ok({
+        ...board,
+        reviewChains: [
+          { steps: [sol, astra], name: "Critical" },
+          { name: "Default", steps: [{ model: opus.model, instanceId: opus.instanceId }] },
+        ],
+      }),
+    ).toBe(true);
+    expect(ok({ ...board, defaultReviewChain: "Critical" })).toBe(false);
+    expect(
+      ok({
+        ...board,
+        reviewChains: [
+          { name: "Critical", steps: [sol, astra] },
+          { name: "Default", steps: [sol] },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("refuses when the planned pool is gone", () => {
+    const waiting = card();
+    const [start] = plan([waiting]);
+    expect(confirmDispatch(board, waiting, [waiting], pools([[sol, 2]]), new Map(), start!)).toBe(
+      false,
+    );
+  });
 });
 
 describe("thread batching", () => {
@@ -529,9 +569,9 @@ describe("thread batching", () => {
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
     expect(planDispatch(paused, [held, back], pools([[opus, 1]]))).toEqual([]);
-    expect(planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]]))).toMatchObject([
-      { cardId: back.id, joins: true },
-    ]);
+    expect(
+      planDispatch({ ...paused, pause: null }, [held, back], pools([[opus, 1]])),
+    ).toMatchObject([{ cardId: back.id, joins: true }]);
   });
 
   it("keeps a held slot for a thread between cards", () => {
@@ -616,9 +656,16 @@ describe("thread batching", () => {
       ...board,
       pause: { reason: "Hold", keep: [back.id], at: "2026-10-28T00:00:00Z", by: "owner" },
     };
-    expect(planDispatch(paused, [held, back], pools([[opus, 1], [haiku, 1]]))).toMatchObject([
-      { cardId: back.id, joins: false, fresh: true },
-    ]);
+    expect(
+      planDispatch(
+        paused,
+        [held, back],
+        pools([
+          [opus, 1],
+          [haiku, 1],
+        ]),
+      ),
+    ).toMatchObject([{ cardId: back.id, joins: false, fresh: true }]);
   });
 
   it("never picks up a backlog card, not even back to its own thread", () => {

@@ -514,9 +514,12 @@ export function planDispatch(
       // A new thread can't take a card its old thread's own work still holds up.
       if (fresh && isBlocked(card, byId, null)) continue;
       if (fresh) thread = null;
-      if (thread !== null && kept !== null && cards.some(
-        (other) => other.activeThreadId === thread && !kept.has(other.id),
-      )) continue;
+      if (
+        thread !== null &&
+        kept !== null &&
+        cards.some((other) => other.activeThreadId === thread && !kept.has(other.id))
+      )
+        continue;
       const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
       if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
       if (!joins) {
@@ -535,6 +538,20 @@ export function planDispatch(
   }
   return plan;
 }
+
+/** Same provider, model and options, whatever order their keys were written in. */
+const canonical = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(canonical)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(
+          Object.keys(value)
+            .toSorted()
+            .map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
+        )
+      : value;
+const sameModel = (a: ModelSelection, b: ModelSelection): boolean =>
+  JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 
 /**
  * Whether a planned start still holds against fresh state. A pass plans every
@@ -556,6 +573,14 @@ export function confirmDispatch(
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const card = byId.get(dispatch.cardId);
   if (!card || JSON.stringify(card) !== JSON.stringify(planned)) return false;
+  // The plan's model came from the board as it was then. A review chain (or a step's
+  // model) changed since would send this start to a reviewer the current chain no longer
+  // names. A card already on a work thread stays on that thread's model, as when planned.
+  if (
+    (dispatch.role === "review" || card.workThreadId !== null) &&
+    !sameModel(nextModel(board, card), dispatch.model)
+  )
+    return false;
   if (
     dispatch.role === "work" &&
     (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
@@ -569,7 +594,7 @@ export function confirmDispatch(
   )
     return false;
   const pool = pools.find((candidate) => candidate.key === dispatch.pool);
-  if (!pool || pool.slots <= 0) return false;
+  if (!pool || pool.slots <= 0 || poolFor(pools, dispatch.model)?.key !== pool.key) return false;
   const holding = poolThreads(cards, holds).get(dispatch.pool) ?? new Set<string>();
   if (dispatch.joins) {
     if (thread === null || !holding.has(thread)) return false;

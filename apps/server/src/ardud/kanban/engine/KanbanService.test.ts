@@ -705,6 +705,83 @@ it.effect("a planned start re-checks its card and skips one that moved on before
 );
 
 it.effect(
+  "a review chain changed during a launch sends no later planned review to the old model",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let armed = false;
+      const layer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (threads) =>
+          KanbanThreads.of({
+            ...threads,
+            launch: (input) =>
+              Effect.suspend(() => {
+                if (!armed) return threads.launch(input);
+                armed = false;
+                return Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(threads.launch(input)),
+                );
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "toy",
+          name: "Toy",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [
+            { name: "Standard", steps: [board.evaluatorModel] },
+            { name: "Critical", steps: [sol] },
+          ],
+          defaultReviewChain: "Standard",
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 4);
+        yield* kanban.setPool(board.id, board.evaluatorModel, 4);
+        yield* kanban.setPool(board.id, sol, 4);
+        const ids = [];
+        for (const title of ["A", "B"]) {
+          ids.push((yield* kanban.createCard(board.id, { prompt: title, title }, owner)).id);
+        }
+        yield* kanban.dispatchNow;
+        for (const id of ids) {
+          const worker = (yield* kanban.card(id)).card.activeThreadId!;
+          yield* kanban.moveCard(id, "needs_review", "cardThread", {
+            _tag: "thread",
+            threadId: worker,
+          });
+        }
+        armed = true;
+        const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+        yield* Deferred.await(entered);
+        // The owner switches the default chain while the first review's launch is out.
+        yield* kanban.updateBoard(board.id, { defaultReviewChain: "Critical" });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(dispatch);
+        const oldPool = Rules.poolKey(board.evaluatorModel);
+        for (const id of ids) {
+          const card = (yield* kanban.card(id)).card;
+          assert.notStrictEqual(card.activeRole === "review" ? card.activePool : null, oldPool);
+        }
+        yield* kanban.dispatchNow;
+        for (const id of ids) {
+          const card = (yield* kanban.card(id)).card;
+          assert.strictEqual(card.stage, "in_review");
+          assert.include(card.activePool ?? "", "gpt-6.1-sol");
+        }
+      }).pipe(Effect.provide(testLayer(layer)));
+    }),
+);
+
+it.effect(
   "an evaluator launch waiting on another service permits board writes and rejects stale setup",
   () =>
     Effect.gen(function* () {
@@ -3479,8 +3556,7 @@ it.effect("the board feed's first frame does not wait on thread state", () =>
       });
       // Thread reads stall, like the orchestration reader queue on a busy server.
       const release = yield* Deferred.make<void>();
-      fake.findControl.beforeRead = (id) =>
-        id === thread ? Deferred.await(release) : Effect.void;
+      fake.findControl.beforeRead = (id) => (id === thread ? Deferred.await(release) : Effect.void);
 
       const pull = yield* Stream.toPull(kanban.watch(board.id));
       const first = Array.from(yield* pull);
