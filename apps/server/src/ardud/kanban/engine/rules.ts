@@ -448,7 +448,7 @@ export function poolThreads(
 
 /**
  * Fill free pool slots by urgency, reviews before todos at the same priority.
- * Todos keep pick order; reviews use card priority, then oldest first.
+ * Within each role, pick order uses inherited urgency, holds, then oldest first.
  * Skip blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
@@ -498,8 +498,8 @@ export function planDispatch(
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
     .map((card) => ({ card, role: "work" as const }));
-  const priority = ({ card, role }: (typeof reviews)[number] | (typeof todos)[number]) =>
-    role === "review" ? card.priority : (blocking.get(card.id)?.urgency ?? card.priority);
+  const priority = ({ card }: (typeof reviews)[number] | (typeof todos)[number]) =>
+    blocking.get(card.id)?.urgency ?? card.priority;
   const queue = [...reviews, ...todos].toSorted(
     (a, b) =>
       priority(a) - priority(b) ||
@@ -507,9 +507,7 @@ export function planDispatch(
         ? a.role === "review"
           ? -1
           : 1
-        : a.role === "work"
-          ? pickOrder(a.card, b.card)
-          : a.card.movedAt.localeCompare(b.card.movedAt) || a.card.number - b.card.number),
+        : pickOrder(a.card, b.card)),
   );
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));

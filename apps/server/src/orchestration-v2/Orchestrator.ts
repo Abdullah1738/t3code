@@ -5158,7 +5158,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // hold; an explicit steer or restart still fails below.
     if (
       command.deliveryIntent === "auto" &&
-      (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") &&
+      (dispatchMode.type === "restart_active" ||
+        (dispatchMode.type === "steer_active" && !dispatchMode.activeTurnOnly)) &&
       (yield* stopReachedRun(command, command.threadId, dispatchMode.targetRunId))
     ) {
       dispatchMode = { type: "queue_after_active" };

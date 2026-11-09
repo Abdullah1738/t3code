@@ -959,6 +959,79 @@ it.effect("keeps a queued message queued when promoted into a run that Stop reac
   ),
 );
 
+it.effect.each(
+  ([undefined, "auto", "steer", "restart"] as const).flatMap((deliveryIntent) =>
+    (["web", "server"] as const).map((creationSource) => ({
+      deliveryIntent,
+      creationSource,
+      label: deliveryIntent ?? "omitted",
+    })),
+  ),
+)(
+  "keeps active-only steering fixed after Stop ($label, $creationSource)",
+  ({ deliveryIntent, creationSource }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { started, steered, layer, startFirstTurn } =
+          yield* nextTurnSelectionHarness("active-only-after-stop");
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("queued"),
+            threadId,
+            messageId: MessageId.make("message:queued"),
+            text: "queued",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("stop"),
+            threadId,
+            runId: started[0]!.runId,
+            holdQueue: true,
+          });
+          const result = yield* orchestrator
+            .dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("strict"),
+              threadId,
+              messageId: MessageId.make("message:strict"),
+              text: "active turn only",
+              attachments: [],
+              dispatchMode: {
+                type: "steer_active",
+                targetRunId: started[0]!.runId,
+                activeTurnOnly: true,
+              },
+              ...(deliveryIntent === undefined ? {} : { deliveryIntent }),
+              createdBy: creationSource === "web" ? "user" : "agent",
+              creationSource,
+            })
+            .pipe(Effect.result);
+          yield* worker.drain();
+
+          assert.isTrue(Result.isFailure(result));
+          if (Result.isFailure(result))
+            assert.equal(result.failure._tag, "OrchestratorDispatchError");
+          const projection = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(steered, []);
+          assert.equal(started.length, 1);
+          assert.equal(projection.runs.length, 2);
+          const queued = projection.runs.find((run) => run.status === "queued");
+          assert.equal(queued?.userMessageId, MessageId.make("message:queued"));
+          assert.isTrue(queued?.queueHeld);
+          assert.isFalse(projection.messages.some((message) => message.id === "message:strict"));
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
 it.effect("queues a plain send behind the stopped queue and releases its hold", () =>
   Effect.scoped(
     Effect.gen(function* () {
