@@ -26,6 +26,7 @@ import {
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as Projection from "../../orchestration-v2/ProjectionStore.ts";
 import * as Store from "../kanban/store/KanbanStore.ts";
+import * as Control from "../control/ControlStore.ts";
 import { unreviewed, violations } from "../../../../../packages/perf-harness/src/queryPlan.ts";
 import { queryPlanExceptions } from "./queryPlanExceptions.ts";
 const database = Sqlite.layerMemory;
@@ -35,6 +36,7 @@ const layer = Layer.mergeAll(
   Store.layer.pipe(Layer.provide(database)),
   Projects.layer.pipe(Layer.provide(database)),
   Auth.layer.pipe(Layer.provide(database)),
+  Control.layer.pipe(Layer.provide(database)),
 );
 it.effect(
   "interactive query registry rejects new scans, archive access and request sorts",
@@ -81,6 +83,7 @@ it.effect(
       const runIds = ids.map((id) => RunId.make(id));
       const projects = yield* Projects.ProjectStoreV2;
       const auth = yield* Auth.AuthSessionRepository;
+      const control = yield* Control.ControlStore;
       const registry: Array<{
         route: string;
         run: Effect.Effect<
@@ -89,6 +92,7 @@ it.effect(
           | Store.KanbanStoreError
           | Projects.ProjectStoreV2Error
           | AuthSessionRepositoryError
+          | Control.ControlStoreError
           | SqlError.SqlError
         >;
       }> = [
@@ -141,6 +145,11 @@ it.effect(
             limit: 500,
             omitIdleSubagents: true,
           }),
+        },
+        {
+          // Control /threads?updatedSince: the changed range only, never every shell.
+          route: "control.threads-updated-since",
+          run: control.threadsUpdatedSince("2026-01-01T00:00:00.000Z"),
         },
         {
           route: "board.thread-state",

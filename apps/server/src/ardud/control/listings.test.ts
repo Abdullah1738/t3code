@@ -220,6 +220,30 @@ const makeHarness = (
     const sql = yield* SqlClient.SqlClient;
     const projects = yield* ProjectStore.make;
     yield* seedRows;
+    // Extra shells are real projection rows too, as in production: updatedSince listings read
+    // the changed range from the table and only build shells for what they return.
+    for (const extra of extraShells) {
+      yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
+        thread_id: extra.id,
+        project_id: extra.projectId,
+        title: extra.title,
+        default_provider: "codex",
+        runtime_mode: "full-access",
+        interaction_mode: "default",
+        active_provider_thread_id: null,
+        created_at: DateTime.formatIso(extra.createdAt),
+        updated_at: DateTime.formatIso(extra.updatedAt),
+        archived_at: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
+        deleted_at: extra.deletedAt === null ? null : DateTime.formatIso(extra.deletedAt),
+        provider_instance_id: "codex",
+        payload_json: JSON.stringify({
+          lineage: extra.lineage,
+          creationSource: extra.creationSource,
+          archivedAt: extra.archivedAt === null ? null : DateTime.formatIso(extra.archivedAt),
+          updatedAt: DateTime.formatIso(extra.updatedAt),
+        }),
+      })}`;
+    }
     const snapshotReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
@@ -322,7 +346,7 @@ const makeHarness = (
             .toSorted();
         }),
       );
-    return { get, threadIds, snapshotReads, startupLog };
+    return { get, threadIds, snapshotReads, startupLog, sql };
   });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -551,6 +575,79 @@ describe("control listings", () => {
         }),
       undefined,
       [nativeChild, appThread, oldNative],
+    );
+  });
+
+  it.effect("lists /threads?updatedSince from the changed rows, never the shell snapshot", () => {
+    const at = (iso: string) => DateTime.makeUnsafe(iso);
+    const changed = (id: string, iso: string, overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
+      shell(id, { ...idle, updatedAt: at(iso), lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null }, ...overrides });
+    const extra = [
+      changed("new-1", "2026-03-01T00:00:03.000Z"),
+      changed("new-2", "2026-03-01T00:00:02.000Z", { projectId: "other" as never }),
+      changed("new-3", "2026-03-01T00:00:01.000Z"),
+      // Exactly at the cut: updatedSince is exclusive.
+      changed("edge", "2026-03-01T00:00:00.000Z"),
+      changed("stale", "2026-02-01T00:00:00.000Z"),
+      changed("new-archived", "2026-03-01T00:00:04.000Z", { archivedAt: at("2026-03-01T00:00:04.000Z") }),
+      changed("new-deleted", "2026-03-01T00:00:04.000Z", { deletedAt: at("2026-03-01T00:00:04.000Z") }),
+      changed("new-child", "2026-03-01T00:00:05.000Z", {
+        creationSource: "provider",
+        lineage: { rootThreadId: ThreadId.make("new-3"), parentThreadId: ThreadId.make("new-3"), relationshipToParent: "subagent" },
+      }),
+    ];
+    const since = Date.parse("2026-03-01T00:00:00.000Z");
+    return run(
+      ({ get, snapshotReads, sql }) =>
+        Effect.gen(function* () {
+          const list = (query: string) =>
+            get(`/threads?updatedSince=${since}${query}`).pipe(
+              Effect.map((response) => {
+                assert.strictEqual(response.status, 200);
+                return {
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                };
+              }),
+            );
+          // Newest first, cut to the limit, total still counts every match.
+          assert.deepStrictEqual(yield* list("&limit=2"), { total: 3, ids: ["new-1", "new-2"] });
+          assert.deepStrictEqual(yield* list("&limit=50"), { total: 3, ids: ["new-1", "new-2", "new-3"] });
+          // ISO form of the same instant.
+          assert.deepStrictEqual(
+            (yield* get("/threads?updatedSince=2026-03-01T00:00:00.000Z&limit=50")).body.total,
+            3,
+          );
+          assert.deepStrictEqual(yield* list("&includeSubagents=true&limit=2"), {
+            total: 4,
+            ids: ["new-child", "new-1"],
+          });
+          assert.deepStrictEqual(yield* list("&creationSource=provider&includeSubagents=true"), {
+            total: 1,
+            ids: ["new-child"],
+          });
+          assert.deepStrictEqual(yield* list("&parentThreadId=new-3"), { total: 1, ids: ["new-child"] });
+          assert.deepStrictEqual(yield* list("&projectId=other"), { total: 1, ids: ["new-2"] });
+          assert.deepStrictEqual(yield* list("&archived=true"), { total: 1, ids: ["new-archived"] });
+          // A state filter that can match idle threads reads the changed range's shells.
+          assert.deepStrictEqual(yield* list("&state=idle&limit=1"), { total: 3, ids: ["new-1"] });
+          assert.deepStrictEqual(yield* list("&active=false&includeSubagents=true"), {
+            total: 4,
+            ids: ["new-child", "new-1", "new-2", "new-3"],
+          });
+          // Origins: a child inherits its root's origin.
+          yield* sql`INSERT INTO ardud_thread_origin (thread_id, origin, created_at) VALUES ('new-3', 'imessage', '2026-03-01T00:00:00.000Z')`;
+          assert.deepStrictEqual(yield* list("&origin=imessage&includeSubagents=true"), {
+            total: 2,
+            ids: ["new-child", "new-3"],
+          });
+          assert.deepStrictEqual(yield* list("&origin=none&limit=1"), { total: 2, ids: ["new-1"] });
+          assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        }),
+      undefined,
+      extra,
     );
   });
 

@@ -15,6 +15,14 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
     ON orchestration_v2_projection_provider_turns(completed_at)
   `;
+  // Control listings by updatedSince read the changed range newest first instead of
+  // building every thread's shell (a 145 s reader stall on 9 Nov). Not partial on
+  // deleted_at: a smaller partial index would win every plain "deleted_at IS NULL" scan
+  // and quietly reorder or replan unrelated reads.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_v2_threads_updated_idx
+    ON orchestration_v2_projection_threads(updated_at DESC, thread_id DESC)
+  `;
   // Only unfinished running turns need the second range scan.
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_running_started_idx
