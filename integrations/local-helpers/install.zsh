@@ -334,7 +334,7 @@ smoke env PYTHONDONTWRITEBYTECODE=1 "$HOME/.local/bin/qcard" templates
 for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
-for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health; do
+for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog; do
   smoke zsh -n "$HOME/.local/bin/$f"
 done
 # The way the watchers run it: bare PATH, no nvm.

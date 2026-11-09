@@ -303,6 +303,7 @@ test("creates only for a question, reuses a chat serially, and emits only final 
   expect(system.startsWith(`${imessageGuidance()}\n`)).toBe(true);
   expect(system).not.toContain("all tools are fully available");
   for (const text of [options.timezone, options.skillPath, options.alertSkillPath, "in_1", "notify-only", "Unsolicited notifications are not conversation context"]) expect(h.backend.prompts[0]!.system).toContain(text);
+  await h.router.tick();
   const final = h.backend.final("Visible answer");
   final.content.unshift({ type: "reasoning", text: "PRIVATE_REASON" }, { type: "tool", id: "call_1", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: "PRIVATE_TOOL" }] } });
   await h.router.tick();
@@ -2208,7 +2209,7 @@ test.each(["absent", "idle", "busy"])("status %s alone never completes a turn", 
   expect(h.backend.prompts).toHaveLength(1);
   const final = h.backend.final();
   await h.router.tick();
-  expect(h.conversations()).toHaveLength(type === "busy" ? 0 : 1);
+  expect(h.conversations()).toHaveLength(1);
   // The reply is bound to its prompt by position: after the prompt, before the idle marker.
   const records = h.backend.records.map(m => m.id);
   expect(records.indexOf(final.id)).toBeGreaterThan(records.indexOf(messageId("first")));

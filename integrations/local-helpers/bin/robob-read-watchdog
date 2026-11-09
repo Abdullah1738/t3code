@@ -1,0 +1,142 @@
+#!/bin/zsh -f
+set -eu
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+umask 077
+
+probe_cmd=${ROBOB_WD_PROBE:-'node /Volumes/ExternalSSD/t3code-fork/apps/server/src/ardud/control/t3ctl.mjs threads --active --limit 5 --request-timeout 10'}
+notify_cmd=${ROBOB_WD_NOTIFY:-'"$HOME/.bun/bin/bun" "$HOME/.local/share/telegram-bridge/src/cli.ts" notify'}
+state_dir=${ROBOB_WD_STATE:-$HOME/.local/state/robob-read-watchdog}
+app_cmd=${ROBOB_WD_APP_RUNNING:-"pgrep -f '^/Applications/Robob[.]app/Contents/MacOS/Robob([[:space:]]|$)'"}
+restart_cmd=${ROBOB_WD_RESTARTING:-'tmux -L restart has-session -t robob-restart'}
+sleep_cmd=${ROBOB_WD_SLEEP:-sleep}
+
+run_command() {
+  local cmd=$1
+  shift
+  /bin/zsh -f -c "$cmd \"\$@\"" -- "$@"
+}
+now() {
+  if [[ ${ROBOB_WD_NOW:-} == <-> ]]; then print -r -- "$ROBOB_WD_NOW"
+  else run_command "${ROBOB_WD_NOW:-date +%s}"
+  fi
+}
+local_time() { date -r "$1" "+$2" }
+usage() {
+  print -u2 'usage: robob-read-watchdog [--sustain SECONDS [--every N] [--give-up SECONDS]]'
+  exit 2
+}
+sustain='' every=30 give_up=1800
+(( $# == 0 )) || [[ $1 == --sustain ]] || usage
+while (( $# )); do
+  (( $# >= 2 )) || usage
+  [[ $2 == <-> ]] && (( $2 > 0 )) || usage
+  case $1 in
+    --sustain) sustain=$2 ;;
+    --every) every=$2 ;;
+    --give-up) give_up=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+[[ -n $sustain ]] || { (( every == 30 && give_up == 1800 )) || usage }
+
+probe_err=$(mktemp "${TMPDIR:-/tmp}/robob-read-watchdog.XXXXXX")
+trap 'rm -f "$probe_err"' EXIT
+last_error='healthy read window not completed'
+probe() {
+  local line
+  if run_command "$probe_cmd" > /dev/null 2> "$probe_err"; then return 0; fi
+  # t3ctl owns the credential. Never read it here; discard credential-labelled diagnostics before saving.
+  line=$(head -n 1 "$probe_err" | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed -E \
+    -e 's/([Bb][Ee][Aa][Rr][Ee][Rr]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Tt][Oo][Kk][Ee][Nn]).*/\1 [redacted]/' \
+    -e 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  last_error=${line[1,120]}
+  [[ -n $last_error ]] || last_error='probe failed without stderr'
+  return 1
+}
+
+if [[ -n $sustain ]]; then
+  started=$(now)
+  healthy_since=''
+  failing_since=$started
+  while true; do
+    sample_start=$(now)
+    if probe; then
+      tick=$(now)
+      [[ -n $healthy_since ]] || healthy_since=$tick
+      if (( tick - started <= give_up && tick - healthy_since >= sustain )); then
+        printf 'reads healthy for %g min\n' "$(( sustain / 60.0 ))"
+        exit 0
+      fi
+    else
+      [[ -z $healthy_since ]] || failing_since=$sample_start
+      healthy_since=''
+      tick=$(now)
+    fi
+    if (( tick - started >= give_up )); then
+      print -r -- "installed but reads still failing since $(local_time "$failing_since" '%H:%M') ($last_error)"
+      exit 1
+    fi
+    delay=$(( every - (tick - sample_start) ))
+    (( delay >= 0 )) || delay=0
+    remaining=$(( give_up - (tick - started) ))
+    (( delay <= remaining )) || delay=$remaining
+    run_command "$sleep_cmd" "$delay"
+  done
+fi
+
+mkdir -p "$state_dir"
+clear_state() {
+  rm -f "$state_dir/first_fail" "$state_dir/last_error" "$state_dir/alerted" \
+    "$state_dir/attention_text" "$state_dir/recovery_text"
+}
+# launchd serializes ticks; the lock also keeps a manual tick from duplicating an alert.
+zmodload zsh/system
+: >> "$state_dir/tick.lock"
+zsystem flock -t 0 -f lockfd "$state_dir/tick.lock" 2>/dev/null || exit 0
+
+if ! run_command "$app_cmd" > /dev/null 2>&1 || run_command "$restart_cmd" > /dev/null 2>&1; then
+  clear_state
+  exit 0
+fi
+
+first_fail=''
+[[ ! -f $state_dir/first_fail ]] || first_fail=$(<"$state_dir/first_fail")
+tick=$(now)
+notify() {
+  unset BUN_INSPECT
+  run_command "$notify_cmd" --source robob-watchdog "$@"
+}
+if probe; then
+  # A failed acknowledgement may already be in the bridge's outbox. Reconcile it before the recovery.
+  if [[ -f $state_dir/attention_text && ! -f $state_dir/alerted ]]; then
+    key="robob-read-stall:$(local_time "$first_fail" '%Y%m%d%H%M')"
+    notify --severity attention --key "$key" --text "$(<"$state_dir/attention_text")" || exit 1
+    print -r -- "$first_fail" > "$state_dir/alerted"
+  fi
+  if [[ -f $state_dir/alerted ]]; then
+    first_fail=$(<"$state_dir/alerted")
+    key="robob-read-stall:$(local_time "$first_fail" '%Y%m%d%H%M'):up"
+    # The bridge requires identical text for retries under the same key, including a lost acknowledgement.
+    if [[ ! -f $state_dir/recovery_text ]]; then
+      print -r -- "Robob reads work again (failing $(local_time "$first_fail" '%H:%M')-$(local_time "$tick" '%H:%M'))" > "$state_dir/recovery_text"
+    fi
+    notify --severity info --key "$key" --text "$(<"$state_dir/recovery_text")" || exit 1
+  fi
+  clear_state
+  exit 0
+fi
+
+if [[ $first_fail != <-> ]]; then
+  first_fail=$tick
+  print -r -- "$first_fail" > "$state_dir/first_fail"
+fi
+print -r -- "$last_error" > "$state_dir/last_error"
+if (( tick - first_fail >= 180 )) && [[ ! -f $state_dir/alerted ]]; then
+  key="robob-read-stall:$(local_time "$first_fail" '%Y%m%d%H%M')"
+  if [[ ! -f $state_dir/attention_text ]]; then
+    print -r -- "Robob reads failing since $(local_time "$first_fail" '%H:%M') ($last_error)" > "$state_dir/attention_text"
+  fi
+  notify --severity attention --key "$key" --text "$(<"$state_dir/attention_text")" || exit 1
+  print -r -- "$first_fail" > "$state_dir/alerted"
+fi
