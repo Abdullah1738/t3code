@@ -3229,8 +3229,9 @@ const make = Effect.gen(function* () {
         discard: true,
       }),
     );
-  const runOwnerDrain = (discussionId: string, state: OwnerDrain) =>
-    Effect.gen(function* () {
+  const runOwnerDrain = Effect.fn("KanbanService.drainOwnerRoutes", { root: true })(
+    function* (discussionId: string, state: OwnerDrain) {
+      yield* Effect.annotateCurrentSpan("discussion.id", discussionId);
       while (true) {
         state.dirty = false;
         const rows = yield* boardSql<{ id: number }>`
@@ -3246,26 +3247,25 @@ const make = Effect.gen(function* () {
         });
         if (finished) return;
       }
-    }).pipe(
-      Effect.catchCause((cause) =>
-        // Pending rows stay for the sweep or the next restart.
-        Effect.logWarning("kanban owner routes stopped draining", { discussionId, cause }),
+    },
+    (effect, discussionId, state) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          // Pending rows stay for the sweep or the next restart.
+          Effect.logWarning("kanban owner routes stopped draining", { discussionId, cause }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (ownerRouteDrains.get(discussionId) === state) ownerRouteDrains.delete(discussionId);
+          }),
+        ),
+        Effect.ensuring(releaseOwnerWaiters(state)),
       ),
-      Effect.ensuring(
-        Effect.sync(() => {
-          if (ownerRouteDrains.get(discussionId) === state) ownerRouteDrains.delete(discussionId);
-        }),
-      ),
-      Effect.ensuring(releaseOwnerWaiters(state)),
-      Effect.withSpan("KanbanService.drainOwnerRoutes", {
-        root: true,
-        attributes: { "discussion.id": discussionId },
-      }),
-    );
+  );
 
   /** Starts the discussion's drain, or asks the running one to look again. */
-  const triggerOwnerDrain = (discussionId: string) =>
-    Effect.gen(function* () {
+  const triggerOwnerDrain = Effect.fn("KanbanService.triggerOwnerDrain")(
+    function* (discussionId: string) {
       const waiter = yield* Deferred.make<void>();
       const state = yield* Effect.sync(() => {
         const active = ownerRouteDrains.get(discussionId);
@@ -3280,7 +3280,8 @@ const make = Effect.gen(function* () {
       });
       if (state !== null) yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
       return waiter;
-    });
+    },
+  );
 
   /**
    * After an owner answer or post commits: in production the reply returns now
