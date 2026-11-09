@@ -24,7 +24,7 @@ class Reader:
         self.session_data={'account_hash':'a'*64,'scope_hash':'b'*64,'session_id':'SESSION1',
             'review_hash':'c'*64,'amount_minor':4585,'card_hash':j.digest(CARD),'order_id':None}
         self.order_data={'order_id':ORDER,'account_hash':'a'*64,'scope_hash':'b'*64,'amount_minor':4585,
-            'card_hash':j.digest(CARD),'intent':INTENT,'accepted':False,'cvv_required':False}
+            'card_hash':j.digest(CARD),'card_last4':'2342','intent':INTENT,'accepted':False,'cvv_required':False}
         self.payment_data={'reference':ORDER,'currency_code':'AED','amount':45.85,'cc_masked':'****2342',
             'payment_method_code':'cc_noonpay','id_token':CARD,'status':'synthetic_pending',
             'transaction_status':'SYNTHETIC_PENDING','error_code':'0','authorized_amount':0,'captured_amount':0}
@@ -229,14 +229,33 @@ class FoodFinancialTests(unittest.TestCase):
 
     def test_payment_proof_requires_exact_capture_currency_card_reference(self):
         self.reader.capture();raw=self.reader.payment(INTENT)
-        self.assertTrue(f.payment_projection(raw,ORDER,4585,j.digest(CARD))['paid'])
+        self.assertTrue(f.payment_projection(raw,ORDER,4585,j.digest(CARD),'2342')['paid'])
         for key,value in [('reference','FOTHER'),('currency_code','USD'),('amount',45.86),
-                          ('cc_masked','****5542'),('id_token','162')]:
+                          ('cc_masked','****5542'),('cc_masked','****9546'),('id_token','162')]:
             with self.subTest(key=key),self.assertRaises(j.JournalError):
-                f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD))
+                f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD),'2342')
         for key,value in [('captured_amount',1),('authorized_amount',1),('transaction_status','AUTHORIZED'),
                           ('error_code','1'),('refunded_amount',1),('reversed_amount',1)]:
-            self.assertFalse(f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD))['paid'])
+            self.assertFalse(f.payment_projection({**raw,key:value},ORDER,4585,j.digest(CARD),'2342')['paid'])
+
+    def test_capture_with_other_supported_card_stays_held(self):
+        self.co.place();self.reader.capture();self.reader.order_data['accepted']=True
+        self.reader.payment_data['cc_masked']='****9546'
+        result=self.co.recover()
+        self.assertFalse(result['paid'])
+        self.assertTrue(result['tracker']['held'])
+        self.assertNotEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        with self.assertRaisesRegex(j.JournalError,'CARD_MISMATCH'):
+            self.co.complete_payment()
+        self.assertEqual(len(self.calls),1)
+
+    def test_visa_capture_requires_matching_bound_card(self):
+        self.reader.capture();raw=self.reader.payment(INTENT)
+        raw['cc_masked']='****9546'
+        self.assertTrue(f.payment_projection(raw,ORDER,4585,j.digest(CARD),'9546')['paid'])
+        for last4 in ('2342', None, '5542'):
+            with self.subTest(last4=last4),self.assertRaises(j.JournalError):
+                f.payment_projection(raw,ORDER,4585,j.digest(CARD),last4)
 
     def test_native_adapter_does_not_guess_unpaid_contract(self):
         self.assertFalse(recovery.NativeReader.__new__(recovery.NativeReader).continuation_verified({},{}))
@@ -294,6 +313,13 @@ class NativeOrderTests(unittest.TestCase):
         with patch.object(recovery.vertical,'_read',return_value=raw),\
              patch.object(recovery.vertical,'_food_data',side_effect=lambda value:value):
             self.assertTrue(reader.order(ORDER)['automatic_payment_processed'])
+            self.assertIs(reader.order(ORDER)['cvv_required'], False)
+            reader.session_data['paymentRequireCvv']=True
+            raw.pop('paymentRequireCvv', None)
+            self.assertIs(reader.order(ORDER)['cvv_required'], True)
+            raw['paymentRequireCvv']=False
+            self.assertIsNone(reader.order(ORDER)['cvv_required'])
+            reader.session_data['paymentRequireCvv']=False
             for key in ('paymentRequireCompletion','paymentRequireCvv'):
                 for value in (None,0,'false',True):
                     reader.session_data[key]=value

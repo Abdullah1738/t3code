@@ -101,6 +101,9 @@ def automatic_order(flow_id, order):
     import noon_vertical_reads as vertical
     import noon_http_orders as core
     state = json.loads((j.ROOT/'food'/(flow_id+'.json')).read_text())
+    # This bank parser only accepts EmiratesNBD 2342. Never attach its receipt
+    # to an automatic order prepared with another supported card.
+    require((state.get('review') or {}).get('card_last4') == '2342', 'CARD_MISMATCH')
     rows = [{'item_code': r['itemCode'], 'qty': r['qty'], 'modifiers': r['modifiers'], 'notes': r['notes']}
             for r in state['items']]
     flow = food.FoodFlow(state['outlet'], rows, flow_id, read_only=True)

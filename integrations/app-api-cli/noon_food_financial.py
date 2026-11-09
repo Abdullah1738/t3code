@@ -51,11 +51,12 @@ def completion_payload(intent, token, *, cvv_required, cvv_encryption=None):
     return body
 
 
-def payment_projection(raw, order, amount, card_hash):
+def payment_projection(raw, order, amount, card_hash, card_last4):
     """Historical Food status proof: exact reference/currency/card and full capture."""
     require(raw.get('reference')==order,'FOOD_PAYMENT_REFERENCE_MISMATCH')
     require(raw.get('currency_code')=='AED' and minor(raw.get('amount'))==amount,'FOOD_PAYMENT_AMOUNT_MISMATCH')
-    require(str(raw.get('cc_masked') or '').endswith(('9546', '2342')) and raw.get('payment_method_code')=='cc_noonpay',
+    require(card_last4 in ('9546', '2342') and
+            str(raw.get('cc_masked') or '').endswith(card_last4) and raw.get('payment_method_code')=='cc_noonpay',
             'FOOD_PAYMENT_CARD_MISMATCH')
     require(j.digest(str(raw.get('id_token')))==card_hash,'FOOD_PAYMENT_TOKEN_MISMATCH')
     require(all(isinstance(raw.get(k),str) and re.fullmatch(r'[A-Za-z0-9_]{1,80}',raw[k])
@@ -173,7 +174,7 @@ class Coordinator:
             state=json.loads(self.path.read_text());session=self.session(state);local=j.inspect(self.flow_id)
             row=self._order(state,session,local)
             require(row and row.get('intent'),'FOOD_BOUND_INTENT_REQUIRED')
-            current=payment_projection(self.reader.payment(row['intent']),row['order_id'],state['amount_minor'],state['card_hash'])
+            current=payment_projection(self.reader.payment(row['intent']),row['order_id'],state['amount_minor'],state['card_hash'],row.get('card_last4'))
             if current['paid']:return self._recover()
             require(not current['challenge_required'],'FOOD_CHALLENGE_ALREADY_ACTIVE')
             require(current['payment_status'] not in ('payment_failed','payment_error'),'FOOD_PAYMENT_FAILED_NO_RETRY')
@@ -203,7 +204,7 @@ class Coordinator:
         payment_error=None
         if row.get('intent'):
             try:
-                payment=payment_projection(self.reader.payment(row['intent']),order,state['amount_minor'],state['card_hash'])
+                payment=payment_projection(self.reader.payment(row['intent']),order,state['amount_minor'],state['card_hash'],row.get('card_last4'))
             except Exception:
                 # A status outage must not strand an exactly identified order.
                 # No exception payload (which could contain a secret) is persisted.

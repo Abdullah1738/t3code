@@ -210,6 +210,12 @@ class CaptureCloseTests(unittest.TestCase):
         state.update(outlet='OUTLET1',items=flow.rows)
         path=self.root/'food'; path.mkdir(mode=0o700)
         path.joinpath(self.flow+'.json').write_text(json.dumps(state))
+        state['review']['card_last4']='9546'
+        path.joinpath(self.flow+'.json').write_text(json.dumps(state))
+        with self.assertRaisesRegex(j.JournalError,'CARD_MISMATCH'):
+            capture.automatic_order(self.flow,ORDER)
+        state['review']['card_last4']='2342'
+        path.joinpath(self.flow+'.json').write_text(json.dumps(state))
         raw.update(paymentClientSecret=None,paymentProcessedAt='2026-11-07T21:46:25',
                    miscInfo={'isPaymentAutoCapture':True},orderRefundToWallet=0,
                    orderIssuedCredit=0,orderAdjustments=0,failedErrorMsg=None)

@@ -63,6 +63,13 @@ class NativeReader:
         require(self.flow is not None,'FOOD_SESSION_READ_REQUIRED')
         data=vertical._food_data(vertical._read('food_detail',self.flow.headers,core.operation_deadline(15),order))
         row=project_order(data,order,self.flow,self.state)
+        # Food exposes the checkout requirement on the bound session. A
+        # contradictory order flag must not authorize completion without CVV.
+        cvv = self.session_data.get('paymentRequireCvv')
+        if type(cvv) is bool and ('paymentRequireCvv' not in data or data['paymentRequireCvv'] is cvv):
+            row['cvv_required'] = cvv
+        else:
+            row['cvv_required'] = None
         row['automatic_payment_processed']=(
             self.session_data.get('paymentRequireCompletion') is False
             and self.session_data.get('paymentRequireCvv') is False
@@ -119,7 +126,8 @@ def project_order(data, order, flow, state):
     require(all(prefs.get(k) is True for k in food.QUIET) and data.get('driverNotes')==food.QUIET_NOTE,
             'FOOD_ORDER_QUIET_CHANGED')
     return {'order_id':order,'account_hash':flow.account,'scope_hash':flow.scope,
-            'amount_minor':amount,'card_hash':state['card_hash'],'intent':data.get('paymentClientSecret'),
+            'amount_minor':amount,'card_hash':state['card_hash'],'card_last4':state['review']['card_last4'],
+            'intent':data.get('paymentClientSecret'),
             'cvv_required':data.get('paymentRequireCvv'),
             'accepted':(data.get('orderStatusCode')=='accepted' and data.get('outletStatusCode')=='accepted') or data.get('orderStatusCode')=='delivered' or
                        (data.get('outletStatusCode')=='picked_up' and data.get('orderStatusCode') in ('delivering','picked_up'))}
