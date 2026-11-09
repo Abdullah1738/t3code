@@ -1628,7 +1628,7 @@ export function omitIdleSubagentShells<
     while (current !== undefined && !keep.has(current.id)) {
       keep.add(current.id);
       if (current.lineage.relationshipToParent !== "subagent") break;
-      const parentId = current.lineage.parentThreadId;
+      const parentId: ThreadId | null = current.lineage.parentThreadId;
       current = parentId === null ? undefined : byId.get(parentId);
     }
   }
@@ -5938,10 +5938,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             )${
               omitIdleSubagents
                 ? sql`,
-            -- Live threads (partial recovery indexes) plus their subagent ancestors.
+            -- Live threads (partial recovery indexes) plus their subagent ancestors. The runs
+            -- term repeats the recovery index's predicate so SQLite can prove it applies.
             live_lineage(thread_id) AS (
               SELECT thread_id FROM orchestration_v2_projection_runs
-              WHERE status IN ('preparing', 'starting', 'running', 'waiting')
+              WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                AND status <> 'queued'
               UNION
               SELECT thread_id FROM orchestration_v2_projection_runtime_requests
               WHERE status = 'pending'
