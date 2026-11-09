@@ -822,6 +822,10 @@ const evaluatorNoteKey = Context.Reference<string | undefined>("KanbanEvaluatorS
   defaultValue: () => undefined,
 });
 
+const evaluatorLaunchKey = Context.Reference<string | undefined>("KanbanEvaluatorLaunchKey", {
+  defaultValue: () => undefined,
+});
+
 const evaluatorDelivered = Context.Reference<Set<ThreadId> | undefined>(
   "KanbanEvaluatorStepDelivered",
   {
@@ -835,6 +839,10 @@ const evaluatorLaunchKeys = Context.Reference<Map<string, string> | undefined>(
     defaultValue: () => undefined,
   },
 );
+
+const evaluatorLaunched = Context.Reference<Set<ThreadId> | undefined>("KanbanEvaluatorLaunched", {
+  defaultValue: () => undefined,
+});
 
 const make = Effect.gen(function* () {
   const context =
@@ -906,6 +914,9 @@ const make = Effect.gen(function* () {
     compactRun: (id, run) => locks.outside(threadIo.compactRun(id, run)),
     launch: Effect.fn("KanbanService.launch")(function* (input) {
       const delivered = yield* evaluatorDelivered;
+      const launched = yield* evaluatorLaunched;
+      const noteKey = yield* evaluatorNoteKey;
+      const launchKey = yield* evaluatorLaunchKey;
       const keys = yield* evaluatorLaunchKeys;
       const recovery = keys && delivered ? { keys, delivered } : undefined;
       const cleanup = (id: ThreadId) => abandonLaunch(input, id, recovery);
@@ -916,10 +927,26 @@ const make = Effect.gen(function* () {
             replacement ? { ...input, key: `${input.key}:replacement:${replacement}` } : input,
           )
           .pipe(
-            Effect.tap((launched) =>
+            Effect.tap((id) =>
               Effect.gen(function* () {
-                (yield* ownerDelivered)?.add(launched);
-                delivered?.add(launched);
+                const replayed = launched?.has(id) === true;
+                launched?.add(id);
+                (yield* ownerDelivered)?.add(id);
+                // A replay has no initial turn to start; the reminder must wake or steer it.
+                if (
+                  replayed &&
+                  noteKey !== undefined &&
+                  noteKey !== launchKey &&
+                  !delivered?.has(id)
+                ) {
+                  yield* threadIo.send({
+                    threadId: id,
+                    text: input.text,
+                    model: input.model,
+                    key: `${noteKey}:${id}:answer`,
+                  });
+                }
+                delivered?.add(id);
               }),
             ),
           ),
@@ -1069,6 +1096,8 @@ const make = Effect.gen(function* () {
         readonly deliveryKey?: string;
         readonly delivered: Set<ThreadId>;
         readonly launchKeys: Map<string, string>;
+        readonly launchKey: string;
+        readonly launched: Set<ThreadId>;
       }
     >
   >(new Map());
@@ -2138,7 +2167,7 @@ const make = Effect.gen(function* () {
       return yield* failWith("invalid", `board ${board.slug} is already in setup`);
     }
     const at = yield* nowIso;
-    const launchKey = (yield* evaluatorNoteKey) ?? uuid();
+    const launchKey = (yield* evaluatorLaunchKey) ?? (yield* evaluatorNoteKey) ?? uuid();
     // The setup evaluator talks in a Setup discussion, so the owner has somewhere to read and reply.
     // An existing discussion can be adopted as the Setup one (boards set up before this existed).
     let setupDiscussion: KanbanDiscussion | null = null;
@@ -2567,7 +2596,10 @@ const make = Effect.gen(function* () {
         const activation = savedStepActivations.get(after);
         const delivered = new Set<ThreadId>();
         const launchKeys = new Map<string, string>();
+        const launched = new Set<ThreadId>();
         return effect.pipe(
+          Effect.provideService(evaluatorLaunched, launched),
+          Effect.provideService(evaluatorLaunchKey, deliveryKey),
           Effect.provideService(evaluatorLaunchKeys, launchKeys),
           Effect.provideService(evaluatorDelivered, delivered),
           Effect.provideService(evaluatorNoteKey, deliveryKey),
@@ -2590,6 +2622,8 @@ const make = Effect.gen(function* () {
                         deliveryKey,
                         delivered,
                         launchKeys,
+                        launchKey: deliveryKey,
+                        launched,
                       }),
                     );
                   yield* Effect.logWarning("kanban evaluator step note failed", {
@@ -5010,6 +5044,8 @@ const make = Effect.gen(function* () {
                       woken: false,
                       delivered: new Set<ThreadId>(),
                       launchKeys: new Map<string, string>(),
+                      launchKey: `step-launch:${card.id}:${key}:${uuid()}`,
+                      launched: new Set<ThreadId>(),
                     }),
                   );
                   continue;
@@ -5042,6 +5078,7 @@ const make = Effect.gen(function* () {
                     now - wait.since < (current.priority === 1 ? STEP_WAIT_P1_MS : STEP_WAIT_MS))
                 )
                   continue;
+                // A reminder gets fresh send state, but an unresolved launch keeps its identity.
                 if (wait.retry)
                   yield* Ref.update(stepWaits, (all) =>
                     new Map(all).set(card.id, {
@@ -5049,7 +5086,6 @@ const make = Effect.gen(function* () {
                       retry: false,
                       since: now,
                       delivered: new Set<ThreadId>(),
-                      launchKeys: new Map<string, string>(),
                     }),
                   );
                 const minutes = Math.round((now - wait.since) / 60_000);
@@ -5068,6 +5104,8 @@ const make = Effect.gen(function* () {
                           true,
                         ).pipe(Effect.as(true)),
                   ),
+                  Effect.provideService(evaluatorLaunched, wait.launched),
+                  Effect.provideService(evaluatorLaunchKey, wait.launchKey),
                   Effect.provideService(evaluatorLaunchKeys, wait.launchKeys),
                   Effect.provideService(evaluatorDelivered, wait.delivered),
                   Effect.provideService(

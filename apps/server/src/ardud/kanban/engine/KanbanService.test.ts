@@ -13924,3 +13924,150 @@ it.effect("ask-drop does not report saved success from a preliminary discussion 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect.each([
+  { firstStop: "failed", retryStop: "failed", finished: false },
+  { firstStop: "failed", retryStop: "confirmed", finished: false },
+  { firstStop: "confirmed", retryStop: "failed", finished: false },
+  { firstStop: "confirmed", retryStop: "confirmed", finished: false },
+  { firstStop: "failed", retryStop: "failed", finished: true },
+  { firstStop: "failed", retryStop: "confirmed", finished: true },
+  { firstStop: "confirmed", retryStop: "failed", finished: true },
+  { firstStop: "confirmed", retryStop: "confirmed", finished: true },
+] as const)(
+  "unresolved launch survives immediate retry failure ($firstStop/$retryStop stops, finished=$finished)",
+  ({ firstStop, retryStop, finished }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let held = yield* Deferred.make<void>();
+      let resume = yield* Deferred.make<void>();
+      const launched = new Map<string, ThreadId>();
+      const runnable = new Set<ThreadId>();
+      const stops = [firstStop, retryStop];
+      let stopAttempt = 0;
+      let armed = false;
+      const threadLayer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.suspend(() => {
+                const existing = launched.get(input.key);
+                const launch = existing
+                  ? Effect.succeed(existing)
+                  : real.launch(input).pipe(
+                      Effect.tap((id) =>
+                        Effect.sync(() => {
+                          launched.set(input.key, id);
+                          runnable.add(id);
+                        }),
+                      ),
+                    );
+                return launch.pipe(
+                  Effect.tap(() => {
+                    if (!armed) return Effect.void;
+                    armed = false;
+                    return Deferred.succeed(held, undefined).pipe(
+                      Effect.andThen(Deferred.await(resume)),
+                    );
+                  }),
+                );
+              }),
+            interrupt: (id, reason) =>
+              Effect.suspend(() =>
+                stops[stopAttempt++] === "failed"
+                  ? Effect.fail(
+                      new KanbanThreadError({ operation: "interrupt", detail: "stop failed" }),
+                    )
+                  : real.interrupt(id, reason).pipe(
+                      Effect.tap(() =>
+                        Effect.sync(() => {
+                          runnable.delete(id);
+                        }),
+                      ),
+                    ),
+              ),
+            send: (input) =>
+              real.send(input).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    runnable.add(input.threadId);
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Race",
+            title: "Race",
+            subtasks: [
+              { step: 1, owner: "work", text: "Build" },
+              { step: 2, owner: "evaluator", text: "Merge" },
+            ],
+          },
+          owner,
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        armed = true;
+        const marking = yield* kanban
+          .markSubtask(card.id, "s1", "done", null, owner, "work")
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(held);
+        yield* kanban.updateBoard(board.id, { name: "First concurrent edit" });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(marking);
+        const original = [...launched.values()][0]!;
+        assert.strictEqual(runnable.size, firstStop === "failed" ? 1 : 0);
+        held = yield* Deferred.make<void>();
+        resume = yield* Deferred.make<void>();
+        armed = true;
+        const retrying = yield* kanban.tick.pipe(Effect.forkChild);
+        yield* Deferred.await(held);
+        yield* kanban.updateBoard(board.id, { name: "Second concurrent edit" });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(retrying);
+        assert.strictEqual(stopAttempt, 2);
+        assert.strictEqual(runnable.size, retryStop === "failed" ? 1 : 0);
+        const expectedLaunches =
+          1 + Number(firstStop === "confirmed") + Number(retryStop === "confirmed");
+        if (finished) runnable.clear();
+        yield* TestClock.adjust("61 minutes");
+        yield* kanban.tick;
+        const talk = yield* kanban.discussion(discussion.id);
+        assert.isNotNull(talk.evaluatorThreadId);
+        assert.strictEqual(runnable.size, 1);
+        assert.isTrue(runnable.has(talk.evaluatorThreadId!));
+        assert.strictEqual(launched.size, expectedLaunches);
+        if (firstStop === "failed" && retryStop === "failed")
+          assert.strictEqual(talk.evaluatorThreadId, original);
+        else assert.notStrictEqual(talk.evaluatorThreadId, original);
+        yield* kanban.tick;
+        assert.strictEqual(runnable.size, 1);
+        assert.strictEqual(launched.size, expectedLaunches);
+        assert.lengthOf(
+          fake.sends.filter(
+            (send) =>
+              send.threadId === talk.evaluatorThreadId && send.key?.startsWith("step-reminder:"),
+          ),
+          retryStop === "failed" ? 1 : 0,
+        );
+        assert.lengthOf(
+          (yield* Ref.get(fake.threads)).get(talk.evaluatorThreadId!)!.messages,
+          retryStop === "failed" ? 2 : 1,
+        );
+        assert.strictEqual(
+          (yield* kanban.discussion(discussion.id)).evaluatorThreadId,
+          talk.evaluatorThreadId,
+        );
+      }).pipe(
+        Effect.ensuring(Effect.suspend(() => Deferred.succeed(resume, undefined))),
+        Effect.provide(testLayer(threadLayer)),
+      );
+    }),
+);

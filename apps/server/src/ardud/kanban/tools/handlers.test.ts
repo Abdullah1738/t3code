@@ -185,6 +185,7 @@ const fakeThreads = (
                 editCardError
                   ? Effect.fail(editCardError)
                   : service.editCard(...args).pipe(Effect.flatMap(reply)),
+              moveCard: (...args) => service.moveCard(...args).pipe(Effect.flatMap(reply)),
               changeAsk: (...args) => service.changeAsk(...args).pipe(Effect.flatMap(reply)),
               postToCard: (...args) =>
                 postToCardError ? Effect.fail(postToCardError) : service.postToCard(...args),
@@ -1374,6 +1375,7 @@ it.effect.each([
   { tool: "card_update", mode: "budget" },
   { tool: "card_edit", mode: "conflict" },
   { tool: "card_edit", mode: "encode" },
+  { tool: "card_move", mode: "conflict" },
 ] as const)("saved $tool gets a read-back success when its reply is $mode", ({ tool, mode }) =>
   Effect.gen(function* () {
     const saved = yield* Deferred.make<void>();
@@ -1392,7 +1394,9 @@ it.effect.each([
       );
       const request = yield* call(ThreadId.make("outside"), tool, {
         card: card.id,
-        comment: "Saved exactly once",
+        ...(tool === "card_move"
+          ? { to: "needs_review", note: "Saved exactly once" }
+          : { comment: "Saved exactly once" }),
       }).pipe(Effect.forkChild);
       yield* Deferred.await(saved);
       if (mode === "slow") yield* TestClock.adjust("25 seconds");
@@ -1401,6 +1405,7 @@ it.effect.each([
       assert.include(reply.text, "Saved");
       assert.strictEqual(reply.structured.saved, true);
       const detail = yield* kanban.card(card.id);
+      if (tool === "card_move") assert.strictEqual(detail.card.stage, "needs_review");
       assert.lengthOf(
         detail.events.filter((event) => event.body === "Saved exactly once"),
         1,
