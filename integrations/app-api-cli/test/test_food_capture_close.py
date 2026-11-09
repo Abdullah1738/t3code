@@ -32,9 +32,11 @@ class CaptureCloseTests(unittest.TestCase):
         self.flow = str(uuid.uuid4())
         self.account = 'a'*64
         j.open_flow(flow_id=self.flow, app='noon', vertical='food', account_hash=self.account, scope_hash='b'*64)
+        (self.root/'food').mkdir(mode=0o700)
+        (self.root/'food'/(self.flow+'.json')).write_text(json.dumps({'review':{'card_last4':'2342'}}))
         self.record = dict(session_id='SESSION1', review_hash='c'*64, amount_minor=11590,
                            card_hash=j.digest('161'), cart_hash=j.digest('SESSION1'))
-        path = self.root/'food-financial'; path.mkdir(mode=0o700)
+        path = self.root/'food-financial'; path.mkdir(mode=0o700,exist_ok=True)
         self.path = path/(self.flow+'.json'); self.save_record()
         with patch.object(j.time, 'time', return_value=PLACED):
             j.consume(self.flow, 'place', kind='place', request_hash=j.digest(financial.place_payload('SESSION1', 11590)),
@@ -50,6 +52,42 @@ class CaptureCloseTests(unittest.TestCase):
                              source='native_order_api', identity_verified=True, account_verified=True,
                              saved_home_verified=True, raw_status='delivered', status='delivered',
                              automatic_payment=self.automatic)
+
+    def test_mashreq_exact_card_amount_and_sender(self):
+        text='Your Mashreq noon Card ending with 9546 was used for a purchase of AED 172.80 at Noon 80038888 AE on 09-NOV-2026 05:48 PM.'
+        bank=dict(source='msgs',source_id=516800,sender='MashreqAlerts@mashreq.com',
+                  timestamp=1794232140,**capture.parse_purchase(text))
+        capture.validate_bank(bank,17280,1794232131,'9546')
+        for change in ({'card_last4':'2342'},{'amount_minor':6780},{'sender':'someone@example.com'}):
+            with self.assertRaises(j.JournalError):capture.validate_bank({**bank,**change},17280,1794232131,'9546')
+        with self.assertRaises(j.JournalError):capture.validate_bank(bank,17280,1794232131,'2342')
+
+    def test_bank_read_failure_cannot_prove_uniqueness(self):
+        rows=[{'id':1234,'ts':PLACED+9},{'id':1235,'ts':PLACED+10}]
+        result=SimpleNamespace(stdout='\n'.join(json.dumps(r) for r in rows))
+        with patch.object(capture.subprocess,'run',return_value=result),patch.object(capture,'bank_message',
+                side_effect=[self.bank,j.JournalError('FOOD_CAPTURE_CLOSE_BANK_READ_FAILED')]):
+            with self.assertRaisesRegex(j.JournalError,'BANK_READ_FAILED'):
+                capture.find_bank_capture(PLACED,11590,'2342')
+        with patch.object(capture.subprocess,'run',return_value=result),patch.object(capture,'bank_message',
+                side_effect=[self.bank,{**self.bank,**capture.parse_purchase('Purchase of AED 9.00 with Credit Card ending 2342 at Noon, Dubai.')}]):
+            self.assertEqual(capture.find_bank_capture(PLACED,11590,'2342')['source_id'],1234)
+
+    def test_malformed_bank_candidate_prevents_capture(self):
+        rows=[{'id':1234,'ts':PLACED+9},{'id':1235,'ts':None}]
+        result=SimpleNamespace(stdout='\n'.join(json.dumps(r) for r in rows))
+        with patch.object(capture.subprocess,'run',return_value=result),patch.object(capture,'bank_message',return_value=self.bank):
+            with self.assertRaisesRegex(j.JournalError,'BANK_SEARCH_ROW_INVALID'):
+                capture.find_bank_capture(PLACED,11590,'2342')
+        placed=1794232131
+        text='Your Mashreq noon Card ending with 9546 was used for a purchase of AED 172.80 at Noon 80038888 AE on 09-NOV-2026 05:48 PM.'
+        bank=dict(source='msgs',source_id=1234,sender='MashreqAlerts@mashreq.com',timestamp=placed+9,**capture.parse_purchase(text))
+        bad={**bank,'source_id':1235,**capture.parse_purchase(text.replace('09-NOV','99-NOV'))}
+        rows=[{'id':1234,'ts':placed+9},{'id':1235,'ts':placed+10}]
+        result.stdout='\n'.join(json.dumps(r) for r in rows)
+        with patch.object(capture.subprocess,'run',return_value=result),patch.object(capture,'bank_message',side_effect=[bank,bad]):
+            with self.assertRaisesRegex(j.JournalError,'BANK_TIME_UNPARSEABLE'):
+                capture.find_bank_capture(placed,17280,'9546')
 
     def save_record(self):
         self.path.write_text(json.dumps(self.record)); self.path.chmod(0o600)
@@ -80,6 +118,10 @@ class CaptureCloseTests(unittest.TestCase):
         with self.assertRaises(j.JournalError):
             j.observe(self.flow, 'place', outcome='RESPONSE_RECEIVED', evidence_hash='a'*64)
         self.assertFalse(j.open_payments(since_seconds=1e10))
+
+    def test_active_delivered_automatic_flow_can_close(self):
+        with j._db() as db:db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?",(self.flow,))
+        self.assertEqual(self.close()['state'],'COMPLETE')
 
     def test_idempotent_and_conflicting_repeat(self):
         first = self.close()
@@ -137,7 +179,7 @@ class CaptureCloseTests(unittest.TestCase):
                          ({'reserved_minor':True},'AMOUNT_MISMATCH')]:
             with self.subTest(kw=kw), self.assertRaisesRegex(j.JournalError, code): self.close(**kw)
         for key,value,code in [('vertical','minutes','FOOD_FLOW_REQUIRED'), ('app','talabat','FOOD_FLOW_REQUIRED'),
-                               ('state','ACTIVE','FENCED_FLOW_REQUIRED')]:
+                               ('state','RELEASED','FENCED_FLOW_REQUIRED')]:
             with j._db() as db: db.execute('UPDATE flows SET '+key+'=? WHERE id=?',(value,self.flow))
             with self.assertRaisesRegex(j.JournalError,code): self.close()
             with j._db() as db: db.execute('UPDATE flows SET '+key+'=? WHERE id=?',({'vertical':'food','app':'noon','state':'FENCED'}[key],self.flow))
@@ -208,9 +250,9 @@ class CaptureCloseTests(unittest.TestCase):
         import noon_vertical_reads as vertical
         flow,state,raw=NativeOrderTests().fixture()
         state.update(outlet='OUTLET1',items=flow.rows)
-        path=self.root/'food'; path.mkdir(mode=0o700)
+        path=self.root/'food'; path.mkdir(mode=0o700,exist_ok=True)
         path.joinpath(self.flow+'.json').write_text(json.dumps(state))
-        state['review']['card_last4']='9546'
+        state['review']['card_last4']='5542'
         path.joinpath(self.flow+'.json').write_text(json.dumps(state))
         with self.assertRaisesRegex(j.JournalError,'CARD_MISMATCH'):
             capture.automatic_order(self.flow,ORDER)

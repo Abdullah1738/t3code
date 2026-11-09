@@ -505,6 +505,26 @@ def retract_food_capture_claim(flow_id, *, evidence_hash):
         db.execute("UPDATE flows SET state='FENCED' WHERE id=?",(flow_id,))
 
 
+def claim_food_bank_purchase(flow_id, bank):
+    """One purchase notification can support only one journalled order."""
+    with _db() as db:
+        flow=_get(db,flow_id)
+        if flow['app']!='noon' or flow['vertical']!='food' or not flow['order_id']:
+            fail('FOOD_BANK_ORDER_REQUIRED')
+        receipt_hash=digest({'source':'msgs','source_id':bank['source_id']})
+        previous=db.execute("SELECT flow_id FROM observations WHERE outcome='FOOD_BANK_PURCHASE_CLAIMED' AND evidence_hash=?",
+                            (receipt_hash,)).fetchone()
+        if previous and previous['flow_id']!=flow_id:
+            fail('FOOD_BANK_PURCHASE_ALREADY_CLAIMED')
+        for audit in db.execute('SELECT flow_id,provider_evidence FROM owner_attestations WHERE flow_id!=?',(flow_id,)):
+            prior=json.loads(audit['provider_evidence'])
+            if prior.get('kind')=='food_automatic_captured' and prior.get('bank',{}).get('source_id')==bank['source_id']:
+                fail('FOOD_BANK_PURCHASE_ALREADY_CLAIMED')
+        if not previous:
+            db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                       (flow_id,'place','FOOD_BANK_PURCHASE_CLAIMED',receipt_hash,flow['order_id'],time.time()))
+
+
 def reconcile_food_paid(flow_id, *, evidence_hash):
     """Food adapter has independently bound session, order, intent and capture."""
     return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('food',))
@@ -933,7 +953,15 @@ def _food_capture_close(db, flow_id, *, order_id, reserved_minor, bank_evidence,
     places = [o for o in ops if o['kind'] == 'place']
     require(len(places) == 1 and places[0]['name'] == 'place'
             and all(o['state'] == 'OBSERVED' for o in ops), 'PLACE_HISTORY_INVALID')
-    validate_bank(bank_evidence, reserved_minor, places[0]['created_at'])
+    prepared=json.loads((ROOT/'food'/(flow_id+'.json')).read_text())
+    validate_bank(bank_evidence, reserved_minor, places[0]['created_at'], prepared['review']['card_last4'])
+    receipt_hash=digest({'source':'msgs','source_id':bank_evidence['source_id']})
+    require(not db.execute("SELECT 1 FROM observations WHERE outcome='FOOD_BANK_PURCHASE_CLAIMED' AND evidence_hash=? AND flow_id!=?",
+                           (receipt_hash,flow_id)).fetchone(), 'BANK_PURCHASE_ALREADY_CLAIMED')
+    for audit in db.execute('SELECT provider_evidence FROM owner_attestations WHERE flow_id!=?',(flow_id,)):
+        prior=json.loads(audit['provider_evidence'])
+        require(not (prior.get('kind')=='food_automatic_captured' and prior.get('bank',{}).get('source_id')==bank_evidence['source_id']),
+                'BANK_PURCHASE_ALREADY_CLAIMED')
     require(type(tracking_evidence) is dict and tracking_evidence.keys() == TRACKING_FIELDS, 'TRACKING_SCHEMA_INVALID')
     require(tracking_evidence.get('ok') is True
             and tracking_evidence.get('app') == 'noon' and tracking_evidence.get('service') == 'food'
@@ -982,7 +1010,7 @@ def _food_capture_close(db, flow_id, *, order_id, reserved_minor, bank_evidence,
         require(flow['state'] == 'COMPLETE' and previous['evidence_hash'] == audit_hash,
                 'EVIDENCE_CONFLICT')
     else:
-        require(flow['state'] == 'FENCED', 'FENCED_FLOW_REQUIRED')
+        require(flow['state'] in ('ACTIVE','FENCED'), 'FENCED_FLOW_REQUIRED')
     return flow, provider, audit_hash, previous
 
 

@@ -1,4 +1,4 @@
-"""Food financial contract and coordinator; production financial transport disabled.
+"""Food automatic saved-card placement and read-only capture recovery.
 
 The coordinator is exercised with injected transports. Recovery uses only exact
 session/order/intent reads and never calls a financial writer. No secret is
@@ -82,6 +82,34 @@ class DisabledTransport:
         self.assert_enabled()
 
 
+class AutomaticTransport:
+    """Only the observed automatic saved-card placement has a live writer."""
+    def __init__(self, reader):
+        self.reader = reader
+
+    def assert_enabled(self):
+        pass
+
+    def send(self, operation, payload):
+        import urllib.request
+        import noon_http_orders as core
+        require(operation == 'place', 'FOOD_NEEDS_APP_PAYMENT_REQUIREMENT')
+        headers = dict(self.reader.flow.headers)
+        headers.update({'content-type': 'application/json', 'accept-encoding': 'identity'})
+        request = urllib.request.Request(PLACE_URL, headers=headers,
+            data=json.dumps(payload).encode(), method='POST')
+        with urllib.request.build_opener(urllib.request.ProxyHandler({}), core.NoRedirect()).open(request, timeout=20) as response:
+            raw = response.read(core.MAX_BYTES + 1)
+        require(len(raw) <= core.MAX_BYTES, 'FOOD_RESPONSE_TOO_LARGE')
+        envelope=json.loads(raw)
+        require(envelope.get('status')=='success' and isinstance(envelope.get('data'),dict),
+                'FOOD_PLACE_RESPONSE_UNVERIFIED')
+        candidate=envelope['data'].get('orderNr')
+        require(isinstance(candidate,str) and re.fullmatch(r'F[A-Z0-9]{1,63}',candidate),
+                'FOOD_PLACE_RESPONSE_UNVERIFIED')
+        return {'candidate_order_id':candidate}
+
+
 class Coordinator:
     """Reader validates native identity; journal independently binds every send.
 
@@ -131,18 +159,26 @@ class Coordinator:
             require(not any(o['kind'] in ('place','payment') for o in j.inspect(self.flow_id)['operations']),
                     'FOOD_FINANCIAL_SEND_ALREADY_CONSUMED')
             session=self.session();require(not session.get('order_id'),'FOOD_SESSION_ALREADY_ORDERED')
+            if isinstance(self.transport, AutomaticTransport):
+                require(session.get('automatic_eligible') is True, 'FOOD_NEEDS_APP_PAYMENT_REQUIREMENT')
             state={k:session[k] for k in ('session_id','review_hash','amount_minor','card_hash')}
             state['cart_hash']=j.digest(session['session_id'])
             payload=place_payload(session['session_id'],session['amount_minor'])
             self.save(state)
             j.consume(self.flow_id,'place',kind='place',request_hash=j.digest(payload),cart_hash=state['cart_hash'],
                       review_hash=state['review_hash'],payable_minor=state['amount_minor'])
-            try:self.transport.send('place',payload)
+            try:
+                response=self.transport.send('place',payload)
+                if isinstance(response,dict) and response.get('candidate_order_id'):
+                    state['candidate_order_id']=response['candidate_order_id']
+                    self.save(state)
             except Exception:
                 self._observe_unknown('place')
-                return {'state':'PLACE_OUTCOME_UNKNOWN','financial_retry':False}
-            # The response envelope is not used as order identity or payment proof.
-            return self._recover()
+                return {'ok':False,'state':'PLACE_OUTCOME_UNKNOWN','flow_id':self.flow_id,'financial_retry':False,
+                        'financial_send':True,'charge':'unknown',
+                        'next':f'commerce recover-payment {self.flow_id}; never resend or place a replacement'}
+            # A returned ID is only a read target; exact order binding is still required.
+            return {**self._recover_report(),'financial_send':True}
         return self.locked(action)
 
     def _order(self, state, session, local):
@@ -169,6 +205,7 @@ class Coordinator:
         return row
 
     def complete_payment(self, *, cvv_encryption=None):
+        require(not isinstance(self.transport, AutomaticTransport), 'FOOD_NEEDS_APP_PAYMENT_REQUIREMENT')
         def action():
             self.transport.assert_enabled()
             state=json.loads(self.path.read_text());session=self.session(state);local=j.inspect(self.flow_id)
@@ -192,14 +229,36 @@ class Coordinator:
         return self.locked(action)
 
     def recover(self):
-        return self.locked(self._recover)
+        return self.locked(self._recover_report)
+
+    def _recover_report(self):
+        try:
+            return self._recover()
+        except Exception as exc:
+            state=json.loads(self.path.read_text())
+            local=j.inspect(self.flow_id)
+            code=str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',str(exc)) else 'FOOD_RECOVERY_UNVERIFIED'
+            raise j.PaymentError(code,{'flow_id':self.flow_id,
+                'order':local.get('order_id') or state.get('candidate_order_id'),
+                'amount_minor':state['amount_minor'],'charge':'unknown','financial_retry':False,
+                'tell':'Placement was sent and may have charged the card. Do not place another order.',
+                'next':[f'commerce recover-payment {self.flow_id} (reads only; never resends)']}) from None
 
     def _recover(self):
-        state=json.loads(self.path.read_text());session=self.session(state);local=j.inspect(self.flow_id)
+        state=json.loads(self.path.read_text());local=j.inspect(self.flow_id)
+        candidate=local.get('order_id') or state.get('candidate_order_id')
+        session=(self.reader.retained_session(state, candidate)
+                 if candidate and hasattr(self.reader, 'retained_session') else self.session(state))
+        if not candidate and session.get('order_id'):
+            state['candidate_order_id']=session['order_id'];self.save(state)
         require(any(o['kind']=='place' for o in local['operations']),'FOOD_PLACE_JOURNAL_REQUIRED')
         row=self._order(state,session,local)
         if row is None:
-            return {'state':'PLACE_OUTCOME_UNKNOWN','order':None,'financial_send':False,'financial_retry':False}
+            return {'ok':False,'state':'PLACE_OUTCOME_UNKNOWN','flow_id':self.flow_id,
+                    'order':None,'amount_minor':state['amount_minor'],'charge':'unknown',
+                    'financial_send':False,'financial_retry':False,
+                    'tell':'Placement may have charged the card. Do not place another order.',
+                    'next':f'commerce recover-payment {self.flow_id}; never resend or place a replacement'}
         order=row['order_id'];payment=None
         payment_error=None
         if row.get('intent'):
@@ -211,6 +270,15 @@ class Coordinator:
                 payment_error='FOOD_PAYMENT_PROOF_UNAVAILABLE_OR_MISMATCHED'
         captured=bool(payment and payment['paid'])
         automatic=row.get('automatic_payment_processed') is True
+        needs_app=bool(row.get('intent') or row.get('cvv_required') is True or row.get('completion_required') is True)
+        if automatic and not needs_app and hasattr(self.reader, 'bank_capture'):
+            try:
+                payment=self.reader.bank_capture(order)
+                captured=bool(payment and payment.get('paid'))
+                if captured and payment.get('bank'):
+                    state['bank_purchase']=payment['bank'];self.save(state)
+            except j.JournalError:
+                payment_error='FOOD_BANK_CAPTURE_EVIDENCE_PENDING_OR_MISMATCHED'
         paid=captured;accepted=row.get('accepted') is True
         if local['state']=='COMPLETE':
             require(paid and accepted,'FOOD_COMPLETED_ORDER_EVIDENCE_CHANGED')
@@ -225,44 +293,20 @@ class Coordinator:
                 if accepted:j.observe(self.flow_id,operation,outcome='EXACT_ORDER_CONFIRMED',evidence_hash=j.digest({'order':order,'accepted':True}),order_id=order)
             j.observe(self.flow_id,operation,outcome='TRACKER_REGISTERED',evidence_hash=j.digest(receipt),order_id=order)
             if paid and accepted and j.inspect(self.flow_id)['state']!='FENCED':j.complete(self.flow_id)
-        return {'ok':True,'state':'MERCHANT_PROCESSED_CAPTURE_UNVERIFIED' if automatic and not captured else 'PAID_AND_ACCEPTED' if paid and accepted else 'PAID_AWAITING_ACCEPTANCE' if paid else 'PAYMENT_UNCONFIRMED',
+        return {'ok':True,'state':'NEEDS_APP_PAYMENT_REQUIREMENT' if needs_app and not paid else 'MERCHANT_PROCESSED_CAPTURE_UNVERIFIED' if automatic and not captured else 'PAID_AND_ACCEPTED' if paid and accepted else 'PAID_AWAITING_ACCEPTANCE' if paid else 'PAYMENT_UNCONFIRMED',
                 'capture_verified':captured,'automatic_payment_processed':automatic,
                 'order':order,'paid':paid,'accepted':accepted,'payment':payment,'tracker':receipt,
                 'payment_error':payment_error,
-                'financial_send':False,'financial_retry':False}
+                'financial_send':False,'financial_retry':False,'flow_id':self.flow_id}
 
 
 def contract():
-    return {'implemented':['durable consume-before-send placement/payment coordinator',
-        'session/review/account/address/items/quiet/card/amount/order/intent binding',
-        'read-only exact capture recovery; ambiguous sends never retried',
-        'order-watch receipt and durable state readback; card held until capture plus acceptance'],
-        'live_financial_transport':'disabled; no enable flag or financial HTTP dispatcher',
-        'static_place':{'url':PLACE_URL,'fields':['sessionCode','orderTotal','orderPaymentAmount']},
-        'static_complete':{'url':COMPLETE_URL,'saved_card_fields':['clientSecret','paymentMethodCode',
-            'idCustomerToken','paymentProviderCode','cvvEncryption'],
-            'optional_wallet_fields':['applePayToken','googlePayToken','adcbTokenCode']},
-        'read_only_status':{'url':STATUS_URL,'fields':['clientSecret'],
-            'proof':'exact reference, AED amount/authorized/captured, cc_noonpay, exact selected token binding, payment_confirmed/CAPTURED/error 0'},
-        'live_place_proof':{'date':'2026-11-07','path':'automatic saved card; one placement, no completion',
-            'observed':['owned session orderNr matches placement and exact order',
-                'explicit false paymentRequireCvv and paymentRequireCompletion',
-                'null paymentClientSecret; paymentProcessedAt populated; accepted/accepted',
-                'fresh saved-card token matches prepared binding; preparing tracking'],
-            'capture_verified':False},
-        'live_app_proof':{'date':'2026-11-09','card_last4':'9546','amount_minor':17280,
-            'path':'Android automatic saved-card purchase; one placement, no completion',
-            'observed':['existing cart retained exact items and empty modifier maps',
-                'session paymentRequireCvv=false and paymentRequireCompletion=false',
-                'place response pending/not_synced with null paymentClientSecret',
-                'exact native tracking progressed from processing to preparing',
-                'Mashreq purchase email corroborated card, amount, merchant and time',
-                'owner watcher registration and delivery-card send verified'],
-            'completion_observed':False,'cvv_observed':False,'three_ds_observed':False,
-            'http_payment_capture_verified':False},
-        'unsupported':['automatic null-intent capture closes through bank-evidenced close-food-captured after exact delivery on 2342 only; Mashreq 9546 bank evidence is not yet supported by that command',
-            'unpaid intent status and safe eligibility for first completion; native adapter refuses unknown states',
-            'saved-card absent wallet-field serialization and encrypted-CVV request acceptance',
-            '3DS challenge/return contract; recovery reads status only and never follows redirect URLs',
-            'other early acceptance pairs beyond accepted/accepted'],
-        'proof_required':'Fresh unpaid intent eligibility, encrypted-CVV acceptance and 3DS return evidence remain required. Automatic app purchase evidence does not enable CLI payment or NowNow 9546. Never replay placement or payment.'}
+    return {'live_financial_transport':'automatic saved-card placement only',
+        'purchase_enabled':True,'cards':['9546','2342'],
+        'eligibility':'fresh exact reviewed session, explicit false CVV/completion requirements, null intent',
+        'capture':'exact native order automatic capture/processed timestamp plus unique bank purchase matching card, AED amount and placement time',
+        'recovery':'retained exact order ID after session expiry; never resend placement or payment',
+        'unsupported':['real payment intent, CVV or 3DS requirement: needs app; no completion writer',
+                       'NowNow 9546: different native endpoint and no equivalent automatic-capture proof yet'],
+        'historical_proof':['2026-11-07 Food HTTP placement on 2342',
+                            '2026-11-09 native automatic Food captures on 9546']}

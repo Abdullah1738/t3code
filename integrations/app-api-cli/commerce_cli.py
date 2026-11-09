@@ -207,6 +207,8 @@ def capabilities():
         'nownow_selected_card_purchase_enabled':order_card.LAST4=='2342',
         'marketplace_card_selection':'requires matching default card in noon app',
         'verticals':{
+        'noon.food':{'purchase_enabled':True,'payment':'automatic_saved_card_native_and_bank',
+            'cards':['9546','2342'],'explicit_payment_requirements':'needs_app','financial_retry':False},
         'noon.minutes':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
             'place':'live_order_created','payment':'live_confirmed_e2e_paid_order_2026_10_10',
             'tracking':'exact_native','rejected_auth_renewal_proven':False,
@@ -717,7 +719,7 @@ def review_contract(vertical):
     if vertical=='food':
         from noon_food_financial import contract
         return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
-            'prepare_only':True,'purchase_enabled':False,'financial_send':False,
+            'prepare_only':True,'purchase_enabled':True,'financial_send':False,
             'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes',order_card.LAST4],
             'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
             'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
@@ -1032,7 +1034,7 @@ def main(argv=None):
     talabat_arguments(buy)
     order=commands.add_parser('order')
     order_commands=order.add_subparsers(dest='order_command',required=True)
-    food_order=order_commands.add_parser('food', help='Journalled Food prepare-only; paid transport is disabled pending proof')
+    food_order=order_commands.add_parser('food', help='Journalled Food automatic saved-card order; explicit payment requirements need app')
     food_order.add_argument('--outlet-code',required=True)
     food_order.add_argument('--items-file',required=True)
     food_order.add_argument('--prepare-only',action='store_true')

@@ -541,15 +541,24 @@ remain bound to their original card; use the original card override for historic
 Minutes/NowNow/Main/Supermall recovery. Food read-only recovery derives its card
 from the retained review and verifies the original journal scope/token hash.
 
-Food paid HTTP transport remains disabled: a native-app automatic payment does
-not prove a fresh unpaid-intent completion/CVV/3DS wire contract. Preparation,
-exact reads and financial journalling retain the same no-resend guards. Do not
-clear the older automatic-payment journal fence based solely on delivered status.
+Food HTTP placement supports the automatic saved-card path. `commerce order food`
+prepares and reviews the exact basket, then checks native `session/can-place` for
+explicit false CVV/completion requirements, the original card token, zero wallet,
+and matching totals. The journal consumes placement before its single HTTP send.
+`--prepare-only` never places; `--resume-flow` binds the original basket.
+Real payment intents, CVV or 3DS requirements need the app; no completion is sent.
+`recover-payment` rereads the retained exact order ID after session expiry.
+Capture requires native automatic processing and a unique bank purchase matching
+the original card, AED amount, merchant and placement time. Mashreq 9546 emails
+and EmiratesNBD 2342 SMS are supported. A purchase notification cannot confirm
+two journalled orders. Until capture and acceptance are verified, the card stays
+held; completion also requires the watcher and delivery-card sent receipt.
 
 Main/Supermall require the selected card to be the noon account default; they
 never switch saved cards. Change that default in the noon app before using a
 different card. NowNow 9546 paid orders refuse before cart changes pending
-verified Visa payment evidence; use the phone, not an unauthorized 2342 override.
+verified Visa payment evidence. Report the CLI limitation before any authorized
+phone fallback; never use an unauthorized 2342 override.
 Visa refund code/title matching is synthetic-fixture coverage only. Unfamiliar
 refund wording remains fenced and must be inspected before extending the parser.
 
@@ -565,7 +574,6 @@ independently corroborated the amount, card, merchant and time. The owner tracke
 and delivery card were registered and sent.
 
 No payment-intent completion, CVV submission or 3DS challenge occurred. This
-proves the app's automatic Visa purchase route, not the disabled CLI transport
-or NowNow's payment contract. `close-food-captured` still supports only the
-EmiratesNBD 2342 evidence format. Do not treat the new bank email as accepted
-input to that command or manufacture a completion request for this paid order.
+establishes the automatic Food contract used by the CLI, alongside the 7 November
+HTTP placement. It does not establish NowNow's different payment contract.
+Never manufacture a completion request for an automatic paid order.

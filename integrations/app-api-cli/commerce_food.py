@@ -1,4 +1,4 @@
-"""Journalled Food preparation. Financial transport stays closed pending proof."""
+"""Journalled Food preparation and automatic saved-card placement."""
 import json
 import os
 import re
@@ -19,7 +19,7 @@ ROOT = Path.home()/'.local/state/app-api-cli/commerce/food'
 PREFIX = 'https://api-app-fd.noon.com/_svc/mp-food-api-mpnoon/session/'
 QUIET = {'leavedoor': True, 'dontring': True, 'avoidcalling': True}
 ROUTES = {'create': {'menuCode','menuVersion','outletCode','addressCode','addressKey','items','deliveryType','scheduleAt'},
-          'details': {'sessionCode'}, 'set-delivery-preference': {'sessionCode','deliveryPreference'},
+          'details': {'sessionCode'}, 'can-place': {'sessionCode'}, 'set-delivery-preference': {'sessionCode','deliveryPreference'},
           'add-notes': {'sessionCode','driverNotes'},
           'add-item': {'sessionCode','itemCode','qty','modifiers','notes'},
           'set-payment-method': {'sessionCode','walletAmount','creditCardMask','paymentMethod','prepaidPaymentMethod','paymentTokenCode'}}
@@ -232,14 +232,19 @@ class FoodFlow:
         review['display_items']=[{'name':names[r['itemCode']],'qty':r['qty']} for r in self.rows]
         self.state['review_hash']=journal.digest(review); self.state['review']=review; self.save()
         return {'ok':True,'state':'PREPARED_NOT_ORDERED','flow_id':self.flow_id,'review':review,
-                'financial_send':False,'purchase_enabled':False,'cleanup':'Leave this isolated session; no owner basket was reset or cleared.'}
+                'financial_send':False,'purchase_enabled':True,'cleanup':'Leave this isolated session; no owner basket was reset or cleared.'}
 
 
 def prepare(args):
-    require(args.prepare_only, 'FOOD_PAID_TRANSPORT_NOT_YET_VERIFIED')
     raw=json.loads(Path(args.items_file).read_text())
     rows=raw.get('items') if isinstance(raw,dict) else raw
-    return FoodFlow(args.outlet_code, rows, args.resume_flow).prepare()
+    flow=FoodFlow(args.outlet_code, rows, args.resume_flow)
+    result=flow.prepare()
+    if args.prepare_only:return result
+    from noon_food_financial import Coordinator, AutomaticTransport
+    from noon_food_recovery import NativeReader, TrackerRegistrar
+    reader=NativeReader(flow.flow_id)
+    return Coordinator(flow.flow_id,reader,TrackerRegistrar(reader),transport=AutomaticTransport(reader)).place()
 
 
 def recover(flow_id):
@@ -250,7 +255,7 @@ def recover(flow_id):
     if local.get('state')=='COMPLETE' and attestation.get('kind')=='food_automatic_captured':
         return {'ok':True,'flow_id':flow_id,'state':'COMPLETE','order':local['order_id'],
                 'charge':'captured','capture_evidence':'bank_sms_and_exact_delivery',
-                'financial_send':False,'financial_retry':False,'purchase_enabled':False}
+                'financial_send':False,'financial_retry':False,'purchase_enabled':True}
     if any(o['kind'] in ('place','payment') for o in local['operations']):
         from noon_food_financial import Coordinator
         from noon_food_recovery import NativeReader, TrackerRegistrar
@@ -265,4 +270,4 @@ def recover(flow_id):
     return {'ok':True,'flow_id':flow_id,'state':'NOT_ORDERED' if not data.get('orderNr') else 'EXTERNAL_ORDER_OBSERVED',
             'order':data.get('orderNr'),'financial_send':False,'financial_retry':False,
             'review':flow.review(data,quiet=bool(state.get('review'))) if not data.get('orderNr') else None,
-            'purchase_enabled':False}
+            'purchase_enabled':True}

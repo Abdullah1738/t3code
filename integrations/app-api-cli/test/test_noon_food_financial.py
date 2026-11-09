@@ -42,7 +42,7 @@ class Reader:
 class FoodFinancialTests(unittest.TestCase):
     def setUp(self):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
-        self.root=Path(temp.name)
+        self.root=Path(temp.name)/"commerce"
         p=patch.object(j,'ROOT',self.root);p.start();self.addCleanup(p.stop)
         self.flow=str(uuid.uuid4())
         j.open_flow(flow_id=self.flow,app='noon',vertical='food',account_hash='a'*64,scope_hash='b'*64)
@@ -57,6 +57,66 @@ class FoodFinancialTests(unittest.TestCase):
             self.registrations.append((order,paid))
             return {'registered':True,'order':order,'held':not paid}
         self.co=f.Coordinator(self.flow,self.reader,register,transport=self.transport)
+
+    def test_automatic_bank_capture_completes_without_payment_send(self):
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        self.reader.bank_capture=lambda order:{'paid':True,'order':order,'source':'native_and_bank'}
+        result=self.co.place()
+        self.assertTrue(result['capture_verified'])
+        self.assertEqual(j.inspect(self.flow)['state'],'COMPLETE')
+        self.assertEqual([call[0] for call in self.calls],['place'])
+        self.co.recover()
+        self.assertEqual(len(self.calls),1)
+
+    def test_bank_receipt_cannot_be_claimed_by_another_order(self):
+        self.co.place()
+        bank={'source_id':516800,'amount_minor':4585}
+        j.claim_food_bank_purchase(self.flow,bank)
+        j.claim_food_bank_purchase(self.flow,bank)
+        other=str(uuid.uuid4())
+        j.open_flow(flow_id=other,app='noon',vertical='food',account_hash='d'*64,scope_hash='e'*64)
+        j.consume(other,'place',kind='place',request_hash='f'*64,cart_hash='f'*64,review_hash='f'*64,payable_minor=4585)
+        j.observe(other,'place',outcome='ORDER_ID_RECEIVED',evidence_hash='f'*64,order_id='FOTHER')
+        with self.assertRaisesRegex(j.JournalError,'ALREADY_CLAIMED'):j.claim_food_bank_purchase(other,bank)
+
+    def test_response_order_survives_first_detail_read_failure(self):
+        self.transport.send=lambda *args:{'candidate_order_id':ORDER}
+        self.reader.retained_session=lambda state,order:{**self.reader.session_data,'order_id':order}
+        original=self.reader.order
+        self.reader.order=Mock(side_effect=TimeoutError('private error'))
+        with self.assertRaises(j.PaymentError) as error:self.co.place()
+        self.assertEqual(error.exception.details['order'],ORDER)
+        self.assertEqual(error.exception.details['charge'],'unknown')
+        self.assertEqual(json.loads(self.co.path.read_text())['candidate_order_id'],ORDER)
+        self.reader.session=Mock(side_effect=AssertionError('expired'))
+        self.reader.order=original
+        self.assertEqual(self.co.recover()['order'],ORDER)
+        with self.assertRaises(j.JournalError):self.co.place()
+
+    def test_bank_pending_keeps_order_held(self):
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        self.reader.bank_capture=Mock(side_effect=j.JournalError('pending'))
+        result=self.co.place()
+        self.assertFalse(result['paid'])
+        self.assertTrue(result['tracker']['held'])
+        self.assertNotEqual(j.inspect(self.flow)['state'],'COMPLETE')
+
+    def test_automatic_transport_requires_explicit_eligibility(self):
+        self.co.transport=f.AutomaticTransport(self.reader)
+        with patch.object(self.co.transport,'send') as send:
+            with self.assertRaisesRegex(j.JournalError,'NEEDS_APP'):self.co.place()
+            with self.assertRaisesRegex(j.JournalError,'NEEDS_APP'):self.co.complete_payment()
+            send.assert_not_called()
+        self.assertEqual(j.inspect(self.flow)['operations'],[])
+
+    def test_retained_order_recovery_skips_expired_session(self):
+        self.co.place()
+        self.reader.retained_session=lambda state,order:{**self.reader.session_data,'order_id':order}
+        self.reader.session=Mock(side_effect=AssertionError('expired session must not be read'))
+        self.reader.order_data.update(intent=None,accepted=True,automatic_payment_processed=True)
+        self.reader.bank_capture=lambda order:{'paid':True,'order':order}
+        self.assertTrue(self.co.recover()['paid'])
+        self.assertEqual(len(self.calls),1)
 
     def test_default_transport_refuses_before_reads_or_journal(self):
         reader=Mock()
@@ -74,7 +134,7 @@ class FoodFinancialTests(unittest.TestCase):
         with self.assertRaises(j.JournalError):self.co.place()
         self.assertEqual(self.co.path.read_text(),before)
         result=self.co.recover()
-        self.assertEqual(result['state'],'PAYMENT_UNCONFIRMED')
+        self.assertEqual(result['state'],'NEEDS_APP_PAYMENT_REQUIREMENT')
         self.assertEqual(result['order'],ORDER)
         self.assertTrue(result['tracker']['held'])
         self.assertEqual(len(self.calls),1)
@@ -87,6 +147,10 @@ class FoodFinancialTests(unittest.TestCase):
     def test_place_without_exact_session_order_retains_reservation(self):
         self.fail_send='place';self.co.place();self.reader.session_data['order_id']=None
         self.assertEqual(self.co.recover()['state'],'PLACE_OUTCOME_UNKNOWN')
+        unknown=self.co.recover()
+        self.assertIs(unknown['ok'],False)
+        self.assertEqual(unknown['flow_id'],self.flow)
+        self.assertEqual(unknown['charge'],'unknown')
         self.assertEqual(j.inspect(self.flow)['reserved_minor'],4585)
         self.assertEqual(self.registrations,[])
         with self.assertRaises(j.JournalError):
@@ -133,6 +197,10 @@ class FoodFinancialTests(unittest.TestCase):
         self.assertEqual(j.inspect(self.flow)['operations'][0]['state'],'MAY_HAVE_SENT')
         with self.assertRaises(j.JournalError):self.co.place()
         self.assertEqual(self.co.recover()['state'],'PLACE_OUTCOME_UNKNOWN')
+        unknown=self.co.recover()
+        self.assertIs(unknown['ok'],False)
+        self.assertEqual(unknown['flow_id'],self.flow)
+        self.assertEqual(unknown['charge'],'unknown')
         self.reader.session_data['order_id']=ORDER;self.reader.capture();self.reader.order_data['accepted']=True
         self.assertEqual(self.co.recover()['state'],'PAID_AND_ACCEPTED')
 
@@ -144,7 +212,7 @@ class FoodFinancialTests(unittest.TestCase):
             except j.JournalError:return 'blocked'
         with ThreadPoolExecutor(max_workers=2) as pool:
             results=list(pool.map(place,[self.co,other]))
-        self.assertEqual(sorted(results),['PAYMENT_UNCONFIRMED','blocked'])
+        self.assertEqual(sorted(results),['NEEDS_APP_PAYMENT_REQUIREMENT','blocked'])
         self.assertEqual(len(self.calls),1)
 
     def test_retained_state_must_match_journal_quote(self):
@@ -155,7 +223,7 @@ class FoodFinancialTests(unittest.TestCase):
 
     def test_successful_complete_ack_is_not_capture(self):
         self.co.place()
-        self.assertEqual(self.co.complete_payment()['state'],'PAYMENT_UNCONFIRMED')
+        self.assertEqual(self.co.complete_payment()['state'],'NEEDS_APP_PAYMENT_REQUIREMENT')
         with self.assertRaises(j.JournalError):self.co.complete_payment()
         self.assertNotEqual(j.inspect(self.flow)['state'],'COMPLETE')
         self.assertEqual(len(self.calls),2)
@@ -182,7 +250,7 @@ class FoodFinancialTests(unittest.TestCase):
         result=self.co.place()
         self.assertEqual(result['order'],ORDER)
         self.assertTrue(result['tracker']['held'])
-        self.assertEqual(result['state'],'PAYMENT_UNCONFIRMED')
+        self.assertEqual(result['state'],'NEEDS_APP_PAYMENT_REQUIREMENT')
         self.assertIsNotNone(result['payment_error'])
 
     def test_different_session_review_amount_card_or_account_block_recovery(self):
@@ -280,6 +348,20 @@ class NativeOrderTests(unittest.TestCase):
             'driverNotes':food.QUIET_NOTE,'paymentClientSecret':INTENT,'orderStatusCode':'delivered'}
         return flow,state,raw
 
+    def test_nov9_captured_automatic_payment_shape(self):
+        captured=json.loads((Path(__file__).parent/'fixture_food_automatic_20261109.json').read_text())
+        flow,state,raw=self.fixture()
+        state['review'].update(card_last4=captured['card_last4'],payable_minor=17280)
+        raw.update({k:captured[k] for k in ('orderStatusCode','outletStatusCode','orderTotal','orderPaymentAmount','orderWalletAmount','paymentProcessedAt')})
+        raw.update(creditCardMask='****9546',paymentClientSecret=None,miscInfo={'isPaymentAutoCapture':captured['automatic_capture']},
+                   orderRefundToWallet=0,orderIssuedCredit=0,orderAdjustments=0,failedErrorMsg=None)
+        reader=recovery.NativeReader.__new__(recovery.NativeReader)
+        reader.flow=flow;reader.state=state;reader.session_data={}
+        with patch.object(recovery.vertical,'_read',return_value=raw),patch.object(recovery.vertical,'_food_data',side_effect=lambda v:v):
+            self.assertTrue(reader.order(ORDER)['automatic_payment_processed'])
+            raw['paymentClientSecret']='unexpected-intent'
+            self.assertFalse(reader.order(ORDER)['automatic_payment_processed'])
+
     def test_native_order_projection_and_mismatch_guards(self):
         flow,state,raw=self.fixture()
         self.assertTrue(recovery.project_order(raw,ORDER,flow,state)['accepted'])
@@ -340,14 +422,14 @@ class NativeOrderTests(unittest.TestCase):
             'items':flow.rows,'deliveryPreferenceInfo':[{'code':k,'value':True} for k in food.QUIET],
             'driverNotes':food.QUIET_NOTE,'creditCardMask':'****2342','paymentMethodCode':'prepaid',
             'prepaidPaymentMethodCode':'cc_noonpay','orderWalletAmount':0,'orderPaymentAmount':45.85,'orderTotal':45.85,
-            'paymentToken':CARD}
+            'paymentToken':CARD,'orderPaymentFinalTotal':45.85}
         review=flow.review(data)
         reader=recovery.NativeReader.__new__(recovery.NativeReader);reader.flow_id='synthetic'
         reader.state={'outlet':flow.outlet,'items':flow.rows,'session':'SESSION1',
             'review':review,'review_hash':j.digest(review),'card_hash':j.digest(CARD)}
         flow.read=lambda:data
-        with patch.object(food,'FoodFlow',return_value=flow),patch.object(j,'inspect',return_value={
-                'operations':[{'name':'set_payment_method','state':'OBSERVED'}]}):
+        with patch.object(recovery.vertical,'food_orders',return_value={'orders':[]}),patch.object(food,'FoodFlow',return_value=flow),patch.object(food,'request',side_effect=lambda *a:data),patch.object(j,'inspect',return_value={
+                'operations':[{'name':'set_payment_method','state':'OBSERVED','kind':'cart'}]}):
             self.assertIsNone(reader.session()['order_id'])
             data['orderNr']=ORDER
             self.assertEqual(reader.session()['order_id'],ORDER)
@@ -378,7 +460,7 @@ class RegistrarTests(unittest.TestCase):
             cfgpath.write_text(json.dumps(config));watchpath.write_text(json.dumps({'id':name}))
             reader=SimpleNamespace(flow_id='synthetic',state={'review':{'store':'Restaurant'}})
             registrar=recovery.TrackerRegistrar(reader)
-            receipt={'tracker_id':name,'watcher_registered':True,'moni_notified':'skipped'}
+            receipt={'tracker_id':name,'watcher_registered':True,'moni_notified':'skipped','delivery_card':{'status':'sent'}}
             result=SimpleNamespace(returncode=0,stdout=json.dumps(receipt).encode())
             with patch.object(j,'inspect',return_value={'order_id':ORDER,'reserved_minor':4585}),\
                  patch.object(recovery.subprocess,'run',return_value=result) as run:

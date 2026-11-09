@@ -38,18 +38,25 @@ def parse_purchase(text):
     # Keep just the purchase sentence; available credit is unrelated private data.
     match = re.match(r'Purchase of AED ([0-9]+(?:,[0-9]{3})*\.[0-9]{2}) with Credit Card ending '
                      r'([0-9]{4}) at ([^\n.]+)\.', text, re.I)
+    if match is None:
+        mashreq = re.search(r'Your Mashreq noon Card ending with ([0-9]{4}) was used for a purchase of AED '
+            r'([0-9]+(?:,[0-9]{3})*\.[0-9]{2}) at ([^\n]+?) on '
+            r'(\d{2}-[A-Z]{3}-\d{4} \d{2}:\d{2} [AP]M)\.', text, re.I)
+        require(mashreq is not None, 'BANK_TEXT_INVALID')
+        return {'amount_minor':int(Decimal(mashreq[2].replace(',', ''))*100),
+                'card_last4':mashreq[1], 'merchant':mashreq[3], 'evidence':mashreq[0]}
     require(match is not None, 'BANK_TEXT_INVALID')
     return {'amount_minor': int(Decimal(match[1].replace(',', '')) * 100),
             'card_last4': match[2], 'merchant': match[3], 'evidence': match[0]}
 
 
-def bank_message(message_id, placed_at):
+def bank_message(message_id, placed_at, card_last4='2342'):
     require(type(message_id) is int and message_id > 0, 'BANK_SOURCE_INVALID')
     day = dt.datetime.fromtimestamp(placed_at, dt.timezone(dt.timedelta(hours=4))).date()
     # show has no JSON mode. Search supplies original sender/id/epoch; its
     # highlighted snippet can be the sender, so read the exact message for text.
-    command = [str(Path.home()/'.local/bin/msgs'), 'search', 'in:imessage',
-               '--from', 'EmiratesNBD', '--since', str(day), '--until', str(day + dt.timedelta(days=2)),
+    command = [str(Path.home()/'.local/bin/msgs'), 'search', 'in:email' if card_last4=='9546' else 'in:imessage',
+               '--from', 'MashreqAlerts@mashreq.com' if card_last4=='9546' else 'EmiratesNBD', '--since', str(day), '--until', str(day + dt.timedelta(days=2)),
                '--json', '-n', '100']
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=20, check=True)
@@ -59,7 +66,7 @@ def bank_message(message_id, placed_at):
     matches = [r for r in rows if type(r) is dict and r.get('id') == message_id]
     require(len(matches) == 1, 'BANK_MESSAGE_NOT_FOUND')
     row = matches[0]
-    require(row.get('source') == 'imessage' and row.get('from_me') == 0
+    require(row.get('source') == ('email' if card_last4=='9546' else 'imessage') and row.get('from_me') == 0
             and row.get('deleted_at') is None, 'BANK_SOURCE_INVALID')
     require(type(row.get('sender')) is str, 'BANK_SENDER_INVALID')
     try:
@@ -69,25 +76,37 @@ def bank_message(message_id, placed_at):
         j.fail('FOOD_CAPTURE_CLOSE_BANK_READ_FAILED')
     lines = re.findall(r'^>\s+' + str(message_id) + r' \d{4}-\d\d-\d\d \d\d:\d\d '
                        + re.escape(row['sender']) + r': ([^\n]+)$', shown.stdout, re.M)
+    if card_last4=='9546':lines=[shown.stdout]
     require(len(lines) == 1, 'BANK_TEXT_INVALID')
     return {'source': 'msgs', 'source_id': message_id, 'sender': row.get('sender'),
             'timestamp': row.get('ts'), **parse_purchase(lines[0])}
 
 
-def validate_bank(bank, amount, placed_at):
+def validate_bank(bank, amount, placed_at, card_last4='2342'):
     require(type(bank) is dict and bank.keys() == BANK_FIELDS, 'BANK_SCHEMA_INVALID')
     require(bank.get('source') == 'msgs'
             and type(bank.get('source_id')) is int and bank['source_id'] > 0, 'BANK_SOURCE_INVALID')
     require(type(bank.get('sender')) is str
-            and re.fullmatch(r'emirates\s*nbd', bank['sender'].strip(), re.I) is not None, 'BANK_SENDER_INVALID')
+            and re.fullmatch(r'mashreqalerts@mashreq\.com' if card_last4=='9546' else r'emirates\s*nbd', bank['sender'].strip(), re.I) is not None, 'BANK_SENDER_INVALID')
     parsed = parse_purchase(bank.get('evidence'))
     require(all(bank.get(k) == v for k, v in parsed.items()), 'BANK_TEXT_MISMATCH')
     require(type(bank.get('amount_minor')) is int and bank['amount_minor'] == amount, 'AMOUNT_MISMATCH')
-    require(bank.get('card_last4') == '2342', 'CARD_MISMATCH')
-    require(re.fullmatch(r'noon(?:,\s*dubai)?', bank['merchant'].strip(), re.I) is not None,
+    require(card_last4 in ('9546','2342') and bank.get('card_last4') == card_last4, 'CARD_MISMATCH')
+    require(re.fullmatch(r'noon(?:,\s*dubai| 80038888 AE)?', bank['merchant'].strip(), re.I) is not None,
             'MERCHANT_MISMATCH')
-    require(type(bank.get('timestamp')) is int and 0 < bank['timestamp'] - placed_at <= 1800,
+    arrival_window=172800 if card_last4=='9546' else 1800
+    require(type(bank.get('timestamp')) is int and 0 < bank['timestamp'] - placed_at <= arrival_window,
             'BANK_TIME_INVALID')
+    if card_last4=='9546':
+        match=re.search(r' on (\d{2}-[A-Z]{3}-\d{4} \d{2}:\d{2} [AP]M)\.$', bank['evidence'], re.I)
+        require(match is not None,'BANK_TIME_UNPARSEABLE')
+        try:
+            purchase_time=dt.datetime.strptime(match[1],'%d-%b-%Y %I:%M %p').replace(
+                tzinfo=dt.timezone(dt.timedelta(hours=4))).timestamp()
+        except ValueError:
+            j.fail('FOOD_CAPTURE_CLOSE_BANK_TIME_UNPARSEABLE')
+        # Bank text has minute precision; email arrival alone cannot date a purchase.
+        require(-60 < purchase_time-placed_at <= 1800,'BANK_TIME_INVALID')
     try:
         j.validate_owner_attestation(evidence=bank['evidence'], attested_by='owner')
     except j.JournalError:
@@ -101,9 +120,8 @@ def automatic_order(flow_id, order):
     import noon_vertical_reads as vertical
     import noon_http_orders as core
     state = json.loads((j.ROOT/'food'/(flow_id+'.json')).read_text())
-    # This bank parser only accepts EmiratesNBD 2342. Never attach its receipt
-    # to an automatic order prepared with another supported card.
-    require((state.get('review') or {}).get('card_last4') == '2342', 'CARD_MISMATCH')
+    # Recovery follows the original prepared card, never the current default.
+    require((state.get('review') or {}).get('card_last4') in ('2342','9546'), 'CARD_MISMATCH')
     rows = [{'item_code': r['itemCode'], 'qty': r['qty'], 'modifiers': r['modifiers'], 'notes': r['notes']}
             for r in state['items']]
     flow = food.FoodFlow(state['outlet'], rows, flow_id, read_only=True)
@@ -121,11 +139,46 @@ def automatic_order(flow_id, order):
             'processed_at': data['paymentProcessedAt']}
 
 
+def find_bank_capture(placed_at, amount, card_last4):
+    """Require one exact purchase in the placement window; ambiguity stays held."""
+    day=dt.datetime.fromtimestamp(placed_at,dt.timezone(dt.timedelta(hours=4))).date()
+    sender='MashreqAlerts@mashreq.com' if card_last4=='9546' else 'EmiratesNBD'
+    command=[str(Path.home()/'.local/bin/msgs'),'search',
+             'in:email' if card_last4=='9546' else 'in:imessage','--from',sender,
+             '--since',str(day),'--until',str(day+dt.timedelta(days=2)),'--json','-n','100']
+    try:
+        result=subprocess.run(command,capture_output=True,text=True,timeout=20,check=True)
+        rows=[json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    except (OSError,ValueError,subprocess.SubprocessError):
+        j.fail('FOOD_BANK_READ_UNAVAILABLE')
+    require(len(rows)<100,'BANK_SEARCH_TRUNCATED')
+    matches=[]
+    for row in rows:
+        window=172800 if card_last4=='9546' else 1800
+        require(isinstance(row,dict) and type(row.get('id')) is int
+                and type(row.get('ts')) is int,'BANK_SEARCH_ROW_INVALID')
+        if not 0 < row['ts']-placed_at <= window:continue
+        try:
+            bank=bank_message(row['id'],placed_at,card_last4)
+            validate_bank(bank,amount,placed_at,card_last4)
+            matches.append(bank)
+        except j.JournalError as exc:
+            # A read failure is unknown evidence, not a nonmatching purchase.
+            if str(exc) in {'FOOD_CAPTURE_CLOSE_'+suffix for suffix in (
+                    'AMOUNT_MISMATCH','CARD_MISMATCH','MERCHANT_MISMATCH','BANK_TIME_INVALID',
+                    'BANK_SENDER_INVALID','BANK_SOURCE_INVALID')}:
+                continue
+            raise
+    require(len(matches)==1,'BANK_PURCHASE_NOT_UNIQUE_OR_PENDING')
+    return matches[0]
+
+
 def close(args, track_exact):
     local = j.inspect(args.flow_id)
     require(local['app'] == 'noon' and local['vertical'] == 'food', 'FOOD_FLOW_REQUIRED')
     require(local['order_id'] is not None, 'ORDER_MISMATCH')
-    bank = bank_message(args.bank_msg_id, j.food_capture_placed_at(args.flow_id))
+    state=json.loads((j.ROOT/'food'/(args.flow_id+'.json')).read_text())
+    bank = bank_message(args.bank_msg_id, j.food_capture_placed_at(args.flow_id), state['review']['card_last4'])
     raw = track_exact('noon', 'food', local['order_id'])
     # Observation time changes on every read; the immutable audit binds the
     # exact delivered result and automatic payment projection instead.
