@@ -12941,7 +12941,7 @@ const withOwnerRouteMode = <A, E, R>(
 /** Polls in real time; owner routes drain on their own fiber. */
 const eventually = <A, E, R>(read: Effect.Effect<A, E, R>, done: (value: A) => boolean) =>
   Effect.gen(function* () {
-    for (let attempt = 0; attempt < 400; attempt += 1) {
+    for (let attempt = 0; attempt < 1500; attempt += 1) {
       const value = yield* read;
       if (done(value)) return value;
       yield* Effect.sleep("10 millis");
@@ -13133,5 +13133,171 @@ it.effect("inline owner routes (the rollback) deliver in the reply and keep no r
       assert.isNotNull(evaluator);
       assert.deepStrictEqual(yield* sql`SELECT id FROM ardud_kanban_owner_routes`, []);
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(fake.layer), "inline")));
+  }),
+);
+
+/** Sends whose text matches fail while `blocked` says so, like a refused provider. */
+const refusingSends = (fake: Effect.Success<typeof makeFake>, blocked: (text: string) => boolean) =>
+  Layer.effect(
+    KanbanThreads,
+    Effect.map(KanbanThreads, (real) =>
+      KanbanThreads.of({
+        ...real,
+        send: (input) =>
+          Effect.suspend(() =>
+            blocked(input.text)
+              ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "refused" }))
+              : real.send(input),
+          ),
+      }),
+    ),
+  ).pipe(Layer.provide(fake.layer));
+
+const routeOutcomes = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ json: string; done_at: string | null }>`
+    SELECT json, done_at FROM ardud_kanban_owner_routes ORDER BY id`;
+  return rows.map((row) => (row.done_at === null ? "pending" : JSON.parse(row.json).outcome));
+});
+
+it.live("a later owner post never overtakes one whose delivery is still failing", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let refuse = true;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Live" });
+      const channel = yield* kanban.createDiscussion(board.id, "Order", owner);
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Ready" },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Proceed first" }]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Cancel second" }]);
+      yield* eventually(routeOutcomes, (all) => all.length === 2);
+      yield* Effect.sleep("300 millis");
+      const early = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+      assert.isFalse(early.some((text) => text.includes("Cancel second")));
+      refuse = false;
+      yield* eventually(routeOutcomes, (all) => all.every((outcome) => outcome === "delivered"));
+      const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+      const first = messages.findIndex((text) => text.includes("Proceed first"));
+      const second = messages.findIndex((text) => text.includes("Cancel second"));
+      assert.isTrue(first >= 0 && second > first);
+    }).pipe(
+      Effect.provide(
+        withOwnerRouteMode(
+          testLayer(refusingSends(fake, (text) => refuse && text.includes("Proceed first"))),
+          "deferred",
+        ),
+      ),
+    );
+  }),
+);
+
+it.live("an owner answer changed while its delivery is retrying is never delivered", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let refuse = true;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Pick" });
+      const channel = yield* kanban.createDiscussion(board.id, "Change", owner);
+      const asked = yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        {
+          _tag: "choice",
+          id: "change-choice",
+          style: "pick",
+          question: "Ship?",
+          options: [
+            { id: "yes", label: "Ship it" },
+            { id: "no", label: "Hold it" },
+          ],
+          multi: false,
+        },
+      ]);
+      yield* kanban.answer(channel.id, asked.seq, "change-choice", ["yes"], owner);
+      yield* kanban.answer(channel.id, asked.seq, "change-choice", ["no"], owner);
+      refuse = false;
+      const outcomes = yield* eventually(routeOutcomes, (all) =>
+        all.every((outcome) => outcome !== "pending"),
+      );
+      assert.deepStrictEqual(outcomes, ["superseded", "delivered"]);
+      const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+      assert.isFalse(messages.some((text) => text.includes("Ship it")));
+      assert.strictEqual(messages.filter((text) => text.includes("Hold it")).length, 1);
+    }).pipe(
+      Effect.provide(
+        withOwnerRouteMode(
+          testLayer(refusingSends(fake, (text) => refuse && text.includes("Ship it"))),
+          "deferred",
+        ),
+      ),
+    );
+  }),
+);
+
+it.live("routes saved before a switch to inline still replay after the restart", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-route-" });
+    const dbPath = path.join(directory, "state.sqlite");
+    const fake = yield* makeFake;
+    let refuse = true;
+    const layer = (mode: KanbanService.OwnerRouteMode) =>
+      withOwnerRouteMode(
+        fileTestLayer(
+          refusingSends(fake, (text) => refuse && text.includes("Before rollback")),
+          dbPath,
+        ),
+        mode,
+      );
+    const ids = yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Live" });
+      const channel = yield* kanban.createDiscussion(board.id, "Rollback", owner);
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Ready" },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Before rollback" }]);
+      yield* eventually(routeOutcomes, (all) => all.length === 1);
+      return { evaluator };
+    }).pipe(Effect.provide(layer("deferred")));
+    refuse = false;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      yield* kanban.ready;
+      yield* eventually(routeOutcomes, (all) => all.length === 1 && all[0] === "delivered");
+      const messages = (yield* Ref.get(fake.threads)).get(ids.evaluator)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("Before rollback")).length, 1);
+    }).pipe(Effect.provide(layer("inline")));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("an owner route that keeps failing is closed as undeliverable, with a notice", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Live" });
+      const channel = yield* kanban.createDiscussion(board.id, "Lost", owner);
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Ready" },
+      ]);
+      fake.rejectSends.add(evaluator);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Never lands" }]);
+      let outcomes: ReadonlyArray<string> = [];
+      for (let step = 0; step < 200; step += 1) {
+        yield* TestClock.adjust("5 seconds");
+        outcomes = yield* routeOutcomes;
+        if (outcomes[0] !== "pending") break;
+      }
+      assert.deepStrictEqual(outcomes, ["undeliverable"]);
+      const texts = (yield* kanban.messages(channel.id)).flatMap((message) =>
+        message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
+      );
+      assert.strictEqual(texts.filter((text) => text.includes("delivery pending")).length, 1);
+      assert.strictEqual(texts.filter((text) => text.includes("could not be delivered")).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
