@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { v2Project, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import {
   applyShellStreamEvent,
+  mergeShellSnapshotPage,
   mergeShellSnapshotProjects,
   reuseUnchangedThreadShells,
 } from "./shellReducer.ts";
@@ -585,5 +586,114 @@ describe("reuseUnchangedThreadShells", () => {
     const next = reuseUnchangedThreadShells({ ...v2ShellSnapshot, threads: [linked] }, incoming);
     expect(next).toBe(incoming);
     expect(next.threads[0]?.pullRequests).toBe(updated.pullRequests);
+  });
+});
+
+describe("mergeShellSnapshotPage", () => {
+  const row = (id: string, title = id) => ({ ...v2ThreadShell, id: ThreadId.make(id), title });
+  const ids = (snapshot: { readonly threads: ReadonlyArray<{ readonly id: string }> }) =>
+    snapshot.threads.map((thread) => thread.id);
+  const shown = {
+    ...v2ShellSnapshot,
+    snapshotSequence: 3,
+    threads: [row("a"), row("m"), row("z")],
+  };
+
+  it("keeps rows a paged reload has not reached yet instead of dropping them", () => {
+    const first = mergeShellSnapshotPage(
+      shown,
+      {
+        ...v2ShellSnapshot,
+        snapshotSequence: 9,
+        threads: [row("a", "renamed")],
+        page: { after: null, nextAfter: "a" },
+      },
+      null,
+    );
+    expect(ids(first.snapshot)).toEqual(["a", "m", "z"]);
+    expect(first.snapshot.threads[0]?.title).toBe("renamed");
+    expect(first.snapshot.page?.nextAfter).toBe("a");
+    expect(first.snapshot.snapshotSequence).toBe(9);
+
+    const second = mergeShellSnapshotPage(
+      first.snapshot,
+      {
+        ...v2ShellSnapshot,
+        snapshotSequence: 10,
+        threads: [row("m", "moved")],
+        page: { after: "a", nextAfter: "m" },
+      },
+      first.coverage,
+    );
+    expect(ids(second.snapshot)).toEqual(["a", "m", "z"]);
+    expect(second.snapshot.threads[1]?.title).toBe("moved");
+
+    // The final page drops only what the whole load did not deliver ("z" was deleted).
+    const last = mergeShellSnapshotPage(
+      second.snapshot,
+      {
+        ...v2ShellSnapshot,
+        snapshotSequence: 11,
+        threads: [row("q")],
+        page: { after: "m", nextAfter: null },
+      },
+      second.coverage,
+    );
+    expect(ids(last.snapshot)).toEqual(["a", "m", "q"]);
+    expect(last.snapshot.page?.nextAfter).toBeNull();
+    expect(last.snapshot.snapshotSequence).toBe(9);
+    expect(last.coverage).toBeNull();
+  });
+
+  it("keeps rows through cumulative HTTP pages and lets the full result decide", () => {
+    const partial = mergeShellSnapshotPage(
+      shown,
+      { ...v2ShellSnapshot, threads: [row("a")], page: { after: null, nextAfter: "a" } },
+      null,
+    );
+    expect(ids(partial.snapshot)).toEqual(["a", "m", "z"]);
+    const cumulative = mergeShellSnapshotPage(
+      partial.snapshot,
+      { ...v2ShellSnapshot, threads: [row("a"), row("m")], page: { after: null, nextAfter: "m" } },
+      partial.coverage,
+    );
+    expect(ids(cumulative.snapshot)).toEqual(["a", "m", "z"]);
+    const full = mergeShellSnapshotPage(
+      cumulative.snapshot,
+      { ...v2ShellSnapshot, threads: [row("a"), row("m")] },
+      cumulative.coverage,
+    );
+    expect(ids(full.snapshot)).toEqual(["a", "m"]);
+    expect(full.coverage).toBeNull();
+  });
+
+  it("restarts coverage when a reload begins again mid-load", () => {
+    const first = mergeShellSnapshotPage(
+      shown,
+      { ...v2ShellSnapshot, threads: [row("a")], page: { after: null, nextAfter: "a" } },
+      null,
+    );
+    // The stream dropped; the retry starts over at page one and still shows every row.
+    const retry = mergeShellSnapshotPage(
+      first.snapshot,
+      { ...v2ShellSnapshot, threads: [row("a")], page: { after: null, nextAfter: "a" } },
+      first.coverage,
+    );
+    expect(ids(retry.snapshot)).toEqual(["a", "m", "z"]);
+    const last = mergeShellSnapshotPage(
+      retry.snapshot,
+      { ...v2ShellSnapshot, threads: [row("z")], page: { after: "a", nextAfter: null } },
+      retry.coverage,
+    );
+    expect(ids(last.snapshot)).toEqual(["a", "z"]);
+  });
+
+  it("never judges rows gone from a final page whose load start it did not see", () => {
+    const last = mergeShellSnapshotPage(
+      shown,
+      { ...v2ShellSnapshot, threads: [row("q")], page: { after: "m", nextAfter: null } },
+      null,
+    );
+    expect(ids(last.snapshot)).toEqual(["a", "m", "z", "q"]);
   });
 });

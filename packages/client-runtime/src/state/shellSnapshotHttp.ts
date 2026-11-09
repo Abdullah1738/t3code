@@ -75,7 +75,8 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
  * The current server reads each page in a separate transaction. Keep the earliest
  * sequence for replay; M3 must pin pages to a server snapshot epoch/watermark.
  * page.nextAfter explicitly marks cumulative partial coverage until the final page.
- * Cumulative pages use after:null so the reducer replaces stale cached membership.
+ * Cumulative pages use after:null: each one restarts the reducer's page coverage, and the
+ * complete result replaces stale cached membership (partial ones keep unreached rows).
  */
 export function mergeHttpShellPages(
   pages: ReadonlyArray<DeferredShellSnapshot>,

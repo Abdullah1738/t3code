@@ -129,6 +129,68 @@ describe("environment shell synchronization", () => {
       expect(Option.getOrThrow(state.snapshot).page?.nextAfter).toBe("next");
     }).pipe(Effect.scoped),
   );
+  it.effect("keeps cached rows while a paged reload has only reached page one", () =>
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
+      const client = {
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: () => Stream.fromQueue(events),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+          Option.some(session(client)),
+        ),
+        prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const row = (id: string) => ({ ...v2ThreadShell, id: ThreadId.make(id) });
+      const cachedShell = { ...LIVE_SHELL_SNAPSHOT, threads: [row("a"), row("m"), row("z")] };
+      const cache = Persistence.EnvironmentCacheStore.of({
+        loadShell: () => Effect.succeed(Option.some(cachedShell)),
+        saveShell: () => Effect.void,
+        loadThread: () => Effect.succeed(Option.none()),
+        saveThread: () => Effect.void,
+        removeThread: () => Effect.void,
+        loadServerConfig: () => Effect.succeedNone,
+        saveServerConfig: () => Effect.void,
+        loadVcsRefs: () => Effect.succeedNone,
+        saveVcsRefs: () => Effect.void,
+        removeVcsRefs: () => Effect.void,
+        clearVcsRefs: () => Effect.void,
+        clear: () => Effect.void,
+      });
+      const pageOne = {
+        ...LIVE_SHELL_SNAPSHOT,
+        snapshotSequence: 5,
+        threads: [row("a")],
+        page: { after: null, nextAfter: "a" },
+      };
+      const snapshotLoader = ShellSnapshotLoader.ShellSnapshotLoader.of({
+        load: (_prepared, onPage) =>
+          Effect.gen(function* () {
+            if (onPage) yield* onPage(pageOne);
+            return yield* Effect.never;
+          }),
+      });
+      const shellState = yield* makeEnvironmentShellState().pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        Effect.provideService(ShellSnapshotLoader.ShellSnapshotLoader, snapshotLoader),
+      );
+      const partial = yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter(
+          (state) => Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === 5,
+        ),
+        Stream.runHead,
+      );
+      const snapshot = Option.getOrThrow(Option.getOrThrow(partial).snapshot);
+      expect(snapshot.page?.nextAfter).toBe("a");
+      expect(snapshot.threads.map((thread) => thread.id)).toEqual(["a", "m", "z"]);
+    }).pipe(Effect.scoped),
+  );
   it.effect("publishes live state before persistence and preserves it when ready", () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();

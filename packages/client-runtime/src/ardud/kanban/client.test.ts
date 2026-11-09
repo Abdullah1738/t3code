@@ -624,13 +624,13 @@ describe("discussion preview loader", () => {
     return { fake, client, board, stopBoard, stopPreviews };
   }
 
-  it("preview loader bounds in-flight reads at 40 while eventually loading every preview", async () => {
+  it("preview loader bounds in-flight reads at 4 while eventually loading every preview", async () => {
     const { fake, board, stopBoard, stopPreviews } = await openWithDiscussions(100);
-    expect(messageReads(fake)).toHaveLength(40);
+    expect(messageReads(fake)).toHaveLength(4);
 
     let answered = 0;
     while (messageReads(fake).length > 0) {
-      expect(messageReads(fake).length).toBeLessThanOrEqual(40);
+      expect(messageReads(fake).length).toBeLessThanOrEqual(4);
       const next = messageReads(fake)[0]!;
       const input = next.input as { discussionId: string; afterSeq: number };
       fake.pending.splice(fake.pending.indexOf(next), 1);
@@ -652,15 +652,15 @@ describe("discussion preview loader", () => {
     }
     await settle();
     expect(fake.pending).toHaveLength(0);
-    expect(board.get()?.lastMessages.size).toBe(40);
+    expect(board.get()?.lastMessages.size).toBe(4);
     stopBoard();
   });
 
   it("releases the slot on an empty response and does not refetch the same seq", async () => {
-    const { fake, stopBoard, stopPreviews } = await openWithDiscussions(41);
+    const { fake, stopBoard, stopPreviews } = await openWithDiscussions(5);
     fake.take("kanban.messages").resolve([]);
     await settle();
-    expect(messageReads(fake)).toHaveLength(40);
+    expect(messageReads(fake)).toHaveLength(4);
     expect(messageReads(fake, "disc-0")).toHaveLength(0);
     stopPreviews();
     stopBoard();
@@ -722,11 +722,13 @@ describe("discussion preview loader", () => {
     }
   });
 
-  it("reloads previews after the keepalive expires and the board is reopened", async () => {
+  it("keeps previews after the keepalive expires and rereads only discussions with news", async () => {
     vi.useFakeTimers();
     try {
-      const { fake, client, board, stopBoard, stopPreviews } = await openWithDiscussions(1);
-      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      const { fake, client, board, stopBoard, stopPreviews } = await openWithDiscussions(2);
+      for (const entry of fake.pending.splice(0)) {
+        entry.resolve([previewMessage((entry.input as { discussionId: string }).discussionId, 1)]);
+      }
       await settle();
       stopPreviews();
       stopBoard();
@@ -735,12 +737,17 @@ describe("discussion preview loader", () => {
       const stopBoardAgain = client.board("board-toy").subscribe(() => {});
       const stopPreviewsAgain = client.watchPreviews("board-toy");
       fake.push(snapshotEvent(0));
-      fake.take("kanban.discussions").resolve([previewDiscussion("disc-0", 1)]);
+      // disc-1 got a message while the board was closed; disc-0 did not.
+      fake
+        .take("kanban.discussions")
+        .resolve([previewDiscussion("disc-0", 1), previewDiscussion("disc-1", 2)]);
       await settle();
-      expect(messageReads(fake, "disc-0")).toHaveLength(1);
-      fake.take("kanban.messages").resolve([previewMessage("disc-0", 1)]);
+      expect(board.get()?.lastMessages.get("disc-0")?.seq).toBe(1);
+      expect(messageReads(fake, "disc-0")).toHaveLength(0);
+      expect(messageReads(fake, "disc-1")).toHaveLength(1);
+      fake.take("kanban.messages").resolve([previewMessage("disc-1", 2)]);
       await settle();
-      expect(board.get()?.lastMessages.size).toBe(1);
+      expect(board.get()?.lastMessages.get("disc-1")?.seq).toBe(2);
       stopPreviewsAgain();
       stopBoardAgain();
     } finally {
@@ -784,7 +791,7 @@ describe("discussion preview loader", () => {
     stopBoard();
   });
 
-  it("bounds each board's previews at 40 independently", async () => {
+  it("bounds each board's previews at 4 independently", async () => {
     // One stream per board, so each feed gets its own snapshot.
     const streams = new Map<string, (event: KanbanWatchEvent) => void>();
     const pending: Pending[] = [];
@@ -845,12 +852,12 @@ describe("discussion preview loader", () => {
       );
     }
     await settle();
-    expect(readsFor("board-a")).toBe(40);
-    expect(readsFor("board-b")).toBe(40);
+    expect(readsFor("board-a")).toBe(4);
+    expect(readsFor("board-b")).toBe(4);
 
     // Closing board-a's preview watcher leaves board-b's count alone.
     previewsA();
-    expect(readsFor("board-b")).toBe(40);
+    expect(readsFor("board-b")).toBe(4);
     previewsB();
     stopA();
     stopB();
