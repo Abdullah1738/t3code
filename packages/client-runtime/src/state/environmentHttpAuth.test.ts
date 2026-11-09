@@ -443,6 +443,53 @@ describe("authenticated environment HTTP requests", () => {
     }),
   );
 
+  it.effect("keeps saved shell progress when a resumed load fails before its next page", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness((number) =>
+        number === 1
+          ? shellPage(4, null, "thread:a")
+          : number >= 4
+            ? shellPage(6, number === 4 ? "thread:a" : null, null)
+            : Response.json({ error: "bad_gateway" }, { status: 502 }),
+      );
+      const signer = Option.getOrThrow(harness.input.signer);
+      const loaderLayer = ShellSnapshotHttp.layer.pipe(
+        Layer.provide(harness.httpLayer),
+        Layer.provide(Layer.succeed(ManagedRelay.ManagedRelayDpopSigner, signer)),
+        Layer.provide(
+          Layer.succeed(
+            RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+            harness.remoteAuthorization,
+          ),
+        ),
+      );
+      const loader = yield* ShellSnapshotHttp.ShellSnapshotLoader.pipe(Effect.provide(loaderLayer));
+      const calls = () =>
+        harness.calls.map((call) => {
+          const params = new URL(call.url).searchParams;
+          return [params.get("after"), params.get("omitIdleSubagents")];
+        });
+
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      // The resumed request fails too; the cursor must survive it.
+      expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
+      expect(Option.isSome(yield* loader.load(PREPARED))).toBe(true);
+      // The web client opts in to leaving out long-idle subagents; mobile sends nothing.
+      const resumed = yield* loader
+        .load(PREPARED)
+        .pipe(Effect.provideService(ShellSnapshotHttp.OmitIdleSubagents, true));
+      expect(Option.isNone(resumed)).toBe(false);
+      expect(calls()).toEqual([
+        [null, null],
+        ["thread:a", null],
+        ["thread:a", null],
+        ["thread:a", null],
+        // Opted-in loads keep their own progress: a different row set restarts from page one.
+        [null, "true"],
+      ]);
+    }),
+  );
+
   it.effect.each(LOADERS)("uses current relay authorization and endpoint for $name", (loader) =>
     Effect.gen(function* () {
       const harness = makeHarness(() => Response.json(loader.response));

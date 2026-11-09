@@ -142,6 +142,7 @@ import {
   loadShellSnapshotParts,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
+  withSubagentRequestAncestors,
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
@@ -973,6 +974,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     readonly afterSequence?: number;
     readonly requestCompletionMarker?: boolean;
     readonly acceptShellPages?: boolean;
+    readonly omitIdleSubagents?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -1005,7 +1007,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
-            omitIdleSubagents: true,
+            ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
             ...(input.acceptShellPages === true ? { limit: 501 } : {}),
             ...(after === undefined ? {} : { afterThreadId: after }),
           }),
@@ -1060,7 +1062,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
-      return yield* Effect.forEach(
+      const items = yield* Effect.forEach(
         coalesceShellApplicationEvents(events),
         (stored) =>
           Effect.gen(function* () {
@@ -1072,6 +1074,9 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           }),
         { concurrency: 8 },
       );
+      return input.omitIdleSubagents === true
+        ? yield* withSubagentRequestAncestors(items, threadManagement.getThreadShell)
+        : items;
     });
 
     const toShellStream = <E, R>(stream: Stream.Stream<ShellApplicationEvent, E, R>) =>

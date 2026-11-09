@@ -187,9 +187,7 @@ export function resolveThreadOutboxDeliveryAction(input: {
     return input.environmentConnected && input.shellStatus === "live" ? "send" : "wait";
   }
   if (!input.threadExists) {
-    // The live shell leaves long-idle subagents out, so absence is not proof of deletion:
-    // keep the message (the thread's composer still shows it) rather than drop it unsent.
-    return "wait";
+    return input.shellStatus === "live" ? "remove" : "wait";
   }
   return input.environmentConnected ? "send" : "wait";
 }

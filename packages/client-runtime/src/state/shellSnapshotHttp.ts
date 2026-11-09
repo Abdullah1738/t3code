@@ -42,6 +42,15 @@ export interface ShellLoadProgress {
   readonly updatedAt: number;
 }
 
+/**
+ * Ask the server to leave out subagents idle for a week with no live descendant. Only clients
+ * whose screens never list such rows (the web sidebar) turn it on; they stay readable by id.
+ */
+export const OmitIdleSubagents = Context.Reference<boolean>(
+  "@t3tools/client-runtime/state/shellSnapshotHttp/OmitIdleSubagents",
+  { defaultValue: () => false },
+);
+
 export const fetchEnvironmentShellSnapshot = Effect.fn(
   "clientRuntime.state.fetchEnvironmentShellSnapshot",
 )(function* (input: {
@@ -57,20 +66,25 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   /** Called after every page that leaves the load unfinished. */
   readonly onProgress?: (progress: ShellLoadProgress) => Effect.Effect<void>;
   readonly pageAttempts?: number;
+  readonly omitIdleSubagents?: boolean;
 }) {
   const baseTimeoutMs = input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS;
+  const query = (after: string | undefined) => ({
+    paged: "true",
+    ...(after === undefined ? {} : { after }),
+    ...(input.omitIdleSubagents === true ? { omitIdleSubagents: "true" } : {}),
+  });
   const fetchPageOnce = (after: string | undefined, timeoutMs: number) =>
     executeAuthenticatedEnvironmentHttpRequest({
       ...input,
       group: "orchestration",
       method: "GET",
-      url: (urls) =>
-        urls.shellSnapshot({ query: { paged: "true", ...(after === undefined ? {} : { after }) } }),
+      url: (urls) => urls.shellSnapshot({ query: query(after) }),
       timeoutMs,
       request: ({ client, headers }) =>
         client
           .shellSnapshot({
-            query: { paged: "true", ...(after === undefined ? {} : { after }) },
+            query: query(after),
             headers: withOrchestrationProtocolHeader(headers),
             responseMode: "response-only",
           })
@@ -191,26 +205,31 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
     // last delivered cursor instead of page one. Keyed by server build: an upgrade can
     // rewrite projections without new events, so its pages must be read again.
     const progressByConnection = new Map<string, ShellLoadProgress>();
-    const progressKey = (prepared: PreparedConnection) =>
+    const progressKey = (prepared: PreparedConnection, omitIdleSubagents: boolean) =>
       [
         prepared.environmentId,
         prepared.httpBaseUrl,
         prepared.verifiedDescriptor?.descriptor.serverVersion ?? "",
+        omitIdleSubagents ? "omit-idle-subagents" : "",
       ].join("\u001f");
     return ShellSnapshotLoader.of({
       load: Effect.fnUntraced(function* (prepared: PreparedConnection, onPage) {
-        const key = progressKey(prepared);
+        const omitIdleSubagents = yield* OmitIdleSubagents;
+        const key = progressKey(prepared, omitIdleSubagents);
         const saved = progressByConnection.get(key);
         const now = yield* Clock.currentTimeMillis;
         const resume =
           saved !== undefined && now - saved.updatedAt <= SHELL_LOAD_RESUME_MAX_AGE_MS
             ? saved
             : undefined;
-        progressByConnection.delete(key);
+        // Valid progress stays until the load finishes or newer progress replaces it, so a
+        // resumed load that fails before its next page still resumes next time.
+        if (saved !== undefined && resume === undefined) progressByConnection.delete(key);
         return yield* fetchEnvironmentShellSnapshot({
           prepared,
           signer,
           remoteAuthorization,
+          ...(omitIdleSubagents ? { omitIdleSubagents } : {}),
           ...(onPage ? { onPage } : {}),
           ...(resume ? { resume } : {}),
           onProgress: (progress) =>

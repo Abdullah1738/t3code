@@ -53,6 +53,54 @@ describe("applyShellStreamEvent", () => {
       }).threads.map((thread) => thread.id),
     ).toEqual(["b"]);
   });
+  it("applies an asking subagent's update and then its omitted ancestors at the same sequence", () => {
+    // The server streams [earlier@8, asking@9, middle@9]: middle is an idle subagent the shell
+    // left out, sent so the request reaches the root through it.
+    const thread = (id: string, parent: string | null) => ({
+      ...v2ThreadShell,
+      id: ThreadId.make(id),
+      lineage: {
+        rootThreadId: ThreadId.make("root"),
+        parentThreadId: parent === null ? null : ThreadId.make(parent),
+        relationshipToParent: parent === null ? null : ("subagent" as const),
+      },
+    });
+    const root = thread("root", null);
+    const asking = { ...thread("asking", "middle"), title: "asking now" };
+    const events = [
+      { kind: "thread.updated", sequence: 8, location: "active", thread: { ...root, title: "r8" } },
+      { kind: "thread.updated", sequence: 9, location: "active", thread: asking },
+      { kind: "thread.updated", sequence: 9, location: "active", thread: thread("middle", "root") },
+    ] as const;
+    const result = events.reduce(applyShellStreamEvent, {
+      ...v2ShellSnapshot,
+      snapshotSequence: 7,
+      threads: [root, thread("asking", "middle")],
+    });
+    expect(result.snapshotSequence).toBe(9);
+    expect(result.threads.map((t) => [t.id, t.title])).toEqual([
+      ["root", "r8"],
+      ["asking", "asking now"],
+      ["middle", v2ThreadShell.title],
+    ]);
+    // Repeats at an applied sequence still change nothing, for present rows and other kinds.
+    const repeat = applyShellStreamEvent(result, {
+      kind: "thread.updated",
+      sequence: 9,
+      location: "active",
+      thread: { ...asking, title: "stale" },
+    });
+    expect(repeat).toBe(result);
+    expect(
+      applyShellStreamEvent(result, {
+        kind: "thread.removed",
+        sequence: 9,
+        location: "active",
+        threadId: asking.id,
+      }),
+    ).toBe(result);
+  });
+
   it("updates a thread in place without moving its siblings", () => {
     const threads = ["a", "b", "c"].map((id) => ({ ...v2ThreadShell, id: ThreadId.make(id) }));
     const updated = { ...threads[1]!, title: "Streaming" };

@@ -345,10 +345,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         yield* Ref.set(activeSubscriptionSession, session);
         const initialConfig = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
         const supportsCompletionMarker = initialConfig?.shellResumeCompletionMarker === true;
-        const shellPages =
-          initialConfig?.shellSnapshotPagination === true
+        const omitIdleSubagents = yield* ShellSnapshotLoader.OmitIdleSubagents;
+        const shellPages = {
+          ...(initialConfig?.shellSnapshotPagination === true
             ? { acceptShellPages: true as const }
-            : {};
+            : {}),
+          ...(omitIdleSubagents ? { omitIdleSubagents: true as const } : {}),
+        };
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
 

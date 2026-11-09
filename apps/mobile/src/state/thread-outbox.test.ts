@@ -1275,7 +1275,7 @@ describe("thread outbox", () => {
     ).toEqual({ step: "send" });
   });
 
-  it("keeps a missing-thread message instead of dropping it unsent", () => {
+  it("only removes a missing-thread message after shell synchronization is live", () => {
     expect(
       resolveThreadOutboxDeliveryAction({
         isCreation: false,
@@ -1293,17 +1293,7 @@ describe("thread outbox", () => {
         environmentConnected: true,
         threadBusy: false,
       }),
-    ).toBe("wait");
-    // A long-idle subagent is absent from the live shell but not deleted: never drop unsent.
-    expect(
-      resolveThreadOutboxDeliveryAction({
-        isCreation: false,
-        threadExists: false,
-        shellStatus: "live",
-        environmentConnected: false,
-        threadBusy: false,
-      }),
-    ).toBe("wait");
+    ).toBe("remove");
     expect(
       resolveThreadOutboxDeliveryAction({
         isCreation: false,

@@ -191,7 +191,20 @@ export function applyShellStreamEvent(
     { readonly kind: "snapshot" } | { readonly kind: "synchronized" }
   >,
 ): OrchestrationV2ShellSnapshot {
-  if (event.sequence <= snapshot.snapshotSequence) return snapshot;
+  if (event.sequence < snapshot.snapshotSequence) return snapshot;
+  if (event.sequence === snapshot.snapshotSequence) {
+    // A server that leaves long-idle subagents out of the shell sends the missing ancestors of
+    // an asking subagent right after its update, at that update's sequence. Take such a row
+    // only when it is absent; anything else at an already-applied sequence is a repeat.
+    if (
+      event.kind !== "thread.updated" ||
+      event.location !== "active" ||
+      snapshot.threads.some((thread) => thread.id === event.thread.id)
+    ) {
+      return snapshot;
+    }
+    return { ...snapshot, threads: upsertById(snapshot.threads, event.thread) };
+  }
 
   switch (event.kind) {
     case "project.updated": {

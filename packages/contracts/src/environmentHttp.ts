@@ -600,6 +600,8 @@ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
       query: Schema.Struct({
         after: Schema.optionalKey(Schema.String),
         paged: Schema.optionalKey(Schema.String),
+        /** "true" leaves out long-idle subagents, as OrchestrationV2SubscribeShellInput. */
+        omitIdleSubagents: Schema.optionalKey(Schema.String),
       }),
       headers: OrchestrationProtocolHeaders,
       success: OrchestrationV2ShellSnapshot,
