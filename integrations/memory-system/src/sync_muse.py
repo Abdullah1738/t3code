@@ -490,7 +490,7 @@ class MuseSync:
             " cwd=coalesce(excluded.cwd, cwd), model=coalesce(excluded.model, model),"
             " robob_thread_id=coalesce(excluded.robob_thread_id, robob_thread_id),"
             " path=excluded.path, updated_at=excluded.updated_at",
-            dict(meta, now=int(time.time())),
+            dict(meta, title=mask_text(meta["title"]) if meta.get("title") is not None else None, now=int(time.time())),
         )
 
     def late_metadata(self):
@@ -513,7 +513,7 @@ class MuseSync:
                 self.mem.execute(
                     "UPDATE muse_sessions SET robob_thread_id=coalesce(?, robob_thread_id), title=coalesce(title, ?),"
                     " parent_id=coalesce(parent_id, ?), updated_at=? WHERE session_id=?",
-                    (t_id, t_title, t_parent, int(time.time()), sid),
+                    (t_id, mask_text(t_title) if t_title is not None else None, t_parent, int(time.time()), sid),
                 )
 
         with_retry(self.mem, write, budget=self.budget)

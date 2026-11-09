@@ -42,6 +42,101 @@ class CardMaskCaptureTests(unittest.TestCase):
         self.assertEqual(json.loads(masked['output']), {'cvv': '•••'})
         self.assertEqual(masked['text'], MASKED)
 
+    def test_recall_numeric_secret_corpus(self):
+        for pan in ['4111111111111111', '5555555555554444', '378282246310005']:
+            for shape in [int(pan), {'number': int(pan)}, [int(pan)],
+                          {'nested': [{'card_number': int(pan)}]}]:
+                with self.subTest(pan=pan, shape=shape):
+                    masked = mask_json_text(json.dumps(shape))
+                    self.assertNotIn(pan, masked)
+                    self.assertIn('•••• ' + pan[-4:], masked)
+                    json.loads(masked)
+        for label in ['cvc', 'CVV', 'csc', 'cvn', 'security code']:
+            for number in [123, 1234, 123.0]:
+                with self.subTest(label=label, number=number):
+                    value = {'nested': [{label: number}], 'count': 123, 'ok': True,
+                             'order_id': 1234567890123456, 'amount': 123.5}
+                    expected = {**value, 'nested': [{label: '•••'}]}
+                    self.assertEqual(json.loads(mask_json_text(json.dumps(value))), expected)
+        self.assertEqual(json.loads(mask_json_text(json.dumps({'number': PAN, 'cvv': '123'}))),
+                         {'number': '•••• 1111', 'cvv': '•••'})
+        nested = json.dumps({'arguments': json.dumps({'number': int(PAN), 'cvv': 123})})
+        result = json.loads(mask_json_text(nested))
+        self.assertEqual(json.loads(result['arguments']), {'number': '•••• 1111', 'cvv': '•••'})
+        self.assertEqual(json.loads(mask_json_text('{"cvv": 1.23e2}')), {'cvv': '•••'})
+
+    def test_claude_ingest_masks_numeric_secrets_in_raw_and_projection(self):
+        import test_sync_claude as fixture
+        f = fixture.ClaudeSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        value = {'number': int(PAN), 'cvv': 123, 'expiry': '12/25', 'count': 123}
+        fixture.write_lines(f.top, [fixture.rec('numeric-tool', 'assistant', '', block=[
+            {'type': 'tool_use', 'id': 'numeric', 'name': 'Bash', 'input': value}])])
+        f.sync()
+        with sqlite3.connect(f.db) as db:
+            raw = json.loads(db.execute('SELECT raw FROM native_capture_raw').fetchone()[0])
+            self.assertEqual(raw['message']['content'][0]['input'],
+                             {'number': '•••• 1111', 'cvv': '•••', 'expiry': '••/••', 'count': 123})
+            for (content,) in db.execute('SELECT content FROM episodic_events'):
+                self.assertNotIn(PAN, content)
+                self.assertNotIn('"cvv": 123', content)
+
+    def test_codex_ingest_masks_numeric_secrets_in_raw(self):
+        import test_sync_codex as fixture
+        f = fixture.CodexSyncTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        value = {'number': int(PAN), 'cvv': 123, 'expiry': '12/25', 'count': 123}
+        fixture.write_rollout(f.rollout, [fixture.meta(fixture.CHILD_ID, fixture.ROOT_ID),
+            fixture.fcall('Bash', json.dumps(value), 'numeric')])
+        f.sync()
+        with sqlite3.connect(f.db) as db:
+            rows = [json.loads(row[0]) for row in db.execute('SELECT raw FROM native_capture_raw')]
+            call = next(r for r in rows if r.get('payload', {}).get('type') == 'function_call')
+            self.assertEqual(json.loads(call['payload']['arguments']),
+                             {'number': '•••• 1111', 'cvv': '•••', 'expiry': '••/••', 'count': 123})
+
+    def test_opencode_ingest_masks_numeric_secrets_in_raw(self):
+        import test_sync_opencode as fixture
+        f = fixture.SyncOpencodeTest()
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        value = {'number': int(PAN), 'cvv': 123, 'expiry': '12/25', 'count': 123}
+        f.src.execute("UPDATE session_message SET data=? WHERE id='msg_u1'", (json.dumps(value),))
+        f.src.commit()
+        f.run_sync(f.load())
+        with sqlite3.connect(f.raw_path) as db:
+            raw = json.loads(zlib.decompress(db.execute('SELECT data_zlib FROM raw_messages').fetchone()[0]))
+            self.assertEqual(raw, {'number': '•••• 1111', 'cvv': '•••', 'expiry': '••/••', 'count': 123})
+
+    def test_muse_titles_mask_initial_and_late_metadata(self):
+        import test_sync_muse as fixture
+        for late in [False, True]:
+            for source in ['robob', 'index']:
+                with self.subTest(late=late, source=source):
+                    f = fixture.MuseSyncTest()
+                    f.setUp()
+                    try:
+                        fixture.write(f.main, fixture.main_log('S1'))
+                        if late:
+                            f.sync()
+                            with sqlite3.connect(f.db) as db:
+                                db.execute('UPDATE muse_sessions SET title=NULL')
+                        title = SECRET if source == 'robob' else None
+                        titles = {'S1': SECRET} if source == 'index' else {}
+                        with patch.object(f.sm.Robob, 'describe', return_value=('fixture-thread', title, 'fixture-parent')), \
+                                patch.object(f.sm, 'index_titles', return_value=titles):
+                            stats = f.sync()
+                        if late:
+                            self.assertEqual(stats['changed'], 0)
+                            self.assertEqual(stats['late_meta'], 1)
+                        with sqlite3.connect(f.db) as db:
+                            row = db.execute('SELECT title,parent_id,robob_thread_id FROM muse_sessions').fetchone()
+                            self.assertEqual(row, (MASKED, 'fixture-parent', 'fixture-thread'))
+                    finally:
+                        f.tearDown()
+
     def test_recall_hook_masks_persisted_task_before_clipping(self):
         spec = importlib.util.spec_from_file_location('card_mask_recall_hook', ROOT / 'hooks/recall_hook.py')
         hook = importlib.util.module_from_spec(spec)
@@ -76,6 +171,28 @@ class CardMaskCaptureTests(unittest.TestCase):
             hook.handle('codex', {'hook_event_name': 'PreToolUse', 'tool_name': 'fixture',
                                  'tool_input': {'text': SECRET}})
         self.assertEqual(preflight.call_args.args[1], {'text': MASKED})
+
+    def test_recall_hook_and_state_mask_numeric_activity(self):
+        spec = importlib.util.spec_from_file_location('card_mask_recall_hook', ROOT / 'hooks/recall_hook.py')
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        value = {'number': int(PAN), 'cvv': 123, 'expiry': '12/25', 'count': 123}
+        expected = {'number': '•••• 1111', 'cvv': '•••', 'expiry': '••/••', 'count': 123}
+        with patch.object(hook, 'config', return_value={'mode': 'on'}), \
+                patch('recall_local.preflight', return_value=([], None)) as preflight, \
+                patch('recall_local.local_note', return_value=None), patch.object(hook, 'log'), \
+                patch.dict(os.environ, RECALL_DECISION_LOG=os.devnull):
+            hook.handle('claude', {'hook_event_name': 'PreToolUse', 'tool_name': 'fixture', 'tool_input': value})
+        self.assertEqual(preflight.call_args.args[1], expected)
+        with tempfile.TemporaryDirectory() as directory:
+            db = Store(str(Path(directory) / 'state.db'))
+            try:
+                state = db.get('fixture')
+                state['activity'] = [{'input': value, 'result': value}]
+                db.save('fixture', state)
+                self.assertEqual(db.get('fixture')['activity'], [{'input': expected, 'result': expected}])
+            finally:
+                db.close()
 
     def test_claude_ingest_masks_projection_and_raw_tool_input(self):
         import test_sync_claude as fixture

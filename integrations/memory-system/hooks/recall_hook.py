@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from card_mask import mask_value
+from card_mask import mask_recall_value
 from recall_hook_state import Store
 from recall_note import bounded_note
 
@@ -184,7 +184,7 @@ def output(name, result=None, note=None):
 
 
 def handle(harness, event):
-    event, _ = mask_value(event)
+    event, _ = mask_recall_value(event)
     started = time.monotonic()
     name = event.get("hook_event_name")
     if name not in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact", "PostCompact", "SessionStart"):

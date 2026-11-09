@@ -54,6 +54,35 @@ class CardMaskTests(unittest.TestCase):
         self.assertNotIn('123', mask_text(nested))
         json.loads(mask_text(nested))
 
+    def test_label_values_preserve_whole_identifiers(self):
+        tokens = ['abc123', 'a' * 37 + '123', 'a' * 61 + '123',
+                  'abc_123', 'abc-123', '123abc', '123_abc', '123-abc',
+                  '123e4567-e89b-12d3-a456-426614174000']
+        for label in ['CVC', 'CVV', 'CSC', 'CVN', 'security code']:
+            for token in tokens:
+                text = label + ': ' + token
+                with self.subTest(text=text):
+                    self.assertEqual(mask_text(text), text)
+                    self.assertEqual(mask_value({label: token}), ({label: token}, False))
+        for token in ['abc12/25', 'abc-12/25', 'abc_12/25']:
+            text = 'expiry: ' + token
+            with self.subTest(text=text):
+                self.assertEqual(mask_text(text), text)
+                self.assertEqual(mask_value({'expiry': token}), ({'expiry': token}, False))
+
+    def test_sensitive_keys_do_not_truncate_values(self):
+        for key in [PAN, '4111 1111 1111 1111', 'CVV: 123', 'expiry: 12/25']:
+            with self.subTest(key=key):
+                value = {key: 'original payload', 'nested': [{key: 'complete value'}]}
+                self.assertEqual(mask_value(value), (value, False))
+                self.assertEqual(mask_value({key: PAN}), ({key: '•••• 1111'}, True))
+        self.assertEqual(mask_value({'CVV': '123', 'expiration date': '12/25'}),
+                         ({'CVV': '•••', 'expiration date': '••/••'}, True))
+
+    def test_hook_masker_preserves_numeric_output_types(self):
+        value = {'number': int(PAN), 'cvv': 123, 'count': 123, 'ok': True}
+        self.assertEqual(mask_value(value), (value, False))
+
     def test_nested_shape_and_original_unchanged(self):
         value = {'stdout': PAN, 'stderr': '', 'interrupted': False, 'count': 123,
                  'nested': [None, 42, {'cvc': '123', 'expiry': '12/2025'}]}
