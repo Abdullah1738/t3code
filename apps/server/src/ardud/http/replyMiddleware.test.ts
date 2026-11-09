@@ -38,8 +38,8 @@ it.effect.each([
     const builders = yield* ReplyBuilders.ReplyBuilders;
     let owned = false;
     yield* middleware(Effect.gen(function* () {
-      const both = yield* builders.takeIfAvailable(2);
-      if (both) yield* builders.release(2);
+      const both = yield* builders.agent.takeIfAvailable(2);
+      if (both) yield* builders.agent.release(2);
       owned = !both;
       return jsonReply({ ready: true });
     })).pipe(
@@ -49,8 +49,8 @@ it.effect.each([
       ),
     );
     expect(owned).toBe(true);
-    expect(yield* builders.takeIfAvailable(2)).toBe(true);
-    yield* builders.release(2);
+    expect(yield* builders.agent.takeIfAvailable(2)).toBe(true);
+    yield* builders.agent.release(2);
   }).pipe(Effect.provide(ReplyBuilders.layer)),
 );
 
@@ -58,8 +58,8 @@ it.effect("does not hold a reply builder for a websocket upgrade", () =>
   Effect.gen(function* () {
     const builders = yield* ReplyBuilders.ReplyBuilders;
     yield* middleware(Effect.gen(function* () {
-      const available = yield* builders.takeIfAvailable(2);
-      if (available) yield* builders.release(2);
+      const available = yield* builders.agent.takeIfAvailable(2);
+      if (available) yield* builders.agent.release(2);
       expect(available).toBe(true);
       return HttpServerResponse.empty({ status: 200 });
     })).pipe(
@@ -123,8 +123,8 @@ it.effect("orchestration authentication waits outside reply builders during boar
     );
     yield* Deferred.await(entered);
     const builders = Context.get(http, ReplyBuilders.ReplyBuilders);
-    const available = yield* builders.takeIfAvailable(2);
-    if (available) yield* builders.release(2);
+    const available = yield* builders.agent.takeIfAvailable(2);
+    if (available) yield* builders.agent.release(2);
     yield* Deferred.succeed(release, undefined);
     for (const request of requests) expect((yield* Fiber.join(request)).status).toBe(200);
     expect(available).toBe(true);
@@ -193,8 +193,8 @@ it.effect.each(["/api/ardud/kanban/boards/test", "/api/ardud/control/threads"] a
       const requests = yield* Effect.forEach([1, 2], () => client.get(path).pipe(Effect.forkScoped));
       yield* Deferred.await(entered);
       const builders = Context.get(services, ReplyBuilders.ReplyBuilders);
-      expect(yield* builders.takeIfAvailable(2)).toBe(true);
-      yield* builders.release(2);
+      expect(yield* builders.agent.takeIfAvailable(2)).toBe(true);
+      yield* builders.agent.release(2);
       expect(yield* ReplyBuilders.bounded(Effect.succeed(200)).pipe(
         Effect.provideService(ReplyBuilders.ReplyBuilders, builders),
       )).toBe(200);

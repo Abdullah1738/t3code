@@ -7332,7 +7332,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(changes);
         const snapshot = yield* read(
-          ReplyBuilders.bounded(snapshotOf(boardId, true).pipe(NodeSqliteClient.readOnly)),
+          ReplyBuilders.interactive(snapshotOf(boardId, true).pipe(NodeSqliteClient.readOnly)),
         );
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),

@@ -10486,10 +10486,10 @@ it.effect.each([false, true])(
           yield* Effect.yieldNow;
           const builders = yield* ReplyBuilders.ReplyBuilders;
           assert.isTrue(
-            yield* builders.takeIfAvailable(2),
+            yield* builders.interactive.takeIfAvailable(2),
             "board startup waits must not occupy reply builders",
           );
-          yield* builders.release(2);
+          yield* builders.interactive.release(2);
           yield* Deferred.succeed(ready, undefined);
           if (failFirstRead) {
             yield* Deferred.await(failed);
@@ -10499,10 +10499,10 @@ it.effect.each([false, true])(
           yield* Deferred.await(reached);
           assert.isFalse(yield* Deferred.isDone(changed));
           assert.isTrue(
-            yield* builders.takeIfAvailable(2),
+            yield* builders.interactive.takeIfAvailable(2),
             "pool rekey waits must not occupy reply builders",
           );
-          yield* builders.release(2);
+          yield* builders.interactive.release(2);
           yield* Deferred.succeed(release, undefined);
           yield* Fiber.join(write);
           yield* Effect.forEach(snapshots, Fiber.join);

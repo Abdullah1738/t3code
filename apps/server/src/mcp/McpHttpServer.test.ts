@@ -261,8 +261,8 @@ it.effect("board tool readiness waits leave the shared reply builders available"
       );
       yield* Deferred.await(entered);
       const builders = yield* ReplyBuilders.ReplyBuilders;
-      expect(yield* builders.takeIfAvailable(2)).toBe(true);
-      yield* builders.release(2);
+      expect(yield* builders.agent.takeIfAvailable(2)).toBe(true);
+      yield* builders.agent.release(2);
       yield* ReplyBuilders.bounded(Effect.void);
       yield* Deferred.succeed(release, undefined);
       for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);

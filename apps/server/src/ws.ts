@@ -842,7 +842,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
             })
           : threadManagement.getThreadSnapshot(input.threadId)
       ).pipe(
-        ReplyBuilders.bounded,
+        ReplyBuilders.interactive,
         Effect.mapError(
           (cause) =>
             new OrchestrationV2GetThreadProjectionError({
@@ -1147,12 +1147,12 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     const completionThenLive = (afterSequence: number) =>
       Stream.concat(completionMarker, liveFrom(afterSequence));
     const snapshotThenLive = Effect.fn("ws.orchestrationV2.pagedShellSnapshot")(function* () {
-      const loaded = yield* ReplyBuilders.bounded(loadSnapshot());
+      const loaded = yield* ReplyBuilders.interactive(loadSnapshot());
       // Subsequent pages are built only when the consumer asks for them.
       const remaining = Stream.unfold(loaded.snapshot.page?.nextAfter ?? null, (after) =>
         after === null
           ? Effect.succeed(undefined)
-          : ReplyBuilders.bounded(loadSnapshot(after)).pipe(
+          : ReplyBuilders.interactive(loadSnapshot(after)).pipe(
               Effect.map(
                 (next) =>
                   [
@@ -1835,7 +1835,7 @@ export const layerWsRpc = (
           threads: threads.archivedThreads,
         } as const;
       }).pipe(
-        ReplyBuilders.bounded,
+        ReplyBuilders.interactive,
         Effect.flatMap((snapshot) =>
           enrichProjectShells(snapshot.projects).pipe(
             Effect.map(({ projects }) => ({ ...snapshot, projects })),

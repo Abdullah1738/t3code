@@ -119,6 +119,8 @@ export const middleware = HttpMiddleware.make((app) =>
         yield* ReplyReadiness.boardReady.pipe(Effect.interruptible);
       }
     }
+    // This global middleware runs before route authentication: no verified session is
+    // in context yet. Keep HTTP (including control-token reads) on the agent lane.
     return yield* (buildsLargeReply ? ReplyBuilders.bounded(app).pipe(Effect.interruptible) : app).pipe(
       Effect.catchCauseIf(
         (cause) =>
