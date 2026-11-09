@@ -961,7 +961,8 @@ const make = Effect.gen(function* () {
     { readonly cardId: string; readonly pool: string; readonly threadId: string | null }
   >();
   const settingUp = new Set<string>();
-  const serial = <A, E, R>(
+  /** Runs `effect` alone per key; it opens its own lock operations (serial: exactly one). */
+  const serialEach = <A, E, R>(
     all: Map<string, Semaphore.Semaphore>,
     key: string,
     effect: Effect.Effect<A, E, R>,
@@ -972,8 +973,13 @@ const make = Effect.gen(function* () {
         mutex = Semaphore.makeUnsafe(1);
         all.set(key, mutex);
       }
-      return locks.outside(mutex.withPermits(1)(locks.fresh(locks.run(effect))));
+      return locks.outside(mutex.withPermits(1)(locks.fresh(effect)));
     });
+  const serial = <A, E, R>(
+    all: Map<string, Semaphore.Semaphore>,
+    key: string,
+    effect: Effect.Effect<A, E, R>,
+  ) => serialEach(all, key, locks.run(effect));
 
   const changes = yield* PubSub.unbounded<{
     readonly boardId: KanbanBoard["id"];
@@ -1027,8 +1033,8 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
     );
-  /** One board's held slots, thread id to pool, as the rules take them. */
-  const boardHolds = (boardId: string) =>
+  /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
+  const boardHolds = (boardId: string, except?: string) =>
     Effect.map(
       Ref.get(holds),
       (all) =>
@@ -1037,7 +1043,7 @@ const make = Effect.gen(function* () {
             held.boardId === boardId ? [[threadId as string, held.pool] as const] : [],
           ),
           ...[...starting]
-            .filter(([key]) => key.startsWith(`${boardId}:`))
+            .filter(([key]) => key.startsWith(`${boardId}:`) && key !== except)
             .map(([key, value]) => [value.threadId ?? key, value.pool] as const),
         ]),
     );
@@ -3070,11 +3076,29 @@ const make = Effect.gen(function* () {
     return attempted;
   });
 
+  /**
+   * Runs as the card's own operation (see dispatchUnlocked), so only a change to
+   * this card or to the board itself invalidates it, not writes to other cards.
+   */
   const startCard = Effect.fn("KanbanService.startCard")(function* (
-    board: KanbanBoard,
+    boardId: KanbanBoard["id"],
     dispatch: Rules.Dispatch,
+    planned: KanbanCard,
+    downKeys: ReadonlySet<string>,
   ) {
+    const board = yield* boardOf(boardId);
+    if (settingUp.has(board.id)) return;
     const card = yield* cardOf(dispatch.cardId);
+    // The plan came from an earlier snapshot: confirm it before any side effect.
+    const confirmed = Rules.confirmDispatch(
+      board,
+      planned,
+      yield* store.cards(board.id),
+      Rules.maskDownPools(yield* store.pools(board.id), downKeys),
+      yield* boardHolds(board.id, `${board.id}:${dispatch.cardId}`),
+      dispatch,
+    );
+    if (!confirmed) return;
     const projectId = card.projectId ?? board.defaultProjectId;
     const at = yield* nowIso;
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
@@ -3293,37 +3317,55 @@ const make = Effect.gen(function* () {
       Effect.forEach(
         yield* store.boards,
         (candidate) =>
-          serial(
+          serialEach(
             dispatching,
             candidate.id,
             Effect.gen(function* () {
-              const board = yield* boardOf(candidate.id);
-              if (board.archivedAt !== null || settingUp.has(board.id)) return;
-              const plan = Rules.planDispatch(
-                board,
-                yield* store.cards(board.id),
-                Rules.maskDownPools(yield* store.pools(board.id), downKeys),
-                yield* boardHolds(board.id),
-                pick,
+              // Plan from one snapshot, then start each card as its own card-scoped
+              // operation. One board-wide operation across every start's thread I/O
+              // went stale on any write to any card of a busy board: the start was
+              // abandoned after its prompt went out, and the rest of the plan never ran.
+              const planned = yield* locks.run(
+                Effect.gen(function* () {
+                  const board = yield* boardOf(candidate.id);
+                  if (board.archivedAt !== null || settingUp.has(board.id)) return null;
+                  const cards = yield* store.cards(board.id);
+                  const plan = Rules.planDispatch(
+                    board,
+                    cards,
+                    Rules.maskDownPools(yield* store.pools(board.id), downKeys),
+                    yield* boardHolds(board.id),
+                    pick,
+                  );
+                  return { boardId: board.id, cards, plan };
+                }),
               );
-              for (const dispatch of plan) {
-                const card = yield* cardOf(dispatch.cardId);
-                const key = `${board.id}:${dispatch.cardId}`;
+              if (planned === null) return;
+              const byId = new Map(planned.cards.map((card) => [card.id as string, card]));
+              for (const dispatch of planned.plan) {
+                const card = byId.get(dispatch.cardId);
+                if (!card) continue;
+                const key = `${planned.boardId}:${dispatch.cardId}`;
                 starting.set(key, {
                   cardId: card.id,
                   pool: dispatch.pool,
                   threadId: dispatch.joins ? card.workThreadId : null,
                 });
-                yield* startCard(board, dispatch).pipe(
-                  Effect.ensuring(
-                    Effect.sync(() => {
-                      starting.delete(key);
-                    }),
-                  ),
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("kanban dispatch failed", { cardId: dispatch.cardId, cause }),
-                  ),
-                );
+                yield* locks
+                  .run(startCard(planned.boardId, dispatch, card, downKeys), card.id)
+                  .pipe(
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        starting.delete(key);
+                      }),
+                    ),
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("kanban dispatch failed", {
+                        cardId: dispatch.cardId,
+                        cause,
+                      }),
+                    ),
+                  );
               }
             }),
           ).pipe(
