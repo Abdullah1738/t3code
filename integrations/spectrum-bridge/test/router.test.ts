@@ -5,6 +5,8 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_INCOMING_BYTES, MAX_PREVIEW_BYTES } from "../src/inbound-files.ts";
+import { createApi } from "../src/api.ts";
+import type { ChatContext } from "../src/chats.ts";
 import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type RequestOptions, type SessionRecord, type SessionStatus, type SteerDelivery } from "../src/openchamber.ts";
 
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
@@ -12,6 +14,8 @@ import { TransportError, type NormalizedInbound, type Photon } from "../src/phot
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
 import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped, wakeGuidance } from "../src/router.ts";
 import { Store } from "../src/store.ts";
+import { RobobBackend } from "../src/robob.ts";
+import type { ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
@@ -420,6 +424,7 @@ test("an answer given before a steered text came in goes out too, once, ahead of
   h.backend.settle();
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations().map(op => [op.id, op.text, op.replyTo])).toEqual([
+    ["reply:1:msg_narration", "Checking prices", "in_1"],
     ["reply:1:msg_booked", "Booked for 11:50", "in_1"],
     ["reply:1:msg_draft", "Here's the draft", "in_1"],
   ]);
@@ -488,6 +493,503 @@ test("a run that ends on narration closes without sending it, and does not stay 
   expect(h.conversations()).toEqual([]);
   expect(h.store.get("activeTurn")).toBeNull();
   expect(inbounds(h.store)).toMatchObject([{ id: "in_1", state: "done" }]);
+});
+
+const earlyStart = Date.parse("2026-11-08T10:18:05.266Z");
+const earlySendCases = [
+  { state: "pending", text: "Checking." },
+  { state: "sent", text: "  Checking.  " },
+  { state: "uncertain", text: "\nChecking.\n" },
+];
+test.each(earlySendCases)("/send reuses the early reply with $state delivery and surrounding whitespace", async ({ state, text }) => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.");
+  delete first.finish;
+  first.answer = false;
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  const id = `reply:1:${first.id}`;
+  expect(h.conversations().map(op => op.id)).toEqual([id]);
+  h.store.outboxState(id, state);
+  // A new API instance exercises the persisted receipt after a bridge restart too.
+  const post = (body: object) => createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) })(new Request("http://bridge/send", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+  const body = { text, dedupeKey: "manual-ack", sessionId: "ses_1@1" };
+  const response = await post(body);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ id, created: false });
+  const replay = await post(body);
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual({ id, created: false });
+  // Different keys for the same turn still refer to the physical early row.
+  expect(await (await post({ ...body, dedupeKey: "manual-ack-again" })).json()).toEqual({ id, created: false });
+  for (const change of [{ text: "Changed." }, { subject: "A new subject" }, { effect: "confetti" }]) {
+    expect((await post({ ...body, ...change })).status).toBe(409);
+  }
+  expect(h.store.getOperation(id)).toMatchObject({ state, text: "Checking." });
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  // The send-key receipt remains idempotent after the active turn is gone.
+  expect(await (await post(body)).json()).toEqual({ id, created: false });
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+});
+
+test.each(["text", "next-turn", "generation", "session"])("/send does not reuse a different $s early reply", async mismatch => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  h.backend.step("Checking.", "tool-calls");
+  await h.router.tick();
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  if (mismatch === "next-turn") {
+    h.backend.settle();
+    await h.router.tick();
+    h.input("in_next", "Check again");
+    await h.router.tick();
+  }
+  if (mismatch === "session") h.store.set("route", { ...route, id: "ses_other" });
+  if (mismatch === "generation") h.store.set("route", { ...route, generation: 2 });
+  const sessionId = mismatch === "session" ? "ses_other" : mismatch === "generation" ? "ses_1@2" : "ses_1@1";
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: mismatch === "text" ? "Different." : "Checking.", dedupeKey: "different-send", sessionId }) }));
+  expect(response.status).toBe(202);
+  expect(await response.json()).toMatchObject({ id: expect.stringMatching(/^send:/), created: true });
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 2 });
+});
+
+test.each([
+  { subject: "Prices" }, { effect: "confetti" }, { subject: "Prices", effect: "confetti" },
+])("a fresh /send with delivery fields %j keeps those fields instead of aliasing plain early text", async fields => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  h.backend.step("Checking.", "tool-calls");
+  await h.router.tick();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const post = () => api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Checking.", dedupeKey: "delivery-fields", sessionId: "ses_1", ...fields }) }));
+  const response = await post();
+  expect(response.status).toBe(202);
+  const { id } = await response.json() as { id: string };
+  expect(id).toMatch(/^send:/);
+  expect(h.store.getOperation(id)).toMatchObject({ text: "Checking.", ...fields });
+  expect(h.conversations()).toHaveLength(2);
+  const replay = await post();
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual({ id, created: false });
+  expect(h.conversations()).toHaveLength(2);
+});
+
+const nativeContinuationCases = [
+  { driver: "opencode", finish: "tool-calls", phase: "unknown", continued: true },
+  { driver: "opencode", finish: "tool-calls", phase: "answer", continued: true },
+  { driver: "opencode", finish: "tool-calls", phase: "narration", continued: true },
+  { driver: "opencode", finish: "stop", phase: "unknown", continued: false },
+  { driver: "opencode", finish: "error", phase: "unknown", continued: false },
+  { driver: "opencode", finish: undefined, phase: "unknown", continued: false },
+  { driver: "claudeAgent", finish: "tool-calls", phase: "answer", continued: false },
+] as const;
+test.each(nativeContinuationCases)("RobobBackend $driver step $finish / $phase continuation is $continued", async ({ driver, finish, phase, continued }) => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const runId = "run:thread:test:ordinal:1";
+  const run = { runId, ordinal: 1, status: "running" };
+  const thread = { threadId: "thread:test", model: { instanceId: driver, model: "test" },
+    nativeSessionId: "ses_1", recentRuns: [run], run, lastError: null } as ThreadDetail;
+  const lookups: string[][] = [];
+  const real = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test-token",
+    finishes: ids => { lookups.push([...ids]); return new Map(finish ? ids.map(id => [id, finish]) : []); }, runEvidence: () => "ran" });
+  spyOn(real.client, "thread").mockResolvedValue({ thread });
+  spyOn(real.client, "runEvidence").mockResolvedValue({ runId, status: "running", complete: true, toolEvidence: "ran", messages: [] });
+  const at = new Date(earlyStart).toISOString();
+  spyOn(real.client, "messages").mockResolvedValue({ state: "running", status: "running", runId, messages: [
+    { messageId: messageId("in_early"), runId, role: "user", text: "Check prices", streaming: false, createdBy: "user", createdAt: new Date(earlyStart - 1000).toISOString(), updatedAt: new Date(earlyStart - 1000).toISOString() },
+    { messageId: `message:provider:${driver}:native-item:msg_A%3Atext%3A0`, runId, role: "assistant", text: "Checking.", phase, streaming: false, createdAt: at, updatedAt: at },
+  ] });
+  const productionRecords = await real.messages(thread.threadId);
+  expect(productionRecords).toHaveLength(2);
+  expect(productionRecords[1]).toMatchObject({ toolEvidence: "ran", time: { completed: earlyStart } });
+  expect(productionRecords[1]).not.toHaveProperty("finish");
+  expect(productionRecords[1]!.continued === true).toBe(continued);
+  if (continued) expect(productionRecords[1]).toHaveProperty("nativeMessage", "msg_A");
+  if (driver === "claudeAgent") expect(lookups).toEqual([]);
+  h.backend.messagesBehavior = () => real.messages(thread.threadId);
+  h.backend.states = { ses_1: { type: "busy" } };
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(continued ? ["Checking."] : []);
+  if (continued) {
+    run.status = "completed";
+    h.backend.states = {};
+    await h.router.tick();
+    expect(h.conversations().map(op => op.text)).toEqual(["Checking."]);
+    expect(h.store.get("activeTurn")).toBeNull();
+  }
+});
+
+function earlyContext(kind: "owner" | "dm" | "group"): ChatContext {
+  return {
+    chat: { key: kind === "group" ? "group:abc123" : "dm:+15555550123", slug: kind === "dm" ? "moni" : kind, kind, title: kind },
+    roleOf: () => ({ name: "Moni", role: "admin" }), typing: () => false, react: async () => {},
+  };
+}
+
+test.each(["owner", "dm"] as const)("%s Claude reply goes early at 20 seconds, stays typing, and settles once", async kind => {
+  setSystemTime(earlyStart);
+  const events: string[] = [];
+  const context = earlyContext(kind);
+  const h = setup(":memory:", { context, chatGuid: context.chat.key, log: event => events.push(event) });
+  h.input("in_early", "Check Selfridges", { sender: "+15555550123" });
+  await h.router.tick();
+  const first = h.backend.step("I'm checking now.");
+  delete first.finish;
+  first.answer = true;
+  h.backend.states = { ses_1: { type: "busy" } };
+  setSystemTime(earlyStart + 19_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([[`reply:1:${first.id}`, "I'm checking now."]]);
+  expect(h.store.get("activeTurn")).toMatchObject({ earlySent: first.id, phase: "running" });
+  expect(events.filter(event => event === "early-reply-enqueued")).toHaveLength(1);
+  expect(events).not.toContain("typing-stopped");
+  setSystemTime(earlyStart + 60 * 60_000);
+  h.backend.states = {};
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.conversations()).toHaveLength(1);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(inbounds(h.store)).toMatchObject([{ id: "in_early", state: "done" }]);
+  expect(events).not.toContain("reply-enqueued");
+  expect(events.at(-1)).toBe("typing-stopped");
+});
+
+test("OpenCode's first narration goes out immediately, later narration stays quiet, and the final follows once", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking prices.", "tool-calls");
+  first.answer = false;
+  const tool: Assistant["content"][number] = { type: "tool", id: "tool_1", name: "search", state: { status: "running" } };
+  first.content.push(tool);
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Checking prices."]);
+  h.backend.step("Still looking.", "tool-calls").answer = false;
+  await h.router.tick();
+  expect(h.conversations()).toHaveLength(1);
+  tool.state.status = "completed";
+  const final = h.backend.final("Found the prices.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([
+    [`reply:1:${first.id}`, "Checking prices."], [`reply:1:${final.id}`, "Found the prices."],
+  ]);
+});
+
+test("a later record proves the run continued without waiting 20 seconds", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.");
+  delete first.finish;
+  h.backend.step("", "tool-calls").content = [{ type: "tool", id: "tool_1", name: "search", state: { status: "running" } }];
+  await h.router.tick();
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${first.id}`]);
+});
+
+test("a single final that reaches idle quickly is sent only at settle", async () => {
+  setSystemTime(earlyStart);
+  const events: string[] = [];
+  const h = setup(":memory:", { log: event => events.push(event) });
+  h.input("in_early", "Quick question");
+  await h.router.tick();
+  const first = h.backend.step("Here it is.");
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  setSystemTime(earlyStart + 2_000);
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${first.id}`]);
+  expect(events).not.toContain("early-reply-enqueued");
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test.each(["claude", "opencode"])("%s synthetic and background narration never goes early", async shape => {
+  for (const background of [false, true]) {
+    setSystemTime(earlyStart);
+    const h = setup(":memory:", { watchMs: 0 });
+    h.input(background ? "in_early" : `wake:${"a".repeat(64)}`, "Check the event");
+    await h.router.tick();
+    if (background) {
+      h.backend.final("On it.");
+      await h.router.tick();
+      for (const row of h.conversations()) h.store.outboxState(row.id, "sent");
+    }
+    const first = h.backend.step("Checking silently.", "tool-calls");
+    first.answer = false;
+    if (shape === "claude") delete first.finish;
+    h.backend.states = { ses_1: { type: "busy" } };
+    await h.router.tick();
+    setSystemTime(earlyStart + 20_000);
+    await h.router.tick();
+    expect(h.store.get("activeTurn")).toMatchObject({ phase: "running", ...(background ? { background: true } : {}) });
+    expect(h.conversations()).toEqual([]);
+    const final = h.backend.final("Done.");
+    h.backend.states = {};
+    await h.router.tick();
+    expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${final.id}`]);
+    expect(h.store.get("activeTurn")).toBeNull();
+  }
+});
+
+test.each(["claude", "opencode"])("%s group narration never goes early", async shape => {
+  setSystemTime(earlyStart);
+  const context = earlyContext("group");
+  const h = setup(":memory:", { context, chatGuid: context.chat.key });
+  h.input("in_early", "Robob, check prices", { sender: "+15555550123" });
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  const first = h.backend.step("Checking.", "tool-calls");
+  first.answer = false;
+  if (shape === "claude") delete first.finish;
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "running" });
+});
+
+test("NO_REPLY anywhere at the end of the native message suppresses the first text before idle", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check the event");
+  await h.router.tick();
+  const first = h.backend.step("Logged it.", "tool-calls");
+  first.nativeMessage = "native_quiet";
+  h.backend.step("NO_REPLY").nativeMessage = "native_quiet";
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).not.toHaveProperty("earlySent");
+});
+
+test.each(["incomplete", "refused", "error", "failed-idle", "model-error"])("%s evidence prevents an early send", async reason => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.", "tool-calls");
+  if (reason === "incomplete") delete first.time.completed;
+  if (reason === "refused") first.finish = "content-filter";
+  if (reason === "error") first.error = { type: "provider" };
+  if (reason === "failed-idle" || reason === "model-error") {
+    h.backend.records.splice(1, 0, { id: "old_idle", type: "idle", outcome: reason === "failed-idle" ? "failed" : "succeeded", modelError: reason === "model-error", time: { created: earlyStart } });
+    h.backend.records.splice(2, 0, { id: "steered", type: "user", text: "Continue", time: { created: earlyStart } });
+    h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), steered: ["steered"] });
+  }
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get("activeTurn")).not.toHaveProperty("earlySent");
+});
+
+test.each(["pending", "sent", "uncertain"])("same text queued through /send (%s) is consumed without an early or final duplicate", async state => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "  Checking.  ", dedupeKey: "early-send", sessionId: "ses_1" }) }));
+  expect(response.status).toBe(202);
+  const { id } = await response.json() as { id: string };
+  h.store.outboxState(id, state);
+  const first = h.backend.step("Checking.");
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.store.getOperation(id)).toMatchObject({ state });
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+  expect(h.store.get("activeTurn")).toMatchObject({ earlySent: first.id });
+  const repeated = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Checking.", dedupeKey: "another-send-key", sessionId: "ses_1" }) }));
+  expect(repeated.status).toBe(200);
+  expect(await repeated.json()).toEqual({ id, created: false });
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.store.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test.each(["old", "session", "generation", "text", "not-send"])("a %s send does not suppress the early reply", async mismatch => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const route = h.store.get<{ id: string; generation: number }>("route")!;
+  const other = { ...route, ...(mismatch === "session" ? { id: "ses_other" } : {}), ...(mismatch === "generation" ? { generation: route.generation + 1 } : {}) };
+  h.store.set("route", other);
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const body = { text: mismatch === "text" ? "Different text." : "Checking.", dedupeKey: "other-send", sessionId: other.id };
+  setSystemTime(mismatch === "old" ? earlyStart - 1 : earlyStart);
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+  expect(response.status).toBe(202);
+  const { id } = await response.json() as { id: string };
+  h.store.set("route", route);
+  if (mismatch === "not-send") h.store.db.query("UPDATE outbox SET id = 'other' WHERE id = ?").run(id);
+  if (mismatch === "old") {
+    setSystemTime(earlyStart + 1);
+    const replay = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+    expect(replay.status).toBe(200);
+  }
+  setSystemTime(earlyStart + 20_000);
+  const first = h.backend.step("Checking.", "tool-calls");
+  await h.router.tick();
+  expect(h.conversations().at(-1)!.id).toBe(`reply:1:${first.id}`);
+  expect(h.store.get("activeTurn")).toMatchObject({ earlySent: first.id });
+});
+
+test("a turn ending on its early tool-call text still settles and closes", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  h.backend.step("Checking.", "tool-calls").answer = false;
+  await h.router.tick();
+  expect(h.conversations()).toHaveLength(1);
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.conversations()).toHaveLength(1);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(inbounds(h.store)).toMatchObject([{ id: "in_early", state: "done" }]);
+});
+
+test("failure after the early send preserves it and follows with the usual failure notice", async () => {
+  setSystemTime(earlyStart);
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.", "tool-calls");
+  await h.router.tick();
+  h.backend.failed();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${first.id}`]);
+  expect(h.store.pendingOutbox().map(op => op.kind)).toEqual(["conversation", "control"]);
+  expect(h.controls()[0]!.text).toContain("Something went wrong");
+  expect(h.store.get("activeTurn")).toMatchObject({ phase: "failed", earlySent: first.id });
+});
+
+test("restart persists earlySent and does not resend a changed final record", async () => {
+  setSystemTime(earlyStart);
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-early-restart-"));
+  directories.push(directory);
+  const path = join(directory, "state.sqlite");
+  const events: string[] = [];
+  const h = setup(path, { log: event => events.push(event) });
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.");
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  const id = `reply:1:${first.id}`;
+  h.store.outboxState(id, "sent");
+  stores.splice(stores.indexOf(h.store), 1);
+  h.store.close();
+  const restored = new Store(path);
+  stores.push(restored);
+  const router = new Router(restored, h.backend, h.transport, h.routerOptions);
+  const api = createApi({ store: restored, photon: { react: async () => {} }, router: () => router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const response = await api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: " Checking. ", dedupeKey: "after-restart", sessionId: "ses_1@1" }) }));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ id, created: false });
+  first.content = [{ type: "text", text: "Checking. More text was appended." }];
+  await router.tick();
+  expect(restored.pendingOutbox()).toEqual([]);
+  h.backend.settle();
+  await router.tick();
+  expect(restored.get("activeTurn")).toBeNull();
+  expect(restored.getOperation(id)).toMatchObject({ state: "sent", text: "Checking." });
+  expect(restored.db.query("SELECT count(*) AS n FROM outbox").get()).toEqual({ n: 1 });
+  expect(events.filter(event => event === "early-reply-enqueued")).toHaveLength(1);
+  expect(events.filter(event => event === "early-reply-text-changed")).toHaveLength(1);
+});
+
+test("steers retain the one early-send allowance and never send the next narration", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  steering(h.backend);
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking.", "tool-calls");
+  first.answer = false;
+  await h.router.tick();
+  h.input("in_steer", "Also check opening hours");
+  await h.router.tick();
+  h.backend.step("Checking hours.", "tool-calls").answer = false;
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${first.id}`]);
+  h.backend.final("Both checked.");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Checking.", "Both checked."]);
+});
+
+test.each([true, undefined])("an early reply after a queued steer cannot overtake an older answer (%s)", async answer => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  steering(h.backend, async () => "queued");
+  h.input("in_early", "First question");
+  await h.router.tick();
+  h.input("in_steer", "Also check the hours");
+  await h.router.tick();
+  h.backend.final("First answer.").answer = answer;
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.backend.records.push({ id: messageId("in_steer"), type: "user", text: "Also check the hours", time: { created: Date.now() } });
+  h.backend.step("Checking hours.", "tool-calls").answer = false;
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.backend.final("Hours checked.");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["First answer.", "Hours checked."]);
+});
+
+test("a steer before the first early reply keeps two answers in the same run in order", async () => {
+  setSystemTime(earlyStart);
+  const h = setup();
+  steering(h.backend);
+  h.input("in_early", "First question");
+  await h.router.tick();
+  h.backend.step("Answer A.").answer = true;
+  h.input("in_steer", "Also check the hours");
+  await h.router.tick();
+  h.backend.step("Answer B.").answer = true;
+  setSystemTime(earlyStart + 20_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  h.backend.settle();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Answer A.", "Answer B."]);
+  expect(h.store.get("activeTurn")).toBeNull();
 });
 
 test("a steer the server refuses goes out once as its own turn after the current one", async () => {
@@ -2266,7 +2768,7 @@ test("response errors yield a safe control and long work is never cut off", asyn
   expect(JSON.stringify(h.router.status())).not.toMatch(/PRIVATE|\/Chats|notification-skill|1555555/);
 });
 
-test("an older completed assistant does not mask a newer unfinished response", async () => {
+test("an older completed assistant goes early while a newer unfinished response still waits for completion", async () => {
   const h = setup();
   h.input("question", "Question");
   await h.router.tick();
@@ -2274,11 +2776,11 @@ test("an older completed assistant does not mask a newer unfinished response", a
   const latest = h.backend.step("Still streaming");
   delete latest.time.completed;
   await h.router.tick();
-  expect(h.conversations()).toEqual([]);
+  expect(h.conversations().map(op => op.text)).toEqual(["Old completion"]);
   latest.time.completed = Date.now();
   h.backend.settle();
   await h.router.tick();
-  expect(h.conversations()[0]!.text).toBe("Still streaming");
+  expect(h.conversations().map(op => op.text)).toEqual(["Old completion", "Still streaming"]);
 });
 
 test("poll errors are silent retries while local controls still work", async () => {
