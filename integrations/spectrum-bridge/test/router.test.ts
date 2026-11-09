@@ -5454,6 +5454,7 @@ test.each(["generic", "model-error", "first-turn-failure", "atomic-rollback"])("
         h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
         if (inbound === "second") h.backend.final("Second successful answer");
         else {
+          h.backend.step("FAILED_RUN_PARTIAL_ANSWER").answer = true;
           h.backend.failed();
           const idle = h.backend.records.at(-1)!;
           if (idle.type === "idle") {
@@ -5486,4 +5487,34 @@ test.each(["generic", "model-error", "first-turn-failure", "atomic-rollback"])("
   expect(h.store.get<object>("watermark")).toMatchObject({ id: lastIdle });
   expect(h.backend.prompts).toHaveLength(1);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
+
+test("review633r4: final failed run cannot send its own intermediate answer", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("first", "Do the work");
+  await h.router.tick();
+  const partial = h.backend.step("FAILED_RUN_PARTIAL_ANSWER");
+  partial.answer = true;
+  h.backend.failed("FAILED_RUN_ERROR");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual([]);
+});
+
+
+test.each(["generic", "model-error", "first-turn-failure"])("failure forwarding excludes the final run without an earlier success (%s)", async kind => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  h.input("first", "Do the work");
+  await h.router.tick();
+  h.backend.step("FAILED_RUN_PARTIAL_ANSWER").answer = true;
+  h.backend.step("FAILED_RUN_OTHER_PARTIAL_ANSWER").answer = true;
+  h.backend.failed("FAILED_RUN_ERROR");
+  const idle = h.backend.records.at(-1)!;
+  if (idle.type === "idle") {
+    if (kind === "model-error") idle.modelError = true;
+    if (kind === "first-turn-failure") idle.firstTurnFailure = true;
+  }
+  for (let i = 0; i < 4; i++) await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.backend.prompts).toHaveLength(1);
 });

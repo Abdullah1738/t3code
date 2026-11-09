@@ -2985,23 +2985,32 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
+        const successful = new Set<string>();
+        const successfulReplies = new Set<string>();
+        let prompts = start >= 0 && messages[start]!.type === "user" ? [messages[start]!.id] : [];
+        let replyIds: string[] = [];
+        for (const record of scope) {
+          if (record.type === "user") prompts.push(record.id);
+          if (record.type === "assistant") replyIds.push(record.id);
+          if (record.type === "idle") {
+            if (record.outcome === "succeeded" && !record.modelError && !record.firstTurnFailure) {
+              for (const id of prompts) successful.add(id);
+              for (const id of replyIds) successfulReplies.add(id);
+            }
+            prompts = [];
+            replyIds = [];
+          }
+        }
+        // The terminal failed idle is outside scope; its open run must never contribute a partial reply.
+        const completedEarlier = earlier.filter(reply => successfulReplies.has(reply.id));
         const failAfterEarlier = (text: string, reason: DropReason, immediate = false) => {
           this.store.db.transaction(() => {
-            const said = earlier.map(reply => ({ reply, text: replyText(assistantText(reply)) })).filter(item => item.text);
+            const said = completedEarlier.map(reply => ({ reply, text: replyText(assistantText(reply)) })).filter(item => item.text);
             for (const { reply, text } of said) this.store.enqueue({
               id: `reply:${turn!.generation}:${reply.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
               ...this.replyTarget(turn!.inboundId),
             });
             if (said.length) this.noteGroupReply(turn!.inboundId, said.map(item => item.text));
-            const successful = new Set<string>();
-            let prompts = start >= 0 && messages[start]!.type === "user" ? [messages[start]!.id] : [];
-            for (const record of scope) {
-              if (record.type === "user") prompts.push(record.id);
-              if (record.type === "idle") {
-                if (record.outcome === "succeeded" && !record.modelError) for (const id of prompts) successful.add(id);
-                prompts = [];
-              }
-            }
             for (const row of this.store.pendingInbound()) {
               const steering = row.state === "processing" && this.steering(row.id)
                 || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
@@ -3013,7 +3022,7 @@ export class Router {
             this.fail(turn!, text, idle.id, reason, immediate);
             for (const id of completed) this.store.updateInbound(id, "done");
           }).immediate();
-          if (earlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
+          if (completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
         if (idle.firstTurnFailure || idle.modelError || priorFailure) {
           failAfterEarlier(firstFailureText(idle.modelError || priorFailure?.modelError), "failed", true);

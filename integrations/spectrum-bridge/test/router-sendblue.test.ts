@@ -1455,6 +1455,8 @@ test.each(["dm", "group"].flatMap(kind => [false, true].map(modelError => ({ kin
         h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
         if (index === 0) h.backend.final("Second successful answer");
         else {
+          h.backend.records.push({ id: "failed-partial", type: "assistant", agent: "build", model: { providerID: "test", id: "model" },
+            content: [{ type: "text", text: "FAILED_RUN_PARTIAL_ANSWER" }], answer: true, finish: "stop", time: { created: Date.now(), completed: Date.now() } });
           h.backend.records.push({ id: "failed-assistant", type: "assistant", agent: "build", model: { providerID: "test", id: "model" },
             content: [{ type: "text", text: "PRIVATE_FAILURE" }], finish: "error", error: { type: "ProviderError" }, time: { created: Date.now(), completed: Date.now() } });
           h.backend.records.push({ id: "failed-idle", type: "idle", outcome: "failed", modelError, time: { created: Date.now() } });
