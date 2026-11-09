@@ -4,6 +4,7 @@
  * apply the exact shell filters.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
@@ -276,12 +277,16 @@ const makeHarness = (
               Layer.mergeAll(
                 Layer.mock(EnvironmentAuth.EnvironmentAuth)({
                   authenticateHttpRequest: () =>
-                    Effect.succeed({
-                      sessionId: AuthSessionId.make("session-cli"),
-                      subject: "cli-issued-session",
-                      method: "bearer-access-token" as const,
-                      scopes: ["orchestration:read", "orchestration:operate"],
-                    }),
+                    sql`SELECT 1`.pipe(
+                      NodeSqliteClient.readOnly,
+                      Effect.orDie,
+                      Effect.as({
+                        sessionId: AuthSessionId.make("session-cli"),
+                        subject: "cli-issued-session",
+                        method: "bearer-access-token" as const,
+                        scopes: ["orchestration:read", "orchestration:operate"],
+                      }),
+                    ),
                 }),
                 threads,
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
@@ -762,5 +767,40 @@ describe("control listings", () => {
         assert.strictEqual(response.body.identity.driver, "claudeAgent");
       }),
     ),
+  );
+
+  it.live("authenticates and resolves identity while a shell snapshot holds the reader", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-control-identity-reader-" });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const harness = yield* makeHarness();
+        const url = "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent";
+        assert.strictEqual((yield* harness.get(url)).status, 200);
+        const held = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const reader = yield* Effect.forkChild(
+          sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* sql`SELECT 1`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }),
+            )
+            .pipe(NodeSqliteClient.readOnly),
+        );
+        yield* Deferred.await(held);
+        const response = yield* harness
+          .get(url)
+          .pipe(Effect.timeout("2 seconds"), Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(reader);
+        assert.strictEqual(response.status, 200);
+        assert.strictEqual(response.body.identity.resolution, "resolved");
+        assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+      }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

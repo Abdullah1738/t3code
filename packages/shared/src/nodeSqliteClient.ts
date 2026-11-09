@@ -37,6 +37,8 @@ export interface SqliteClientConfig {
   readonly filename: string;
   /** Reserve a bounded process for fresh session lookups. */
   readonly authReaderProcess?: boolean | undefined;
+  /** Reserve a separate bounded process for execution identity lookups. */
+  readonly identityReaderProcess?: boolean | undefined;
 
   readonly readonly?: boolean | undefined;
   readonly allowExtension?: boolean | undefined;
@@ -125,6 +127,10 @@ export class UnsupportedNodeSqliteOperationError extends Schema.TaggedError<Unsu
 /** Fresh committed auth lookup, isolated from the base reader queue. */
 export const authReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   readOnly(Effect.provideService(effect, ReaderLane, "auth"));
+
+/** Identity lookups have their own bounded process and never queue behind auth or views. */
+export const identityReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  readOnly(Effect.provideService(effect, ReaderLane, "identity"));
 
 const checkNodeSqliteCompat = () => {
   const parts = process.versions.node.split(".").map(Number);
@@ -1463,12 +1469,24 @@ const make = Effect.fn("makeWithDatabase")(function* (
         )
       : undefined;
 
+  const acquireIdentity =
+    options.readerWorker && isFileDatabase && (options.identityReaderProcess ?? options.authReaderProcess)
+      ? yield* makeReaderLanes(() =>
+          makeAuthReader({
+            ...options,
+            readerStatementLimit: options.readerStatementLimit ?? "5 seconds",
+          }),
+        )
+      : undefined;
+
   const writer = { name: "writer" as const, lock: bindSemaphore(semaphore), connection };
   const admission = Effect.withFiber((fiber) => {
     const wait = options.beforeAcquire ?? Effect.void;
     const restore = fiber.getRef(TransactionAcquire)?.restore;
     return restore === undefined ? wait : restore(wait);
   });
+  const reservedReader = (fiber: Fiber.Fiber<any, any>) =>
+    Context.get(fiber.context, ReaderLane) === "identity" ? acquireIdentity : acquireAuth;
   const route = Effect.andThen(
     admission,
     Effect.withFiber<{
@@ -1477,8 +1495,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
       lock: typeof writer.lock | Effect.Success<NonNullable<typeof acquireAuth>>["lock"];
     }, SqlError>((fiber) =>
       acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
-        ? acquireAuth !== undefined && Context.get(fiber.context, ReaderLane) === "auth"
-          ? Effect.map(acquireAuth, (reader) => ({ name: "reader" as const, ...reader }))
+        ? reservedReader(fiber) !== undefined && Context.get(fiber.context, ReaderLane) !== "view"
+          ? Effect.map(reservedReader(fiber)!, (reader) => ({ name: "reader" as const, ...reader }))
           : Effect.map(acquireReader, (readerConnection) =>
               readerConnection === undefined
                 ? writer
@@ -1550,7 +1568,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const clock = fiber.getRef(Clock.Clock);
       const start = clock.monotonicTimeNanosUnsafe();
       const pending = fiber.getRef(TransactionAcquire);
-      if (pending !== undefined && acquireAuth !== undefined && target.name === "reader" && Context.get(fiber.context, ReaderLane) === "auth")
+      if (pending !== undefined && reservedReader(fiber) !== undefined && target.name === "reader" && Context.get(fiber.context, ReaderLane) !== "view")
         pending.retire = retireAuthReader(target.connection);
       const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
         if (pending !== undefined) pending.acquired = acquired(target, clock, start);
@@ -1590,17 +1608,17 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const body = Effect.withFiber<A, E | SqlError, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired);
           pending.restore = undefined;
-          return acquireAuth !== undefined &&
-            Context.get(fiber.context, ReaderLane) === "auth" &&
+          return reservedReader(fiber) !== undefined &&
+            Context.get(fiber.context, ReaderLane) !== "view" &&
             pending.acquired?.connection === "reader"
             ? Effect.timeoutOrElse(effect, {
                 duration: options.readerStatementLimit ?? "5 seconds",
                 orElse: () =>
                   Effect.fail(
                     new SqlError({
-                      reason: classifySqliteError(new Error("Auth snapshot expired"), {
+                      reason: classifySqliteError(new Error("Reserved reader snapshot expired"), {
                         operation: "readerSnapshot",
-                        message: "Auth snapshot expired",
+                        message: "Reserved reader snapshot expired",
                       }),
                     }),
                   ),

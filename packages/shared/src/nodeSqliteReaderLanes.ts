@@ -4,12 +4,12 @@ import * as Semaphore from "effect/Semaphore";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import type { Connection } from "effect/sql/SqlConnection";
 
-export const ReaderLane = Context.Reference<"auth" | "view">(
+export const ReaderLane = Context.Reference<"auth" | "identity" | "view">(
   "@t3tools/shared/nodeSqliteClient/ReaderLane",
   { defaultValue: () => "view" },
 );
 
-/** Bounded admission for the reserved auth connection; opened after migrations. */
+/** Bounded admission for one reserved connection; opened after migrations. */
 export const makeReaderLanes = Effect.fnUntraced(function* <E, R>(
   make: () => Effect.Effect<Effect.Effect<Connection | undefined>, E, R>,
 ) {

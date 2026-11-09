@@ -33,6 +33,53 @@ const withLaneClient = <A, E>(use: (sql: SqlClient.SqlClient) => Effect.Effect<A
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
+// Ported from 4a15b49745 (origin/main): identity lookups get their own reserved lane.
+it.effect("keeps identity reads read-only on their own lane and preserves an enclosing writer transaction", () =>
+  withLaneClient((sql) =>
+    Effect.gen(function* () {
+      const viewHeld = yield* Deferred.make<void>();
+      const authHeld = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const hold = (ready: Deferred.Deferred<void>) =>
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`SELECT * FROM sessions`;
+            yield* Deferred.succeed(ready, undefined);
+            yield* Deferred.await(release);
+          }),
+        );
+      const view = yield* hold(viewHeld).pipe(SqliteClient.readOnly, Effect.forkChild);
+      yield* Deferred.await(viewHeld);
+      const auth = yield* hold(authHeld).pipe(SqliteClient.authReadOnly, Effect.forkChild);
+      yield* Deferred.await(authHeld);
+      assert.deepEqual(
+        yield* sql`SELECT revoked FROM sessions WHERE id=1`.pipe(
+          SqliteClient.identityReadOnly,
+          Effect.timeout("2 seconds"),
+        ),
+        [{ revoked: 0 }],
+      );
+      const refused = yield* sql`INSERT INTO sessions VALUES (2,0)`.pipe(
+        SqliteClient.identityReadOnly,
+        Effect.flip,
+      );
+      assert.equal(refused._tag, "SqlError");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(view);
+      yield* Fiber.join(auth);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO sessions VALUES (3,0)`;
+          const rows = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM sessions`.pipe(
+            SqliteClient.identityReadOnly,
+          );
+          assert.equal(rows[0]?.n, 2);
+        }),
+      );
+    }),
+  ),
+);
+
 it.effect("reserves auth while the base reader and writer are held", () =>
   withLaneClient((sql) =>
     Effect.gen(function* () {
