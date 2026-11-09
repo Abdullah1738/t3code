@@ -606,3 +606,13 @@ No payment-intent completion, CVV submission or 3DS challenge occurred. This
 establishes the automatic Food contract used by the CLI, alongside the 7 November
 HTTP placement. It does not establish NowNow's different payment contract.
 Never manufacture a completion request for an automatic paid order.
+
+NowNow retained cart cleanup: `commerce clear-cart nownow --flow FLOW_UUID`.
+Requires a released flow and the exact retained session/review/account/Home.
+A failed pre-order card verification additionally requires its terminal release
+and fresh exact failed-intent evidence with zero bank amounts. Active account
+flows, later writers, unknown sends and placement history refuse. The native
+`v1/session/delete` POST takes only `sessionCode`; deletion is consumed once,
+then the exact store's active session and recent carts independently prove empty.
+A missing response or failed readback keeps the cleanup flow blocking the account.
+No automatic resend, payment, placement or watcher registration occurs.

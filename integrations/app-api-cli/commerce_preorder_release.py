@@ -21,7 +21,8 @@ def review_cart(flow_id, *, auth=None):
     from commerce_nownow_order import NowNowOrderFlow, saved_card
     state = load(flow_id)
     auth = auth or CommerceAuth().noon
-    client = reader(auth=auth, expected_account=state['binding']['account_hash'])
+    client = reader(auth=auth, expected_account=state['binding']['account_hash'],
+                    expected_address=state['address_hash'])
     require(not client.home(timeout=25).projection['active_orders'], 'ACTIVE_ORDER_PRESENT')
     recent = client.recent_carts(timeout=25)
     p = state['review']['projection']

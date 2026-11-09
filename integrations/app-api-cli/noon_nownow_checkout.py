@@ -31,9 +31,11 @@ PREFIX = '/_svc/mp-shop-api-mpnoon/v1/order/'
 MP_BASE = 'https://' + HOST + '/_svc/mp-shop-api-mpnoon/'
 PAYMENT_BASE = 'https://api-app-st.noon.com/_svc/mp-payment-api-public/'
 QUIET_NOTE = seam.QUIET_NOTE
-WRITES = frozenset({'cart_get', 'cart_create', 'cart_validate', 'product_edit', 'instructions', 'delivery_preference',
+WRITES = frozenset({'cart_delete', 'cart_get', 'cart_create', 'cart_validate', 'product_edit', 'instructions', 'delivery_preference',
                     'payment', 'place', 'payment_complete', 'payment_subscription'})
 ROUTES = {
+    # Android deleteCart: shape 21062 (key buffer 396762) = {sessionCode}.
+    'cart_delete': ('POST', MP_BASE + 'v1/session/delete', {'sessionCode'}),
     'cart_get': ('POST', MP_BASE + 'v1/session/active', {'storeCode'}),
     'carts_recent': ('POST', MP_BASE + 'v1/session/recent', set()),
     'cart_create': ('POST', MP_BASE + 'v1/session/create', {'productCode', 'storeCode', 'modifiers'}),
@@ -493,6 +495,14 @@ class NowNowCheckout:
                             for row in carts], 'complete_history': False}, time.time())
         return self._call('carts_recent', {}, timeout, project=project)
 
+    def delete_cart(self, session_code, *, before_send, timeout=25):
+        def project(data):
+            seam._application_ok(data)
+            require(data.get('status') in (None, 'success'), 'APPLICATION_REJECTED')
+            return {'response_received': True, 'empty_verified': False}
+        return self._call('cart_delete', {'sessionCode': ident(session_code)}, timeout,
+                          before_send, project=project)
+
     def _session(self, operation, payload, timeout, before_send, *, store_code=None):
         return self._call(operation, payload, timeout, before_send,
             project=lambda data: Snapshot(data, project_cart(data,
@@ -598,6 +608,7 @@ class NowNowCheckout:
         """Order homepage readback; the coordinator checks journal attribution."""
         def project(data):
             row = _data(data)
+            require('active' in row, 'HOMEPAGE_SCHEMA_CHANGED')
             active = row.get('active')
             # Live 2026-10-10: active is null when no order is in flight.
             require(active is None or isinstance(active, list) and len(active) <= 50,

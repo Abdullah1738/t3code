@@ -997,7 +997,7 @@ def main(argv=None):
     cart.add_argument('--expect-hash',dest='expect_hash',default=None,metavar='HASH',
         help='set: cart_hash from the last cart minutes show; refused if the cart changed since')
     clear=commands.add_parser('clear-cart',help='Clear an unchanged cart owned by a closed, cart-only noon flow')
-    clear.add_argument('vertical',choices=('minutes','main','supermall'))
+    clear.add_argument('vertical',choices=('minutes','main','supermall','nownow'))
     clear.add_argument('--flow',dest='flow_id',required=True)
     for name in ('menu','choices'):
         discovery=commands.add_parser(name,help='Read Talabat menu items or item choices; never changes a cart')
@@ -1158,7 +1158,10 @@ def main(argv=None):
                 result=cart_set(read_items(args.items_file),expect_hash=args.expect_hash,auth=CommerceAuth().noon,
                                 items_file=args.items_file)
         elif args.command=='clear-cart':
-            if args.vertical=='minutes':
+            if args.vertical=='nownow':
+                from commerce_nownow_cleanup import clear_cart
+                result=clear_cart(args.flow_id)
+            elif args.vertical=='minutes':
                 from commerce_minutes_cleanup import clear_cart
                 result=clear_cart(args.flow_id)
             else:
@@ -1263,7 +1266,8 @@ def main(argv=None):
                               'financial_send':False,'financial_retry':False}))
             return 1
         from commerce_minutes_cart import OutcomeUnverified
-        if isinstance(exc,OutcomeUnverified):
+        from commerce_nownow_cleanup import CleanupUnverified
+        if isinstance(exc,(OutcomeUnverified,CleanupUnverified)):
             print(json.dumps({'ok':False,'error':exc.code,**exc.details,'financial_retry':False}))
             return 1
         code=str(exc)

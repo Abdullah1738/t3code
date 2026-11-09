@@ -1324,6 +1324,11 @@ def abandon(flow_id):
         flow = _get(db, flow_id)
         if flow['state'] not in ('ACTIVE', 'FENCED'):
             fail('JOURNAL_ABANDON_ACTIVE_ONLY')
+        # A delete acknowledgement alone does not establish an empty cart.
+        if db.execute("SELECT 1 FROM operations WHERE flow_id=? AND name='cart_delete'", (flow_id,)).fetchone():
+            if not db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_delete' "
+                              "AND outcome='CART_READBACK'", (flow_id,)).fetchone():
+                fail('JOURNAL_CLEAR_EMPTY_READBACK_REQUIRED')
         rows = list(db.execute("SELECT kind,state FROM operations WHERE flow_id=?", (flow_id,)))
         if (any(r['state'] != 'OBSERVED' for r in rows)
                 or any(r['kind'] in ('place', 'payment', 'preauthorize', 'prepay') for r in rows)
