@@ -77,6 +77,11 @@ import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as ContextResetHandlers from "../ardud/context-reset/handlers.ts";
 import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
 import { ContextResetToolkit } from "../ardud/context-reset/tools.ts";
+import * as ImessageSendHandlers from "../ardud/imessage/handlers.ts";
+import * as ImessageBridgeCli from "../ardud/imessage/ImessageBridgeCli.ts";
+import * as ImessageSendService from "../ardud/imessage/ImessageSendService.ts";
+import { ImessageSendToolkit } from "../ardud/imessage/tools.ts";
+import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
@@ -1132,6 +1137,16 @@ const layerContextResetToolkitRegistration = toolkitRegistration(
   ContextResetToolkit,
   ContextResetHandlers.layer,
 ).pipe(Layer.provide(ContextResetService.layer));
+const layerImessageSendToolkitRegistration = toolkitRegistration(
+  ImessageSendToolkit,
+  ImessageSendHandlers.layer,
+).pipe(
+  Layer.provide(
+    ImessageSendService.layer.pipe(
+      Layer.provide(Layer.mergeAll(ControlStore.layer, ImessageBridgeCli.layer)),
+    ),
+  ),
+);
 const layerScheduledTaskBlockRetryRegistration = toolkitRegistration(
   ScheduledTaskBlockRetry.ScheduledTaskBlockRetryToolkit,
   ScheduledTaskBlockRetry.layer,
@@ -1192,6 +1207,7 @@ export const layer = Layer.mergeAll(
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
   layerContextResetToolkitRegistration,
+  layerImessageSendToolkitRegistration,
   layerScheduledTaskBlockRetryRegistration,
   // ardud: missions board
   layerKanbanToolkitRegistration,

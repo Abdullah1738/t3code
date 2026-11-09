@@ -41,6 +41,7 @@ export type T3McpToolSummaryAction =
   | "question-respond"
   | "secret-request"
   | "context-reset"
+  | "imessage-send"
   | "worktree-handoff"
   | "worktree-list"
   | "worktree-status"
@@ -166,6 +167,7 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
   t3_worktree_status: tool(["Get", "Getting", "Got", "thread worktree status"], "worktree-status"),
   // ardud fork
   t3_context_reset: tool(["Reset", "Resetting", "Reset", "this thread's context"], "context-reset"),
+  imessage_send: tool(["Send", "Sending", "Sent", "an iMessage"], "imessage-send"),
   t3_scheduled_task_block_retry: tool(
     ["Set", "Setting", "Set", "a scheduled task's blocked-run retry"],
     "schedule-update",
