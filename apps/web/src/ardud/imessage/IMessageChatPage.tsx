@@ -545,7 +545,7 @@ function TurnChip(props: {
       )}
     >
       {turn.outcome === "working" ? (
-        <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-(--im-dot)" />
+        <span aria-hidden className="size-1.5 rounded-full bg-(--im-dot)" />
       ) : turn.errorCount > 0 ? (
         <span aria-hidden className="size-1.5 rounded-full bg-destructive" />
       ) : null}
