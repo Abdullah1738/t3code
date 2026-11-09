@@ -568,7 +568,7 @@ describe("ExecutionIdentity", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live("resolves a started app-managed Codex child while the SQLite writer is held", () =>
+  it.live("resolves a started child while writer, shared reader and auth lane are held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
@@ -671,13 +671,35 @@ describe("ExecutionIdentity", () => {
           ),
         );
         yield* Deferred.await(writerHeld);
+        const readerHeld = yield* Deferred.make<void>();
+        const releaseReader = yield* Deferred.make<void>();
+        const reader = yield* Effect.forkChild(sql.withTransaction(
+          sql`SELECT 1`.pipe(
+            Effect.andThen(Deferred.succeed(readerHeld, undefined)),
+            Effect.andThen(Deferred.await(releaseReader)),
+          ),
+        ).pipe(NodeSqliteClient.readOnly));
+        yield* Deferred.await(readerHeld);
+        const authHeld = yield* Deferred.make<void>();
+        const releaseAuth = yield* Deferred.make<void>();
+        const auth = yield* Effect.forkChild(sql.withTransaction(
+          sql`SELECT 1`.pipe(
+            Effect.andThen(Deferred.succeed(authHeld, undefined)),
+            Effect.andThen(Deferred.await(releaseAuth)),
+          ),
+        ).pipe(NodeSqliteClient.authReadOnly));
+        yield* Deferred.await(authHeld);
         const result = yield* identity
           .resolve({ nativeId, driver })
           .pipe(
             Effect.timeout("2 seconds"),
             Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+            Effect.ensuring(Deferred.succeed(releaseReader, undefined)),
+            Effect.ensuring(Deferred.succeed(releaseAuth, undefined)),
           );
         yield* Fiber.join(writer);
+        yield* Fiber.join(reader);
+        yield* Fiber.join(auth);
         assert.strictEqual(result.resolution, "resolved");
         assert.strictEqual(result.robobThreadId, childId);
         assert.strictEqual(result.executionKind, "app-managed-child");

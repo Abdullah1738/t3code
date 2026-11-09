@@ -272,3 +272,26 @@ it.live("two first-boot openers cannot replay stale rows after cutover", () =>
     assert.strictEqual((yield* current.sql`SELECT * FROM ardud_kanban_custom`).length, 39);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it.live("identity import reads bypass a held boards reader", () =>
+  Effect.gen(function* () {
+    const { legacy, boards } = yield* fixture;
+    const context = yield* Layer.build(BoardsDatabase.layerFromPaths(boards, legacy));
+    const db = Context.get(context, BoardsDatabase.BoardsDatabase);
+    yield* db.ready;
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const reader = yield* Effect.forkChild(db.sql.withTransaction(db.sql`SELECT 1`.pipe(
+      Effect.andThen(Deferred.succeed(held, undefined)),
+      Effect.andThen(Deferred.await(release)),
+    )).pipe(NodeSqliteClient.readOnly));
+    yield* Deferred.await(held);
+    const rows = yield* db.sql<{ thread_id: string }>`SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = 'ses_1'`.pipe(
+      NodeSqliteClient.identityReadOnly,
+      Effect.timeout("2 seconds"),
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+    );
+    yield* Fiber.join(reader);
+    assert.strictEqual(rows[0]?.thread_id, "thread-1");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

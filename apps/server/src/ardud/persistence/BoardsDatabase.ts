@@ -190,6 +190,7 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
           NodeSqliteClient.layer({
             filename: dbPath,
             readerWorker: true,
+            identityReaderProcess: true,
             checkpointWorker: true,
             beforeAcquire: Effect.flatMap(bypassReady, (bypass) =>
               bypass ? Effect.void : Deferred.await(ready),
