@@ -505,11 +505,20 @@ def retract_food_capture_claim(flow_id, *, evidence_hash):
         db.execute("UPDATE flows SET state='FENCED' WHERE id=?",(flow_id,))
 
 
+def require_nownow_card_selection(flow_id, request_hash):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        op = db.execute("SELECT * FROM operations WHERE flow_id=? AND name='payment'", (flow_id,)).fetchone()
+        if (flow['vertical'] != 'nownow' or not op or op['kind'] != 'selection'
+                or op['state'] != 'OBSERVED' or op['request_hash'] != request_hash):
+            fail('NOWNOW_DURABLE_CARD_SELECTION_MISMATCH')
+
+
 def claim_food_bank_purchase(flow_id, bank):
     """One purchase notification can support only one journalled order."""
     with _db() as db:
         flow=_get(db,flow_id)
-        if flow['app']!='noon' or flow['vertical']!='food' or not flow['order_id']:
+        if flow['app']!='noon' or flow['vertical'] not in ('food', 'nownow') or not flow['order_id']:
             fail('FOOD_BANK_ORDER_REQUIRED')
         receipt_hash=digest({'source':'msgs','source_id':bank['source_id']})
         previous=db.execute("SELECT flow_id FROM observations WHERE outcome='FOOD_BANK_PURCHASE_CLAIMED' AND evidence_hash=?",
@@ -528,6 +537,29 @@ def claim_food_bank_purchase(flow_id, bank):
 def reconcile_food_paid(flow_id, *, evidence_hash):
     """Food adapter has independently bound session, order, intent and capture."""
     return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('food',))
+
+
+def reconcile_nownow_preorder(flow_id):
+    """Only an observed challenged verification followed by exact status success."""
+    with _db() as db:
+        flow = _get(db, flow_id)
+        if flow['state'] == 'ACTIVE':
+            return
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+        success = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? AND outcome='PREORDER_PAYMENT_CONFIRMED'", (flow_id,)).fetchone()['s']
+        fences = list(db.execute("SELECT o.sequence,o.outcome,p.kind FROM observations o JOIN operations p ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or flow['state'] != 'FENCED'
+                or flow['order_id'] or not success or not fences
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('place','payment') for o in ops)
+                or any(r['kind'] != 'prepay' or r['outcome'] != 'CHALLENGE_REQUIRED' or r['sequence'] >= success for r in fences)):
+            fail('NOWNOW_PREORDER_RECONCILIATION_UNPROVEN')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) VALUES (?,?,?,?,?,?)',
+                   (flow_id, 'payment_complete', 'NOWNOW_PREORDER_RECONCILED', digest({'confirmed_sequence': success}), None, time.time()))
+        db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?", (flow_id,))
+
+
+def reconcile_nownow_paid(flow_id, *, evidence_hash):
+    return _reconcile_noon_paid(flow_id, evidence_hash=evidence_hash, verticals=('nownow',))
 
 
 def _reconcile_noon_paid(flow_id, *, evidence_hash, verticals):
@@ -549,6 +581,10 @@ def _reconcile_noon_paid(flow_id, *, evidence_hash, verticals):
         fences = list(db.execute("SELECT o.sequence,p.kind FROM observations o JOIN operations p "
             "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
             "AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if flow['vertical'] == 'nownow':
+            reconciled = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? AND outcome='NOWNOW_PREORDER_RECONCILED'", (flow_id,)).fetchone()['s']
+            if reconciled:
+                fences = [r for r in fences if r['sequence'] > reconciled]
         if (not success or not fences or any(r['kind'] not in ('place', 'payment')
                                             or r['sequence'] >= success for r in fences)):
             fail('JOURNAL_RECONCILIATION_EVIDENCE_CHAIN_INVALID')
@@ -740,6 +776,10 @@ def complete(flow_id):
         if preorder is not None:
             successes=list(db.execute("SELECT sequence FROM observations WHERE flow_id=? AND operation=? AND outcome='PREORDER_PAYMENT_CONFIRMED' ORDER BY sequence",
                 (flow_id,preorder['name'])))
+            captured = db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='place' AND order_id=? AND outcome='PAYMENT_REPORTED_SUCCESS'",
+                                  (flow_id, flow['order_id'])).fetchone()
+            if not captured:
+                fail('NOWNOW_FULL_ORDER_CAPTURE_REQUIRED')
         observations = list(db.execute('SELECT sequence,outcome FROM observations WHERE flow_id=? AND order_id=?',
                                        (flow_id, flow['order_id'])))
         if (not successes or not any(row['outcome'] == 'EXACT_ORDER_CONFIRMED'

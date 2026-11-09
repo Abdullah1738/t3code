@@ -28,6 +28,9 @@ class PreorderTests(unittest.TestCase):
         j.observe(FLOW,'place',outcome='ORDER_ID_RECEIVED',evidence_hash='8'*64,order_id='NNEXACT')
         j.observe(FLOW,'place',outcome='EXACT_ORDER_CONFIRMED',evidence_hash='9'*64,order_id='NNEXACT')
         j.observe(FLOW,'place',outcome='TRACKER_REGISTERED',evidence_hash='a'*64,order_id='NNEXACT')
+        with self.assertRaisesRegex(j.JournalError, 'FULL_ORDER_CAPTURE_REQUIRED'):
+            j.complete(FLOW)
+        j.observe(FLOW,'place',outcome='PAYMENT_REPORTED_SUCCESS',evidence_hash='b'*64,order_id='NNEXACT')
         self.assertEqual(j.complete(FLOW)['state'],'COMPLETE')
         self.assertEqual(j.inspect(FLOW)['campaign_reserved_minor'],2500)
 

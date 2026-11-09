@@ -204,7 +204,8 @@ def capabilities():
         'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,
         'selected_card':{'last4':order_card.LAST4,'network':order_card.NETWORK,'bank_app':order_card.BANK_APP},
         'live_paid_proof_card':'2342',
-        'nownow_selected_card_purchase_enabled':order_card.LAST4=='2342',
+        'nownow_selected_card_purchase_enabled':True,
+        'nownow_9546_paid_live_proof':False,
         'marketplace_card_selection':'requires matching default card in noon app',
         'verticals':{
         'noon.food':{'purchase_enabled':True,'payment':'automatic_saved_card_native_and_bank',
@@ -225,7 +226,8 @@ def capabilities():
             'tracking':'exact_shipment_manifest_rocket_unit_binding','multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True},
         'noon.nownow':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
-            'place':'live_order_created','payment':'saved_card_session_token_live_paid_2026_10_10',
+            'place':'journalled_single_send','payment':'exact_native_order_and_unique_bank_purchase',
+            'cvv':'journalled_preorder_verification','device_verification':'fail_closed',
             'tracking':'exact_native','multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True,
             'quiet_driver_note_live_verified':True},
@@ -385,8 +387,6 @@ def order_nownow(args):
     tracking poll. Payment rides the session token; place is the only
     financial send. On 401: stop, no re-login attempt.
     """
-    if not args.prepare_only and order_card.LAST4 != '2342':
-        journal.fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
     import noon_nownow_checkout as nownow_transport
     from commerce_nownow_order import NowNowOrderFlow
     items=input_items(args,id_argument='product_code',id_key='product_code')
@@ -404,6 +404,7 @@ def order_nownow(args):
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
     if args.prepare_only:
         return verified
+    flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
     try:
         placed=flow.place()
     except nownow_transport.NowNowError as exc:
@@ -411,8 +412,12 @@ def order_nownow(args):
             journal.fail('NOWNOW_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     print(json.dumps({'flow_id':flow.flow_id,'phase':'placed','order':placed['order']}),flush=True)
-    tracking=flow.poll_tracking()
-    paid=flow.confirm_paid(tracking)
+    try:
+        tracking=flow.poll_tracking()
+        paid=flow.confirm_paid(tracking)
+    except Exception:
+        flow.register_tracker(args.label, recipient=args.recipient, paid=False)
+        raise
     registration=flow.register_tracker(args.label,eta=tracking.get('estimate'),recipient=args.recipient)
     journal.complete(flow.flow_id)
     return {'ok':True,'flow_id':flow.flow_id,'order':flow.order,
@@ -857,6 +862,9 @@ def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
         from commerce_food import recover
         return recover(flow_id)
     if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
+    if binding['vertical']=='nownow' and journal.inspect(flow_id)['order_id']:
+        from commerce_nownow_capture import recover
+        return recover(flow_id, recipient=recipient)
     if binding['vertical']=='nownow' and journal.preorder_status(flow_id)['operations']:
         from commerce_preorder import recover
         return recover(flow_id)
@@ -1058,6 +1066,7 @@ def main(argv=None):
         help='Authorized NowNow paid order E2E: guard, session, validate, saved-card, quiet, place, tracking')
     basket_arguments(nownow_order,'--product-code')
     nownow_order.add_argument('--store-code',required=True)
+    nownow_order.add_argument('--cvv-from-keychain',action='store_true')
     nownow_order.add_argument('--label',default='Noon NowNow order')
     nownow_order.add_argument('--resume-flow',default=None,metavar='FLOW_UUID',
         help='continue an ACTIVE pre-place flow (24h window; exact session readback)')

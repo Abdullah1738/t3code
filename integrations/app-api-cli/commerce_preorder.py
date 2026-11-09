@@ -69,6 +69,8 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20):
         state=journal.preorder_status(flow_id)
     manager=auth or CommerceAuth()
     if state['payment_confirmed']:
+        if state['state'] == 'FENCED':
+            journal.reconcile_nownow_preorder(flow_id)
         return {'flow_id':flow_id,'payment_status':'payment_confirmed',
                 'recovery':'durable_observation','financial_retry':False,'journal_state':state['state']}
     client=reader(auth=manager.noon,expected_account=binding['account_hash'])
@@ -78,5 +80,7 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20):
         project=lambda data:Snapshot(data,project_payment(data,None),time.time()))
     op=next(x['name'] for x in state['operations'] if x['kind']=='prepay')
     journal.observe(flow_id,op,outcome=payment_outcome(result.projection),evidence_hash=journal.digest(result.projection))
+    if payment_outcome(result.projection) == 'PREORDER_PAYMENT_CONFIRMED':
+        journal.reconcile_nownow_preorder(flow_id)
     return {'flow_id':flow_id,**result.projection,'financial_retry':False,
             'journal_state':journal.inspect(flow_id)['state']}

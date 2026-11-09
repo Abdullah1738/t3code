@@ -556,9 +556,23 @@ held; completion also requires the watcher and delivery-card sent receipt.
 
 Main/Supermall require the selected card to be the noon account default; they
 never switch saved cards. Change that default in the noon app before using a
-different card. NowNow 9546 paid orders refuse before cart changes pending
-verified Visa payment evidence. Report the CLI limitation before any authorized
-phone fallback; never use an unauthorized 2342 override.
+different card. NowNow supports explicit saved-card selection and
+`--cvv-from-keychain`. It journals subscription verification and CVV completion
+once, keeps secrets in Keychain/RAM, and stops on bank/device challenges.
+Verification is not purchase capture: the order needs exact native details and
+a unique bank purchase for its original card, amount and placement time.
+`recover-payment` uses the retained order ID after checkout expiry; pending
+evidence registers a held tracker. A completed verification can resume the same
+flow without another subscription or completion. Unknown sends stay fenced.
+Customized NowNow modifiers/notes remain unsupported and fail before mutation.
+
+9 November live attempt: one White Chocolate 330ml shake prepared at AED26.70.
+9546 required an AED1 card verification. One CLI completion reached Mashreq 3DS;
+the retained redirect was displayed, then reopened once with authorization after
+browser navigation interrupted it. Native status ended `payment_failed`,
+`FAILED`, error 19046 (3D secure authentication failure), with authorized and
+captured amounts both zero. No order placement was sent. Full 9546 purchase and
+capture remain unproven; there was no replacement flow or fallback charge.
 Visa refund code/title matching is synthetic-fixture coverage only. Unfamiliar
 refund wording remains fenced and must be inspected before extending the parser.
 

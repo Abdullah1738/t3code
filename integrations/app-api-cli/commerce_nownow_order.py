@@ -71,8 +71,7 @@ def corroborate_token(client, card, *, timeout=25):
     """subscription/list must contain the saved-card token before edit-payment."""
     refs = client.payment_subscription_list(timeout=timeout).projection['token_refs']
     from noon_checkout import fingerprint
-    if fingerprint(card.token) not in refs:
-        _fail('NOWNOW_SAVED_CARD_TOKEN_NOT_ACTIVE')
+    return fingerprint(card.token) in refs
 
 
 def project_fees(row):
@@ -119,6 +118,8 @@ def _normalize_items(product_code, quantity, items):
             notes = row.get('notes')
             if notes is not None and not isinstance(notes, str):
                 _fail('NOWNOW_NOTES_INVALID')
+            if modifiers or notes:
+                _fail('NOWNOW_CUSTOMIZED_MANIFEST_UNSUPPORTED')
             out.append({'product_code': code, 'quantity': qty,
                         'modifiers': dict(modifiers) if modifiers else {}, 'notes': notes})
         return out
@@ -234,11 +235,12 @@ class NowNowOrderFlow:
         kinds = {'cart_get': 'quote', 'cart_create': 'cart', 'product_edit': 'cart',
                   'cart_validate': 'quote', 'payment': 'selection',
                   'delivery_preference': 'instructions', 'instructions': 'instructions',
+                  'payment_subscription': 'preauthorize', 'payment_complete': 'prepay',
                   'place': 'place'}
         kind = kinds.get(operation)
         if kind is None:
             _fail('NOWNOW_OPERATION_UNMAPPED')
-        financial = kind == 'place'
+        financial = kind in ('place', 'preauthorize', 'prepay')
         if financial:
             if self.review is None or time.time() - self.review['observed_at'] > 60:
                 _fail('NOWNOW_FRESH_REVIEW_REQUIRED')
@@ -260,7 +262,8 @@ class NowNowOrderFlow:
         result = journal.consume(self.flow_id, name, kind=kind, request_hash=digest,
                                  cart_hash=self.cart_hash,
                                  review_hash=self.review['digest'] if financial else None,
-                                 payable_minor=self.review['payable_minor'] if financial else None)
+                                 payable_minor=self.review['payable_minor'] if financial else None,
+                                 payment_intent_hash=getattr(self, 'preorder_intent_hash', None) if kind == 'prepay' else None)
         self.expected = None
         return result
 
@@ -275,6 +278,7 @@ class NowNowOrderFlow:
                 payable_minor=self.review['payable_minor'], review_sha256=self.review['digest']))
         journal.observe(self.flow_id, self.operation_name, outcome=record['outcome'],
                         evidence_hash=record['evidence_hash'], order_id=record['order_id'])
+        self.last_receipt = dict(record)
         return True
 
     def _cookies(self, operation, values, *, response_url, http_status, outcome_journaled):
@@ -435,9 +439,13 @@ class NowNowOrderFlow:
         state = self._guard_state(row)
         if self.card is None:
             _fail('NOWNOW_CARD_REQUIRED')
-        if row.get('hasPaymentSubscription') is not True \
-                or row.get('paymentMethodCode') != 'prepaid' \
+        journal.require_nownow_card_selection(self.flow_id, hashlib.sha256(
+            native.seam._json(native.payment_payload(self.session_code, self.card))).hexdigest())
+        if row.get('paymentMethodCode') != 'prepaid' \
                 or row.get('creditCardMask') != self.card.mask:
+            _fail('NOWNOW_PAYMENT_READBACK_MISMATCH')
+        if ('paymentToken' in row and str(row['paymentToken']) != self.card.token) \
+                or (row.get('prepaidPaymentMisc') or {}).get('prepaidPaymentMethodCode') != 'cc_noonpay':
             _fail('NOWNOW_PAYMENT_READBACK_MISMATCH')
         prefs = row.get('deliveryPreference')
         if not isinstance(prefs, dict) or any(prefs.get(code) is not True for code in QUIET_FLAGS):
@@ -471,8 +479,7 @@ class NowNowOrderFlow:
                                                       card=self.card, before_send=self._before,
                                                       timeout=timeout)
         row = self.current.wire['data']
-        if row.get('hasPaymentSubscription') is not True \
-                or row.get('paymentMethodCode') != 'prepaid' \
+        if row.get('paymentMethodCode') != 'prepaid' \
                 or row.get('creditCardMask') != self.card.mask:
             _fail('NOWNOW_PAYMENT_READBACK_MISMATCH')
         return {'paymentMethodCode': 'prepaid', 'creditCardMask': self.card.mask,
@@ -512,8 +519,13 @@ class NowNowOrderFlow:
         """Single financial send: place-order {sessionCode, total}."""
         if self.review is None:
             _fail('NOWNOW_REVIEW_REQUIRED')
-        if order_card.LAST4 != '2342':
-            _fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
+        frozen = self.review['digest']
+        self.pre_place_read(timeout=timeout)
+        self.review_final(timeout=timeout)
+        if self.review['digest'] != frozen:
+            _fail('NOWNOW_REVIEW_CHANGED_BEFORE_PLACE')
+        self.payment_guard()
+        self.retain_review()
         body = native.place_payload(self.session_code, self.review['payable_minor'])
         self._expect('place', body)
         result = self.client.place_order(session_code=self.session_code,
@@ -546,28 +558,72 @@ class NowNowOrderFlow:
             sleep(5)
         _fail('NOWNOW_TRACKING_NOT_CONFIRMED')
 
-    def confirm_paid(self, tracking):
-        """place 200 + native tracking == the captured paid signal (no intents)."""
-        if order_card.LAST4 != '2342':
-            _fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
-        if tracking.get('order') != self.order \
-                or tracking.get('status') not in TERMINAL_TRACK_STATUSES:
-            _fail('NOWNOW_EXACT_TRACKING_NOT_CONFIRMED')
-        journal.observe(self.flow_id, 'place', outcome='PAYMENT_REPORTED_SUCCESS',
-                        evidence_hash=journal.digest({'order': self.order,
-                                                      'tracking': tracking}),
-                        order_id=self.order)
-        journal.observe(self.flow_id, 'place', outcome='EXACT_ORDER_CONFIRMED',
-                        evidence_hash=journal.digest(tracking), order_id=self.order)
-        return {'paid': True, 'signal': 'place_200_plus_native_tracking',
-                'need_help_actions': tracking.get('need_help_actions')}
+    def payment_guard(self):
+        row = self.current.wire['data']
+        misc = row.get('prepaidPaymentMisc') or {}
+        if row.get('isVerifyDeviceRequired') is not False:
+            _fail('NOWNOW_DEVICE_VERIFICATION_REQUIRED_NO_FINANCIAL_SEND')
+        if row.get('checkoutWarningPopup') is not None or (row.get('vipSingleCheckoutInfo') or {}).get('isAddedToCart') is not False:
+            _fail('NOWNOW_CHECKOUT_WARNING_OR_MEMBERSHIP')
+        if type(misc.get('isCvvRequired')) is not bool:
+            _fail('NOWNOW_PAYMENT_FLAGS_UNVERIFIED')
+        if misc['isCvvRequired'] and not journal.preorder_status(self.flow_id)['payment_confirmed']:
+            _fail('NOWNOW_CVV_VERIFICATION_REQUIRED')
 
-    def register_tracker(self, label, *, eta=None, recipient='owner'):
+    def retain_review(self):
+        from commerce_nownow_capture import retain
+        retain(self)
+
+    def prepare_payment(self, cvv_loader=None):
+        from commerce_preorder import IntentVault, payment_outcome
+        from noon_cvv import encrypt
+        from noon_checkout import fingerprint
+        row = self.current.wire['data']
+        if journal.preorder_status(self.flow_id)['payment_confirmed']:
+            self.payment_guard()
+            return
+        if row.get('isVerifyDeviceRequired') is not False:
+            _fail('NOWNOW_DEVICE_VERIFICATION_REQUIRED_NO_FINANCIAL_SEND')
+        misc = row.get('prepaidPaymentMisc') or {}
+        if misc.get('isCvvRequired') is False:
+            self.payment_guard()
+            return
+        if misc.get('isCvvRequired') is not True or cvv_loader is None:
+            _fail('NOWNOW_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')
+        if row.get('checkoutWarningPopup') is not None or (row.get('vipSingleCheckoutInfo') or {}).get('isAddedToCart') is not False:
+            _fail('NOWNOW_CHECKOUT_WARNING_OR_MEMBERSHIP')
+        self.retain_review()
+        encrypted = encrypt(self.client.payment_config(timeout=25).wire, cvv_loader())
+        body = {'addressCode': row['addressCode'], 'addressVersion': row['addressVersion'], 'paymentToken': self.card.token}
+        self._expect('payment_subscription', body)
+        intent = self.client.create_payment_subscription(address_code=row['addressCode'],
+            address_version=row['addressVersion'], card=self.card, before_send=self._before, timeout=25)
+        secret = intent.wire['data']
+        self.preorder_intent_hash = IntentVault().retain(self.flow_id, secret=secret,
+            review_hash=self.review['digest'], cart_hash=self.cart_hash,
+            card_hash=fingerprint(self.card.token), payable_minor=self.review['payable_minor'])
+        journal.observe(self.flow_id, 'payment_subscription', outcome='PREORDER_INTENT_RECEIVED', evidence_hash=self.preorder_intent_hash)
+        body = native.payment_complete_payload(secret, self.card, encrypted)
+        self._expect('payment_complete', body)
+        result = self.client.complete_payment(order=None, session_code=self.session_code,
+            client_secret=secret, card=self.card, cvv_encryption=encrypted, before_send=self._before, timeout=25)
+        outcome = payment_outcome(result.projection)
+        journal.observe(self.flow_id, 'payment_complete', outcome=outcome, evidence_hash=journal.digest(result.projection))
+        if outcome != 'PREORDER_PAYMENT_CONFIRMED':
+            raise journal.PaymentError('NOWNOW_BANK_APPROVAL_OR_PAYMENT_PENDING', {
+                'flow_id': self.flow_id, 'financial_retry': False, 'amount_minor': self.review['payable_minor'],
+                'card_last4': order_card.LAST4, 'next': 'Approve the bank step if present; recover-payment reads status only. Never resend.'})
+
+    def confirm_paid(self, tracking):
+        from commerce_nownow_capture import confirm
+        return confirm(self.flow_id, client=self.client)
+
+    def register_tracker(self, label, *, eta=None, recipient='owner', paid=True):
         """order-watch add with durable readback; observe TRACKER_REGISTERED."""
         name = f"order-noon-{self.order.lower()}"
         command = [WATCH_BIN, 'add', '--app', 'noon', '--order', self.order,
                    *__import__('delivery_cards').commerce_args(self, 'nownow'),
-                   '--payment-confirmed',
+                   '--payment-confirmed' if paid else '--hold-placed-text',
                    *order_watch_receipt.command_args(recipient, order_watch_receipt.reserved_minor(journal, self.flow_id)),
                    '--placed-at', dt.datetime.now(dt.timezone(dt.timedelta(hours=4))).isoformat(),
                    '--label', label]
@@ -587,11 +643,13 @@ class NowNowOrderFlow:
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
         exit_ok, receipt = order_watch_receipt.parse(result.stdout, result.returncode, recipient, name)
         if not exit_ok or config.get('order') != self.order \
-                or config.get('active') is not True or not watcher:
+                or config.get('active') is not True or not watcher \
+                or (paid and (receipt.get('delivery_card') or {}).get('status') != 'sent'):
             _fail('TRACKER_REGISTRATION_UNCONFIRMED_READBACK_REQUIRED')
-        journal.observe(self.flow_id, 'place', outcome='TRACKER_REGISTERED',
-                        evidence_hash=journal.digest({'watcher': name, 'active': True}),
-                        order_id=self.order)
+        if paid:
+            journal.observe(self.flow_id, 'place', outcome='TRACKER_REGISTERED',
+                            evidence_hash=journal.digest({'watcher': name, 'active': True}),
+                            order_id=self.order)
         return {'watcher': name, 'registered': True, **receipt}
 
     # -- resume --------------------------------------------------------------
@@ -614,6 +672,9 @@ class NowNowOrderFlow:
                 or any(x['kind'] == 'place' for x in state['operations']) \
                 or any(x['state'] != 'OBSERVED' for x in state['operations']):
             _fail('NOWNOW_ACTIVE_PREPARATION_REQUIRED')
+        preorder = journal.preorder_status(flow_id)
+        if preorder['operations'] and not preorder['payment_confirmed']:
+            _fail('NOWNOW_PREORDER_STATUS_RECOVERY_REQUIRED')
         if time.time() - journal.flow_created_at(flow_id) > FLOW_MAX_AGE_SECONDS:
             _fail('NOWNOW_FLOW_EXPIRED_24H')
         self = object.__new__(cls)

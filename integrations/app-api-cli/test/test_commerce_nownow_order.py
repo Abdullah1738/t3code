@@ -65,7 +65,10 @@ def nn_state(*, session='S-SESSION-1', store=STORE, product=PRODUCT, qty=1.0,
                      'orderCashFee': 0.0, 'orderTotal': aed(total), 'orderWalletAmount': 0.0,
                      'orderPaymentAmount': aed(total), 'totalQuantity': int(qty),
                      'currencyCode': 'AED', 'driverNotes': native.QUIET_NOTE if quiet else '',
-                     'notes': '',
+                     'notes': '', 'customerCode': 'synthetic-account',
+                     'isVerifyDeviceRequired': False, 'checkoutWarningPopup': None,
+                     'vipSingleCheckoutInfo': {'isAddedToCart': False},
+                     'prepaidPaymentMisc': {'isCvvRequired': False, 'prepaidPaymentMethodCode': 'cc_noonpay'},
                      'deliveryPreference': {'dont_ring_the_bell': quiet,
                                             'leave_it_at_my_door': quiet},
                      'products': [{'productCode': product, 'qty': qty, 'price': aed(subtotal),
@@ -95,7 +98,14 @@ class Harness:
 
     def request(self, operation, headers, deadline, payload, *, response_observer, order=None):
         self.calls.append((operation, copy.deepcopy(payload)))
-        response = self.responses[operation]
+        if operation == 'order_detail' and operation not in self.responses:
+            row = copy.deepcopy(self.responses['cart_get']['data'])
+            row.update(orderNr=SYNTHETIC_ORDER, orderStatusCode='pending_acceptance', paymentClientSecret=None,
+                       failedErrorMsg=None, orderRefunds=0, orderIssuedCredit=0,
+                       deliveryPreferenceInfo=[{'code': k, 'choice': True} for k in c.QUIET_FLAGS])
+            response = {'data': row}
+        else:
+            response = self.responses[operation]
         if isinstance(response, Exception):
             raise response
         _, url = native.endpoint(operation, payload, order)
@@ -132,6 +142,16 @@ def make_flow(responses, **kwargs):
                              quantity=kwargs.pop('quantity', 1), auth=FakeAuth())
     flow.client._request = harness.request
     return flow, harness
+
+
+class FixtureTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for module in (j, c.receipts):
+            p = patch.object(module, 'ROOT', Path(temp.name) / 'commerce')
+            p.start()
+            self.addCleanup(p.stop)
 
 
 class CapturedContractTests(unittest.TestCase):
@@ -222,7 +242,7 @@ class CapturedContractTests(unittest.TestCase):
         walk(FIXTURE)
 
 
-class GuardTests(unittest.TestCase):
+class GuardTests(FixtureTests):
     def test_active_order_blocks_before_any_write(self):
         flow, harness = make_flow(happy_responses(
             home={'data': {'active': [{'orderNr': SYNTHETIC_ORDER, 'status': 'placed'}]}}))
@@ -240,8 +260,8 @@ class GuardTests(unittest.TestCase):
     def test_card_token_not_in_subscription_list_refused(self):
         flow, _ = make_flow(happy_responses(
             payment_subscription_list={'data': [{'paymentToken': 'other'}]}))
-        with self.assertRaisesRegex(j.JournalError, 'TOKEN_NOT_ACTIVE'):
-            flow.guard()
+        flow.guard()
+        self.assertFalse(c.corroborate_token(flow.client, flow.card))
 
     def test_ambiguous_saved_card_refused(self):
         cards = {'data': [{'id': 1111111111, 'ccMasked': '52287301xxxx2342',
@@ -253,7 +273,15 @@ class GuardTests(unittest.TestCase):
             flow.guard()
 
 
-class LaneTests(unittest.TestCase):
+class BankFixtureTests(FixtureTests):
+    def setUp(self):
+        super().setUp()
+        p = patch('commerce_food_capture.find_bank_capture', return_value={'source_id': 123, 'source': 'msgs'})
+        p.start()
+        self.addCleanup(p.stop)
+
+
+class LaneTests(BankFixtureTests):
     def test_prepare_sets_exact_quiet_note_before_fresh_review(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
@@ -305,12 +333,12 @@ class LaneTests(unittest.TestCase):
         self.assertEqual([x[0] for x in harness.calls],
                          ['home', 'carts_recent', 'payment_cards', 'payment_subscription_list',
                           'cart_create', 'cart_validate', 'payment', 'delivery_preference',
-                          'cart_get', 'place', 'track'])
+                          'cart_get', 'cart_get', 'place', 'track', 'order_detail'])
         preference = [p for op, p in harness.calls if op == 'delivery_preference']
         self.assertEqual(len(preference), 1)
         self.assertEqual(preference[0]['deliveryPreference'],
                          {'leave_it_at_my_door': True, 'dont_ring_the_bell': True})
-        place_body = dict(harness.calls[-2][1])
+        place_body = next(body for op, body in harness.calls if op == 'place')
         self.assertEqual(place_body, {'sessionCode': 'S-SESSION-1', 'total': 31.45})
         self.assertEqual(review['total_minor'], 3145)
         self.assertEqual(flow.review['payable_minor'], 3145)
@@ -396,7 +424,7 @@ class LaneTests(unittest.TestCase):
             self.assertNotIn('place', [x[0] for x in harness.calls])
 
 
-class ResumeTests(unittest.TestCase):
+class ResumeTests(BankFixtureTests):
     def prepare_partial_flow(self):
         """Run guard..quiet_delivery, then simulate a restart before place."""
         temp = tempfile.mkdtemp()
@@ -453,7 +481,7 @@ class ResumeTests(unittest.TestCase):
                                             auth=FakeAuth())
 
 
-class CompletionTests(unittest.TestCase):
+class CompletionTests(BankFixtureTests):
     def test_paid_order_completes_journal_with_tracker(self):
         temp = tempfile.mkdtemp()
         with patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
@@ -486,7 +514,7 @@ class CompletionTests(unittest.TestCase):
                     {'order': SYNTHETIC_ORDER, 'active': True}))
                 (Path(temp).resolve() / 'watchers' / name / 'watcher.json').write_text(json.dumps({'ok': 1}))
                 import subprocess as sp
-                result = sp.CompletedProcess([], 0)
+                result = sp.CompletedProcess([], 0, stdout=json.dumps({'moni_notified': 'skipped', 'tracker_id': name, 'watcher_registered': True, 'delivery_card': {'status': 'sent'}}).encode())
                 with patch.object(c.subprocess, 'run', return_value=result):
                     registration = flow.register_tracker('test label')
                 self.assertTrue(registration['registered'])

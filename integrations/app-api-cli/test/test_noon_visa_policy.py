@@ -19,18 +19,13 @@ class VisaPolicyTests(unittest.TestCase):
             data['order_refund']['sections']['paymentDetails']['paymentMethods'][0]['title']='VISA xxxx2342'
             with self.assertRaises(journal.JournalError):disposition.failed_evidence(*args,'NTESTORDER',1980)
 
-    def test_nownow_visa_refuses_before_auth_or_cart(self):
-        with patch.object(order_card,'LAST4','9546'),patch.object(cli,'CommerceAuth') as auth:
-            with self.assertRaisesRegex(journal.JournalError,'NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED'):
-                cli.order_nownow(SimpleNamespace(prepare_only=False))
-            auth.assert_not_called()
-
-    def test_nownow_visa_cannot_claim_paid_from_placed(self):
-        flow=nownow.NowNowOrderFlow.__new__(nownow.NowNowOrderFlow)
-        with patch.object(order_card,'LAST4','9546'),patch.object(journal,'observe') as observe:
-            with self.assertRaisesRegex(journal.JournalError,'NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED'):
-                flow.confirm_paid({'status':'placed'})
-            observe.assert_not_called()
+    def test_nownow_visa_capability_distinguishes_live_proof(self):
+        with patch.object(order_card, 'LAST4', '9546'):
+            result = cli.capabilities()
+            self.assertTrue(result['nownow_selected_card_purchase_enabled'])
+            self.assertFalse(result['nownow_9546_paid_live_proof'])
+            self.assertEqual(result['verticals']['noon.nownow']['payment'],
+                             'exact_native_order_and_unique_bank_purchase')
 
     def test_recovery_steps_name_selected_bank(self):
         for bank in ('Mashreq app','ENBD X'):
