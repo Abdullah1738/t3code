@@ -843,6 +843,8 @@ interface OwnerRoutePost {
   readonly kind: "post";
   readonly seq: number;
   readonly createdAt: string;
+  /** The discussion's title is written from this post once its route is delivered. */
+  readonly writeTitle?: boolean;
 }
 interface OwnerRouteAnswer {
   readonly kind: "answer";
@@ -850,6 +852,9 @@ interface OwnerRouteAnswer {
   readonly blockId: string;
   readonly at: string;
   readonly note: string;
+  /** What was answered; two answers in the same millisecond still differ here. */
+  readonly choice?: ReadonlyArray<string>;
+  readonly text?: string | null;
 }
 type OwnerRoutePayload = OwnerRoutePost | OwnerRouteAnswer;
 
@@ -3041,7 +3046,12 @@ const make = Effect.gen(function* () {
         return yield* markOwnerRouteDone(record.id, "not-saved");
       }
       yield* ownerPostRoute(message, record.route_key, row);
-      return yield* markOwnerRouteDelivered(record);
+      yield* markOwnerRouteDelivered(record);
+      // As inline: the title is written once routing has attached the evaluator.
+      if (payload.writeTitle === true) {
+        yield* forkDiscussionTitle(discussionId, blocksText(message.blocks, attachments.pathOf));
+      }
+      return;
     }
     const entry = message?.answers.find(
       (answer) => answer.blockId === payload.blockId && answer.by._tag === "owner",
@@ -3050,7 +3060,13 @@ const make = Effect.gen(function* () {
       return yield* markOwnerRouteDone(record.id, "not-saved");
     }
     // The owner changed this answer since: the newer one has its own route.
-    if (entry.at !== payload.at) return yield* markOwnerRouteDone(record.id, "superseded");
+    const changed =
+      entry.at !== payload.at ||
+      (payload.choice !== undefined &&
+        (entry.text !== (payload.text ?? null) ||
+          entry.choice.length !== payload.choice.length ||
+          entry.choice.some((id, index) => id !== payload.choice![index])));
+    if (changed) return yield* markOwnerRouteDone(record.id, "superseded");
     yield* ownerAnswerRoute(
       discussionId,
       payload.seq,
@@ -3273,14 +3289,17 @@ const make = Effect.gen(function* () {
       answers: [],
       createdAt: at,
     };
+    const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
+    const durablePost = saveRoute && author._tag === "owner";
     // An owner post commits with its routing obligation: no drain ever sees one without the other.
     yield* (
-      saveRoute && author._tag === "owner"
+      durablePost
         ? boardSql.withTransaction(
             saveOwnerRoute(discussion.boardId, discussionId, ownerPostKey(message), {
               kind: "post",
               seq: message.seq,
               createdAt: message.createdAt,
+              writeTitle,
             }).pipe(Effect.andThen(store.putMessage(message))),
           )
         : store.putMessage(message)
@@ -3311,9 +3330,9 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(storedBlocks, attachments.pathOf);
-    const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
     if (!route) {
-      if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);
+      // A durable owner post's title follows its delivery (see `runOwnerRoute`).
+      if (writeTitle && !durablePost) yield* forkDiscussionTitle(discussion.id, text);
       return message;
     }
     if (author._tag === "owner") {
@@ -7645,7 +7664,15 @@ const make = Effect.gen(function* () {
           previous.choice.every((id, index) => id === choiceIds[index]);
         const at = same ? previous.at : yield* nowIso;
         const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")}`;
-        const routeKey = `owner-answer:${discussionId}:${seq}:${blockId}:${at}`;
+        const answerText = words === "" ? null : words;
+        // The content is part of the key: a different answer in the same millisecond
+        // is a different delivery, never deduplicated as the earlier one.
+        const content = NodeCrypto.createHash("sha256")
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          .update(JSON.stringify([choiceIds, answerText]))
+          .digest("hex")
+          .slice(0, 16);
+        const routeKey = `owner-answer:${discussionId}:${seq}:${blockId}:${at}:${content}`;
         const next: KanbanMessage = {
           ...message,
           answers: [
@@ -7671,6 +7698,8 @@ const make = Effect.gen(function* () {
                   blockId,
                   at,
                   note,
+                  choice: choiceIds,
+                  text: answerText,
                 }).pipe(Effect.andThen(store.putMessage(next))),
               )
               .pipe(Effect.mapError(toKanbanError))
