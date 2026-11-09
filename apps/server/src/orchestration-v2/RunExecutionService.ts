@@ -1,3 +1,4 @@
+import * as DelegatedTaskRecoveryService from "./DelegatedTaskRecoveryService.ts";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -602,6 +603,7 @@ export const layer: Layer.Layer<
 > = Layer.effect(
   RunExecutionServiceV2,
   Effect.gen(function* () {
+    const recovery = yield* DelegatedTaskRecoveryService.DelegatedTaskRecoveryService;
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -1015,6 +1017,39 @@ export const layer: Layer.Layer<
           if (yield* Ref.get(rootRunFinalized)) {
             return;
           }
+          if (terminal.status === "failed" && terminal.threadDisposition === "reusable" &&
+            (yield* recovery.shouldResume({ thread: input.appThread, run: input.run, failure: terminal.failure }))) {
+            const now = yield* DateTime.now;
+            const attemptOrdinal = input.attempt.attemptOrdinal + 1;
+            const attemptId = idAllocator.derive.runAttempt({ runId: input.run.id, attemptOrdinal });
+            const run = { ...input.run, status: "starting" as const, activeAttemptId: attemptId,
+              transientRecovery: { firstError: terminal.failure, since: now }, completedAt: null };
+            const attempt = { ...input.attempt, id: attemptId, attemptOrdinal, reason: "retry" as const,
+              status: "pending" as const, providerTurnId: null, startedAt: null, completedAt: null };
+            const payloads = [
+              { type: "run-attempt.updated" as const, payload: { ...input.attempt, status: "failed" as const, completedAt: now } },
+              { type: "run-attempt.updated" as const, payload: attempt },
+              { type: "run.updated" as const, payload: run },
+              { type: "provider-thread.updated" as const, payload: { ...(yield* Ref.get(latestProviderThread)), status: "idle" as const, updatedAt: now } },
+            ];
+            yield* eventSink.writeIfRunCurrent({
+              threadId: input.run.threadId, runId: input.run.id, activeAttemptId: input.attempt.id,
+              expectedStatus: "running",
+              events: yield* Effect.forEach(payloads, (event) => Effect.gen(function* () {
+                return { ...event, id: yield* idAllocator.allocate.event({ threadId: input.run.threadId }),
+                  threadId: input.run.threadId, runId: input.run.id, nodeId: input.rootNode.id,
+                  providerInstanceId: input.run.providerInstanceId, occurredAt: now };
+              })),
+              effects: [{ id: `effect:delegated-transient-resume:${input.run.id}`, commandId: input.commandId,
+                threadId: input.run.threadId, request: { type: "provider-turn.start", runId: input.run.id, retryDelayMs: 1000 } }],
+            });
+            yield* Ref.set(rootRunFinalized, true);
+            return;
+          }
+          if (terminal.status === "failed" && input.run.transientRecovery !== undefined) {
+            terminal = { ...terminal, failure: makeProviderFailure({ ...terminal.failure,
+              message: `Automatic resume failed. First error: ${input.run.transientRecovery.firstError.message} Resume error: ${terminal.failure.message} Files may be partly written.` }) };
+          }
           const providerThread = yield* Ref.get(latestProviderThread);
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
           yield* writeFinalRunEvents({
@@ -1041,7 +1076,7 @@ export const layer: Layer.Layer<
                 }),
             openRunOwnedSubagents: openSubagents,
             terminal,
-            failureItemPersisted: terminal.status === "failed",
+            failureItemPersisted: terminal.status === "failed" && input.run.transientRecovery === undefined,
             refreshAfterTurn,
           }).pipe(
             Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
@@ -1642,7 +1677,7 @@ export const layer: Layer.Layer<
       }),
     } satisfies RunExecutionServiceV2Shape);
   }),
-);
+).pipe(Layer.provide(DelegatedTaskRecoveryService.layer));
 
 export function makeInterruptResultTurnItem(input: {
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];

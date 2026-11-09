@@ -7112,7 +7112,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       name: "newer forbidden result wins even when unclassified",
       retries: [{ error: "server_error", status: 500 }],
       resultStatus: 403,
-      expectedCategory: "unknown",
+      expectedCategory: "config",
     },
     {
       name: "newer rate limit result wins",
@@ -18198,4 +18198,18 @@ describe("ClaudeAdapterV2 query message stream", () => {
       assert.isTrue(closed);
     }),
   );
+});
+
+
+describe("Claude upstream model errors after successful responses", () => {
+  it.each([
+    { status: 404, error: "model_not_found", successful: false, expected: "model_invalid" },
+    { status: 404, error: "model_not_found", successful: true, expected: "transient" },
+    { status: 401, error: "authentication_failed", successful: true, expected: "auth_expired" },
+    { status: 413, error: "invalid_request", successful: true, expected: "context_exhausted" },
+    { status: 529, error: "overloaded", successful: false, expected: "transient" },
+  ])("classifies $status after success=$successful", ({ status, error, successful, expected }) => {
+    assert.equal(ClaudeAdapterV2.claudeFailureCategory({ apiErrorStatus: status,
+      retryError: error, hadSuccessfulResponse: successful }), expected);
+  });
 });

@@ -1727,7 +1727,7 @@ const make = Effect.gen(function* () {
         : progress.state;
     const resultRunIds = [
       ...new Set(
-        [taskResultRun?.id, terminalRun?.id].filter((id): id is RunId => id !== undefined),
+        [taskResultRun?.id, terminalRun?.id, childRun?.id].filter((id): id is RunId => id !== undefined),
       ),
     ];
     const resultRecords = yield* threadManagement
@@ -1800,7 +1800,23 @@ const make = Effect.gen(function* () {
         instanceId: task.providerInstanceId,
         model: task.model,
       };
+    const activeRun = taskResultRun ?? childRun;
+    const activeError = childProjection.turnItems.filter(
+      (item) => item.runId === activeRun?.id && item.type === "error",
+    ).toSorted((a, b) => b.ordinal - a.ordinal)[0];
+    const retry = activeError?.type === "error" && activeError.retry !== undefined && activeError.status === "running"
+      ? { state: "retrying" as const, lastError: activeError.failure.message,
+          since: DateTime.formatIso(activeError.startedAt ?? activeError.updatedAt),
+          attempt: activeError.retry.attempt, delayMs: activeError.retry.retryDelayMs,
+          filesMayBePartlyWritten: true }
+      : activeRun?.transientRecovery === undefined ? null : {
+          state: status === "failed" ? "failed_transient" as const : "resuming" as const,
+          lastError: activeRun.transientRecovery.firstError.message,
+          since: DateTime.formatIso(activeRun.transientRecovery.since), attempt: 1,
+          delayMs: activeRun.status === "starting" ? 1000 : 0, filesMayBePartlyWritten: true,
+        };
     const response = {
+      retry,
       taskId: task.id,
       childThreadId: task.childThreadId,
       childRunId: childRun?.id ?? null,

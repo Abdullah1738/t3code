@@ -160,6 +160,7 @@ export const layerExecutor: Layer.Layer<
             return providerTurnStart
               .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
               .pipe(
+                Effect.delay(Duration.millis(effect.request.retryDelayMs ?? 0)),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationEffectExecutionError({

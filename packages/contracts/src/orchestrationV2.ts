@@ -583,6 +583,10 @@ export const OrchestrationV2Run = Schema.Struct({
       planId: PlanId,
     }),
   ),
+  transientRecovery: Schema.optional(Schema.Struct({
+    firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
+    since: Schema.DateTimeUtc,
+  })),
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
   /** ardud: this run starts a fresh provider thread (agent-requested context reset). */

@@ -1532,8 +1532,10 @@ export const layer: Layer.Layer<
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {
           messageId: message.id,
-          text: userText,
-          attachments: message.attachments,
+          text: run.transientRecovery !== undefined && attempt.reason === "retry"
+            ? "Continue where you left off after the transient API failure. Check work already completed and any partly written files before continuing; do not repeat completed actions."
+            : userText,
+          attachments: run.transientRecovery !== undefined && attempt.reason === "retry" ? [] : message.attachments,
           createdBy: message.createdBy,
           creationSource: message.creationSource,
           ...(message.scheduledTaskId === undefined

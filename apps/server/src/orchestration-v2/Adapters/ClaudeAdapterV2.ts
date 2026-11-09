@@ -3018,6 +3018,7 @@ export function claudeFailureCategory(input: {
   /** Rate-limit evidence on the turn: a usage limit even when the CLI ends it as blocking_limit. */
   readonly usageLimited?: boolean | undefined;
   readonly text?: string | undefined;
+  readonly hadSuccessfulResponse?: boolean;
 }): OrchestrationV2ProviderFailureCategory {
   if (input.usageLimited === true) return "quota";
   const status = input.apiErrorStatus ?? input.retryStatus ?? null;
@@ -3041,7 +3042,7 @@ export function claudeFailureCategory(input: {
     // A bare invalid_request is also how the API refuses an over-long prompt, so it
     // is not called a config error here; the text check below decides it.
     case "model_not_found":
-      return "model_invalid";
+      return input.hadSuccessfulResponse ? "transient" : "model_invalid";
     default:
       break;
   }
@@ -3052,6 +3053,9 @@ export function claudeFailureCategory(input: {
   if (input.terminalReason === "prompt_too_long" || input.terminalReason === "blocking_limit") {
     return "context_exhausted";
   }
+  if (status === 404) return input.hadSuccessfulResponse ? "transient" : "model_invalid";
+  if (status === 403) return "config";
+  if (status === 413) return "context_exhausted";
   if (status === 400 && input.text !== undefined && CLAUDE_MODEL_CONFIG_TEXT.test(input.text)) {
     return "model_invalid";
   }
@@ -3143,7 +3147,7 @@ function providerFailureFromResult(
 function providerFailureFromApiRetry(message: SDKAPIRetryMessage): OrchestrationV2ProviderFailure {
   const errorName = message.error.replaceAll("_", " ");
   return makeProviderFailure({
-    message: `Claude API ${errorName}.`,
+    message: `Claude API ${message.error_status === null ? "no HTTP response" : Math.trunc(message.error_status)}: ${errorName}${message.no_response === undefined ? "" : ` (no_response: waited ${message.no_response.waited_ms}ms, retry wait ${message.no_response.retry_wait_ms}ms)`}. Attempt ${message.attempt}/${message.max_retries}; retry in ${message.retry_delay_ms}ms.`,
     category: claudeFailureCategory({
       retryError: message.error,
       retryStatus: message.error_status,
@@ -3367,6 +3371,8 @@ interface ActiveClaudeTurnContext {
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
+  hadSuccessfulResponse: boolean;
+  latestApiFailure: OrchestrationV2ProviderFailure | undefined;
   // Latest root API error, cleared when an error-free root assistant response recovers.
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
@@ -7822,6 +7828,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             };
             const failure = providerFailureFromApiRetry(message);
             context.latestApiFailureCategory = failure.category;
+            context.latestApiFailure = failure;
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -7861,11 +7868,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const now = yield* DateTime.now;
             if (message.parent_tool_use_id === null) {
               if (message.error === undefined) {
+                context.hadSuccessfulResponse = true;
+                context.latestApiFailure = undefined;
                 context.latestApiFailureCategory = undefined;
                 yield* completeProviderRetry(context, now);
               } else {
                 context.latestApiFailureCategory = claudeFailureCategory({
                   retryError: message.error,
+                  hadSuccessfulResponse: context.hadSuccessfulResponse,
+                });
+                const status = Reflect.get(message, "api_error_status");
+                context.latestApiFailure = makeProviderFailure({
+                  category: context.latestApiFailureCategory,
+                  class: "provider_error",
+                  code: typeof status === "number" ? `api_error_${status}` : message.error,
+                  message: context.hadSuccessfulResponse && message.error === "model_not_found"
+                    ? `Claude upstream returned ${typeof status === "number" ? status : "model_not_found"} after successful responses in this session.`
+                    : `Claude API ${typeof status === "number" ? `${status} ` : ""}${message.error}.`,
                 });
               }
             }
@@ -8527,23 +8546,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const turnFailure = interrupted
               ? null
               : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
-            // A generic api_error result without a status repeats the latest SDK
-            // failure; an explicit terminal cause always takes precedence.
-            const latestApiFailureCategory = context.latestApiFailureCategory;
-            const failureWithRetryCause =
-              turnFailure !== null &&
-              turnFailure.category === "unknown" &&
-              message.terminal_reason === "api_error" &&
-              (message.subtype !== "success" || message.api_error_status == null) &&
-              latestApiFailureCategory !== undefined
-                ? {
-                    ...turnFailure,
-                    category: latestApiFailureCategory,
-                    ...(latestApiFailureCategory === "quota"
-                      ? { class: "usage_limit" as const }
-                      : {}),
-                  }
-                : turnFailure;
+            const latestFailure = context.latestApiFailure;
+            const retryFailure = (yield* Ref.get(providerRetries)).get(context.providerTurnId)?.failure;
+            const apiExhausted = message.terminal_reason === "api_error";
+            const selectedModelAfterSuccess = context.hadSuccessfulResponse &&
+              message.subtype === "success" && message.api_error_status === 404;
+            const cause = selectedModelAfterSuccess ? latestFailure :
+              (message.subtype !== "success" || message.api_error_status == null)
+                ? latestFailure ?? retryFailure : undefined;
+            const failureWithRetryCause = turnFailure !== null && apiExhausted
+              ? makeProviderFailure({
+                  ...turnFailure,
+                  ...(cause === undefined ? {} : { category: cause.category, code: cause.code, ...(cause.category === "quota" ? { class: "usage_limit" as const } : {}) }),
+                  ...(selectedModelAfterSuccess ? { category: "transient" as const } : {}),
+                  message: `Claude gave up after repeated API errors. Last error: ${cause?.message ?? (selectedModelAfterSuccess ? "upstream 404 after successful responses in this session." : turnFailure.message)}`,
+                })
+              : turnFailure;
             const resultFailure = interrupted
               ? null
               : limitedCompaction !== null
@@ -9469,6 +9487,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,
               latestApiFailureCategory: undefined,
+              latestApiFailure: undefined,
+              hadSuccessfulResponse: turnInput.nativeThreadHasTurns,
               refusalMessage: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
