@@ -307,6 +307,23 @@ function providerConstraints(
   return constraints;
 }
 
+function supportedInheritedOptions(
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+): ReadonlyArray<ProviderOptionSelection> | undefined {
+  if (descriptors === undefined) return options;
+  return options?.filter((option) => {
+    // Legacy variants are canonicalized and checked by the selection resolver.
+    if (option.id === "variant") return true;
+    const descriptor = descriptors.find((candidate) => candidate.id === option.id);
+    return (
+      descriptor !== undefined &&
+      (descriptor.type !== "select" ||
+        descriptor.options.some((choice) => choice.id === option.value))
+    );
+  });
+}
+
 /**
  * Models without descriptors skip the descriptor checks (mirroring how model slugs are only
  * validated when the provider advertises models), but duplicate ids always fail: downstream
@@ -1525,9 +1542,10 @@ const make = Effect.gen(function* () {
       );
     }
 
+    const descriptors = provider.models.find((candidate) => candidate.slug === model)?.capabilities
+      ?.optionDescriptors;
+    const inheritedOptions = supportedInheritedOptions(inheritedSelection.options, descriptors);
     if (!input.delegateSelection && requestedOptions !== undefined) {
-      const descriptors = provider.models.find((candidate) => candidate.slug === model)
-        ?.capabilities?.optionDescriptors;
       const invalid = invalidOptionSelections(requestedOptions, descriptors);
       if (invalid.length > 0) {
         return yield* failure(
@@ -1539,7 +1557,7 @@ const make = Effect.gen(function* () {
 
     const inheritsOptions =
       instanceId === inheritedSelection.instanceId && model === inheritedSelection.model;
-    let options = inheritsOptions ? inheritedSelection.options : undefined;
+    let options = inheritsOptions ? inheritedOptions : undefined;
     if (
       input.delegateSelection &&
       (input.migrateSelection ||
@@ -1571,9 +1589,10 @@ const make = Effect.gen(function* () {
           ? {
               ...inheritedSelection,
               instanceId: effortInstanceId,
+              options: inheritedOptions ?? [],
               ...(overridesEffort || requestedOptions?.length === 0
                 ? {
-                    options: (inheritedSelection.options ?? []).filter(
+                    options: (inheritedOptions ?? []).filter(
                       (option) => option.id !== effortId && option.id !== "variant",
                     ),
                   }
@@ -1595,7 +1614,7 @@ const make = Effect.gen(function* () {
       options = requestedOptions?.length === 0 ? [] : merged.selection.options;
       if (options !== undefined && options.length > 1) {
         const order = [
-          ...(inheritsOptions ? (inheritedSelection.options ?? []) : []),
+          ...(inheritsOptions ? (inheritedOptions ?? []) : []),
           ...(requestedOptions ?? []),
         ];
         const position = (id: string) => {
@@ -1619,8 +1638,6 @@ const make = Effect.gen(function* () {
       options = [...selections.values()];
     }
     if (input.delegateSelection) {
-      const descriptors = provider.models.find((candidate) => candidate.slug === model)
-        ?.capabilities?.optionDescriptors;
       if (
         (effortInstanceId === "claudeAgent" ||
           effortInstanceId === "codex" ||
@@ -2255,11 +2272,17 @@ const make = Effect.gen(function* () {
         Effect.map((settings) => settings.providerModelPreferences ?? {}),
         Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
       );
+      const inheritedSelection = parent?.thread.modelSelection;
+      const inheritedDescriptors = providers
+        .find((provider) => provider.instanceId === inheritedSelection?.instanceId)
+        ?.models.find((model) => model.slug === inheritedSelection?.model)
+        ?.capabilities?.optionDescriptors;
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: parent?.thread.modelSelection.instanceId ?? null,
         inheritedModel: parent?.thread.modelSelection.model ?? null,
-        inheritedOptions: parent?.thread.modelSelection.options ?? [],
+        inheritedOptions:
+          supportedInheritedOptions(inheritedSelection?.options, inheritedDescriptors) ?? [],
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
         providers: providers.map((provider) => {
