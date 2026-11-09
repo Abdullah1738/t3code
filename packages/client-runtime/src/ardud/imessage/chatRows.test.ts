@@ -509,6 +509,64 @@ describe("buildIMessageChatRows in tool mode", () => {
     expect(replies.map((row) => row.kind === "reply" && row.send.state)).toEqual(["sent"]);
     expect([...result.turns.values()][0]?.sentCount).toBe(1);
   });
+
+  it("clears a failed retry when the retry that followed it repeats an outbox id already shown", () => {
+    const outbox = `send:${"d".repeat(64)}`;
+    const ok = { id: outbox, created: false, chat: "owner" };
+    const sameTurn = buildIMessageChatRows(
+      [
+        message("in", "user", `${TOOL_GUIDANCE}Hi`, "r1"),
+        sendTool("s1", "r1", { text: "On it" }, { output: { ...ok, created: true } }),
+        sendTool("s2", "r1", { text: "On it" }, { status: "failed" }),
+        sendTool("s3", "r1", { text: "On it" }, { output: ok }),
+        message("out", "assistant", "NO_REPLY", "r1"),
+      ],
+      ownerChat,
+    );
+    expect(
+      sameTurn.rows
+        .filter((row) => row.kind === "reply")
+        .map((row) => row.kind === "reply" && row.send.state),
+    ).toEqual(["sent"]);
+    expect([...sameTurn.turns.values()][0]?.sentCount).toBe(1);
+
+    const crossTurn = buildIMessageChatRows(
+      [
+        message("in", "user", `${TOOL_GUIDANCE}Hi`, "r1"),
+        sendTool("s1", "r1", { text: "On it" }, { output: { ...ok, created: true } }),
+        message("out", "assistant", "NO_REPLY", "r1"),
+        message("in2", "user", `${TOOL_GUIDANCE}Hi?`, "r2", noon),
+        sendTool("s2", "r2", { text: "On it" }, { createdAt: noon, status: "failed" }),
+        sendTool("s3", "r2", { text: "On it" }, { createdAt: noon, output: ok }),
+        message("out2", "assistant", "NO_REPLY", "r2", noon),
+      ],
+      ownerChat,
+    );
+    expect(
+      crossTurn.rows
+        .filter((row) => row.kind === "reply")
+        .map((row) => row.kind === "reply" && row.send.state),
+    ).toEqual(["sent"]);
+    const [, second] = [...crossTurn.turns.values()];
+    expect(second?.sentCount).toBe(0);
+    expect(second?.steps.filter((step) => step.send !== undefined)).toHaveLength(2);
+  });
+
+  it("keeps a failed attempt while its retry is still running", () => {
+    const rows = build(
+      [
+        message("in", "user", `${TOOL_GUIDANCE}Hi`, "r1"),
+        sendTool("s1", "r1", { text: "On it" }, { status: "failed" }),
+        sendTool("s2", "r1", { text: "On it" }, { status: "running" }),
+      ],
+      { ...ownerChat, activeRunId: "r1" },
+    );
+    expect(
+      rows
+        .filter((row) => row.kind === "reply")
+        .map((row) => row.kind === "reply" && row.send.state),
+    ).toEqual(["failed", "sending"]);
+  });
 });
 
 describe("imessageAgentSummary", () => {

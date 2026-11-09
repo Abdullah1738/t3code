@@ -262,9 +262,6 @@ export function buildIMessageChatRows(
       const step = entryStep(entry);
       steps.push(step);
       if (step.send !== undefined) {
-        const outboxId = step.send.outboxId ?? null;
-        if (outboxId !== null && shownOutbox.has(outboxId)) continue;
-        if (outboxId !== null) shownOutbox.add(outboxId);
         const row: IMessageChatRow = {
           kind: "reply",
           level: "conversation",
@@ -335,8 +332,11 @@ export function buildIMessageChatRows(
       }
     }
 
-    // A failed attempt that a later call in this turn sent anyway (same text, file and
-    // chat, e.g. a timeout retried with its dedupe key) is not a failed message.
+    // Reconcile every attempt first, duplicates included. A failed attempt that a later
+    // call in this turn completed (same text, file and chat, e.g. a timeout retried with
+    // its dedupe key) is not a failed message, even when that retry's outbox id was
+    // already shown. A retry still running proves nothing yet.
+    const dropped = new Set<IMessageChatRow>();
     for (const [index, row] of sendRows.entries()) {
       if (row.kind !== "reply" || row.send.state !== "failed") continue;
       const retried = sendRows
@@ -344,16 +344,26 @@ export function buildIMessageChatRows(
         .some(
           (later) =>
             later.kind === "reply" &&
-            later.send.state !== "failed" &&
+            later.send.state === "sent" &&
             later.send.text === row.send.text &&
             later.send.file === row.send.file &&
             later.send.to === row.send.to,
         );
-      if (retried) rows.splice(rows.indexOf(row), 1);
+      if (retried) dropped.add(row);
     }
+    // Then one bubble per bridge outbox id across the thread: a deduplicated retry is the
+    // same message. Every attempt stays in the inspector.
+    for (const row of sendRows) {
+      if (row.kind !== "reply" || dropped.has(row)) continue;
+      const outboxId = row.send.outboxId ?? null;
+      if (outboxId === null) continue;
+      if (shownOutbox.has(outboxId)) dropped.add(row);
+      else shownOutbox.add(outboxId);
+    }
+    for (const row of dropped) rows.splice(rows.indexOf(row), 1);
     // Sends are counted by message: retries sharing an outbox id count once.
     const sentCount = sendRows.filter(
-      (row) => row.kind === "reply" && row.send.state !== "failed" && rows.includes(row),
+      (row) => row.kind === "reply" && row.send.state !== "failed" && !dropped.has(row),
     ).length;
     const outcome: IMessageAgentOutcome = working
       ? "working"
