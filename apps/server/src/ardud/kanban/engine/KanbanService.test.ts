@@ -14009,7 +14009,7 @@ it.effect.each(
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
-        const { kanban, card, thread } = yield* reuseDeliveryFixture(role);
+        const { kanban, board, card, thread } = yield* reuseDeliveryFixture(role);
         if (role === "work") {
           yield* kanban.dispatchNow;
           yield* setRunning(fake, thread, true);
@@ -14039,6 +14039,11 @@ it.effect.each(
           yield* setRunStart(fake, thread, true, "2026-10-25T13:00:02Z");
           const threads = yield* KanbanThreads;
           yield* threads.send({ threadId: thread, text: "Use 2%" });
+          if (role === "review")
+            fake.activeModels.set(
+              thread,
+              Rules.nextModel(board, (yield* kanban.card(card.id)).card),
+            );
         }
         const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
         yield* kanban.dispatchNow;
@@ -14074,6 +14079,7 @@ it.effect.each(["work", "review"] as const)(
         yield* kanban.setPool(board.id, otherModel, 1);
         yield* store.putCard({ ...ready, priority: 1 });
         yield* setRunning(fake, thread, true);
+        fake.activeModels.set(thread, model);
         fake.lastRuns.set(thread, {
           runId: "orphan-mid-run",
           status: "running",
@@ -14099,6 +14105,64 @@ it.effect.each(["work", "review"] as const)(
         assert.strictEqual((yield* kanban.card(same.id)).card.stage, "working");
         assert.strictEqual((yield* kanban.card(other.id)).card.stage, "working");
         if (role === "review") yield* kanban.reviewResult(thread, "clear", []);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["matching", "different-model", "different-effort", "unknown"] as const)(
+  "a first-round orphan requires the active review model (%s)",
+  (active) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board, store, card, thread } = yield* reuseDeliveryFixture("review");
+        const ready = (yield* kanban.card(card.id)).card;
+        const originalModel = Rules.nextModel(board, ready);
+        const requiredModel = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
+        assert.notStrictEqual(Rules.poolKey(originalModel), Rules.poolKey(requiredModel));
+        assert.isFalse((yield* store.cardEvents(card.id)).some((event) => event.kind === "review"));
+        yield* store.putCard({ ...ready, priority: 1 });
+        yield* setRunning(fake, thread, true);
+        if (active !== "unknown")
+          fake.activeModels.set(
+            thread,
+            active === "matching"
+              ? requiredModel
+              : active === "different-effort"
+                ? modelSelectionOf({ model: "opus/gpt-6-astra", variant: "high" })
+                : originalModel,
+          );
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [{ name: "Required", steps: [requiredModel] }],
+          defaultReviewChain: "Required",
+        });
+        yield* kanban.setPool(board.id, requiredModel, 2);
+        const lower = yield* kanban.createCard(
+          board.id,
+          { title: "Lower", prompt: "Lower", priority: 3, model: requiredModel },
+          owner,
+        );
+        const messages = (yield* Ref.get(fake.threads)).get(thread)!.messages.length;
+        yield* kanban.dispatchNow;
+        assert.lengthOf((yield* Ref.get(fake.threads)).get(thread)!.messages, messages);
+        assert.strictEqual((yield* kanban.card(lower.id)).card.stage, "working");
+        const current = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(current.reviewStep, 0);
+        if (active !== "matching") {
+          assert.strictEqual(current.stage, "needs_review");
+          assert.isNull(current.activeThreadId);
+          assert.isNull(current.activePool);
+          assert.strictEqual(
+            (yield* Effect.result(kanban.reviewResult(thread, "clear", [])))._tag,
+            "Failure",
+          );
+          yield* setRunning(fake, thread, false);
+          yield* kanban.dispatchNow;
+          assert.deepStrictEqual(fake.sends.at(-1)?.model, requiredModel);
+        }
+        assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, thread);
+        yield* kanban.reviewResult(thread, "clear", []);
+        assert.strictEqual((yield* kanban.card(card.id)).card.stage, "completed");
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );

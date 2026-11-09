@@ -3193,10 +3193,8 @@ const make = Effect.gen(function* () {
                 !(Date.parse(view.runStartedAt) > Date.parse(verdict.at)))
             )
               return;
-            if (verdict) {
-              const model = yield* threads.model(existing, true);
-              if (model === null || Rules.poolKey(model) !== Rules.poolKey(dispatch.model)) return;
-            }
+            const model = yield* threads.model(existing, true);
+            if (model === null || Rules.poolKey(model) !== Rules.poolKey(dispatch.model)) return;
           }
           adoptRunning = true;
         } else if (!dispatch.joins) return;
