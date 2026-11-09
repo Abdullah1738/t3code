@@ -55,6 +55,8 @@ type Turn = Route & {
   /** The first reply already queued while this turn was still running, including a matching /send. */
   earlySent?: string;
   earlyText?: string;
+  /** Physical outbox row, whether the router or /send queued it first. */
+  earlyOutbox?: string;
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
 type ResendBody = {
@@ -2833,20 +2835,21 @@ export class Router {
         const candidate = after.slice(steered + 1).find((record): record is Extract<MessageRecord, { type: "assistant" }> =>
           record.type === "assistant" && record.time.completed !== undefined && !record.error
           && !providerRefusal(record) && !quiet.has(record.id) && !!replyText(assistantText(record))
-          && (record.finish === "tool-calls" || after.indexOf(record) < after.length - 1
+          && (record.continued || record.finish === "tool-calls" || after.indexOf(record) < after.length - 1
             || Date.now() - record.time.completed >= EARLY_REPLY_MS));
         if (candidate) {
           const text = replyText(assistantText(candidate));
           const enqueued = this.store.db.transaction(() => {
             if (!this.current(turn!)) return false;
-            const sent = this.store.queuedSendTexts(turn!.id, turn!.generation, turn!.startedAt)
-              .some(words => replyText(words).trim() === text.trim());
+            const sent = this.store.queuedSends(turn!.id, turn!.generation, turn!.startedAt)
+              .find(op => replyText(op.text).trim() === text.trim());
+            const id = sent?.id ?? `reply:${turn!.generation}:${candidate.id}`;
             // TODO(#728): run the final-reply check here too
             const created = !sent && this.store.enqueue({
-              id: `reply:${turn!.generation}:${candidate.id}`, kind: "conversation", text,
+              id, kind: "conversation", text,
               sessionId: turn!.id, generation: turn!.generation, ...this.replyTarget(turn!.inboundId),
             });
-            turn = { ...turn!, earlySent: candidate.id, earlyText: text };
+            turn = { ...turn!, earlySent: candidate.id, earlyText: text, earlyOutbox: id };
             this.store.set("activeTurn", turn);
             return created;
           }).immediate();

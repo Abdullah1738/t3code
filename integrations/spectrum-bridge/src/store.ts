@@ -168,14 +168,14 @@ export class Store {
     ).all().map(outboxRecord);
   }
 
-  queuedSendTexts(sessionId: string, generation: number, since: number): string[] {
-    return this.db.query<{ text: string }, [string, number, number]>(`
-      SELECT json_extract(o.payload, '$.text') AS text FROM outbox o
+  queuedSends(sessionId: string, generation: number, since: number): Pick<OutboxOperation, "id" | "text">[] {
+    return this.db.query<{ id: string; text: string }, [string, number, number]>(`
+      SELECT o.id, json_extract(o.payload, '$.text') AS text FROM outbox o
       JOIN kv ON kv.key = 'api:send:' || o.id
       WHERE o.id GLOB 'send:*' AND json_extract(o.payload, '$.sessionId') = ?
         AND json_extract(o.payload, '$.generation') = ?
         AND json_extract(kv.value, '$.queuedAt') >= ?
-    `).all(sessionId, generation, since).map(row => row.text);
+    `).all(sessionId, generation, since);
   }
 
   putBlob(data: Uint8Array): string {
