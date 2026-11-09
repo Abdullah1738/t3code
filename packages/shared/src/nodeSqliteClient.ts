@@ -534,7 +534,24 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
-          const id = nextRequestId++;
+          let id = nextRequestId++;
+          // A slot still holding a queued request is not reused, or the worker
+          // would skip that request; claimed and cancelled slots are free.
+          for (let tries = 1; Atomics.load(claims, id & (CLAIM_SLOTS - 1)) > 0; tries++) {
+            if (tries >= CLAIM_SLOTS) {
+              resume(
+                Effect.fail(
+                  failed(
+                    new Error("Reader request queue full"),
+                    "Reader request queue full",
+                    "readerAdmission",
+                  ),
+                ),
+              );
+              return;
+            }
+            id = nextRequestId++;
+          }
           const entry: {
             readonly endsTransaction: boolean;
             readonly sql: string;
