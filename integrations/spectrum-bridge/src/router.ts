@@ -29,7 +29,7 @@ type Turn = Route & {
   /** The prompt record id, or the last seen record id for a background turn. */
   messageId: string;
   startedAt: number;
-  phase: "submitting" | "running" | "unknown" | "failed";
+  phase: "submitting" | "running" | "unknown" | "held" | "failed";
   background?: boolean;
   /**
    * `"request"`: opened by the idle watch only to relay a subagent's request.
@@ -42,7 +42,7 @@ type Turn = Route & {
   activeAt?: number;
   /** Given-up synthetic rows whose text this turn's prompt carries. */
   carried?: string[];
-  /** Owner text only: which delivery attempt `messageId` is (1 when absent). */
+  /** Delivery attempt under the same prompt id (1 when absent). */
   attempt?: number;
   /** When the current attempt was POSTed (the original turn uses `startedAt`). */
   attemptAt?: number;
@@ -53,7 +53,7 @@ type Turn = Route & {
   /** When the last steer was sent, bounding how long a steer that never shows up holds the reply. */
   steeredAt?: number;
 };
-/** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
+/** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
   owner?: OwnerWords;
@@ -288,20 +288,11 @@ export const SYNTHETIC_RETRY_MS = 30_000;
 const ERRORED_RETRY_MS = 120_000;
 /** Dropped-row notices closer together than this go out as one message. */
 const DROPPED_BATCH_MS = 10 * 60_000;
-/**
- * Owner text whose prompt OpenCode never confirmed (it was briefly
- * unresponsive, say) is sent again rather than lost. Entry n is how long
- * attempt n stays unconfirmed before the next one, or before the owner is
- * asked to resend once the attempts run out: 3 tries over about 5 minutes.
- * Every earlier attempt is checked before each POST, so a late landing is
- * adopted instead of duplicated.
- */
-export const OWNER_RESEND_MS = [60_000, 120_000, 120_000] as const;
-/** An owner text still unconfirmed this long after arrival (backend down or unreadable) is given up on, never sent late. */
-export const OWNER_GIVE_UP_MS = 10 * 60_000;
-/** How long a synthetic row's prompt stays unconfirmed before its own retry policy takes over. */
-const UNDELIVERED_MS = 120_000;
-const UNDELIVERED_TEXT = "I didn't catch that last message. Mind sending it again?";
+/** One idempotent retry, then hold the batch until the route can accept it. */
+export const ACCEPT_WAIT_MS = 60_000;
+const OUTAGE_TEXT = "I'm having a technical problem; I'll answer this as soon as I'm back.";
+type Outage = { id: string; probeAt: number; replayAt?: number };
+type PreparingDelivery = { id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean };
 /** A prompt POSTed for a synthetic row. It is checked again before any further POST for that row. */
 type SentPrompt = { sessionId: string; directory: string; generation?: number; messageId: string; startedAt: number };
 type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason };
@@ -588,6 +579,7 @@ export class Router {
         else this.retrySynthetic(id, "undelivered");
         return;
       }
+      if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       this.store.enqueue({ id: `control:${hash(id)}`, kind: "control", text, ...this.replyTarget(id) });
       this.store.updateInbound(id, state);
     }).immediate();
@@ -712,6 +704,13 @@ export class Router {
   /** The turn's prompt is confirmed admitted: it is no longer uncertain, and what it carried was delivered. Call inside a transaction. */
   private landed(turn: Turn): void {
     this.store.set("resendBody", null);
+    this.store.set("deliveryOutage", null);
+    if (turn.inboundId) {
+      const ids = this.store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId];
+      for (const id of ids) this.store.updateInbound(id, "done");
+      this.store.set(`batch-phase:${turn.inboundId}`, "accepted");
+      this.stage("prompt-accepted", turn.inboundId);
+    }
     for (const id of this.syntheticBatch(turn.inboundId) ?? []) {
       const retry = this.store.get<SyntheticRetry | null>(this.retryKey(id));
       if (retry) this.store.set(this.retryKey(id), { ...retry, prompts: retry.prompts.filter(p => p.messageId !== turn.messageId) });
@@ -750,7 +749,9 @@ export class Router {
     try {
       // Recover before taking the control snapshot so /new also sees restored members.
       for (const row of this.store.pendingInbound()) {
-        if (row.state === "processing") this.unsealBatch(row.id);
+        const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+        const held = preparing?.id === row.id && (preparing.attempt > 1 || preparing.held || this.store.get(`batch-phase:${row.id}`) === "creating");
+        if (row.state === "processing" && !held) this.unsealBatch(row.id);
       }
       // Before controls, so a group line not meant for Robob never answers his pending question either.
       // Only groups await the gate, so other chats keep their tick timing.
@@ -768,7 +769,7 @@ export class Router {
         const input = row.payload as NormalizedInbound;
         if (row.state === "processing") {
           // A steer cut short is retried under its prompt id below, never dropped.
-          if (!this.owns(row.id) && !this.steering(row.id)) {
+          if (!this.owns(row.id) && !this.steering(row.id) && this.store.get<PreparingDelivery | null>("preparingDelivery")?.id !== row.id) {
             this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
           }
         } else {
@@ -776,6 +777,8 @@ export class Router {
         }
         preceding.add(row.id);
       }
+      await this.deliveryWatchdog(preceding);
+      await this.preparationWatchdog(preceding);
       await this.poll();
       for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row);
       await this.watch();
@@ -794,7 +797,7 @@ export class Router {
         const turn = this.store.get<Turn | null>("activeTurn");
         const sendblue = this.options.context !== undefined;
         // Sendblue shows typing from the moment a batch is taken, so a prompt still being accepted counts.
-        const working = sendblue ? turn?.phase !== undefined && turn.phase !== "failed" : turn?.phase === "running";
+        const working = sendblue ? turn?.phase !== undefined && turn.phase !== "failed" && turn.phase !== "held" : turn?.phase === "running";
         // A reset nudge is bookkeeping, not an answer the owner is waiting on.
         active = completed && working && !!turn && !turn.background && this.current(turn)
           && !(turn.inboundId && (sendblue ? !this.typingFor(turn.inboundId) : resetRow(turn.inboundId)))
@@ -808,6 +811,7 @@ export class Router {
   private sealBatch(handled: Set<string>): InboundRecord | undefined {
     return this.store.db.transaction(() => {
       this.cancelQueuedNew();
+      if (this.store.get<PreparingDelivery | null>("preparingDelivery")) return;
       const rows = this.store.pendingInbound();
       const now = Date.now();
       let latestReceivedAt = 0;
@@ -912,6 +916,7 @@ export class Router {
       for (const member of this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id]) this.store.updateInbound(member, "done");
       this.store.set(`batch:${id}`, null);
       this.store.set(`batch-phase:${id}`, null);
+      this.store.set(`steer-attempt:${id}`, null);
     }).immediate();
   }
 
@@ -930,6 +935,7 @@ export class Router {
       if (this.options.swipes) this.thawSwipe(id);
       const turn = this.store.get<Turn | null>("activeTurn");
       const messageId = `msg_${hash(id)}`;
+      if (forget) this.store.set(`steer-attempt:${id}`, null);
       if (forget && turn?.steered?.includes(messageId)) this.store.set("activeTurn", { ...turn, steered: turn.steered.filter(item => item !== messageId) });
     }).immediate();
   }
@@ -940,17 +946,21 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     // Same id a turn of its own would use, so a later send of this batch replays rather than repeats.
     const messageId = `msg_${hash(row.id)}`;
-    if (!turn || !this.steerable(turn)) {
-      // An earlier try with no answer may have landed after all.
-      const tried = !!turn?.steered?.includes(messageId);
-      const accepted = tried ? await bounded(this.backend.promptAccepted(turn!.id, turn!.directory, messageId)).catch(() => undefined) : false;
+    const attempt = this.store.get<Route | null>(`steer-attempt:${row.id}`)
+      ?? (turn?.steered?.includes(messageId) ? turn : undefined);
+    const tried = attempt !== undefined && attempt !== null;
+    if (attempt) {
+      const accepted = await bounded(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => undefined);
       if (accepted === undefined) return;
-      if (accepted) this.consumeSteer(row.id);
-      else this.releaseSteer(row.id, tried);
+      if (accepted) { this.consumeSteer(row.id); return; }
+    }
+    if (!turn || !this.steerable(turn)) {
+      this.releaseSteer(row.id, tried);
       return;
     }
     const input = this.store.get<NormalizedInbound>(`batch:${row.id}`) ?? row.payload as NormalizedInbound;
     this.store.db.transaction(() => {
+      this.store.set(`steer-attempt:${row.id}`, { id: turn.id, directory: turn.directory, generation: turn.generation });
       const live = this.store.get<Turn | null>("activeTurn");
       if (live && live.messageId === turn.messageId && this.current(live) && !live.steered?.includes(messageId)) {
         this.store.set("activeTurn", { ...live, steered: [...live.steered ?? [], messageId], steeredAt: Date.now() });
@@ -1013,6 +1023,7 @@ export class Router {
       // Original payloads were never replaced by the aggregate.
       this.store.set(`batch:${id}`, null);
       this.store.set(`batch-phase:${id}`, null);
+      if (this.store.get<PreparingDelivery | null>("preparingDelivery")?.id === id) this.store.set("preparingDelivery", null);
       return true;
     }).immediate();
   }
@@ -1038,7 +1049,10 @@ export class Router {
     if (!next) return;
     this.stage("batch-sealed", next.id);
     if (this.steering(next.id)) await this.steer(next);
-    else await this.submit(next, handled);
+    else {
+      this.store.set("preparingDelivery", { id: next.id, startedAt: Date.now(), attemptAt: Date.now(), attempt: 1 } satisfies PreparingDelivery);
+      await this.submit(next, handled);
+    }
   }
 
   /**
@@ -1136,7 +1150,9 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     const waiting = this.pending().filter(p => p.state === "pending").length;
     const queued = this.store.pendingInbound().filter(row => row.state === "pending" && row.id !== self).length;
-    const doing = turn && this.current(turn) && turn.phase !== "failed"
+    const doing = turn?.phase === "held" || this.store.get<PreparingDelivery | null>("preparingDelivery")?.held
+      ? "Holding your last message until the chat is back."
+      : turn && this.current(turn) && turn.phase !== "failed"
       ? turn.background ? "Finishing something in the background." : "Working on your last message."
       : "Nothing running right now.";
     return [doing, waiting ? `Waiting on ${waiting === 1 ? "an answer" : `${waiting} answers`} from you.` : "", queued ? `${queued} message${queued === 1 ? "" : "s"} queued.` : ""]
@@ -1354,6 +1370,7 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     const generation = Math.max(old?.generation ?? 0, this.store.get<number>("routeGeneration") ?? 0) + 1;
     let inPlace = !!old && this.resetsInPlace(old)
+      && !(turn?.inboundId && resetRow(turn.inboundId) && this.current(turn))
       && !this.store.pendingInbound().some(row => resetRow(row.id));
     this.store.db.transaction(() => {
       for (const row of this.store.pendingInbound()) {
@@ -1368,6 +1385,13 @@ export class Router {
       this.store.set("routeGeneration", generation);
       this.store.set("route", null);
       this.store.set("activeTurn", null);
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      if (preparing) {
+        for (const id of this.store.get<NormalizedInbound | null>(`batch:${preparing.id}`)?.batchIds ?? [preparing.id]) this.store.updateInbound(id, "cancelled");
+        this.store.set(`batch:${preparing.id}`, null);
+        this.store.set(`batch-phase:${preparing.id}`, null);
+      }
+      this.store.set("preparingDelivery", null);
       this.store.set("pendingApprovals", null);
       this.store.set("watermark", null);
     }).immediate();
@@ -2043,10 +2067,22 @@ export class Router {
     }
   }
 
+  private controlArrived(handled: Set<string>): boolean {
+    return this.store.pendingInbound().some(row => {
+      if (row.state !== "pending" || handled.has(row.id)) return false;
+      const input = row.payload as NormalizedInbound;
+      return input.poll !== undefined || /^\/(?!(?:notification|context)(?:\s|$))/.test(input.text.trim());
+    });
+  }
+
   private async submit(row: InboundRecord, handled: Set<string>): Promise<void> {
     const input = this.store.get<NormalizedInbound>(`batch:${row.id}`) ?? row.payload as NormalizedInbound;
+    const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
     const interrupted = () => {
-      if (this.store.pendingInbound().some(next => next.state === "pending" && !handled.has(next.id))) {
+      const held = preparing?.id === row.id && (preparing.attempt > 1 || preparing.held);
+      const arrived = held ? this.controlArrived(handled)
+        : this.store.pendingInbound().some(next => next.state === "pending" && !handled.has(next.id));
+      if (arrived) {
         this.unsealBatch(row.id);
         return true;
       }
@@ -2267,7 +2303,7 @@ export class Router {
         }).immediate();
         this.retireOthers();
       } catch {
-        this.acknowledge(row.id, "I couldn't get started on that just now. Mind sending it again in a moment?", "unknown");
+        // No prompt was sent: keep this sealed batch for its watchdog rather than asking for a resend.
         return;
       }
     }
@@ -2354,7 +2390,8 @@ export class Router {
     }
     const turn: Turn = {
       id: activeRoute.id, directory: activeRoute.directory, generation: activeRoute.generation,
-      inboundId: row.id, messageId: promptId, startedAt: Date.now(), phase: "submitting",
+      inboundId: row.id, messageId: promptId, startedAt: preparing?.startedAt ?? Date.now(), phase: "submitting",
+      ...(preparing ? { attempt: preparing.attempt, attemptAt: preparing.attemptAt } : {}),
     };
     // The iMessage preferences come from the OpenCode config at prompt time, so
     // a config change applies to the very next inbound batch. Any read or shape
@@ -2374,6 +2411,7 @@ export class Router {
     const background = members.every(id => id.startsWith("wake:"));
     const guidance = preferences.prompt ?? (background ? wakeGuidance : imessageGuidance)({ appsRoot: this.options.appsRoot });
     let system = `${guidance}\nUse the existing available tools under their existing permissions; do not change tool permissions. Timezone: ${this.options.timezone}. Current incoming message ID: ${JSON.stringify(input.id)}. Source incoming message IDs (in order, available as reaction targets): ${JSON.stringify((input.batchIds ?? [input.id]).filter(id => !synthetic(id)))}. CURRENT_SESSION_ID for bridge commands: ${sessionMarker(turn)}. The imessage skill at ${JSON.stringify(this.options.skillPath)} has more detail on file sends. Read ${JSON.stringify(this.options.alertSkillPath)} for one-time alerts and durable reminders. Use that alert CLI without ever reading credentials. Handle reminders with it; plain reminders are notify-only, not scheduled agent work. Your primary response is forwarded automatically, unless it ends with ${NO_REPLY}. Do not send normal final responses via the alert CLI, to avoid duplicates. Unsolicited notifications are not conversation context. Only explicitly referenced notification text is supplied as quoted data.`;
+    if (preparing?.held) system += this.delayNote(input, turn.startedAt);
     if (context) system += `\n${sendblueContextPrompt(context, eyes, this.batchSenders(members), background)}`;
     const seed = this.store.get<string>(`seed:${turn.id}`);
     if (seed) system += `\n${seed}`;
@@ -2421,10 +2459,11 @@ export class Router {
         this.clearDeferredNew();
       }
       this.store.set(`batch-phase:${row.id}`, "submitting");
+      this.store.set("preparingDelivery", null);
       if (this.options.swipes) this.freezeSwipe(row.id);
       this.store.set("activeTurn", turn);
-      // Owner text is sent again if this POST never shows up (see OWNER_RESEND_MS).
-      this.store.set("resendBody", members.every(synthetic) ? null : {
+      // Keep the exact sealed body until acceptance; retries share its prompt id.
+      this.store.set("resendBody", {
         inboundId: row.id, text: body, system, parts, model: preferences.model, ...(owner ? { owner } : {}),
       } satisfies ResendBody);
       if (members.every(synthetic)) for (const id of members) {
@@ -2445,7 +2484,6 @@ export class Router {
     if (!submitting) return;
     try {
       await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner));
-      this.stage("prompt-accepted", row.id);
       if (this.current(turn)) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
@@ -2601,7 +2639,7 @@ export class Router {
       } catch { conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
     }
     if (!this.current(turn)) return false;
-    const next: Turn = found ? { ...turn, messageId: found, phase: "running" } : { ...turn, phase: "unknown" };
+    const next: Turn = found ? { ...turn, messageId: found, phase: "running" } : { ...turn, phase: turn.phase === "held" ? "held" : "unknown" };
     this.store.db.transaction(() => {
       this.store.set("activeTurn", next);
       if (found) {
@@ -2613,54 +2651,118 @@ export class Router {
     return !found && conclusive;
   }
 
-  /**
-   * An owner text whose prompt is still unconfirmed. Once the current attempt's
-   * window has passed and OpenCode confirms none of the attempts landed, the
-   * same prompt goes out again under a fresh record id. When the attempts run
-   * out (or delivery stays unreadable too long) the owner is asked to resend.
-   * Returns true when this tick's poll should stop here.
-   */
-  private async resend(turn: Turn, absent: boolean, elapsed: number): Promise<boolean> {
-    const attempt = turn.attempt ?? 1;
-    const body = this.store.get<ResendBody | null>("resendBody");
-    if (!body || body.inboundId !== turn.inboundId) {
-      // A turn submitted before resends existed keeps the old two-minute rule.
-      if (elapsed < UNDELIVERED_MS) return false;
-      this.fail(turn, UNDELIVERED_TEXT, undefined, "undelivered");
-      return true;
-    }
-    // Past the cap (say after a long outage) the text is stale: ask rather than send it late.
-    const due = Date.now() - (turn.attemptAt ?? turn.startedAt) >= OWNER_RESEND_MS[Math.min(attempt, OWNER_RESEND_MS.length) - 1]!;
-    if (!due && elapsed < OWNER_GIVE_UP_MS) return false;
-    if (attempt >= OWNER_RESEND_MS.length || elapsed >= OWNER_GIVE_UP_MS) {
-      this.options.log?.("owner-text-undelivered", String(attempt));
-      this.fail(turn, UNDELIVERED_TEXT, undefined, "undelivered");
-      return true;
-    }
-    // Unreadable is not absent: wait for a read that settles it.
-    if (!absent) return false;
-    const next: Turn = {
-      ...turn, phase: "submitting", messageId: `msg_${hash(`${turn.inboundId}:resend:${attempt}`)}`,
-      attempt: attempt + 1, attemptAt: Date.now(), earlier: [...(turn.earlier ?? []), turn.messageId],
-    };
-    const fenced = this.store.db.transaction(() => {
-      if (!this.current(next) || this.store.get<Turn | null>("activeTurn")?.messageId !== turn.messageId) return false;
-      this.store.set("activeTurn", next);
-      return true;
+  private watchdogLog(decision: "retry" | "notice" | "replay", turn: Pick<Turn, "inboundId" | "messageId">): void {
+    this.options.log?.("delivery-watchdog", JSON.stringify({ decision, chat: this.options.context?.chat.slug ?? "imessage", batchId: turn.inboundId, promptId: turn.messageId }));
+  }
+
+  private outageNotice(id: string): void {
+    if (this.store.get<Outage | null>("deliveryOutage")) return;
+    const notice = `outage:${hash(id)}`;
+    this.store.set("deliveryOutage", { id: notice, probeAt: Date.now() } satisfies Outage);
+    this.store.enqueue({ id: notice, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
+    this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+  }
+
+  private holdDelivery(turn: Turn): void {
+    this.store.db.transaction(() => {
+      if (turn.inboundId) this.outageNotice(turn.inboundId);
+      this.store.set("activeTurn", { ...turn, phase: "held" });
     }).immediate();
-    if (!fenced) return true;
-    this.options.log?.("owner-text-resent", String(next.attempt));
+  }
+
+  private delayNote(input: NormalizedInbound | null | undefined, fallback: number): string {
+    return `\n[Bridge note, not typed by anyone.] This batch was delayed by a technical outage. It was sent at ${new Date(input?.sentAt ?? input?.receivedAt ?? fallback).toISOString()}. Answer the held messages now.`;
+  }
+
+  private async preparationWatchdog(handled: Set<string>): Promise<void> {
+    const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+    if (!preparing) return;
+    const row = this.store.pendingInbound().find(row => row.id === preparing.id);
+    if (!row || row.state !== "processing") { this.store.set("preparingDelivery", null); return; }
+    const turn = { inboundId: preparing.id, messageId: `msg_${hash(preparing.id)}` };
+    if (preparing.held) {
+      const outage = this.store.get<Outage | null>("deliveryOutage");
+      if (!outage || Date.now() - outage.probeAt < 5_000) return;
+      const health = await bounded(this.backend.health()).catch(() => undefined);
+      const healthy = health?.status === "ok";
+      if (this.controlArrived(handled)) return;
+      this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
+      if (!healthy || (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS)) return;
+      this.store.set("deliveryOutage", { ...outage, probeAt: Date.now(), replayAt: Date.now() });
+      this.watchdogLog("replay", turn);
+    } else {
+      if (Date.now() - preparing.attemptAt < ACCEPT_WAIT_MS) return;
+      if (preparing.attempt >= 2) {
+        this.store.db.transaction(() => {
+          this.outageNotice(preparing.id);
+          this.store.set("preparingDelivery", { ...preparing, held: true });
+        }).immediate();
+        return;
+      }
+      this.store.set("preparingDelivery", { ...preparing, attempt: 2, attemptAt: Date.now() });
+      this.watchdogLog("retry", turn);
+    }
+    this.store.set(`batch-phase:${preparing.id}`, "preparing");
+    await this.submit(row, handled);
+  }
+
+  private async sendDelivery(turn: Turn, body: ResendBody, handled: Set<string>, replay = false): Promise<void> {
+    if (this.controlArrived(handled)) return;
+    const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
+    const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
     try {
-      await bounded(this.backend.prompt(next.id, next.directory, next.messageId, body.text, body.system, body.parts, body.model, body.owner));
-      if (this.current(next)) this.store.db.transaction(() => {
-        this.store.set("activeTurn", { ...next, phase: "running" });
-        this.store.set(`seed:${next.id}`, null);
-        this.landed(next);
+      await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body.text, system, body.parts, body.model, body.owner));
+      if (this.current(turn) && this.store.get<Turn | null>("activeTurn")?.messageId === turn.messageId) this.store.db.transaction(() => {
+        this.store.set("activeTurn", { ...turn, phase: "running" });
+        this.store.set(`seed:${turn.id}`, null);
+        this.landed(turn);
       }).immediate();
     } catch {
-      if (this.current(next)) await this.reconcile(next);
+      if (this.current(turn)) await this.reconcile(turn);
     }
-    return true;
+  }
+
+  /** Independent of status/request reads: an unavailable poll must not disable the delivery clock. */
+  private async deliveryWatchdog(handled: Set<string>): Promise<void> {
+    let turn = this.store.get<Turn | null>("activeTurn");
+    if (!turn || !this.current(turn) || turn.background) return;
+    const failedBeforeAcceptance = turn.phase === "failed" && turn.inboundId
+      && this.store.get(`batch-phase:${turn.inboundId}`) === "submitting";
+    if (!["submitting", "unknown", "held"].includes(turn.phase) && !failedBeforeAcceptance) return;
+    const absent = await this.reconcile(turn);
+    turn = this.store.get<Turn | null>("activeTurn");
+    if (!turn || !this.current(turn) || turn.phase === "running" || this.controlArrived(handled)) return;
+    const body = this.store.get<ResendBody | null>("resendBody");
+    const elapsed = Date.now() - (turn.attemptAt ?? turn.startedAt);
+    if (turn.phase !== "held") {
+      if ((turn.attempt ?? 1) < 2 && elapsed >= ACCEPT_WAIT_MS && absent && body && body.inboundId === turn.inboundId) {
+        const retry: Turn = { ...turn, phase: "submitting", attempt: 2, attemptAt: Date.now() };
+        this.store.set("activeTurn", retry);
+        this.watchdogLog("retry", retry);
+        await this.sendDelivery(retry, body, handled);
+      } else if (elapsed >= ACCEPT_WAIT_MS && ((turn.attempt ?? 1) >= 2 || Date.now() - turn.startedAt >= 2 * ACCEPT_WAIT_MS)) {
+        this.holdDelivery(turn);
+      }
+      return;
+    }
+    const outage = this.store.get<Outage | null>("deliveryOutage");
+    if (!outage || Date.now() - outage.probeAt < 5_000) return;
+    const messages = await bounded(this.backend.messages(turn.id, turn.directory, { since: turn.startedAt, limit: 20 })).catch(() => []);
+    await this.reconcile(turn, messages);
+    if (this.store.get<Turn | null>("activeTurn")?.phase === "running") return;
+    const recoveredPrompt = [...messages].reverse().find(message => message.type === "user" && message.id !== turn!.messageId
+      && !turn!.earlier?.includes(message.id) && message.time.created >= turn!.startedAt)?.id;
+    const health = await bounded(this.backend.health()).catch(() => undefined);
+    const healthy = health?.status === "ok";
+    if (this.controlArrived(handled)) return;
+    this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
+    const recovered = healthy || recoveredPrompt !== undefined;
+    if (!recovered || !absent || !body || body.inboundId !== turn.inboundId
+      || (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS)) return;
+    // A crash after this fence delays the next try by one minute; the batch keeps its idempotency key.
+    this.store.set("deliveryOutage", { ...outage, probeAt: Date.now(), replayAt: Date.now() });
+    this.watchdogLog("replay", turn);
+    await this.sendDelivery(turn, body, handled, true);
   }
 
   /**
@@ -2709,7 +2811,6 @@ export class Router {
     let turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
     // Work has no deadline: a turn runs for as long as the agent needs.
-    const elapsed = Date.now() - turn.startedAt;
     try {
       const statuses = await this.statusesFor(turn);
       const [messages, requests] = await Promise.all([
@@ -2719,20 +2820,11 @@ export class Router {
       ]);
       if (!this.current(turn)) return;
       if (!messages || !statuses) throw new Error();
-      if (turn.phase === "submitting" || turn.phase === "unknown") {
-        const absent = await this.reconcile(turn, messages);
-        const reconciled = this.store.get<Turn | null>("activeTurn");
-        if (!reconciled || reconciled.messageId !== turn.messageId || !this.current(reconciled)) return;
-        turn = reconciled;
-        if (turn.phase === "unknown") {
-          // Owner text is sent again before anyone is asked to resend it.
-          if (turn.inboundId && !synthetic(turn.inboundId) && !turn.background) {
-            if (await this.resend(turn, absent, elapsed)) return;
-          } else if (elapsed >= UNDELIVERED_MS) {
-            this.fail(turn, UNDELIVERED_TEXT, undefined, "undelivered");
-            return;
-          }
-        }
+      if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
+        await this.reconcile(turn, messages);
+        const accepted = this.store.get<Turn | null>("activeTurn");
+        if (!accepted || accepted.phase !== "running" || !this.current(accepted)) return;
+        turn = accepted;
       }
       const entries = this.pending();
       const live = new Set<string>();

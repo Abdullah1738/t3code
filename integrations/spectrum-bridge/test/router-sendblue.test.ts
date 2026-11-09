@@ -1307,3 +1307,41 @@ test("a batch of only tapbacks gets an unthreaded reply", async () => {
   await h.router.tick();
   expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([["Glad it helped", undefined]]);
 });
+
+test("owner, Moni and group outages each get one notice, with held messages ordered on recovery", async () => {
+  const start = Date.parse("2026-11-07T07:27:00Z");
+  setSystemTime(start);
+  const chats = ["owner", "dm", "group"].map(kind => setup(context(kind as ChatInfo["kind"]), { quietMs: 0 }));
+  for (const h of chats) {
+    h.backend.prompt = async () => { throw new Error("offline"); };
+    h.backend.health = async () => ({ status: "down", timestamp: "", openchamberVersion: "test" });
+    h.input("first", "robob first question", "+971585933213");
+    await h.router.tick();
+  }
+  for (const offset of [60_000, 120_000]) {
+    setSystemTime(start + offset);
+    for (const h of chats) await h.router.tick();
+  }
+  for (const h of chats) {
+    h.input("second", "robob second question", "+971585933213");
+    h.input("third", "robob third question", "+971585933213");
+  }
+  setSystemTime(start + 180_000);
+  for (const h of chats) {
+    await h.router.tick();
+    expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
+    h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
+    h.backend.health = async () => ({ status: "ok", timestamp: "", openchamberVersion: "test" });
+  }
+  setSystemTime(start + 185_000);
+  for (const h of chats) {
+    await h.router.tick();
+    await h.router.tick();
+    expect(h.backend.prompts).toHaveLength(1);
+    expect(h.backend.prompts[0]!.text).toContain("first question");
+    expect(h.backend.prompts[0]!.system).toContain("delayed by a technical outage");
+    expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state)).toEqual(["done", "pending", "pending"]);
+    expect(h.store.pendingOutbox().some(op => /didn't catch/.test(op.text))).toBe(false);
+  }
+  setSystemTime();
+});
