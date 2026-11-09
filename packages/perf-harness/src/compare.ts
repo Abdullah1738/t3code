@@ -2,6 +2,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { percentiles, type Run } from "./metrics.ts";
+import { ownerAnswerSamples, ownerAnswerWorkload } from "./ownerAnswers.ts";
+import { ownerMessagePostSamples } from "./ownerMessagePosts.ts";
 export const gateVersion = "paired-bootstrap-v2";
 export function median(values: readonly number[]) {
   if (!values.length || values.some((v) => !Number.isFinite(v) || v < 0))
@@ -80,7 +82,7 @@ export function compare(
     if (new Set(runs.map((r) => r.repeat)).size !== repeats) throw new Error("Duplicate repeat");
   }
   const metrics: Record<string, unknown> = {};
-  const requiredRequests = ["boards", "board", "discussion", "post", "move"].map(
+  const requiredRequests = ["boards", "board", "discussion", "post", "move", "answer", "messagePost"].map(
     (name) => name + ".response.ms",
   );
   const requiredScalars = [
@@ -141,7 +143,9 @@ export function compare(
   ])) {
     const a = base.map((r) => r.requests?.[key] ?? []),
       b = candidate.map((r) => r.requests?.[key] ?? []);
-    if ([...a, ...b].some((r) => r.length < 40)) {
+    if ([...a, ...b].some((r) => r.length < 40 ||
+      (key === "answer.response.ms" && r.length !== ownerAnswerSamples) ||
+      (key === "messagePost.response.ms" && r.length !== ownerMessagePostSamples))) {
       missing = true;
       relativeMissing ||= requiredRequests.includes(key);
       tails[key] = { status: "unmeasured" };
@@ -157,6 +161,51 @@ export function compare(
       verdict: regression ? "fail" : "pass",
     };
   }
+  const ownerAnswerCoverage = {
+    asks: [...base, ...candidate].every((run) => run.ownerAnswers?.workload === ownerAnswerWorkload &&
+      run.ownerAnswers.rpcAnswers === ownerAnswerSamples && run.ownerAnswers.consumedAsks === ownerAnswerSamples) ? "pass" : "unmeasured",
+    mockDelivery: [...base, ...candidate].every((run) => run.ownerAnswers?.mockProvider === "acp-local" &&
+      run.ownerAnswers.mockDelivered === ownerAnswerSamples && run.ownerAnswers.routedAsks === ownerAnswerSamples &&
+      run.ownerAnswers.launchedEvaluators === 10) ? "pass" : "unmeasured",
+    liveDelivery: "unmeasured",
+  };
+  relativeMissing ||= ownerAnswerCoverage.asks !== "pass";
+  missing ||= ownerAnswerCoverage.asks !== "pass" || ownerAnswerCoverage.mockDelivery !== "pass";
+  const answerValues = candidate.map((run) => run.requests?.["answer.response.ms"] ?? []);
+  const answerP95 = answerValues.every((values) => values.length === ownerAnswerSamples)
+    ? percentiles(answerValues.flat())!.p95 : null;
+  const answerBudget = budgets.metrics["answer.response.ms.p95"]?.max ?? 500;
+  const ownerAnswerTarget = {
+    scale: "5x", samplesPerRun: ownerAnswerSamples, metric: "answer.response.ms", percentile: "p95",
+    maxExclusiveMs: answerBudget, candidateP95Ms: answerP95,
+    verdict: first.scale !== "5x" ? "not-applicable"
+      : answerP95 === null || ownerAnswerCoverage.asks !== "pass" ? "incomplete"
+      : answerP95 < answerBudget ? "pass" : "fail",
+  };
+  fail ||= ownerAnswerTarget.verdict === "fail";
+  const ownerMessagePostCoverage = {
+    persistence: [...base, ...candidate].every((run) => run.ownerMessagePosts?.workload === ownerAnswerWorkload &&
+      run.ownerMessagePosts.rpcPosts === ownerMessagePostSamples && run.ownerMessagePosts.persistedPosts === ownerMessagePostSamples) ? "pass" : "unmeasured",
+    asks: [...base, ...candidate].every((run) => run.ownerMessagePosts?.consumedAsks === ownerMessagePostSamples) ? "pass" : "unmeasured",
+    mockDelivery: [...base, ...candidate].every((run) => run.ownerMessagePosts?.mockProvider === "acp-local" &&
+      run.ownerMessagePosts.mockDelivered === ownerMessagePostSamples && run.ownerMessagePosts.routedPosts === ownerMessagePostSamples &&
+      run.ownerMessagePosts.launchedEvaluators === 10) ? "pass" : "unmeasured",
+    liveDelivery: "unmeasured",
+  };
+  relativeMissing ||= ownerMessagePostCoverage.persistence !== "pass" || ownerMessagePostCoverage.asks !== "pass";
+  missing ||= ownerMessagePostCoverage.persistence !== "pass" || ownerMessagePostCoverage.asks !== "pass" || ownerMessagePostCoverage.mockDelivery !== "pass";
+  const postValues = candidate.map((run) => run.requests?.["messagePost.response.ms"] ?? []);
+  const postP95 = postValues.every((values) => values.length === ownerMessagePostSamples)
+    ? percentiles(postValues.flat())!.p95 : null;
+  const postBudget = budgets.metrics["messagePost.response.ms.p95"]?.max ?? 500;
+  const ownerMessagePostTarget = {
+    scale: "5x", samplesPerRun: ownerMessagePostSamples, metric: "messagePost.response.ms", percentile: "p95",
+    maxExclusiveMs: postBudget, candidateP95Ms: postP95,
+    verdict: first.scale !== "5x" ? "not-applicable"
+      : postP95 === null || ownerMessagePostCoverage.persistence !== "pass" || ownerMessagePostCoverage.asks !== "pass" ? "incomplete"
+      : postP95 < postBudget ? "pass" : "fail",
+  };
+  fail ||= ownerMessagePostTarget.verdict === "fail";
   const correctness = [...base, ...candidate].every((r) => r.correctness === "pass")
     ? "pass"
     : [...base, ...candidate].some((r) => r.correctness === "fail")
@@ -165,6 +214,10 @@ export function compare(
   return {
     gateVersion,
     tails,
+    ownerAnswerTarget,
+    ownerAnswerCoverage,
+    ownerMessagePostTarget,
+    ownerMessagePostCoverage,
     performanceVerdict: fail ? "fail" : relativeMissing ? "incomplete" : "pass",
     base: first.sha,
     candidate: candidate[0]!.sha,

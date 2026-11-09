@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - record ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
+import type { ThreadManagementTerminalRunStatus } from "../../../orchestration-v2/ThreadManagementService.ts";
 
 import {
   KANBAN_BACKLOG,
@@ -52,6 +53,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Exit from "effect/Exit";
 import * as Schedule from "effect/Schedule";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -85,7 +87,7 @@ import * as Text from "./text.ts";
 import * as Pages from "./messagePages.ts";
 import * as BoardReplies from "./boardReplies.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
-import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { KanbanThreads, KanbanThreadError, type KanbanThreadView } from "./threads.ts";
 import { KanbanModels, isListed } from "./models.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { planCutoverCardRestore, type RestoreCutoverCardInput } from "./cutoverCards.ts";
@@ -817,10 +819,76 @@ const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDe
   defaultValue: () => undefined,
 });
 
+/** The durable route row a delivery attempt works for; launches record their thread on it. */
+const ownerRouteRow = Context.Reference<number | undefined>("KanbanOwnerRouteRow", {
+  defaultValue: () => undefined,
+});
+
+/**
+ * How owner answers and posts reach their agents.
+ * - `deferred` (production): the reply returns once the answer or post and its
+ *   route row are committed; delivery runs in the background and replays after a restart.
+ * - `await`: the same durable route row and drain, but the reply waits for the
+ *   first delivery attempt (the default, so tests observe delivery synchronously).
+ * - `inline`: the pre-durable path with no route row (rollback:
+ *   `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`).
+ */
+export type OwnerRouteMode = "deferred" | "await" | "inline";
+/** A route still failing after this long is closed as undeliverable, with a notice. */
+const OWNER_ROUTE_GIVE_UP_MS = 10 * 60_000;
+/**
+ * Run states after which a thread no longer acts on its instruction: thread
+ * management's terminal states, kept exhaustive by the record's key type.
+ */
+const FINISHED_RUN: Record<ThreadManagementTerminalRunStatus, true> = {
+  completed: true,
+  failed: true,
+  cancelled: true,
+  interrupted: true,
+  rolled_back: true,
+};
+const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set(Object.keys(FINISHED_RUN));
+/** How long a durable owner post's title write may hold its discussion's drain. */
+const OWNER_ROUTE_TITLE_DEADLINE = "20 seconds";
+/** `noticed` value of a route whose give-up is decided but whose notice may not be posted yet. */
+const OWNER_ROUTE_GIVING_UP = 2;
+export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
+  defaultValue: () => "await",
+});
+
+interface OwnerRoutePost {
+  readonly kind: "post";
+  readonly seq: number;
+  readonly createdAt: string;
+  /** The discussion's title is written from this post once its route is delivered. */
+  readonly writeTitle?: boolean;
+}
+interface OwnerRouteAnswer {
+  readonly kind: "answer";
+  readonly seq: number;
+  readonly blockId: string;
+  readonly at: string;
+  readonly note: string;
+  /** What was answered; two answers in the same millisecond still differ here. */
+  readonly choice?: ReadonlyArray<string>;
+  readonly text?: string | null;
+}
+type OwnerRoutePayload = OwnerRoutePost | OwnerRouteAnswer;
+
+/**
+ * The asks a durable owner route answers, fixed by its first attempt. Routing
+ * closes only these, so a retry never answers an ask opened after the message.
+ */
+const ownerRouteAsks = Context.Reference<ReadonlySet<string> | undefined>("KanbanOwnerRouteAsks", {
+  defaultValue: () => undefined,
+});
+
 const make = Effect.gen(function* () {
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
+  const ownerRouteMode = yield* OwnerRouteMode;
+  const durableOwnerRoutes = ownerRouteMode !== "inline";
   const routingEnabled = locks.outside(
     selectionRoutingEnabled.pipe(Effect.provideContext(context)),
     undefined,
@@ -841,7 +909,8 @@ const make = Effect.gen(function* () {
   const threadIo = yield* KanbanThreads;
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
     function* (input: Parameters<typeof threadIo.launch>[0], id: ThreadId) {
-      yield* threadIo.interrupt(id, "Board state changed during launch");
+      // The ended link comes first: a keyed owner-route replay must see this
+      // launch as abandoned even if the process stops before the interrupt.
       const existing = yield* rawStore.threadLink(id);
       const [source, role] = input.key.split(":");
       const card =
@@ -866,7 +935,11 @@ const make = Effect.gen(function* () {
             },
       );
     },
-    (effect) => effect.pipe(Effect.ignore),
+    (effect, _input, id) =>
+      effect.pipe(
+        Effect.ignore,
+        Effect.ensuring(threadIo.interrupt(id, "Board state changed during launch")),
+      ),
   );
   const threads: typeof threadIo = {
     view: (id) => locks.outside(threadIo.view(id), undefined, true),
@@ -883,6 +956,20 @@ const make = Effect.gen(function* () {
             Effect.tap((id) =>
               Effect.gen(function* () {
                 (yield* ownerDelivered)?.add(id);
+                // Durable before the discussion names it, so a replay never sends again
+                // what this launch's first message already carried.
+                const row = yield* ownerRouteRow;
+                if (row !== undefined) {
+                  yield* boardSql`
+                    UPDATE ardud_kanban_owner_routes SET launched = json_insert(launched, '$[#]', ${id})
+                    WHERE id = ${row} AND NOT EXISTS (SELECT 1 FROM json_each(launched) WHERE value = ${id})
+                  `.pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new KanbanThreadError({ operation: "launch", detail: String(error) }),
+                    ),
+                  );
+                }
               }),
             ),
           ),
@@ -968,13 +1055,38 @@ const make = Effect.gen(function* () {
     effect: Effect.Effect<A, E, R>,
   ) =>
     Effect.suspend(() => {
+      const started = performance.now();
       let mutex = all.get(key);
       if (!mutex) {
         mutex = Semaphore.makeUnsafe(1);
         all.set(key, mutex);
       }
-      return locks.outside(mutex.withPermits(1)(locks.fresh(effect)));
-    });
+      return locks.outside(
+        mutex.withPermits(1)(
+          Effect.gen(function* () {
+            // The permit wait was invisible in traces: it dominated slow owner answers.
+            yield* Effect.annotateCurrentSpan("serial.wait_ms", performance.now() - started);
+            return yield* locks.fresh(effect);
+          }),
+        ),
+      );
+    }).pipe(
+      Effect.withSpan("KanbanService.serial", {
+        attributes: {
+          "serial.queue":
+            all === routing
+              ? "routing"
+              : all === evaluating
+                ? "evaluating"
+                : all === dispatching
+                  ? "dispatching"
+                  : all === ticking
+                    ? "ticking"
+                    : "turnEnding",
+          "serial.key": key,
+        },
+      }),
+    );
   const serial = <A, E, R>(
     all: Map<string, Semaphore.Semaphore>,
     key: string,
@@ -2070,13 +2182,41 @@ const make = Effect.gen(function* () {
     }
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
-    const threadId = yield* threads.launch({
-      key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${launchKey}`,
-      projectId: board.defaultProjectId,
+    const launchInput = (key: string) => ({
+      key: `${board.id}:eval:${Briefs.purposeKey(purpose)}:${key}`,
+      projectId: board.defaultProjectId!,
       title,
       model: board.evaluatorModel,
       text: extra.text ? `${brief}\n\n${extra.text}` : brief,
     });
+    const routeKey = (yield* ownerRouteRow) === undefined ? undefined : yield* ownerDeliveryKey;
+    let threadId: ThreadId | undefined;
+    if (routeKey === undefined) {
+      threadId = yield* threads.launch(launchInput(launchKey));
+    } else {
+      // A durable owner route launches under a stable key, so a replay after a
+      // restart gets the evaluator it already started instead of a second one.
+      // A launch the board abandoned has an ended link; the next attempt is fresh.
+      for (let attempt = 0; threadId === undefined; attempt += 1) {
+        if (attempt >= 8) {
+          return yield* failWith("failed", "evaluator launch was abandoned 8 times");
+        }
+        const launched = yield* threads.launch(launchInput(`${routeKey}:${attempt}`));
+        const link = yield* rawStore.threadLink(launched);
+        if (link === null || link.endedAt === null) threadId = launched;
+        // The ended link is written before its interrupt; a restart between the two
+        // leaves the abandoned evaluator running. It must be seen stopped before the
+        // next one starts with the same instruction; otherwise the route retries.
+        else {
+          yield* threads.interrupt(launched, "Board state changed during launch");
+          const run = yield* threads.latestRun(launched).pipe(Effect.mapError(toKanbanError));
+          if (run !== null && !FINISHED_RUN_STATUSES.has(run.status)) {
+            return yield* failWith("failed", `abandoned evaluator ${launched} is still running`);
+          }
+        }
+      }
+    }
+    if (threadId === undefined) return yield* failWith("failed", "evaluator launch gave no thread");
     yield* linkThread(
       {
         threadId,
@@ -2623,7 +2763,10 @@ const make = Effect.gen(function* () {
       let card = yield* cardOf(current.cardId);
       let told = new Set<string>();
       if (from === "owner" && kanbanNeedsOwner(card)) {
-        const result = yield* answerAsks(current, card, text, pick ?? (() => true));
+        const frozen = yield* ownerRouteAsks;
+        const which = (ask: KanbanOwnerAsk) =>
+          (pick === undefined || pick(ask)) && (frozen === undefined || frozen.has(ask.id));
+        const result = yield* answerAsks(current, card, text, which);
         ({ told, discussion: current, card } = result);
       }
       if (pick && told.size > 0) return;
@@ -2645,20 +2788,53 @@ const make = Effect.gen(function* () {
   });
 
   const ownerDeliveries = new Map<string, Set<string>>();
-  /** Saving succeeds independently of delivery. Every retry starts with fresh board state. */
+  /** A durable route row a delivery attempt works for (see `deliverOwnerRoute`). */
+  interface SavedOwnerRow {
+    readonly id: number;
+    readonly launched: ReadonlyArray<string>;
+    /** The askers that hear this answer, fixed by its first delivery attempt. */
+    readonly askers: { readonly ids: ReadonlyArray<string>; readonly needsOwner: boolean } | null;
+    /** Run first inside the locked attempt: null when the route still stands. */
+    readonly check?: Effect.Effect<OwnerRouteClosed | null, KanbanError>;
+    /** Set when `check` closed the route instead of routing it. */
+    closed?: OwnerRouteClosed;
+  }
+  type OwnerRouteClosed = "not-saved" | "superseded";
+  /**
+   * Saving succeeds independently of delivery. Every retry starts with fresh board state.
+   * A durable route row gets one attempt here: its discussion's drain retries it in
+   * order and checks before each attempt that it still stands.
+   */
   const routeSavedOwner = <E>(
     discussionId: KanbanDiscussion["id"],
     key: string,
     route: Effect.Effect<unknown, E>,
+    row?: SavedOwnerRow,
+    asks?: ReadonlySet<string>,
   ) => {
     let delivered = ownerDeliveries.get(key);
     if (!delivered) ownerDeliveries.set(key, (delivered = new Set()));
+    // Evaluators this route already started carried the text in their first message.
+    for (const id of row?.launched ?? []) delivered.add(id);
+    // A saved route checks that it still stands inside the same board operation
+    // that routes it, so an answer changed meanwhile is seen before anything is sent.
+    const body =
+      row?.check === undefined
+        ? route
+        : row.check.pipe(
+            Effect.flatMap((closed) =>
+              closed === null ? route : Effect.sync(() => (row.closed = closed)),
+            ),
+          );
     const attempt = locks
-      .fresh(locks.run(route))
+      .fresh(locks.run(body))
       .pipe(
         Effect.provideService(ownerDeliveryKey, key),
         Effect.provideService(ownerDelivered, delivered),
+        Effect.provideService(ownerRouteRow, row?.id),
+        Effect.provideService(ownerRouteAsks, row === undefined ? undefined : asks),
       );
+    if (row !== undefined) return attempt.pipe(Effect.asVoid);
     const retry = (remaining: number): Effect.Effect<void> =>
       attempt.pipe(
         Effect.asVoid,
@@ -2674,23 +2850,10 @@ const make = Effect.gen(function* () {
               return yield* retry(remaining - 1);
             }
             // Visible evidence survives a process restart even if the retry worker cannot.
-            yield* locks
-              .fresh(
-                locks.run(
-                  postUnlocked(
-                    discussionId,
-                    { _tag: "system", component: "owner-delivery" },
-                    [
-                      {
-                        _tag: "md",
-                        text: `Owner message delivery pending (${key}). Retrying in the background.`,
-                      },
-                    ],
-                    false,
-                  ),
-                ),
-              )
-              .pipe(Effect.ignore);
+            yield* ownerDeliveryNotice(
+              discussionId,
+              `Owner message delivery pending (${key}). Retrying in the background.`,
+            ).pipe(Effect.ignore);
             yield* attempt.pipe(
               Effect.asVoid,
               Effect.catchCause((failure) =>
@@ -2706,18 +2869,103 @@ const make = Effect.gen(function* () {
       );
     return retry(3);
   };
+  const ownerDeliveryNotice = (discussionId: KanbanDiscussion["id"], text: string) =>
+    locks
+      .fresh(
+        locks.run(
+          postUnlocked(
+            discussionId,
+            { _tag: "system", component: "owner-delivery" },
+            [{ _tag: "md", text }],
+            false,
+          ),
+        ),
+      )
+      .pipe(Effect.asVoid);
+
+  interface OwnerRouteRecord {
+    readonly id: number;
+    readonly route_key: string;
+    readonly discussion_id: string;
+    readonly json: string;
+    readonly launched: string;
+    readonly noticed: number;
+    readonly done_at: string | null;
+  }
+  const markOwnerRouteDone = Effect.fn("KanbanService.markOwnerRouteDone")(
+    function* (id: number, outcome: string) {
+      const at = yield* nowIso;
+      yield* boardSql`
+        UPDATE ardud_kanban_owner_routes
+        SET done_at = ${at}, json = json_set(json, '$.outcome', ${outcome})
+        WHERE id = ${id}
+      `;
+    },
+    (effect, id) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          // Left pending: the next drain replays it, and its sends are keyed.
+          Effect.logWarning("kanban owner route could not be marked done", { id, cause }),
+        ),
+      ),
+  );
+
+  /**
+   * The commit half of an owner answer or post: its routing obligation, written
+   * in the same transaction as the message, so an acknowledged write always has
+   * one. A row whose message no longer matches is closed when it is drained.
+   */
+  const saveOwnerRoute = Effect.fn("KanbanService.saveOwnerRoute")(
+    function* (
+      boardId: KanbanBoardId,
+      discussionId: KanbanDiscussion["id"],
+      key: string,
+      payload: OwnerRoutePayload,
+    ) {
+      const at = yield* nowIso;
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const json = JSON.stringify(payload);
+      // The key covers the message and the answer's content and time, so the same
+      // answer saved again (a retried request) keeps its route, outcome and askers.
+      yield* boardSql`
+        INSERT INTO ardud_kanban_owner_routes (route_key, board_id, discussion_id, json, created_at)
+        VALUES (${key}, ${boardId}, ${discussionId}, ${json}, ${at})
+        ON CONFLICT (route_key) DO NOTHING
+      `;
+    },
+    (effect) => effect.pipe(Effect.mapError(toKanbanError)),
+  );
   const routeRetainingAskers = <E>(
     discussionId: KanbanDiscussion["id"],
     key: string,
     text: string,
     route: Effect.Effect<unknown, E>,
     askId?: string,
+    row?: SavedOwnerRow,
   ) =>
     Effect.gen(function* () {
       const initial = yield* rawStore.discussion(discussionId);
       const card = initial?.cardId ? yield* rawStore.card(initial.cardId) : null;
       const specific = card?.asks.find((ask) => ask.id === askId);
-      const asks = specific ? [specific] : card ? kanbanOpenAsks(card) : [];
+      const recorded = row?.askers ?? null;
+      const asks = recorded
+        ? (card?.asks ?? []).filter((ask) => recorded.ids.includes(ask.id))
+        : specific
+          ? [specific]
+          : card
+            ? kanbanOpenAsks(card)
+            : [];
+      const needsOwner = recorded ? recorded.needsOwner : card?.stage === "needs_owner";
+      if (row !== undefined && recorded === null) {
+        // Routing closes these asks. A replay after a restart must still tell
+        // the same askers, so they are fixed before the first attempt runs.
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const askers = JSON.stringify({ ids: asks.map((ask) => ask.id), needsOwner });
+        yield* boardSql`
+          UPDATE ardud_kanban_owner_routes SET json = json_set(json, '$.askers', json(${askers}))
+          WHERE id = ${row.id}
+        `;
+      }
       yield* routeSavedOwner(
         discussionId,
         key,
@@ -2727,12 +2975,7 @@ const make = Effect.gen(function* () {
             const by = ask.by;
             if (by._tag !== "thread" && by._tag !== "evaluator") continue;
             // A blocked worker receives its answer through the saved wake note.
-            if (
-              by._tag === "thread" &&
-              card?.stage === "needs_owner" &&
-              by.threadId === card.workThreadId
-            )
-              continue;
+            if (by._tag === "thread" && needsOwner && by.threadId === card?.workThreadId) continue;
             const current = yield* discussionOf(discussionId);
             const next = current.cardId ? yield* cardOf(current.cardId) : null;
             const live =
@@ -2754,27 +2997,375 @@ const make = Effect.gen(function* () {
               );
           }
         }),
+        row,
+        new Set(asks.map((ask) => ask.id)),
       );
     }).pipe(Effect.mapError(toKanbanError));
+  const ownerPostRoute = Effect.fn("KanbanService.ownerPostRoute")(
+    function* (message: KanbanMessage, key: string, row?: SavedOwnerRow) {
+      const initial = yield* discussionOf(message.discussionId);
+      const text = Briefs.ownerMessageText(
+        initial.title,
+        initial.id,
+        blocksText(message.blocks, attachments.pathOf),
+      );
+      yield* routeRetainingAskers(
+        message.discussionId,
+        key,
+        text,
+        Effect.gen(function* () {
+          yield* routeToOwnerAgent(yield* discussionOf(message.discussionId), text);
+        }),
+        undefined,
+        row,
+      );
+    },
+    (effect) => effect.pipe(Effect.mapError(toKanbanError)),
+  );
   const routeOwnerPost = (message: KanbanMessage) =>
     message.author._tag !== "owner"
       ? Effect.void
-      : Effect.gen(function* () {
-          const initial = yield* discussionOf(message.discussionId);
-          const text = Briefs.ownerMessageText(
-            initial.title,
-            initial.id,
-            blocksText(message.blocks, attachments.pathOf),
+      : durableOwnerRoutes
+        ? afterOwnerCommit(message.discussionId)
+        : ownerPostRoute(message, `owner-post:${message.discussionId}:${message.seq}`);
+  const ownerPostKey = (message: Pick<KanbanMessage, "discussionId" | "seq" | "createdAt">) =>
+    `owner-post:${message.discussionId}:${message.seq}:${message.createdAt}`;
+
+  /** A pick or written answer on a choice block reaches whoever asked it. */
+  const ownerAnswerRoute = (
+    discussionId: KanbanDiscussion["id"],
+    seq: number,
+    blockId: string,
+    note: string,
+    key: string,
+    row?: SavedOwnerRow,
+  ) =>
+    routeRetainingAskers(
+      discussionId,
+      key,
+      note,
+      Effect.gen(function* () {
+        const discussion = yield* discussionOf(discussionId);
+        const message = yield* store.message(discussionId, seq);
+        if (!message) return yield* failWith("not-found", `message ${seq}`);
+        const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
+        // A pick on an ask answers that ask alone.
+        const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
+        if (card !== null && ask !== undefined && ask.closedAt === null) {
+          yield* routeToOwnerAgent(discussion, note, "owner", (open) => open.id === ask.id);
+          return;
+        }
+        if (card !== null && ask !== undefined) {
+          // Already answered or dropped: its asker hears the late pick, and nothing else closes.
+          const by = ask.by;
+          if (by._tag === "thread" && by.threadId === card.activeThreadId) {
+            yield* deliver(discussion, by, roleName(card.activeRole ?? "work"), by.threadId, note);
+          } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
+            yield* deliver(discussion, by, "Evaluator", by.threadId, note);
+          } else {
+            yield* toEvaluator(
+              discussion,
+              by._tag === "thread" ? Asks.passOnText(card, ask, note) : note,
+            );
+          }
+          return;
+        }
+        // A pick on a card waiting on the owner answers it like a reply does.
+        const waiting = card !== null && card.stage === "needs_owner";
+        const author = message.author;
+        if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
+          if (yield* liveEvaluator(author.threadId)) {
+            yield* deliver(discussion, author, message.authorName, author.threadId, note);
+            return;
+          }
+        }
+        yield* routeToOwnerAgent(discussion, note);
+      }),
+      blockId,
+      row,
+    );
+
+  /**
+   * One saved owner route: its message must still be the one it was saved
+   * for (a row whose message never committed, or an answer the owner has
+   * since changed, is closed without delivery). Delivery marks it done.
+   */
+  const runOwnerRoute = Effect.fn("KanbanService.runOwnerRoute")(function* (
+    record: OwnerRouteRecord,
+  ) {
+    const payload = ownerRoutePayload(record);
+    const discussionId = KanbanDiscussionId.make(record.discussion_id);
+    // Checked before the attempt and again inside its board operation (see `routeSavedOwner`).
+    const check = (read: typeof rawStore.message) =>
+      read(discussionId, payload.seq).pipe(
+        Effect.map((message): OwnerRouteClosed | null => {
+          if (payload.kind === "post") {
+            return message === null ||
+              message.author._tag !== "owner" ||
+              message.createdAt !== payload.createdAt
+              ? "not-saved"
+              : null;
+          }
+          const entry = message?.answers.find(
+            (answer) => answer.blockId === payload.blockId && answer.by._tag === "owner",
           );
-          yield* routeRetainingAskers(
-            message.discussionId,
-            `owner-post:${message.discussionId}:${message.seq}`,
-            text,
-            Effect.gen(function* () {
-              yield* routeToOwnerAgent(yield* discussionOf(message.discussionId), text);
+          if (message === null || entry === undefined) return "not-saved";
+          // The owner changed this answer since: the newer one has its own route.
+          const changed =
+            entry.at !== payload.at ||
+            (payload.choice !== undefined &&
+              (entry.text !== (payload.text ?? null) ||
+                entry.choice.length !== payload.choice.length ||
+                entry.choice.some((id, index) => id !== payload.choice![index])));
+          return changed ? "superseded" : null;
+        }),
+      );
+    const before = yield* check(rawStore.message);
+    if (before !== null) return yield* markOwnerRouteDone(record.id, before);
+    const message = (yield* rawStore.message(discussionId, payload.seq))!;
+    const row: SavedOwnerRow = {
+      id: record.id,
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      launched: JSON.parse(record.launched) as ReadonlyArray<string>,
+      askers: payload.askers ?? null,
+      check: check(store.message).pipe(Effect.mapError(toKanbanError)),
+    };
+    if (payload.kind === "post") {
+      yield* ownerPostRoute(message, record.route_key, row);
+      if (row.closed !== undefined) return yield* markOwnerRouteDone(record.id, row.closed);
+      // As inline: the title is written once routing has attached the evaluator.
+      // It completes before the route closes, so a restart in between writes it on replay.
+      if (payload.writeTitle === true) yield* writeOwnerTitle(discussionId, message);
+      return yield* markOwnerRouteDelivered(record);
+    }
+    yield* ownerAnswerRoute(
+      discussionId,
+      payload.seq,
+      payload.blockId,
+      payload.note,
+      record.route_key,
+      row,
+    );
+    if (row.closed !== undefined) return yield* markOwnerRouteDone(record.id, row.closed);
+    return yield* markOwnerRouteDelivered(record);
+  });
+  // Rows are written by this module from its own payload types.
+  const ownerRoutePayload = (record: OwnerRouteRecord) =>
+    JSON.parse(record.json) as OwnerRoutePayload & {
+      readonly askers?: SavedOwnerRow["askers"];
+    };
+  // The client's first-line title stays when the writer fails or runs past its
+  // deadline; the deadline keeps later routes in the discussion from waiting long.
+  const writeOwnerTitle = (discussionId: KanbanDiscussion["id"], message: KanbanMessage) =>
+    writeDiscussionTitle(discussionId, blocksText(message.blocks, attachments.pathOf)).pipe(
+      Effect.timeout(OWNER_ROUTE_TITLE_DEADLINE),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban discussion title writer failed", { discussionId, cause }),
+      ),
+    );
+  const markOwnerRouteDelivered = (record: OwnerRouteRecord) =>
+    markOwnerRouteDone(record.id, "delivered").pipe(
+      Effect.ensuring(Effect.sync(() => ownerDeliveries.delete(record.route_key))),
+    );
+
+  const readOwnerRoute = (id: number) =>
+    boardSql<OwnerRouteRecord>`
+      SELECT id, route_key, discussion_id, json, launched, noticed, done_at
+      FROM ardud_kanban_owner_routes WHERE id = ${id}
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.map((rows) => rows[0]),
+    );
+
+  /**
+   * One saved route through to its outcome. It stays at its discussion's head
+   * until it is delivered, closed as no longer standing, or given up on, so a
+   * later post never overtakes it. `settle` releases `await` callers once the
+   * first attempts failed and only slow retries are left.
+   */
+  const deliverOwnerRoute = Effect.fn("KanbanService.deliverOwnerRoute")(function* (
+    id: number,
+    settle: Effect.Effect<void>,
+  ) {
+    let firstFailure: number | null = null;
+    for (let attempt = 0; ; attempt += 1) {
+      // Re-read every time: an earlier attempt may have fixed its askers or launches.
+      const record = yield* readOwnerRoute(id);
+      if (record === undefined || record.done_at !== null) return;
+      if (record.noticed === OWNER_ROUTE_GIVING_UP) return yield* giveUpOwnerRoute(record);
+      const exit = yield* Effect.exit(runOwnerRoute(record));
+      if (Exit.isSuccess(exit)) return;
+      yield* Effect.logWarning("kanban saved owner message delivery pending", {
+        id,
+        key: record.route_key,
+        cause: exit.cause,
+      });
+      if (attempt < 3) {
+        yield* Effect.yieldNow;
+        continue;
+      }
+      const now = yield* Clock.currentTimeMillis;
+      if (firstFailure === null) {
+        firstFailure = now;
+        if (record.noticed === 0) {
+          yield* boardSql`UPDATE ardud_kanban_owner_routes SET noticed = 1 WHERE id = ${id}`.pipe(
+            Effect.ignore,
+          );
+          yield* ownerDeliveryNotice(
+            KanbanDiscussionId.make(record.discussion_id),
+            `Owner message delivery pending (${record.route_key}). Retrying in the background.`,
+          ).pipe(Effect.ignore);
+        }
+        yield* settle;
+      } else if (now - firstFailure >= OWNER_ROUTE_GIVE_UP_MS) {
+        // The decision is saved first, so a restart finishes the notice instead of retrying.
+        yield* boardSql`
+          UPDATE ardud_kanban_owner_routes SET noticed = ${OWNER_ROUTE_GIVING_UP} WHERE id = ${id}
+        `.pipe(Effect.mapError(toKanbanError));
+        return yield* giveUpOwnerRoute(record);
+      }
+      yield* Effect.sleep("5 seconds");
+    }
+  });
+
+  /**
+   * Closes a route given up on. The notice is posted before the row closes, so
+   * a stop in between posts it again on replay rather than never.
+   */
+  const giveUpOwnerRoute = Effect.fn("KanbanService.giveUpOwnerRoute")(function* (
+    record: OwnerRouteRecord,
+  ) {
+    const discussionId = KanbanDiscussionId.make(record.discussion_id);
+    yield* ownerDeliveryNotice(
+      discussionId,
+      `Owner message delivery could not be confirmed (${record.route_key}) after 10 minutes of retries. Some of it may already have reached an agent, so check the discussion before posting it again.`,
+    );
+    const payload = ownerRoutePayload(record);
+    if (payload.kind === "post" && payload.writeTitle === true) {
+      // The post stays in the discussion, so its title is still written.
+      const message = yield* rawStore.message(discussionId, payload.seq);
+      if (message !== null && message.createdAt === payload.createdAt) {
+        yield* writeOwnerTitle(discussionId, message);
+      }
+    }
+    yield* markOwnerRouteDone(record.id, "undeliverable");
+  });
+
+  /**
+   * Discussions with a running drain. `dirty` asks it to look again before it
+   * stops; `waiters` are `await` callers released when it stops or a route it
+   * holds falls back to slow retries.
+   */
+  interface OwnerDrain {
+    dirty: boolean;
+    /** The route at its head has fallen back to slow retries. */
+    slow: boolean;
+    readonly waiters: Array<Deferred.Deferred<void>>;
+  }
+  const ownerRouteDrains = new Map<string, OwnerDrain>();
+  const releaseOwnerWaiters = (state: OwnerDrain) =>
+    Effect.suspend(() =>
+      Effect.forEach(state.waiters.splice(0), (waiter) => Deferred.succeed(waiter, undefined), {
+        discard: true,
+      }),
+    );
+  const runOwnerDrain = Effect.fn("KanbanService.drainOwnerRoutes", { root: true })(
+    function* (discussionId: string, state: OwnerDrain) {
+      yield* Effect.annotateCurrentSpan("discussion.id", discussionId);
+      while (true) {
+        state.dirty = false;
+        const rows = yield* boardSql<{ id: number }>`
+          SELECT id FROM ardud_kanban_owner_routes
+          WHERE discussion_id = ${discussionId} AND done_at IS NULL ORDER BY id
+        `.pipe(NodeSqliteClient.readOnly);
+        for (const row of rows) {
+          yield* deliverOwnerRoute(
+            row.id,
+            Effect.suspend(() => {
+              state.slow = true;
+              return releaseOwnerWaiters(state);
             }),
           );
-        }).pipe(Effect.mapError(toKanbanError));
+          state.slow = false;
+        }
+        // Checked and released in one step, so a route saved meanwhile is never missed.
+        const finished = yield* Effect.sync(() => {
+          if (state.dirty) return false;
+          ownerRouteDrains.delete(discussionId);
+          return true;
+        });
+        if (finished) return;
+      }
+    },
+    (effect, discussionId, state) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          // Pending rows stay for the sweep or the next restart.
+          Effect.logWarning("kanban owner routes stopped draining", { discussionId, cause }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (ownerRouteDrains.get(discussionId) === state) ownerRouteDrains.delete(discussionId);
+          }),
+        ),
+        Effect.ensuring(releaseOwnerWaiters(state)),
+      ),
+  );
+
+  /** Starts the discussion's drain, or asks the running one to look again. */
+  const triggerOwnerDrain = Effect.fn("KanbanService.triggerOwnerDrain")(
+    function* (discussionId: string) {
+      const waiter = yield* Deferred.make<void>();
+      const state = yield* Effect.sync(() => {
+        const active = ownerRouteDrains.get(discussionId);
+        if (active) {
+          active.dirty = true;
+          // Behind a route in slow retries, a caller waits for no attempt of its own.
+          if (!active.slow) active.waiters.push(waiter);
+          return active.slow ? "settled" : null;
+        }
+        const started: OwnerDrain = { dirty: false, slow: false, waiters: [waiter] };
+        ownerRouteDrains.set(discussionId, started);
+        return started;
+      });
+      if (state === "settled") yield* Deferred.succeed(waiter, undefined);
+      else if (state !== null)
+        yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
+      return waiter;
+    },
+  );
+
+  /**
+   * After an owner answer or post commits: in production the reply returns now
+   * and delivery follows in its own trace; `await` waits until the discussion's
+   * drain has run this route, or a route ahead of it fell back to slow retries.
+   */
+  const afterOwnerCommit = (discussionId: string): Effect.Effect<void> =>
+    triggerOwnerDrain(discussionId).pipe(
+      Effect.flatMap((waiter) =>
+        ownerRouteMode === "deferred" ? Effect.void : Deferred.await(waiter),
+      ),
+    );
+
+  /** Replays pending owner routes; `minAgeMs` leaves fresh ones to their own drain. */
+  const sweepOwnerRoutes = Effect.fn("KanbanService.sweepOwnerRoutes")(
+    function* (minAgeMs: number) {
+      const before = DateTime.formatIso(
+        DateTime.subtract(yield* DateTime.now, { milliseconds: minAgeMs }),
+      );
+      const pending = yield* boardSql<{ discussion_id: string }>`
+        SELECT DISTINCT discussion_id FROM ardud_kanban_owner_routes
+        WHERE done_at IS NULL AND created_at <= ${before}
+      `.pipe(NodeSqliteClient.readOnly);
+      for (const row of pending) yield* triggerOwnerDrain(row.discussion_id);
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban owner route sweep failed", { cause }),
+        ),
+      ),
+  );
 
   /** Internal posts, including asks that own a sequence, must not deduplicate. */
   const postUnlocked = Effect.fn("KanbanService.postUnlocked")(function* (
@@ -2783,6 +3374,8 @@ const make = Effect.gen(function* () {
     blocks: ReadonlyArray<KanbanBlock>,
     route = true,
     dedupe = false,
+    /** Commit an owner post with its routing obligation (see `saveOwnerRoute`). */
+    saveRoute = false,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
@@ -2830,9 +3423,24 @@ const make = Effect.gen(function* () {
       answers: [],
       createdAt: at,
     };
-    yield* store
-      .putMessage(message)
-      .pipe(Effect.onError(() => attachments.release(claim.claimedPaths)));
+    const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
+    const durablePost = saveRoute && author._tag === "owner";
+    // An owner post commits with its routing obligation: no drain ever sees one without the other.
+    yield* (
+      durablePost
+        ? boardSql.withTransaction(
+            saveOwnerRoute(discussion.boardId, discussionId, ownerPostKey(message), {
+              kind: "post",
+              seq: message.seq,
+              createdAt: message.createdAt,
+              writeTitle,
+            }).pipe(Effect.andThen(store.putMessage(message))),
+          )
+        : store.putMessage(message)
+    ).pipe(
+      Effect.mapError(toKanbanError),
+      Effect.onError(() => attachments.release(claim.claimedPaths)),
+    );
     // A board discussion with no evaluator yet belongs to the first one that
     // speaks in it. Card discussions keep starting their own, which knows the card.
     const owned =
@@ -2856,9 +3464,9 @@ const make = Effect.gen(function* () {
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(storedBlocks, attachments.pathOf);
-    const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
     if (!route) {
-      if (writeTitle) yield* forkDiscussionTitle(discussion.id, text);
+      // A durable owner post's title follows its delivery (see `runOwnerRoute`).
+      if (writeTitle && !durablePost) yield* forkDiscussionTitle(discussion.id, text);
       return message;
     }
     if (author._tag === "owner") {
@@ -7225,6 +7833,16 @@ const make = Effect.gen(function* () {
           previous.choice.length === choiceIds.length &&
           previous.choice.every((id, index) => id === choiceIds[index]);
         const at = same ? previous.at : yield* nowIso;
+        const note = `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")}`;
+        const answerText = words === "" ? null : words;
+        // The content is part of the key: a different answer in the same millisecond
+        // is a different delivery, never deduplicated as the earlier one.
+        const content = NodeCrypto.createHash("sha256")
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          .update(JSON.stringify([choiceIds, answerText]))
+          .digest("hex")
+          .slice(0, 16);
+        const routeKey = `owner-answer:${discussionId}:${seq}:${blockId}:${at}:${content}`;
         const next: KanbanMessage = {
           ...message,
           answers: [
@@ -7240,65 +7858,32 @@ const make = Effect.gen(function* () {
             },
           ],
         };
-        yield* store.putMessage(next);
+        // An owner answer commits with its routing obligation, in one transaction.
+        yield* durableOwnerRoutes && by._tag === "owner"
+          ? boardSql
+              .withTransaction(
+                saveOwnerRoute(discussion.boardId, discussionId, routeKey, {
+                  kind: "answer",
+                  seq,
+                  blockId,
+                  at,
+                  note,
+                  choice: choiceIds,
+                  text: answerText,
+                }).pipe(Effect.andThen(store.putMessage(next))),
+              )
+              .pipe(Effect.mapError(toKanbanError))
+          : store.putMessage(next);
         yield* publish(discussion.boardId, { _tag: "message", message: next });
-        return {
-          next,
-          note: `Owner answered "${block.question}" in discussion ${discussion.id} (message ${seq}): ${[...picked.map((option) => option.label), ...(words === "" ? [] : [`his own answer: "${words}"`])].join(", ")}`,
-        };
+        return { next, note, routeKey };
       }),
     ).pipe(
-      Effect.flatMap(({ next, note }) =>
+      Effect.flatMap(({ next, note, routeKey }) =>
         by._tag !== "owner"
           ? Effect.succeed(next)
-          : routeRetainingAskers(
-              discussionId,
-              `owner-answer:${discussionId}:${seq}:${blockId}:${next.answers.find((entry) => entry.blockId === blockId && actorKey(entry.by) === actorKey(by))!.at}`,
-              note,
-              Effect.gen(function* () {
-                const discussion = yield* discussionOf(discussionId);
-                const message = next;
-                const card = discussion.cardId === null ? null : yield* cardOf(discussion.cardId);
-                // A pick on an ask answers that ask alone.
-                const ask = card?.asks.find((entry) => entry.id === blockId && entry.seq === seq);
-                if (card !== null && ask !== undefined && ask.closedAt === null) {
-                  yield* routeToOwnerAgent(discussion, note, "owner", (open) => open.id === ask.id);
-                  return;
-                }
-                if (card !== null && ask !== undefined) {
-                  // Already answered or dropped: its asker hears the late pick, and nothing else closes.
-                  const by = ask.by;
-                  if (by._tag === "thread" && by.threadId === card.activeThreadId) {
-                    yield* deliver(
-                      discussion,
-                      by,
-                      roleName(card.activeRole ?? "work"),
-                      by.threadId,
-                      note,
-                    );
-                  } else if (by._tag === "evaluator" && (yield* liveEvaluator(by.threadId))) {
-                    yield* deliver(discussion, by, "Evaluator", by.threadId, note);
-                  } else {
-                    yield* toEvaluator(
-                      discussion,
-                      by._tag === "thread" ? Asks.passOnText(card, ask, note) : note,
-                    );
-                  }
-                  return;
-                }
-                // A pick on a card waiting on the owner answers it like a reply does.
-                const waiting = card !== null && card.stage === "needs_owner";
-                const author = message.author;
-                if (!waiting && (author._tag === "thread" || author._tag === "evaluator")) {
-                  if (yield* liveEvaluator(author.threadId)) {
-                    yield* deliver(discussion, author, message.authorName, author.threadId, note);
-                    return;
-                  }
-                }
-                yield* routeToOwnerAgent(discussion, note);
-              }),
-              blockId,
-            ).pipe(Effect.as(next)),
+          : durableOwnerRoutes
+            ? afterOwnerCommit(discussionId).pipe(Effect.as(next))
+            : ownerAnswerRoute(discussionId, seq, blockId, note, routeKey).pipe(Effect.as(next)),
       ),
     );
 
@@ -7504,6 +8089,30 @@ const make = Effect.gen(function* () {
         Effect.andThen(Deferred.succeed(startupReady, undefined)),
       ),
   );
+  // Owner routes left pending by a restart replay first; later sweeps pick up
+  // any whose drain failed, leaving fresh ones to the drain their reply started.
+  // Rows saved before a switch to `inline` still replay.
+  {
+    yield* Deferred.await(startupReady).pipe(
+      Effect.andThen(
+        Effect.gen(function* () {
+          const cutoff = DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { days: 7 }));
+          yield* boardSql`
+            DELETE FROM ardud_kanban_owner_routes WHERE done_at IS NOT NULL AND done_at < ${cutoff}
+          `.pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("kanban owner route prune failed", { cause }),
+            ),
+          );
+          yield* sweepOwnerRoutes(0);
+          // `await` delivers inside the reply, so only the restart replay is needed there.
+          if (ownerRouteMode !== "deferred") return;
+          return yield* sweepOwnerRoutes(30_000).pipe(Effect.delay("1 minute"), Effect.forever);
+        }),
+      ),
+      Effect.forkIn(scope),
+    );
+  }
 
   const runJob = (job: Job) =>
     read(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId)).pipe(
@@ -7596,14 +8205,28 @@ const make = Effect.gen(function* () {
         }),
       ),
     post: (discussionId, author, blocks) =>
-      guard(postUnlocked(discussionId, author, blocks, author._tag !== "owner", true)).pipe(
-        Effect.tap(routeOwnerPost),
-      ),
+      guard(
+        postUnlocked(
+          discussionId,
+          author,
+          blocks,
+          author._tag !== "owner",
+          true,
+          durableOwnerRoutes,
+        ),
+      ).pipe(Effect.tap(routeOwnerPost)),
     postToCard: (cardId, author, blocks) =>
       guard(
         Effect.gen(function* () {
           const discussion = yield* cardDiscussionUnlocked(cardId);
-          return yield* postUnlocked(discussion.id, author, blocks, author._tag !== "owner", true);
+          return yield* postUnlocked(
+            discussion.id,
+            author,
+            blocks,
+            author._tag !== "owner",
+            true,
+            durableOwnerRoutes,
+          );
         }),
       ).pipe(Effect.tap(routeOwnerPost)),
     attachmentPath: (attachment) => attachments.pathOf(attachment),

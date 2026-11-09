@@ -2,6 +2,12 @@
   "schemaVersion": 1,
   "source": "ARCH-PROGRAM-PLAN.md section 4 (2026-11-08)",
   "metrics": {
+    "messagePost.response.ms.p95": {
+      "max": 500
+    },
+    "answer.response.ms.p95": {
+      "max": 500
+    },
     "optimisticPaint.p95.ms": {
       "max": 16
     },

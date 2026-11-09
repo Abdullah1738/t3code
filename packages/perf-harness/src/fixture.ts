@@ -13,6 +13,8 @@ import * as Sqlite from "../../../apps/server/src/persistence/Sqlite.ts";
 import * as Projection from "../../../apps/server/src/orchestration-v2/ProjectionStore.ts";
 import { kanbanDDL } from "../../../apps/server/src/ardud/persistence/kanbanSchema.ts";
 import { hash, fileHash } from "./metrics.ts";
+import { repairOwnerAnswerHistory, seedOwnerAnswers } from "./ownerAnswerFixture.ts";
+import { ownerAnswerWorkload } from "./ownerAnswers.ts";
 
 export const scales = {
   correctness: { threads: 24, nodes: 240, agents: 0, boards: 2 },
@@ -156,6 +158,7 @@ export async function fixture(directory: string, scale: keyof typeof scales, see
   db.exec(
     "COMMIT; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_checkpoint(TRUNCATE)",
   );
+  repairOwnerAnswerHistory(db);
   db.close();
   const boards = new DatabaseSync(resolve(dir, "userdata/boards.sqlite"));
   for (const ddl of kanbanDDL) boards.exec(ddl);
@@ -254,9 +257,11 @@ export async function fixture(directory: string, scale: keyof typeof scales, see
     }
   }
   boards.exec("COMMIT");
+  seedOwnerAnswers(boards);
   boards.close();
   const manifest = {
-    version: 1,
+    version: 3,
+    ownerWrites: ownerAnswerWorkload,
     synthetic: true,
     seed,
     scale,

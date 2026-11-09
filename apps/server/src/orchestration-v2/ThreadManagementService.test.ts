@@ -790,9 +790,19 @@ const migrationHarness = (input: {
   readonly backgroundTask?: boolean;
 }) => {
   const calls: Array<OrchestrationV2ServerCommand> = [];
+  const transcriptCalls: Array<ThreadId> = [];
   let stored = input.stored ?? legacySelection;
   let failMessageOnce = input.failMessageOnce ?? false;
-  const layerTest = ThreadManagementService.layer.pipe(
+  const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
+    Layer.provide(
+      Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+        ensureTranscript: (threadId) =>
+          Effect.sync(() => {
+            transcriptCalls.push(threadId);
+            return { importedThreadCount: 0, importedMessageCount: 0 };
+          }),
+      }),
+    ),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
@@ -883,7 +893,7 @@ const migrationHarness = (input: {
     ),
     Layer.provideMerge(layerReceiptsTest),
   );
-  return { layerTest, calls, getStored: () => stored };
+  return { layerTest, calls, transcriptCalls, getStored: () => stored };
 };
 
 it.effect("migrates a dormant stored selection once before multiple inherited sends", () => {
@@ -1212,7 +1222,7 @@ it.effect("does not repeat a successful selection update if the send fails and i
 });
 
 it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
-  "leaves %s receipt replay and conflicts to the orchestrator without migrating",
+  "leaves %s receipt replay and conflicts to the orchestrator without hydrating or migrating",
   (kind) => {
     const harness = migrationHarness({
       mode: "apply",
@@ -1238,6 +1248,7 @@ it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
       const threads = yield* ThreadManagementService.ThreadManagementService;
       yield* threads.dispatch(message);
       expect(harness.calls).toEqual([message]);
+      expect(harness.transcriptCalls).toEqual([]);
       expect(harness.getStored()).toEqual(legacySelection);
     }).pipe(Effect.provide(harness.layerTest));
   },

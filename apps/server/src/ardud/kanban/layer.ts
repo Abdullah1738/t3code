@@ -1,5 +1,6 @@
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schedule from "effect/Schedule";
@@ -8,7 +9,11 @@ import * as Stream from "effect/Stream";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
-import { KanbanService, layer as KanbanServiceLayer } from "./engine/KanbanService.ts";
+import {
+  KanbanService,
+  OwnerRouteMode,
+  layer as KanbanServiceLayer,
+} from "./engine/KanbanService.ts";
 import { layer as KanbanModelsLayer } from "./engine/models.ts";
 import { KanbanScripts, layer as KanbanScriptsLayer } from "./engine/ScriptService.ts";
 import { layer as KanbanThreadsLayer } from "./engine/threads.ts";
@@ -30,6 +35,21 @@ export const boardEventRoute = (
     return "turnEnd";
   return THREAD_STATE_EVENTS.has(event.type) ? "threadChanged" : null;
 };
+
+/**
+ * Owner answers and posts reply once they and their routing are committed;
+ * delivery follows in the background. `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`
+ * restores delivery inside the reply.
+ */
+const ownerRouteModeLayer = Layer.effect(
+  OwnerRouteMode,
+  Effect.gen(function* () {
+    const inline = yield* Config.Boolean("ROBOB_KANBAN_INLINE_OWNER_ROUTES").pipe(
+      Config.withDefault(false),
+    );
+    return inline ? "inline" : "deferred";
+  }).pipe(Effect.orElseSucceed((): OwnerRouteMode => "deferred")),
+);
 
 /** Typing heartbeat, review completion and the dispatcher's safety net. */
 const TICK = "30 seconds";
@@ -91,7 +111,7 @@ export const ArdudKanbanLive = Layer.effectDiscard(
   }),
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
-  Layer.provideMerge(KanbanServiceLayer),
+  Layer.provideMerge(KanbanServiceLayer.pipe(Layer.provide(ownerRouteModeLayer))),
   Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),

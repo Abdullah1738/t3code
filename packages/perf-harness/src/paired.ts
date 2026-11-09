@@ -28,11 +28,16 @@ if (
   throw new Error("Output already contains a paired experiment; choose a new directory");
 const controllerHash = hash(
   await Promise.all(
-    ["driver.ts", "sampler.ts", "network.ts", "process.ts", "host.ts", "paired.ts"].map((name) =>
+    ["driver.ts", "sampler.ts", "network.ts", "process.ts", "host.ts", "paired.ts", "ownerAnswers.ts", "ownerMessagePosts.ts", "ownerAnswerFixture.ts", "compare.ts", "metrics.ts"].map((name) =>
       fileHash(new URL(name, import.meta.url).pathname),
     ),
   ),
 );
+const harnessHash = hash([controllerHash,
+  await fileHash(resolve("apps/server/scripts/acp-mock-agent.ts")),
+  await fileHash(resolve("apps/server/scripts/acpMockCancellationState.ts")),
+  await fileHash(new URL("../budgets.json", import.meta.url).pathname),
+]);
 const revisions = [
   { sha: baseSha, entry: baseEntry },
   { sha: candidateSha, entry: candidateEntry },
@@ -52,7 +57,7 @@ for (let pair = 0; pair < pairs; pair++) {
           pair,
           `${output}/attempts-${index}.jsonl`,
           revision.entry,
-          controllerHash,
+          harnessHash,
         );
         pending[index] = run;
         appendLedger(`${output}/commands.jsonl`, {
