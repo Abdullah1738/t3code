@@ -552,3 +552,20 @@ different card. NowNow 9546 paid orders refuse before cart changes pending
 verified Visa payment evidence; use the phone, not an unauthorized 2342 override.
 Visa refund code/title matching is synthetic-fixture coverage only. Unfamiliar
 refund wording remains fenced and must be inspected before extending the parser.
+
+### Food automatic app purchase (9 November 2026)
+
+A single owner-authorized Android purchase on Mashreq 9546 completed the existing
+Just Fit Food basket for AED172.80. The capture retained the selected items,
+empty modifier maps, zero wallet contribution, quiet preferences and driver note.
+The session explicitly required neither CVV nor separate completion. Placement
+returned `pending/not_synced` with a null payment client secret; exact tracking
+then progressed from processing to preparing. A Mashreq purchase notification
+independently corroborated the amount, card, merchant and time. The owner tracker
+and delivery card were registered and sent.
+
+No payment-intent completion, CVV submission or 3DS challenge occurred. This
+proves the app's automatic Visa purchase route, not the disabled CLI transport
+or NowNow's payment contract. `close-food-captured` still supports only the
+EmiratesNBD 2342 evidence format. Do not treat the new bank email as accepted
+input to that command or manufacture a completion request for this paid order.
