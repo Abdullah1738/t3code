@@ -128,7 +128,10 @@ export interface KanbanThreadsShape {
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
   readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
-  readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
+  readonly interrupt: (
+    threadId: ThreadId,
+    reason: string,
+  ) => Effect.Effect<void, KanbanThreadError>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -398,7 +401,9 @@ const make = Effect.gen(function* () {
         reason,
       });
     },
-    Effect.catchCause(() => Effect.void),
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "interrupt", detail: detailOf(error) }),
+    ),
   );
 
   return KanbanThreads.of({

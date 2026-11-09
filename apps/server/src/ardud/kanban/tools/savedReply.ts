@@ -10,6 +10,7 @@ export const TOOLS = new Set([
   "card_flag",
   "card_update",
   "card_edit",
+  "card_ask_change",
   "evaluator_start",
 ]);
 

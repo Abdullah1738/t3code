@@ -13716,3 +13716,211 @@ it.effect(
       );
     }),
 );
+
+it.effect("saved ask-drop returns success after notification races with a concurrent edit", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const held = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let armed = false;
+    const threadLayer = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            Effect.suspend(() => {
+              if (!armed) return real.send(input);
+              armed = false;
+              return Deferred.succeed(held, undefined).pipe(
+                Effect.andThen(Deferred.await(resume)),
+                Effect.andThen(real.send(input)),
+              );
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      yield* kanban.askOwner(card.id, { question: "Logo?", blocking: false }, worker, "cardThread");
+      armed = true;
+      const dropping = yield* kanban
+        .changeAsk(card.id, "q1", "drop", owner, "owner")
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(held);
+      yield* kanban.editCard(card.id, { description: "Concurrent edit" }, owner);
+      yield* Deferred.succeed(resume, undefined);
+      const result = yield* Fiber.join(dropping);
+      const saved = yield* kanban.card(card.id);
+      assert.isNotNull(saved.card.asks[0]!.closedAt);
+      assert.strictEqual(saved.card.description, "Concurrent edit");
+      assert.strictEqual(result._tag, "Success", JSON.stringify(result));
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(resume, undefined)),
+      Effect.provide(testLayer(threadLayer)),
+    );
+  }),
+);
+
+it.effect.each([
+  { timing: "initial", stop: "confirmed" },
+  { timing: "initial", stop: "failed" },
+  { timing: "reminder", stop: "confirmed" },
+  { timing: "reminder", stop: "failed" },
+] as const)(
+  "$timing handoff retry rotates a launch key only when cleanup stop is $stop",
+  ({ timing, stop }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const held = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const launched = new Map<string, ThreadId>();
+      const runnable = new Set<ThreadId>();
+      let armed = false;
+      const threadLayer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.suspend(() => {
+                const id = launched.get(input.key);
+                if (id) return Effect.succeed(id);
+                return real.launch(input).pipe(
+                  Effect.tap((created) => {
+                    launched.set(input.key, created);
+                    runnable.add(created);
+                    if (!armed) return Effect.void;
+                    armed = false;
+                    return Deferred.succeed(held, undefined).pipe(
+                      Effect.andThen(Deferred.await(resume)),
+                    );
+                  }),
+                );
+              }),
+            interrupt: (id, reason) =>
+              stop === "failed"
+                ? Effect.fail(
+                    new KanbanThreadError({ operation: "interrupt", detail: "stop failed" }),
+                  )
+                : real.interrupt(id, reason).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        runnable.delete(id);
+                      }),
+                    ),
+                  ),
+            send: (input) =>
+              real.send(input).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    runnable.add(input.threadId);
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            prompt: "Race",
+            title: "Race",
+            subtasks:
+              timing === "initial"
+                ? [
+                    { step: 1, owner: "work", text: "Build" },
+                    { step: 2, owner: "evaluator", text: "Merge" },
+                  ]
+                : [{ step: 1, owner: "evaluator", text: "Packet" }],
+          },
+          timing === "initial"
+            ? owner
+            : { _tag: "evaluator", threadId: ThreadId.make("packet-writer") },
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        if (timing === "reminder") {
+          yield* kanban.tick;
+          yield* TestClock.adjust("61 minutes");
+        }
+        armed = true;
+        const marking = yield* (
+          timing === "initial"
+            ? kanban.markSubtask(card.id, "s1", "done", null, owner, "work")
+            : kanban.tick
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(held);
+        yield* kanban.updateBoard(board.id, { name: "Concurrent board edit" });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(marking);
+        assert.lengthOf(fake.interrupted, stop === "confirmed" ? 1 : 0);
+        const original = [...launched.values()][0]!;
+        yield* kanban.tick;
+        const talk = yield* kanban.discussion(discussion.id);
+        assert.isNotNull(talk.evaluatorThreadId);
+        if (stop === "confirmed") assert.notStrictEqual(talk.evaluatorThreadId, original);
+        else assert.strictEqual(talk.evaluatorThreadId, original);
+        assert.strictEqual(launched.size, stop === "confirmed" ? 2 : 1);
+        assert.strictEqual(runnable.size, 1);
+        assert.isTrue(
+          runnable.has(talk.evaluatorThreadId!),
+          "the retry reused an interrupted launch without sending a new turn",
+        );
+        yield* kanban.tick;
+        assert.strictEqual(launched.size, stop === "confirmed" ? 2 : 1);
+        assert.strictEqual(
+          (yield* kanban.discussion(discussion.id)).evaluatorThreadId,
+          talk.evaluatorThreadId,
+        );
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+        Effect.provide(testLayer(threadLayer)),
+      );
+    }),
+);
+
+it.effect("ask-drop does not report saved success from a preliminary discussion association", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Blocking ask", title: "Blocking ask" },
+        owner,
+      );
+      const evaluator = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Context",
+      });
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Proceed?", blocking: true },
+        { _tag: "evaluator", threadId: evaluator },
+        "evaluator",
+      );
+      yield* store.putCard({ ...asked, discussionId: null });
+      fake.rejectSends.add(evaluator);
+      let reported = false;
+      const result = yield* kanban.changeAsk(card.id, "q1", "drop", owner, "owner").pipe(
+        Effect.provideService(SavedWrite.observer, () => {
+          reported = true;
+        }),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isFailure(result));
+      assert.isFalse(reported);
+      const saved = (yield* kanban.card(card.id)).card;
+      assert.isNotNull(saved.discussionId);
+      assert.isNull(saved.asks[0]!.closedAt);
+      assert.strictEqual(saved.stage, "needs_owner");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);

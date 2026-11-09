@@ -829,6 +829,13 @@ const evaluatorDelivered = Context.Reference<Set<ThreadId> | undefined>(
   },
 );
 
+const evaluatorLaunchKeys = Context.Reference<Map<string, string> | undefined>(
+  "KanbanEvaluatorLaunchKeys",
+  {
+    defaultValue: () => undefined,
+  },
+);
+
 const make = Effect.gen(function* () {
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
@@ -852,8 +859,17 @@ const make = Effect.gen(function* () {
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
-    function* (input: Parameters<typeof threadIo.launch>[0], id: ThreadId) {
+    function* (
+      input: Parameters<typeof threadIo.launch>[0],
+      id: ThreadId,
+      recovery?: { readonly keys: Map<string, string>; readonly delivered: Set<ThreadId> },
+    ) {
       yield* threadIo.interrupt(id, "Board state changed during launch");
+      if (recovery) {
+        // Replaying the launch command would return its canceled initial turn.
+        recovery.keys.set(input.key, uuid());
+        recovery.delivered.delete(id);
+      }
       const existing = yield* rawStore.threadLink(id);
       const [source, role] = input.key.split(":");
       const card =
@@ -880,7 +896,7 @@ const make = Effect.gen(function* () {
     },
     (effect) => effect.pipe(Effect.ignore),
   );
-  const threads: typeof threadIo = {
+  const threads = {
     view: (id) => locks.outside(threadIo.view(id), undefined, true),
     find: (id) => locks.outside(threadIo.find(id), undefined, true),
     model: (id) => locks.outside(threadIo.model(id), undefined, true),
@@ -888,20 +904,30 @@ const make = Effect.gen(function* () {
     findLastFailure: (id) => locks.outside(threadIo.findLastFailure(id), undefined, true),
     latestRun: (id) => locks.outside(threadIo.latestRun(id), undefined, true),
     compactRun: (id, run) => locks.outside(threadIo.compactRun(id, run)),
-    launch: (input) =>
-      locks
-        .outside(
-          threadIo.launch(input).pipe(
-            Effect.tap((id) =>
+    launch: Effect.fn("KanbanService.launch")(function* (input) {
+      const delivered = yield* evaluatorDelivered;
+      const keys = yield* evaluatorLaunchKeys;
+      const recovery = keys && delivered ? { keys, delivered } : undefined;
+      const cleanup = (id: ThreadId) => abandonLaunch(input, id, recovery);
+      const replacement = keys?.get(input.key);
+      const id = yield* locks.outside(
+        threadIo
+          .launch(
+            replacement ? { ...input, key: `${input.key}:replacement:${replacement}` } : input,
+          )
+          .pipe(
+            Effect.tap((launched) =>
               Effect.gen(function* () {
-                (yield* ownerDelivered)?.add(id);
-                (yield* evaluatorDelivered)?.add(id);
+                (yield* ownerDelivered)?.add(launched);
+                delivered?.add(launched);
               }),
             ),
           ),
-          (id) => abandonLaunch(input, id),
-        )
-        .pipe(Effect.tap((id) => locks.launched(id, abandonLaunch(input, id)))),
+        cleanup,
+      );
+      yield* locks.launched(id, cleanup(id));
+      return id;
+    }),
     send: (input) =>
       Effect.gen(function* () {
         const key = (yield* evaluatorNoteKey) ?? (yield* ownerDeliveryKey);
@@ -931,8 +957,9 @@ const make = Effect.gen(function* () {
         );
       }),
     setModel: (id, model) => locks.outside(threadIo.setModel(id, model)),
-    interrupt: (id, reason) => locks.outside(threadIo.interrupt(id, reason)),
-  };
+    interrupt: (id, reason) =>
+      locks.outside(threadIo.interrupt(id, reason)).pipe(Effect.ignoreCause),
+  } satisfies typeof threadIo;
   // Timeout forks a fiber; release the caller's permit before that fiber takes its own.
   const postCommit = <A, E, R>(effect: Effect.Effect<A, E, R>, fallback: A) =>
     locks.outside(SavedWrite.bestEffort(locks.fresh(locks.run(effect)), fallback));
@@ -1040,7 +1067,8 @@ const make = Effect.gen(function* () {
         readonly retry?: boolean;
         readonly handoff?: boolean;
         readonly deliveryKey?: string;
-        readonly delivered?: Set<ThreadId>;
+        readonly delivered: Set<ThreadId>;
+        readonly launchKeys: Map<string, string>;
       }
     >
   >(new Map());
@@ -2538,7 +2566,9 @@ const make = Effect.gen(function* () {
         const deliveryKey = `step:${after.id}:${key}:${uuid()}`;
         const activation = savedStepActivations.get(after);
         const delivered = new Set<ThreadId>();
+        const launchKeys = new Map<string, string>();
         return effect.pipe(
+          Effect.provideService(evaluatorLaunchKeys, launchKeys),
           Effect.provideService(evaluatorDelivered, delivered),
           Effect.provideService(evaluatorNoteKey, deliveryKey),
           Effect.onExit((exit) =>
@@ -2559,6 +2589,7 @@ const make = Effect.gen(function* () {
                         handoff: true,
                         deliveryKey,
                         delivered,
+                        launchKeys,
                       }),
                     );
                   yield* Effect.logWarning("kanban evaluator step note failed", {
@@ -4973,7 +5004,13 @@ const make = Effect.gen(function* () {
                 const wait = (yield* Ref.get(stepWaits)).get(card.id);
                 if (wait === undefined || wait.key !== key) {
                   yield* Ref.update(stepWaits, (all) =>
-                    new Map(all).set(card.id, { key, since: now, woken: false }),
+                    new Map(all).set(card.id, {
+                      key,
+                      since: now,
+                      woken: false,
+                      delivered: new Set<ThreadId>(),
+                      launchKeys: new Map<string, string>(),
+                    }),
                   );
                   continue;
                 }
@@ -5011,6 +5048,8 @@ const make = Effect.gen(function* () {
                       ...wait,
                       retry: false,
                       since: now,
+                      delivered: new Set<ThreadId>(),
+                      launchKeys: new Map<string, string>(),
                     }),
                   );
                 const minutes = Math.round((now - wait.since) / 60_000);
@@ -5029,10 +5068,8 @@ const make = Effect.gen(function* () {
                           true,
                         ).pipe(Effect.as(true)),
                   ),
-                  Effect.provideService(
-                    evaluatorDelivered,
-                    wait.retry ? wait.delivered : new Set<ThreadId>(),
-                  ),
+                  Effect.provideService(evaluatorLaunchKeys, wait.launchKeys),
+                  Effect.provideService(evaluatorDelivered, wait.delivered),
                   Effect.provideService(
                     evaluatorNoteKey,
                     wait.retry ? wait.deliveryKey : `step-reminder:${card.id}:${key}:${wait.since}`,
@@ -5431,13 +5468,17 @@ const make = Effect.gen(function* () {
     );
   const guard = <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, boardId?: string) =>
     Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect, cardId, boardId)));
-  const savedCardGuard = <E, R>(effect: Effect.Effect<KanbanCard, E, R>, cardId?: string) =>
+  const savedCardGuard = <E, R>(
+    effect: Effect.Effect<KanbanCard, E, R>,
+    cardId?: string,
+    isSaved: (card: KanbanCard) => boolean = () => true,
+  ) =>
     Effect.suspend(() => {
       let target = cardId;
       return SavedWrite.recover(guard(effect, cardId), (saved) => {
         if (saved.kind !== "card") return undefined;
         target ??= saved.card.id;
-        return saved.card.id === target ? saved.card : undefined;
+        return saved.card.id === target && isSaved(saved.card) ? saved.card : undefined;
       });
     });
   const read = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -6378,7 +6419,7 @@ const make = Effect.gen(function* () {
     );
 
   const changeAsk: KanbanServiceShape["changeAsk"] = (cardId, askId, action, actor, role) =>
-    guard(
+    savedCardGuard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
@@ -6416,6 +6457,17 @@ const make = Effect.gen(function* () {
         yield* evaluatorTurn(card, next, actor);
         return next;
       }),
+      undefined,
+      (saved) => {
+        if (saved.id !== cardId) return false;
+        const ask = saved.asks.find((entry) => entry.id === askId);
+        return (
+          ask !== undefined &&
+          (action === "drop"
+            ? ask.closedAt !== null
+            : ask.closedAt === null && ask.blocking && saved.stage === "needs_owner")
+        );
+      },
     );
 
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>

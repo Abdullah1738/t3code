@@ -444,3 +444,35 @@ it.effect("an accepted keyed wake replays once but a new key sends another messa
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(dependencies));
 });
+
+it.effect("interrupt exposes a failed stop so cleanup cannot treat it as confirmed", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("failed-stop");
+    const failure = new Orchestrator.OrchestratorProjectionError({
+      threadId,
+      cause: "stop failed",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.succeed({ projectId: ProjectId.make("project-1"), deletedAt: null } as never),
+      interruptThread: () => Effect.fail(failure),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const result = yield* Effect.result(threads.interrupt(threadId, "Abandoned launch"));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("interrupt");
+      }
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);

@@ -23,9 +23,11 @@ export const recover = Effect.fn("KanbanSavedWrite.recover")(function* <A, E, R>
   let saved: A | undefined;
   return yield* effect.pipe(
     Effect.provideService(observer, (receipt) => {
-      parent(receipt);
       const value = select(receipt);
-      if (value !== undefined) saved = value;
+      if (value !== undefined) {
+        saved = value;
+        parent(receipt);
+      }
     }),
     Effect.catchCause((cause) =>
       saved === undefined
