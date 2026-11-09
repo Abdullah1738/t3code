@@ -1,3 +1,4 @@
+import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -12328,7 +12329,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               threadId: commandThreadId(command),
               commandType: command.type,
               rejectedAt,
-              error: cause instanceof Error ? cause.message : String(cause),
+              error:
+                userFacingDispatchErrorMessage(cause) ??
+                (cause instanceof Error ? cause.message : String(cause)),
             })
             .pipe(
               Effect.mapError(

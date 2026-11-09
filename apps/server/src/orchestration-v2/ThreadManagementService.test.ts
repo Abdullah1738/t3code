@@ -311,20 +311,31 @@ const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettin
   );
 
 // ardud: an accepted steer/restart can be retried after the run or thread changes state.
-it.effect.each(["steer", "restart"] as const)(
-  "replays an accepted %s after its run completes or its thread is archived",
-  (mode) => {
+it.effect.each([
+  ["steer", true, true, true],
+  ["restart", true, true, true],
+  ["restart", false, true, true],
+  ["restart", false, false, true],
+  ["restart", false, true, false],
+] as const)(
+  "replays the capability-selected send after completion or archive (%j)",
+  ([mode, native, interrupt, queue]) => {
     const projectId = ProjectId.make(`project:receipt:${mode}`);
     const threadId = ThreadId.make(`thread:receipt:${mode}`);
     const runId = RunId.make(`run:receipt:${mode}`);
     const attemptId = RunAttemptId.make(`attempt:receipt:${mode}`);
     const messageId = MessageId.make(`message:receipt:${mode}`);
     const commandId = CommandId.make(`command:receipt:${mode}`);
+    const fallback = mode === "restart" && !native && interrupt && queue;
+    const providerThreadId = ProviderThreadId.make("provider-thread:restart");
+    const sessionId = ProviderSessionId.make("session:restart");
     const commands: OrchestrationV2ServerCommand[] = [];
+    const freshCommands: OrchestrationV2ServerCommand[] = [];
     const messages: Array<{ id: MessageId; runId: RunId }> = [];
     let completed = false;
     let archived = false;
     let accepted = false;
+    let partialRestart = false;
     const now = DateTime.makeUnsafe("2026-11-03T00:00:00.000Z");
     const layerTest = ThreadManagementService.layer.pipe(
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
@@ -347,6 +358,7 @@ it.effect.each(["steer", "restart"] as const)(
                       ordinal: 1,
                       status: completed ? "completed" : "running",
                       activeAttemptId: attemptId,
+                      providerThreadId,
                     },
                   ],
                   providerTurns: [
@@ -356,17 +368,31 @@ it.effect.each(["steer", "restart"] as const)(
                       status: "running",
                     },
                   ],
+                  providerThreads: [{ id: providerThreadId, providerSessionId: sessionId }],
+                  providerSessions: [
+                    {
+                      id: sessionId,
+                      capabilities: {
+                        turns: {
+                          supportsSteeringByInterruptRestart: native,
+                          supportsInterrupt: interrupt,
+                          supportsQueuedMessages: queue,
+                        },
+                      },
+                    },
+                  ],
                   messages,
                   turnItems: messages.map((message) => ({
                     type: "user_message",
                     messageId: message.id,
-                    inputIntent: "steering",
+                    inputIntent: fallback ? "queued_turn" : "steer",
                   })),
                 }) as unknown as OrchestrationV2ThreadProjection,
             ),
           dispatch: (command) =>
             Effect.sync(() => {
               commands.push(command);
+              if (!accepted) freshCommands.push(command);
               if (!accepted && command.type === "message.dispatch") {
                 accepted = true;
                 messages.push({ id: command.messageId, runId });
@@ -379,17 +405,27 @@ it.effect.each(["steer", "restart"] as const)(
         Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
           getByCommandId: (id) =>
             Effect.succeed(
-              accepted && id === commandId
+              partialRestart && id === `${commandId}:restart-interrupt`
                 ? Option.some({
-                    commandId,
+                    commandId: id,
                     threadId,
-                    commandType: "message.dispatch",
+                    commandType: "run.interrupt",
                     status: "accepted",
                     acceptedAt: now,
                     resultSequence: 1,
                     error: null,
                   })
-                : Option.none(),
+                : accepted && id === commandId
+                  ? Option.some({
+                      commandId,
+                      threadId,
+                      commandType: "message.dispatch",
+                      status: "accepted",
+                      acceptedAt: now,
+                      resultSequence: 1,
+                      error: null,
+                    })
+                  : Option.none(),
             ),
         }),
       ),
@@ -410,11 +446,33 @@ it.effect.each(["steer", "restart"] as const)(
         creationSource: "web" as const,
       };
       const first = yield* service.sendToThread(input);
+      expect(first.delivery).toBe(mode === "restart" ? "restarted" : "steered");
+      expect(freshCommands.map((command) => command.type)).toEqual(
+        fallback ? ["run.interrupt", "message.dispatch"] : ["message.dispatch"],
+      );
+      if (fallback)
+        expect(freshCommands[0]).toMatchObject({
+          commandId: CommandId.make(`${commandId}:restart-interrupt`),
+          threadId,
+          runId,
+          fenced: true,
+          expectedAttemptId: attemptId,
+        });
+      expect(freshCommands.at(-1)).toMatchObject({
+        commandId,
+        messageId,
+        dispatchMode: fallback
+          ? { type: "queue_after_active" }
+          : { type: mode === "restart" ? "restart_active" : "steer_active", targetRunId: runId },
+      });
+      yield* service.sendToThread(input);
+      expect(freshCommands).toHaveLength(fallback ? 2 : 1);
       completed = true;
       const retry = yield* service.sendToThread(input);
       expect(retry.message).toEqual(first.message);
       expect(messages).toHaveLength(1);
       expect(retry.run.id).toBe(runId);
+      expect(retry.delivery).toBe(first.delivery);
       expect(commands.at(-1)).toMatchObject({
         commandId,
         dispatchMode: { type: "start_immediately" },
@@ -433,6 +491,23 @@ it.effect.each(["steer", "restart"] as const)(
       expect(archivedFresh).toBeInstanceOf(
         ThreadManagementService.ThreadManagementThreadArchivedError,
       );
+      if (fallback) {
+        // The interrupt committed, but the message did not, and the run has since settled.
+        archived = false;
+        accepted = false;
+        messages.length = 0;
+        partialRestart = true;
+        const start = commands.length;
+        expect((yield* service.sendToThread(input)).delivery).toBe("restarted");
+        expect(commands.slice(start)).toMatchObject([
+          {
+            type: "message.dispatch",
+            commandId,
+            messageId,
+            dispatchMode: { type: "queue_after_active" },
+          },
+        ]);
+      }
     }).pipe(Effect.provide(layerTest));
   },
 );

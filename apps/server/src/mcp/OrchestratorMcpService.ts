@@ -258,7 +258,10 @@ function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return (
+    userFacingDispatchErrorMessage(error) ??
+    (error instanceof Error ? error.message : String(error))
+  );
 }
 
 function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): OrchestratorMcpScheduledTask {
@@ -3028,7 +3031,7 @@ const make = Effect.gen(function* () {
               ? threadManagementFailure(error)
               : failure(
                   "orchestration_error",
-                  `Unable to send to thread ${input.threadId}: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                  `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
                 ),
           ),
         );
