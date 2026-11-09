@@ -85,6 +85,7 @@ export const layer = HttpApiBuilder.group(
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
+            omitIdleSubagents: true,
             ...(paged ? { limit: 501 } : {}),
             ...(after === undefined ? {} : { afterThreadId: after }),
           }),

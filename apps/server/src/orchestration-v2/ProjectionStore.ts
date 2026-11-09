@@ -391,6 +391,15 @@ export interface ShellSnapshotOptions {
   readonly projectId?: ProjectId;
   readonly unsettledOnly?: boolean;
   readonly pullRequestCandidatesOnly?: boolean;
+  /**
+   * Client shells (sidebar, notifications) never list subagent threads, and archiving a
+   * parent leaves its subagents unarchived, so they pile up as most of the active rows.
+   * Keep only live subagents (an active run or a pending request) and the subagent
+   * ancestors of live threads, which carry a nested request up to its root row. Every other
+   * subagent stays reachable by id (thread detail, relationship panel from the parent's
+   * projection) and returns through live shell deltas when it next changes.
+   */
+  readonly omitIdleSubagents?: boolean;
 }
 
 export interface ProjectionStoreV2Shape {
@@ -1588,6 +1597,30 @@ function secretRequestAsPendingInput(
     createdAt: item.startedAt ?? item.updatedAt,
     blocking: true,
   };
+}
+
+/** Memory-store mirror of the SQL `omitIdleSubagents` filter (see ShellSnapshotOptions). */
+export function omitIdleSubagentShells<
+  T extends Pick<
+    OrchestrationV2ThreadShell,
+    "id" | "lineage" | "activityRunStatus" | "pendingRuntimeRequest"
+  >,
+>(shells: ReadonlyArray<T>): ReadonlyArray<T> {
+  const byId = new Map(shells.map((shell) => [shell.id, shell] as const));
+  const keep = new Set<ThreadId>();
+  for (const shell of shells) {
+    if (shell.activityRunStatus == null && shell.pendingRuntimeRequest == null) continue;
+    let current: T | undefined = shell;
+    while (current !== undefined && !keep.has(current.id)) {
+      keep.add(current.id);
+      if (current.lineage.relationshipToParent !== "subagent") break;
+      const parentId = current.lineage.parentThreadId;
+      current = parentId === null ? undefined : byId.get(parentId);
+    }
+  }
+  return shells.filter(
+    (shell) => shell.lineage.relationshipToParent !== "subagent" || keep.has(shell.id),
+  );
 }
 
 export function threadShellFromProjection(
@@ -5862,6 +5895,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         projectId,
         unsettledOnly = false,
         pullRequestCandidatesOnly = false,
+        omitIdleSubagents = false,
         afterThreadId,
         limit,
       }: ShellSnapshotOptions = {},
@@ -5872,7 +5906,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             -- A page (limit), a single thread or a filtered snapshot (the PR sync's
             -- unsettled candidates, one project) must not copy the whole runs table:
             -- clients fetch ~60 pages at 8s each, and the PR sync stalled every 30s.
-            WITH shell_runs AS ${
+            WITH${omitIdleSubagents ? sql` RECURSIVE` : sql``} shell_runs AS ${
               threadId === undefined &&
               limit === undefined &&
               projectId === undefined &&
@@ -5883,7 +5917,25 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             } (
               SELECT * FROM orchestration_v2_projection_runs
               ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}
-            )
+            )${
+              omitIdleSubagents
+                ? sql`,
+            -- Live threads (partial recovery indexes) plus their subagent ancestors.
+            live_lineage(thread_id) AS (
+              SELECT thread_id FROM orchestration_v2_projection_runs
+              WHERE status IN ('preparing', 'starting', 'running', 'waiting')
+              UNION
+              SELECT thread_id FROM orchestration_v2_projection_runtime_requests
+              WHERE status = 'pending'
+              UNION
+              SELECT json_extract(child.payload_json, '$.lineage.parentThreadId')
+              FROM live_lineage live
+              JOIN orchestration_v2_projection_threads child ON child.thread_id = live.thread_id
+              WHERE json_extract(child.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+                AND json_extract(child.payload_json, '$.lineage.parentThreadId') IS NOT NULL
+            )`
+                : sql``
+            }
             SELECT
               t.thread_id,
               t.payload_json,
@@ -6063,6 +6115,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }${
               pullRequestCandidatesOnly
                 ? sql` AND (json_extract(t.payload_json, '$.branch') IS NOT NULL OR json_extract(t.payload_json, '$.branchPullRequest') IS NOT NULL)`
+                : sql``
+            }${
+              omitIdleSubagents
+                ? sql` AND (json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent' OR t.thread_id IN (SELECT thread_id FROM live_lineage))`
                 : sql``
             }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
@@ -6763,7 +6819,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           (threadId) =>
             service.getThreadProjection(threadId).pipe(Effect.map(threadShellFromProjection)),
         );
-        const visible = shells.filter((thread) => thread.deletedAt === null);
+        const undeleted = shells.filter((thread) => thread.deletedAt === null);
+        const visible = options?.omitIdleSubagents
+          ? omitIdleSubagentShells(undeleted)
+          : undeleted;
         return {
           schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
           snapshotSequence: yield* Ref.get(sequence),

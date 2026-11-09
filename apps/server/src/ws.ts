@@ -1005,6 +1005,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
+            omitIdleSubagents: true,
             ...(input.acceptShellPages === true ? { limit: 501 } : {}),
             ...(after === undefined ? {} : { afterThreadId: after }),
           }),

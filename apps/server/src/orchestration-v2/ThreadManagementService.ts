@@ -387,6 +387,7 @@ export interface ThreadManagementServiceShape {
     readonly location?: "active" | "archive";
     readonly afterThreadId?: string;
     readonly limit?: number;
+    readonly omitIdleSubagents?: boolean;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error

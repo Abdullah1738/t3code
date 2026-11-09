@@ -134,6 +134,15 @@ it.effect(
           run: projection.getShellSnapshot({ location: "active", limit: 500 }),
         },
         {
+          // The client shell route (HTTP + WS pages) with idle subagents omitted.
+          route: "shell.client-selection",
+          run: projection.getShellSnapshot({
+            location: "active",
+            limit: 500,
+            omitIdleSubagents: true,
+          }),
+        },
+        {
           route: "board.thread-state",
           run: projection.getThreadShell(ThreadId.make("synthetic-thread")),
         },
@@ -181,6 +190,7 @@ it.effect(
           if (
             ![
               "shell.selection",
+              "shell.client-selection",
               "board.thread-state",
               "boards.tallies",
               "discussion.messages",
