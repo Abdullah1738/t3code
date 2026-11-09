@@ -284,7 +284,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.resolve_identity(unknown, "claude")["robobThreadId"], "later-thread")
         for file in (self.root / "hook-state/identity").glob("*.json"):
             cached = json.loads(file.read_text())
-            cached["at"] = time.time() - 61
+            cached["at"] = time.time() - 1801
             file.write_text(json.dumps(cached))
         count = len(self.state.calls)
         engine.resolve_identity(one, "claude")
@@ -387,7 +387,7 @@ class EngineTests(unittest.TestCase):
         for resolution in ("none", "pending", "ambiguous", "unavailable"):
             with self.subTest(resolution=resolution):
                 engine.decide(self.identity_probe(), "claude")
-                self.age_identity_cache(61)
+                self.age_identity_cache(1801)
                 with patch.object(engine, "_get", return_value={"identity": {"resolution": resolution}}):
                     result = engine.decide(self.identity_probe(), "claude")
                     self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", result["context"].get("updatedInput", {}).get("command", ""))
@@ -405,7 +405,7 @@ class EngineTests(unittest.TestCase):
 
     def test_claude_bad_response_or_auth_error_does_not_use_old_cache(self):
         engine.decide(self.identity_probe(), "claude")
-        self.age_identity_cache(61)
+        self.age_identity_cache(1801)
         for error in (ValueError("bad response"), PermissionError("private credential"),
                       engine.urllib.error.HTTPError("http://test", 403, "forbidden", {}, None)):
             with self.subTest(error=type(error).__name__), patch.object(engine, "_get", side_effect=error):
@@ -464,6 +464,23 @@ class EngineTests(unittest.TestCase):
             result = engine.decide(self.identity_probe(), "claude")
             self.assertEqual(get.call_count, 2)
             self.assertEqual(self.token_identity(result)["robobThreadId"], "child")
+
+    def test_binding_cache_avoids_control_for_30_minutes_without_stale_model(self):
+        for harness in ("claude", "codex"):
+            event = self.identity_probe()
+            if harness == "codex":
+                self.add_identity("agent-child", "codex-thread", model="gpt-6-astra")
+            engine.resolve_identity(event, harness)
+            self.age_identity_cache(1799)
+            with patch.object(engine, "_get", side_effect=AssertionError("control called")):
+                result = engine.resolve_identity(event, harness)
+                self.assertEqual(result["resolution"], "resolved")
+                self.assertNotIn("model", result)
+
+    def test_codex_identity_has_longer_budget_without_changing_other_calls(self):
+        with patch.object(engine, "_get", return_value={"identity": {"resolution": "unavailable"}}) as get:
+            engine.resolve_identity(self.identity_probe(), "codex")
+            self.assertEqual(get.call_args.kwargs["timeout"], 3.0)
 
     def test_codex_child_uses_agent_id_as_concrete_native(self):
         self.add_identity("codex-child", "child", parent="parent", model="gpt-6-astra")

@@ -109,6 +109,7 @@ def _log(**record):
             "ms": record.get("ms") if type(record.get("ms")) in (int, float) else 0,
             "error": _log_enum(record.get("error"), _LOG_ERRORS),
             "identity_source": _log_enum(record.get("identity_source"), {"cache", "control"}),
+            "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -434,9 +435,10 @@ def _command_with_context(command, identity, pin):
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
+_IDENTITY_BINDING_TTL = 30 * 60
 _CLAUDE_IDENTITY_TTL = 12 * 60 * 60
-_CLAUDE_IDENTITY_BUDGET = 4.5
-_CLAUDE_IDENTITY_CALL_TIMEOUT = 3.0
+_IDENTITY_LOOKUP_BUDGET = 4.5
+_IDENTITY_CALL_TIMEOUT = 3.0
 
 
 def _identity_transport_error(error):
@@ -446,21 +448,19 @@ def _identity_transport_error(error):
 
 
 def _lookup_identity(path, harness):
-    if harness != "claude":
-        return _get(path)
     # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
-    deadline = time.monotonic() + _CLAUDE_IDENTITY_BUDGET
+    deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
     for attempt in range(2):
         try:
-            return _get(path, deadline=min(deadline, time.monotonic() + _CLAUDE_IDENTITY_CALL_TIMEOUT),
-                        timeout=_CLAUDE_IDENTITY_CALL_TIMEOUT)
+            return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
+                        timeout=_IDENTITY_CALL_TIMEOUT)
         except Exception as error:
             if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
                 raise
 
 
 def resolve_identity(event, harness, *, fresh=False):
-    """Resolve exact hook identity; refresh bindings after 60 seconds.
+    """Resolve exact hook identity; cache binding-only lookups for 30 minutes.
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
@@ -483,8 +483,12 @@ def resolve_identity(event, harness, *, fresh=False):
                        bool(identity.get("robobThreadId")) and identity.get("nativeSessionId") == native and
                        identity.get("nativeAgentId") == agent and identity.get("driver") in (None, driver) and
                        (not instance or identity.get("providerInstanceId") in (None, instance)))
-        if not fresh and 0 <= age < 60 and valid_cache:
-            return {**identity, "identity_source": "cache"}
+        if not fresh and 0 <= age < _IDENTITY_BINDING_TTL and valid_cache:
+            binding = {**identity, "identity_source": "cache"}
+            # Binding stability does not imply model-policy stability.
+            if age >= 60:
+                binding.pop("model", None)
+            return binding
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
@@ -1116,7 +1120,7 @@ def decide(event, harness):
             # The live DB rule is independent of native identity and offbox/coord
             # availability, so a service outage cannot disable this local check.
             try:
-                hit = statev2_guard.classify(command, command_cwd)
+                hit, cause = statev2_guard.classify_detail(command, command_cwd)
             except Exception as error:
                 error_type = type(error).__name__
                 result = {"decision": "deny", "reason": "Live database guard unavailable; this shell command was NOT run. Retry after the guard is available; do not bypass it.",
@@ -1124,7 +1128,13 @@ def decide(event, harness):
                 return result
             if hit:
                 reason = statev2_guard.UNRESOLVED_REASON if hit == "live-database-script-unresolved" else statev2_guard.REASON
-                result = {"decision": "deny", "reason": reason, "context": {"rule": hit}}
+                context = {"rule": hit}
+                if hit == "live-database-script-unresolved" and cause:
+                    reason = ("statev2 guard: this command was NOT run. Could not check an explicit script invocation: "
+                              f"{cause}. Resolved workdir: {command_cwd}. Run the script by a literal path, write scripts "
+                              "with apply_patch rather than a heredoc in the same command, or split the steps; do not bypass the guard.")
+                    context["cause"] = cause
+                result = {"decision": "deny", "reason": reason, "context": context}
                 return result
         native, _, _ = _native(event, harness)
         if native:
@@ -1209,7 +1219,7 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-             identity_source=identity.get("identity_source"),
+             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
              command=command, ms=round((time.monotonic() - start) * 1000, 3), error=error_type)
     return result
 
