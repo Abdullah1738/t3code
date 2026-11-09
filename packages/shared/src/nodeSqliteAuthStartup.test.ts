@@ -43,37 +43,38 @@ vi.mock("./nodeSqliteReaderProcess.ts", () => ({
   },
 }));
 
-for (const cancel of [false, true]) {
-  it.live(`reaps ${cancel ? "cancelled" : "failed"} startup before retry`, () =>
-    Effect.gen(function* () {
-      const acquire = yield* makeAuthReader({ filename: "unused-synthetic.sqlite" });
-      const created = Promise.withResolvers<void>();
-      transport.next = () => created.resolve();
-      const first = yield* acquire.pipe(Effect.forkChild);
-      yield* Effect.promise(() => created.promise);
-      const runtime = transport.runtimes.at(-1)!;
-      yield* Effect.promise(() => runtime.listening);
-      const done = yield* (
-        cancel ? Effect.asVoid(Fiber.interrupt(first)) : Effect.asVoid(Fiber.join(first))
-      ).pipe(Effect.forkChild);
-      if (!cancel) runtime.emit({ type: "unavailable", message: "temporary open failure" });
-      yield* Effect.promise(() => runtime.terminating);
-      yield* Effect.yieldNow;
-      assert.isUndefined(done.pollUnsafe());
-      runtime.finish();
-      yield* Fiber.join(done);
-      const retryCreated = Promise.withResolvers<void>();
-      transport.next = () => retryCreated.resolve();
-      const retry = yield* acquire.pipe(Effect.forkChild);
-      yield* Effect.promise(() => retryCreated.promise);
-      const next = transport.runtimes.at(-1)!;
-      yield* Effect.promise(() => next.listening);
-      next.emit({ type: "ready" });
-      assert.isDefined(yield* Fiber.join(retry));
-      next.finish();
-    }).pipe(Effect.scoped),
-  );
-}
+it.live.each([
+  { cancel: false, label: "failed" },
+  { cancel: true, label: "cancelled" },
+])("reaps $label startup before retry", ({ cancel }) =>
+  Effect.gen(function* () {
+    const acquire = yield* makeAuthReader({ filename: "unused-synthetic.sqlite" });
+    const created = Promise.withResolvers<void>();
+    transport.next = () => created.resolve();
+    const first = yield* acquire.pipe(Effect.forkChild);
+    yield* Effect.promise(() => created.promise);
+    const runtime = transport.runtimes.at(-1)!;
+    yield* Effect.promise(() => runtime.listening);
+    const done = yield* (
+      cancel ? Effect.asVoid(Fiber.interrupt(first)) : Effect.asVoid(Fiber.join(first))
+    ).pipe(Effect.forkChild);
+    if (!cancel) runtime.emit({ type: "unavailable", message: "temporary open failure" });
+    yield* Effect.promise(() => runtime.terminating);
+    yield* Effect.yieldNow;
+    assert.isUndefined(done.pollUnsafe());
+    runtime.finish();
+    yield* Fiber.join(done);
+    const retryCreated = Promise.withResolvers<void>();
+    transport.next = () => retryCreated.resolve();
+    const retry = yield* acquire.pipe(Effect.forkChild);
+    yield* Effect.promise(() => retryCreated.promise);
+    const next = transport.runtimes.at(-1)!;
+    yield* Effect.promise(() => next.listening);
+    next.emit({ type: "ready" });
+    assert.isDefined(yield* Fiber.join(retry));
+    next.finish();
+  }).pipe(Effect.scoped),
+);
 
 it.live("does not retire a ready process when another acquisition is cancelled", () =>
   Effect.gen(function* () {

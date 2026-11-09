@@ -49,6 +49,7 @@ const decodeTranscript = Schema.decodeUnknownEffect(
   Schema.toCodecJson(OrchestrationV2ThreadTranscript),
 );
 
+const decodeTurnItem = Schema.decodeUnknownEffect(OrchestrationV2TurnItem);
 const now = DateTime.makeUnsafe("2026-09-29T00:00:00.000Z");
 const environmentId = EnvironmentId.make("source-بيئة");
 const output = "Full tool output. ".repeat(4_000);
@@ -297,7 +298,7 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       }
     }
 
-    const huge = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+    const huge = yield* decodeTurnItem({
       ...items[0],
       id: "huge-assistant",
       ordinal: 201,
@@ -306,13 +307,13 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
       text: "x".repeat(18 * 1024 * 1024),
       streaming: false,
     });
-    const newest = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+    const newest = yield* decodeTurnItem({
       ...huge,
       id: "newest-assistant",
       ordinal: 202,
       text: "newest",
     });
-    const collection = yield* Schema.decodeUnknownEffect(OrchestrationV2TurnItem)({
+    const collection = yield* decodeTurnItem({
       ...items[0],
       id: "huge-search",
       ordinal: 200,

@@ -48,7 +48,9 @@ it.live("awaits retirement when stop precedes autocommit cancellation", () =>
       const sql = yield* SqlClient.SqlClient;
       yield* sql`PRAGMA journal_mode=WAL`;
       const submitted = yield* Deferred.make<void>();
-      transport.control.submitted = () => Effect.runSync(Deferred.succeed(submitted, undefined));
+      transport.control.submitted = () => {
+        Deferred.doneUnsafe(submitted, Effect.void);
+      };
       const read = yield* sql`SELECT 1`.pipe(Sqlite.authReadOnly, Effect.forkChild);
       yield* Deferred.await(submitted);
       // Error retirement clears pending immediately, but physical exit is delayed.
@@ -61,7 +63,11 @@ it.live("awaits retirement when stop precedes autocommit cancellation", () =>
     }).pipe(
       Effect.ensuring(Effect.sync(transport.control.finish)),
       Effect.provide(
-        Sqlite.layer({ filename: `${dir}/fixture.sqlite`, readerWorker: true, authReaderProcess: true }),
+        Sqlite.layer({
+          filename: `${dir}/fixture.sqlite`,
+          readerWorker: true,
+          authReaderProcess: true,
+        }),
       ),
     );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

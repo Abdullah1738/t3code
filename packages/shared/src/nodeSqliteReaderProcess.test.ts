@@ -1,12 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off -- fake child-process lifecycle probes avoid signalling real processes.
-import { EventEmitter } from "node:events";
-import type { spawn } from "node:child_process";
+import * as NodeEvents from "node:events";
+import type * as NodeChildProcess from "node:child_process";
 import { expect, it, vi } from "vite-plus/test";
 import { startReaderProcess } from "./nodeSqliteReaderProcess.ts";
 
 it("never signals a failed spawn before its asynchronous error arrives", async () => {
   const kill = vi.fn();
-  const child = Object.assign(new EventEmitter(), {
+  const child = Object.assign(new NodeEvents.EventEmitter(), {
     pid: undefined,
     connected: false,
     send: () => true,
@@ -14,7 +14,11 @@ it("never signals a failed spawn before its asynchronous error arrives", async (
     ref: () => {},
     unref: () => {},
   });
-  const runtime = startReaderProcess("", {}, (() => child) as unknown as typeof spawn);
+  const runtime = startReaderProcess(
+    "",
+    {},
+    (() => child) as unknown as typeof NodeChildProcess.spawn,
+  );
   const stopped = runtime.terminate();
   expect(kill).not.toHaveBeenCalled();
   child.emit("error", Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
@@ -25,7 +29,7 @@ it("never signals a failed spawn before its asynchronous error arrives", async (
 
 it("keeps a spawned process owned until exit even after an IPC error", async () => {
   const kill = vi.fn();
-  const child = Object.assign(new EventEmitter(), {
+  const child = Object.assign(new NodeEvents.EventEmitter(), {
     pid: 42,
     connected: true,
     send: () => true,
@@ -33,7 +37,11 @@ it("keeps a spawned process owned until exit even after an IPC error", async () 
     ref: () => {},
     unref: () => {},
   });
-  const runtime = startReaderProcess("", {}, (() => child) as unknown as typeof spawn);
+  const runtime = startReaderProcess(
+    "",
+    {},
+    (() => child) as unknown as typeof NodeChildProcess.spawn,
+  );
   child.emit("error", new Error("IPC failed"));
   let done = false;
   void runtime.completion!.then(() => {

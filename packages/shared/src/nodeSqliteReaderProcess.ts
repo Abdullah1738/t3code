@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off -- process boundary must interrupt native SQLite, including a blocked C call.
-import { spawn, type Serializable } from "node:child_process";
-import { isSea } from "node:sea";
-import { createRequire } from "node:module";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeSea from "node:sea";
+import * as NodeModule from "node:module";
 
 export interface ReaderRuntime {
   readonly completion?: Promise<number>;
@@ -19,7 +19,7 @@ export interface ReaderRuntime {
 export function startReaderProcess(
   source: string,
   data: Record<string, unknown>,
-  spawnProcess: typeof spawn = spawn,
+  spawnProcess: typeof NodeChildProcess.spawn = NodeChildProcess.spawn,
 ): ReaderRuntime {
   const bootstrap =
     source.replace(
@@ -52,7 +52,7 @@ const parentPort = {
   }),
 };`,
     ) + "\n}";
-  const sea = isSea();
+  const sea = NodeSea.isSea();
   const child = spawnProcess(process.execPath, sea ? ["__sqlite-reader"] : ["-e", bootstrap], {
     stdio: ["ignore", "ignore", "ignore", "ipc"],
     serialization: "advanced",
@@ -77,7 +77,7 @@ const parentPort = {
     completion: exit,
     on: (event, listener) => child.on(event, listener),
     postMessage: (value) => {
-      if (child.connected) child.send(value as Serializable);
+      if (child.connected) child.send(value as NodeChildProcess.Serializable);
     },
     ref: () => {
       child.ref();
@@ -99,7 +99,7 @@ export function runReaderProcess(): void {
   if (typeof process.send !== "function") throw new Error("Reader requires a private IPC channel");
   process.once("message", (input: { bootstrap: string; data: unknown }) => {
     const run = new Function("require", input.bootstrap);
-    run(createRequire(process.execPath));
+    run(NodeModule.createRequire(process.execPath));
     process.emit("message", input.data, undefined);
   });
 }

@@ -308,54 +308,53 @@ it.effect("pooled readers send only result messages for SQL requests", () => {
   ).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
 });
 
-for (const cancel of [true, false]) {
-  it.live(
-    `waits for physical exit after idle auth transaction ${cancel ? "cancellation" : "expiry"}`,
-    () => {
-      const terminating = Promise.withResolvers<void>();
-      const releaseExit = Promise.withResolvers<void>();
-      const start = ReaderProcess.startReaderProcess;
-      const spy = vi.spyOn(ReaderProcess, "startReaderProcess").mockImplementation((...args) => {
-        const runtime = start(...args);
-        const terminate = runtime.terminate;
-        runtime.terminate = async () => {
-          terminating.resolve();
-          const code = await terminate();
-          await releaseExit.promise;
-          return code;
-        };
-        return runtime;
-      });
-      return withLaneClient((sql) =>
-        Effect.gen(function* () {
-          const ready = yield* Deferred.make<void>();
-          const read = yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                yield* sql`SELECT * FROM sessions`;
-                yield* Deferred.succeed(ready, undefined);
-                return yield* Effect.never;
-              }),
-            )
-            .pipe(SqliteClient.authReadOnly, Effect.exit, Effect.forkChild);
-          yield* Deferred.await(ready);
-          const done = yield* (
-            cancel ? Effect.asVoid(Fiber.interrupt(read)) : Effect.asVoid(Fiber.join(read))
-          ).pipe(Effect.forkChild);
-          yield* Effect.promise(() => terminating.promise);
-          yield* Effect.yieldNow;
-          assert.isUndefined(done.pollUnsafe());
+it.live.each(["cancellation", "expiry"] as const)(
+  "waits for physical exit after idle auth transaction %s",
+  (mode) => {
+    const cancel = mode === "cancellation";
+    const terminating = Promise.withResolvers<void>();
+    const releaseExit = Promise.withResolvers<void>();
+    const start = ReaderProcess.startReaderProcess;
+    const spy = vi.spyOn(ReaderProcess, "startReaderProcess").mockImplementation((...args) => {
+      const runtime = start(...args);
+      const terminate = runtime.terminate;
+      runtime.terminate = async () => {
+        terminating.resolve();
+        const code = await terminate();
+        await releaseExit.promise;
+        return code;
+      };
+      return runtime;
+    });
+    return withLaneClient((sql) =>
+      Effect.gen(function* () {
+        const ready = yield* Deferred.make<void>();
+        const read = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`SELECT * FROM sessions`;
+              yield* Deferred.succeed(ready, undefined);
+              return yield* Effect.never;
+            }),
+          )
+          .pipe(SqliteClient.authReadOnly, Effect.exit, Effect.forkChild);
+        yield* Deferred.await(ready);
+        const done = yield* (
+          cancel ? Effect.asVoid(Fiber.interrupt(read)) : Effect.asVoid(Fiber.join(read))
+        ).pipe(Effect.forkChild);
+        yield* Effect.promise(() => terminating.promise);
+        yield* Effect.yieldNow;
+        assert.isUndefined(done.pollUnsafe());
+        releaseExit.resolve();
+        yield* Fiber.join(done);
+      }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
           releaseExit.resolve();
-          yield* Fiber.join(done);
+          spy.mockRestore();
         }),
-      ).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            releaseExit.resolve();
-            spy.mockRestore();
-          }),
-        ),
-      );
-    },
-  );
-}
+      ),
+    );
+  },
+);

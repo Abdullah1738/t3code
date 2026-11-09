@@ -5487,13 +5487,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         }
         const source = before.runs[0]!;
         yield* continueRestartedRun({ threadId, sourceRunId: source.id }).pipe(
-          Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
           Effect.provide(
-            Layer.mock(ThreadManagementService.ThreadManagementService)({
-              getThreadRecords: (id) => orchestrator.getThreadProjection(id),
-              dispatch: orchestrator.dispatch,
-              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
-            }),
+            Layer.mergeAll(
+              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                dispatch: orchestrator.dispatch,
+                recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              }),
+            ),
           ),
         );
         const resumed = yield* orchestrator.getThreadProjection(threadId);
@@ -5513,14 +5515,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                       queued: effect.request.queued,
                     }).pipe(
                       Effect.provide(
-                        ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
-                      ),
-                      Effect.provide(
-                        Layer.mock(ThreadManagementService.ThreadManagementService)({
-                          getThreadRecords: (id) => orchestrator.getThreadProjection(id),
-                          dispatch: orchestrator.dispatch,
-                          recoverDelegatedTask: orchestrator.recoverDelegatedTask,
-                        }),
+                        Layer.mergeAll(
+                          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+                          Layer.mock(ThreadManagementService.ThreadManagementService)({
+                            getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                            dispatch: orchestrator.dispatch,
+                            recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+                          }),
+                        ),
                       ),
                       Effect.orDie,
                     )
@@ -5673,23 +5675,27 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const source = before.runs[0]!;
         // Repeated delivery of the durable recovery effect must claim only one run.
         yield* continueRestartedRun({ threadId, sourceRunId: source.id, queued: true }).pipe(
-          Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
           Effect.provide(
-            Layer.mock(ThreadManagementService.ThreadManagementService)({
-              getThreadRecords: (id) => orchestrator.getThreadProjection(id),
-              dispatch: orchestrator.dispatch,
-              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
-            }),
+            Layer.mergeAll(
+              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                dispatch: orchestrator.dispatch,
+                recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              }),
+            ),
           ),
         );
         yield* continueRestartedRun({ threadId, sourceRunId: source.id, queued: true }).pipe(
-          Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
           Effect.provide(
-            Layer.mock(ThreadManagementService.ThreadManagementService)({
-              getThreadRecords: (id) => orchestrator.getThreadProjection(id),
-              dispatch: orchestrator.dispatch,
-              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
-            }),
+            Layer.mergeAll(
+              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadRecords: (id) => orchestrator.getThreadProjection(id),
+                dispatch: orchestrator.dispatch,
+                recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              }),
+            ),
           ),
         );
         const started = yield* orchestrator.getThreadProjection(threadId);

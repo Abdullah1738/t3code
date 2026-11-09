@@ -519,18 +519,20 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     options.readerStartupTimeout ?? Duration.seconds(10),
   );
 
-  const turnOff = (reader: typeof current, reason: string) =>
-    Effect.gen(function* () {
-      if (reader !== undefined) {
-        if (current === reader) current = undefined;
-        retiring = reader.worker.terminate();
-        yield* Effect.promise(() => retiring);
-      }
-      yield* Effect.logWarning("SQLite auth process unavailable; verification fails closed", {
-        reason,
-      });
-      return undefined;
+  const turnOff = Effect.fn("SqliteAuthReader.turnOff")(function* (
+    reader: typeof current,
+    reason: string,
+  ) {
+    if (reader !== undefined) {
+      if (current === reader) current = undefined;
+      retiring = reader.worker.terminate();
+      yield* Effect.promise(() => retiring);
+    }
+    yield* Effect.logWarning("SQLite auth process unavailable; verification fails closed", {
+      reason,
     });
+    return undefined;
+  });
 
   return Effect.andThen(
     Effect.promise(() => retiring),
