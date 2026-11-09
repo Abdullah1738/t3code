@@ -1,8 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off globalConsole:off preferSchemaOverJson:off - Only newly generated synthetic fixtures are opened here.
-import { DatabaseSync } from "node:sqlite";
-import { cpSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import * as NodeSqlite from "node:sqlite";
+import * as NodeFS from "node:fs";
+const { cpSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } = NodeFS;
+import * as NodePath from "node:path";
+const { resolve } = NodePath;
+import * as NodeURL from "node:url";
+const { pathToFileURL } = NodeURL;
 import * as Schema from "effect/Schema";
 import { KanbanCard, KanbanDiscussion, KanbanMessage, OrchestrationV2ExecutionNodeJson } from "@t3tools/contracts";
 import { assertRuntime } from "./runtime.ts";
@@ -11,20 +14,25 @@ import { ownerAnswerCases, ownerAnswerWorkload } from "./ownerAnswers.ts";
 
 const at = "2026-01-01T00:00:00.000Z";
 const model = { instanceId: "synthetic", model: "default" };
+const decodeHistoryNode = Schema.decodeUnknownSync(OrchestrationV2ExecutionNodeJson);
+const encodeHistoryNode = Schema.encodeSync(OrchestrationV2ExecutionNodeJson);
+const decodeCard = Schema.decodeUnknownSync(KanbanCard);
+const decodeDiscussion = Schema.decodeUnknownSync(KanbanDiscussion);
+const decodeMessage = Schema.decodeUnknownSync(KanbanMessage);
 
-export function repairOwnerAnswerHistory(main: DatabaseSync) {
+export function repairOwnerAnswerHistory(main: NodeSqlite.DatabaseSync) {
   // The bulk fixture uses opaque node payloads for storage load. Real sends
   // decode the recipients' history, so retain those rows with valid payloads.
   for (const threadId of ["synthetic-thread-20", "synthetic-thread-21"]) {
     const nodes = main.prepare("SELECT node_id, payload_json FROM orchestration_v2_projection_nodes WHERE thread_id=?").all(threadId);
     for (const row of nodes) {
-      const node = Schema.decodeUnknownSync(OrchestrationV2ExecutionNodeJson)({
+      const node = decodeHistoryNode({
         id: row.node_id, threadId, runId: null, rootNodeId: row.node_id,
         parentNodeId: null, kind: "tool_call", status: "completed", countsForRun: false,
         providerThreadId: null, providerTurnId: null, nativeItemRef: null, runtimeRequestId: null,
         checkpointScopeId: null, startedAt: at, completedAt: at,
       });
-      const encoded = Schema.encodeSync(OrchestrationV2ExecutionNodeJson)(node);
+      const encoded = encodeHistoryNode(node);
       main.prepare("UPDATE orchestration_v2_projection_nodes SET kind='tool_call',payload_json=? WHERE node_id=?").run(
         JSON.stringify({ ...JSON.parse(String(row.payload_json)), ...encoded }), row.node_id!,
       );
@@ -32,7 +40,7 @@ export function repairOwnerAnswerHistory(main: DatabaseSync) {
   }
 }
 
-export function seedOwnerAnswers(boards: DatabaseSync) {
+export function seedOwnerAnswers(boards: NodeSqlite.DatabaseSync) {
   const template = JSON.parse(String(boards.prepare("SELECT json FROM ardud_kanban_cards LIMIT 1").get()!.json));
   const discussionTemplate = JSON.parse(String(boards.prepare("SELECT json FROM ardud_kanban_discussions LIMIT 1").get()!.json));
   const boardId = "synthetic-board-0";
@@ -48,7 +56,7 @@ export function seedOwnerAnswers(boards: DatabaseSync) {
       const ask = { id: sample.askId, text: `${sample.marker} May this change proceed?`, by,
         blocking: sample.route !== "worker", seq: sample.seq, at, closedAt: null };
       const companion = { ...ask, id: "q1", text: "Keep this separate question open.", blocking: false, seq: 21 };
-      const card = Schema.decodeUnknownSync(KanbanCard)({ ...template,
+      const card = decodeCard({ ...template,
         id: sample.cardId, boardId, number: 501 + sample.sample, title: sample.marker,
         discussionId: sample.discussionId, stage: ask.blocking ? "needs_owner" : "working",
         model, projectId: "synthetic-project", activeThreadId: sample.route === "worker" ? sample.askerThreadId : null,
@@ -56,7 +64,7 @@ export function seedOwnerAnswers(boards: DatabaseSync) {
         workThreadId: sample.route === "worker" ? sample.askerThreadId : null, reviewThreadId: null,
         question: ask.blocking ? ask.text : null, asks: sample.kind === "pick" ? [companion, ask] : [ask],
       });
-      const discussion = Schema.decodeUnknownSync(KanbanDiscussion)({ ...discussionTemplate,
+      const discussion = decodeDiscussion({ ...discussionTemplate,
         id: sample.discussionId, boardId, cardId: sample.cardId, title: sample.marker,
         evaluatorThreadId: sample.route === "launch" || sample.route === "worker" ? null : "synthetic-thread-21",
         participants: [], lastSeq: sample.seq, lastMessageAt: at,
@@ -68,7 +76,7 @@ export function seedOwnerAnswers(boards: DatabaseSync) {
         discussion.id, boardId, card.id, discussion.evaluatorThreadId, JSON.stringify(discussion),
       );
       for (const entry of card.asks) {
-        const message = Schema.decodeUnknownSync(KanbanMessage)({ discussionId: discussion.id,
+        const message = decodeMessage({ discussionId: discussion.id,
           seq: entry.seq, author: entry.by, authorName: entry.by._tag === "thread" ? "Worker" : "Evaluator",
           blocks: entry.id === sample.askId ? [{ _tag: "choice", id: entry.id,
             style: "pick", question: entry.text, options: [{ id: "o1", label: "Hold" }, { id: "o2", label: "Proceed" }], multi: false,
@@ -89,7 +97,7 @@ export function seedOwnerAnswers(boards: DatabaseSync) {
 export function configureOwnerAnswerMock(home: string, mockScript: string) {
   const workspace = resolve(home, "workspace");
   mkdirSync(workspace, { recursive: true });
-  const db = new DatabaseSync(resolve(home, "userdata/statev2.sqlite"));
+  const db = new NodeSqlite.DatabaseSync(resolve(home, "userdata/statev2.sqlite"));
   try {
     db.prepare(`INSERT INTO projection_projects
       (project_id,title,workspace_root,scripts_json,created_at,updated_at)
@@ -114,7 +122,7 @@ export function configureOwnerAnswerMock(home: string, mockScript: string) {
   }));
 }
 
-export function ownerAnswerRoutingEvidence(boards: DatabaseSync, main: DatabaseSync) {
+export function ownerAnswerRoutingEvidence(boards: NodeSqlite.DatabaseSync, main: NodeSqlite.DatabaseSync) {
   let routedAsks = 0, launchedEvaluators = 0;
   for (const sample of ownerAnswerCases()) {
     const row = boards.prepare("SELECT json FROM ardud_kanban_discussions WHERE id=?").get(sample.discussionId);
@@ -151,9 +159,9 @@ export async function ownerAnswerFixture(source: string, destination: string) {
     if (existsSync(path + "-wal")) throw new Error("Close and checkpoint the synthetic source before upgrading it");
     cpSync(path, resolve(destination, "userdata", name), { mode: constants.COPYFILE_FICLONE });
   }
-  const main = new DatabaseSync(resolve(destination, "userdata/statev2.sqlite"));
+  const main = new NodeSqlite.DatabaseSync(resolve(destination, "userdata/statev2.sqlite"));
   try { repairOwnerAnswerHistory(main); } finally { main.close(); }
-  const db = new DatabaseSync(resolve(destination, "userdata/boards.sqlite"));
+  const db = new NodeSqlite.DatabaseSync(resolve(destination, "userdata/boards.sqlite"));
   try { seedOwnerAnswers(db); } finally { db.close(); }
   const { fixtureHash: _oldHash, ...previous } = meta;
   const manifest = { ...previous, version: 2, ownerAnswers: ownerAnswerWorkload,

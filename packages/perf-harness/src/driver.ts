@@ -3,7 +3,7 @@ import { observeExit } from "./process.ts";
 import { shapedFetch } from "./network.ts";
 import { assertRuntime } from "./runtime.ts";
 import { configureOwnerAnswerMock, ownerAnswerRoutingEvidence } from "./ownerAnswerFixture.ts";
-import { DatabaseSync } from "node:sqlite";
+import * as NodeSqlite from "node:sqlite";
 import { assertOpenOwnerAsk, assertClosedOwnerAsk, mockAnswerDelivery, ownerAnswerCases, ownerAnswerRequest, ownerAnswerSamples, ownerAnswerWorkload } from "./ownerAnswers.ts";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
@@ -568,8 +568,8 @@ export async function drive(
         traceFlushed = false;
       }
       if (traceFlushed) {
-        const boardEvidence = new DatabaseSync(resolve(home, "userdata/boards.sqlite"), { readOnly: true });
-        const mainEvidence = new DatabaseSync(resolve(home, "userdata/statev2.sqlite"), { readOnly: true });
+        const boardEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/boards.sqlite"), { readOnly: true });
+        const mainEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/statev2.sqlite"), { readOnly: true });
         try {
           Object.assign(ownerAnswers, ownerAnswerRoutingEvidence(boardEvidence, mainEvidence));
           if (ownerAnswers.routedAsks !== ownerAnswerSamples || ownerAnswers.launchedEvaluators !== 10)

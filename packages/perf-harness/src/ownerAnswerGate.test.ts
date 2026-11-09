@@ -1,5 +1,7 @@
-import { test } from "node:test";
-import assert from "node:assert/strict";
+import * as NodeTest from "node:test";
+const { test } = NodeTest;
+import * as NodeAssert from "node:assert/strict";
+const assert: typeof NodeAssert = NodeAssert;
 import { compare } from "./compare.ts";
 import { percentiles, type Run } from "./metrics.ts";
 

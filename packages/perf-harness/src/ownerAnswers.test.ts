@@ -1,16 +1,19 @@
 // @effect-diagnostics nodeBuiltinImport:off - All databases are disposable in-memory synthetic records.
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
+import * as NodeTest from "node:test";
+const { test } = NodeTest;
+import * as NodeAssert from "node:assert/strict";
+const assert: typeof NodeAssert = NodeAssert;
+import * as NodeSqlite from "node:sqlite";
 import { kanbanDDL } from "../../../apps/server/src/ardud/persistence/kanbanSchema.ts";
 import { repairOwnerAnswerHistory, seedOwnerAnswers } from "./ownerAnswerFixture.ts";
 import * as Schema from "effect/Schema";
 import { OrchestrationV2ExecutionNodeJson } from "@t3tools/contracts";
 import { ownerAnswerCases, ownerAnswerRequest, assertOpenOwnerAsk, assertClosedOwnerAsk, mockAnswerDelivery } from "./ownerAnswers.ts";
 import type { KanbanCard, KanbanMessage } from "@t3tools/contracts";
+const decodeHistoryNode = Schema.decodeUnknownSync(Schema.fromJsonString(OrchestrationV2ExecutionNodeJson));
 
 function seeded() {
-  const db = new DatabaseSync(":memory:");
+  const db = new NodeSqlite.DatabaseSync(":memory:");
   for (const ddl of kanbanDDL) db.exec(ddl);
   const at = "2026-01-01T00:00:00.000Z";
   const model = { instanceId: "synthetic", model: "synthetic" };
@@ -89,7 +92,7 @@ test("mock delivery requires prompts containing every unique answer marker", () 
 });
 
 test("answer recipients retain decodable history rows and the bulk synthetic body", () => {
-  const db = new DatabaseSync(":memory:");
+  const db = new NodeSqlite.DatabaseSync(":memory:");
   try {
     db.exec("CREATE TABLE orchestration_v2_projection_nodes (node_id TEXT,thread_id TEXT,kind TEXT,payload_json TEXT)");
     for (const i of [19, 20, 21]) db.prepare("INSERT INTO orchestration_v2_projection_nodes VALUES (?,?,?,?)").run(
@@ -99,7 +102,7 @@ test("answer recipients retain decodable history rows and the bulk synthetic bod
     const rows = db.prepare("SELECT * FROM orchestration_v2_projection_nodes").all();
     assert.equal(rows.length, 3);
     for (const row of rows.slice(1)) {
-      const decoded = Schema.decodeUnknownSync(Schema.fromJsonString(OrchestrationV2ExecutionNodeJson))(row.payload_json);
+      const decoded = decodeHistoryNode(row.payload_json);
       assert.equal(decoded.threadId, row.thread_id);
       assert.equal(decoded.kind, "tool_call");
       assert.equal(JSON.parse(String(row.payload_json)).text.length, 8192);
