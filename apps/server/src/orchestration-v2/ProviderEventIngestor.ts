@@ -39,6 +39,10 @@ import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failu
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
 import { boundFileChangeForStorage } from "./WireProjection.ts";
+import {
+  isTransientSqliteReadFailure,
+  transientReadRetrySchedule,
+} from "../ardud/durability/transientSqliteRead.ts";
 
 export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
   "ProviderEventNormalizeError",
@@ -732,7 +736,14 @@ export const layer: Layer.Layer<
         /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
         Effect.fnUntraced(
           function* (input) {
-            const events = yield* normalize(input);
+            // ardud: normalize only reads. A retired or unavailable reader must
+            // not fail a live turn, so wait for a fresh one (9 Nov incident).
+            const events = yield* normalize(input).pipe(
+              Effect.retry({
+                schedule: transientReadRetrySchedule(),
+                while: isTransientSqliteReadFailure,
+              }),
+            );
             if (events.length === 0) {
               return [];
             }

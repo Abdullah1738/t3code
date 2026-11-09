@@ -4171,6 +4171,62 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
+// ardud (9 Nov): a failed projection read failed the run while the Claude turn
+// kept running unread, and the next send was refused as "previous turn is
+// still running". A failed run must stop its provider turn.
+it.effect("stops the provider turn when ingestion fails the run before a terminal", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make<ReadonlyArray<string>>([]);
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:orphaned-turn",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          type: "node.updated",
+          driver,
+          node: { id: ids.rootNodeId, threadId: ids.threadId, runId: ids.runId },
+        } as unknown as ProviderAdapter.ProviderAdapterV2Event),
+      ingestNormalized: (ingest) =>
+        Effect.fail(
+          new ProviderEventIngestor.ProviderEventNormalizeError({
+            providerSessionId: ingest.providerSessionId,
+            threadId: ingest.threadId,
+            providerEvent: ingest.event,
+            cause: new Error("projection read failed"),
+          }),
+        ),
+      interruptTurn: (turn) =>
+        Ref.update(interrupted, (current) => [...current, String(turn.providerTurnId)]),
+    });
+    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
+    assert.deepEqual(yield* Ref.get(interrupted), ["provider-turn:ingest-failure:orphaned-turn"]);
+  }),
+);
+
+it.effect("does not stop a provider turn that already reached its terminal", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make(0);
+    yield* captureRootRunTermination({
+      key: "ingest-failure:settled-turn",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.concat(
+          Stream.make(rootTerminalEvent(ids, "completed")),
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:settled"),
+              cause: "late stream failure",
+            }),
+          ),
+        ),
+      hasPendingBackgroundWorkForThread: () => Effect.succeed(true),
+      interruptTurn: () => Ref.update(interrupted, (count) => count + 1),
+    });
+    assert.equal(yield* Ref.get(interrupted), 0);
+  }),
+);
+
 it.effect("leaves the run to restart recovery when shutdown interrupts its event stream", () =>
   Effect.gen(function* () {
     const { written, observed } = yield* captureRootRunTermination({
@@ -4264,6 +4320,8 @@ function captureRootRunTermination(input: {
     ProviderAdapter.ProviderAdapterV2Error
   >;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
@@ -4341,7 +4399,7 @@ function captureRootRunTermination(input: {
           }),
           IdAllocator.layer,
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
-            ingestNormalized: () => Effect.succeed([]),
+            ingestNormalized: input.ingestNormalized ?? (() => Effect.succeed([])),
           }),
           ServerSettings.layerTest(),
           Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
@@ -4396,6 +4454,7 @@ function captureRootRunTermination(input: {
             ),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
+          interruptTurn: input.interruptTurn ?? (() => Effect.void),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {

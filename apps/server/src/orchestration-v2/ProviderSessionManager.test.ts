@@ -6236,6 +6236,7 @@ function runIdleThreadUnloadScenario(
     readonly manager: ProviderSessionManager.ProviderSessionManagerV2Shape;
     readonly providerSessionId: ProviderSessionId;
     readonly threadA: ThreadId;
+    readonly threadB: ThreadId;
     readonly startTurn: (
       threadId: ThreadId,
       ordinal: number,
@@ -6243,7 +6244,10 @@ function runIdleThreadUnloadScenario(
     ) => Effect.Effect<void>;
     readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
     readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
-  }) => Effect.Effect<void, ProviderSessionManager.ProviderSessionManagerV2Error>,
+    readonly subscribe: NonNullable<
+      ProviderAdapter.ProviderAdapterV2SessionRuntime["subscribeEvents"]
+    >;
+  }) => Effect.Effect<void, ProviderSessionManager.ProviderSessionManagerV2Error, Scope.Scope>,
   options: {
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly beforeUnload?: Effect.Effect<void>;
@@ -6358,10 +6362,12 @@ function runIdleThreadUnloadScenario(
         manager,
         providerSessionId,
         threadA,
+        threadB,
         startTurn,
         endTurn,
         resume,
-      });
+        subscribe: subscribe!,
+      }).pipe(Effect.scoped);
     }).pipe(
       Effect.provide(
         layerTest({
@@ -6405,6 +6411,61 @@ it.effect(
           const resumes = (yield* Ref.get(state)).resumeCount;
           yield* resume(threadA);
           assert.equal((yield* Ref.get(state)).resumeCount, resumes + 1);
+        }),
+    ),
+);
+
+// ardud (9 Nov): a turn that is silent for longer than the idle window (a
+// long tool, a long model think) is still a live turn.
+it.effect(
+  "ProviderSessionManagerV2 never unloads or releases threads whose turns run silently past the idle window",
+  () =>
+    runIdleThreadUnloadScenario(
+      "silent-long-turn",
+      ({ state, manager, providerSessionId, threadA, startTurn }) =>
+        Effect.gen(function* () {
+          yield* startTurn(threadA, 1);
+          // Thirty idle windows with no provider events at all.
+          for (let tick = 0; tick < 30; tick++) {
+            yield* TestClock.adjust("1 second");
+            yield* Effect.yieldNow;
+          }
+          const current = yield* Ref.get(state);
+          assert.deepEqual(current.unloadedNativeThreadIds, []);
+          assert.equal(current.closeCount, 0);
+          assert.equal(current.interruptCount, 0);
+          assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        }),
+    ),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 unloading one idle thread leaves another thread's live subscription intact",
+  () =>
+    runIdleThreadUnloadScenario(
+      "unload-isolation",
+      ({ state, threadA, threadB, startTurn, endTurn, subscribe }) =>
+        Effect.gen(function* () {
+          // Thread B's run keeps reading the shared session while A goes idle.
+          const subscription = yield* Effect.acquireRelease(subscribe, (sub) => sub.close);
+          const terminals = yield* subscription.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal"),
+            Stream.take(2),
+            Stream.runCollect,
+            Effect.exit,
+            Effect.forkScoped,
+          );
+          yield* startTurn(threadA, 1);
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          yield* Effect.yieldNow;
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+          assert.equal((yield* Ref.get(state)).closeCount, 0);
+          // Thread B's turn ends after A was unloaded; B's reader still sees it.
+          yield* endTurn(threadB, 1);
+          const exit = yield* Fiber.join(terminals);
+          assert.isTrue(Exit.isSuccess(exit), "thread B's subscription must not be failed");
+          if (Exit.isSuccess(exit)) assert.lengthOf(Array.from(exit.value), 2);
         }),
     ),
 );
