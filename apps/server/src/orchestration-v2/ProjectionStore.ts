@@ -6542,7 +6542,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ? {
             ...requested,
             idleSubagentsUpdatedSince: DateTime.formatIso(
-              DateTime.subtract(yield* DateTime.now, { millis: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
+              DateTime.subtract(yield* DateTime.now, { milliseconds: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
             ),
           }
         : requested;
@@ -6855,7 +6855,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
         const visible = options?.omitIdleSubagents
           ? omitIdleSubagentShells(
               undeleted,
-              DateTime.subtract(yield* DateTime.now, { millis: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
+              DateTime.subtract(yield* DateTime.now, { milliseconds: IDLE_SUBAGENT_SHELL_WINDOW_MS }),
             )
           : undeleted;
         return {

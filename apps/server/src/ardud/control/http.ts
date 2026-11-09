@@ -944,7 +944,7 @@ const makeRoutes = Effect.gen(function* () {
       // updated_at is an ISO string; widen by a second so precision differences can't drop a
       // row at the edge, then compare instants exactly.
       const rows = yield* store
-        .threadsUpdatedSince(new Date(since - 1_000).toISOString())
+        .threadsUpdatedSince(DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)))
         .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
       let matched = rows.filter(
         (row) =>

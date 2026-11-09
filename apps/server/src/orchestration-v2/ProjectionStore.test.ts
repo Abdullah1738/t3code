@@ -8406,10 +8406,11 @@ const idleSubagentShellBody = (label: string) =>
     } as never);
     expected.add(idleMiddle);
     expected.add(asking);
-    // A subagent that finished recently stays: it is in the user's working set.
+    // A subagent that finished three days ago stays: it is in the user's working set.
     const recent = id("top-3-recent");
-    yield* created(recent, id("top-3"), {}, now);
-    yield* run(recent, "completed", now);
+    const threeDaysAgo = DateTime.subtract(now, { days: 3 });
+    yield* created(recent, id("top-3"), {}, threeDaysAgo);
+    yield* run(recent, "completed", threeDaysAgo);
     expected.add(recent);
     // An archived subagent is never in the active shell.
     yield* created(id("top-2-archived"), id("top-2"), { archivedAt: now });

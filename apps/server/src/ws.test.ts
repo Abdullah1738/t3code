@@ -732,7 +732,7 @@ it.live(
           ),
         );
         assert.equal(
-          optedIn[0]?.kind === "synchronized" ? -1 : optedIn[0]?.sequence,
+          optedIn[0] !== undefined && "sequence" in optedIn[0] ? optedIn[0].sequence : -1,
           fixture.cursor,
         );
         assert.deepEqual(optedIn.slice(1), baseline);

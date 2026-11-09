@@ -671,7 +671,9 @@ describe("withSubagentRequestAncestors", () => {
       // The idle middle subagent follows the update at its sequence; the top-level root is read
       // but not resent.
       expect(
-        items.map((item) => [item.kind === "thread.updated" ? item.thread.id : null, item.sequence]),
+        items.map((item) =>
+          item.kind === "thread.updated" ? [item.thread.id, item.sequence] : [null, null],
+        ),
       ).toEqual([
         ["asking", 9],
         ["middle", 9],
@@ -710,7 +712,9 @@ describe("withSubagentRequestAncestors", () => {
             return shells.get(id) ?? null;
           }),
         );
-        const ids = items.map((item) => (item.kind === "thread.updated" ? item.thread.id : null));
+        const ids = items.map((item) =>
+          item.kind === "thread.updated" ? String(item.thread.id) : null,
+        );
         expect(ids.filter((id) => id === "upper")).toHaveLength(1);
         expect(ids.filter((id) => id === "lower")).toHaveLength(1);
         // upper follows deep, the update that needed it.
