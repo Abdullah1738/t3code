@@ -67,6 +67,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as CredentialStore from "./ardud/mcp/CredentialStore.ts";
+import * as BoardsDatabase from "./ardud/persistence/BoardsDatabase.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
@@ -120,6 +121,7 @@ import * as Observability from "./observability/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
 import * as LargeReplyLog from "./observability/LargeReplyLog.ts";
+import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -188,12 +190,14 @@ import * as OrchestrationHttp from "./orchestration-v2/http.ts";
 import * as ProjectHttp from "./project/http.ts";
 import { controlRouteLayer } from "./ardud/control/http.ts";
 import { desktopLeaseRouteLayer } from "./ardud/desktop-lease/http.ts";
+import { harnessCutoverRouteLayer } from "./ardud/harness-migrate/http.ts";
 import { deferIdleSocketClose } from "./ardud/http/deferIdleSocketClose.ts";
 // ardud fork: OpenCode session import
 import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -325,7 +329,9 @@ const layerHttpServer = Layer.unwrap(
 
 const layerPlatformServices = NodeServices.layer;
 
-const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
+const layerPersistence = BoardsDatabase.layerConfig.pipe(
+  Layer.provideMerge(SqlitePersistence.layerConfig),
+);
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
 
@@ -611,6 +617,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ArdudOpenCodeImportLive,
   // ardud: missions board
   ArdudKanbanLive,
+  ReadonlyReplica.layer,
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
@@ -719,6 +726,7 @@ const layerMakeRoutes = Layer.mergeAll(
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
     desktopLeaseRouteLayer,
+    harnessCutoverRouteLayer,
     openCodeImportRouteLayer,
     // ardud: missions board
     kanbanRouteLayer,
@@ -1073,7 +1081,8 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
-          Layer.provide(CredentialStore.layer.pipe(Layer.provide(layerPersistence))),
+          Layer.provide(CredentialStore.layer),
+          Layer.provide(layerPersistence),
           Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
         ),
       ),
@@ -1082,6 +1091,7 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(layerHttpServer),
       Layer.provide(layerApplicationObservability),
       Layer.provide(LargeReplyLog.layer),
+      Layer.provide(ReplyBuilders.layer),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(AgentScopeLive.layer),

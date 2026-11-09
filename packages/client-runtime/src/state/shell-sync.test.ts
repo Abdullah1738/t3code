@@ -375,6 +375,29 @@ describe("environment shell synchronization", () => {
       );
       expect(recovered.error).toEqual(Option.none());
       expect(Option.getOrThrow(recovered.snapshot).threads[0]).toEqual(updatedRow);
+      yield* Queue.offer(events, {
+        kind: "snapshot",
+        snapshot: { ...httpSnapshot, page: { after: null, nextAfter: "missing-page" } },
+      });
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter(
+          (value) =>
+            Option.isSome(value.snapshot) &&
+            value.snapshot.value.page?.nextAfter === "missing-page",
+        ),
+        Stream.runHead,
+      );
+      yield* Queue.offer(
+        events,
+        new OrchestrationV2GetShellSnapshotError({ message: "Page two failed" }),
+      );
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter((value) => Option.isSome(value.error)),
+        Stream.runHead,
+      );
+      yield* TestClock.adjust("250 millis");
+      yield* Queue.take(subscriptions);
+      expect(yield* SubscriptionRef.get(loaderCalls)).toBe(2);
     }),
   );
 

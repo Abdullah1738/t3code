@@ -1,6 +1,7 @@
 """sync_thread_identity: aliases from a read-only statev2 fixture, one canonical id per thread."""
 
 import json
+from replica_fixture import ready
 import contextlib
 import io
 import os
@@ -55,6 +56,7 @@ class IdentityTest(unittest.TestCase):
         self.state = os.path.join(self.tmp.name, "statev2.sqlite")
         self.mem = os.path.join(self.tmp.name, "memory.db")
         s = sqlite3.connect(self.state)
+        ready(s)
         s.executescript(STATE_DDL)
         # thread T: started as OpenCode (imported), then Claude native, then Codex native
         s.execute("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,?)", thread("T", "Kafka fix"))

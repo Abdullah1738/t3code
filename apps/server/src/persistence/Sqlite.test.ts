@@ -60,7 +60,7 @@ it.effect("logs migration before a blocked shell-index phase", () => {
   );
 });
 
-it.effect("logs the actual SQLite open, setup, migration and index boundaries", () => {
+it.effect("logs the actual SQLite open, setup, migration, index and archive boundaries", () => {
   const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-phases-"));
   const dbPath = NodePath.join(tempDir, "state.sqlite");
   return Effect.gen(function* () {
@@ -88,6 +88,8 @@ it.effect("logs the actual SQLite open, setup, migration and index boundaries", 
         ["sqlite.migrations", "success"],
         ["sqlite.shell-indexes", "start"],
         ["sqlite.shell-indexes", "success"],
+        ["sqlite.history-archive", "start"],
+        ["sqlite.history-archive", "success"],
         ["sqlite.setup", "success"],
       ],
     );

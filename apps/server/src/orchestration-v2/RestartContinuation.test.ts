@@ -414,6 +414,7 @@ it.effect.each([
                     },
             }),
             Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getLiveSharedProviderSessions: () => Effect.succeed([]),
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
               getRuntimeRecoveryProjection: () => Effect.succeed(makeProjection()),
             }),
@@ -495,6 +496,7 @@ it.effect.each(["disabled", "unreadable", "read_failed"] as const)(
           Layer.mergeAll(
             Layer.succeed(ServerSettings.ServerSettingsService, settings),
             Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getLiveSharedProviderSessions: () => Effect.succeed([]),
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
               getRuntimeRecoveryProjection: () => Effect.succeed(makeProjection()),
             }),
@@ -554,6 +556,7 @@ it.effect("lets a cut blocking delegate_task wake its parent like an async task"
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -620,6 +623,7 @@ it.effect.each(["running", "waiting"])(
           Layer.mergeAll(
             ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
             Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getLiveSharedProviderSessions: () => Effect.succeed([]),
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
               getRuntimeRecoveryProjection: () => Effect.succeed(projection),
             }),
@@ -747,6 +751,7 @@ it.effect("prepares no continuation for background work another provider thread 
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -774,6 +779,7 @@ it.effect("prepares no continuation for background work another provider thread 
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(ownWork),
           }),
@@ -869,6 +875,7 @@ it.effect.each([
             Layer.mergeAll(
               ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
               Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getLiveSharedProviderSessions: () => Effect.succeed([]),
                 getRecoveryThreadIds: () => Effect.succeed([threadId]),
                 getRuntimeRecoveryProjection: () => Effect.succeed(projection),
               }),
@@ -1029,6 +1036,7 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.sync(() => projection),
           }),
@@ -1288,6 +1296,7 @@ it.effect("prepares later threads' continuations when one thread fails", () =>
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([brokenThreadId, threadId]),
             getRuntimeRecoveryProjection: (id) =>
               id === brokenThreadId
@@ -1496,7 +1505,9 @@ it.effect(
         ];
         const projection = {
           ...base,
-          runs: [{ ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork }],
+          runs: [
+            { ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork },
+          ],
           providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
         } as unknown as OrchestrationV2ThreadProjection;
         const commands: Parameters<
@@ -1547,7 +1558,9 @@ it.effect("hedges a failed OpenCode probe and keeps the stopped headline off it"
         new Promise<string>((resolve) => {
           server.listen(0, "127.0.0.1", () => {
             const address = server.address();
-            resolve(`http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`);
+            resolve(
+              `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`,
+            );
           });
         }),
     );
@@ -1566,7 +1579,9 @@ it.effect("hedges a failed OpenCode probe and keeps the stopped headline off it"
       ];
       const projection = {
         ...base,
-        runs: [{ ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork }],
+        runs: [
+          { ...base.runs[0]!, status: "completed", restartCancelledBackgroundWork: childWork },
+        ],
         providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
       } as unknown as OrchestrationV2ThreadProjection;
       const commands: Parameters<

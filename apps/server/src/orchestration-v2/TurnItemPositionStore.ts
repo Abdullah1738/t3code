@@ -52,7 +52,7 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           if (existing[0] !== undefined) return existing[0].ordinal;
 
           const runRows =
-            runId === null
+            suppliedRunOrdinal !== undefined || runId === null
               ? []
               : yield* sql<{ readonly ordinal: number }>`
                 SELECT ordinal
@@ -63,16 +63,23 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           const runOrdinal = suppliedRunOrdinal ?? runRows[0]?.ordinal ?? null;
           const lowerBound = runOrdinal === null ? 0 : runOrdinal * 1_000_000;
           const upperBound = runOrdinal === null ? 999_999 : lowerBound + 999_999;
+          // UNIQUE(thread_id, ordinal) covers this seek; the item-id primary key would scan the thread.
           yield* sql`
           INSERT INTO orchestration_v2_turn_item_positions (thread_id, turn_item_id, ordinal)
-          SELECT
+          VALUES (
             ${threadId},
             ${turnItemId},
-            COALESCE(MAX(ordinal), ${lowerBound}) + 1
-          FROM orchestration_v2_turn_item_positions
-          WHERE thread_id = ${threadId}
-            AND ordinal >= ${lowerBound}
-            AND ordinal <= ${upperBound}
+            COALESCE((
+              SELECT ordinal
+              FROM orchestration_v2_turn_item_positions
+              INDEXED BY sqlite_autoindex_orchestration_v2_turn_item_positions_2
+              WHERE thread_id = ${threadId}
+                AND ordinal >= ${lowerBound}
+                AND ordinal <= ${upperBound}
+              ORDER BY ordinal DESC
+              LIMIT 1
+            ), ${lowerBound}) + 1
+          )
           ON CONFLICT(thread_id, turn_item_id) DO NOTHING
         `;
           const rows = yield* sql<{ readonly ordinal: number }>`

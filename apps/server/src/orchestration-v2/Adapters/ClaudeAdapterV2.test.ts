@@ -797,90 +797,92 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
   it.effect.each([true, false])(
     "routes recall through the app thread when configured: %s",
     (recallEnabled) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "t3-claude-recall-",
-        });
-        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
-          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
-          settings: DEFAULT_CLAUDE_SETTINGS,
-          environment: recallEnabled ? { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" } : {},
-          attachmentsDir,
-          fileSystem,
-          path: yield* Path.Path,
-          crypto: yield* Crypto.Crypto,
-          idAllocator: yield* IdAllocator.IdAllocatorV2,
-          queryRunner: {
-            allocateSessionId: Effect.succeed("native-claude-recall"),
-            open: (input) =>
-              Effect.sync(() => {
-                openedOptions = input.options;
-                return {
-                  messages: Stream.never,
-                  offer: () => Effect.void,
-                  setModel: () => Effect.void,
-                  applyFlagSettings: () => Effect.void,
-                  setPermissionMode: () => Effect.void,
-                  backgroundTasks: () => Effect.succeed(false),
-                  stopTask: () => Effect.void,
-                  interrupt: Effect.void,
-                  close: Effect.void,
-                };
-              }),
-            forkSession: () => Effect.die("unused"),
-            subagentLaunchToolUseId: () => Effect.succeed(null),
-            assertComplete: Effect.void,
-          },
-        });
-        const threadId = ThreadId.make("thread-claude-recall");
-        yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
-        const runtime = yield* adapter.openSession({
-          threadId,
-          providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
-          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
-          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
-        });
-        const providerThread = yield* runtime.ensureThread({
-          threadId,
-          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
-          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
-        });
-        yield* runtime.startTurn(
-          makeClaudeTestTurnInput({
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-claude-recall-",
+          });
+          let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+            instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+            settings: DEFAULT_CLAUDE_SETTINGS,
+            environment: recallEnabled
+              ? { ROBOB_RECALL_MCP_URL: "http://127.0.0.1:18765/mcp" }
+              : {},
+            attachmentsDir,
+            fileSystem,
+            path: yield* Path.Path,
+            crypto: yield* Crypto.Crypto,
+            idAllocator: yield* IdAllocator.IdAllocatorV2,
+            queryRunner: {
+              allocateSessionId: Effect.succeed("native-claude-recall"),
+              open: (input) =>
+                Effect.sync(() => {
+                  openedOptions = input.options;
+                  return {
+                    messages: Stream.never,
+                    offer: () => Effect.void,
+                    setModel: () => Effect.void,
+                    applyFlagSettings: () => Effect.void,
+                    setPermissionMode: () => Effect.void,
+                    backgroundTasks: () => Effect.succeed(false),
+                    stopTask: () => Effect.void,
+                    interrupt: Effect.void,
+                    close: Effect.void,
+                  };
+                }),
+              forkSession: () => Effect.die("unused"),
+              subagentLaunchToolUseId: () => Effect.succeed(null),
+              assertComplete: Effect.void,
+            },
+          });
+          const threadId = ThreadId.make("thread-claude-recall");
+          yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+          const runtime = yield* adapter.openSession({
             threadId,
-            providerThread,
-            now: yield* DateTime.now,
-            attemptId: RunAttemptId.make("attempt-claude-recall"),
-            text: "hello",
-            attachments: [],
-          }),
-        );
-        assert.deepEqual(openedOptions?.mcpServers, {
-          ...T3_MCP_SERVERS,
-          ...(recallEnabled
-            ? {
-                recall: {
-                  type: "http",
-                  url: "http://127.0.0.1:18765/mcp",
-                  headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "claudeAgent" },
-                },
-              }
-            : {}),
-        });
-        assert.include(openedOptions?.allowedTools ?? [], "mcp__t3-code__*");
-        assert.notInclude(
-          JSON.stringify(ClaudeAdapterV2.loggedClaudeQueryOptions(openedOptions!)),
-          "http://127.0.0.1:18765/mcp",
-        );
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+            providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          const providerThread = yield* runtime.ensureThread({
+            threadId,
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          yield* runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId,
+              providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt-claude-recall"),
+              text: "hello",
+              attachments: [],
+            }),
+          );
+          assert.deepEqual(openedOptions?.mcpServers, {
+            ...T3_MCP_SERVERS,
+            ...(recallEnabled
+              ? {
+                  recall: {
+                    type: "http",
+                    url: "http://127.0.0.1:18765/mcp",
+                    headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "claudeAgent" },
+                  },
+                }
+              : {}),
+          });
+          assert.include(openedOptions?.allowedTools ?? [], "mcp__t3-code__*");
+          assert.notInclude(
+            JSON.stringify(ClaudeAdapterV2.loggedClaudeQueryOptions(openedOptions!)),
+            "http://127.0.0.1:18765/mcp",
+          );
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
         ),
       ),
-    ),
   );
 
   it.effect("uses the turn's app thread instead of the session thread for recall", () =>
@@ -3055,6 +3057,150 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect.each(["echo", "lifecycle"] as const)(
+    "marks prompt acceptance only after matching native SDK %s evidence, not the local offer",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const attemptId = RunAttemptId.make("attempt-native-acceptance");
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId,
+              text: "Continue the cutover task",
+              attachments: [],
+            }),
+          );
+          const turns = () =>
+            harness.events.filter(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.runAttemptId === attemptId,
+            );
+          yield* awaitUntil(() => turns().length > 0, "provisional provider turn");
+          assert.isTrue(
+            turns().every(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.promptAcceptedAt === undefined,
+            ),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: "00000000-0000-4000-8000-000000001234",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          assert.isTrue(
+            turns().every(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.promptAcceptedAt === undefined,
+            ),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "command_lifecycle",
+              command_uuid: "foreign-prompt",
+              state: "started",
+            }),
+          );
+          assert.isTrue(
+            turns().every(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.promptAcceptedAt === undefined,
+            ),
+          );
+          yield* harness.offerAndWait(
+            evidence === "lifecycle"
+              ? claudeSdkFrame({
+                  type: "command_lifecycle",
+                  command_uuid: harness.promptUuid(0),
+                  state: "started",
+                })
+              : claudeSdkFrame({
+                  ...makeAssistantTextFrame({
+                    uuid: "00000000-0000-4000-8000-000000001235",
+                    text: "Native task accepted",
+                  }),
+                  user_message_uuid: harness.promptUuid(0),
+                }),
+          );
+          yield* awaitUntil(
+            () =>
+              turns().some(
+                (event) =>
+                  event.type === "provider_turn.updated" &&
+                  event.providerTurn.promptAcceptedAt !== undefined,
+              ),
+            "native prompt acceptance",
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeAssistantTextFrame({
+                uuid: "00000000-0000-4000-8000-000000001237",
+                text: "Working after acceptance",
+              }),
+              user_message_uuid: harness.promptUuid(0),
+            }),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "compact_boundary",
+              compact_metadata: { trigger: "auto", pre_tokens: 1_075, post_tokens: 400 },
+              uuid: "00000000-0000-4000-8000-000000001238",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeResultFrame({ uuid: "00000000-0000-4000-8000-000000001236", result: "Done" }),
+              user_message_uuid: harness.promptUuid(0),
+            }),
+          );
+          yield* Queue.take(harness.terminalReceipts);
+          const last = turns().at(-1)!;
+          assert.equal(last.type, "provider_turn.updated");
+          if (last.type === "provider_turn.updated") {
+            assert.equal(last.providerTurn.status, "completed");
+            assert.isDefined(last.providerTurn.promptAcceptedAt);
+          }
+          const acceptedIndex = turns().findIndex(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          );
+          assert.isTrue(
+            turns()
+              .slice(acceptedIndex)
+              .every(
+                (event) =>
+                  event.type === "provider_turn.updated" &&
+                  event.providerTurn.promptAcceptedAt !== undefined,
+              ),
+          );
+          assert.isTrue(
+            turns().some(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.tokenUsage?.usedTokens === 400,
+            ),
+          );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
 
   describe("Plan-mode tool approval", () => {
     const openPlanTurn = Effect.fn("openPlanTurn")(function* (

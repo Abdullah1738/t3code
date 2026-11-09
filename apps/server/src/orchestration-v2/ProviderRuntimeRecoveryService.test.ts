@@ -43,6 +43,7 @@ it.effect("leaves durable effects for the worker after runtime reconciliation", 
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([]),
           }),
           Layer.mock(EventSink.EventSinkV2)({}),
@@ -173,6 +174,7 @@ function staleRecoveryLayer(input: {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () =>
             Effect.succeed(input.projections.map(({ thread }) => thread.id)),
           getRuntimeRecoveryProjection: (id) =>
@@ -446,90 +448,25 @@ it.effect("continues recovery and counts a defective stale abort as failed", () 
   }),
 );
 
-// ardud: an already-failed shared provider session must not block every thread.
-it.effect("queues continuations for two running threads with an errored shared session", () =>
+it.effect("stops an idle shared session once without reading any bound thread", () =>
   Effect.gen(function* () {
-    const driver = ProviderDriverKind.make("opencode");
-    const providerInstanceId = ProviderInstanceId.make("opencode");
-    const sessionId = ProviderSessionId.make("provider-session:opencode:shared");
-    const startedAt = DateTime.makeUnsafe("2026-10-30T00:00:00.000Z");
-    const threadIds = [ThreadId.make("thread:shared-a"), ThreadId.make("thread:shared-b")];
-    const projections = threadIds.map((threadId, index) => {
-      const runId = RunId.make(`run:shared-${index}`);
-      const providerThreadId = ProviderThreadId.make(`provider-thread:shared-${index}`);
-      const attemptId = RunAttemptId.make(`attempt:shared-${index}`);
-      return {
-        thread: {
-          id: threadId,
-          projectId: ProjectId.make("project:shared"),
-          providerInstanceId,
-          archivedAt: null,
-          deletedAt: null,
-        },
-        runs: [
-          {
-            id: runId,
-            ordinal: 1,
-            status: "running",
-            providerInstanceId,
-            providerThreadId,
-            activeAttemptId: attemptId,
-            requestedAt: startedAt,
-            startedAt,
-            completedAt: null,
-          },
-        ],
-        providerThreads: [
-          {
-            id: providerThreadId,
-            appThreadId: threadId,
-            ownerNodeId: null,
-            driver,
-            providerInstanceId,
-            providerSessionId: sessionId,
-            nativeThreadRef: { driver, nativeId: `native-${index}`, strength: "strong" },
-            status: "active",
-          },
-        ],
-        providerSessions: [
-          {
-            id: sessionId,
-            driver,
-            providerInstanceId,
-            status: "error",
-            capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
-          },
-        ],
-        providerTurns: [
-          {
-            id: ProviderTurnId.make(`turn:shared-${index}`),
-            providerThreadId,
-            runAttemptId: attemptId,
-            status: "running",
-          },
-        ],
-        runtimeRequests: [],
-        attempts: [],
-        nodes: [],
-        subagents: [],
-        messages: [],
-        turnItems: [],
-      } as unknown as OrchestrationV2ThreadProjection;
-    });
+    const session = {
+      id: ProviderSessionId.make("codex:shared"),
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "ready",
+    } as unknown as OrchestrationV2ThreadProjection["providerSessions"][number];
+    const threadId = ThreadId.make("idle:bound");
     const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
-    const summaries: unknown[] = [];
-    const logger = Logger.make(({ message }) => {
-      const [text, fields] = Array.isArray(message) ? message : [message];
-      if (text === "orchestration-v2.restart-continuation.summary") summaries.push(fields);
-    });
     const recovery = yield* ProviderRuntimeRecovery.make.pipe(
       Effect.provide(
         Layer.mergeAll(
-          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          ServerSettings.layerTest(),
+          IdAllocator.layer,
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
-            getRecoveryThreadIds: () => Effect.succeed(threadIds),
-            getRuntimeRecoveryProjection: (id) =>
-              Effect.succeed(projections[threadIds.indexOf(id)]!),
+            getRecoveryThreadIds: () => Effect.succeed([]),
+            getLiveSharedProviderSessions: () => Effect.succeed([{ threadId, session }]),
+            getRuntimeRecoveryProjection: () => Effect.die("idle thread must not be read"),
           }),
           Layer.mock(EventSink.EventSinkV2)({
             commitCommand: (input) =>
@@ -538,53 +475,187 @@ it.effect("queues continuations for two running threads with an errored shared s
                 return { committed: true, cancelledEffectCount: 0 } as never;
               }),
           }),
-          IdAllocator.layer,
-          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
       ),
     );
-    yield* recovery.reconcile("startup").pipe(Effect.provide(Logger.layer([logger])));
+    const result = yield* recovery.reconcile("startup");
+    assert.equal(result.stoppedSessions, 1);
+    assert.lengthOf(commits, 1);
     assert.deepEqual(
-      commits.flatMap((commit) =>
-        commit.effects.map((effect) => ({
-          id: effect.id,
-          request: effect.request,
-        })),
-      ),
-      [
-        {
-          id: "effect:restart-continuation:run:shared-0",
-          request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-0") },
-        },
-        {
-          id: "effect:restart-continuation:run:shared-1",
-          request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-1") },
-        },
-      ],
+      commits[0]!.events.map((event) => ({
+        type: event.type,
+        status: (event.payload as typeof session).status,
+      })),
+      [{ type: "provider-session.updated", status: "stopped" }],
     );
-    assert.deepEqual(summaries, [
-      {
-        threadsRead: 2,
-        runsCancelled: 2,
-        continuationsQueued: 2,
-        skipped: {
-          settings_disabled: 0,
-          settings_unreadable: 0,
-          blocked: 0,
-          no_provider_thread: 0,
-          provider_thread_not_active: 0,
-          no_session: 0,
-          session_stopped_or_error: 0,
-          no_running_turn: 0,
-          other: 0,
-        },
-      },
-    ]);
   }),
 );
+
+// ardud: an already-failed shared provider session must not block every thread.
+for (const status of ["ready", "error"] as const)
+  it.effect(`queues continuations for two running threads with a ${status} shared session`, () =>
+    Effect.gen(function* () {
+      const driver = ProviderDriverKind.make("opencode");
+      const providerInstanceId = ProviderInstanceId.make("opencode");
+      const sessionId = ProviderSessionId.make("provider-session:opencode:shared");
+      const startedAt = DateTime.makeUnsafe("2026-10-30T00:00:00.000Z");
+      const threadIds = [ThreadId.make("thread:shared-a"), ThreadId.make("thread:shared-b")];
+      const projections = threadIds.map((threadId, index) => {
+        const runId = RunId.make(`run:shared-${index}`);
+        const providerThreadId = ProviderThreadId.make(`provider-thread:shared-${index}`);
+        const attemptId = RunAttemptId.make(`attempt:shared-${index}`);
+        return {
+          thread: {
+            id: threadId,
+            projectId: ProjectId.make("project:shared"),
+            providerInstanceId,
+            archivedAt: null,
+            deletedAt: null,
+          },
+          runs: [
+            {
+              id: runId,
+              ordinal: 1,
+              status: "running",
+              providerInstanceId,
+              providerThreadId,
+              activeAttemptId: attemptId,
+              requestedAt: startedAt,
+              startedAt,
+              completedAt: null,
+            },
+          ],
+          providerThreads: [
+            {
+              id: providerThreadId,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              driver,
+              providerInstanceId,
+              providerSessionId: sessionId,
+              nativeThreadRef: { driver, nativeId: `native-${index}`, strength: "strong" },
+              status: "active",
+            },
+          ],
+          providerSessions: [
+            {
+              id: sessionId,
+              driver,
+              providerInstanceId,
+              status,
+              capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+            },
+          ],
+          providerTurns: [
+            {
+              id: ProviderTurnId.make(`turn:shared-${index}`),
+              providerThreadId,
+              runAttemptId: attemptId,
+              status: "running",
+            },
+          ],
+          runtimeRequests: [],
+          attempts: [],
+          nodes: [],
+          subagents: [],
+          messages: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+      });
+      const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+      const summaries: unknown[] = [];
+      const logger = Logger.make(({ message }) => {
+        const [text, fields] = Array.isArray(message) ? message : [message];
+        if (text === "orchestration-v2.restart-continuation.summary") summaries.push(fields);
+      });
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getLiveSharedProviderSessions: () =>
+                Effect.succeed(
+                  status === "ready"
+                    ? [{ threadId: threadIds[0]!, session: projections[0]!.providerSessions[0]! }]
+                    : [],
+                ),
+              getRecoveryThreadIds: () => Effect.succeed(threadIds),
+              getRuntimeRecoveryProjection: (id) =>
+                Effect.succeed(projections[threadIds.indexOf(id)]!),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              commitCommand: (input) =>
+                Effect.sync(() => {
+                  commits.push(input);
+                  if (input.events.some((event) => event.type === "provider-session.updated")) {
+                    for (const projection of projections) {
+                      (
+                        projection as { providerSessions: typeof projection.providerSessions }
+                      ).providerSessions = projection.providerSessions.map((session) => ({
+                        ...session,
+                        status: "stopped",
+                      }));
+                    }
+                  }
+                  return { committed: true, cancelledEffectCount: 0 } as never;
+                }),
+            }),
+            IdAllocator.layer,
+            Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+            Layer.mock(EffectOutbox.EffectOutboxV2)({
+              reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+            }),
+          ),
+        ),
+      );
+      yield* recovery.reconcile("startup").pipe(Effect.provide(Logger.layer([logger])));
+      assert.equal(
+        commits
+          .flatMap((commit) => commit.events)
+          .filter((event) => event.type === "provider-session.updated").length,
+        status === "ready" ? 1 : 0,
+      );
+      assert.deepEqual(
+        commits.flatMap((commit) =>
+          (commit.effects ?? []).map((effect) => ({
+            id: effect.id,
+            request: effect.request,
+          })),
+        ),
+        [
+          {
+            id: "effect:restart-continuation:run:shared-0",
+            request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-0") },
+          },
+          {
+            id: "effect:restart-continuation:run:shared-1",
+            request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run:shared-1") },
+          },
+        ],
+      );
+      assert.deepEqual(summaries, [
+        {
+          threadsRead: 2,
+          runsCancelled: 2,
+          continuationsQueued: 2,
+          skipped: {
+            settings_disabled: 0,
+            settings_unreadable: 0,
+            blocked: 0,
+            no_provider_thread: 0,
+            provider_thread_not_active: 0,
+            no_session: 0,
+            session_stopped_or_error: 0,
+            no_running_turn: 0,
+            other: 0,
+          },
+        },
+      ]);
+    }),
+  );
 
 it.effect("reads recovery projections only for threads that need runtime recovery", () => {
   const settledThreadIds = Array.from({ length: 1_000 }, (_, index) =>
@@ -597,6 +668,7 @@ it.effect("reads recovery projections only for threads that need runtime recover
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getShellSnapshot: () =>
             Effect.succeed({
               schemaVersion: 2,
@@ -675,6 +747,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
@@ -727,6 +800,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
@@ -775,6 +849,7 @@ it.effect("uses the same reconciliation path to cancel runtime requests during s
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
@@ -858,6 +933,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -1003,6 +1079,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -1069,6 +1146,7 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
@@ -1134,6 +1212,7 @@ it.effect("closes a secret request card's form when its run is recovered", () =>
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
@@ -1218,6 +1297,7 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           getThreadRecords: () => Effect.succeed(projection),
@@ -1344,6 +1424,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -1451,6 +1532,7 @@ it.effect("cancels workflow members and child roots without run ids after restar
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([parentThreadId, childThreadId]),
           getRuntimeRecoveryProjection: (threadId) =>
             Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
@@ -1616,6 +1698,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -1773,6 +1856,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -1903,6 +1987,7 @@ it.effect(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getLiveSharedProviderSessions: () => Effect.succeed([]),
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
@@ -2060,6 +2145,7 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getLiveSharedProviderSessions: () => Effect.succeed([]),
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),

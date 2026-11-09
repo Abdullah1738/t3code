@@ -36,7 +36,10 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
         handoff.delivery?.nativeThreadId !== nativeThreadId ||
         handoff.delivery.status === "pending",
     );
-    if (pending.length === 0 || (input.deferInline && input.inject === undefined))
+    const inject = pending.some((handoff) => handoff.deliveryMode === "prompt")
+      ? undefined
+      : input.inject;
+    if (pending.length === 0 || (input.deferInline && inject === undefined))
       return { context: "", delivered: Effect.void, unsent: Effect.void };
     const budget = typeof input.budget === "number" ? input.budget : yield* input.budget;
     let coverage = pending
@@ -109,7 +112,7 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
           }),
         { discard: true },
       );
-    if (input.inject !== undefined && nativeThreadId !== undefined) {
+    if (inject !== undefined && nativeThreadId !== undefined) {
       if (
         pending.some(
           (handoff) =>
@@ -120,7 +123,7 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
         return yield* new ContextHandoffDeliveryUncertainError();
       }
       yield* persist("pending");
-      const injected = yield* input.inject({
+      const injected = yield* inject({
         messages: selected.messages,
         context: selected.context,
       });

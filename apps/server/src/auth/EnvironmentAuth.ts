@@ -48,6 +48,7 @@ import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 // ardud:
 import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
+import * as BoardsDatabase from "../ardud/persistence/BoardsDatabase.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -1527,7 +1528,9 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
   Layer.provideMerge(EnvironmentAuthPolicy.layer),
 );
 
-const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
+const layerStorage = Layer.mergeAll(ServerSecretStore.layer, BoardsDatabase.layerConfig).pipe(
+  Layer.provideMerge(SqlitePersistence.layerConfig),
+);
 
 export const layerRuntime = layer.pipe(
   Layer.provideMerge(layerStorage),

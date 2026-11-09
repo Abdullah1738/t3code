@@ -13,7 +13,7 @@ block every later queued message.
 
 ## What a scan does
 
-1. Reads failed runs and failed subagents from `~/.robob/userdata/statev2.sqlite`
+1. Reads failed runs and failed subagents from the server-owned `~/.robob/userdata/readonly/state.sqlite`
    (read-only) and groups them into incidents: a cluster with a stream-lost
    error, or a burst of 3+ subagents failed within 2s with no result.
 2. Waits 90s after the last failure, then per affected thread (failed-run
@@ -24,15 +24,36 @@ block every later queued message.
      `msg_t3_turn_<ses>:<attempt>` / `msg_t3_steer_<ses>:<message>`), replies
      OpenCode made that Robob never showed, orphaned subagents (still running or
      finished after the drop), pending OpenCode forms, and held queued runs;
-   - cancels held queued runs older than 24h before the drop, resumes the
+    - cancels only verified held coordination pulses older than 24h before the drop, resumes the
      thread's queue (`queue.resume` over the Robob WS RPC), and sends one note to
-     the thread (control API, mode auto, idempotent `clientRequestId`) listing
+      the thread (control API, mode queue, idempotent `clientRequestId`) listing
      what it lost and asking it to pick up where it was.
    - iMessage threads get no note; they show up in the Telegram summary.
 3. Sends one Telegram summary per incident (`stream-recovery:<incident id>`).
 
 Handled incidents are recorded in `~/.local/share/stream-recovery/data/state.json`.
 An incident that hit errors is retried on later scans, up to 3 attempts.
+
+`STREAM_RECOVERY_DB` overrides the shared `ROBOB_READONLY_DB`; otherwise the
+server's published snapshot above is used. Live writer paths and their symlink
+or hardlink aliases are rejected before SQLite connects. No missing-snapshot
+fallback exists. Key/value `ardud_readonly_meta` must have `ready='1'`,
+`schema_version='1'` and an ISO `updated_at`
+no older than 45 seconds (export every 15 seconds). A scan checks the opened
+snapshot's metadata and age again before every query and recovery mutation and stops without exhausting
+recovery retries if it expires. `BEGIN` precedes the metadata read, keeping data
+and readiness pinned to the same export. The next scan opens the next complete export.
+Before recovery actions, current control-API shell timestamps must not be newer
+than the export watermark; this also defers an idle Stop that kept the same run ID.
+Both Robob homes (`~/.robob`, `~/.t3`, configured `ROBOB_HOME`/`T3CODE_HOME`)
+and native OpenCode default/XDG database paths are protected, including aliases;
+an arbitrary fixture basename is not blocked.
+Stall detection itself continues to use existing live control/OpenCode APIs;
+interrupts include the expected run ID so a newer run is not stopped instead.
+Missing, not-ready or stale recovery exports do not disable that API-only stall
+pass. It keeps its independent once-a-minute cadence and saves its own progress;
+recovery's `lastScan` advances only on a successful recovery scan. A recovery
+error still produces a nonzero CLI exit and `recoveryError` in JSON output.
 
 ## Restart watch
 
@@ -42,7 +63,7 @@ result. Their wake-ups never come, so parents sit idle or start over. Each scan
 also looks for those:
 
 - Reads `cancelled` provider-native subagents and top-level `cancelled`/`failed`
-  runs (statev2, read-only), plus `interrupted` runs and native subagents whose turn has no
+  runs (replica, read-only), plus `interrupted` runs and native subagents whose turn has no
   `run_interrupt_request` item: an OpenCode crash leaves turns that way (31 Oct, SIGBUS),
   while every Stop writes that item first. Cancelled queued messages and user Stops are excluded. A cluster
   (rows <= 10s apart) is a restart when it has 3+ rows across 2+ top-level
@@ -70,7 +91,7 @@ also looks for those:
   turn), cut, or stale (idle 6h+ before the restart).
 - One note per affected idle thread, including crw and handed-off parents (control API, mode queue,
   `clientRequestId` = incident id) listing title, model, child session, start
-  time, and the original prompt (statev2 `payload.prompt`) or the finished
+  time, and the original prompt (replica `payload.prompt`) or the finished
   result, and asking it to resume each cut one by session id. Handled children
   are still listed so a parent can pass them to its replacement thread. Notes
   explain that macOS boot wipes `$TMPDIR`, including `$TMPDIR/opencode`.
@@ -117,7 +138,8 @@ model stream that died mid tool call and left the session "running" for hours.
   form or permission are never touched, and neither is a parent whose subagent
   session is still active.
 - A stuck session that is its Robob thread's current session is interrupted
-  through Robob (`POST /threads/:id/interrupt`). If OpenCode is still running
+  through Robob (`POST /threads/:id/interrupt`, `expectedRunId` guards the
+  observed run). If OpenCode is still running
   2 min later, it is interrupted in OpenCode directly. When Robob has no run to
   stop, OpenCode is interrupted right away. Subagent sessions, unmapped
   sessions and old sessions of a thread that moved on are interrupted in
@@ -131,6 +153,75 @@ model stream that died mid tool call and left the session "running" for hours.
 - A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob, gets the carry-on note (not crw/iMessage) and one Telegram summary. It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
 
 Stalls are kept in the same state file (`watch`, `stalls`, `servers`, `ghosts`).
+
+## Harness cutover and installer protocol
+
+Recovery reads authenticated `GET /api/ardud/control/harness-cutover/status`:
+
+```json
+{"ok":true,"cutover":{"active":true,"completed":false,"claimedThreadIds":["thread-id"],"claimedRunIds":["source-run-id"]}}
+```
+
+`claimedRuns: [{threadId, runId}]` is also accepted. While active, claimed threads
+get no restart/stream-loss note, stall interruption, or queue release. Retained
+run claims suppress only the old cut runs after completion, not future restarts
+of those threads. Status must expose prepared input claims before ledger creation;
+missing/invalid/unauthorized status fails closed rather than assuming no claims.
+Claims are rechecked before mutation. The server must establish preparation before
+recovery starts, and fence dispatch against its cutover ledger to close a claim
+arriving between the last GET and the mutation.
+
+Only an explicit OpenCode provider binding/selection plus a valid `ses_` ID can
+be a ghost candidate. A stale OpenCode alias on a Claude/Codex selection is not
+OpenCode liveness evidence. Native IDs never reach OpenCode session APIs; native
+child outcomes without a provider-neutral proof are labelled unknown, not cut.
+Robob restart recovery can resume native-only incidents without OpenCode being up.
+Native stall/ghost intervention remains disabled until authoritative native
+progress and guarded interruption are available.
+
+The source-controlled preparation helper uses only control API reads, validates
+the exact stopped-card manifest, and atomically publishes a private version-1
+input. It refuses truncated active-thread lists, missing source run IDs and
+replacement of a different existing input. Run immediately before the installer's
+snapshot/restart, with dispatch already paused/drained by the coordinator:
+
+```bash
+T3_CONTROL_TOKEN_FILE="$HOME/.robob/components/t3ctl.json" \
+  node /Volumes/ExternalSSD/t3code-fork/integrations/stream-recovery/scripts/prepare-cutover.mjs \
+  --stopped-cards /Users/ardud/.robob/reports/perf-arch-20261105/stopped-cards.json
+```
+
+Default output is `~/.robob/harness-cutover-input.json`; use `--output` for a
+non-default server base directory. `--dry-run` validates without writing.
+The input is `{version:1, stoppedCards:[{n,stage,id,thread}],
+interruptedThreads:[{threadId,runId}]}`. Queue-only roots with no current run and
+child threads are not interrupted roots. The helper does not pause dispatch,
+restart, launch turns, change board state, or read a database.
+
+The untracked desktop installer must call the helper **before** its snapshot,
+then classify the pending snapshot before any generic resume:
+
+```bash
+T3_CONTROL_TOKEN_FILE="$HOME/.robob/components/t3ctl.json" \
+  node /Volumes/ExternalSSD/t3code-fork/integrations/stream-recovery/scripts/installer-resume-plan.mjs \
+  "$HOME/.robob/restart-snapshots/pending.json"
+```
+
+Only `resumeThreadIds` may get its generic message. Keep
+`cutoverPendingThreadIds` and `unresolvedThreadIds` in pending.json; remove
+`cutoverCompletedThreadIds` without sending. A nonzero helper exit means no
+generic sends and no clearing pending.json. Preserve source `activeRunId` (or
+`latestRunId` for waiting roots) in the installer snapshot; completed claims
+without a matching source run are unresolved, not permission to resume. Recheck
+the plan immediately before each generic send. The retired Missions endpoint
+is not an ownership check. The helper accepts a second status-fixture path for
+offline installer tests; normal use fetches authenticated status.
+
+Preparation and status claims are required before installing these recovery
+changes. Deploying them against a server without status intentionally holds
+recovery. Existing runtime DB reads in `lib/io.mjs` are unchanged by this protocol;
+the separate read-replica/API migration must remove those before live use under
+the new storage architecture.
 
 ## Commands
 

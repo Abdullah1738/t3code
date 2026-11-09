@@ -603,10 +603,24 @@ it.effect("shell failure lookups stay on the thread's own turn items", () =>
       shellQuery![1],
     );
     const itemLookups = plan.filter((row) => row.detail.startsWith("SEARCH item "));
-    assert.lengthOf(itemLookups, 2);
-    assert.isTrue(itemLookups.every((row) => row.detail.includes("turn_items_failed_error_idx")));
+    assert.lengthOf(itemLookups, 6);
+    // Terminal and blocking failures each probe hot, archive and base storage.
+    assert.deepEqual(
+      itemLookups.map((row) => row.detail),
+      [
+        "orchestration_v2_projection_turn_items_failed_error_idx",
+        "ardud_turn_items_failed_error_idx",
+        "orchestration_v2_projection_turn_items_failed_error_idx",
+        "orchestration_v2_projection_turn_items_failed_error_idx",
+        "ardud_turn_items_failed_error_idx",
+        "orchestration_v2_projection_turn_items_failed_error_idx",
+      ].map((index) => `SEARCH item USING INDEX ${index} (thread_id=? AND run_id=? AND node_id=?)`),
+    );
     const secretLookups = plan.filter((row) => row.detail.startsWith("SEARCH secret "));
     assert.lengthOf(secretLookups, 1);
     assert.include(secretLookups[0]!.detail, "turn_items_thread_run_idx");
+    for (const row of plan) {
+      assert.notMatch(row.detail, /^SCAN (?:item|secret)(?:$| )/);
+    }
   }).pipe(Effect.provide(layerSql)),
 );

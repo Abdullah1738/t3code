@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 
 import { MAX_BATCH } from "./rules.ts";
+import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
 import { subtaskIds, subtaskLines } from "./subtasks.ts";
 
 const lines = (...parts: ReadonlyArray<string | null | false | undefined>) =>
@@ -203,6 +204,7 @@ export const reviewBrief = (
     board.instructions.reviewerRouting.trim()
       ? `\nReviewer routing instructions:\n${board.instructions.reviewerRouting.trim()}`
       : null,
+    `\n${REVIEW_DELEGATION_GUIDANCE}`,
   );
 };
 
@@ -295,6 +297,7 @@ export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
     board.instructions.modelRouting.trim()
       ? `Model routing:\n${board.instructions.modelRouting.trim()}\n`
       : null,
+    REVIEW_DELEGATION_GUIDANCE,
     board.instructions.escalation.trim()
       ? `When to ask the owner:\n${board.instructions.escalation.trim()}\n`
       : null,

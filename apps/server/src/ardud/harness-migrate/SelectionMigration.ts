@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
-import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import type {
   CommandId,
   KanbanBoard,
@@ -261,7 +261,7 @@ interface Plans {
  * has no other owner.
  */
 export const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   const settings = yield* ServerSettingsService.ServerSettingsService;
   const projects = yield* ProjectService.ProjectService;
   const kanban = yield* KanbanService.KanbanService;
@@ -280,8 +280,10 @@ export const make = Effect.gen(function* () {
     return CommandIdSchema.make(`harness-migrate:${label}:${uuid}`);
   });
 
-  yield* sql.unsafe(LEDGER_DDL).pipe(Effect.mapError((cause) => migrationError("create ledger", cause)));
-  yield* sql.unsafe(LEDGER_INDEX).pipe(Effect.mapError((cause) => migrationError("index ledger", cause)));
+  yield* BoardsDatabase.initialize(Effect.gen(function* () {
+    yield* sql.unsafe(LEDGER_DDL).pipe(Effect.mapError((cause) => migrationError("create ledger", cause)));
+    yield* sql.unsafe(LEDGER_INDEX).pipe(Effect.mapError((cause) => migrationError("index ledger", cause)));
+  }));
 
   const readSettings: Effect.Effect<ServerSettings, SelectionMigrationError> = settings.getSettings.pipe(
     Effect.mapError((cause) => migrationError("read settings", cause)),

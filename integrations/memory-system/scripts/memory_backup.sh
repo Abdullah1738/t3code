@@ -138,15 +138,15 @@ for pat in sys.argv[2:]:
 PY
 ) || log "retired replicas not removed: $(printf '%s' "$out" | tail -1)"
 [ -n "$out" ] && log "$(printf '%s' "$out" | tr '\n' ' ')"
-# Robob state: only the small tables nothing else backs up (schedules, projects,
-# session board, OpenCode import map, thread origins, thread/subagent index), plus
-# the retired missions' tables (ardud_mission_*), kept in the DB as an archive.
+# Robob state comes only from the server-owned export. This is not a complete
+# control-data backup unless that export includes every table below.
 # A name with % is a LIKE pattern (sqlite .dump takes them).
-# The full DB is ~70 GB of event log and message projections rebuilt from the
-# OpenCode/Muse sessions that memory.db and opencode_raw.db already hold; it
-# added 2-4 GB to restic every run. .dump reads in one transaction (~2 s).
-# Restore: sqlite3 new.sqlite < robob-state.sql. Skipped until Robob is installed.
-ROBOB_DB="${ROBOB_STATE_DB:-$HOME/.robob/userdata/statev2.sqlite}"
+# Restore: sqlite3 new.sqlite < robob-state.sql. Missing export fails closed.
+ROBOB_DB=$(/opt/homebrew/bin/python3 "$ROOT/src/robob_readonly.py" 2>&1) \
+  || fail replica "robob-state.sql: $ROBOB_DB"
+[ -f "$ROBOB_DB" ] || fail replica "Robob read-only replica missing: $ROBOB_DB"
+ROBOB_GENERATION=$(/opt/homebrew/bin/python3 "$ROOT/src/robob_readonly.py" --generation 2>&1) \
+  || fail replica "robob-state.sql: $ROBOB_GENERATION"
 ROBOB_TABLES="scheduled_tasks projection_projects ardud_board_% ardud_kanban_% ardud_mission_%
   ardud_opencode_import ardud_opencode_import_state ardud_thread_origin
   orchestration_v2_projection_threads orchestration_v2_projection_provider_threads
@@ -156,6 +156,9 @@ if [ -f "$ROBOB_DB" ]; then
   out=$("$SQLITE" -readonly -bail "$ROBOB_DB" ".output '$STAGE/robob-state.sql.tmp'" \
     ".dump $(echo $ROBOB_TABLES)" 2>&1) || fail replica "robob-state.sql: $out"
   [ -z "$out" ] || fail replica "robob-state.sql: $out"
+  after=$(/opt/homebrew/bin/python3 "$ROOT/src/robob_readonly.py" --generation 2>&1) \
+    || fail replica "robob-state.sql: $after"
+  [ "$after" = "$ROBOB_GENERATION" ] || fail replica "robob-state.sql: replica refreshed during dump; retry next run"
   # Check, then move into place. A table Robob renamed or dropped is skipped by
   # .dump; it's logged as missing, not a failure.
   out=$(/opt/homebrew/bin/python3 - "$STAGE" $ROBOB_TABLES <<'PY' 2>&1

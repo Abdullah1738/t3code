@@ -12,6 +12,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+
 export class ControlStoreError extends Schema.TaggedError<ControlStoreError>()(
   "ControlStoreError",
   { operation: Schema.String, cause: Schema.Defect() },
@@ -85,30 +87,35 @@ const chunks = <A>(values: ReadonlyArray<A>): ReadonlyArray<ReadonlyArray<A>> =>
 
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const controlSql = yield* BoardsDatabase.client;
   const fail = (operation: string) => (cause: unknown) =>
     new ControlStoreError({ operation, cause });
 
-  yield* sql`
+  yield* BoardsDatabase.initialize(
+    Effect.gen(function* () {
+      yield* controlSql`
     CREATE TABLE IF NOT EXISTS ardud_thread_origin (
       thread_id   TEXT PRIMARY KEY,
       origin      TEXT NOT NULL,
       created_at  TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-thread-origin")));
-  yield* sql`
+      yield* controlSql`
     CREATE TABLE IF NOT EXISTS ardud_opencode_import (
       native_session_id TEXT PRIMARY KEY,
       thread_id         TEXT NOT NULL UNIQUE,
       imported_at       TEXT NOT NULL
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import")));
+    }),
+  );
 
   const getOrigins: ControlStoreShape["getOrigins"] = (threadIds) =>
     Effect.forEach(
       chunks([...new Set(threadIds)]),
       (ids) =>
-        sql<{ readonly thread_id: string; readonly origin: string }>`
-          SELECT thread_id, origin FROM ardud_thread_origin WHERE thread_id IN ${sql.in(ids)}
+        controlSql<{ readonly thread_id: string; readonly origin: string }>`
+          SELECT thread_id, origin FROM ardud_thread_origin WHERE thread_id IN ${controlSql.in(ids)}
         `,
       { concurrency: 1 },
     ).pipe(
@@ -120,19 +127,21 @@ export const make = Effect.gen(function* () {
   const getOrigin: ControlStoreShape["getOrigin"] = (threadId) =>
     getOrigins([threadId]).pipe(Effect.map((origins) => origins.get(threadId) ?? null));
 
-  const setOrigin: ControlStoreShape["setOrigin"] = (threadId, origin) =>
-    Effect.gen(function* () {
+  const setOrigin: ControlStoreShape["setOrigin"] = Effect.fn("ControlStore.setOrigin")(
+    function* (threadId, origin) {
       if (origin === null) {
-        yield* sql`DELETE FROM ardud_thread_origin WHERE thread_id = ${threadId}`;
+        yield* controlSql`DELETE FROM ardud_thread_origin WHERE thread_id = ${threadId}`;
         return;
       }
       const now = DateTime.formatIso(yield* DateTime.now);
-      yield* sql`
+      yield* controlSql`
         INSERT INTO ardud_thread_origin (thread_id, origin, created_at)
         VALUES (${threadId}, ${origin}, ${now})
         ON CONFLICT(thread_id) DO UPDATE SET origin = excluded.origin
       `;
-    }).pipe(Effect.mapError(fail("write-origin")));
+    },
+    Effect.mapError(fail("write-origin")),
+  );
 
   const threadIdForNativeSession: ControlStoreShape["threadIdForNativeSession"] = Effect.fn(
     "ControlStore.threadIdForNativeSession",
@@ -140,7 +149,7 @@ export const make = Effect.gen(function* () {
     function* (nativeId, driver) {
       const imported =
         driver === undefined || driver === "opencode"
-          ? yield* sql<{ readonly thread_id: string }>`
+          ? yield* controlSql<{ readonly thread_id: string }>`
               SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
             `
           : [];

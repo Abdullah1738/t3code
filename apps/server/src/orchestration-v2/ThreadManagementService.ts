@@ -2,6 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   mergeSelection,
+  postCutoverSelectionProblem,
   resolveSelection,
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import type {
@@ -47,6 +48,7 @@ import {
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
+import { runningBackgroundWork } from "../ardud/context-reset/backgroundWork.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -383,6 +385,8 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
+    readonly afterThreadId?: string;
+    readonly limit?: number;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
@@ -701,6 +705,7 @@ const make = Effect.gen(function* () {
     "orchestrationV2.threadManagement.dispatchWithSelectionMigration",
   )(function* (
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
+    options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
   ) {
     yield* ensureCommandTranscripts(command);
 
@@ -723,6 +728,27 @@ const make = Effect.gen(function* () {
     if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
     const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
     if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    if (options.cutoverComplete && command.modelSelection !== undefined) {
+      const reason = postCutoverSelectionProblem(command.modelSelection);
+      // ardud: idle threads keep their OpenCode selection until their next turn, and the composer
+      // sends the thread's own selection explicitly. That is the inherited case; migrate it below.
+      const ownSelection =
+        reason !== null &&
+        options.migrate &&
+        modelSelectionsEqual(
+          command.modelSelection,
+          (yield* orchestrator.getThreadRecords(command.threadId, [])).thread.modelSelection,
+        );
+      if (reason !== null && !ownSelection) {
+        return yield* new Orchestrator.OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: reason,
+        });
+      }
+    }
+    if (!options.migrate) return yield* dispatchUnchanged(command);
 
     const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
     const stored = projection.thread.modelSelection;
@@ -785,7 +811,13 @@ const make = Effect.gen(function* () {
       resolvedStored.kind !== "conflict" &&
       !modelSelectionsEqual(stored, resolvedStored.selection)
     ) {
-      const { thread, runs } = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
+      const quiet = yield* orchestrator.getThreadRecords(command.threadId, [
+        "runs",
+        "runtimeRequests",
+        "providerThreads",
+        "subagents",
+      ]);
+      const { thread, runs } = quiet;
       if (isProviderNativeSubagentThread(thread)) {
         return yield* new Orchestrator.OrchestratorSubagentThreadReadOnlyError({
           commandId: command.commandId,
@@ -804,12 +836,18 @@ const make = Effect.gen(function* () {
       if (
         thread.deletedAt !== null ||
         thread.archivedAt !== null ||
-        runs.some((run) => isActiveRun(run) || run.status === "queued")
+        runs.some((run) => isActiveRun(run) || run.status === "queued") ||
+        quiet.runtimeRequests.some((request) => request.status === "pending") ||
+        runningBackgroundWork(quiet).length > 0
       ) {
+        // ardud: after cutover a busy thread keeps working where it is; this turn runs (or
+        // queues) on its current harness and the thread moves on its first turn that starts idle.
+        if (options.cutoverComplete) return yield* dispatchUnchanged(command);
         return yield* new Orchestrator.OrchestratorCommandRejectedError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "Cannot migrate an archived or deleted thread, or one with active or queued runs.",
+          cause:
+            "Cannot migrate an archived or deleted thread, or one with active or queued runs, pending requests or background work.",
         });
       }
       yield* orchestrator.dispatch({
@@ -841,13 +879,17 @@ const make = Effect.gen(function* () {
     return serverSettings.getSettings.pipe(
       Effect.orDie,
       Effect.flatMap((settings) => {
-        if (settings.ardudHarnessMigration?.selections !== "apply") {
+        const migrate =
+          settings.ardudHarnessMigration?.selections === "apply" ||
+          settings.ardudHarnessMigration?.threadIds?.includes(command.threadId) === true;
+        const cutoverComplete = settings.ardudHarnessMigration?.cutoverComplete === true;
+        if (!migrate && !cutoverComplete) {
           return dispatchUnchanged(command);
         }
         return selectionDispatchLock.withLock(
           command.threadId,
           command.type === "message.dispatch"
-            ? dispatchWithSelectionMigration(command)
+            ? dispatchWithSelectionMigration(command, { migrate, cutoverComplete })
             : dispatchUnchanged(command),
         );
       }),

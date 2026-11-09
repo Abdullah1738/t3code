@@ -93,6 +93,17 @@ TOOLS = {
         "native": "@openai/codex",  # darwin build is published as <v>-darwin-arm64
         "native_suffix": "-darwin-arm64",
         "binary_in_native": "package/vendor/aarch64-apple-darwin/bin/codex",
+        # Staged with the package's own layout (CodexInstallation.ts checks the same three
+        # paths): bin/codex, bin/codex-code-mode-host, codex-path/rg. Codex runs every tool
+        # call through code mode, which spawns the host as a sibling of its executable, so the
+        # host is required. Codex looks for its bundled ripgrep under codex-path/ and falls
+        # back to rg on PATH, so a package without it still stages (warned, recorded as null).
+        # `source` is relative to the binary's directory in the package; `dest` to <version>/.
+        "companions": [
+            {"name": "codex-code-mode-host", "source": "codex-code-mode-host",
+             "dest": "bin/codex-code-mode-host", "required": True},
+            {"name": "rg", "source": "../codex-path/rg", "dest": "codex-path/rg", "required": False},
+        ],
         "version_flag": ["--version"],
         "version_regex": r"codex-cli\s+(\d+\.\d+\.\d+)",
         "minimum_model_key": "codex",
@@ -114,7 +125,7 @@ CLAUDE_MODEL_IDS = {
     "claude-haiku-5-5": "cc/claude-haiku-5-5",
 }
 DEFAULT_TIMEOUT = 600
-CANARY_SCHEMA_VERSION = 6
+CANARY_SCHEMA_VERSION = 7
 CODEX_OBSERVATION_SECONDS = 120
 SANDBOX_SYSTEM_READ_ROOTS = ("/System", "/usr", "/bin", "/dev", "/private/etc",
                              "/private/var/db", "/private/var/run", "/private/var/protected")
@@ -423,6 +434,26 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         bin_dir.mkdir(parents=True)
         final_bin = bin_dir / ("claude" if tool == "claude" else "codex")
         shutil.copy2(binary, final_bin)
+        executables = {final_bin}
+        companions: dict[str, str | None] = {}
+        warnings: list[str] = []
+        for spec in companion_specs(tool):
+            source = (binary.parent / spec["source"]).resolve()
+            if extract.resolve() not in source.parents:
+                raise HarnessError(f"{tool}: companion {spec['source']} resolves outside the package")
+            if not source.is_file():
+                if spec["required"]:
+                    raise HarnessError(f"{tool}: companion {spec['source']} not in the package")
+                warning = f"{tool} {version}: optional companion {spec['name']} not in the package; recorded as null"
+                print(f"warning: {warning}", file=sys.stderr)
+                warnings.append(warning)
+                companions[spec["name"]] = None
+                continue
+            dest = final / spec["dest"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+            executables.add(dest)
+            companions[spec["name"]] = sha256_file(dest)
         digest = sha256_file(final_bin)
         tool_dir(tool).mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -430,10 +461,12 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         # Rename while still writable (macOS needs write on the directory being moved), then lock
         # the tree read-only at its final place. The version dir never appears half-written.
         os.rename(final, target)
+        executable_rel = {p.relative_to(final) for p in executables}
         for dirpath, dirs, files in os.walk(target, topdown=False):
             for name in files:
                 full = Path(dirpath) / name
-                os.chmod(full, 0o555 if full == target / "bin" / final_bin.name else 0o444)
+                executable = full.relative_to(target) in executable_rel
+                os.chmod(full, 0o555 if executable else 0o444)
             for name in dirs:
                 os.chmod(Path(dirpath) / name, 0o555)
         os.chmod(target, 0o555)
@@ -441,12 +474,179 @@ def stage(tool: str, version: str, *, work_root: Path | None = None) -> dict:
         state[tool]["candidate"] = version
         save_state(state)
         result = {"tool": tool, "version": version, "dir": str(target),
-                  "binary": str(target / "bin" / final_bin.name), "sha512": actual, "binarySha256": digest}
+                  "binary": str(target / "bin" / final_bin.name), "sha512": actual, "binarySha256": digest,
+                  "companions": companions}
+        extra = {"warnings": warnings} if warnings else {}
         write_record("stage", tool, version, "staged", binarySha256=digest, integrity=actual,
-                     harnessHomes=harness_home_hashes())
+                     companions=companions,
+                     harnessHomes=harness_home_hashes(), **extra)
         return result
     finally:
         remove_tree(temp_root)
+
+
+def companion_specs(tool: str) -> list[dict]:
+    return list(TOOLS[tool].get("companions", []))
+
+
+def tool_records(tool: str, version: str) -> list[dict]:
+    if not records_path().exists():
+        return []
+    out = []
+    for line in records_path().read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("tool") == tool and record.get("version") == version:
+            out.append(record)
+    return out
+
+
+def recorded_companions(tool: str, version: str) -> dict | None:
+    """The companion hashes from the latest stage or repair record for this version, or None."""
+    found = None
+    for record in tool_records(tool, version):
+        if record.get("action") in ("stage", "repair-companions") and isinstance(record.get("companions"), dict):
+            found = record["companions"]
+    return found
+
+
+def recorded_binary_sha(tool: str, version: str) -> str | None:
+    """The latest binary sha256 any step recorded for this version (stage, repair, canary, promote)."""
+    found = None
+    for record in tool_records(tool, version):
+        if record.get("action") in ("stage", "repair-companions", "canary", "promote") \
+                and isinstance(record.get("binarySha256"), str):
+            found = record["binarySha256"]
+    return found
+
+
+def verify_companions(tool: str, version: str) -> dict:
+    """Check each companion on disk against the recorded hashes. Returns the verified hashes.
+
+    A required companion must be recorded and present with its hash. An optional one recorded as
+    null is accepted; recorded with a hash, it must be present at its package path and match.
+    """
+    specs = companion_specs(tool)
+    if not specs:
+        return {}
+    recorded = recorded_companions(tool, version)
+    if recorded is None:
+        raise HarnessError(f"{tool} {version}: no companion hashes recorded; re-stage this version")
+    target = version_dir(tool, version)
+    verified: dict[str, str | None] = {}
+    for spec in specs:
+        name = spec["name"]
+        if name not in recorded:
+            raise HarnessError(f"{tool} {version}: companion {name} is not in the record; "
+                               f"run `harness_cli.py repair-companions {tool} {version}` or re-stage")
+        expected = recorded[name]
+        path = target / spec["dest"]
+        if expected is None:
+            if spec["required"]:
+                raise HarnessError(f"{tool} {version}: required companion {name} is recorded as missing")
+            verified[name] = None
+            continue
+        if not path.is_file():
+            hint = (f"; run `harness_cli.py repair-companions {tool} {version}`"
+                    if (target / "bin" / name).is_file() and spec["dest"] != f"bin/{name}" else "")
+            raise HarnessError(f"{tool} {version}: companion {name} missing at {spec['dest']}{hint}")
+        if sha256_file(path) != expected:
+            raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+        verified[name] = expected
+    return verified
+
+
+def _restore_read_only(target: Path, executables: set[Path]) -> None:
+    for dirpath, dirs, files in os.walk(target, topdown=False):
+        for name in files:
+            full = Path(dirpath) / name
+            os.chmod(full, 0o555 if full in executables or full.parent == target / "bin" else 0o444)
+        for name in dirs:
+            os.chmod(Path(dirpath) / name, 0o555)
+    os.chmod(target, 0o555)
+
+
+def repair_companions(tool: str, version: str) -> dict:
+    """Move companions staged by the old flat layout (bin/<name>) to their package paths.
+
+    Idempotent: a tree that already verifies is left alone and gets no new record. Refuses when
+    the binary or any companion differs from its record, so it can only rearrange recorded bytes.
+    """
+    if tool not in TOOLS:
+        raise HarnessError(f"unknown tool {tool}")
+    specs = companion_specs(tool)
+    if not specs:
+        raise HarnessError(f"{tool} has no companions to repair")
+    target = version_dir(tool, version)
+    binary = target / "bin" / ("claude" if tool == "claude" else "codex")
+    if not binary.is_file():
+        raise HarnessError(f"{version} is not staged")
+    expected_bin = recorded_binary_sha(tool, version)
+    if not expected_bin or sha256_file(binary) != expected_bin:
+        raise HarnessError(f"{tool} {version}: staged binary differs from its record; refusing to repair")
+    recorded = recorded_companions(tool, version)
+    if recorded is None:
+        raise HarnessError(f"{tool} {version}: no companion hashes recorded; re-stage this version")
+    moves: list[tuple[Path, Path]] = []
+    for spec in specs:
+        name = spec["name"]
+        expected = recorded.get(name)
+        dest = target / spec["dest"]
+        legacy = target / "bin" / name
+        if dest.is_file():
+            if expected is None or sha256_file(dest) != expected:
+                raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+            continue
+        if expected is None:
+            if spec["required"]:
+                raise HarnessError(f"{tool} {version}: required companion {name} is missing and unrecorded")
+            continue
+        if legacy == dest or not legacy.is_file():
+            raise HarnessError(f"{tool} {version}: companion {name} missing at {spec['dest']} and "
+                               f"bin/{name}; re-stage this version")
+        if sha256_file(legacy) != expected:
+            raise HarnessError(f"{tool} {version}: bin/{name} differs from its recorded sha256")
+        moves.append((legacy, dest))
+    if not moves:
+        return {"tool": tool, "version": version, "status": "already-ok", "companions": verify_companions(tool, version)}
+    executables = {binary}
+    try:
+        os.chmod(target, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        os.chmod(target / "bin", stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        for legacy, dest in moves:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(dest.parent, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            os.rename(legacy, dest)  # same filesystem: atomic, bytes unchanged
+            executables.add(dest)
+        for spec in specs:
+            path = target / spec["dest"]
+            if path.is_file():
+                executables.add(path)
+    finally:
+        _restore_read_only(target, executables)
+    companions = verify_companions_on_disk(tool, version, recorded)
+    write_record("repair-companions", tool, version, "companions-repaired", binarySha256=expected_bin,
+                 companions=companions, moved=[str(d.relative_to(target)) for _, d in moves],
+                 harnessHomes=harness_home_hashes())
+    verify_companions(tool, version)
+    return {"tool": tool, "version": version, "status": "repaired",
+            "moved": [str(d.relative_to(target)) for _, d in moves], "companions": companions}
+
+
+def verify_companions_on_disk(tool: str, version: str, recorded: dict) -> dict:
+    target = version_dir(tool, version)
+    out: dict[str, str | None] = {}
+    for spec in companion_specs(tool):
+        path = target / spec["dest"]
+        expected = recorded.get(spec["name"])
+        if expected is None:
+            out[spec["name"]] = None
+            continue
+        if not path.is_file() or sha256_file(path) != expected:
+            raise HarnessError(f"{tool} {version}: companion {spec['dest']} differs from its recorded sha256")
+        out[spec["name"]] = expected
+    return out
 
 
 def remove_tree(path: Path) -> None:
@@ -900,6 +1100,23 @@ def claude_project_slug(project_dir: Path) -> str:
 
 
 THINKING_CANARY_WORD = "ROBOB-THINK-4417"
+CLAUDE_THINKING_ATTEMPTS = 2
+THINKING_CANARY_PROMPT = (
+    f"Remember the code {THINKING_CANARY_WORD}. Solve both problems without tools: "
+    "(1) How many length-24 binary strings contain exactly nine ones with no adjacent ones? "
+    "(2) What is 17^123 modulo 1009? Check the counting argument and modular arithmetic "
+    "carefully before answering. Reply only in the form: OK <count> <remainder>."
+)
+
+
+def claude_thinking_settings_checked(records: list[dict]) -> bool:
+    """Verify CLI flags reached the wire, rather than assuming a silent flag was honored."""
+    primary = [r["body"] for r in records if isinstance(r.get("body"), dict)
+               and THINKING_CANARY_PROMPT in json.dumps(r["body"])]
+    return bool(primary) and all(
+        isinstance(body.get("thinking"), dict) and body["thinking"].get("type") == "adaptive"
+        and isinstance(body.get("output_config"), dict) and body["output_config"].get("effort") == "max"
+        for body in primary)
 
 
 def thinking_replay_check(first_turn: list[dict], second_turn: list[dict]) -> dict:
@@ -951,8 +1168,8 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
 
     Memory: the seed is written for the project dir the CLI runs in, and the marker must be absent
     from every request body. Thinking: turn 1 (one session) produces a thinking block; turn 2 (the
-    same session) must send that block back with its signature, and must carry no
-    input_transformations. A gateway that drops the thinking blocks fails promotion here.
+    same session) must send that block back with its signature, and its response must explicitly
+    report empty input_transformations. A gateway that drops thinking fails promotion here.
 
     The context-management edits and the anthropic-beta header are recorded as informational
     diagnostics only; they never fail the canary.
@@ -979,24 +1196,40 @@ def canary_claude(binary: Path, version: str, work: Path, key_present: bool) -> 
         env = claude_env(home, cdir, base)
         model = "claude-opus-5-5"
         routed = CLAUDE_MODEL_IDS[model]
-        session_id = str(uuid_for(work))
-        turn1 = run_cli(binary, ["-p", f"Remember the code {THINKING_CANARY_WORD}. Think it through briefly, "
-                                 "then reply with the single word OK.", "--model", routed,
-                                 "--effort", "high", "--thinking", "adaptive", "--thinking-display", "summarized",
-                                 "--session-id", session_id, "--output-format", "text"],
-                        env=env, timeout=240, cwd=project, sandbox_root=work, recorder_url=base)
-        turn1_ok = turn1.returncode == 0 and "OK" in turn1.stdout
-        first_turn = list(recorder.requests)
-        boundary = len(first_turn)
-        turn2 = run_cli(binary, ["-p", "What code did I ask you to remember? Reply with the code only.",
-                                 "--model", routed, "--effort", "high", "--thinking", "adaptive",
-                                 "--thinking-display", "summarized", "--resume", session_id,
-                                 "--output-format", "text"], env=env, timeout=240, cwd=project,
-                        sandbox_root=work, recorder_url=base)
-        turn2_ok = turn2.returncode == 0 and THINKING_CANARY_WORD in turn2.stdout
+        attempts = []
+        for attempt in range(CLAUDE_THINKING_ATTEMPTS):
+            session_id = uuid_for(work / f"thinking-{attempt}")
+            start = len(recorder.requests)
+            turn1 = run_cli(binary, ["-p", THINKING_CANARY_PROMPT, "--model", routed,
+                                     "--effort", "max", "--thinking", "adaptive", "--thinking-display", "summarized",
+                                     "--session-id", session_id, "--output-format", "text"],
+                            env=env, timeout=240, cwd=project, sandbox_root=work, recorder_url=base)
+            turn1_ok = turn1.returncode == 0 and "OK 11440 407" in turn1.stdout
+            first_turn = list(recorder.requests[start:])
+            boundary = len(recorder.requests)
+            blocks = [b for rec in first_turn for b in rec.get("response_thinking", [])]
+            settings_checked = claude_thinking_settings_checked(first_turn)
+            if turn1_ok and first_turn and not blocks:
+                attempts.append({"status": "inconclusive", "turn1ThinkingBlocks": 0,
+                                 "settingsChecked": settings_checked})
+                if attempt + 1 < CLAUDE_THINKING_ATTEMPTS:
+                    continue
+            turn2 = run_cli(binary, ["-p", "What code did I ask you to remember? Reply with the code only.",
+                                     "--model", routed, "--effort", "max", "--thinking", "adaptive",
+                                     "--thinking-display", "summarized", "--resume", session_id,
+                                     "--output-format", "text"], env=env, timeout=240, cwd=project,
+                            sandbox_root=work, recorder_url=base)
+            turn2_ok = turn2.returncode == 0 and THINKING_CANARY_WORD in turn2.stdout
+            preserved = thinking_replay_check(first_turn, recorder.requests[boundary:])
+            if blocks or not turn1_ok or not first_turn:
+                attempts.append({"status": "passed" if turn1_ok and turn2_ok and settings_checked
+                                 and preserved["thinkingReplayed"] and preserved["inputTransformationsEmpty"]
+                                 else "failed", "turn1ThinkingBlocks": len(blocks), "settingsChecked": settings_checked})
+            break
         results[model] = {"ok": turn1_ok and turn2_ok, "turn1Ok": turn1_ok, "turn2Ok": turn2_ok}
-        # The recorder keeps every upstream request and the thinking blocks each reply returned.
-        preserved = thinking_replay_check(first_turn, recorder.requests[boundary:])
+        results["thinkingAttempts"] = attempts
+        results["thinkingInconclusive"] = any(a["status"] == "inconclusive" for a in attempts)
+        results["thinkingSettingsChecked"] = all(a["settingsChecked"] for a in attempts)
         results["thinking"] = preserved
         results["thinkingCheckChecked"] = bool(first_turn and recorder.requests[boundary:])
         results["thinkingReplayed"] = preserved["thinkingReplayed"]
@@ -1076,8 +1309,118 @@ def codex_memory_snapshot(chome: Path) -> dict[str, str]:
                 relative = str(path.relative_to(chome))
                 if path.is_symlink():
                     raise HarnessError("memory fixture contains a symlink")
+                # SQLite rotates WAL/SHM files while connections open/close. Hashing them races
+                # unlink and says nothing about jobs; persistent audit triggers inspect commits.
+                if relative in {db + suffix for db in CODEX_MEMORY_DATABASES for suffix in ("", "-wal", "-shm")}:
+                    snapshot[relative] = "sqlite-store"
+                    continue
                 snapshot[relative] = "directory" if path.is_dir() else sha256_file(path)
     return snapshot
+
+
+CODEX_MEMORY_SOURCE = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
+CODEX_MEMORY_DATABASES = ("memories_1.sqlite", "memories_v2_1.sqlite")
+CODEX_MEMORY_MIGRATIONS = (
+    ("0001_memories.sql", "a1af50da50775a70f98da680006b7df4501956753ae98511ab727aa295915d9ae6f4190b4eaa5abc4fd7891642f7d21d"),
+    ("0002_consolidation_progress.sql", "18f0a8dd7fe9a847b30d719029066d7a78e0bc64310dc66e4f7708bad6f1a0a594c0dbd14fec1ccb410cd7ae75dd7b10"),
+)
+
+
+class CodexMemoryAudit:
+    """Persistent triggers cover even insert+delete between polls in the disposable stores.
+
+    StateRuntime opens/migrates v1 unconditionally, even with features.memories=false.
+    Startup jobs are gated separately (Codex 0.166.0 state/src/runtime.rs and
+    memories/write/src/start.rs). A claimed job commits before extraction; cleanup may
+    delete it later, so final row counts alone are insufficient. Audit both v1 and v2.
+    """
+
+    def __init__(self, chome: Path, version: str):
+        import sqlite3
+        from contextlib import closing
+        if version != "0.166.0":
+            raise HarnessError("Codex memory audit schema has not been verified for this version")
+        self.home = chome
+        self.nonce = uuid.uuid4().hex
+        self.identities = {}
+        self.schemas = {}
+        self.migrations = []
+        source = Path(__file__).resolve().parent / "vendor" / "codex-memory-0.166.0"
+        for name, checksum in CODEX_MEMORY_MIGRATIONS:
+            sql = (source / name).read_bytes()
+            if hashlib.sha384(sql).hexdigest() != checksum:
+                raise HarnessError("Codex memory audit migration checksum mismatch")
+            self.migrations.append((int(name[:4]), name[5:-4].replace("_", " "), bytes.fromhex(checksum), sql.decode()))
+        for name in CODEX_MEMORY_DATABASES:
+            db = chome / name
+            if db.exists():
+                raise HarnessError("Codex audit requires fresh disposable memory databases")
+            with closing(sqlite3.connect(db)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY,
+                    description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)""")
+                for number, description, checksum, sql in self.migrations:
+                    conn.executescript(sql)
+                    conn.execute("INSERT INTO _sqlx_migrations (version,description,success,checksum,execution_time) VALUES (?,?,1,?,0)",
+                                 (number, description, checksum))
+                    conn.commit()
+                conn.execute("CREATE TABLE robob_canary_identity (nonce TEXT NOT NULL)")
+                conn.execute("INSERT INTO robob_canary_identity VALUES (?)", (self.nonce,))
+                conn.execute("CREATE TABLE robob_canary_activity (table_name TEXT NOT NULL, operation TEXT NOT NULL)")
+                for table in ("jobs", "stage1_outputs", "consolidation_progress"):
+                    for operation in ("INSERT", "UPDATE", "DELETE"):
+                        conn.execute(f"""CREATE TRIGGER robob_canary_{table}_{operation.lower()}
+                            AFTER {operation} ON {table} BEGIN
+                            INSERT INTO robob_canary_activity VALUES ('{table}', '{operation}'); END""")
+                # Verify that this connection really fires persistent triggers before arming.
+                conn.execute("UPDATE consolidation_progress SET max_thread_count=0")
+                if conn.execute("SELECT COUNT(*) FROM robob_canary_activity").fetchone()[0] != 1:
+                    raise HarnessError("Codex memory audit could not be armed")
+                conn.execute("DELETE FROM robob_canary_activity")
+                conn.commit()
+                self.schemas[name] = self.schema(conn)
+            st = db.stat()
+            self.identities[name] = (st.st_dev, st.st_ino)
+
+    @staticmethod
+    def schema(conn) -> list:
+        return conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+
+    def read(self) -> dict:
+        import sqlite3
+        from contextlib import closing
+        stores = {}
+        try:
+            for name in CODEX_MEMORY_DATABASES:
+                db = self.home / name
+                st = db.stat()
+                if db.is_symlink() or (st.st_dev, st.st_ino) != self.identities[name]:
+                    raise HarnessError("Codex memory audit database was replaced")
+                with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+                    conn.execute("BEGIN")
+                    if self.schema(conn) != self.schemas[name] or conn.execute(
+                            "SELECT nonce FROM robob_canary_identity").fetchall() != [(self.nonce,)]:
+                        raise HarnessError("Codex memory audit identity or schema changed")
+                    migrations = conn.execute("SELECT version,description,checksum,success FROM _sqlx_migrations ORDER BY version").fetchall()
+                    if migrations != [(n, d, c, 1) for n, d, c, _ in self.migrations]:
+                        raise HarnessError("Codex memory audit migrations changed")
+                    counts = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                              for table in ("jobs", "stage1_outputs")}
+                    activity = {table: count for table, count in conn.execute(
+                        "SELECT table_name,COUNT(*) FROM robob_canary_activity GROUP BY table_name")}
+                    progress = conn.execute("SELECT singleton,max_thread_count FROM consolidation_progress").fetchall()
+                    stores[name] = {"rowCounts": counts, "activity": activity,
+                                    "consolidationProgress": [list(row) for row in progress]}
+        except (OSError, sqlite3.Error) as exc:
+            raise HarnessError("Codex memory audit could not be inspected") from exc
+        return {"method": "sqlite-triggers-v1", "sourceCommit": CODEX_MEMORY_SOURCE,
+                "identityVerified": True, "stores": stores}
+
+
+def codex_audit_evidence(audit: dict) -> list[str]:
+    return sorted(f"{name}:audit:{table}" for name, store in audit["stores"].items()
+                  for table, count in store["activity"].items() if count)
 
 
 def seed_codex_rollout(chome: Path, work: Path, version: str) -> str:
@@ -1122,7 +1465,7 @@ def codex_memory_pipeline_evidence(chome: Path, baseline: dict[str, str], after:
     changed = [p for p in set(baseline) | set(after) if baseline.get(p) != after.get(p)]
     evidence = []
     # An unknown memory artifact is not silently classified as harmless initialization.
-    inert = re.compile(r"^(memories_1\.sqlite(?:-wal|-shm)?|memories)$")
+    inert = re.compile(r"^(memories(?:_v2)?_1\.sqlite(?:-wal|-shm)?|memories)$")
     for relative in changed:
         name = Path(relative).name
         if not inert.fullmatch(relative) and not relative.startswith("memories/"):
@@ -1266,6 +1609,7 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
     memory_dir.mkdir(parents=True, exist_ok=True)
     for name in ("MEMORY.md", "memory_summary.md", "raw_memories.md"):
         (memory_dir / name).write_text(f"Canary preference: {sentinel}\n", encoding="utf-8")
+    audit = CodexMemoryAudit(chome, version)
     baseline = codex_memory_snapshot(chome)
     recorder = Recorder(nine_router_url(), nine_router_key())
     base = recorder.start()
@@ -1302,6 +1646,7 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                             cwd=work, sandbox_root=work, recorder_url=base)
         if bootstrap.returncode or not recorder.requests:
             raise HarnessError("Codex memory-control bootstrap failed")
+        audit.read()
         fixture_id = seed_codex_rollout(chome, work, version)
         completed_prompts = set()
         control_observed = False
@@ -1343,6 +1688,7 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                                     "-m", model, *cfg, prompt], env=env, timeout=int(observation_seconds) + 240,
                            cwd=work, sandbox_root=work, recorder_url=base,
                            hold_complete=lambda: prompt in completed_prompts)
+            audit.read()
             ok = proc.returncode == 0 and "OK" in proc.stdout
             records = recorder.requests[before:]
             observations = [codex_memory_in_body(r.get("body"), sentinel, instructions) for r in records]
@@ -1365,7 +1711,8 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         if not enable_memory:
             monitor.join(timeout=5)
             if monitor.is_alive() or observation_errors:
-                raise HarnessError("Codex memory observation could not be completed")
+                detail = ", ".join(observation_errors) or "observer did not stop"
+                raise HarnessError(f"Codex memory observation could not be completed ({detail})")
         if recorder.errors:
             raise HarnessError("Codex recorder could not inspect every accepted request")
         after = codex_memory_snapshot(chome)
@@ -1373,6 +1720,8 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
         results["memoryBaseline"] = baseline
         results["memoryArtifacts"] = artifacts
         observed_pipeline.update(codex_memory_pipeline_evidence(chome, baseline, after))
+        results["memoryAudit"] = audit.read()
+        observed_pipeline.update(codex_audit_evidence(results["memoryAudit"]))
         results["memoryPipelineEvidence"] = sorted(observed_pipeline)
         unexpected_requests = sum(1 for r in recorder.requests
                                   if not any(p in json.dumps(r.get("body")) for p in [bootstrap_prompt, *prompts]))
@@ -1415,7 +1764,8 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
     """The memory-off check on a generated Codex home, with a positive control first.
 
     The positive control (memory enabled on a copy) must show the detector firing. Only then does
-    the real generated home count: no memory section in any request, no memory artifact on disk.
+    the real generated home count: no memory section, no memory job/content writes. An empty
+    initialized database is expected; durable audit triggers catch transient rows between polls.
     """
     models = models or MODEL_CANARIES["codex"]
     if generated_home is None:
@@ -1426,7 +1776,8 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
     detector_fires = (bool(control["memoryPositiveEvidence"]) and control["observationComplete"] is True
                       and control["positiveObservedDuringHold"] is True
                       and all(m["ok"] for m in control["models"].values())
-                      and any(m["memoryPipelineRequests"] > 0 for m in control["models"].values()))
+                      and any(m["memoryPipelineRequests"] > 0 for m in control["models"].values())
+                      and bool(codex_audit_evidence(control["memoryAudit"])))
     read_control_fires = any(m["memorySentinelInPrimaryRequest"] for m in control["models"].values())
     real_work = work / "real"
     real_work.mkdir(parents=True, exist_ok=True)
@@ -1439,6 +1790,8 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
         "positiveElapsedSeconds": control["positiveElapsedSeconds"],
         "readControlFired": read_control_fires,
         "positiveControlArtifacts": control["memoryArtifacts"],
+        "positiveControlAudit": control["memoryAudit"],
+        "memoryAudit": real["memoryAudit"],
         "memoryPipelineEvidence": real["memoryPipelineEvidence"],
         "memoryPipelineRequests": real["memoryPipelineRequests"],
         "models": real["models"],
@@ -1447,10 +1800,8 @@ def canary_codex(binary: Path, version: str, work: Path, key_present: bool, *,
         "memoryPipelineRan": real["memoryPipelineRan"],
         "memorySentinelSeen": real["memorySentinelSeen"],
         "memoryPromptSeen": real["memoryPromptSeen"],
-        # Snapshot polling can miss a job that is created and deleted between reads.
-        # Until that interval is observable without gaps, a clean snapshot is not proof.
-        "memoryCanaryChecked": False,
-        "memoryObservationLimitation": "transient jobs between filesystem snapshots are not ruled out",
+        "memoryCanaryChecked": bool(detector_fires and read_control_fires and real["observationComplete"]
+                                     and real["memoryAudit"]["identityVerified"]),
         "observationWindowSeconds": real["observationWindowSeconds"],
         "observedSeconds": real["observedSeconds"],
         "observationComplete": real["observationComplete"],
@@ -1473,6 +1824,7 @@ def canary(tool: str, version: str) -> dict:
     reasons: list[str] = []
     result: dict = {}
     digest = None
+    companions = None
     # Supersede any older pass before executing untrusted candidates, even if a run hangs.
     write_record("canary", tool, version, "failed", binarySha256=None, canary={},
                  reasons=["canary run did not complete"], canarySchemaVersion=CANARY_SCHEMA_VERSION)
@@ -1481,6 +1833,8 @@ def canary(tool: str, version: str) -> dict:
         if not binary.is_file():
             raise HarnessError(f"{binary} not staged")
         digest = sha256_file(binary)
+        # The canary must run with the exact companions that were staged, so a pass proves them too.
+        companions = verify_companions(tool, version)
         if binary_version(binary, tool) != version:
             raise HarnessError(f"{binary} does not report {version}")
         key_present = bool(os.environ.get("NINEROUTER_KEY"))
@@ -1497,6 +1851,10 @@ def canary(tool: str, version: str) -> dict:
             requests = result.get("requests", 0)
             # Preserved thinking is a promotion gate: turn 2 must replay turn 1's thinking block with
             # its signature, and the gateway must not have rewritten the conversation.
+            if result.get("thinkingInconclusive"):
+                reasons.append("preserved-thinking check inconclusive (turn 1 returned no thinking; retry cannot pass)")
+            if not result.get("thinkingSettingsChecked"):
+                reasons.append("Claude thinking/effort settings were not confirmed in the request")
             if not result.get("thinkingCheckChecked"):
                 reasons.append("preserved-thinking check did not run (fewer than two turns)")
             elif not result.get("thinkingReplayed"):
@@ -1551,9 +1909,17 @@ def canary(tool: str, version: str) -> dict:
         reasons.append(str(exc))
     except Exception as exc:
         reasons.append(f"canary error: {type(exc).__name__}")
+    if not reasons and digest is not None:
+        # Nothing may change under the canary: re-check binary and companions after the run.
+        try:
+            if sha256_file(binary) != digest or verify_companions(tool, version) != companions:
+                reasons.append("staged binary or companions changed during the canary")
+        except (HarnessError, OSError) as exc:
+            reasons.append(str(exc))
     passed = not reasons
-    write_record("canary", tool, version, "passed" if passed else "failed",
-                 binarySha256=digest, canary=result, reasons=reasons,
+    outcome = "passed" if passed else "inconclusive" if result.get("thinkingInconclusive") else "failed"
+    write_record("canary", tool, version, outcome,
+                 binarySha256=digest, companions=companions, canary=result, reasons=reasons,
                  harnessHomes=harness_home_hashes(), keyPresent=bool(os.environ.get("NINEROUTER_KEY")),
                  canarySchemaVersion=CANARY_SCHEMA_VERSION)
     return {"passed": passed, "reasons": reasons, "result": result}
@@ -1669,6 +2035,10 @@ def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     binary = version_dir(tool, version) / "bin" / ("claude" if tool == "claude" else "codex")
     if not binary.is_file() or not verdict.get("binarySha256") or sha256_file(binary) != verdict["binarySha256"]:
         raise HarnessError("staged binary differs from the canary record")
+    companions = verify_companions(tool, version)
+    if companion_specs(tool) and verdict.get("companions") != companions:
+        raise HarnessError(f"{tool} {version}: companions differ from the canary record "
+                           "(or the canary predates them); run a fresh canary")
     if tool == "codex":
         status = "promoted, rotation pending"
     else:
@@ -1681,7 +2051,7 @@ def promote(tool: str, version: str, *, queue_notice: bool = False) -> dict:
     transition_current(state, {"op": "promote", "tool": tool, "from": previous, "to": version,
                                "lastKnownGood": previous, "notice": notice, "promotedAt": now_iso()})
     digest = verdict.get("binarySha256")
-    write_record("promote", tool, version, status, binarySha256=digest,
+    write_record("promote", tool, version, status, binarySha256=digest, companions=companions,
                  previous=previous, harnessHomes=harness_home_hashes())
     return {"tool": tool, "version": version, "previous": previous, "status": status}
 
@@ -1694,6 +2064,12 @@ def rollback(tool: str) -> dict:
         raise HarnessError(f"{tool} has no lastKnownGood to roll back to")
     if not version_dir(tool, target).is_dir():
         raise HarnessError(f"lastKnownGood {target} is no longer on disk")
+    # Roll back only onto the bytes that were recorded for that version: binary and companions.
+    binary = version_dir(tool, target) / "bin" / ("claude" if tool == "claude" else "codex")
+    expected = recorded_binary_sha(tool, target)
+    if not binary.is_file() or not expected or sha256_file(binary) != expected:
+        raise HarnessError(f"lastKnownGood {target} binary differs from its record; refusing to roll back")
+    verify_companions(tool, target)
     previous = slot.get("current")
     transition_current(state, {"op": "rollback", "tool": tool, "from": previous, "to": target,
                                "lastKnownGood": previous, "notice": None})
@@ -1703,12 +2079,6 @@ def rollback(tool: str) -> dict:
 
 
 def valid_codex_canary_home(body, models: list[str]) -> bool:
-    # The current snapshot observer cannot rule out short-lived jobs between reads.
-    # No record produced by this implementation is sufficient for promotion.
-    return False
-
-
-def _valid_codex_canary_home_fields(body, models: list[str]) -> bool:
     if not isinstance(body, dict):
         return False
     if any(body.get(k) is not True for k in ("memoryCanaryChecked", "positiveControlFired",
@@ -1721,6 +2091,9 @@ def _valid_codex_canary_home_fields(body, models: list[str]) -> bool:
         return False
     evidence = body.get("positiveControlEvidence")
     if not isinstance(evidence, list) or "memories_1.sqlite:stage1_outputs:content" not in evidence:
+        return False
+    if not valid_codex_memory_audit(body.get("memoryAudit"), clean=True) \
+            or not valid_codex_memory_audit(body.get("positiveControlAudit"), clean=False):
         return False
     window, elapsed, observed = (body.get("observationWindowSeconds"), body.get("positiveElapsedSeconds"),
                                  body.get("observedSeconds"))
@@ -1738,14 +2111,54 @@ def _valid_codex_canary_home_fields(body, models: list[str]) -> bool:
     actual = body.get("models")
     return (isinstance(actual, dict) and all(isinstance(actual.get(model), dict)
             and actual[model].get("ok") is True and type(actual[model].get("requests")) is int
-            and actual[model]["requests"] > 0 for model in models))
+            and actual[model]["requests"] > 0
+            and actual[model].get("memoryPipelineRequests") == 0
+            and all(actual[model].get(field) is False for field in
+                    ("memorySentinelInRequest", "memorySentinelInPrimaryRequest", "memorySectionInRequest"))
+            for model in models))
+
+
+def valid_codex_memory_audit(audit, *, clean: bool) -> bool:
+    if not isinstance(audit, dict) or audit.get("method") != "sqlite-triggers-v1" \
+            or audit.get("sourceCommit") != CODEX_MEMORY_SOURCE or audit.get("identityVerified") is not True:
+        return False
+    stores = audit.get("stores")
+    if not isinstance(stores, dict) or set(stores) != set(CODEX_MEMORY_DATABASES):
+        return False
+    for store in stores.values():
+        if not isinstance(store, dict):
+            return False
+        counts, activity = store.get("rowCounts"), store.get("activity")
+        if not isinstance(counts, dict) or set(counts) != {"jobs", "stage1_outputs"} \
+                or any(type(n) is not int or n < 0 for n in counts.values()) \
+                or not isinstance(activity, dict) \
+                or any(table not in ("jobs", "stage1_outputs", "consolidation_progress")
+                       or type(n) is not int or n <= 0 for table, n in activity.items()):
+            return False
+        progress = store.get("consolidationProgress")
+        if not isinstance(progress, list) or len(progress) != 1 or not isinstance(progress[0], list) \
+                or len(progress[0]) != 2 or progress[0][0] != 1 \
+                or type(progress[0][1]) is not int or progress[0][1] < 0:
+            return False
+        if clean and (any(counts.values()) or activity or progress != [[1, 0]]):
+            return False
+    return clean or any(store["activity"].get("jobs", 0) > 0 and
+                        store["activity"].get("stage1_outputs", 0) > 0
+                        and store["rowCounts"]["stage1_outputs"] > 0 for store in stores.values())
 
 
 def valid_claude_canary(body) -> bool:
     if not isinstance(body, dict):
         return False
     if any(body.get(k) is not True for k in ("memoryCanaryChecked", "thinkingCheckChecked",
-                                              "thinkingReplayed", "inputTransformationsEmpty")):
+                                              "thinkingReplayed", "inputTransformationsEmpty", "thinkingSettingsChecked")):
+        return False
+    attempts = body.get("thinkingAttempts")
+    if body.get("thinkingInconclusive") is not False or not isinstance(attempts, list) or len(attempts) != 1:
+        return False
+    attempt = attempts[0]
+    if not isinstance(attempt, dict) or attempt.get("status") != "passed" or attempt.get("settingsChecked") is not True \
+            or type(attempt.get("turn1ThinkingBlocks")) is not int or attempt["turn1ThinkingBlocks"] < 1:
         return False
     if body.get("memoryCanaryLeaked") is not False or type(body.get("recorderViolations")) is not int \
             or body["recorderViolations"] != 0 or type(body.get("requests")) is not int or body["requests"] < 3:
@@ -1791,6 +2204,7 @@ def latest_canary(tool: str, version: str) -> dict | None:
     return {
         "passed": passed,
         "binarySha256": found.get("binarySha256"),
+        "companions": found.get("companions"),
         "memoryCheckedAt": found.get("at") if passed else None,
     }
 
@@ -2163,6 +2577,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rollback")
     p.add_argument("tool", choices=sorted(TOOLS))
     sub.add_parser("status")
+    p = sub.add_parser("repair-companions",
+                       help="move companions from the old flat bin/ layout to their package paths")
+    p.add_argument("tool", choices=sorted(TOOLS))
+    p.add_argument("version")
     p = sub.add_parser("rotate-codex")
     p.add_argument("--when-idle", action="store_true")
     sub.add_parser("auto")
@@ -2171,7 +2589,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-LOCKED_COMMANDS = {"discover", "stage", "canary", "promote", "rollback", "rotate-codex", "auto"}
+LOCKED_COMMANDS = {"discover", "stage", "canary", "promote", "rollback", "rotate-codex", "auto",
+                   "repair-companions"}
 
 
 class StateLock:
@@ -2241,6 +2660,8 @@ def _dispatch(args) -> int:
             print(json.dumps(rollback(args.tool), indent=2, sort_keys=True))
         elif args.cmd == "status":
             print(json.dumps(status(), indent=2, sort_keys=True))
+        elif args.cmd == "repair-companions":
+            print(json.dumps(repair_companions(args.tool, args.version), indent=2, sort_keys=True))
         elif args.cmd == "rotate-codex":
             print(rotate_codex(when_idle=args.when_idle))
         elif args.cmd == "auto":

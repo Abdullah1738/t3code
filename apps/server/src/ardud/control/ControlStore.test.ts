@@ -1,7 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -9,6 +12,9 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../persistence/Sqlite.ts";
+import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { controlDDL } from "../persistence/boardsSchema.ts";
 import * as ControlStore from "./ControlStore.ts";
 
 const providerRow = (
@@ -110,6 +116,86 @@ const run = <A, E>(body: Effect.Effect<A, E, ControlStore.ControlStore | SqlClie
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ControlStore native ids", () => {
+  it.effect("keeps origins and import aliases in a separate database from provider bindings", () =>
+    Effect.gen(function* () {
+      const context = yield* Layer.build(NodeSqliteClient.layer({ filename: ":memory:" }));
+      const controlSql = Context.get(context, SqlClient.SqlClient);
+      yield* Effect.forEach(controlDDL, (ddl) => controlSql.unsafe(ddl), { discard: true });
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* seed;
+        yield* controlSql`INSERT INTO ardud_opencode_import (native_session_id, thread_id, imported_at)
+          VALUES ('ses_import', 't-moved', '2026-01-01T00:00:00.000Z')`;
+        yield* Effect.gen(function* () {
+          const store = yield* ControlStore.ControlStore;
+          const identity = yield* ExecutionIdentity.ExecutionIdentity;
+          yield* store.setOrigin("t-moved", "imessage");
+          assert.strictEqual(yield* store.getOrigin("t-moved"), "imessage");
+          assert.strictEqual((yield* store.getOrigins(["t-moved"])).get("t-moved"), "imessage");
+          assert.strictEqual(yield* store.threadIdForNativeSession("ses_import"), "t-moved");
+          assert.strictEqual(yield* store.threadIdForNativeSession("claude-moved-uuid"), "t-moved");
+          assert.strictEqual(
+            (yield* store.nativeSessionIds(["t-moved"])).get("t-moved"),
+            "claude-moved-uuid",
+          );
+          assert.strictEqual(
+            (yield* identity.resolve({ nativeId: "ses_import" })).robobThreadId,
+            "t-moved",
+          );
+          assert.deepStrictEqual(
+            (yield* identity.aliases("t-moved")).map((alias) => alias.nativeId).toSorted(),
+            ["claude-moved-uuid", "ses_import", "ses_moved_old"],
+          );
+          assert.strictEqual(
+            (yield* identity.currentNative(["t-moved"])).get("t-moved")?.nativeId,
+            "claude-moved-uuid",
+          );
+
+          const rolledBack = yield* sql
+            .withTransaction(
+              store
+                .setOrigin("t-moved", "automation")
+                .pipe(Effect.andThen(Effect.fail("rollback"))),
+            )
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(rolledBack));
+          assert.strictEqual(yield* store.getOrigin("t-moved"), "automation");
+          yield* store.setOrigin("t-moved", null);
+          assert.isNull(yield* store.getOrigin("t-moved"));
+
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+            providerRow(
+              "pt-conflict",
+              "t-detached",
+              "opencode",
+              "ses_import",
+              "2026-01-01T00:00:00.000Z",
+            ),
+          )}`;
+          assert.isNull(yield* store.threadIdForNativeSession("ses_import"));
+          assert.strictEqual(
+            (yield* identity.resolve({ nativeId: "ses_import" })).resolution,
+            "ambiguous",
+          );
+          assert.deepStrictEqual(
+            yield* sql`SELECT name FROM sqlite_schema WHERE name IN ('ardud_thread_origin', 'ardud_opencode_import')`,
+            [],
+          );
+        }).pipe(Effect.provide(Layer.mergeAll(ControlStore.layer, ExecutionIdentity.layer)));
+      }).pipe(
+        Effect.provideService(
+          BoardsDatabase.BoardsDatabase,
+          BoardsDatabase.BoardsDatabase.of({
+            sql: controlSql,
+            ready: Effect.void,
+            path: ":memory:",
+          }),
+        ),
+        Effect.provide(Sqlite.layerMemory),
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.live("reads origins, native bindings and live IDs while the writer is held", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

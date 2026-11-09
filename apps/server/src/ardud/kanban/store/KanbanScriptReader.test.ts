@@ -6,9 +6,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Statement from "effect/sql/Statement";
+import * as SqlClient from "effect/sql/SqlClient";
 import type * as Tracer from "effect/Tracer";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 
 it.effect("reads committed script changes on the file database reader", () =>
@@ -17,6 +19,12 @@ it.effect("reads committed script changes on the file database reader", () =>
     const path = yield* Path.Path;
     const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-kanban-script-reader-" });
     const layer = KanbanStore.layer.pipe(
+      Layer.provideMerge(
+        BoardsDatabase.layerFromPaths(
+          path.join(directory, "boards.sqlite"),
+          path.join(directory, "no-legacy.sqlite"),
+        ),
+      ),
       Layer.provideMerge(Sqlite.layerFromPath(path.join(directory, "state.sqlite"))),
     );
     const reads: Array<Tracer.Span> = [];
@@ -62,6 +70,11 @@ it.effect("reads committed script changes on the file database reader", () =>
       assert.deepStrictEqual(
         reads.map((span) => span.attributes.get("db.connection")),
         ["reader", "reader", "reader"],
+      );
+      const state = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(
+        yield* state`SELECT name FROM sqlite_schema WHERE name GLOB 'ardud_kanban_*'`,
+        [],
       );
     }).pipe(
       Effect.provide(layer),
