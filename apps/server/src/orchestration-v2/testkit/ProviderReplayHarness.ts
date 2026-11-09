@@ -271,6 +271,7 @@ export function layerWithRegistry<Error>(
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
+    readonly ardudHarnessMigration?: import("@t3tools/contracts").ArdudHarnessMigrationSettings;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -300,6 +301,9 @@ export function layerWithRegistry<Error>(
   );
   const layerServerSettings = ServerSettings.layerTest({
     responseStreamingMode: "turn",
+    ...(options.ardudHarnessMigration === undefined
+      ? {}
+      : { ardudHarnessMigration: options.ardudHarnessMigration }),
     ...(options.continueThreadsAfterServerUpdate === undefined
       ? {}
       : { continueThreadsAfterServerUpdate: options.continueThreadsAfterServerUpdate }),
@@ -464,6 +468,7 @@ export function layerWithRegistry<Error>(
         layerRunExecutionServiceProvided,
         layerServerSettings,
         layerDatabase,
+        layerServerConfig,
         ThreadForkService.layer,
       ),
     ),

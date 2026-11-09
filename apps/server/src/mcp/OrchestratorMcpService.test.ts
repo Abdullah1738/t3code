@@ -2687,6 +2687,180 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
+  it.effect("drops obsolete inherited options while validating explicit delegated options", () =>
+    Effect.gen(function* () {
+      const claude = ProviderInstanceId.make("claudeAgent");
+      const high = { id: "effort", value: "high" } as const;
+      const xhigh = { id: "effort", value: "xhigh" } as const;
+      const stale = { id: "fastMode", value: false } as const;
+      const cases = [
+        { name: "object override", target: { options: { effort: "xhigh" } }, expected: [xhigh] },
+        { name: "array override", target: { options: [xhigh] }, expected: [xhigh] },
+        { name: "no override", expected: [high] },
+        { name: "array clear", target: { options: [] }, expected: [] },
+        { name: "object clear", target: { options: {} }, expected: [] },
+        {
+          name: "explicit true",
+          target: { options: [{ id: "fastMode", value: true }] },
+          error: "Unknown option fastMode",
+        },
+        {
+          name: "explicit false",
+          target: { options: { fastMode: false } },
+          error: "Unknown option fastMode",
+        },
+        {
+          name: "obsolete select",
+          inherited: [{ id: "effort", value: "ultra" }, stale],
+          reportedOptions: [],
+          expected: [],
+        },
+        {
+          name: "obsolete select overridden",
+          inherited: [{ id: "effort", value: "ultra" }, stale],
+          reportedOptions: [],
+          target: { options: { effort: "xhigh" } },
+          expected: [xhigh],
+        },
+        {
+          name: "explicit obsolete select",
+          target: { options: { effort: "ultra" } },
+          error: "must be one of",
+        },
+        {
+          name: "unknown descriptors",
+          descriptors: undefined,
+          reportedOptions: [high, stale],
+          expected: [high, stale],
+        },
+        { name: "empty descriptors", descriptors: [], reportedOptions: [], expected: [] },
+        {
+          name: "legacy variant",
+          inherited: [{ id: "variant", value: "high" }, stale],
+          reportedOptions: [{ id: "variant", value: "high" }],
+          expected: [high],
+        },
+      ] as const;
+      for (const testCase of cases) {
+        const inherited = {
+          instanceId: claude,
+          model: "claude-opus-5-5",
+          options: "inherited" in testCase ? testCase.inherited : [high, stale],
+        };
+        const descriptors =
+          "descriptors" in testCase
+            ? testCase.descriptors
+            : [
+                {
+                  id: "effort",
+                  label: "Effort",
+                  type: "select" as const,
+                  options: ["high", "xhigh"].map((id) => ({ id, label: id })),
+                },
+              ];
+        const commands: Array<{ modelSelection: ModelSelection }> = [];
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: claude,
+          model: inherited.model,
+          status: "running",
+          result: null,
+        };
+        const provider: ServerProvider = {
+          ...providerSnapshot({
+            instanceId: claude,
+            driver: ProviderDriverKind.make("claudeAgent"),
+          }),
+          models: [
+            {
+              slug: inherited.model,
+              name: inherited.model,
+              isCustom: false,
+              capabilities: descriptors === undefined ? null : { optionDescriptors: descriptors },
+            },
+          ],
+        };
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            getThreadRecords: (threadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? parentProjection(commands.length > 0 ? [task] : [], inherited)
+                  : {
+                      ...childProjection,
+                      thread: {
+                        ...childProjection.thread,
+                        modelSelection: commands[0]?.modelSelection ?? inherited,
+                      },
+                    },
+              ),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command as unknown as { modelSelection: ModelSelection });
+                return {
+                  storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
+                } as never;
+              }),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([provider]),
+          adapterRegistryLayer([claude]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const capabilities = yield* service.capabilities(scope);
+          const expectedInheritance =
+            "reportedOptions" in testCase ? testCase.reportedOptions : [high];
+          assert.deepEqual(capabilities.inheritedOptions, expectedInheritance, testCase.name);
+          const target = yield* decodeTarget({
+            providerInstanceId: claude,
+            model: inherited.model,
+            ...("target" in testCase ? testCase.target : {}),
+          });
+          const result = yield* service
+            .delegateTask(scope, {
+              task: "Review.",
+              target,
+              mode: "async",
+              clientRequestId: testCase.name,
+            })
+            .pipe(Effect.result);
+          if ("error" in testCase) {
+            assert.equal(result._tag, "Failure", testCase.name);
+            if (result._tag !== "Failure") return;
+            assert.equal(result.failure.code, "invalid_request");
+            assert.include(result.failure.message, "rejected options");
+            assert.include(result.failure.message, testCase.error);
+            assert.equal(commands.length, 0);
+          } else {
+            assert.equal(result._tag, "Success", testCase.name);
+            assert.deepEqual(
+              commands[0]?.modelSelection,
+              {
+                instanceId: claude,
+                model: inherited.model,
+                ...(testCase.expected.length === 0 && !("target" in testCase)
+                  ? {}
+                  : { options: testCase.expected }),
+              },
+              testCase.name,
+            );
+            if (result._tag === "Success")
+              assert.deepEqual(result.success.options, testCase.expected);
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }
+    }),
+  );
+
   it.effect("routes and validates the final delegated selection under the migration flag", () =>
     Effect.gen(function* () {
       const opencode = ProviderInstanceId.make("opencode");

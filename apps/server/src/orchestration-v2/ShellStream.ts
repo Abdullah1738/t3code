@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
+import { compactShell } from "../ardud/http/compactShell.ts";
 
 export function buildActiveShellSnapshot(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
@@ -28,7 +29,7 @@ export function buildActiveShellSnapshot(input: {
     schemaVersion: input.threads.schemaVersion,
     snapshotSequence: input.snapshotSequence,
     projects: input.projects,
-    threads: input.threads.threads,
+    threads: input.threads.threads.map(compactShell),
     archivedThreads: [],
   };
 }
@@ -289,7 +290,7 @@ export function shellStreamItemFromThreadShell(input: {
       kind: "thread.updated",
       sequence: input.stored.sequence,
       location: "active",
-      thread: input.shell,
+      thread: compactShell(input.shell),
     };
   }
 
@@ -309,7 +310,7 @@ export function archivedShellStreamItemFromThreadShell(input: {
     return {
       kind: "thread.updated",
       sequence: input.stored.sequence,
-      thread: input.shell,
+      thread: compactShell(input.shell),
     };
   }
   if (

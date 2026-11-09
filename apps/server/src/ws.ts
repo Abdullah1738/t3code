@@ -18,6 +18,8 @@ import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
+import * as ReplyBuilders from "./ardud/http/ReplyBuilders.ts";
+import { withReplyBudget } from "./ardud/http/ReplyProtocol.ts";
 import { subscribeChatGptHandoff } from "./provider/CodexChatGptHandoff.ts";
 import { subscribeCodexAuthCallback } from "./provider/CodexAuthCallback.ts";
 import {
@@ -840,6 +842,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
             })
           : threadManagement.getThreadSnapshot(input.threadId)
       ).pipe(
+        ReplyBuilders.bounded,
         Effect.mapError(
           (cause) =>
             new OrchestrationV2GetThreadProjectionError({
@@ -969,6 +972,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   function* (input: {
     readonly afterSequence?: number;
     readonly requestCompletionMarker?: boolean;
+    readonly acceptShellPages?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -993,18 +997,37 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         };
       },
     );
-    const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* () {
+    const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* (
+      after?: string,
+    ) {
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "active",
+            ...(input.acceptShellPages === true ? { limit: 501 } : {}),
+            ...(after === undefined ? {} : { afterThreadId: after }),
+          }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         }),
       );
       const enriched = yield* enrichProjectShells(base.projects);
+      if (input.acceptShellPages !== true)
+        return {
+          snapshot: { ...base, projects: enriched.projects },
+          resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
+        };
       return {
-        snapshot: { ...base, projects: enriched.projects } as OrchestrationV2ShellSnapshot,
+        snapshot: {
+          ...base,
+          projects: enriched.projects,
+          threads: base.threads.slice(0, 500),
+          page: {
+            after: after ?? null,
+            nextAfter: base.threads.length > 500 ? base.threads[499]!.id : null,
+          },
+        } as OrchestrationV2ShellSnapshot,
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
@@ -1108,16 +1131,6 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       input.requestCompletionMarker === true
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
-    const initialSnapshotItems = (loaded: {
-      readonly snapshot: OrchestrationV2ShellSnapshot;
-      readonly resolvedRepositoryIdentityRoots: ReadonlyArray<string>;
-    }) =>
-      rpcInitialItems(
-        shellStreamItemsFromInitialSnapshot({
-          snapshot: loaded.snapshot,
-          resolvedRepositoryIdentityRoots: loaded.resolvedRepositoryIdentityRoots,
-        }),
-      );
     const initialEnrichmentItems = (loaded: {
       readonly snapshot: OrchestrationV2ShellSnapshot;
       readonly resolvedRepositoryIdentityRoots: ReadonlyArray<string>;
@@ -1133,25 +1146,40 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     // refresh cannot interleave before the authoritative initial frame.
     const completionThenLive = (afterSequence: number) =>
       Stream.concat(completionMarker, liveFrom(afterSequence));
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.pagedShellSnapshot")(function* () {
+      const loaded = yield* ReplyBuilders.bounded(loadSnapshot());
+      // Subsequent pages are built only when the consumer asks for them.
+      const remaining = Stream.unfold(loaded.snapshot.page?.nextAfter ?? null, (after) =>
+        after === null
+          ? Effect.succeed(undefined)
+          : ReplyBuilders.bounded(loadSnapshot(after)).pipe(
+              Effect.map(
+                (next) =>
+                  [
+                    shellStreamItemsFromInitialSnapshot(next),
+                    next.snapshot.page?.nextAfter ?? null,
+                  ] as const,
+              ),
+            ),
+      );
+      return composeShellStreamWithEnrichment({
+        initial: Stream.concat(
+          rpcInitialItems(shellStreamItemsFromInitialSnapshot(loaded)),
+          remaining.pipe(Stream.flatMap(Stream.fromIterable)),
+        ),
+        tail: completionThenLive(loaded.snapshot.snapshotSequence),
+        enrichment: enrichmentRefreshes,
+      });
+    });
 
     const stream = yield* Effect.gen(function* () {
       if (input.afterSequence === undefined) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
+        return yield* snapshotThenLive();
       }
 
       const highWater = yield* applicationEvents.latestApplicationSequence;
       if (!(yield* canReplayPersistedRange(input.afterSequence, highWater, SHELL_RESUME_MAX_GAP))) {
-        const loaded = yield* loadSnapshot();
-        return composeShellStreamWithEnrichment({
-          initial: initialSnapshotItems(loaded),
-          tail: completionThenLive(loaded.snapshot.snapshotSequence),
-          enrichment: enrichmentRefreshes,
-        });
+        return yield* snapshotThenLive();
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
@@ -1775,6 +1803,7 @@ export const layerWsRpc = (
           },
           settings,
           shellResumeCompletionMarker: true,
+          shellSnapshotPagination: true,
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
           threadFind: true,
@@ -1806,6 +1835,7 @@ export const layerWsRpc = (
           threads: threads.archivedThreads,
         } as const;
       }).pipe(
+        ReplyBuilders.bounded,
         Effect.flatMap((snapshot) =>
           enrichProjectShells(snapshot.projects).pipe(
             Effect.map(({ projects }) => ({ ...snapshot, projects })),
@@ -3227,7 +3257,10 @@ export const layer = Layer.unwrap(
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
           yield* RpcServer.make(ServerWsRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
-            Effect.provideService(RpcServer.Protocol, withTerminalOutputWindow(protocol)),
+            Effect.provideService(
+              RpcServer.Protocol,
+              withTerminalOutputWindow(withReplyBudget(protocol, largeReplyLog, new Set(ServerWsRpcGroup.requests.keys()))),
+            ),
             Effect.provide(
               Layer.merge(
                 RpcAuthorization.layer(session.scopes, (method, payload) => {

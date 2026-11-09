@@ -174,6 +174,23 @@ UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on 
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
 
+## Repo toolchains
+
+The `usdtwallet-android` repo recipe installs JDK 17, Android command-line tools, SDK platforms 37.1 and 36,
+build-tools 36.0.0, platform-tools, NDK 26.3.11579264, and gomobile/gobind pinned to `core/go.mod`.
+Offbox sets `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME` and `PATH` for you: no export
+prefix is needed. Setup is locked per box and skipped after success; recipe or x/mobile version changes rerun it.
+Boxes the pool grows into (including through `OFFBOX_POOL_SIZE`) or resumes start with whatever they had and
+get the toolchain on their first run.
+
+`android/app/libs/` AARs aren't synced, so every Android run starts with `./scripts/build-core.sh` before Gradle.
+Run Gradle online (no `--offline`): every box has its own Gradle cache, and an offline run can miss dependencies.
+JDK 25 for the wallet's unit tests is resolved by Gradle's existing toolchain resolver.
+
+To add another repo, add `templates/repos/<repo_key>.sh`. The recipe gets `OFFBOX_REPO_ROOT` pointing to the
+synced root and must write `~/.offbox/repo-env/<repo_key>.sh`. A failed setup stops before your command and
+returns infra exit 90 (internal exit 98); its log is `~/.offbox/repo-setup-<repo_key>.log` on the box.
+
 ## Save state for later (do this!)
 
 Stopped boxes are free, but boat deletes a stopped box's data 14 days after its last stop. Bases and templates

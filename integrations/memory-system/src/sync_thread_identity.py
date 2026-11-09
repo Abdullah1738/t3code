@@ -17,19 +17,22 @@ aliases survive recovery unless current evidence contradicts them.
 """
 
 import json
+import argparse
+import fcntl
 import os
 import sqlite3
 import sys
 import time
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import schema_migrations  # noqa: E402
+import robob_readonly  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
+from capture_budget import Budget, checkpoint, setup_writer  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
-STATE_DB = os.environ.get("ROBOB_STATE_DB", os.path.join(HOME, ".robob/userdata/statev2.sqlite"))
+STATE_DB = robob_readonly.state_db("ROBOB_STATE_DB")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS thread_aliases(
@@ -64,13 +67,15 @@ def _str(v):
     return v if isinstance(v, str) and v else None
 
 
-def gather(state):
+def gather(state, budget=None):
     """Read all source projections from the same SQLite snapshot."""
     if state.in_transaction:
-        return _gather(state)
+        robob_readonly.ready_generation(state)
+        return _gather(state, budget)
     state.execute("BEGIN")
     try:
-        return _gather(state)
+        robob_readonly.ready_generation(state)
+        return _gather(state, budget)
     finally:
         state.rollback()
 
@@ -81,7 +86,7 @@ class AliasRows(list):
         self.unresolved = []
 
 
-def _gather(state):
+def _gather(state, budget=None):
     """Alias rows from statev2 (read-only). Field names follow the live payload_json shapes.
 
     Thread: title, worktreePath (cwd), lineage.parentThreadId / rootThreadId,
@@ -93,6 +98,8 @@ def _gather(state):
     for tid, title, payload in state.execute(
         "SELECT thread_id, title, payload_json FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL"
     ):
+        if budget is not None:
+            budget.check()
         p = _j(payload)
         lineage = p.get("lineage") if isinstance(p.get("lineage"), dict) else {}
         model_sel = p.get("modelSelection") if isinstance(p.get("modelSelection"), dict) else {}
@@ -109,6 +116,8 @@ def _gather(state):
         "SELECT thread_id, payload_json, driver, provider_instance_id FROM orchestration_v2_projection_provider_threads"
         " WHERE thread_id IS NOT NULL"
     ):
+        if budget is not None:
+            budget.check()
         p = _j(payload)
         ref = p.get("nativeThreadRef") if isinstance(p.get("nativeThreadRef"), dict) else {}
         native = _str(ref.get("nativeId"))
@@ -133,6 +142,8 @@ def _gather(state):
         for node_id, provider_thread_id in state.execute(
             "SELECT node_id, provider_thread_id FROM orchestration_v2_projection_provider_turns"
         ):
+            if budget is not None:
+                budget.check()
             turn_owner.setdefault(node_id, set()).add(provider_thread_id)
     task_parent = {}  # a subagent's own task node id -> its parentNodeId
     task_parent_ambiguous = set()
@@ -140,6 +151,8 @@ def _gather(state):
         "SELECT child_thread_id, thread_id, payload_json, driver, provider_instance_id"
         " FROM orchestration_v2_projection_subagents WHERE child_thread_id IS NOT NULL"))
     for _c, _p, payload, _d, _i in subagent_rows:
+        if budget is not None:
+            budget.check()
         pj = _j(payload)
         node, parent_node = _str(pj.get("id")), _str(pj.get("parentNodeId"))
         if node:
@@ -151,6 +164,8 @@ def _gather(state):
         turn_owner[node] = set()
     unresolved = {}  # reason -> child thread ids left without an alias this tick
     for child_tid, parent_tid, payload, driver, instance in subagent_rows:
+        if budget is not None:
+            budget.check()
         p = _j(payload)
         if p.get("origin") == "app_owned":
             continue  # Its child has its own provider thread, not a native task alias.
@@ -182,6 +197,8 @@ def _gather(state):
     for native, tid in state.execute("SELECT native_session_id, thread_id FROM ardud_opencode_import"):
         out.append(dict(canonical=tid, native=native, agent=None, driver="opencode", instance="opencode", model=None))
     for row in out:
+        if budget is not None:
+            budget.check()
         t = threads.get(row["canonical"], {})
         row["title"] = t.get("title")
         row["cwd"] = t.get("cwd")
@@ -257,11 +274,13 @@ def _lookup_key(driver, instance, native, agent):
     return driver, instance, key
 
 
-def _blocked_by_unresolved(row, unresolved):
+def _blocked_by_unresolved(row, unresolved, budget=None):
     driver, instance, native, agent = row["driver"], row["instance"], row["native"], row.get("agent")
     if driver not in ("codex", "claudeAgent"):
         return False
     for _child, scope_driver, scope_instance, task in unresolved:
+        if budget is not None:
+            budget.check()
         if scope_driver in ("codex", "claudeAgent") and scope_driver != driver:
             continue
         if isinstance(scope_instance, str) and scope_instance and scope_instance != instance:
@@ -276,12 +295,14 @@ def _blocked_by_unresolved(row, unresolved):
     return False
 
 
-def write(mem, rows, now=None, *, _inside_transaction=False):
+def write(mem, rows, now=None, *, _inside_transaction=False, budget=None):
     now = int(time.time()) if now is None else now
     claims = {}
     conflicts = set()
     lookup_claimants = {}
     for row in rows:
+        if budget is not None:
+            budget.check()
         parts = (row["driver"], row["instance"], row["native"], row.get("agent"))
         key = f"{parts[0] or ''}|{parts[1] or ''}|{parts[2]}|{parts[3] or ''}"
         if (not all(isinstance(p, str) and p and "|" not in p for p in parts[:3])
@@ -299,6 +320,8 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
     blocked = {lookup for lookup, canonicals in lookup_claimants.items() if len(canonicals) > 1}
     unresolved = list(getattr(rows, "unresolved", ()))
     for row in rows:
+        if budget is not None:
+            budget.check()
         parts = (row["driver"], row["instance"], row["native"], row.get("agent"))
         key = f"{parts[0] or ''}|{parts[1] or ''}|{parts[2]}|{parts[3] or ''}"
         if key in conflicts:
@@ -313,6 +336,8 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
         blocked_now = set(blocked)
         unresolved_children = {child for child, _driver, _instance, _task in unresolved}
         for child, _driver, _instance, _task in unresolved:
+            if budget is not None:
+                budget.check()
             for driver, instance, native, agent in mem.execute(
                     "SELECT driver,instance,native_id,agent_id FROM thread_aliases WHERE canonical_thread_id=?", (child,)):
                 lookup = _lookup_key(driver, instance, native, agent)
@@ -327,18 +352,22 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
             key, canonical, driver, instance, native, agent = record
             lookup = _lookup_key(driver, instance, native, agent)
             row = {"driver": driver, "instance": instance, "native": native, "agent": agent}
-            if canonical in unresolved_children or key in conflicts or lookup in blocked_now or _blocked_by_unresolved(row, unresolved):
+            if canonical in unresolved_children or key in conflicts or lookup in blocked_now or _blocked_by_unresolved(row, unresolved, budget):
                 return True
             current = claims.get(key)
             if current is not None and current["canonical"] != canonical:
                 return True
             return bool(lookup is not None and lookup_claimants.get(lookup, set()) - {canonical})
         for record in list(mem.execute("SELECT alias_key,canonical_thread_id,driver,instance,native_id,agent_id FROM thread_aliases")):
+            if budget is not None:
+                budget.check()
             if invalid_historical(record):
                 mem.execute("DELETE FROM thread_aliases WHERE alias_key=?", (record[0],))
         for key, r in claims.items():
+            if budget is not None:
+                budget.check()
             lookup = _lookup_key(r["driver"], r["instance"], r["native"], r.get("agent"))
-            if key in conflicts or lookup in blocked_now or _blocked_by_unresolved(r, unresolved):
+            if key in conflicts or lookup in blocked_now or _blocked_by_unresolved(r, unresolved, budget):
                 continue
             if r.get("agent") is not None and r["canonical"] in historical_children:
                 existing = mem.execute("SELECT 1 FROM thread_aliases WHERE alias_key=?", (key,)).fetchone()
@@ -365,32 +394,48 @@ def write(mem, rows, now=None, *, _inside_transaction=False):
         )
         return len(rows)
 
-    return txn() if _inside_transaction else with_retry(mem, txn)
+    return txn() if _inside_transaction else with_retry(mem, txn, budget=budget)
 
 
-def sync(mem_path=MEM_DB, state_path=STATE_DB):
-    if not os.path.isfile(state_path):
-        raise FileNotFoundError(f"Robob state DB {state_path} not found")
-    mem = sqlite3.connect(mem_path, timeout=600)
-    mem.execute("PRAGMA busy_timeout=600000")
+def sync(mem_path=MEM_DB, state_path=STATE_DB, deadline=45):
+    budget = Budget(deadline)
+    state = robob_readonly.connect_ro(state_path)
+    try:
+        robob_readonly.ready_generation(state)
+        # Serialize gather AND publish without holding memory.db's writer lock.
+        # Never unlink this lock: another process may already have opened its inode.
+        with open(os.fspath(mem_path) + ".identity.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0
+            return _sync(mem_path, state, budget)
+    finally:
+        state.close()
+
+
+def _sync(mem_path, state, budget=None):
+    budget = budget or Budget(45)
+    state.execute("PRAGMA busy_timeout=100")
+    with budget.sql(state):
+        rows = gather(state, budget)
+    budget.check()
+    mem = setup_writer(sqlite3.connect(mem_path, timeout=0.1), budget)
     try:
         schema_migrations.migrate(mem)
         mem.executescript(DDL)
-        state = sqlite3.connect(f"{Path(os.path.abspath(state_path)).as_uri()}?mode=ro", uri=True, timeout=30)
-        state.execute("PRAGMA busy_timeout=30000")
-        try:
-            # Serialize the source snapshot too: a delayed older gather must not
-            # overwrite a newer ambiguity that another refresh already committed.
-            n = with_retry(mem, lambda: write(mem, gather(state), _inside_transaction=True))
-        finally:
-            state.close()
+        n = with_retry(mem, lambda: write(mem, rows, _inside_transaction=True, budget=budget), budget=budget)
     finally:
+        checkpoint(mem)
         mem.close()
     return n
 
 
 def main():
-    n = sync()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deadline", type=int, default=45)
+    args = parser.parse_args()
+    n = sync(deadline=args.deadline)
     print("DONE", json.dumps({"aliases": n}), flush=True)
 
 

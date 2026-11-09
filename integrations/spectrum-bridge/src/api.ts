@@ -1,3 +1,4 @@
+import { newFormKeys } from "./secret-crypto.ts";
 import { createHash } from "node:crypto";
 import { MAX_FILE_BYTES, validAppUrl, validFileName, validMimeType } from "./cli.ts";
 import { chatKey, GROUP_APP_REFUSAL, type ChatKey } from "./line.ts";
@@ -22,6 +23,7 @@ type Options = {
     stateRoot: string;
     /** Returns the tailnet https base URL of the apps server, publishing it if needed. */
     publishApps: () => Promise<string>;
+    publicForm?: boolean;
     now?: () => number;
   };
   /** Public Cloudflare links for the apps; absent in per-chat APIs that the Sendblue socket fronts. */
@@ -361,6 +363,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         let base: string;
         try { base = await secrets.publishApps(); } catch { throw new ApiError(502); }
         if (!validAppUrl(base)) throw new ApiError(502);
+        const encryption = secrets.publicForm ? await newFormKeys() : undefined;
         const token = newToken();
         const now = secrets.now?.() ?? Date.now();
         const result = { token, url: `${base.replace(/\/+$/, "")}/_secret/${token}`, expiresAt: now + SECRET_REQUEST_TTL_MS };
@@ -371,9 +374,9 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
           const raced = replay();
           if (raced) return { result: raced, created: false };
           putSecretRequest(store, token, { sessionId: route.id, generation: route.generation, purpose, fields: formFields,
-            createdAt: now, expiresAt: result.expiresAt, state: "open" });
+            createdAt: now, expiresAt: result.expiresAt, state: "open", encryption });
           store.enqueue({ id, kind: "conversation", text: "", sessionId: route.id, generation: route.generation,
-            app: { url: result.url, caption: "Secure form", subcaption: purpose } });
+            app: { url: result.url, caption: "Secure form" } });
           store.set(savedKey, { spec, result } satisfies SavedSecretRequest);
           return { result, created: true };
         }).immediate();

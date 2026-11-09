@@ -18,6 +18,8 @@
 	<string>com.abdullah.recall</string>
 	<key>Nice</key>
 	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/Users/ardud/.local/share/memory-system/.venv/bin/python</string>

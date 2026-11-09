@@ -909,6 +909,112 @@ def validate_owner_attestation(*, evidence, attested_by):
         fail('OWNER_ATTESTATION_EVIDENCE_REQUIRED')
 
 
+def food_capture_placed_at(flow_id):
+    with _db() as db:
+        _get(db, flow_id)
+        places = list(db.execute("SELECT created_at FROM operations WHERE flow_id=? AND kind='place'", (flow_id,)))
+        if len(places) != 1:
+            fail('FOOD_CAPTURE_CLOSE_PLACE_HISTORY_INVALID')
+        return places[0]['created_at']
+
+
+def _food_capture_close(db, flow_id, *, order_id, reserved_minor, bank_evidence, tracking_evidence, attested_by):
+    from commerce_food_capture import require, validate_bank, valid_processed_at, TRACKING_FIELDS, AUTOMATIC_FIELDS
+    flow = _get(db, flow_id)
+    require(flow['app'] == 'noon' and flow['vertical'] == 'food', 'FOOD_FLOW_REQUIRED')
+    require(_order(order_id) and flow['order_id'] == order_id, 'ORDER_MISMATCH')
+    require(type(reserved_minor) is int and reserved_minor > 0 and flow['reserved_minor'] == reserved_minor,
+            'AMOUNT_MISMATCH')
+    require(attested_by in (None, 'owner'), 'ATTESTER_INVALID')
+    ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+    require(not any(o['kind'] in ('payment', 'prepay', 'preauthorize')
+                    or o['name'] in ('complete', 'completion', 'complete_payment', 'payment_complete') for o in ops),
+            'PAYMENT_ALREADY_SENT')
+    places = [o for o in ops if o['kind'] == 'place']
+    require(len(places) == 1 and places[0]['name'] == 'place'
+            and all(o['state'] == 'OBSERVED' for o in ops), 'PLACE_HISTORY_INVALID')
+    validate_bank(bank_evidence, reserved_minor, places[0]['created_at'])
+    require(type(tracking_evidence) is dict and tracking_evidence.keys() == TRACKING_FIELDS, 'TRACKING_SCHEMA_INVALID')
+    require(tracking_evidence.get('ok') is True
+            and tracking_evidence.get('app') == 'noon' and tracking_evidence.get('service') == 'food'
+            and tracking_evidence.get('order') == order_id and tracking_evidence.get('scope') == 'order'
+            and tracking_evidence.get('source') == 'native_order_api'
+            and tracking_evidence.get('identity_verified') is True
+            and tracking_evidence.get('account_verified') is True
+            and tracking_evidence.get('saved_home_verified') is True
+            and tracking_evidence.get('raw_status') == tracking_evidence.get('status') == 'delivered',
+            'DELIVERY_UNVERIFIED')
+    try:
+        path = ROOT/'food-financial'/(flow_id+'.json')
+        _stat(path.parent, True)
+        _stat(path)
+        state = json.loads(path.read_text())
+    except (OSError, ValueError, JournalError):
+        fail('FOOD_CAPTURE_CLOSE_PLACEMENT_RECORD_INVALID')
+    require(type(state) is dict and 'intent_hash' not in state
+            and state.get('review_hash') == flow['review_hash']
+            and state.get('amount_minor') == reserved_minor
+            and state.get('cart_hash') == flow['place_cart_hash']
+            and state.get('cart_hash') == digest(state.get('session_id'))
+            and places[0]['request_hash'] == digest({'sessionCode': state.get('session_id'),
+                'orderTotal': reserved_minor/100, 'orderPaymentAmount': reserved_minor/100})
+            and _hash(state.get('card_hash')), 'AUTOMATIC_PATH_REQUIRED')
+    # The coordinator records intent_hash only for a non-null intent. Its
+    # absence alone is insufficient: exact native detail must explicitly prove
+    # null client secret and automatic processing, bound to the retained review.
+    automatic = tracking_evidence.get('automatic_payment')
+    require(type(automatic) is dict and automatic.keys() == AUTOMATIC_FIELDS, 'AUTOMATIC_SCHEMA_INVALID')
+    require(automatic.get('order') == order_id
+            and automatic.get('account_hash') == flow['account_hash']
+            and automatic.get('scope_hash') == flow['scope_hash']
+            and automatic.get('amount_minor') == reserved_minor
+            and automatic.get('card_hash') == state['card_hash']
+            and automatic.get('payment_client_secret_null') is True
+            and automatic.get('automatic_capture') is True
+            and valid_processed_at(automatic.get('processed_at')),
+            'AUTOMATIC_PATH_REQUIRED')
+    provider = {'kind': 'food_automatic_captured', 'bank': bank_evidence, 'tracking': tracking_evidence}
+    audit_input = {'flow_id': flow_id, 'order_id': order_id, 'reserved_minor': reserved_minor,
+                   'attested_by': attested_by or 'bank_evidence', 'provider_evidence': provider}
+    audit_hash = digest(audit_input)
+    previous = db.execute('SELECT * FROM owner_attestations WHERE flow_id=?', (flow_id,)).fetchone()
+    if previous is not None:
+        require(flow['state'] == 'COMPLETE' and previous['evidence_hash'] == audit_hash,
+                'EVIDENCE_CONFLICT')
+    else:
+        require(flow['state'] == 'FENCED', 'FENCED_FLOW_REQUIRED')
+    return flow, provider, audit_hash, previous
+
+
+def preview_food_automatic_captured(flow_id, **kwargs):
+    with _db() as db:
+        flow, _, audit_hash, previous = _food_capture_close(db, flow_id, **kwargs)
+        return {'flow_id': flow_id, 'order_id': flow['order_id'], 'from_state': flow['state'],
+                'to_state': 'COMPLETE', 'reserved_minor_retained': flow['reserved_minor'],
+                'charge': 'captured', 'evidence_hash': audit_hash, 'already_closed': previous is not None,
+                'retry_allowed': False}
+
+
+def close_food_automatic_captured(flow_id, *, order_id, reserved_minor, bank_evidence,
+                                 tracking_evidence, attested_by):
+    """Bank-evidenced charged close; every send and ownership identity stays consumed."""
+    with _db() as db:
+        flow, provider, audit_hash, previous = _food_capture_close(db, flow_id, order_id=order_id,
+            reserved_minor=reserved_minor, bank_evidence=bank_evidence,
+            tracking_evidence=tracking_evidence, attested_by=attested_by)
+        now = previous['attested_at'] if previous else time.time()
+        if previous is None:
+            db.execute('INSERT INTO owner_attestations VALUES (?,?,?,?,?,?,?,?)',
+                (flow_id, order_id, reserved_minor, attested_by or 'bank_evidence', bank_evidence['evidence'],
+                 now, json.dumps(provider, sort_keys=True, separators=(',', ':'), allow_nan=False), audit_hash))
+            db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,order_id,observed_at) '
+                       'VALUES (?,?,?,?,?,?)', (flow_id, 'place', 'FOOD_CAPTURE_EVIDENCED', audit_hash, order_id, now))
+            db.execute("UPDATE flows SET state='COMPLETE' WHERE id=?", (flow_id,))
+    return {'state': 'COMPLETE', 'charge': 'captured', 'account_fence_lifted': True,
+            'attested_at': now, 'evidence_hash': audit_hash, 'already_closed': previous is not None,
+            'reservation_minor_retained': reserved_minor, 'retry_allowed': False}
+
+
 def close_owner_attested_uncharged(flow_id, *, order_id, reserved_minor,
                                   evidence, attested_by, provider_evidence):
     """Trusted exact-provider review plus owner evidence, committed atomically.

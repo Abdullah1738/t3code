@@ -40,6 +40,7 @@ import transcript_capture as tc  # noqa: E402
 import transcript_roots  # noqa: E402
 from sync_claude import clip, is_seeded, load_seeded  # noqa: E402
 from sync_opencode_v2 import with_retry  # noqa: E402
+from capture_budget import Budget, Exhausted, checkpoint, setup_writer  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEM_DB = os.environ.get("MEMORY_DB", os.path.join(HOME, ".local/share/memory-system/data/memory.db"))
@@ -247,13 +248,11 @@ def _first_line_hash(path):
 class CodexSync:
     def __init__(self, args, roots=None):
         self.args = args
+        self.budget = Budget(args.deadline)
         self.roots = roots if roots is not None else [
             r for r in transcript_roots.existing() if r["driver"] == DRIVER]
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
-        self.mem = sqlite3.connect(MEM_DB, timeout=600)
-        self.mem.execute("PRAGMA wal_autocheckpoint=0")
-        self.mem.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        self.mem.execute("PRAGMA busy_timeout=600000")
+        self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seed_roots = list(self.roots) + list(self.all_roots)
@@ -290,7 +289,7 @@ class CodexSync:
         key = self.key_of(path)
         instance = self._root_of(path)["instance"]
         if tc.quarantined(self.mem, key):
-            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance))
+            with_retry(self.mem, lambda: tc.follow_quarantined_move(self.mem, path, key, instance), budget=self.budget)
             self.stats["quarantined"] += 1
             return
         if path.endswith(tc.ZST) and not tc.zstd_bin():
@@ -302,12 +301,12 @@ class CodexSync:
                     def update_known():
                         self.mem.execute("UPDATE native_capture_files SET path=?, instance=? WHERE rep_id=?",
                                          (path, instance, known["rep_id"]))
-                    with_retry(self.mem, update_known)
+                    with_retry(self.mem, update_known, budget=self.budget)
                 if known["session_key"] is None:
                     self._restore_identity(known["rep_id"])
                 self.stats["unchanged"] += 1
                 return  # archive unchanged: no decode, no head probe, no re-journal
-        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance))
+        rep = with_retry(self.mem, lambda: tc.open_representation(self.mem, path, st, key=key, instance=instance), budget=self.budget)
         if rep["quarantined_until"] > time.time():
             self.stats["quarantined"] += 1
             return
@@ -330,6 +329,7 @@ class CodexSync:
     def _restore_identity(self, rep_id):
         key = None
         for (line,) in self.mem.execute("SELECT raw FROM native_capture_raw WHERE rep_id=? ORDER BY line_no", (rep_id,)):
+            self.budget.check()
             try:
                 rec = json.loads(line)
             except (ValueError, UnicodeDecodeError):
@@ -338,7 +338,8 @@ class CodexSync:
                 key = tc.merge_session_key(key, rec["payload"].get("id"))
         if key is not None:
             with_retry(self.mem, lambda: self.mem.execute(
-                "UPDATE native_capture_files SET session_key=? WHERE rep_id=? AND session_key IS NULL", (key, rep_id)))
+                "UPDATE native_capture_files SET session_key=? WHERE rep_id=? AND session_key IS NULL", (key, rep_id)),
+                       budget=self.budget)
 
     @staticmethod
     def _plain_unchanged(path, st, rep):
@@ -361,6 +362,7 @@ class CodexSync:
         pos = 0
         if rep["offset"]:
             for line, end in _physical_lines(path, 0):
+                self.budget.check()
                 if end > rep["offset"]:
                     break
                 line_no += 1
@@ -375,6 +377,7 @@ class CodexSync:
             pos = rep["offset"]
         batch_rows, batch_raw, batch_end, batch_bytes = [], [], pos, 0
         for line, end in _physical_lines(path, pos):
+            self.budget.check()
             line_no += 1
             batch_end = end
             batch_bytes += len(line)
@@ -434,7 +437,7 @@ class CodexSync:
                          complete=eof, inode=st.st_ino, instance=self._root_of(path)["instance"],
                          session_key=session_key, clear_error=eof)
 
-        with_retry(self.mem, txn)
+        with_retry(self.mem, txn, budget=self.budget)
         self.stats["rows"] += len(events)
         self.stats["raw"] += len(raw)
 
@@ -452,7 +455,7 @@ class CodexSync:
         except (OSError, ValueError):
             return
         try:
-            with_retry(self.mem, lambda: self._record_failure(path, key, msg))
+            with_retry(self.mem, lambda: self._record_failure(path, key, msg), budget=self.budget)
         except Exception as e:  # noqa: BLE001 - recording must never abort the other files
             self.errors.append(f"{os.path.basename(path)}: could not record failure: {type(e).__name__}")
 
@@ -476,6 +479,13 @@ class CodexSync:
         return cur.lastrowid
 
     def run(self):
+        try:
+            return self._run()
+        finally:
+            checkpoint(self.mem)
+            self.mem.close()
+
+    def _run(self):
         t0 = time.time()
         for r in self.all_roots:
             if not r["exists"]:
@@ -483,7 +493,8 @@ class CodexSync:
         for r in self.roots:
             if not os.path.isdir(r["path"]):
                 continue
-            if self.args.deadline and time.time() - t0 > self.args.deadline:
+            if self.budget.expired() or (self.args.deadline and time.time() - t0 > self.args.deadline):
+                self.stats["partial"] = True
                 break
             files_before, errors_before = self.stats["files"], self.stats["errors"]
             finished = True
@@ -492,9 +503,10 @@ class CodexSync:
                 self.stats["unchanged"] += 1
 
             for path in session_files(r["path"], on_alias=skip_alias):
-                if self.args.deadline and time.time() - t0 > self.args.deadline:
+                if self.budget.expired() or (self.args.deadline and time.time() - t0 > self.args.deadline):
                     print("soft deadline reached; rest next run", flush=True)
                     finished = False
+                    self.stats["partial"] = True
                     break
                 self.stats["files"] += 1
                 try:
@@ -503,11 +515,19 @@ class CodexSync:
                     continue  # moved between listing and stat: the archive move is picked up next tick
                 try:
                     self.sync_file(path, st)
+                except Exhausted:
+                    finished = False
+                    self.stats["partial"] = True
+                    break
                 except ZstdMissing:
                     self._fail(path, "zstd missing")
                 except FileNotFoundError:
                     continue
                 except sqlite3.OperationalError as e:
+                    if self.budget.expired():
+                        finished = False
+                        self.stats["partial"] = True
+                        break
                     if "locked" in str(e) or "busy" in str(e):
                         raise  # shared write lock: the whole tick retries, not one file
                     self._fail(path, str(e))
@@ -515,13 +535,12 @@ class CodexSync:
                     self._fail(path, f"zstd failed rc={e.returncode}")
                 except Exception as e:  # noqa: BLE001 - one bad file must not block the others
                     self._fail(path, f"{type(e).__name__}: {str(e)[:200]}")
-            if (finished and os.path.isdir(r["path"]) and
+            if (finished and not self.budget.expired() and os.path.isdir(r["path"]) and
                     (not self.args.deadline or time.time() - t0 <= self.args.deadline)):
                 with_retry(self.mem, lambda: tc.record_root_pass(
                     self.mem, r["instance"], r["path"], self.stats["files"] - files_before,
-                    self.stats["errors"] - errors_before))
+                    self.stats["errors"] - errors_before), budget=self.budget)
         self.stats["secs"] = round(time.time() - t0, 2)
-        self.mem.close()
         print("DONE", json.dumps(self.stats), flush=True)
         return self.stats
 

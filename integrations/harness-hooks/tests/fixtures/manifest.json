@@ -352,6 +352,19 @@
     "source_line_0": 267,
     "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc"
   },
+  "crpko-2697-python-prose-facts.sh": {
+    "card": 2697,
+    "kind": "exec_command",
+    "cwd": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "workdir": "/Volumes/ExternalSSD/board-wt/crpko-devops-operation-record-gc",
+    "exact": true,
+    "redactions": [],
+    "sha256": "f1e180bcf964de6049fffd6b8f5171340a04f4fef56b465ca696cbf68594a80d",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T01-00-16-01a1bcf6-3bd5-74a2-98ed-5b06f92af8a4.jsonl",
+    "source_line_0": 2004,
+    "source_call_id": "call_2dd4c7523e56483889544838c0fbacd8",
+    "refusal_line_0": 2006
+  },
   "crpko-2697-source-and-test-heredocs.sh": {
     "body_fixture": "bodies/crpko-2697-gc-private-release-operation-records.mjs",
     "body_sha256": "4799751f63e1f1b9d90fbada849d2fdcc717fbd3cc806d155dfbab23ce6537ed",
@@ -969,6 +982,19 @@
     "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/08/rollout-2026-11-08T23-19-34-01a1bc9a-0c2a-7ef2-9353-2b20a8afe17c.jsonl",
     "source_call_id": "call_66258f83ad93497f8203e8b3d1d8b445",
     "source_line_0": 78
+  },
+  "torssh-29-native-build-heredocs.sh": {
+    "card": 29,
+    "kind": "exec_command",
+    "cwd": "/Users/ardud/checkouts/torssh-native-tor",
+    "workdir": "/Users/ardud/checkouts/torssh-native-tor",
+    "exact": true,
+    "redactions": [],
+    "sha256": "58995248bdf9e2c91f4924b486c21d0c1abb335346d3b08fa3d9191727328af0",
+    "source": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/09/rollout-2026-11-09T11-55-24-01a1bf4e-06ed-7b21-9e01-42dac5ee7432.jsonl",
+    "source_line_0": 124,
+    "source_call_id": "call_57652bddb7c64191a9791e5618c0b04e",
+    "refusal_line_0": 127
   },
   "usdtwallet-140-proof-body-offbox.sh": {
     "body_fixture": "bodies/usdtwallet-140-proof.sh",

@@ -30,7 +30,18 @@ class NativeReader:
         rows=[{'item_code':r['itemCode'],'qty':r['qty'],'modifiers':r['modifiers'],'notes':r['notes']}
               for r in self.state['items']]
         self.flow=food.FoodFlow(self.state['outlet'],rows,self.flow_id,read_only=True)
-        data=self.flow.read()
+        try:
+            data=self.flow.read()
+        except j.JournalError as exc:
+            if str(exc) == 'FOOD_RESPONSE_UNVERIFIED':
+                local=j.inspect(self.flow_id)
+                if local['state']=='FENCED' and local['order_id'] and not any(
+                        o['kind'] in ('payment','prepay','preauthorize') for o in local['operations']):
+                    raise j.PaymentError('FOOD_RESPONSE_UNVERIFIED', {
+                        'flow_id':self.flow_id, 'financial_send':False, 'financial_retry':False,
+                        'next':[f'For a delivered automatic capture, use commerce close-food-captured {self.flow_id} '
+                                '--bank-msg-id MSG_ID (dry run); add --confirm only after reviewing its evidence.']}) from None
+            raise
         self.session_data=data
         # An exact owned session is the only permitted source of an order ID.
         # Retain all review guards while allowing that session to have an order.

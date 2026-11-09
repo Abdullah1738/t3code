@@ -32,7 +32,7 @@ type Turn = Route & {
   phase: "submitting" | "running" | "unknown" | "failed";
   background?: boolean;
   /**
-   * `"request"`: opened by the idle watch only to relay a subagent's request.
+   * `"request"`: follows requests after a reply or when the idle watch finds one.
    * Nothing guarantees the root resumes afterwards (the child may be aborted,
    * fail, or have its request answered elsewhere), so poll() closes it once
    * nothing is asked and the route has stayed quiet for a short grace.
@@ -2711,14 +2711,9 @@ export class Router {
     // Work has no deadline: a turn runs for as long as the agent needs.
     const elapsed = Date.now() - turn.startedAt;
     try {
-      const statuses = await this.statusesFor(turn);
-      const [messages, requests] = await Promise.all([
-        bounded(this.backend.messages(turn.id, turn.directory, turn.background
-          ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
-        this.requests(turn, statuses),
-      ]);
+      const messages = await bounded(this.backend.messages(turn.id, turn.directory, turn.background
+        ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 }));
       if (!this.current(turn)) return;
-      if (!messages || !statuses) throw new Error();
       if (turn.phase === "submitting" || turn.phase === "unknown") {
         const absent = await this.reconcile(turn, messages);
         const reconciled = this.store.get<Turn | null>("activeTurn");
@@ -2734,6 +2729,25 @@ export class Router {
           }
         }
       }
+      // OpenCode 2 records carry no parent link. A turn is every record after
+      // its user prompt (or, for background work, after the last delivered
+      // record) up to the next idle marker, which OpenCode appends once the
+      // execution settles (succeeded, failed or interrupted).
+      const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
+      const after = start < 0 ? [] : messages.slice(start + 1);
+      // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
+      let steered = -1;
+      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
+      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
+        && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
+      const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
+      const end = missing || found < 0 ? -1 : steered + 1 + found;
+      const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
+      // A run's idle marker settles its reply independently of other runs and children.
+      // Child discovery can fail or block, so only await requests while this run is open.
+      const statuses = idle ? {} : await this.statusesFor(turn);
+      const requests = idle ? [] : await this.requests(turn, statuses);
+      if (!this.current(turn)) return;
       const entries = this.pending();
       const live = new Set<string>();
       for (const { request, directory } of requests) {
@@ -2751,42 +2765,30 @@ export class Router {
           this.store.set("pendingApprovals", entries);
         }).immediate();
       }
-      for (const entry of entries) {
-        if (!live.has(entry.operationId)) {
-          if (entry.state === "pending") entry.state = "expired";
-          // An answer handed over for a request that is no longer open either
-          // landed or no longer matters. Once the resubmit window has passed,
-          // nothing can come of it; while inside it, a restart could still
-          // show the request open again and ask anew.
-          else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-            entry.state = "expired";
-          }
-        } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-          // The request is still open long after an answer was handed over (for
-          // example across a restart), so that answer never landed: ask again.
-          const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
-          if (body && this.signature(body) === entry.signature) {
-            entry.state = "pending";
-            entry.prompt = undefined;
+      if (!idle) {
+        for (const entry of entries) {
+          if (!live.has(entry.operationId)) {
+            if (entry.state === "pending") entry.state = "expired";
+            // An answer handed over for a request that is no longer open either
+            // landed or no longer matters. Once the resubmit window has passed,
+            // nothing can come of it; while inside it, a restart could still
+            // show the request open again and ask anew.
+            else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+              entry.state = "expired";
+            }
+          } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+            // The request is still open long after an answer was handed over (for
+            // example across a restart), so that answer never landed: ask again.
+            const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
+            if (body && this.signature(body) === entry.signature) {
+              entry.state = "pending";
+              entry.prompt = undefined;
+            }
           }
         }
+        this.store.set("pendingApprovals", entries);
+        this.advance(turn);
       }
-      this.store.set("pendingApprovals", entries);
-      this.advance(turn);
-      // OpenCode 2 records carry no parent link. A turn is every record after
-      // its user prompt (or, for background work, after the last delivered
-      // record) up to the next idle marker, which OpenCode appends once the
-      // execution settles (succeeded, failed or interrupted).
-      const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
-      const after = start < 0 ? [] : messages.slice(start + 1);
-      // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
-      let steered = -1;
-      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
-      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
-        && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
-      const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
-      const end = missing || found < 0 ? -1 : steered + 1 + found;
-      const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
@@ -2868,10 +2870,18 @@ export class Router {
         }).immediate();
         return;
       }
+      // Busy activity may belong to an older run whose records precede this watermark.
+      // Once it stops, there is no later idle marker for this empty background turn.
+      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size) {
+        this.store.db.transaction(() => {
+          this.store.set("activeTurn", null);
+          this.store.set("pendingApprovals", null);
+        }).immediate();
+        return;
+      }
       const tools = replies.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p?.type === "tool") : []);
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
-      // An active session is still working even after an idle marker.
-      if (turn.phase !== "running" || live.size || statuses[turn.id] !== undefined) return;
+      if (turn.phase !== "running") return;
       if (runningTools || !idle) return;
       // A final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
@@ -2913,8 +2923,13 @@ export class Router {
         }
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
         this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
-        this.store.set("activeTurn", null);
-        this.store.set("pendingApprovals", null);
+        const waiting = entries.filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
+        // Keep already-asked requests answerable without rediscovering their run or child.
+        this.store.set("activeTurn", waiting.length ? {
+          id: turn!.id, directory: turn!.directory, generation: turn!.generation,
+          messageId: idle.id, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
+        } satisfies Turn : null);
+        this.store.set("pendingApprovals", waiting.length ? waiting : null);
         this.store.set("settledAt", Date.now());
       }).immediate();
       if (text || earlier.length) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);

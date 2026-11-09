@@ -30,6 +30,76 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
+# Recipes travel with this runner so an uninstalled checkout can prove the exact change.
+REPO_RECIPES_DIR = Path(__file__).resolve().parents[2] / "templates" / "repos"
+REPO_SETUP_FAILED_MARKER = "offbox-repo-setup-failed"
+EXIT_REPO_SETUP = 98
+
+REPO_SETUP = r'''# offbox-repo-setup
+(
+  set -euo pipefail
+  mkdir -p "$HOME/.offbox/repo-env"
+  exec 9>"$HOME/.offbox/repo-setup-@KEY@.lock"
+  flock -x -w 1800 9
+  export OFFBOX_REPO_ROOT="$HOME"/@ROOT@
+  _offbox_base="$HOME/.offbox/repo-setup-@KEY@"
+  _offbox_stamp=$(python3 - "$OFFBOX_REPO_ROOT" <<'OFFBOX_REPO_STAMP'
+import base64, hashlib, re, sys
+from pathlib import Path
+recipe = base64.b64decode('@RECIPE@')
+mod = Path(sys.argv[1]) / 'core/go.mod'
+match = re.search(r'^\s*(?:require\s+)?golang\.org/x/mobile\s+(v[^\s]+)', mod.read_text(), re.M) if mod.exists() else None
+version = match[1] if match else ''
+print(hashlib.sha256(recipe + b'\0' + version.encode()).hexdigest())
+OFFBOX_REPO_STAMP
+  )
+  if [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
+     [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
+    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    rm -f "$_offbox_base.stamp"
+    _offbox_t0=$SECONDS
+    python3 - "$_offbox_base.sh" <<'OFFBOX_REPO_RECIPE'
+import base64, sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
+OFFBOX_REPO_RECIPE
+    bash "$_offbox_base.sh"
+    # A successful recipe must publish the environment before we trust its stamp.
+    test -f "$HOME/.offbox/repo-env/@KEY@.sh"
+    printf '%s\n' "$_offbox_stamp" > "$_offbox_base.stamp.tmp"
+    mv -f "$_offbox_base.stamp.tmp" "$_offbox_base.stamp"
+    echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3
+  fi
+) 3>&2 >>"$HOME/.offbox/repo-setup-@KEY@.log" 2>&1
+_offbox_repo_rc=$?
+if [ "$_offbox_repo_rc" -ne 0 ]; then
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+fi
+. "$HOME/.offbox/repo-env/@KEY@.sh" || {
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+}
+'''
+
+
+def repo_setup_block(repo_key: str, rdir: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", repo_key):
+        return ""
+    recipe = REPO_RECIPES_DIR / f"{repo_key}.sh"
+    if not recipe.is_file():
+        return ""
+    # The log redirection opens before the subshell can create its directories.
+    return ('mkdir -p "$HOME/.offbox" || { '
+            f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
+            'echo offbox-repo-setup-failed >&2; exit 98; }\n'
+            + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
+            .replace('@RECIPE@', base64.b64encode(recipe.read_bytes()).decode()))
+
 # The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
 # itself so even boxes made before the fix use the bound. The supervisor never waits for a wedged root child.
 IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
@@ -491,6 +561,11 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
+    return (code == EXIT_REPO_SETUP and bool(log_path) and Path(log_path).exists()
+            and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
+
+
 def scope_failed(log_path: Path | None) -> bool:
     """True when the run's only output is boat's scope error: nothing of ours ran."""
     if not log_path or not Path(log_path).exists():
@@ -620,7 +695,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
-                  image_wait: int = 180) -> str:
+                  image_wait: int = 180, repo_key: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -631,6 +706,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
+              repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
               cmd]
@@ -710,7 +786,8 @@ class Runner:
         except Exception:
             node_block = ""
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds())
+                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
+                               repo_key=me["repo_key"])
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
@@ -1212,6 +1289,11 @@ def _run_remote(a, rn) -> int:
             after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
         raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
                           f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
+    if repo_setup_failed(code, rn.log_path):
+        rn.started = False
+        rn.record(error="repo toolchain setup failed (exit 98)")
+        finish(rn.run_id, None, "infra")
+        raise OffboxError("repo toolchain setup failed (exit 98), not your command", code=EXIT_INFRA)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

@@ -1,4 +1,7 @@
-"""Shared, fail-open Claude/Codex hook policy.  No harness SDK is required."""
+"""Shared Claude/Codex policy. Offbox/coord errors fail open; desktop admission
+fails closed and local live-DB denials need no control service or identity.
+No harness SDK is required.
+"""
 from __future__ import annotations
 
 import datetime
@@ -50,8 +53,8 @@ def _state():
 
 # The JSONL file is an audit trail, not a transcript. Untrusted event, tool,
 # identity and classifier fields can themselves contain an entire command.
-_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim"}
-_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl"}
+_LOG_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "shim", "Stop", "SubagentStop", "SessionEnd"}
+_LOG_TOOLS = {"Bash", "shell", "apply_patch", "aws", "psql", "fdbcli", "clickhouse-client", "terraform", "docker", "desktop-cua", "desktop-node-repl", "desktop-flush"}
 _LOG_RULES = {
     "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
     "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
@@ -62,7 +65,7 @@ _LOG_RULES = {
     "aws-mutation", "clickhouse-http-write", "terraform-mutation", "coord-control", "github-write", "deploy-script",
     "force-push", "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
-    "desktop-unavailable", "desktop-end", "desktop-end-error",
+    "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
 }
 _LOG_ERRORS = {
@@ -432,9 +435,10 @@ def _command_with_context(command, identity, pin):
             "\nunset " + " ".join(scratch) + "\neval 'unset " + status + "; (exit '" + '"$' + status + '"' + "')' && :\n}")
 
 
+_IDENTITY_BINDING_TTL = 30 * 60
 _CLAUDE_IDENTITY_TTL = 12 * 60 * 60
-_CLAUDE_IDENTITY_BUDGET = 4.5
-_CLAUDE_IDENTITY_CALL_TIMEOUT = 3.0
+_IDENTITY_LOOKUP_BUDGET = 4.5
+_IDENTITY_CALL_TIMEOUT = 3.0
 
 
 def _identity_transport_error(error):
@@ -444,21 +448,19 @@ def _identity_transport_error(error):
 
 
 def _lookup_identity(path, harness):
-    if harness != "claude":
-        return _get(path)
     # Leave room for the 3s classifier and 1.5s lineage walk in the 10s hook.
-    deadline = time.monotonic() + _CLAUDE_IDENTITY_BUDGET
+    deadline = time.monotonic() + _IDENTITY_LOOKUP_BUDGET
     for attempt in range(2):
         try:
-            return _get(path, deadline=min(deadline, time.monotonic() + _CLAUDE_IDENTITY_CALL_TIMEOUT),
-                        timeout=_CLAUDE_IDENTITY_CALL_TIMEOUT)
+            return _get(path, deadline=min(deadline, time.monotonic() + _IDENTITY_CALL_TIMEOUT),
+                        timeout=_IDENTITY_CALL_TIMEOUT)
         except Exception as error:
             if attempt or not _identity_transport_error(error) or time.monotonic() >= deadline:
                 raise
 
 
 def resolve_identity(event, harness, *, fresh=False):
-    """Resolve exact hook identity; refresh bindings after 60 seconds.
+    """Resolve exact hook identity; cache binding-only lookups for 30 minutes.
 
     Claude children need the hook's agent_id. A shell with only the session id
     identifies the parent, not necessarily the shell's executing child.
@@ -481,8 +483,12 @@ def resolve_identity(event, harness, *, fresh=False):
                        bool(identity.get("robobThreadId")) and identity.get("nativeSessionId") == native and
                        identity.get("nativeAgentId") == agent and identity.get("driver") in (None, driver) and
                        (not instance or identity.get("providerInstanceId") in (None, instance)))
-        if not fresh and 0 <= age < 60 and valid_cache:
-            return {**identity, "identity_source": "cache"}
+        if not fresh and 0 <= age < _IDENTITY_BINDING_TTL and valid_cache:
+            binding = {**identity, "identity_source": "cache"}
+            # Binding stability does not imply model-policy stability.
+            if age >= 60:
+                binding.pop("model", None)
+            return binding
         params = {"nativeId": native, "driver": driver}
         if agent:
             params["agentId"] = agent
@@ -1091,9 +1097,9 @@ def decide(event, harness):
             # This policy must not enter the general engine's fail-open identity path.
             try:
                 if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control)
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state())
                 else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control)
+                    rule, error_type = desktop_lease.finish(event, harness, _control, _state())
                     decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
@@ -1101,6 +1107,11 @@ def decide(event, harness):
                 result = {"decision": "deny" if kind == "PreToolUse" else "allow",
                           "reason": desktop_lease.UNAVAILABLE if kind == "PreToolUse" else "",
                           "context": {"rule": "desktop-unavailable"}}
+            return result
+        if kind in desktop_lease.TURN_END:
+            log_tool = "desktop-flush"
+            rule, error_type = desktop_lease.flush(event, harness, _control, _state())
+            result = {"decision": "allow", "reason": "", "context": {"rule": rule}}
             return result
         command = _command(event) if kind == "PreToolUse" else None
         if command:

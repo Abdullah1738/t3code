@@ -482,6 +482,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
           startTurn: () => options.startTurn ?? Effect.void,
+          compactThread: () => options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -1141,7 +1142,7 @@ it.effect(
       const failStart = yield* Ref.make(false);
       yield* Effect.gen(function* () {
         const f = yield* makeSessionAudienceFixture(state);
-        const [carrier, busy, failed] = f.threadIds;
+        const [, busy, failed] = f.threadIds;
         yield* f.resume(busy!);
         yield* f.start(busy!, 1);
         yield* f.start(busy!, 2);
@@ -1164,10 +1165,11 @@ it.effect(
         assert.isTrue(Exit.isFailure(yield* f.start(failed!).pipe(Effect.exit)));
         yield* Ref.set(failStart, false);
         yield* f.finish(failed!); // A late terminal for a rejected start cannot clear the other owner.
-        assertSessionRecipients(yield* f.emit(waiting), [busy!], waiting);
+        // A rejected send can still have reloaded its native thread.
+        assertSessionRecipients(yield* f.emit(waiting), [busy!, failed!], waiting);
         yield* f.finish(busy!, 2);
         const ready = { ...running, status: "ready" as const };
-        assertSessionRecipients(yield* f.emit(ready), [carrier!], ready);
+        assertSessionRecipients(yield* f.emit(ready), [failed!], ready);
         yield* TestClock.adjust("1 second");
         assert.isTrue(Option.isNone(yield* f.manager.get(f.providerSessionId)));
       }).pipe(
@@ -4376,6 +4378,28 @@ it.effect("ProviderSessionManagerV2 checks liveness without delaying idle releas
   }),
 );
 
+it.effect.each([
+  { name: "shared", capabilities: CodexCapabilities },
+  { name: "exclusive", capabilities: ExclusiveCapabilities },
+])(
+  "ProviderSessionManagerV2 runtime polling does not keep an idle $name session alive",
+  ({ capabilities }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const { providerSessionId } = yield* openSessionWithBackgroundCommand(
+          "provider-session-manager-polled-runtime",
+        );
+        yield* TestClock.adjust("600 millis");
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        yield* TestClock.adjust("600 millis");
+        assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000, capabilities })));
+    }),
+);
+
 it.effect("ProviderSessionManagerV2 clears the background roster of an idle-released session", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -5134,6 +5158,19 @@ it.effect("ProviderSessionManagerV2 marks pending runtime requests non-live on r
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
   }),
 );
+it.effect("ProviderSessionManagerV2 protects compaction from idle unloading", () =>
+  runIdleThreadUnloadScenario("compact-idle-unload", ({ state, threadA, startTurn, endTurn }) =>
+    Effect.gen(function* () {
+      yield* startTurn(threadA, 1, { compact: true });
+      yield* TestClock.adjust("2 seconds");
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      yield* endTurn(threadA, 1);
+      yield* TestClock.adjust("1 second");
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+    }),
+  ),
+);
+
 it.effect("ProviderSessionManagerV2 retries release records that failed to persist", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -6193,11 +6230,18 @@ function runIdleThreadUnloadScenario(
     readonly manager: ProviderSessionManager.ProviderSessionManagerV2Shape;
     readonly providerSessionId: ProviderSessionId;
     readonly threadA: ThreadId;
-    readonly startTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
+    readonly startTurn: (
+      threadId: ThreadId,
+      ordinal: number,
+      options?: { resume?: boolean; compact?: boolean },
+    ) => Effect.Effect<void>;
     readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
     readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
   }) => Effect.Effect<void, ProviderSessionManager.ProviderSessionManagerV2Error>,
-  options: { readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean> } = {},
+  options: {
+    readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+    readonly beforeUnload?: Effect.Effect<void>;
+  } = {},
 ) {
   return Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -6242,11 +6286,15 @@ function runIdleThreadUnloadScenario(
             runtimePolicy,
           })
           .pipe(Effect.asVoid, Effect.orDie);
-      const startTurn = (threadId: ThreadId, ordinal: number) =>
+      const startTurn = (
+        threadId: ThreadId,
+        ordinal: number,
+        options?: { resume?: boolean; compact?: boolean },
+      ) =>
         Effect.gen(function* () {
-          yield* resume(threadId);
+          if (options?.resume !== false) yield* resume(threadId);
           const runId = idAllocator.derive.run({ threadId, ordinal });
-          yield* runtime.startTurn({
+          yield* (options?.compact ? runtime.compactThread! : runtime.startTurn)({
             appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
             threadId,
             runId,
@@ -6311,6 +6359,7 @@ function runIdleThreadUnloadScenario(
         layerTest({
           state,
           idleTimeoutMs: 1000,
+          ...(options.beforeUnload === undefined ? {} : { beforeUnload: options.beforeUnload }),
           ...(options.hasPendingBackgroundWorkForThread === undefined
             ? {}
             : { hasPendingBackgroundWorkForThread: options.hasPendingBackgroundWorkForThread }),
@@ -6347,6 +6396,46 @@ it.effect(
           assert.equal((yield* Ref.get(state)).resumeCount, resumes + 1);
         }),
     ),
+);
+
+it.effect("ProviderSessionManagerV2 unloads a thread resumed without starting a turn", () =>
+  runIdleThreadUnloadScenario("resume-only-unload", ({ state, threadA, resume, startTurn }) =>
+    Effect.gen(function* () {
+      yield* resume(threadA);
+      yield* TestClock.adjust("1 second");
+      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+      const resumes = (yield* Ref.get(state)).resumeCount;
+      yield* startTurn(threadA, 1, { resume: false });
+      assert.equal((yield* Ref.get(state)).resumeCount, resumes + 1);
+    }),
+  ),
+);
+
+it.effect("ProviderSessionManagerV2 retries an idle unload after a transient failure", () =>
+  Effect.gen(function* () {
+    const attempts = yield* Ref.make(0);
+    yield* runIdleThreadUnloadScenario(
+      "retry-idle-unload",
+      ({ state, threadA, startTurn, endTurn }) =>
+        Effect.gen(function* () {
+          yield* startTurn(threadA, 1);
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          assert.equal(yield* Ref.get(attempts), 1);
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          yield* TestClock.adjust("1 second");
+          assert.equal(yield* Ref.get(attempts), 2);
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+      {
+        beforeUnload: Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+          Effect.flatMap((count) =>
+            count === 1 ? Effect.die("temporary unload failure") : Effect.void,
+          ),
+        ),
+      },
+    );
+  }),
 );
 
 it.effect(

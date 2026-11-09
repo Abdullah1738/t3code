@@ -307,6 +307,23 @@ function providerConstraints(
   return constraints;
 }
 
+function supportedInheritedOptions(
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+): ReadonlyArray<ProviderOptionSelection> | undefined {
+  if (descriptors === undefined) return options;
+  return options?.filter((option) => {
+    // Legacy variants are canonicalized and checked by the selection resolver.
+    if (option.id === "variant") return true;
+    const descriptor = descriptors.find((candidate) => candidate.id === option.id);
+    return (
+      descriptor !== undefined &&
+      (descriptor.type !== "select" ||
+        descriptor.options.some((choice) => choice.id === option.value))
+    );
+  });
+}
+
 /**
  * Models without descriptors skip the descriptor checks (mirroring how model slugs are only
  * validated when the provider advertises models), but duplicate ids always fail: downstream
@@ -1343,7 +1360,8 @@ const make = Effect.gen(function* () {
           );
         }
       }
-      const explicitSource = input.target.providerInstanceId ??
+      const explicitSource =
+        input.target.providerInstanceId ??
         (input.target.driverKind === undefined || input.target.driverKind === "opencode"
           ? "opencode"
           : undefined);
@@ -1524,9 +1542,10 @@ const make = Effect.gen(function* () {
       );
     }
 
+    const descriptors = provider.models.find((candidate) => candidate.slug === model)?.capabilities
+      ?.optionDescriptors;
+    const inheritedOptions = supportedInheritedOptions(inheritedSelection.options, descriptors);
     if (!input.delegateSelection && requestedOptions !== undefined) {
-      const descriptors = provider.models.find((candidate) => candidate.slug === model)
-        ?.capabilities?.optionDescriptors;
       const invalid = invalidOptionSelections(requestedOptions, descriptors);
       if (invalid.length > 0) {
         return yield* failure(
@@ -1538,7 +1557,7 @@ const make = Effect.gen(function* () {
 
     const inheritsOptions =
       instanceId === inheritedSelection.instanceId && model === inheritedSelection.model;
-    let options = inheritsOptions ? inheritedSelection.options : undefined;
+    let options = inheritsOptions ? inheritedOptions : undefined;
     if (
       input.delegateSelection &&
       (input.migrateSelection ||
@@ -1550,8 +1569,7 @@ const make = Effect.gen(function* () {
       const optionOverridesEffort =
         requestedOptions?.some((option) => option.id === effortId || option.id === "variant") ===
         true;
-      const overridesEffort =
-        requestedSuffix !== undefined || optionOverridesEffort;
+      const overridesEffort = requestedSuffix !== undefined || optionOverridesEffort;
       const requestedIds = new Set(requestedOptions?.map((option) => option.id));
       const mergedOptions =
         requestedOptions === undefined
@@ -1571,10 +1589,13 @@ const make = Effect.gen(function* () {
           ? {
               ...inheritedSelection,
               instanceId: effortInstanceId,
+              options: inheritedOptions ?? [],
               ...(overridesEffort || requestedOptions?.length === 0
-                ? { options: (inheritedSelection.options ?? []).filter(
-                    (option) => option.id !== effortId && option.id !== "variant",
-                  ) }
+                ? {
+                    options: (inheritedOptions ?? []).filter(
+                      (option) => option.id !== effortId && option.id !== "variant",
+                    ),
+                  }
                 : {}),
             }
           : { instanceId, model, options: [] },
@@ -1593,12 +1614,12 @@ const make = Effect.gen(function* () {
       options = requestedOptions?.length === 0 ? [] : merged.selection.options;
       if (options !== undefined && options.length > 1) {
         const order = [
-          ...(inheritsOptions ? (inheritedSelection.options ?? []) : []),
+          ...(inheritsOptions ? (inheritedOptions ?? []) : []),
           ...(requestedOptions ?? []),
         ];
         const position = (id: string) => {
-          const index = order.findIndex((option) =>
-            option.id === id || (id === effortId && option.id === "variant"),
+          const index = order.findIndex(
+            (option) => option.id === id || (id === effortId && option.id === "variant"),
           );
           return index < 0 ? order.length : index;
         };
@@ -1617,8 +1638,6 @@ const make = Effect.gen(function* () {
       options = [...selections.values()];
     }
     if (input.delegateSelection) {
-      const descriptors = provider.models.find((candidate) => candidate.slug === model)
-        ?.capabilities?.optionDescriptors;
       if (
         (effortInstanceId === "claudeAgent" ||
           effortInstanceId === "codex" ||
@@ -2253,11 +2272,17 @@ const make = Effect.gen(function* () {
         Effect.map((settings) => settings.providerModelPreferences ?? {}),
         Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
       );
+      const inheritedSelection = parent?.thread.modelSelection;
+      const inheritedDescriptors = providers
+        .find((provider) => provider.instanceId === inheritedSelection?.instanceId)
+        ?.models.find((model) => model.slug === inheritedSelection?.model)
+        ?.capabilities?.optionDescriptors;
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: parent?.thread.modelSelection.instanceId ?? null,
         inheritedModel: parent?.thread.modelSelection.model ?? null,
-        inheritedOptions: parent?.thread.modelSelection.options ?? [],
+        inheritedOptions:
+          supportedInheritedOptions(inheritedSelection?.options, inheritedDescriptors) ?? [],
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
         providers: providers.map((provider) => {
@@ -2870,7 +2895,15 @@ const make = Effect.gen(function* () {
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
     }),
-    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, input) {
+    readThread: Effect.fn("OrchestratorMcpService.readThread")(function* (scope, rawInput) {
+      const callerThreadId = scope.thread?.threadId;
+      if (rawInput.threadId === undefined && callerThreadId === undefined) {
+        return yield* failure(
+          "invalid_request",
+          "threadId is required when the caller is not a T3 thread.",
+        );
+      }
+      const input = { ...rawInput, threadId: (rawInput.threadId ?? callerThreadId)! };
       const { parent, target, shell } = yield* loadReadableThread(scope, input.threadId);
       const view = input.view ?? "messages";
       const afterPosition = input.afterPosition ?? -1;

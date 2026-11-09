@@ -777,6 +777,8 @@ const migrationMessage = (
 // actual flag, receipt store, resolver and management dispatch remain real.
 const migrationHarness = (input: {
   readonly mode?: "off" | "dryrun" | "apply";
+  readonly cutoverComplete?: boolean;
+  readonly threadIds?: ReadonlyArray<ThreadId>;
   readonly allowConflicts?: boolean;
   readonly stored?: ModelSelection;
   readonly targetEnabled?: boolean;
@@ -784,6 +786,8 @@ const migrationHarness = (input: {
   readonly runs?: ReadonlyArray<{ readonly status: OrchestrationV2Run["status"] }>;
   readonly failSelection?: boolean;
   readonly failMessageOnce?: boolean;
+  readonly pendingRequest?: boolean;
+  readonly backgroundTask?: boolean;
 }) => {
   const calls: Array<OrchestrationV2ServerCommand> = [];
   let stored = input.stored ?? legacySelection;
@@ -804,8 +808,19 @@ const migrationHarness = (input: {
                   lineage: { relationshipToParent: "root" },
                   creationSource: "web",
                   modelSelection: stored,
+                  activeProviderThreadId: input.backgroundTask ? "active" : null,
                 },
                 runs: input.runs ?? [],
+                runtimeRequests: input.pendingRequest ? [{ status: "pending" }] : [],
+                providerThreads: input.backgroundTask
+                  ? [
+                      {
+                        id: "active",
+                        pendingBackgroundTasks: [{ taskId: "task:live", kind: "subagent" }],
+                      },
+                    ]
+                  : [],
+                subagents: [],
               }) as unknown as OrchestrationV2ThreadProjection,
           ),
         dispatch: (command) =>
@@ -838,11 +853,17 @@ const migrationHarness = (input: {
     ),
     Layer.provide(
       ServerSettings.layerTest({
-        ...(input.mode === undefined
+        ...(input.mode === undefined &&
+        input.threadIds === undefined &&
+        input.cutoverComplete === undefined
           ? {}
           : {
               ardudHarnessMigration: {
-                selections: input.mode,
+                ...(input.mode === undefined ? {} : { selections: input.mode }),
+                ...(input.cutoverComplete === undefined
+                  ? {}
+                  : { cutoverComplete: input.cutoverComplete }),
+                ...(input.threadIds === undefined ? {} : { threadIds: input.threadIds }),
                 ...(input.allowConflicts === undefined
                   ? {}
                   : { allowConflicts: input.allowConflicts }),
@@ -879,6 +900,79 @@ it.effect("migrates a dormant stored selection once before multiple inherited se
     expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
     expect(harness.calls[1]).not.toHaveProperty("modelSelection");
     expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect.each(["apply", "off"] as const)(
+  "rejects explicit legacy sends before canonicalization after cutover with migration %s",
+  (mode) => {
+    const harness = migrationHarness({ mode, cutoverComplete: true, stored: mappedSelection });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(
+        threads.dispatch(migrationMessage(`legacy-${mode}`, legacySelection)),
+      );
+      expect(error._tag).toBe("OrchestratorCommandRejectedError");
+      expect(harness.calls).toEqual([]);
+      yield* threads.dispatch(migrationMessage(`native-${mode}`, mappedSelection));
+      yield* threads.dispatch(migrationMessage(`inherited-${mode}`));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "message.dispatch",
+        "message.dispatch",
+      ]);
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect(
+  "after cutover, an idle thread still on its legacy selection migrates when the composer resends that selection",
+  () => {
+    const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage("composer-own", legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual([
+        "thread.model-selection.set",
+        "message.dispatch",
+      ]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.calls[1]).toMatchObject({ modelSelection: mappedSelection });
+      expect(harness.getStored()).toEqual(mappedSelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect("after cutover, a legacy selection that is not the thread's own is still refused", () => {
+  const other: ModelSelection = {
+    instanceId: ProviderInstanceId.make("opencode"),
+    model: "opus/cc/claude-haiku-5-5",
+  };
+  const harness = migrationHarness({ mode: "apply", cutoverComplete: true });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const error = yield* Effect.flip(threads.dispatch(migrationMessage("composer-other", other)));
+    expect(error._tag).toBe("OrchestratorCommandRejectedError");
+    expect(harness.calls).toEqual([]);
+    expect(harness.getStored()).toEqual(legacySelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("routes only allowlisted threads while global selection routing stays off", () => {
+  const harness = migrationHarness({ mode: "off", threadIds: [migrationThreadId] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("allowlisted"));
+    expect(harness.getStored()).toEqual(mappedSelection);
+  }).pipe(Effect.provide(harness.layerTest));
+});
+
+it.effect("does not route a different thread on the allowlist", () => {
+  const harness = migrationHarness({ threadIds: [ThreadId.make("thread:someone-else")] });
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    yield* threads.dispatch(migrationMessage("not-allowlisted"));
+    expect(harness.getStored()).toEqual(legacySelection);
   }).pipe(Effect.provide(harness.layerTest));
 });
 
@@ -1057,6 +1151,38 @@ it.effect.each(["running", "queued"] as const)(
   },
 );
 
+it.effect.each(["running", "queued"] as const)(
+  "after cutover, a %s thread keeps its harness for this send and moves on a later idle turn",
+  (status) => {
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      runs: [{ status }],
+    });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.dispatch(migrationMessage(`busy-${status}`, legacySelection));
+      expect(harness.calls.map((command) => command.type)).toEqual(["message.dispatch"]);
+      expect(harness.calls[0]).toMatchObject({ modelSelection: legacySelection });
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
+it.effect.each(["pendingRequest", "backgroundTask"] as const)(
+  "does not detach a provider with $0",
+  (blocker) => {
+    const harness = migrationHarness({ threadIds: [migrationThreadId], [blocker]: true });
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* Effect.flip(threads.dispatch(migrationMessage(blocker)));
+      expect(error).toMatchObject({ _tag: "OrchestratorCommandRejectedError" });
+      expect(harness.calls).toEqual([]);
+      expect(harness.getStored()).toEqual(legacySelection);
+    }).pipe(Effect.provide(harness.layerTest));
+  },
+);
+
 it.effect("propagates a failed selection update without dispatching the message", () => {
   const harness = migrationHarness({ mode: "apply", failSelection: true });
   return Effect.gen(function* () {
@@ -1088,8 +1214,12 @@ it.effect("does not repeat a successful selection update if the send fails and i
 it.effect.each(["accepted", "rejected", "other-thread", "project"] as const)(
   "leaves %s receipt replay and conflicts to the orchestrator without migrating",
   (kind) => {
-    const harness = migrationHarness({ mode: "apply", targetEnabled: false });
-    const message = migrationMessage(`receipt-${kind}`);
+    const harness = migrationHarness({
+      mode: "apply",
+      cutoverComplete: true,
+      targetEnabled: false,
+    });
+    const message = migrationMessage(`receipt-${kind}`, legacySelection);
     return Effect.gen(function* () {
       const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
       yield* receipts.insertIfAbsent({

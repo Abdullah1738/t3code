@@ -270,6 +270,7 @@ export const layer: Layer.Layer<
                   source.id === handoff.targetRunId &&
                   (source.status === "failed" ||
                     source.status === "interrupted" ||
+                    source.status === "cancelled" ||
                     (source.status === "completed" &&
                       handoff.delivery === undefined &&
                       projection.messages.some(
@@ -1412,7 +1413,19 @@ export const layer: Layer.Layer<
                 ],
               });
             }),
-          });
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: session.driver,
+                  threadId: projection.thread.id,
+                  providerThreadId: providerThread.id,
+                  runId: run.id,
+                  code: "provider_prompt_not_sent",
+                  cause,
+                }),
+            ),
+          );
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
           const context = [delivery.context, restartNote]
@@ -1438,6 +1451,18 @@ export const layer: Layer.Layer<
                     ),
                   )
                 : Effect.void,
+            ),
+            Effect.mapError((cause) =>
+              refusedBeforePrompt(cause)
+                ? new ProviderAdapter.ProviderAdapterTurnStartError({
+                    driver: session.driver,
+                    threadId: projection.thread.id,
+                    providerThreadId: providerThread.id,
+                    runId: run.id,
+                    code: "provider_prompt_not_sent",
+                    cause,
+                  })
+                : cause,
             ),
           );
           // The provider already accepted the turn. A stale pending marker

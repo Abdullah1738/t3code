@@ -290,6 +290,31 @@ describe("authenticated environment HTTP requests", () => {
     }),
   );
 
+  it.effect(
+    "follows shell pages using authenticated cursor URLs and retains the earliest replay boundary",
+    () =>
+      Effect.gen(function* () {
+        const harness = makeHarness((number) =>
+          Response.json({
+            ...SHELL,
+            snapshotSequence: number + 3,
+            page: {
+              after: number === 1 ? null : "thread:a",
+              nextAfter: number === 1 ? "thread:a" : null,
+            },
+          }),
+        );
+        const snapshot = yield* fetchEnvironmentShellSnapshot(harness.input).pipe(
+          Effect.provide(harness.httpLayer),
+        );
+        expect(snapshot.snapshotSequence).toBe(4);
+        expect("page" in snapshot).toBe(false);
+        expect(harness.calls).toHaveLength(2);
+        expect(new URL(harness.calls[1]!.url).searchParams.get("after")).toBe("thread:a");
+        expect(harness.proofs[1]!.url).toBe(harness.calls[1]!.url);
+      }),
+  );
+
   it.effect.each(LOADERS)("uses current relay authorization and endpoint for $name", (loader) =>
     Effect.gen(function* () {
       const harness = makeHarness(() => Response.json(loader.response));

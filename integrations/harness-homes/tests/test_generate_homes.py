@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
@@ -143,12 +144,17 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(cfg["model_providers"]["ninerouter"]["http_headers"],
                          {"x-9router-token-saver": "off", "x-openai-actor-authorization": "robob-9router-local"})
         self.assertEqual(cfg["mcp_servers"]["cua-driver"]["args"], ["mcp"])
+        self.assertEqual(cfg["mcp_servers"]["recall"]["url"], "http://127.0.0.1:18765/mcp")
         self.assertEqual(cfg["mcp_servers"]["perplexity"]["tool_timeout_sec"], 660)
         self.assertEqual(cfg["mcp_servers"]["dia"]["env"], {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"})
         self.assertEqual(cfg["notify"], [])
         self.assertEqual(cfg["shell_environment_policy"]["set"]["PATH"],
-                         ":".join(m["shellPathPrefix"] + m["shellPath"]))
+                          ":".join(m["shellPathPrefix"] + m["shellPath"]))
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["BUN_INSPECT"], "")
+        self.assertEqual(cfg["shell_environment_policy"]["set"]["OFFBOX_GATE"], "1")
         self.assertEqual(cfg["agents"]["max_depth"], 1000000)
+        # Computer Use parses every other [agents] key as a role table; a boolean there breaks it.
+        self.assertEqual(set(cfg["agents"]), {"max_depth"})
         self.assertEqual(cfg["history"], {"persistence": "none"})
 
         hooks = json.loads((self.codex / "hooks.json").read_text())
@@ -584,7 +590,8 @@ class GenerateTests(HarnessTestCase):
 
         claude_hooks, codex_hooks = split(all_claude, False), split(all_codex, False)
         self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
-        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse"})
+        # Codex has no PostToolUseFailure; turn-end hooks close desktop calls that failed without PostToolUse.
+        self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse", "Stop", "SubagentStop", "SessionEnd"})
         claude_recall, codex_recall = split(all_claude, True), split(all_codex, True)
         self.assertEqual(set(claude_recall), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
                                               "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
@@ -692,6 +699,7 @@ class GenerateTests(HarnessTestCase):
         self.assertEqual(base.pop("model_catalog_json"), str(self.codex / "models.json"))
         self.assertIs(base["features"].pop("computer_use"), False)
         self.assertNotIn("node_repl", base["mcp_servers"])
+        self.assertEqual(cu.pop("computer_use"), {"default_app_access": "allow"})
         self.assertEqual(cu, base)
         self.assertEqual(cu["notify"], [])
         self.assertEqual(cu["analytics"], {"enabled": False})
@@ -715,6 +723,22 @@ class GenerateTests(HarnessTestCase):
         rc, output = self.run_check(m)
         self.assertEqual(rc, 0, output)
 
+    def test_only_cu_home_allows_every_app_for_computer_use(self) -> None:
+        self.run_gen(self.manifest())
+        cu = tomllib.loads((self.codex_cu / "config.toml").read_text())
+        plain = tomllib.loads((self.codex / "config.toml").read_text())
+        self.assertEqual(cu["computer_use"], {"default_app_access": "allow"})
+        self.assertNotIn("computer_use", plain)
+
+    def test_cu_catalog_carries_base_instructions_for_the_computer_use_service(self) -> None:
+        self.run_gen(self.manifest())
+        models = json.loads((self.codex_cu / "models.json").read_text())["models"]
+        self.assertTrue(models)
+        for model in models:
+            template = (model.get("model_messages") or {}).get("instructions_template")
+            if template:
+                self.assertEqual(model["base_instructions"], template)
+
     def test_cu_catalog_extends_original_terra_without_losing_metadata(self) -> None:
         self.run_gen()
         upstream = json.loads((PKG / "vendor/codex-models-0.166.0.json").read_text())
@@ -723,13 +747,16 @@ class GenerateTests(HarnessTestCase):
         cu_models = {m["slug"]: m for m in cu["models"]}
         original = next(m for m in upstream["models"] if m["slug"] == "gpt-6.1-terra")
         expected_terra = dict(original, slug="cx/gpt-6.1-terra", context_window=1050000,
-                              max_context_window=1050000, auto_compact_token_limit=450000)
+                              max_context_window=1050000, auto_compact_token_limit=450000,
+                              base_instructions=original["model_messages"]["instructions_template"])
         self.assertEqual(cu_models.pop("cx/gpt-6.1-terra"), expected_terra)
         self.assertEqual(cu_models.pop("gpt-6.1-terra"), dict(expected_terra, slug="gpt-6.1-terra"))
-        self.assertEqual(cu_models, {m["slug"]: m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"})
+        with_base = lambda m: dict(m, base_instructions=m["model_messages"]["instructions_template"])
+        self.assertEqual(cu_models, {m["slug"]: with_base(m) for m in plain["models"] if m["slug"] != "gpt-6.1-terra"})
         self.assertNotIn("cx/gpt-6.1-terra", {m["slug"] for m in plain["models"]})
         self.assertEqual([m for m in cu["models"] if m["slug"] not in {"gpt-6.1-terra", "cx/gpt-6.1-terra"}],
-                         [m for m in plain["models"] if m["slug"] != "gpt-6.1-terra"])
+                         [with_base(m) for m in plain["models"] if m["slug"] != "gpt-6.1-terra"])
+        self.assertTrue(all("base_instructions" not in m for m in plain["models"]))
 
     def test_check_detects_parity_isolation_analytics_and_catalog_drift(self) -> None:
         cases = (
@@ -904,6 +931,405 @@ class GenerateTests(HarnessTestCase):
         out = self.run_gen(extra=["--dry-run"])
         self.assertIn("would write", out)
         self.assertFalse(self.root.exists())
+
+
+class ParityTests(HarnessTestCase):
+    def json_check(self):
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["check", "--home-root", str(self.root), "--json"])
+        return rc, json.loads(out.getvalue())
+
+    def test_parity_inventory_and_machine_readable_existing_check(self):
+        self.run_gen()
+        rc, result = self.json_check()
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result["schemaVersion"], 1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["failures"], [])
+        for entry in result["homes"]:
+            home = Path(entry["home"])
+            parity = json.loads(Path(entry["parityManifestPath"]).read_text())
+            self.assertEqual(parity["harness"], entry["harness"])
+            self.assertEqual(parity["schemaVersion"], 1)
+            self.assertEqual({skill["name"] for skill in parity["skills"]}, {"alpha", "beta", "gamma"})
+            for skill in parity["skills"]:
+                self.assertEqual(os.readlink(home / "skills" / skill["name"]), skill["source"])
+                self.assertEqual(hashlib.sha256((Path(skill["source"]) / "SKILL.md").read_bytes()).hexdigest(), skill["sha256"])
+            self.assertEqual({server["id"] for server in parity["mcpServers"]},
+                             {server["id"] for server in self.manifest()["mcpServers"]})
+            self.assertIn("recall", {server["id"] for server in parity["mcpServers"]})
+            self.assertEqual(parity["runtimeMcpServers"], ["t3-code"])
+            self.assertEqual({guard["id"] for guard in parity["guards"]},
+                             {"hook-adapters", "live-database", "offbox", "betterstack-scope", "coord-haiku", "desktop-lease", "recall"})
+            self.assertFalse(parity["compactSkillCatalog"]["required"])
+            self.assertEqual(parity["instructions"]["canonical"]["path"], str(self.canonical))
+            self.assertFalse((home / "src").exists())
+            expected_names = {"settings.json", ".claude.json", "CLAUDE.md", "overlay.md"} if home.name == "claude" else {"config.toml", "hooks.json", "AGENTS.md", "models.json"}
+            self.assertEqual({Path(artifact["path"]).name for artifact in parity["artifacts"]}, expected_names)
+            for artifact in parity["artifacts"]:
+                self.assertTrue(Path(artifact["path"]).is_absolute())
+                self.assertEqual(Path(artifact["path"]).parent, home)
+                content = Path(artifact["path"]).read_bytes()
+                if Path(artifact["path"]).name == ".claude.json":
+                    self.assertEqual(artifact["format"], "claude-owned-json")
+                    content = gh.claude_owned_json(content)
+                else:
+                    self.assertNotIn("format", artifact)
+                self.assertEqual(artifact["sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_artifact_digests_use_expected_not_tampered_output_bytes(self):
+        self.run_gen()
+        for home, name, change in [
+            (self.claude, "settings.json", lambda text: text.replace("Bash|bash|shell|exec_command|shell_command", "NeverMatches")),
+            (self.claude, ".claude.json", lambda text: text.replace("http://127.0.0.1:18765/mcp", "http://127.0.0.1:9/mcp")),
+            (self.codex, "hooks.json", lambda text: text.replace("Bash|bash|shell|exec_command|shell_command", "NeverMatches")),
+            (self.codex, "config.toml", lambda text: text.replace("http://127.0.0.1:18765/mcp", "http://127.0.0.1:9/mcp")),
+            (self.codex_cu, "AGENTS.md", lambda text: text + "\nEdited instructions\n"),
+            (self.codex_cu, "models.json", lambda text: text.replace('"models":', '"edited":')),
+        ]:
+            with self.subTest(home=home.name, file=name):
+                path = home / name
+                original = path.read_bytes()
+                path.write_text(change(original.decode()))
+                with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+                    _, _, _, _, planned = gh.plan_all(str(self.root))
+                parity = json.loads(planned[str(home / gh.PARITY_MANIFEST)])
+                artifact = next(artifact for artifact in parity["artifacts"] if artifact["path"] == str(path))
+                expected_bytes = gh.claude_owned_json(original) if name == ".claude.json" else original
+                actual_bytes = gh.claude_owned_json(path.read_bytes()) if name == ".claude.json" else path.read_bytes()
+                self.assertEqual(artifact["sha256"], hashlib.sha256(expected_bytes).hexdigest())
+                self.assertNotEqual(artifact["sha256"], hashlib.sha256(actual_bytes).hexdigest())
+                self.assertEqual(self.json_check()[0], 1)
+                path.write_bytes(original)
+
+    def test_claude_runtime_fields_do_not_change_owned_artifact_or_check(self):
+        self.run_gen()
+        path = self.claude / ".claude.json"
+        parity_path = self.claude / gh.PARITY_MANIFEST
+        parity_before = parity_path.read_bytes()
+        value = json.loads(path.read_bytes())
+        value.update(projects={"/tmp/example": {"lastCost": 1.25}}, numStartups=42, runtimeField="日常")
+        path.write_text(json.dumps(value, ensure_ascii=False))
+        self.assertEqual(self.json_check()[0], 0)
+        self.assertEqual(parity_path.read_bytes(), parity_before)
+        self.run_gen()
+        self.assertEqual(json.loads(path.read_bytes())["runtimeField"], "日常")
+        self.assertEqual(parity_path.read_bytes(), parity_before)
+        value["mcpServers"]["recall"]["url"] = "http://127.0.0.1:9/mcp"
+        path.write_text(json.dumps(value))
+        self.assertEqual(self.json_check()[0], 1)
+
+    def test_claude_owned_json_is_sorted_compact_utf8(self):
+        content = b'{"runtime":42,"mcpServers":{"z":{"b":2,"a":"\\u65e5"},"a":{}},"hasCompletedOnboarding":true}'
+        expected = '{"hasCompletedOnboarding":true,"mcpServers":{"a":{},"z":{"a":"日","b":2}}}'.encode("utf-8")
+        self.assertEqual(gh.claude_owned_json(content), expected)
+
+    def test_all_roots_and_new_skills_change_inventory_without_fixed_count(self):
+        second = self.tmp / "second-root"
+        write(second / "delta/SKILL.md", "---\nname: delta\n---\nnew\n")
+        alias = self.tmp / "skill-root-alias"
+        alias.symlink_to(self.skill_root, target_is_directory=True)
+        manifest = self.manifest()
+        manifest["skillRoots"].extend([str(second), str(alias)])
+        self.run_gen(manifest)
+        for home in (self.claude, self.codex, self.codex_cu):
+            parity = json.loads((home / gh.PARITY_MANIFEST).read_text())
+            self.assertEqual({skill["name"] for skill in parity["skills"]}, {"alpha", "beta", "gamma", "delta"})
+            self.assertEqual(os.readlink(home / "skills/delta"), str(second / "delta"))
+        self.assertEqual(self.run_check(manifest)[0], 0)
+
+    def test_check_detects_stale_source_inventory_and_tampering_without_writes(self):
+        self.run_gen()
+        path = self.codex / gh.PARITY_MANIFEST
+        before = path.read_bytes()
+        write(self.skill_root / "alpha/SKILL.md", "---\nname: alpha\n---\nupdated body\n")
+        rc, result = self.json_check()
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any(gh.PARITY_MANIFEST in failure for failure in result["failures"]))
+        self.assertEqual(path.read_bytes(), before)
+        self.run_gen()
+        parity = json.loads(path.read_text())
+        parity["guards"] = []
+        path.write_text(json.dumps(parity))
+        self.assertEqual(self.json_check()[0], 1)
+
+    def test_installed_offbox_layout_uses_shared_skill_not_an_extra_copy(self):
+        installed = self.tmp / "installed/remote-compute/scripts/classify.py"
+        write(installed, "# installed fixture\n")
+        digest = gh.parity_source({"source": "missing-source.py", "installed": str(installed)})
+        self.assertEqual(digest["path"], str(installed))
+        self.assertEqual(digest["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+
+    def test_json_check_reports_unreadable_required_source_without_writes(self):
+        manifest = self.manifest()
+        manifest["paritySources"]["live-database"] = ["missing-guard.py"]
+        with mock.patch.object(gh, "load_manifest", return_value=manifest):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["check", "--home-root", str(self.root), "--json"])
+        result = json.loads(out.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("missing-guard.py", result["failures"][0])
+        self.assertFalse(self.root.exists())
+
+
+def opencode_entry(server: dict) -> dict:
+    """The OpenCode `mcp` form of a manifest server."""
+    if "url" in server:
+        return {"type": "remote", "url": server["url"], "enabled": True}
+    entry = {"type": "local", "command": [server["command"], *server["args"]], "enabled": True}
+    if server.get("env"):
+        entry["environment"] = dict(server["env"])
+    return entry
+
+
+class McpParityTests(HarnessTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.oc_path = self.home / ".config/opencode/opencode.jsonc"
+        self.mcp = {s["id"]: opencode_entry(s) for s in self.manifest()["mcpServers"]}
+        self.write_oc()
+
+    def write_oc(self, mcp: dict | None = None, *, raw: str | None = None) -> None:
+        if raw is None:
+            body = json.dumps({"$schema": "https://opencode.ai/config.json",
+                               "mcp": self.mcp if mcp is None else mcp}, indent=2)
+            # Real-world JSONC: comments everywhere and trailing commas.
+            body = body.replace('"mcp": {', '// MCP servers live here\n  "mcp": { /* block\n comment */', 1)
+            body = body.replace("\n  }\n}", ",\n  },\n}\n// trailing comment")
+            raw = body
+        write(self.oc_path, raw)
+
+    def check(self, manifest: dict | None = None, json_output: bool = False) -> tuple[int, str]:
+        args = ["check", "--home-root", str(self.root), "--opencode-config", str(self.oc_path)]
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(args + (["--json"] if json_output else []))
+        return rc, out.getvalue()
+
+    def diff(self, manifest: dict | None = None) -> tuple[int, dict]:
+        with mock.patch.object(gh, "load_manifest", return_value=manifest or self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["mcp-diff", "--json", "--opencode-config", str(self.oc_path)])
+        return rc, json.loads(out.getvalue())
+
+    def gen(self) -> tuple[str, str]:
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gh.main(["generate", "--home-root", str(self.root), "--opencode-config", str(self.oc_path)])
+        self.assertEqual(rc, 0, err.getvalue())
+        return out.getvalue(), err.getvalue()
+
+    def test_manifest_declares_parity_against_opencode_config(self) -> None:
+        manifest = self.manifest()
+        self.assertEqual(manifest["mcpParity"], {"opencodeConfig": "~/.config/opencode/opencode.jsonc", "ignore": []})
+        gh.validate_manifest(manifest)
+
+    def test_matching_sets_pass_check_and_diff(self) -> None:
+        _, err = self.gen()
+        self.assertEqual(err, "")
+        rc, out = self.check()
+        self.assertEqual(rc, 0, out)
+        rc, result = self.check(json_output=True)
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(json.loads(result)["failures"], [])
+        rc, diff = self.diff()
+        self.assertEqual(rc, 0, diff)
+        self.assertEqual({row["id"] for row in diff["servers"]}, set(self.mcp))
+        self.assertTrue(all(row["status"] == "ok" for row in diff["servers"]))
+
+    def test_opencode_only_server_fails_check(self) -> None:
+        self.mcp["newthing"] = {"type": "local", "command": ["/bin/newthing"], "enabled": True}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: opencode has newthing, native manifest lacks it", out)
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        self.assertEqual(next(r for r in diff["servers"] if r["id"] == "newthing")["status"], "opencode-only")
+
+    def test_native_only_server_fails_check_json(self) -> None:
+        del self.mcp["inbody"]
+        self.write_oc()
+        self.gen()
+        rc, out = self.check(json_output=True)
+        result = json.loads(out)
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("mcp parity: native manifest has inbody, opencode lacks it", result["failures"])
+
+    def test_disabled_opencode_entry_counts_as_absent(self) -> None:
+        self.mcp["inbody"]["enabled"] = False
+        self.mcp["oldthing"] = {"type": "remote", "url": "https://old.example/mcp", "enabled": False}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("native manifest has inbody, opencode lacks it (disabled in opencode)", out)
+        self.assertNotIn("oldthing", out)
+        manifest = self.manifest()
+        manifest["mcpServers"] = [s for s in manifest["mcpServers"] if s["id"] != "inbody"]
+        self.run_gen(manifest)
+        self.assertEqual(self.check(manifest)[0], 0)
+
+    def test_missing_enabled_key_means_enabled(self) -> None:
+        self.mcp["recall"].pop("enabled")
+        self.mcp["extra"] = {"type": "remote", "url": "https://x.example/mcp"}
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("opencode has extra", out)
+        self.assertNotIn("recall", out)
+
+    def test_ignore_list_is_honored_on_both_sides(self) -> None:
+        self.mcp["opencode-only-tool"] = {"type": "local", "command": ["/bin/tool"], "enabled": True}
+        del self.mcp["flighty"]
+        self.write_oc()
+        manifest = self.manifest()
+        manifest["mcpParity"]["ignore"] = ["opencode-only-tool", "flighty"]
+        self.run_gen(manifest)
+        rc, out = self.check(manifest)
+        self.assertEqual(rc, 0, out)
+        rc, diff = self.diff(manifest)
+        self.assertEqual(rc, 0, diff)
+        statuses = {row["id"]: row["status"] for row in diff["servers"]}
+        self.assertEqual(statuses["opencode-only-tool"], "ignored")
+        self.assertEqual(statuses["flighty"], "ignored")
+
+    def test_url_transport_command_and_args_mismatches_are_reported(self) -> None:
+        self.mcp["recall"]["url"] = "http://127.0.0.1:9999/mcp"
+        self.mcp["betterstack"] = {"type": "local", "command": ["/bin/betterstack"], "enabled": True}
+        self.mcp["inbody"]["command"] = ["/usr/local/bin/inbody-mcp"]
+        self.mcp["cua-driver"]["command"] = [self.mcp["cua-driver"]["command"][0], "serve"]
+        self.write_oc()
+        self.gen()
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: recall url differs (opencode http://127.0.0.1:9999/mcp, "
+                      "native http://127.0.0.1:18765/mcp)", out)
+        self.assertIn("mcp parity: betterstack transport differs (opencode command, native url)", out)
+        self.assertIn("mcp parity: inbody command differs (opencode /usr/local/bin/inbody-mcp, "
+                      "native /Users/ardud/bin/inbody-mcp)", out)
+        self.assertIn('cua-driver args differ (opencode ["serve"], native ["mcp"])', out)
+        rc, diff = self.diff()
+        self.assertEqual(next(r for r in diff["servers"] if r["id"] == "recall")["status"], "mismatch")
+
+    def test_env_key_drift_is_reported_without_values(self) -> None:
+        self.mcp["dia"]["environment"] = {"OTHER": "sk-abcdefghijklmnop"}
+        self.write_oc()
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        text = json.dumps(diff)
+        self.assertIn("dia env keys differ", text)
+        self.assertNotIn("sk-abcdefghijklmnop", text)
+
+    def test_unparseable_config_fails_check_but_not_generate(self) -> None:
+        self.write_oc(raw='{"mcp": {"recall": {"url": "http://x" "oops"}}}')
+        out, err = self.gen()
+        self.assertIn("warning: mcp parity: cannot parse opencode config", err)
+        self.assertTrue((self.claude / ".claude.json").exists())
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: cannot parse opencode config", out)
+        rc, result = self.check(json_output=True)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("cannot parse" in f for f in json.loads(result)["failures"]))
+
+    def test_missing_config_fails_closed(self) -> None:
+        self.oc_path.unlink()
+        _, err = self.gen()
+        self.assertIn("warning: mcp parity: cannot read opencode config", err)
+        rc, out = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("mcp parity: cannot read opencode config", out)
+        rc, diff = self.diff()
+        self.assertEqual(rc, 1)
+        self.assertFalse(diff["ok"])
+
+    def test_generate_warns_on_drift_and_still_writes(self) -> None:
+        del self.mcp["dia"]
+        self.write_oc()
+        _, err = self.gen()
+        self.assertIn("warning: mcp parity: native manifest has dia, opencode lacks it", err)
+        self.assertIn("dia", json.loads((self.claude / ".claude.json").read_text())["mcpServers"])
+
+    def test_configured_homes_use_manifest_path_and_home_root_runs_skip_parity(self) -> None:
+        # A --home-root run without --opencode-config (tests, harness-cli canary) never compares.
+        self.oc_path.unlink()
+        self.run_gen()
+        self.assertEqual(self.run_check()[0], 0)
+        # The configured homes use mcpParity.opencodeConfig, expanded under HOME.
+        manifest = self.manifest()
+        self.write_oc()
+        self.assertEqual(gh.opencode_config_path(manifest, None), str(self.oc_path))
+        self.assertTrue(gh.parity_applies(manifest, None, None))
+        self.assertFalse(gh.parity_applies(manifest, str(self.root), None))
+        del manifest["mcpParity"]
+        self.assertFalse(gh.parity_applies(manifest, None, None))
+
+    def test_human_diff_lists_both_sides(self) -> None:
+        self.mcp["recall"]["url"] = "http://127.0.0.1:1/mcp"
+        self.write_oc()
+        with mock.patch.object(gh, "load_manifest", return_value=self.manifest()):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = gh.main(["mcp-diff", "--opencode-config", str(self.oc_path)])
+        text = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH      recall", text)
+        self.assertIn("opencode  url http://127.0.0.1:1/mcp", text)
+        self.assertIn("native    url http://127.0.0.1:18765/mcp", text)
+        self.assertIn("DRIFT 1 mcp parity failure(s)", text)
+
+    def test_invalid_parity_block_is_refused(self) -> None:
+        manifest = self.manifest()
+        manifest["mcpParity"]["ignore"] = "recall"
+        with self.assertRaises(gh.HomeError):
+            gh.validate_manifest(manifest)
+
+
+class JsoncTests(unittest.TestCase):
+    def test_slashes_inside_strings_are_kept(self) -> None:
+        text = '''{
+          // a comment with "quotes" and https://x
+          "url": "https://mcp.example.com//path", /* inline */ "glob": "a/*b*/c",
+          "esc": "quote \\" // not a comment",
+          "list": [1, 2, 3,],
+          "obj": {"a": 1,
+            // trailing comment before brace
+          },
+        }'''
+        self.assertEqual(gh.loads_jsonc(text), {
+            "url": "https://mcp.example.com//path", "glob": "a/*b*/c",
+            "esc": 'quote " // not a comment', "list": [1, 2, 3], "obj": {"a": 1}})
+
+    def test_comma_inside_string_before_brace_is_kept(self) -> None:
+        self.assertEqual(gh.loads_jsonc('{"a": ",}", "b": [",]"],}'), {"a": ",}", "b": [",]"]})
+
+    def test_bom_and_trailing_backslash_escape(self) -> None:
+        self.assertEqual(gh.loads_jsonc('\ufeff{"p": "C:\\\\dir\\\\", // c\n}'), {"p": "C:\\dir\\"})
+
+    def test_errors(self) -> None:
+        for bad in ('{"a": 1 /* never closed', '{"a": "never closed', '{"a" 1}', ""):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gh.loads_jsonc(bad)
+
+    def test_live_style_opencode_block_parses(self) -> None:
+        text = '''{
+          "$schema": "https://opencode.ai/config.json",
+          "mcp": {
+            // Recall: search over past sessions
+            "recall": {"type": "remote", "url": "http://127.0.0.1:18765/mcp", "enabled": true},
+            "dia": {"type": "local", "command": ["/node", "/srv.js"], "environment": {"K": "v"}, "enabled": true},
+          },
+        }'''
+        mcp = gh.loads_jsonc(text)["mcp"]
+        self.assertEqual(gh.opencode_mcp_view(mcp["recall"]), {"kind": "url", "url": "http://127.0.0.1:18765/mcp", "enabled": True})
+        self.assertEqual(gh.opencode_mcp_view(mcp["dia"]), {"kind": "command", "command": "/node", "args": ["/srv.js"],
+                                                            "envKeys": ["K"], "enabled": True})
 
 
 if __name__ == "__main__":

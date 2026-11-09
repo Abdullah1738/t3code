@@ -14,20 +14,42 @@ import noon_http_orders as core
 import noon_vertical_reads as verticals
 
 
+def unplaced(lane, row):
+    raw = row.get('raw_status')
+    if lane == 'food':
+        return raw == 'failed'
+    if lane == 'nownow':
+        return verticals.NOWNOW_STAGES.get(raw) == 'cancelled'
+    # Marketplace cancellation is shipment/item-scoped, not a non-placed order.
+    return False
+
+
 def scan_lane(state, lane, rows, now, registered):
     ids = sorted({row['order'] for row in rows})
+    ignored = set(ids) - {row['order'] for row in rows if not unplaced(lane, row)}
     old = state.setdefault(lane, {'seen': ids, 'pending': {}})
     pending = old['pending']
-    for order in set(ids) - set(old['seen']):
-        pending.setdefault(order, 0)
+    gave_up = old.setdefault('gave_up', [])
+    for order in set(ids) - set(old['seen']) - ignored - set(gave_up):
+        pending.setdefault(order, {'last_fire': 0, 'fires': 0})
     old['seen'] = sorted(set(old['seen']) | set(ids))
     events = []
-    for order, last in list(pending.items()):
-        if registered(order):
+    for order, attempt in list(pending.items()):
+        if order in ignored or order in gave_up or registered(order):
             del pending[order]
-        elif now - last >= 600:
-            events.append({'order': order, 'service': lane})
-            pending[order] = now
+            continue
+        if isinstance(attempt, (int, float)):
+            # Legacy state has no fire count; retain its retry deadline.
+            attempt = pending[order] = {'last_fire': attempt, 'fires': 0}
+        if now - attempt['last_fire'] >= 600:
+            event = {'order': order, 'service': lane}
+            if attempt['fires'] >= 6:
+                event['persistent'] = True
+                gave_up.append(order)
+                del pending[order]
+            else:
+                attempt.update(last_fire=now, fires=attempt['fires'] + 1)
+            events.append(event)
     return events
 
 
@@ -36,7 +58,9 @@ def registered(order):
     try:
         cfg = json.loads((Path.home()/'.local/state/order-tracker/orders'/(name+'.json')).read_text())
         watcher = Path.home()/'.local/share/robob-watch/watchers'/name/'watcher.json'
-        return cfg.get('order') == order and cfg.get('watcher') == name and watcher.is_file()
+        archive = Path.home()/'.local/share/robob-watch/archive'
+        return (cfg.get('order') == order and cfg.get('watcher') == name
+                and (watcher.is_file() or any(path.is_dir() for path in archive.glob(name+'-*'))))
     except (OSError, ValueError):
         return False
 

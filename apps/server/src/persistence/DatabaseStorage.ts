@@ -13,14 +13,18 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { resolveHostCliCommand } from "../cli/invocation.ts";
+import { archiveHistoryPass } from "../ardud/persistence/HistoryArchive.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import { forkParked } from "../serverActivation.ts";
 
-/** Pages returned per reclaim pass; one minute of churn, not a backlog. */
-const RECLAIM_PAGES_PER_PASS = 1024;
+/** A slow disk must not turn minute-by-minute reclamation into a backlog. */
+const RECLAIM_PAGES_PER_PASS = 16;
+const RECLAIM_MAX_DURATION_MS = 100;
 const COMPACTION_INTERVAL = Duration.hours(24);
 const COMPACTION_MIN_PAGE_INTERVAL_MS = 25;
+const COMPACTION_MAX_PAGES_PER_SCAN = 20;
+const COMPACTION_MAX_DURATION_MS = 2_000;
 
 export class DatabaseStorage extends Context.Service<
   DatabaseStorage,
@@ -33,8 +37,8 @@ export class DatabaseStorage extends Context.Service<
 >()("t3/persistence/DatabaseStorage") {}
 
 /**
- * Deletes superseded history daily and hands freed pages back to
- * the filesystem every minute. Deleted events are always superseded by a
+ * Deletes a bounded window of superseded history daily and hands a small number
+ * of freed pages back to the filesystem every minute. Deleted events are superseded by a
  * retained event with a higher sequence, so a client replaying from an older
  * cursor still reaches the same state; no replay boundary is published.
  */
@@ -80,27 +84,40 @@ const make = Effect.gen(function* () {
   );
 
   const reclaim = Effect.gen(function* () {
+    const started = yield* Clock.monotonicTimeNanos;
     const mode = yield* sql<{ readonly auto_vacuum: number }>`PRAGMA auto_vacuum`;
     if (mode[0]?.auto_vacuum !== 2) return;
-    // The driver steps a statement without result columns once, and each
-    // step of incremental_vacuum frees one page. Yield between pages so
-    // client requests can run.
+    // Each statement frees at most one page; release the writer between them.
     for (let page = 0; page < RECLAIM_PAGES_PER_PASS; page++) {
+      if (
+        Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000 >=
+        RECLAIM_MAX_DURATION_MS
+      )
+        break;
       const free = yield* sql<{ readonly freelist_count: number }>`PRAGMA freelist_count`;
       if ((free[0]?.freelist_count ?? 0) === 0) break;
+      if (
+        Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000 >=
+        RECLAIM_MAX_DURATION_MS
+      )
+        break;
       yield* sql`PRAGMA incremental_vacuum(1)`;
-      yield* Effect.yieldNow;
+      yield* Effect.sleep("2 millis");
     }
   }).pipe(
     Effect.catch((cause) => Effect.logWarning("Database space reclamation failed", { cause })),
   );
 
-  // Even a pass that deletes nothing scans the event store. Persist completion
-  // so restarting does not trigger another scan before the daily interval.
+  // Remember the bounded pass, not a full-store sweep. Starting from the newest
+  // events again is safe without persisting the per-entity replay anchors.
   const compactedAtPath = path.join(path.dirname(config.dbPath), "compacted-at");
   const compact = Effect.gen(function* () {
     const result = yield* maintenance.compactEventStoreWith({
       minPageIntervalMs: COMPACTION_MIN_PAGE_INTERVAL_MS,
+      minDeleteIntervalMs: 5,
+      maxPagesPerScan: COMPACTION_MAX_PAGES_PER_SCAN,
+      maxDurationMs: COMPACTION_MAX_DURATION_MS,
+      maxDeletePayloadBytes: 64 * 1024,
     });
     const completedAt = yield* Clock.currentTimeMillis;
     yield* fs.writeFileString(compactedAtPath, String(completedAt)).pipe(Effect.ignore);
@@ -134,6 +151,16 @@ const make = Effect.gen(function* () {
         compact.pipe(
           Effect.andThen(publishStatus),
           Effect.repeat(Schedule.spaced(COMPACTION_INTERVAL)),
+        ),
+      ),
+    ),
+  );
+  yield* forkParked(
+    Effect.sleep("1 minute").pipe(
+      Effect.andThen(
+        archiveHistoryPass().pipe(
+          Effect.catch((cause) => Effect.logWarning("History archive pass failed", { cause })),
+          Effect.repeat(Schedule.spaced("25 millis")),
         ),
       ),
     ),

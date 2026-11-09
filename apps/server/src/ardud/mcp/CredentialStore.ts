@@ -3,7 +3,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
+import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 
 import * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 
@@ -69,11 +69,13 @@ const Row = Schema.Struct({
 const decodeRow = Schema.decodeUnknownEffect(Row);
 
 const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+  const sql = yield* BoardsDatabase.client;
   // Do not include SQL errors or malformed row values in logs or error messages.
   const fail = (operation: string) => () => new CredentialStoreError({ operation });
 
-  yield* sql`
+  yield* BoardsDatabase.initialize(
+    Effect.gen(function* () {
+      yield* sql`
     CREATE TABLE IF NOT EXISTS ardud_mcp_credentials (
       token_hash TEXT PRIMARY KEY,
       environment_id TEXT NOT NULL,
@@ -86,11 +88,13 @@ const make = Effect.gen(function* () {
       last_alive_at INTEGER NOT NULL
     )
   `.pipe(Effect.mapError(fail("initialize")));
-  yield* sql`CREATE INDEX IF NOT EXISTS ardud_mcp_credentials_thread ON ardud_mcp_credentials (environment_id, thread_id)`.pipe(
-    Effect.mapError(fail("initialize")),
-  );
-  yield* sql`CREATE INDEX IF NOT EXISTS ardud_mcp_credentials_provider_session ON ardud_mcp_credentials (environment_id, provider_session_id)`.pipe(
-    Effect.mapError(fail("initialize")),
+      yield* sql`CREATE INDEX IF NOT EXISTS ardud_mcp_credentials_thread ON ardud_mcp_credentials (environment_id, thread_id)`.pipe(
+        Effect.mapError(fail("initialize")),
+      );
+      yield* sql`CREATE INDEX IF NOT EXISTS ardud_mcp_credentials_provider_session ON ardud_mcp_credentials (environment_id, provider_session_id)`.pipe(
+        Effect.mapError(fail("initialize")),
+      );
+    }),
   );
 
   const load = Effect.fn("CredentialStore.load")(

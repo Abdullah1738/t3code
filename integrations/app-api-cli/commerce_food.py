@@ -239,6 +239,11 @@ def recover(flow_id):
     """Status-only recovery never turns an interrupted preparation into a send."""
     binding=journal.binding(flow_id); local=journal.inspect(flow_id)
     require(binding['app']=='noon' and binding['vertical']=='food', 'FOOD_FLOW_REQUIRED')
+    attestation=local.get('owner_attestation',{}).get('provider_evidence',{})
+    if local.get('state')=='COMPLETE' and attestation.get('kind')=='food_automatic_captured':
+        return {'ok':True,'flow_id':flow_id,'state':'COMPLETE','order':local['order_id'],
+                'charge':'captured','capture_evidence':'bank_sms_and_exact_delivery',
+                'financial_send':False,'financial_retry':False,'purchase_enabled':False}
     if any(o['kind'] in ('place','payment') for o in local['operations']):
         from noon_food_financial import Coordinator
         from noon_food_recovery import NativeReader, TrackerRegistrar

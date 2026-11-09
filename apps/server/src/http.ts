@@ -30,6 +30,7 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import { OtlpTracer, OtlpSerialization } from "effect/observability";
 
 import * as ServerConfig from "./config.ts";
+import * as ReplyMiddleware from "./ardud/http/replyMiddleware.ts";
 import { ASSET_ROUTE_PREFIX, readMcpAppHtml, resolveAsset } from "./assets/AssetAccess.ts";
 import { githubMediaResponse } from "./assets/GitHubMediaFetch.ts";
 import { statMediaFile, streamMediaFile, type OpenMediaFile } from "./assets/MediaFile.ts";
@@ -251,9 +252,12 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
   return yield* HttpServerResponse.file(asset.path, { status, offset, bytesToRead, headers });
 });
 
-export const layerHttpCompression = HttpRouter.middleware(HttpMiddleware.compression(), {
-  global: true,
-});
+export const layerHttpCompression = HttpRouter.middleware(
+  (app) => ReplyMiddleware.middleware(HttpMiddleware.compression()(app)),
+  {
+    global: true,
+  },
+);
 
 export const layerBrowserApiCors = Layer.unwrap(
   Effect.gen(function* () {

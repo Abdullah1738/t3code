@@ -38,6 +38,15 @@ describe("harness migration settings", () => {
     expect(() => decodeServerSettings(input)).toThrow();
     expect(() => decodeServerSettingsPatch(input)).toThrow();
   });
+
+  it.each([true, false])(
+    "round-trips cutoverComplete %s in snapshots and patches",
+    (cutoverComplete) => {
+      const input = { ardudHarnessMigration: { cutoverComplete } };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    },
+  );
 });
 
 describe("ServerSettings response streaming", () => {

@@ -317,6 +317,7 @@ class ChargeTests(unittest.TestCase):
             return [r for r in self.rows if (source is None or r['source'] == source)
                     and all(any(w in r['text'].lower() for w in g) for g in groups)]
         self.patches = [patch.object(self.mc, 'DATA', self.tmp / 'money'),
+                        patch.object(t, 'chat_down', return_value=(False, '')),
                         patch.object(self.mc.charges, 'search', search),
                         patch.object(self.mc.charges, 'show', lambda row, deadline=None: row['text']),
                         patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None: []),

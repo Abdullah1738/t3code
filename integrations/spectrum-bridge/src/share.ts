@@ -1,3 +1,4 @@
+import { createSecretHandler, getSecretRequest, MAX_SECRET_FORM_BYTES, SECRET_PAGE_HEADERS, type SecretDeps, validToken } from "./secrets.ts";
 /**
  * Public links for people off the tailnet. With a public origin configured (a named Cloudflare
  * tunnel such as cards.abdullah.fund, run by its own LaunchAgent), every share is a path on one
@@ -115,11 +116,15 @@ export type SharesOptions = {
   startTunnel: StartTunnel;
   /** When set, shares are paths on this origin instead of one quick tunnel each. */
   origin?: ShareOrigin;
+  secrets?: (token: string) => SecretDeps | undefined;
   log?: Log;
   now?: () => number;
 };
 
 export class Shares {
+  private secretWindow = 0;
+  private secretRequests = 0;
+  private readonly formRequests = new Map<string, number>();
   private readonly live = new Map<string, Live>();
   private server: ReturnType<typeof Bun.serve> | undefined;
   private queue: Promise<unknown> = Promise.resolve();
@@ -199,7 +204,7 @@ export class Shares {
     if (!origin) return false;
     if (this.server) return true;
     try {
-      this.server = Bun.serve({ hostname: "127.0.0.1", port: origin.port, maxRequestBodySize: 1024, fetch: request => this.handle(request) });
+      this.server = Bun.serve({ hostname: "127.0.0.1", port: origin.port, maxRequestBodySize: MAX_SECRET_FORM_BYTES, fetch: request => this.handle(request) });
       return true;
     } catch {
       this.log("share-origin-failed", String(origin.port));
@@ -207,8 +212,36 @@ export class Shares {
     }
   }
 
+  secretBase(): string {
+    if (!this.options.origin || !this.options.secrets || !this.serveOrigin()) throw new ShareError(503, "Public secure forms unavailable");
+    return this.options.origin.url;
+  }
+
   private async handle(request: Request): Promise<Response> {
     const { pathname, search } = new URL(request.url);
+    if (pathname === "/_secret" || pathname.startsWith("/_secret/")) {
+      const window = Math.floor(this.now() / 60_000);
+      if (window !== this.secretWindow) { this.secretWindow = window; this.secretRequests = 0; this.formRequests.clear(); }
+      const limited = () => new Response("Try again shortly", { status: 429,
+        headers: { ...SECRET_PAGE_HEADERS, "Retry-After": "60" } });
+      const token = pathname.slice("/_secret/".length);
+      const deps = validToken(token) ? this.options.secrets?.(token) : undefined;
+      const record = deps && getSecretRequest(deps.store, token);
+      if (!deps || !record?.encryption) {
+        if (++this.secretRequests > 120) return limited();
+        return new Response("Not found", { status: 404, headers: SECRET_PAGE_HEADERS });
+      }
+      // Unknown-token traffic cannot spend a real form's submission budget. Only issued
+      // tokens enter this bounded map, and all entries disappear at the minute boundary.
+      if (!this.formRequests.has(token) && this.formRequests.size >= 256) return limited();
+      const count = (this.formRequests.get(token) ?? 0) + 1;
+      this.formRequests.set(token, count);
+      if (count > 30) return limited();
+      try { return await createSecretHandler(deps)(request, token); }
+      catch { return new Response("Could not send", { status: 500, headers: SECRET_PAGE_HEADERS }); }
+    }
+    if (Number(request.headers.get("content-length") ?? 0) > 1024) return new Response("Too large", { status: 413 });
+    if (!["GET", "HEAD"].includes(request.method)) return new Response("Method not allowed", { status: 405 });
     if (pathname === "/healthz") return this.health(this.options.origin!);
     const match = SHARE_PATH.exec(pathname);
     const origin = this.options.origin!;
