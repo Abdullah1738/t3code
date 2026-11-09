@@ -561,7 +561,7 @@ class PaymentAwaitTests(unittest.TestCase):
         command=run.call_args.args[0]
         self.assertIn('minutes-cli-3ds-IAEGA123',command)
         text=command[command.index('--text')+1]
-        self.assertEqual(text,'this is ours: approve noon Minutes AED 17.25 in ENBD X now (order IAEGA123)')
+        self.assertEqual(text,f'this is ours: approve noon Minutes AED 17.25 in {c.order_card.BANK_APP} now (order IAEGA123)')
         self.assertEqual(command[command.index('--source')+1],'Noon payment')
         self.assertEqual(command[command.index('--severity')+1],'attention')
         env=run.call_args.kwargs['env']

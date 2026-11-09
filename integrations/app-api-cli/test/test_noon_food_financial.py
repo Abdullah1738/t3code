@@ -252,7 +252,7 @@ class NativeOrderTests(unittest.TestCase):
         flow=SimpleNamespace(account=fingerprint('synthetic-customer'),scope='b'*64,outlet='OUTLET1',
             headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'},
             rows=food.manifest([{'item_code':'I1','qty':1,'modifiers':{'MD1':{'I2':1}},'notes':'Extra crispy'}]))
-        state={'review':{'payable_minor':4585},'card_hash':j.digest(CARD)}
+        state={'review':{'card_last4':'2342','payable_minor':4585},'card_hash':j.digest(CARD)}
         raw={'orderNr':ORDER,'customerCode':'synthetic-customer','outletInfo':{'outletCode':'OUTLET1'},
             'addressCode':'ADDRESS','addressVersion':1,'items':flow.rows,'currencyCode':'AED',
             'orderTotal':45.85,'orderPaymentAmount':45.85,'orderWalletAmount':0,
@@ -306,7 +306,7 @@ class NativeOrderTests(unittest.TestCase):
                 raw[key]=old
 
     def test_native_session_binding_preserves_all_preparation_guards(self):
-        flow=food.FoodFlow.__new__(food.FoodFlow)
+        flow=food.FoodFlow.__new__(food.FoodFlow);flow.card_last4='2342'
         flow.outlet='OUTLET1';flow.account='a'*64;flow.scope='b'*64
         flow.headers={'x-addresscode':'ADDRESS','x-addresskey':'ADDRESS-1'}
         flow.rows=food.manifest([{'item_code':'I1'}]);flow.state={'session':'SESSION1'}

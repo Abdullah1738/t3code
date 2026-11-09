@@ -55,7 +55,7 @@ def payment_projection(raw, order, amount, card_hash):
     """Historical Food status proof: exact reference/currency/card and full capture."""
     require(raw.get('reference')==order,'FOOD_PAYMENT_REFERENCE_MISMATCH')
     require(raw.get('currency_code')=='AED' and minor(raw.get('amount'))==amount,'FOOD_PAYMENT_AMOUNT_MISMATCH')
-    require(str(raw.get('cc_masked') or '').endswith('2342') and raw.get('payment_method_code')=='cc_noonpay',
+    require(str(raw.get('cc_masked') or '').endswith(('9546', '2342')) and raw.get('payment_method_code')=='cc_noonpay',
             'FOOD_PAYMENT_CARD_MISMATCH')
     require(j.digest(str(raw.get('id_token')))==card_hash,'FOOD_PAYMENT_TOKEN_MISMATCH')
     require(all(isinstance(raw.get(k),str) and re.fullmatch(r'[A-Za-z0-9_]{1,80}',raw[k])
@@ -242,7 +242,7 @@ def contract():
             'idCustomerToken','paymentProviderCode','cvvEncryption'],
             'optional_wallet_fields':['applePayToken','googlePayToken','adcbTokenCode']},
         'read_only_status':{'url':STATUS_URL,'fields':['clientSecret'],
-            'proof':'exact reference, AED amount/authorized/captured, cc_noonpay, 2342 token binding, payment_confirmed/CAPTURED/error 0'},
+            'proof':'exact reference, AED amount/authorized/captured, cc_noonpay, exact selected token binding, payment_confirmed/CAPTURED/error 0'},
         'live_place_proof':{'date':'2026-11-07','path':'automatic saved card; one placement, no completion',
             'observed':['owned session orderNr matches placement and exact order',
                 'explicit false paymentRequireCvv and paymentRequireCompletion',

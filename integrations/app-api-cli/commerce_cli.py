@@ -201,7 +201,12 @@ def talabat_discovery(args):
 
 def capabilities():
     return {'ok':True,'currency':'AED','order_cap_minor':journal.ORDER_LIMIT_MINOR,
-        'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,'verticals':{
+        'campaign_cap_minor':journal.TOTAL_LIMIT_MINOR,
+        'selected_card':{'last4':order_card.LAST4,'network':order_card.NETWORK,'bank_app':order_card.BANK_APP},
+        'live_paid_proof_card':'2342',
+        'nownow_selected_card_purchase_enabled':order_card.LAST4=='2342',
+        'marketplace_card_selection':'requires matching default card in noon app',
+        'verticals':{
         'noon.minutes':{'auth':'verified_cookie_revalidation','cart':'journalled_native',
             'place':'live_order_created','payment':'live_confirmed_e2e_paid_order_2026_10_10',
             'tracking':'exact_native','rejected_auth_renewal_proven':False,
@@ -250,7 +255,7 @@ def capabilities():
 
 def cvv_from_keychain():
     """Saved-card CVV from Keychain into RAM; never an argument, file or log line."""
-    command=['security','find-generic-password','-s','robob-card','-a','Marriott.card_cvc','-w']
+    command=['security','find-generic-password','-s','robob-card','-a',order_card.CVV_ACCOUNT,'-w']
     try:
         result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
     except (OSError,subprocess.TimeoutExpired):
@@ -378,6 +383,8 @@ def order_nownow(args):
     tracking poll. Payment rides the session token; place is the only
     financial send. On 401: stop, no re-login attempt.
     """
+    if not args.prepare_only and order_card.LAST4 != '2342':
+        journal.fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
     import noon_nownow_checkout as nownow_transport
     from commerce_nownow_order import NowNowOrderFlow
     items=input_items(args,id_argument='product_code',id_key='product_code')
@@ -711,7 +718,7 @@ def review_contract(vertical):
         from noon_food_financial import contract
         return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
             'prepare_only':True,'purchase_enabled':False,'financial_send':False,
-            'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes','2342'],
+            'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes',order_card.LAST4],
             'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
             'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
             'financial_contract':contract()}

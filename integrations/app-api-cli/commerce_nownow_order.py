@@ -58,7 +58,7 @@ def saved_card(client, *, timeout=25):
     rows = snap.wire.get('data')
     matches = [row for row in rows
                if isinstance(row.get('ccMasked'), str) and row['ccMasked'].endswith(order_card.LAST4)
-               and isinstance(row.get('ccType'), str) and row['ccType'].lower() == 'mastercard'
+               and isinstance(row.get('ccType'), str) and row['ccType'].lower() == order_card.NETWORK
                and row.get('isDeleted') is False]
     if len(matches) != 1 or not str(matches[0].get('id', '')).isdigit():
         _fail('NOWNOW_SAVED_CARD_NOT_UNIQUE')
@@ -512,6 +512,8 @@ class NowNowOrderFlow:
         """Single financial send: place-order {sessionCode, total}."""
         if self.review is None:
             _fail('NOWNOW_REVIEW_REQUIRED')
+        if order_card.LAST4 != '2342':
+            _fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
         body = native.place_payload(self.session_code, self.review['payable_minor'])
         self._expect('place', body)
         result = self.client.place_order(session_code=self.session_code,
@@ -546,6 +548,8 @@ class NowNowOrderFlow:
 
     def confirm_paid(self, tracking):
         """place 200 + native tracking == the captured paid signal (no intents)."""
+        if order_card.LAST4 != '2342':
+            _fail('NOWNOW_SELECTED_CARD_PAYMENT_UNVERIFIED_USE_PHONE')
         if tracking.get('order') != self.order \
                 or tracking.get('status') not in TERMINAL_TRACK_STATUSES:
             _fail('NOWNOW_EXACT_TRACKING_NOT_CONFIRMED')

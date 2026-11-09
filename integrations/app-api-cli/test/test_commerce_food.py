@@ -5,13 +5,13 @@ import commerce_food as f
 
 class FoodTests(unittest.TestCase):
     def test_recovery_instance_cannot_mutate(self):
-        flow=f.FoodFlow.__new__(f.FoodFlow);flow.read_only=True
+        flow=f.FoodFlow.__new__(f.FoodFlow);flow.card_last4='2342';flow.read_only=True
         with patch.object(f,'request') as send, patch.object(f.journal,'consume') as consume:
             with self.assertRaises(f.journal.JournalError):flow.write('create',{})
         send.assert_not_called();consume.assert_not_called()
 
     def test_review_rejects_changed_cart_card_and_quiet(self):
-        flow=f.FoodFlow.__new__(f.FoodFlow)
+        flow=f.FoodFlow.__new__(f.FoodFlow);flow.card_last4='2342'
         flow.outlet='OUTLET';flow.state={'session':'SESSION'}
         flow.headers={'x-addresscode':'ADDR','x-addresskey':'ADDR-1'}
         flow.rows=f.manifest([{'item_code':'I1'}])
@@ -20,6 +20,10 @@ class FoodTests(unittest.TestCase):
               'driverNotes':f.QUIET_NOTE,'creditCardMask':'****2342','paymentMethodCode':'prepaid',
               'prepaidPaymentMethodCode':'cc_noonpay','orderWalletAmount':0,'orderPaymentAmount':10,'orderTotal':10}
         self.assertEqual(flow.review(data)['payable_minor'],1000)
+        flow.card_last4='9546'
+        with self.assertRaises(f.journal.JournalError):flow.review(data)
+        self.assertEqual(flow.review({**data,'creditCardMask':'****9546'})['card_last4'],'9546')
+        flow.card_last4='2342'
         for key,value in [('orderNr','FOTHER'),('items',[]),('creditCardMask','****5542'),
                           ('driverNotes',''),('orderPaymentAmount',9),('addressVersion',2)]:
             with self.subTest(key=key), self.assertRaises(f.journal.JournalError):flow.review({**data,key:value})

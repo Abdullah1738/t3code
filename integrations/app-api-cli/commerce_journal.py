@@ -125,17 +125,17 @@ def payment_details(*, flow_id, order, amount_minor, outcome):
         steps = ['nothing to reconcile; a new order is a new purchase and needs its own go']
     elif outcome == 'waiting':
         tell = f'The payment for {amount} is still waiting on the bank. {unknown}.'
-        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+        steps = [f'check {order_card.BANK_APP} for a pending approval or a charge SMS', status, reconcile]
     elif outcome == 'unconfirmed':
         tell = f'The payment for {amount} went out but I lost its status before it confirmed. {unknown}.'
-        steps = ['check ENBD X for a pending approval or a charge SMS', status, reconcile]
+        steps = [f'check {order_card.BANK_APP} for a pending approval or a charge SMS', status, reconcile]
     elif outcome == 'confirming':
         tell = (f'The bank approved the payment for {amount}, but the store hasn\'t confirmed the order yet. '
                 'Treat the card as charged until the order shows up or is refunded.')
         steps = ['check the store\'s Orders page for this order', status, reconcile]
     else:
         tell = f'The payment for {amount} didn\'t go through. {unknown}; checking.'
-        steps = ['check ENBD X / the bank SMS for a charge or a hold', reconcile]
+        steps = [f'check {order_card.BANK_APP} / the bank SMS for a charge or a hold', reconcile]
     return {'flow_id': flow_id, 'order': order, 'amount_minor': amount_minor,
             'charge': 'not_charged' if outcome == 'not_charged' else 'unknown', 'tell': tell,
             'next': steps + ['never re-place or resend this payment']}

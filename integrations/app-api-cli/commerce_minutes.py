@@ -118,7 +118,7 @@ def exact_failed_evidence(auth, order, *, timeout=25):
 
 def telegram_3ds_notify(order,total_minor):
     """One attention ping for the owner's out-of-band ENBD 3DS approval."""
-    text=f"this is ours: approve noon Minutes AED {m.wire_amount(total_minor):.2f} in ENBD X now (order {order})"
+    text=f"this is ours: approve noon Minutes AED {m.wire_amount(total_minor):.2f} in {order_card.BANK_APP} now (order {order})"
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
     command=[*TELEGRAM_CLI,'--source','Noon payment','--severity','attention',
              '--text',text,'--key',f'minutes-cli-3ds-{order}']
@@ -138,7 +138,7 @@ STALL_SECONDS=300
 
 def telegram_stall_notify(order,total_minor):
     """Second alert when the sent payment is still unconfirmed after STALL_SECONDS."""
-    text=(f"noon Minutes AED {m.wire_amount(total_minor):.2f} still not confirmed after 5 min. If ENBD X has "
+    text=(f"noon Minutes AED {m.wire_amount(total_minor):.2f} still not confirmed after 5 min. If {order_card.BANK_APP} has "
           "a prompt, approve it. No prompt: check noon > Orders before ordering in the app, "
           "this one can still go through.")
     env={k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}

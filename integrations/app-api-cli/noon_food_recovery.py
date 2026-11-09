@@ -91,7 +91,7 @@ class NativeReader:
         data=payment.native_request('payment_cards',self.flow.headers,core.operation_deadline(15),None,
                                    response_observer=lambda *a,**k:None)
         rows=[r for r in data.get('data',[]) if isinstance(r,dict) and r.get('isDeleted') is False
-              and str(r.get('ccMasked') or '').endswith('2342') and str(r.get('id','')).isdigit()]
+              and str(r.get('ccMasked') or '').endswith(self.flow.card_last4) and str(r.get('id','')).isdigit()]
         require(len(rows)==1 and j.digest(str(rows[0]['id']))==self.state['card_hash'],'FOOD_PAYMENT_TOKEN_MISMATCH')
         return str(rows[0]['id'])
 
@@ -111,7 +111,7 @@ def project_order(data, order, flow, state):
     require(data.get('currencyCode')=='AED' and minor(data.get('orderTotal'))==amount
             and minor(data.get('orderPaymentAmount'))==amount and minor(data.get('orderWalletAmount'))==0,
             'FOOD_ORDER_AMOUNT_CHANGED')
-    require(str(data.get('creditCardMask') or '').endswith('2342')
+    require(str(data.get('creditCardMask') or '').endswith(state['review']['card_last4'])
             and data.get('paymentMethodCode')=='prepaid' and data.get('prepaidPaymentMethodCode')=='cc_noonpay'
             and data.get('paymentProviderCode')=='NOON_PAY','FOOD_ORDER_PAYMENT_METHOD_CHANGED')
     # Quiet preferences in order details use "choice"; sessions use "value".

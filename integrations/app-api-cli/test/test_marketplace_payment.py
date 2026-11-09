@@ -746,7 +746,7 @@ class ProjectionTests(unittest.TestCase):
         with patch.object(payment.subprocess, 'run', return_value=Mock(returncode=0)) as run:
             result = payment.telegram_3ds_notify(main.ORDER, 13348)
         command = run.call_args.args[0]
-        self.assertEqual(command[command.index('--text') + 1], 'this is ours: approve noon AED 133.48 in ENBD X')
+        self.assertEqual(command[command.index('--text') + 1], f'this is ours: approve noon AED 133.48 in {payment.order_card.BANK_APP}')
         self.assertTrue(result['queued'])
         with patch.object(payment.subprocess, 'run', side_effect=OSError):
             self.assertFalse(payment.telegram_3ds_notify(main.ORDER, 13348)['queued'])

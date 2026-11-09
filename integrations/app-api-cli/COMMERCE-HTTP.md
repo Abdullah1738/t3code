@@ -528,3 +528,27 @@ not block; pending/unpaid stops); fresh rocket orders bind a `-U<digits>`
 fulfillment unit at the manifest group level (null row shipment ids) that
 rebinds as `-S1` at packing — the exact-track projection and the
 `/orders/active` guard read both accept it.
+
+## Noon card selection (9 November 2026)
+
+All active noon lanes default to saved Mashreq Noon Visa 9546. The only explicit
+fallback is `COMMERCE_CARD_LAST4=2342 commerce ...`, using Marriott Mastercard.
+The caller must establish that 9546 failed/declined and reconcile any ambiguous
+financial send before purchasing with the fallback. There is no automatic retry
+or card switching. Other card values, including cancelled 5542, refuse at startup.
+CVV retrieval and bank-approval notices follow the selected card. Existing flows
+remain bound to their original card; use the original card override for historical
+Minutes/NowNow/Main/Supermall recovery. Food read-only recovery derives its card
+from the retained review and verifies the original journal scope/token hash.
+
+Food paid HTTP transport remains disabled: a native-app automatic payment does
+not prove a fresh unpaid-intent completion/CVV/3DS wire contract. Preparation,
+exact reads and financial journalling retain the same no-resend guards. Do not
+clear the older automatic-payment journal fence based solely on delivered status.
+
+Main/Supermall require the selected card to be the noon account default; they
+never switch saved cards. Change that default in the noon app before using a
+different card. NowNow 9546 paid orders refuse before cart changes pending
+verified Visa payment evidence; use the phone, not an unauthorized 2342 override.
+Visa refund code/title matching is synthetic-fixture coverage only. Unfamiliar
+refund wording remains fenced and must be inspected before extending the parser.

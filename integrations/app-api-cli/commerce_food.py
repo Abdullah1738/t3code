@@ -10,6 +10,7 @@ from pathlib import Path
 
 import commerce_journal as journal
 import native
+import order_card
 import noon_http_orders as core
 import noon_vertical_reads as vertical
 from noon_checkout import project_home, QUIET_NOTE
@@ -111,7 +112,13 @@ class FoodFlow:
         who = core.request('whoami', self.headers, core.operation_deadline(15))
         self.home = project_home(who, self.headers, 'main', checked_at=time.time())
         self.account = self.home.account_ref
-        self.scope = journal.digest({'outlet':outlet, 'items':self.rows, 'home':self.home.address_ref, 'card':'2342','quiet':QUIET_NOTE})
+        self.card_last4 = order_card.LAST4
+        if read_only and flow_id:
+            journal.binding(flow_id)
+            retained = json.loads((ROOT/(flow_id+'.json')).read_text())
+            self.card_last4 = retained.get('card_last4', (retained.get('review') or {}).get('card_last4', '2342'))
+            require(self.card_last4 in ('9546', '2342'), 'FOOD_CARD_INVALID')
+        self.scope = journal.digest({'outlet':outlet, 'items':self.rows, 'home':self.home.address_ref, 'card':self.card_last4,'quiet':QUIET_NOTE})
         self.flow_id = flow_id or str(uuid.uuid4())
         ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = ROOT/(self.flow_id+'.json')
@@ -166,8 +173,8 @@ class FoodFlow:
             require(all(prefs.get(k) is True for k in QUIET) and data.get('driverNotes')==QUIET_NOTE, 'FOOD_QUIET_NOT_VERIFIED')
         last4 = str(data.get('creditCardMask') or '')[-4:]
         if quiet:
-            require(last4=='2342' and data.get('paymentMethodCode')=='prepaid'
-                    and data.get('prepaidPaymentMethodCode')=='cc_noonpay', 'FOOD_CARD_2342_REQUIRED')
+            require(last4==self.card_last4 and data.get('paymentMethodCode')=='prepaid'
+                    and data.get('prepaidPaymentMethodCode')=='cc_noonpay', 'FOOD_SELECTED_CARD_REQUIRED')
             require(money(data.get('orderWalletAmount'))==0 and
                     money(data.get('orderPaymentAmount'))==money(data.get('orderTotal')), 'FOOD_PAYMENT_AMOUNT_CHANGED')
         review = {'outlet':self.outlet,'items':self.rows,'home_verified':True,'card_last4':last4,
@@ -186,7 +193,7 @@ class FoodFlow:
             orders = vertical.food_orders(timeout=15)['orders']
             require(all(o['raw_status'] in ('delivered','cancelled','canceled','failed','rejected') for o in orders), 'FOOD_ACTIVE_OR_UNKNOWN_ORDER')
             journal.open_flow(flow_id=self.flow_id, app='noon', vertical='food', account_hash=self.account, scope_hash=self.scope)
-            self.state = {'scope':self.scope,'outlet':self.outlet,'items':self.rows,'created_at':time.time()}
+            self.state = {'scope':self.scope,'outlet':self.outlet,'items':self.rows,'created_at':time.time(),'card_last4':self.card_last4}
             self.save()
             print(json.dumps({'flow_id':self.flow_id,'phase':'creating','financial_send':False}),flush=True)
             data = self.write('create', {'menuCode':info['menu_code'],'menuVersion':info['menu_version'],
@@ -212,8 +219,8 @@ class FoodFlow:
             response=cards.native_request('payment_cards',self.headers,core.operation_deadline(15),None,
                                           response_observer=lambda *a,**k:None)
             matches=[r for r in response.get('data',[]) if isinstance(r.get('ccMasked'),str)
-                     and r['ccMasked'].endswith('2342') and r.get('isDeleted') is False]
-            require(len(matches)==1 and str(matches[0].get('id','')).isdigit(), 'FOOD_CARD_2342_NOT_UNIQUE')
+                     and r['ccMasked'].endswith(self.card_last4) and r.get('isDeleted') is False]
+            require(len(matches)==1 and str(matches[0].get('id','')).isdigit(), 'FOOD_SELECTED_CARD_NOT_UNIQUE')
             card=matches[0]
             self.state['card_hash']=journal.digest(str(card['id'])); self.save()
             self.write('set-payment-method', {'sessionCode':self.state['session'],'walletAmount':0,
