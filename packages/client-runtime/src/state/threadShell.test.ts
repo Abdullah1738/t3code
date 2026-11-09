@@ -215,6 +215,55 @@ describe("v2 thread shell lists", () => {
     registry.dispose();
   });
 
+  it("credits the root when an omitted idle subagent sits between it and an asking subagent", () => {
+    // Client shells drop long-idle subagents, so the middle of root > middle > asking can be
+    // missing while asking waits for input.
+    const { registry, threads, snapshotAtom } = makeHarness();
+    const root = { ...v2ThreadShell, status: "completed" as const };
+    const asking = {
+      ...v2ThreadShell,
+      id: ThreadId.make("asking"),
+      creationSource: "mcp" as const,
+      status: "running" as const,
+      activityRunStatus: "running" as const,
+      lineage: {
+        rootThreadId: root.id,
+        parentThreadId: ThreadId.make("omitted-middle"),
+        relationshipToParent: "subagent" as const,
+      },
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("question"),
+        kind: "user_input" as const,
+        createdAt: v2Now,
+      },
+    };
+    const parent = threads.threadShellAtom({ environmentId, threadId: root.id });
+    const inputs = threads.childThreadInputsAtom({ environmentId, threadId: root.id });
+    const disposeParent = registry.mount(parent);
+    const disposeInputs = registry.mount(inputs);
+    registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [root, asking] });
+    expect(registry.get(parent)?.pendingSubagentRequest).toBe("user_input");
+    expect(registry.get(inputs).map((thread) => thread.id)).toEqual([asking.id]);
+    // A live update clearing the request clears the root too.
+    registry.set(
+      snapshotAtom(environmentId),
+      applyShellStreamEvent(
+        { ...v2ShellSnapshot, threads: [root, asking], snapshotSequence: 1 },
+        {
+          kind: "thread.updated",
+          sequence: 2,
+          location: "active",
+          thread: { ...asking, pendingRuntimeRequest: null },
+        },
+      ),
+    );
+    expect(registry.get(parent)?.pendingSubagentRequest).toBeNull();
+    expect(registry.get(inputs)).toEqual([]);
+    disposeInputs();
+    disposeParent();
+    registry.dispose();
+  });
+
   it.each([
     { reason: "switched-off", state: { enabled: false } },
     {

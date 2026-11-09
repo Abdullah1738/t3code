@@ -79,6 +79,12 @@ export function pendingSubagentRequestsByThread(
       if (requests.get(parentId) !== "approval") requests.set(parentId, request);
       current = byId.get(parentId);
     }
+    // Client shells omit long-idle subagents, so a nested chain can break before its root.
+    // The root row (what the sidebar and notifications read) still owns the request.
+    const rootId = child.lineage.rootThreadId;
+    if (current === undefined && !seen.has(rootId) && requests.get(rootId) !== "approval") {
+      requests.set(rootId, request);
+    }
   }
   return requests.size === 0 ? EMPTY_SUBAGENT_REQUESTS : requests;
 }
@@ -286,9 +292,17 @@ export function createEnvironmentThreadShellAtoms(input: {
     let previous: ReadonlyArray<EnvironmentThreadShell> = [];
     return Atom.make((get) => {
       const children = new Map<ThreadId, OrchestrationV2ThreadShell[]>();
-      for (const thread of get(environmentThreadsAtom(ref.environmentId))) {
-        const parent = thread.lineage.parentThreadId;
-        if (parent === null || thread.lineage.relationshipToParent !== "subagent") continue;
+      const threadsInShell = get(environmentThreadsAtom(ref.environmentId));
+      const present = new Set(threadsInShell.map((thread) => thread.id));
+      for (const thread of threadsInShell) {
+        const declared = thread.lineage.parentThreadId;
+        if (declared === null || thread.lineage.relationshipToParent !== "subagent") continue;
+        // A long-idle subagent ancestor is omitted from client shells; hang its live
+        // descendants off the lineage root so the root still lists their requests.
+        const parent =
+          present.has(declared) || thread.lineage.rootThreadId === thread.id
+            ? declared
+            : thread.lineage.rootThreadId;
         const siblings = children.get(parent);
         if (siblings) siblings.push(thread);
         else children.set(parent, [thread]);
