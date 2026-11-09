@@ -13301,3 +13301,77 @@ it.effect("an owner route that keeps failing is closed as undeliverable, with a 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect("the same owner answer sent again keeps its delivered route and sends nothing new", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Pick" });
+      const channel = yield* kanban.createDiscussion(board.id, "Again", owner);
+      const asked = yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        {
+          _tag: "choice",
+          id: "again-choice",
+          style: "pick",
+          question: "Ship?",
+          options: [
+            { id: "yes", label: "Ship it" },
+            { id: "no", label: "Hold it" },
+          ],
+          multi: false,
+        },
+      ]);
+      yield* kanban.answer(channel.id, asked.seq, "again-choice", ["yes"], owner);
+      assert.deepStrictEqual(yield* routeOutcomes, ["delivered"]);
+      yield* kanban.answer(channel.id, asked.seq, "again-choice", ["yes"], owner);
+      assert.deepStrictEqual(yield* routeOutcomes, ["delivered"]);
+      const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("Ship it")).length, 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.live("a give-up decided before a restart posts its notice on replay and never delivers", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-route-" });
+    const dbPath = path.join(directory, "state.sqlite");
+    const fake = yield* makeFake;
+    let refuse = true;
+    const layer = withOwnerRouteMode(
+      fileTestLayer(
+        refusingSends(fake, (text) => refuse && text.includes("Decided lost")),
+        dbPath,
+      ),
+      "deferred",
+    );
+    const ids = yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sql = yield* SqlClient.SqlClient;
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Live" });
+      const channel = yield* kanban.createDiscussion(board.id, "Give up", owner);
+      yield* kanban.post(channel.id, { _tag: "evaluator", threadId: evaluator }, [
+        { _tag: "md", text: "Ready" },
+      ]);
+      yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Decided lost" }]);
+      yield* eventually(routeOutcomes, (all) => all.length === 1);
+      // As if the process stopped right after deciding to give up.
+      yield* sql`UPDATE ardud_kanban_owner_routes SET noticed = 2`;
+      return { evaluator, channel: channel.id };
+    }).pipe(Effect.provide(layer));
+    refuse = false;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      yield* kanban.ready;
+      yield* eventually(routeOutcomes, (all) => all.length === 1 && all[0] === "undeliverable");
+      const messages = (yield* Ref.get(fake.threads)).get(ids.evaluator)!.messages;
+      assert.isFalse(messages.some((text) => text.includes("Decided lost")));
+      const texts = (yield* kanban.messages(ids.channel)).flatMap((message) =>
+        message.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : [])),
+      );
+      assert.strictEqual(texts.filter((text) => text.includes("could not be delivered")).length, 1);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
