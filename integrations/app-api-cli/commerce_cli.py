@@ -392,6 +392,9 @@ def order_nownow(args):
     items=input_items(args,id_argument='product_code',id_key='product_code')
     auth=CommerceAuth().noon
     if args.resume_flow:
+        if args.prepare_only and journal.inspect(args.resume_flow)['state'] == 'RELEASED':
+            from commerce_preorder_release import prepare_released
+            return prepare_released(args.resume_flow, store_code=args.store_code, items=items, auth=auth)
         flow=NowNowOrderFlow.resume_active(args.resume_flow,store_code=args.store_code,
             items=items,auth=auth)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'resumed'}),flush=True)
@@ -623,6 +626,12 @@ def release_flow(args):
     from commerce_minutes import exact_failed_evidence
     binding=journal.binding(args.flow_id)
     local=journal.inspect(args.flow_id)
+    if binding['app']=='noon' and binding['vertical']=='nownow':
+        from commerce_preorder_release import release
+        return release(args.flow_id)
+    if binding['app']=='noon' and binding['vertical'] in ('food','main','supermall'):
+        # These lanes place before paying; no pre-order intent contract exists.
+        journal.fail('RELEASE_EXACT_ORDER_RECONCILIATION_REQUIRED')
     if binding['app']=='noon' and binding['vertical']=='minutes':
         if local['state']!='FENCED':
             journal.fail('RELEASE_FENCED_ONLY')

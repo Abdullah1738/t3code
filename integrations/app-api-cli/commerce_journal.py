@@ -875,6 +875,32 @@ def release(flow_id, *, evidence_hash):
     return {'state': 'RELEASED', 'reservation_minor_retained': True, 'retry_allowed': False}
 
 
+def release_failed_preorder(flow_id, *, evidence_hash, intent_hash):
+    """Close a verified failed subscription; never make its sends reusable."""
+    if not _hash(evidence_hash) or not _hash(intent_hash):
+        fail('JOURNAL_RELEASE_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        ops = list(db.execute('SELECT * FROM operations WHERE flow_id=?', (flow_id,)))
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow'
+                or flow['state'] != 'FENCED' or flow['order_id'] is not None
+                or any(o['state'] != 'OBSERVED' or o['kind'] in ('place', 'payment') for o in ops)
+                or sum(o['kind'] == 'preauthorize' for o in ops) != 1
+                or sum(o['kind'] == 'prepay' for o in ops) != 1):
+            fail('JOURNAL_RELEASE_PREORDER_HISTORY_INVALID')
+        observations = list(db.execute('SELECT * FROM observations WHERE flow_id=?', (flow_id,)))
+        intents = [o['evidence_hash'] for o in observations if o['outcome'] == 'PREORDER_INTENT_RECEIVED']
+        if (not intents or any(i != intent_hash for i in intents)
+                or any(o['order_id'] is not None or o['outcome'] in
+                       ('PREORDER_PAYMENT_CONFIRMED', 'PAYMENT_REPORTED_SUCCESS', 'EXACT_ORDER_CONFIRMED')
+                       for o in observations)):
+            fail('JOURNAL_RELEASE_PREORDER_EVIDENCE_CONFLICT')
+        db.execute("UPDATE flows SET state='RELEASED' WHERE id=?", (flow_id,))
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'flow', 'FLOW_RELEASED_FAILED_PREORDER', evidence_hash, time.time()))
+    return {'state': 'RELEASED', 'reservation_minor_retained': True, 'retry_allowed': False}
+
+
 def release_orderless(flow_id, *, evidence_hash):
     """Terminal closure of a FENCED flow whose place POST was answered with an
     orderless refusal (4xx, no order id, no payment send).

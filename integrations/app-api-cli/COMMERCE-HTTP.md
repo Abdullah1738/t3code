@@ -566,6 +566,21 @@ evidence registers a held tracker. A completed verification can resume the same
 flow without another subscription or completion. Unknown sends stay fenced.
 Customized NowNow modifiers/notes remain unsupported and fail before mutation.
 
+`release-flow` can close a failed NowNow subscription before placement. It reads
+the retained intent and exact retained cart, checks the original account/card,
+requires `payment_failed` / `FAILED` with explicit zero authorized, captured,
+reversed and refunded amounts, and rejects any placement, order ID, unobserved
+send or earlier success evidence. The journal rechecks local history atomically;
+release is terminal and retains the reservation and every consumed operation.
+Food/Main/Supermall have no pre-order authorization contract and continue to
+require exact-order reconciliation. Missing or ambiguous evidence stays fenced.
+
+For a released NowNow cart, `order nownow ... --resume-flow FLOW --prepare-only`
+only rereads the exact original basket and reports `released_cart_review_only`.
+It verifies account availability and normal cart review checks, sends no cart or
+payment mutation, and cannot resume that released flow for purchase. Release
+does not remove the remote cart or authorize a replacement purchase.
+
 9 November live attempt: one White Chocolate 330ml shake prepared at AED26.70.
 9546 required an AED1 card verification. One CLI completion reached Mashreq 3DS;
 the retained redirect was displayed, then reopened once with authorization after
