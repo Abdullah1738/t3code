@@ -5033,7 +5033,8 @@ test.each(["wake", "secret"])("an intervening %s cannot rotate an unresolved ste
   await h.router.tick();
   const deliveries = [...records].flatMap(([id, rows]) => rows.filter(row => row.type === "user" && row.id === original.messageId).map(() => id));
   expect(deliveries).toEqual([original.id]);
-  expect(h.backend.prompts.find(prompt => prompt.messageId === original.messageId)).toMatchObject({ id: original.id, text: original.text });
+  // The watcher settled this accepted steer too, so its receipt never needs another POST.
+  expect(h.backend.prompts.filter(prompt => prompt.messageId === original.messageId)).toEqual([]);
   expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
   // Once the steer is accepted, ordinary future turns may rotate again.
   h.backend.final("NO_REPLY");
@@ -5041,4 +5042,358 @@ test.each(["wake", "secret"])("an intervening %s cannot rotate an unresolved ste
   h.input("later", "New work");
   await h.router.tick();
   expect(h.backend.prompts.at(-1)!.id).not.toBe(original.id);
+});
+
+test("review633r2: late accepted steer after the first turn closes still forwards its answer", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  expect(steers).toHaveLength(1);
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let landed = false;
+  h.backend.promptAccepted = async (id, directory, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === messageId("followup") && !landed) {
+      // The old turn finishes in poll(); the pending steer commits before
+      // the subsequent acceptance read, starting its own run.
+      landed = true;
+      h.backend.records.push({ id: promptId, type: "user", text: "Follow-up question", time: { created: Date.now() } });
+    }
+    return read(id, directory, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("done");
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    id: steers[0]!.id, directory: "/Chats/ses_1", generation: 1,
+    inboundId: "followup", messageId: steers[0]!.messageId, phase: "running",
+  });
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Follow-up answer"]);
+});
+
+
+test.each(["running", "completed", "multi", "failed-foreground", "legacy-route-only", "reset-during-read"])("accepted steer after foreground settlement retains reply ownership (%s)", async kind => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Second original line");
+  await h.router.tick();
+  const original = steers[0]!;
+  const firstAnswer = h.backend.final("Original answer");
+  if (kind === "legacy-route-only") {
+    const kept = h.store.get<{ id: string; directory: string; generation: number }>("steer-attempt:followup")!;
+    h.store.set("steer-attempt:followup", { id: kept.id, directory: kept.directory, generation: kept.generation });
+  }
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, directory, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === original.messageId && !h.backend.records.some(record => record.id === promptId)) {
+      h.backend.records.push({ id: promptId, type: "user", text: original.text, time: { created: Date.now() } });
+      if (kind === "completed") h.backend.final("Follow-up answer");
+      if (kind === "failed-foreground") h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: "failed-run", startedAt: start, phase: "failed" });
+      if (kind === "reset-during-read") {
+        const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+        h.store.set("route", { ...route, generation: route.generation + 1 });
+        h.store.set("activeTurn", null);
+        h.store.updateInbound("followup", "cancelled");
+      }
+    }
+    return read(id, directory, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  if (kind === "reset-during-read") {
+    h.backend.final("Old follow-up answer");
+    await h.router.tick();
+    expect(h.store.get<object | null>("activeTurn")).toBeNull();
+    expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("cancelled");
+    expect(h.conversations().map(op => op.text)).toEqual(["Original answer"]);
+    return;
+  }
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: original.id, messageId: original.messageId, inboundId: "followup", phase: "running" });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(kind === "multi" ? ["followup", "member"] : ["followup"]);
+  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${firstAnswer.id}`]);
+  if (kind !== "completed") h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo, op.sessionId, op.generation])).toEqual([
+    ["Original answer", "first", original.id, 1], ["Follow-up answer", "followup", original.id, 1],
+  ]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+  if (kind === "multi") expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test("late accepted steer reply ownership survives closing and reopening the bridge store", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-late-steer-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path);
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === steers[0]!.messageId && !h.backend.records.some(record => record.id === promptId)) h.backend.records.push({ id: promptId, type: "user", text: steers[0]!.text, time: { created: Date.now() } });
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  h.store.close();
+  const reopened = new Store(path);
+  stores.push(reopened);
+  const restarted = new Router(reopened, h.backend, h.transport, h.routerOptions);
+  h.backend.final("Follow-up answer");
+  await restarted.tick();
+  await restarted.tick();
+  expect(reopened.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Follow-up answer", "followup"],
+  ]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+});
+
+
+test("two uncertain steers accepted after settlement keep all replies tracked in order", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Second question");
+  await h.router.tick();
+  h.input("another", "Third question");
+  await h.router.tick();
+  expect(new Set(steers.map(steer => steer.messageId)).size).toBe(2);
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && [messageId("followup"), messageId("another")].includes(promptId) && !h.backend.records.some(record => record.id === promptId)) {
+      const steer = steers.find(steer => steer.messageId === promptId)!;
+      h.backend.records.push({ id: promptId, type: "user", text: steer.text, time: { created: Date.now() } });
+      h.backend.final(promptId === messageId("followup") ? "Second answer" : "Third answer");
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({
+    messageId: messageId("followup"), steered: [messageId("another")], phase: "running",
+  });
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Second answer", "Third answer"]);
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test.each(["same-run", "own-run", "multi", "quiet"])("a lost-response steer already answered by its foreground is not adopted twice (%s)", async kind => {
+  const h = setup();
+  let finishFirst = false;
+  const steers = steering(h.backend, async call => {
+    if (kind === "own-run" && !finishFirst) {
+      finishFirst = true;
+      h.backend.final("Original answer");
+    }
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    throw new Error("lost response");
+  });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Another follow-up line");
+  await h.router.tick();
+  h.backend.final(kind === "quiet" ? "NO_REPLY" : "Both answered");
+  await h.router.tick();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "quiet" ? []
+    : kind === "own-run" ? [["Original answer", "first"], ["Both answered", "first"]] : [["Both answered", "first"]]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+});
+
+test.each(["single", "multi", "own-run"])("a queued steer covered by settlement cannot replay an already-delivered answer (%s)", async kind => {
+  const h = setup();
+  const steers = steering(h.backend, async () => {
+    if (steers.length === 1) throw new Error("lost response");
+    return "refused";
+  });
+  h.backend.promptBehavior = async call => {
+    if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.accept(call);
+  };
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  if (kind === "multi") h.input("member", "Another original line");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:followup")).toBe("queued-steer");
+  const original = steers[0]!;
+  if (kind === "own-run") h.backend.final("Original answer");
+  h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.final("Both answered");
+  await h.router.tick();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "own-run"
+    ? [["Original answer", "first"], ["Both answered", "followup"]] : [["Both answered", "first"]]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
+  expect(h.backend.prompts).toHaveLength(kind === "own-run" ? 2 : 1);
+});
+
+test.each(["normal", "reversed"])("late steer replies follow accepted record order (%s)", async order => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("second", "Second question");
+  await h.router.tick();
+  h.input("third", "Third question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of order === "normal" ? ["second", "third"] : ["third", "second"]) {
+        const steer = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+        h.backend.final(inbound === "second" ? "Second answer" : "Third answer");
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: steers[0]!.id, messageId: messageId("second"), steered: [messageId("third")] });
+  await h.router.tick();
+  setSystemTime(start + 240_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(order === "normal"
+    ? ["Original answer", "Second answer", "Third answer"] : ["Original answer", "Third answer", "Second answer"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+
+const lateSteerOrders = [
+  ["second", "third", "fourth"], ["second", "fourth", "third"],
+  ["third", "second", "fourth"], ["third", "fourth", "second"],
+  ["fourth", "second", "third"], ["fourth", "third", "second"],
+];
+test.each(lateSteerOrders.map(order => ({ order })))("all accepted late-steer run orders retain every reply: $order", async ({ order }) => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
+  h.input("first", "Original question");
+  await h.router.tick();
+  for (const inbound of ["second", "third", "fourth"]) {
+    h.input(inbound, `${inbound} question`);
+    await h.router.tick();
+  }
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  let exposed = false;
+  h.backend.promptAccepted = async (id, dir, promptId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && !exposed && promptId === messageId("second")) {
+      exposed = true;
+      for (const inbound of order) {
+        const steer = steers.find(call => call.messageId === messageId(inbound))!;
+        h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+        h.backend.final(`${inbound} answer`);
+      }
+    }
+    return read(id, dir, promptId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  await h.router.tick();
+  setSystemTime(start + 240_000);
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", ...order.map(inbound => `${inbound} answer`)]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done", "done"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+  expect(h.backend.prompts).toHaveLength(1);
+});
+
+test("an accepted steer with a temporarily unreadable record stays tracked beyond the grace period", async () => {
+  const h = setup();
+  const start = Date.now();
+  setSystemTime(start);
+  const steers = steering(h.backend, async () => "queued");
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.final("Original answer");
+  h.backend.single = true;
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ messageId: messageId("first"), phase: "running" });
+  expect(h.conversations()).toEqual([]);
+  const original = steers[0]!;
+  h.backend.records.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Follow-up answer"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
+});
+
+test.each(["question", "approval"].flatMap(kind => ["missing-record", "page-error", "admission-error"].map(failure => ({ kind, failure }))))("an unreadable accepted steer never holds its foreground's live $kind ($failure)", async ({ kind, failure }) => {
+  const h = setup();
+  const steers = steering(h.backend, async () => "queued");
+  h.input("first", "Original question");
+  await h.router.tick();
+  h.input("followup", "Follow-up question");
+  await h.router.tick();
+  h.backend.single = true;
+  if (failure === "page-error") Object.assign(h.backend, {
+    async messages(_id: string, _directory: string, options: { until?: string } = {}) {
+      if (options.until === steers[0]!.messageId) throw new Error("page unavailable");
+      return h.backend.records;
+    },
+  });
+  if (failure === "admission-error") h.backend.promptAccepted = async () => { throw new Error("admission unavailable"); };
+  if (kind === "question") h.backend.questionRequests = [question()];
+  else h.backend.permissionRequests = [permission()];
+  await h.router.tick();
+  await h.router.tick();
+  expect(asked(h.store)).toHaveLength(1);
+  deliver(h.store);
+  h.input("answer", kind === "question" ? "A" : "yes");
+  await h.router.tick();
+  if (kind === "question") expect(h.backend.questionReplies).toHaveLength(1);
+  else expect(h.backend.permissionReplies).toHaveLength(1);
+  h.backend.messages = Backend.prototype.messages.bind(h.backend);
+  const steer = steers[0]!;
+  h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+  h.backend.final("Both answered");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Both answered"]);
+  expect(h.store.get<object | null>("activeTurn")).toBeNull();
 });

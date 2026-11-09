@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1337,4 +1338,43 @@ test("a background run's answer before two steered texts reaches the chat along 
   // finish is looked up once however often the router polls.
   expect(control.lookups.flat().filter(id => id === native("msg_booked"))).toHaveLength(1);
   expect(store.get("activeTurn")).toBeNull();
+});
+
+
+test.each([0, 94, 95, 99, 100, 101, 250])("owned late-steer replies cross the real backend page boundary (%s narration records)", async count => {
+  const start = Date.now();
+  setSystemTime(start);
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const promptId = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
+  await backend.prompt(chat.id, chat.directory, promptId("third"), "Third question");
+  control.reply(chat.id, "Third answer", "completed");
+  await backend.prompt(chat.id, chat.directory, promptId("second"), "Second question");
+  const thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  for (let i = 0; i < count; i++) thread.messages.push({
+    messageId: `narration-${i}`, runId: thread.runs.at(-1)!.runId, role: "assistant", phase: "narration", text: "Working", streaming: false,
+    createdAt: new Date(start + 1_000 + i).toISOString(), updatedAt: new Date(start + 1_000 + i).toISOString(),
+  });
+  setSystemTime(start + 2_000);
+  control.reply(chat.id, "Second answer", "completed");
+  const store = new Store(":memory:");
+  stores.push(store);
+  for (const id of ["second", "third"]) {
+    store.acceptInbound(id, { id, text: `${id} question`, attachments: [], isAudioMessage: false, receivedAt: start });
+    store.updateInbound(id, "done");
+  }
+  store.set("route", { ...chat, generation: 1 });
+  store.set("batch:second", { id: "second", text: "Second question", batchIds: ["second"], attachments: [], isAudioMessage: false, receivedAt: start });
+  store.set("activeTurn", { ...chat, generation: 1, inboundId: "second", messageId: promptId("second"), startedAt: start, phase: "running", steered: [promptId("third")], steeredAt: start });
+  const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("Unexpected file"); } }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/imessage", alertSkillPath: "/test/telegram", alertSocketPath: "/test/telegram.sock", openCodeConfigRoot: "/nonexistent/opencode-config",
+  });
+  setSystemTime(start + 120_000);
+  await router.tick();
+  await router.tick();
+  expect(store.pendingOutbox().filter(op => op.kind === "conversation").map(op => op.text)).toEqual(["Third answer", "Second answer"]);
+  expect(store.get<object | null>("activeTurn")).toBeNull();
+  expect(control.calls.filter(call => call.path.endsWith("/send"))).toHaveLength(2);
 });

@@ -1392,3 +1392,38 @@ test.each(["dm", "group"] as const)("late steer fallback in %s preserves named m
     expect(h.store.get<string[]>("group-observed")).toEqual([]);
   }
 });
+
+test.each(["dm", "group"] as const)("late accepted steer in %s forwards its own reply after the foreground closes", async kind => {
+  const start = Date.now();
+  setSystemTime(start);
+  const h = live(context(kind));
+  const steers: { id: string; messageId: string; text: string }[] = [];
+  Object.assign(h.backend, { async steer(id: string, _dir: string, messageId: string, text: string) {
+    steers.push({ id, messageId, text });
+    throw new Error("lost response");
+  } });
+  h.input("first", "robob original question", "+971585933213");
+  await h.router.tick();
+  h.input("followup", "robob follow-up question", "+971585933213");
+  h.input("member", "robob second original line", "+447700900123");
+  await h.router.tick();
+  const original = steers[0]!;
+  h.backend.final("Original answer");
+  const read = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, dir, messageId) => {
+    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && messageId === original.messageId && !h.backend.records.some(record => record.id === messageId)) h.backend.records.push({ id: messageId, type: "user", text: original.text, time: { created: Date.now() } });
+    return read(id, dir, messageId);
+  };
+  setSystemTime(start + 120_000);
+  await h.router.tick();
+  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: original.id, messageId: original.messageId, inboundId: "followup", phase: "running" });
+  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(["followup", "member"]);
+  h.backend.final("Follow-up answer");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.store.pendingOutbox().filter(op => op.kind === "conversation").map(op => [op.text, op.replyTo])).toEqual([
+    ["Original answer", "first"], ["Follow-up answer", "followup"],
+  ]);
+  expect(steers).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(1);
+});

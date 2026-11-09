@@ -54,7 +54,7 @@ type Turn = Route & {
   steeredAt?: number;
 };
 /** Older persisted steer attempts contain only their route. */
-type SteerAttempt = Route & { text?: string; guidance?: string };
+type SteerAttempt = Route & { text?: string; guidance?: string; startedAt?: number };
 /** The sealed prompt body, retained until delivery is confirmed. */
 type ResendBody = {
   inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
@@ -923,10 +923,28 @@ export class Router {
     return this.store.get(`batch-phase:${id}`) === "steering";
   }
 
-  /** Marks a steered batch consumed: its text is now part of the running turn. */
-  private consumeSteer(id: string): void {
+  /** Acceptance also owns reply delivery: a late steer may start its own run after the original turn closes. */
+  private consumeSteer(id: string, attempt: SteerAttempt): void {
     this.store.db.transaction(() => {
-      if (this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state !== "processing") return;
+      const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
+      const queued = state === "pending" && this.store.get(`batch-phase:${id}`) === "queued-steer";
+      if (!this.current(attempt) || (state !== "processing" && !queued)) return;
+      const messageId = `msg_${hash(id)}`;
+      const turn = this.store.get<Turn | null>("activeTurn");
+      if (!turn || !this.current(turn) || turn.phase === "failed") {
+        const adopted: Turn = {
+          id: attempt.id, directory: attempt.directory, generation: attempt.generation,
+          inboundId: id, messageId, startedAt: attempt.startedAt ?? Date.now(), phase: "running",
+        };
+        this.store.set("activeTurn", adopted);
+        this.store.set("pendingApprovals", null);
+        this.landed(adopted);
+        return;
+      }
+      // Several uncertain steers can settle together; one tracked turn forwards each run's answer in order.
+      if (turn.messageId !== messageId && !turn.steered?.includes(messageId)) this.store.set("activeTurn", {
+        ...turn, steered: [...turn.steered ?? [], messageId], steeredAt: Date.now(),
+      });
       for (const member of this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id]) this.store.updateInbound(member, "done");
       this.store.set(`batch:${id}`, null);
       this.store.set(`batch-phase:${id}`, null);
@@ -957,7 +975,7 @@ export class Router {
     if (attempt) {
       const accepted = await bounded(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => undefined);
       if (accepted === undefined) return;
-      if (accepted) { this.consumeSteer(row.id); return; }
+      if (accepted) { this.consumeSteer(row.id, attempt); return; }
     }
     if (!turn || !this.steerable(turn)) {
       this.releaseSteer(row.id);
@@ -992,7 +1010,8 @@ export class Router {
     }
     const body = attempt?.text ?? (quote ? `${quote}\n${input.text.trim()}` : input.text.trim());
     const guidance = attempt?.guidance ?? `[Bridge note, not typed by anyone.] This message came in while you were working. Take it into account in what you are doing now; your final reply still goes to the chat. Current incoming message ID: ${JSON.stringify(input.id)}. Source incoming message IDs (in order, available as reaction targets): ${JSON.stringify(input.batchIds ?? [row.id])}.${eyes ? " The 👀 reaction to it is already sent." : ""}`;
-    this.store.set(`steer-attempt:${row.id}`, { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance } satisfies SteerAttempt);
+    const sent: SteerAttempt = { id: turn.id, directory: turn.directory, generation: turn.generation, text: body, guidance, startedAt: attempt?.startedAt ?? Date.now() };
+    this.store.set(`steer-attempt:${row.id}`, sent);
     let delivery: SteerDelivery;
     try {
       delivery = await bounded(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance));
@@ -1005,7 +1024,7 @@ export class Router {
       // A replayed send can be refused after its first try landed; only then is the text already in.
       const accepted = await bounded(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => undefined);
       if (accepted === undefined) return;
-      if (accepted) this.consumeSteer(row.id);
+      if (accepted) this.consumeSteer(row.id, sent);
       else {
         this.steerRefusedAt = Date.now();
         this.releaseSteer(row.id);
@@ -1013,7 +1032,7 @@ export class Router {
       this.options.log?.(accepted ? "steered" : "steer-refused");
       return;
     }
-    this.consumeSteer(row.id);
+    this.consumeSteer(row.id, sent);
     this.options.log?.("steered", delivery);
   }
 
@@ -2841,13 +2860,14 @@ export class Router {
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
       const statuses = await this.statusesFor(turn);
-      const [messages, requests] = await Promise.all([
+      const [page, requests] = await Promise.all([
         bounded(this.backend.messages(turn.id, turn.directory, turn.background
           ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
         this.requests(turn, statuses),
       ]);
       if (!this.current(turn)) return;
-      if (!messages || !statuses) throw new Error();
+      if (!page || !statuses) throw new Error();
+      let messages = page;
       if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
         await this.reconcile(turn, messages);
         const accepted = this.store.get<Turn | null>("activeTurn");
@@ -2893,16 +2913,36 @@ export class Router {
       }
       this.store.set("pendingApprovals", entries);
       this.advance(turn);
+      // A late accepted steer can precede the adopted prompt by more than the backend's page size.
+      for (const id of [turn.messageId, ...turn.steered ?? []]) {
+        if (messages.some(record => record.id === id)) continue;
+        const extended = await bounded(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
+        if (!this.current(turn)) return;
+        if (extended.some(record => record.id === id)) {
+          const owned = new Set([turn.messageId, ...turn.steered ?? []]);
+          const kept = messages.filter(record => record.type === "user" && owned.has(record.id));
+          if (kept.some(record => !extended.some(next => next.id === record.id))) return;
+          messages = extended;
+        } else if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) {
+          // Acceptance without a readable record is not permission to discard its reply after the grace period.
+          return;
+        }
+      }
+      if (!this.current(turn)) return;
       // OpenCode 2 records carry no parent link. A turn is every record after
       // its user prompt (or, for background work, after the last delivered
       // record) up to the next idle marker, which OpenCode appends once the
       // execution settles (succeeded, failed or interrupted).
-      const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
+      // Admission can reverse the order of uncertain steers. The adopted prompt keeps its identity,
+      // but reply ownership starts at the earliest accepted prompt this turn tracks.
+      const ownedPrompts = new Set([turn.messageId, ...turn.steered ?? []]);
+      const start = messages.findIndex(m => m.type === "user" && ownedPrompts.has(m.id)
+        || turn!.background && m.id === turn!.messageId);
       const after = start < 0 ? [] : messages.slice(start + 1);
       // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
       let steered = -1;
-      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
-      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
+      after.forEach((m, index) => { if (m.type === "user" && ownedPrompts.has(m.id)) steered = index; });
+      const missing = (turn.steered ?? []).some(id => !messages.slice(Math.max(start, 0)).some(m => m.type === "user" && m.id === id))
         && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
       const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
       const end = missing || found < 0 ? -1 : steered + 1 + found;
@@ -3020,6 +3060,13 @@ export class Router {
         const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
         if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
+        // Readback must not adopt a steer whose answer this transaction has already delivered.
+        const coveredSteers = new Set(scope.filter(record => record.type === "user").map(record => record.id));
+        for (const row of this.store.pendingInbound()) {
+          const steering = row.state === "processing" && this.steering(row.id)
+            || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
+          if (steering && coveredSteers.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn!);
+        }
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
         // The agent refused a /new nudge and said why: ask again once it's idle with nothing said in the meantime.
         // Any other reply of the same context means the conversation moved on, so the deferred reset is dropped.
