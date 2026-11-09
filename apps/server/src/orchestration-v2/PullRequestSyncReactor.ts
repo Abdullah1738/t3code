@@ -425,7 +425,10 @@ export const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker((scope: "all" | "requested") =>
     Effect.suspend(() => {
       if (scope === "requested") requestedSweepQueued = false;
-      return sweep(scope);
+      // A fresh memo per sweep: each project's shell is read once per sweep, never reused after.
+      return sweep(scope).pipe(
+        Effect.provideService(PullRequestService.SweepProjectShells, new Map()),
+      );
     }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
   );
 

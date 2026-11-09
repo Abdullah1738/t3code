@@ -532,6 +532,7 @@ function makeService(input: {
   readonly providers: ReadonlyArray<PullRequestProviderApi>;
   readonly resolveHandle?: SourceControlProviderRegistry.SourceControlProviderRegistry["Service"]["resolveHandle"];
   readonly resolveRepositoryIdentity?: RepositoryIdentityResolver.RepositoryIdentityResolver["Service"]["resolve"];
+  readonly getShellCalls?: Array<string>;
 }) {
   // Built into the test's own scope rather than provided call by call: the marks store owns a
   // database, and `Effect.provide` would close it the moment the service was handed back.
@@ -556,7 +557,10 @@ function makeService(input: {
               input.projects.filter((project) => options?.projectIds?.includes(project.id) ?? true),
             ),
           getShell: (projectId) =>
-            Effect.succeed(Option.fromNullishOr(input.projects.find((p) => p.id === projectId))),
+            Effect.sync(() => {
+              input.getShellCalls?.push(projectId);
+              return Option.fromNullishOr(input.projects.find((p) => p.id === projectId));
+            }),
         }),
         Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
           resolve: input.resolveRepositoryIdentity ?? (() => Effect.succeed(null)),
@@ -7972,5 +7976,59 @@ it.effect("checks expanded files against a diff too large to cache without fetch
       });
     }
     assert.strictEqual(diffReads, 1);
+  }),
+);
+
+it.effect("a sweep's memo reads each project's shell once; reads outside a sweep stay fresh", () =>
+  Effect.gen(function* () {
+    const getShellCalls: Array<string> = [];
+    const service = yield* makeService({
+      projects: [
+        project({
+          id: "p1",
+          title: "web",
+          workspaceRoot: "/repo",
+          repository: "acme/web",
+          provider: SourceControlProviderKind.make("github"),
+          host: "github.com",
+        }),
+      ],
+      providers: [
+        fakeProvider(SourceControlProviderKind.make("github"), {
+          getChangeRequestSummary: (input) =>
+            Effect.succeed(changeRequest(input.number, "2026-07-02T00:00:00Z")),
+        }),
+      ],
+      getShellCalls,
+    });
+    const reference = (number: number) => ({
+      projectId: "p1" as ProjectId,
+      host: "github.com",
+      repository: "acme/web",
+      number,
+    });
+    const readAll = Effect.forEach(
+      [1, 2, 3, 4],
+      (number) =>
+        service
+          .invalidate({ reference: reference(number) })
+          .pipe(
+            Effect.andThen(service.summary(reference(number), { recoverTransientFailure: false })),
+          ),
+      { concurrency: 4, discard: true },
+    );
+
+    yield* readAll;
+    const unmemoized = getShellCalls.length;
+    assert.isAtLeast(unmemoized, 4);
+
+    getShellCalls.length = 0;
+    yield* readAll.pipe(Effect.provideService(PullRequestService.SweepProjectShells, new Map()));
+    assert.deepStrictEqual(getShellCalls, ["p1"]);
+
+    // The next sweep reads again: nothing carries over.
+    getShellCalls.length = 0;
+    yield* readAll.pipe(Effect.provideService(PullRequestService.SweepProjectShells, new Map()));
+    assert.deepStrictEqual(getShellCalls, ["p1"]);
   }),
 );
