@@ -14008,7 +14008,7 @@ it.live("saved model switches for two cards sharing a thread leave the newest mo
       yield* Effect.sleep("200 millis");
       yield* Deferred.succeed(release, undefined);
       yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
-      const last = fake.modelSwitches.filter((entry) => entry.threadId === thread).at(-1);
+      const last = fake.modelSwitches.findLast((entry) => entry.threadId === thread);
       assert.strictEqual(last?.model.model, board.defaultCardModel.model);
       assert.strictEqual((yield* kanban.card(a.id)).card.model.model, board.defaultCardModel.model);
       assert.strictEqual(

@@ -1034,19 +1034,20 @@ const make = Effect.gen(function* () {
     stops.set(routeKey, reason);
   };
   // A failed close fails the stop like a failed interrupt: the send waiting on it fails too.
-  const closeStopRows = (keys: ReadonlyArray<string>) =>
-    Effect.gen(function* () {
+  const closeStopRows = Effect.fn("KanbanService.closeStopRows")(
+    function* (keys: ReadonlyArray<string>) {
       const at = yield* nowIso;
       yield* boardSql`
         UPDATE ardud_kanban_owner_routes
         SET done_at = ${at}, json = json_set(json, '$.outcome', 'delivered')
         WHERE route_key IN ${boardSql.in(keys)} AND done_at IS NULL
       `;
-    }).pipe(
-      Effect.mapError(
-        (error) => new KanbanThreadError({ operation: "interrupt", detail: `stop not saved: ${error.message}` }),
-      ),
-    );
+    },
+    Effect.mapError(
+      (error) =>
+        new KanbanThreadError({ operation: "interrupt", detail: `stop not saved: ${error.message}` }),
+    ),
+  );
   /**
    * Runs the thread's pending stops, if any; callers hold no board gate. A
    * drain passes its own route: skipped when a send already ran it.
