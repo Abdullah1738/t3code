@@ -6,6 +6,11 @@ describe("readerLaneOptions", () => {
   it("defaults: two statev2 foreground slots, one boards slot, bounded queues and results", () => {
     const statev2 = readerLaneOptions(STATEV2_READER_LANES, {});
     expect(statev2.foregroundReaderSlots).toBe(2);
+    expect(statev2.backgroundReaderSlots).toBe(1);
+    expect(
+      readerLaneOptions(STATEV2_READER_LANES, { ROBOB_STATEV2_BACKGROUND_READERS: "2" })
+        .backgroundReaderSlots,
+    ).toBe(2);
     expect(statev2.readerQueueLimits).toEqual({ foreground: 128, background: 1024 });
     expect(statev2.foregroundReaderInitializationSql).toEqual(["PRAGMA cache_size = -32768"]);
     expect(statev2.readerMaxResultBytes).toEqual({

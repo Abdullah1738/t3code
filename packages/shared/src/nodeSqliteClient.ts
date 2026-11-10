@@ -70,6 +70,8 @@ export interface SqliteClientConfig {
    * Needs `readerWorker`.
    */
   readonly foregroundReaderSlots?: number | undefined;
+  /** Default-reader (background lane) slots; 1 (the default) is the single shared reader. */
+  readonly backgroundReaderSlots?: number | undefined;
   /** Extra connection-local SQL for foreground slots, after `readerInitializationSql` (e.g. a smaller cache). */
   readonly foregroundReaderInitializationSql?: ReadonlyArray<string> | undefined;
   /** Reads queued or running per lane before new ones fail with "Reader lane admission queue full". */
@@ -1592,7 +1594,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const background = readers
     ? yield* makeReaderPool({
         lane: "background",
-        slots: [yield* laneReader("background")],
+        slots: yield* Effect.forEach(
+          Array.from({ length: Math.max(1, Math.floor(options.backgroundReaderSlots ?? 1)) }),
+          () => laneReader("background"),
+        ),
         queueLimit: options.readerQueueLimits?.background ?? 1024,
       })
     : undefined;
