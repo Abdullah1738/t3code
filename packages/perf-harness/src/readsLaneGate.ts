@@ -97,7 +97,10 @@ const threads = () => {
   }
 };
 const resources: Array<Record<string, number | string>> = [];
-const sample = (at: string) => resources.push({ at, rssBytes: process.memoryUsage().rss, threads: threads(), ...readIo() });
+const sample = (at: string) => {
+  console.error(`[${label}] phase ${at} t=${Math.round(performance.now())}ms`);
+  resources.push({ at, rssBytes: process.memoryUsage().rss, threads: threads(), ...readIo() });
+};
 
 const probes: Record<string, Record<string, Array<number>>> = {};
 const failures: Record<string, Array<string>> = {};
@@ -140,6 +143,7 @@ const program = Effect.gen(function* () {
     );
   // Warm every lane and slot (prepared statements, page cache).
   for (let i = 0; i < 3; i++) yield* Effect.all(Object.values(run).map((f) => f()), { concurrency: "unbounded" });
+  yield* Effect.sync(() => console.error(`[${label}] warmed t=${Math.round(performance.now())}ms`));
   yield* sql`CREATE TABLE IF NOT EXISTS gate_scratch (id INTEGER PRIMARY KEY, body TEXT NOT NULL)`;
   const holderTransaction = sql
     .withTransaction(
@@ -150,6 +154,7 @@ const program = Effect.gen(function* () {
     )
     .pipe(NodeSqliteClient.readOnly);
   const holderIdleMs = yield* time(holderTransaction);
+  yield* Effect.sync(() => console.error(`[${label}] holder alone ${Math.round(holderIdleMs)}ms`));
   sample("idle-start");
   for (let i = 0; i < readsLaneWorkload.idleCycles; i++) yield* cycle("idle");
   sample("idle-end");
@@ -204,6 +209,9 @@ const program = Effect.gen(function* () {
 });
 
 const started = new Date().toISOString();
+// Reader workers and their ports are unref'd (the server's listener keeps it alive);
+// a bare script must hold the event loop open while a worker statement runs.
+const keepAlive = setInterval(() => undefined, 1000);
 let result: { holderIdleMs: number; checkpoint: unknown };
 try {
   result = (await Effect.runPromise(
@@ -214,6 +222,7 @@ try {
     >,
   )) as { holderIdleMs: number; checkpoint: unknown };
 } finally {
+  clearInterval(keepAlive);
   rmSync(home, { recursive: true, force: true });
 }
 const dist = (values: ReadonlyArray<number>) => {
