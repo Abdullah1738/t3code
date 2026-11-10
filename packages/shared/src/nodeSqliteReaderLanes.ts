@@ -9,6 +9,53 @@ export const ReaderLane = Context.Reference<"auth" | "identity" | "view">(
   { defaultValue: () => "view" },
 );
 
+// Reads a reserved reader never ran (queued behind a slow statement, or its
+// process stopped first). Nothing executed for them, so a caller may run an
+// idempotent read again; a read that started is never replayed.
+const notStartedErrors = new WeakSet<object>();
+export const markNotStarted = <E extends object>(error: E): E => {
+  notStartedErrors.add(error);
+  return error;
+};
+
+/** Typed "busy, retry" for a reserved reader: the process is kept, the caller is not. */
+export const readerBusy = (message: string, started: boolean): SqlError => {
+  const error = new SqlError({
+    reason: classifySqliteError(new Error(message), { operation: "readerBusy", message }),
+  });
+  return started ? error : markNotStarted(error);
+};
+
+const LANE_OPERATIONS = new Set(["readerAdmission", "readerBusy", "readerSnapshot"]);
+const LANE_MESSAGE =
+  /^(?:Database (?:auth )?reader (?:exited|retired|failed)|Reader lane |Reader startup queue full)/;
+
+/**
+ * Classify a failure from a reserved reader lane anywhere in an error's cause
+ * chain: "retryable" when no statement ran for it (lane unavailable, queue
+ * full, never started), "busy" when a started read gave up or its process
+ * stopped, undefined for any other failure (SQL errors, decode errors).
+ */
+export const readerLaneFailure = (error: unknown): "retryable" | "busy" | undefined => {
+  let busy = false;
+  const seen = new Set<unknown>();
+  const stack: Array<unknown> = [error];
+  while (stack.length > 0 && seen.size < 32) {
+    const node = stack.pop();
+    if (typeof node !== "object" || node === null || seen.has(node)) continue;
+    seen.add(node);
+    if (notStartedErrors.has(node)) return "retryable";
+    const reason = (node as { readonly reason?: { readonly operation?: unknown } }).reason;
+    const operation = typeof reason === "object" && reason !== null ? reason.operation : undefined;
+    if (operation === "readerAdmission") return "retryable";
+    if (typeof operation === "string" && LANE_OPERATIONS.has(operation)) busy = true;
+    const message = (node as { readonly message?: unknown }).message;
+    if (typeof message === "string" && LANE_MESSAGE.test(message)) busy = true;
+    stack.push((node as { readonly cause?: unknown }).cause, reason);
+  }
+  return busy ? "busy" : undefined;
+};
+
 /** Bounded admission for one reserved connection; opened after migrations. */
 export const makeReaderLanes = Effect.fnUntraced(function* <E, R>(
   make: () => Effect.Effect<Effect.Effect<Connection | undefined>, E, R>,

@@ -3,7 +3,14 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import type { Connection } from "effect/sql/SqlConnection";
-import { makeReaderLanes, ReaderLane } from "./nodeSqliteReaderLanes.ts";
+import { SqlError, classifySqliteError } from "effect/sql/SqlError";
+import {
+  makeReaderLanes,
+  markNotStarted,
+  ReaderLane,
+  readerBusy,
+  readerLaneFailure,
+} from "./nodeSqliteReaderLanes.ts";
 
 // Routing-only fixtures never execute SQL on this connection.
 const connection = {} as Connection;
@@ -45,3 +52,27 @@ it.effect("fails closed when the reserved auth process cannot open", () =>
     assert.equal(failure.reason.operation, "readerAdmission");
   }),
 );
+
+it("classifies reserved-lane failures through cause chains", () => {
+  const admission = new SqlError({
+    reason: classifySqliteError(new Error("Reader lane unavailable"), {
+      operation: "readerAdmission",
+      message: "Reader lane unavailable",
+    }),
+  });
+  assert.strictEqual(readerLaneFailure(admission), "retryable");
+  assert.strictEqual(readerLaneFailure(readerBusy("Reader lane busy", false)), "retryable");
+  assert.strictEqual(readerLaneFailure(readerBusy("Reader lane busy", true)), "busy");
+  const stopped = new Error("verification failed", {
+    cause: new Error("Database reader exited with code null"),
+  });
+  assert.strictEqual(readerLaneFailure({ _tag: "Wrapper", cause: stopped }), "busy");
+  assert.strictEqual(
+    readerLaneFailure(markNotStarted(new Error("Database reader exited"))),
+    "retryable",
+  );
+  assert.strictEqual(readerLaneFailure(new Error("no such table: sessions")), undefined);
+  const cyclic: { cause?: unknown } = {};
+  cyclic.cause = cyclic;
+  assert.strictEqual(readerLaneFailure(cyclic), undefined);
+});

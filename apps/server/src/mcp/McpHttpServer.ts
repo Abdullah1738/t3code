@@ -1009,9 +1009,26 @@ const withToolAnalytics =
               const result = options
                 .handle(payload)
                 .pipe(Effect.provideService(ReplyRejection, rejection));
-              return yield* (
-                LARGE_READ_TOOLS.has(options.tool.name) ? ReplyBuilders.bounded(result) : result
-              ).pipe(
+              // The tool (reads, waits, acknowledgements) runs without a reply-builder
+              // permit; a large read takes one only to measure its built result
+              // (10 Nov 2026: t3_thread_read held a permit up to 153 s).
+              const check = <A>(built: A): A | McpSchema.CallToolResult => {
+                // MCP repeats the result as text and structuredContent; leave envelope headroom.
+                if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
+                  return built;
+                if (Option.isSome(largeRepliesForTools))
+                  largeRepliesForTools.value.record({
+                    kind: "mcp",
+                    name: options.tool.name,
+                    bytes: MAX_REPLY_BYTES + 1,
+                    rejected: true,
+                  });
+                return new McpSchema.CallToolResult({
+                  isError: true,
+                  content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                });
+              };
+              return yield* result.pipe(
                 Effect.catchCauseIf(
                   (cause) =>
                     cause.reasons.some(
@@ -1034,22 +1051,11 @@ const withToolAnalytics =
                     );
                   },
                 ),
-                Effect.map((result) => {
-                  // MCP repeats the result as text and structuredContent; leave envelope headroom.
-                  if (!rejection.exceeded && !jsonExceedsBudget(result, MAX_REPLY_BYTES - 4096))
-                    return result;
-                  if (Option.isSome(largeRepliesForTools))
-                    largeRepliesForTools.value.record({
-                      kind: "mcp",
-                      name: options.tool.name,
-                      bytes: MAX_REPLY_BYTES + 1,
-                      rejected: true,
-                    });
-                  return new McpSchema.CallToolResult({
-                    isError: true,
-                    content: [{ type: "text", text: REPLY_TOO_LARGE }],
-                  });
-                }),
+                Effect.flatMap((built) =>
+                  LARGE_READ_TOOLS.has(options.tool.name)
+                    ? ReplyBuilders.bounded(Effect.sync(() => check(built)))
+                    : Effect.sync(() => check(built)),
+                ),
                 Effect.onExit((exit) => {
                   const result = exit._tag === "Success" ? exit.value : undefined;
                   // A call that asks for input is retried with it, and that call is the one counted.

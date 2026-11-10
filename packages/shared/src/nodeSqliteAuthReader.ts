@@ -13,6 +13,10 @@ import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import { identity } from "effect/Function";
 import type { SqliteClientConfig } from "./nodeSqliteClient.ts";
 import { startReaderProcess, type ReaderRuntime } from "./nodeSqliteReaderProcess.ts";
+import { markNotStarted, readerBusy } from "./nodeSqliteReaderLanes.ts";
+
+// Autocommit reads a process may still be finishing for callers that left.
+const MAX_ABANDONED_READS = 16;
 export const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReadOnly",
   { defaultValue: () => undefined },
@@ -198,12 +202,22 @@ export const makeAuthReader = Effect.fnUntraced(function* (
   const statementLimitMs = Duration.toMillis(
     Duration.fromInputUnsafe(options.readerStatementLimit ?? Duration.seconds(5)),
   );
+  // An autocommit statement still running after this long means the process is
+  // wedged, not slow: retire it. Callers already left at statementLimitMs.
+  const wedgeLimitMs = Math.max(
+    statementLimitMs,
+    options.readerWedgeLimit === undefined
+      ? Math.max(30_000, 6 * statementLimitMs)
+      : Duration.toMillis(Duration.fromInputUnsafe(options.readerWedgeLimit)),
+  );
   let current:
     | {
         readonly worker: ReaderRuntime;
         readonly connection: Connection;
         readonly started: Promise<ReaderStartup>;
         readonly isOpening: () => boolean;
+        /** Acquisitions waiting for this process to open. */
+        waiters: number;
       }
     | undefined;
   const runtimes = new Set<ReaderRuntime>();
@@ -217,7 +231,11 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       prepareCacheSize: options.prepareCacheSize ?? 200,
       initializationSql: options.readerInitializationSql ?? [],
       reportStarted: false,
-      statementLimitMs,
+      // The child's own SIGKILL guard (it also bounds an orphan). The watchdog
+      // below enforces the transaction and snapshot limits; arming the guard at
+      // the statement limit killed every slow autocommit read in-process
+      // ("exited with code null"), whatever the parent decided.
+      statementLimitMs: wedgeLimitMs,
     };
     const worker: ReaderRuntime = startReaderProcess(readerWorkerSource, data);
     runtimes.add(worker);
@@ -232,58 +250,95 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       };
     });
     let stoppedMessage: string | undefined;
-    const pending = new Map<
-      number,
-      {
-        readonly endsTransaction: boolean;
-        readonly sql: string;
-        readonly resume: (reply: ReaderReply) => void;
-        startedAt?: number;
-        reported?: boolean;
-      }
-    >();
+    interface PendingRead {
+      readonly endsTransaction: boolean;
+      readonly sql: string;
+      readonly resume: (reply: ReaderReply) => void;
+      readonly reject: (error: SqlError) => void;
+      /** A statement outside any transaction on this connection. */
+      readonly autocommit: boolean;
+      readonly enqueuedAt: number;
+      readonly settle: () => void;
+      readonly settled: Promise<void>;
+      /** When the worker (which runs one statement at a time) reached it. */
+      execAt?: number;
+      reported?: boolean;
+      /** The caller gave up; the child still finishes it and its reply is dropped. */
+      abandoned?: boolean;
+    }
+    const pending = new Map<number, PendingRead>();
+    let abandonedCount = 0;
+    // A BEGIN posted on this connection and not yet ended by COMMIT/ROLLBACK.
+    let transactionOpen = false;
     // The worker runs one statement at a time; this is the one it last started.
     let running: number | undefined;
     let snapshotStartedAt: number | undefined;
+    const startRunning = (id: number | undefined) => {
+      running = id;
+      const next = id === undefined ? undefined : pending.get(id);
+      if (next !== undefined && next.execAt === undefined) next.execAt = performance.now();
+    };
+    // A caller that waited past the statement limit gets a typed "busy" and
+    // leaves; the process keeps running the statement (an I/O stall is not a
+    // wedge). Only autocommit reads are abandoned: a transaction keeps the
+    // retire-on-limit rule below, which protects WAL checkpoints.
+    const abandon = (entry: PendingRead) => {
+      if (entry.abandoned) return;
+      entry.abandoned = true;
+      abandonedCount++;
+      entry.reject(
+        readerBusy(
+          `Reader lane busy: no answer within ${statementLimitMs} ms`,
+          entry.execAt !== undefined,
+        ),
+      );
+      entry.settle();
+    };
     // One statement must not hold every read in the process: report a slow one
     // with its SQL, and past the limit retire the worker so new reads get a
-    // fresh one. Retirement waits for physical process exit.
+    // fresh one. Autocommit statements get the longer wedge limit. Retirement
+    // waits for physical process exit.
     // @effect-diagnostics-next-line globalTimers:off -- watches a worker that may block for hours; it must not wait on any fiber.
     const watchdog = setInterval(() => {
       if (stoppedMessage !== undefined) return;
-      if (
-        snapshotStartedAt !== undefined &&
-        performance.now() - snapshotStartedAt >= statementLimitMs
-      ) {
+      const now = performance.now();
+      if (snapshotStartedAt !== undefined && now - snapshotStartedAt >= statementLimitMs) {
         stop("Database reader retired: snapshot duration limit exceeded");
         void worker.terminate();
         return;
       }
+      for (const entry of pending.values())
+        if (entry.autocommit && !entry.abandoned && now - entry.enqueuedAt >= statementLimitMs)
+          abandon(entry);
       if (running === undefined) return;
       const request = pending.get(running);
-      if (request?.startedAt === undefined) return;
-      const elapsedMs = Math.round(performance.now() - request.startedAt);
+      if (request?.execAt === undefined) return;
+      const elapsedMs = Math.round(now - request.execAt);
+      const limitMs = request.autocommit ? wedgeLimitMs : statementLimitMs;
       const details = {
         sql: request.sql.replace(/\s+/g, " ").trim().slice(0, 2000),
         elapsedMs,
         queued: pending.size - 1,
+        abandoned: abandonedCount,
       };
-      if (elapsedMs >= statementLimitMs) {
+      if (elapsedMs >= limitMs) {
         runFork(
           Effect.logError(
             "SQLite reader statement exceeded its limit; reader worker retired",
             details,
           ),
         );
-        stop(`Database reader retired: a statement ran longer than ${statementLimitMs} ms`);
+        stop(`Database reader retired: a statement ran longer than ${limitMs} ms`);
         void worker.terminate();
       } else if (elapsedMs >= slowStatementMs && !request.reported) {
         request.reported = true;
         runFork(Effect.logWarning("SQLite reader statement is slow", details));
       }
-    }, 1000);
+    }, 250);
     watchdog.unref();
     const stop = (message: string) => {
+      // A retirement terminates the worker, whose exit then reports here too.
+      if (stoppedMessage !== undefined) return;
       clearInterval(watchdog);
       running = undefined;
       stoppedMessage = message;
@@ -291,13 +346,28 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       if (current?.worker === worker) current = undefined;
       retiring = worker.terminate();
       for (const [id, request] of pending) {
-        const reply: ReaderReply =
-          request.endsTransaction && !/^\s*COMMIT\b/i.test(request.sql)
-            ? { id, rows: [] }
-            : { id, error: { operation: "execute", message } };
-        void retiring.then(() => request.resume(reply));
+        if (request.abandoned) {
+          request.settle();
+          continue;
+        }
+        if (request.endsTransaction && !/^\s*COMMIT\b/i.test(request.sql)) {
+          const reply: ReaderReply = { id, rows: [] };
+          void retiring.then(() => {
+            request.resume(reply);
+            request.settle();
+          });
+          continue;
+        }
+        const error = failed(new Error(message), readerFailureMessages.execute, "execute");
+        // A read the worker never reached ran nothing and may be retried.
+        if (request.execAt === undefined) markNotStarted(error);
+        void retiring.then(() => {
+          request.reject(error);
+          request.settle();
+        });
       }
       pending.clear();
+      abandonedCount = 0;
     };
     worker.on("message", (reply: ReaderReply | ReaderStartup | { readonly started: number }) => {
       if ("type" in reply) {
@@ -307,7 +377,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       }
       if ("started" in reply) {
         const request = pending.get(reply.started);
-        if (request !== undefined) request.startedAt = performance.now();
+        if (request !== undefined) request.execAt = performance.now();
         running = reply.started;
         return;
       }
@@ -315,13 +385,20 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       const request = pending.get(reply.id);
       if (request === undefined) return;
       pending.delete(reply.id);
-      running = pending.keys().next().value;
+      startRunning(pending.keys().next().value);
       if (!("error" in reply)) {
         if (/^\s*BEGIN\b/i.test(request.sql)) snapshotStartedAt = performance.now();
         if (/^\s*(?:COMMIT|ROLLBACK)\s*;?\s*$/i.test(request.sql)) snapshotStartedAt = undefined;
       }
       if (pending.size === 0) worker.unref();
-      setImmediate(() => request.resume(reply));
+      if (request.abandoned) {
+        abandonedCount--;
+        return;
+      }
+      setImmediate(() => {
+        request.resume(reply);
+        request.settle();
+      });
     });
     worker.on("error", (cause) => stop(`Database reader failed: ${cause.message}`));
     worker.on("exit", (code) => stop(`Database reader exited with code ${code}`));
@@ -334,25 +411,42 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             endsTransaction && !/^\s*COMMIT\b/i.test(input.sql)
               ? Effect.succeed([])
               : Effect.fail(
-                  failed(new Error(stoppedMessage), readerFailureMessages.execute, "execute"),
+                  markNotStarted(
+                    failed(new Error(stoppedMessage), readerFailureMessages.execute, "execute"),
+                  ),
                 );
           return Effect.andThen(
             Effect.promise(() => retiring),
             result,
           );
         }
+        const beginsTransaction = /^\s*BEGIN\b/i.test(input.sql);
+        const endsWholeTransaction = /^\s*(?:COMMIT|ROLLBACK)\s*;?\s*$/i.test(input.sql);
+        const autocommit =
+          !transactionOpen &&
+          !beginsTransaction &&
+          !/^\s*(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(input.sql);
+        // Backpressure: a process still finishing many abandoned reads answers
+        // new ones with "busy" at once instead of queueing them behind it.
+        if (autocommit && abandonedCount >= MAX_ABANDONED_READS)
+          return Effect.fail(
+            readerBusy(`Reader lane busy: ${abandonedCount} abandoned reads still running`, false),
+          );
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
           const id = nextRequestId++;
-          const entry: {
-            readonly endsTransaction: boolean;
-            readonly sql: string;
-            readonly resume: (reply: ReaderReply) => void;
-            startedAt?: number;
-          } = {
+          let settle: () => void = () => {};
+          const settled = new Promise<void>((resolve) => {
+            settle = resolve;
+          });
+          const entry: PendingRead = {
             endsTransaction,
             sql: input.sql,
-            startedAt: performance.now(),
+            autocommit,
+            enqueuedAt: performance.now(),
+            settle,
+            settled,
+            reject: (error) => resume(Effect.fail(error)),
             resume: (reply) => {
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
@@ -371,21 +465,26 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             },
           };
           pending.set(id, entry);
+          if (beginsTransaction) transactionOpen = true;
+          if (endsWholeTransaction) transactionOpen = false;
           if (pending.size === 1) {
             worker.ref();
-            running = id;
+            startRunning(id);
           }
           const cached = input.cached && !hasLargeBinding(input.params);
           // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
           worker.postMessage({ id, safeIntegers, ...input, cached });
-          // Cancellation retains the permit until native work has physically exited.
           return Effect.suspend(() => {
-            if (!pending.has(id))
+            if (!pending.has(id) || entry.abandoned)
               return stoppedMessage === undefined
                 ? Effect.void
                 : Effect.asVoid(Effect.promise(() => retiring));
+            // An autocommit read keeps its permit until the statement finishes
+            // or passes the statement limit (then it is abandoned and the child
+            // finishes it); a cancelled HTTP request no longer kills the process.
+            if (entry.autocommit) return Effect.promise(() => entry.settled);
             // IPC cannot share the worker's abandoned bitmap. Keep the borrowed
-            // permit until the submitted work is physically gone.
+            // permit until the submitted transaction work is physically gone.
             stop("Database reader retired: request interrupted");
             return Effect.asVoid(Effect.promise(() => retiring));
           });
@@ -505,7 +604,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       stop("Database auth reader retired: transaction interrupted or failed");
       return retiring;
     });
-    current = { worker, connection, started, isOpening: () => opening };
+    current = { worker, connection, started, isOpening: () => opening, waiters: 0 };
     return current;
   };
 
@@ -534,41 +633,60 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     return undefined;
   });
 
-  return Effect.andThen(
-    Effect.promise(() => retiring),
-    Effect.suspend((): Effect.Effect<Connection | undefined> => {
-      let reader: NonNullable<typeof current>;
-      try {
-        reader = current ?? start();
-      } catch (cause) {
-        return turnOff(undefined, String(cause));
-      }
-      return Effect.flatMap(
-        Effect.withFiber((fiber) => {
-          const restore = Context.get(fiber.context, ReadOnly) ?? identity;
-          return restore(Effect.timeoutOption(awaitStartup(reader.started), startupTimeout)).pipe(
-            Effect.onInterrupt(() =>
-              reader.isOpening() ? turnOff(reader, "startup interrupted") : Effect.void,
-            ),
-          );
-        }),
-        (startup): Effect.Effect<Connection | undefined> =>
-          // Another acquire may have timed out and retired this worker while this one
-          // waited; a late "ready" must not hand out a worker that is being terminated.
-          current !== reader
-            ? Effect.as(
-                Effect.promise(() => retiring),
-                undefined,
-              )
-            : Option.isSome(startup) && startup.value.type === "ready"
-              ? Effect.succeed(reader.connection)
-              : turnOff(
-                  reader,
-                  Option.isSome(startup) && startup.value.type === "unavailable"
-                    ? startup.value.message
-                    : `worker did not open the database within ${Duration.toMillis(startupTimeout)} ms`,
+  const acquire = (retried: boolean): Effect.Effect<Connection | undefined> =>
+    Effect.andThen(
+      Effect.promise(() => retiring),
+      Effect.suspend((): Effect.Effect<Connection | undefined> => {
+        let reader: NonNullable<typeof current>;
+        try {
+          reader = current ?? start();
+        } catch (cause) {
+          return turnOff(undefined, String(cause));
+        }
+        reader.waiters++;
+        return Effect.flatMap(
+          Effect.withFiber((fiber) => {
+            const restore = Context.get(fiber.context, ReadOnly) ?? identity;
+            return restore(Effect.timeoutOption(awaitStartup(reader.started), startupTimeout)).pipe(
+              // Only the last caller waiting for this start reaps it. A cancelled
+              // request (a client that gave up) used to retire a process other
+              // callers were waiting for, failing all of them (10 Nov 2026:
+              // 2,599 "startup interrupted" retirements, 6,189 lane failures).
+              Effect.onInterrupt(() =>
+                Effect.suspend(() =>
+                  reader.isOpening() && reader.waiters <= 1
+                    ? turnOff(reader, "startup interrupted")
+                    : Effect.void,
                 ),
-      );
-    }),
-  );
+              ),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  reader.waiters--;
+                }),
+              ),
+            );
+          }),
+          (startup): Effect.Effect<Connection | undefined> =>
+            // Another acquire may have timed out and retired this worker while this one
+            // waited; a late "ready" must not hand out a worker that is being terminated.
+            // Nothing ran for this caller, so it tries the replacement once.
+            current !== reader
+              ? retried
+                ? Effect.as(
+                    Effect.promise(() => retiring),
+                    undefined,
+                  )
+                : acquire(true)
+              : Option.isSome(startup) && startup.value.type === "ready"
+                ? Effect.succeed(reader.connection)
+                : turnOff(
+                    reader,
+                    Option.isSome(startup) && startup.value.type === "unavailable"
+                      ? startup.value.message
+                      : `worker did not open the database within ${Duration.toMillis(startupTimeout)} ms`,
+                  ),
+        );
+      }),
+    );
+  return acquire(false);
 });

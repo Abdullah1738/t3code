@@ -30,6 +30,7 @@ import * as Statement from "effect/sql/Statement";
 
 import { makeAuthReader, ReadOnly, retireAuthReader } from "./nodeSqliteAuthReader.ts";
 import { makeReaderLanes, ReaderLane, bindSemaphore } from "./nodeSqliteReaderLanes.ts";
+export { readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
@@ -68,6 +69,12 @@ export interface SqliteClientConfig {
    */
   readonly readerStatementLimit?: Duration.Input | undefined;
   /**
+   * Reserved (auth/identity) lanes: an autocommit statement still running this
+   * long retires its process. Callers stop waiting at readerStatementLimit and
+   * get a typed "busy". Default max(30 s, 6 x readerStatementLimit).
+   */
+  readonly readerWedgeLimit?: Duration.Input | undefined;
+  /**
    * Ignored for in-memory databases.
    */
   readonly checkpointWorker?: boolean | undefined;
@@ -100,7 +107,12 @@ const annotateAcquired = (fiber: Fiber.Fiber<unknown, unknown>, acquired: Acquir
 };
 
 const TransactionAcquire = Context.Reference<
-  { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } | undefined
+  | {
+      acquired?: Acquired;
+      restore: typeof Effect.interruptible | undefined;
+      retire?: Effect.Effect<void>;
+    }
+  | undefined
 >("@t3tools/shared/nodeSqliteClient/TransactionAcquire", { defaultValue: () => undefined });
 
 export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
@@ -1377,12 +1389,20 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 if (span?._tag === "Span") {
                   span.attribute("db.rows_returned", Array.isArray(value) ? value.length : 0);
                   span.attribute("db.stmt_status.available", false);
-                  if (!db.isTransaction && /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)) {
-                    span.attribute("db.commit.at_ms", fiber.getRef(Clock.Clock).currentTimeMillisUnsafe());
+                  if (
+                    !db.isTransaction &&
+                    /^\s*(?:COMMIT|END|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(statement.sourceSQL)
+                  ) {
+                    span.attribute(
+                      "db.commit.at_ms",
+                      fiber.getRef(Clock.Clock).currentTimeMillisUnsafe(),
+                    );
                     span.attribute("db.commit.boundary", "sqlite-returned");
                   }
                 }
-              } catch { /* Observing a committed write must never change its result. */ }
+              } catch {
+                /* Observing a committed write must never change its result. */
+              }
             }
             result = Exit.succeed(value);
           } catch (cause) {
@@ -1470,7 +1490,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
       : undefined;
 
   const acquireIdentity =
-    options.readerWorker && isFileDatabase && (options.identityReaderProcess ?? options.authReaderProcess)
+    options.readerWorker &&
+    isFileDatabase &&
+    (options.identityReaderProcess ?? options.authReaderProcess)
       ? yield* makeReaderLanes(() =>
           makeAuthReader({
             ...options,
@@ -1489,11 +1511,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
     Context.get(fiber.context, ReaderLane) === "identity" ? acquireIdentity : acquireAuth;
   const route = Effect.andThen(
     admission,
-    Effect.withFiber<{
-      name: "writer" | "reader";
-      connection: Connection;
-      lock: typeof writer.lock | Effect.Success<NonNullable<typeof acquireAuth>>["lock"];
-    }, SqlError>((fiber) =>
+    Effect.withFiber<
+      {
+        name: "writer" | "reader";
+        connection: Connection;
+        lock: typeof writer.lock | Effect.Success<NonNullable<typeof acquireAuth>>["lock"];
+      },
+      SqlError
+    >((fiber) =>
       acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
         ? reservedReader(fiber) !== undefined && Context.get(fiber.context, ReaderLane) !== "view"
           ? Effect.map(reservedReader(fiber)!, (reader) => ({ name: "reader" as const, ...reader }))
@@ -1568,7 +1593,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const clock = fiber.getRef(Clock.Clock);
       const start = clock.monotonicTimeNanosUnsafe();
       const pending = fiber.getRef(TransactionAcquire);
-      if (pending !== undefined && reservedReader(fiber) !== undefined && target.name === "reader" && Context.get(fiber.context, ReaderLane) !== "view")
+      if (
+        pending !== undefined &&
+        reservedReader(fiber) !== undefined &&
+        target.name === "reader" &&
+        Context.get(fiber.context, ReaderLane) !== "view"
+      )
         pending.retire = retireAuthReader(target.connection);
       const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
         if (pending !== undefined) pending.acquired = acquired(target, clock, start);
@@ -1602,7 +1632,11 @@ const make = Effect.fn("makeWithDatabase")(function* (
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {
         // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
-        const pending: { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } = {
+        const pending: {
+          acquired?: Acquired;
+          restore: typeof Effect.interruptible | undefined;
+          retire?: Effect.Effect<void>;
+        } = {
           restore,
         };
         const body = Effect.withFiber<A, E | SqlError, R>((fiber) => {
@@ -1622,7 +1656,11 @@ const make = Effect.fn("makeWithDatabase")(function* (
                       }),
                     }),
                   ),
-              }).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? pending.retire ?? Effect.void : Effect.void))
+              }).pipe(
+                Effect.onExit((exit) =>
+                  Exit.isFailure(exit) ? (pending.retire ?? Effect.void) : Effect.void,
+                ),
+              )
             : effect;
         });
         return restore(

@@ -26,6 +26,7 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
+import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
@@ -218,6 +219,8 @@ const makeHarness = (
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
   // Shells deleted after their projection row was read: the row stays, the shell read is null.
   vanished: ReadonlySet<string> = new Set(),
+  // Failures the session check returns, in order, before it succeeds.
+  authFailures: Array<unknown> = [],
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -248,6 +251,9 @@ const makeHarness = (
       })}`;
     }
     const snapshotReads = yield* Ref.make(0);
+    // Targeted (threadIds) shell reads and one-thread shell reads, counted apart.
+    const targetedReads = yield* Ref.make<Array<ReadonlyArray<string>>>([]);
+    const shellReads = yield* Ref.make(0);
     const config = yield* ServerConfig.ServerConfig.pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-listings" }).pipe(
@@ -257,15 +263,33 @@ const makeHarness = (
     );
     const startupLog = StartupPhaseLog.makeStartupPhaseLog(config.logsDir);
     const threads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-      getShellSnapshot: (options) =>
-        Ref.update(snapshotReads, (count) => count + 1).pipe(
+      getShellSnapshot: (options) => {
+        const ids = options?.threadIds;
+        if (ids !== undefined) {
+          const full = snapshotFor(options?.location ?? "active", extraShells);
+          const keep = (candidate: OrchestrationV2ThreadShell) =>
+            ids.includes(candidate.id) && !vanished.has(candidate.id);
+          return Ref.update(targetedReads, (reads) => [...reads, ids]).pipe(
+            Effect.as({
+              ...full,
+              snapshotSequence: 0,
+              threads: full.threads.filter(keep),
+              archivedThreads: full.archivedThreads.filter(keep),
+            }),
+          );
+        }
+        return Ref.update(snapshotReads, (count) => count + 1).pipe(
           Effect.as(snapshotFor(options?.location ?? "active", extraShells)),
-        ),
+        );
+      },
       getThreadShell: (threadId) =>
-        Effect.succeed(
-          vanished.has(threadId)
-            ? null
-            : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ?? null),
+        Ref.update(shellReads, (count) => count + 1).pipe(
+          Effect.as(
+            vanished.has(threadId)
+              ? null
+              : ([...shells, ...extraShells].find((candidate) => candidate.id === threadId) ??
+                  null),
+          ),
         ),
       getThreadRecords: (threadId) => Effect.succeed(projectionFor(threadId)),
     });
@@ -277,15 +301,23 @@ const makeHarness = (
               Layer.mergeAll(
                 Layer.mock(EnvironmentAuth.EnvironmentAuth)({
                   authenticateHttpRequest: () =>
-                    sql`SELECT 1`.pipe(
-                      NodeSqliteClient.readOnly,
-                      Effect.orDie,
-                      Effect.as({
-                        sessionId: AuthSessionId.make("session-cli"),
-                        subject: "cli-issued-session",
-                        method: "bearer-access-token" as const,
-                        scopes: ["orchestration:read", "orchestration:operate"],
-                      }),
+                    Effect.suspend(() =>
+                      authFailures.length > 0
+                        ? Effect.fail(
+                            new EnvironmentAuth.ServerAuthSessionCredentialValidationError({
+                              cause: authFailures.shift(),
+                            }),
+                          )
+                        : sql`SELECT 1`.pipe(
+                            NodeSqliteClient.readOnly,
+                            Effect.orDie,
+                            Effect.as({
+                              sessionId: AuthSessionId.make("session-cli"),
+                              subject: "cli-issued-session",
+                              method: "bearer-access-token" as const,
+                              scopes: ["orchestration:read", "orchestration:operate"],
+                            }),
+                          ),
                     ),
                 }),
                 threads,
@@ -344,7 +376,11 @@ const makeHarness = (
             headers: { authorization: "Bearer shared" },
           }),
         );
-        return { status: response.status, body: (await response.json()) as Record<string, any> };
+        return {
+          status: response.status,
+          retryAfter: response.headers.get("retry-after"),
+          body: (await response.json()) as Record<string, any>,
+        };
       });
     const threadIds = (path: string) =>
       get(path).pipe(
@@ -355,7 +391,7 @@ const makeHarness = (
             .toSorted();
         }),
       );
-    return { get, threadIds, snapshotReads, startupLog, sql };
+    return { get, threadIds, snapshotReads, targetedReads, shellReads, startupLog, sql };
   });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -366,10 +402,11 @@ const run = <A, E>(
   buildCommit?: string,
   extraShells: ReadonlyArray<OrchestrationV2ThreadShell> = [],
   vanished: ReadonlySet<string> = new Set(),
+  authFailures: Array<unknown> = [],
 ) =>
-  Effect.scoped(Effect.flatMap(makeHarness(buildCommit, extraShells, vanished), body)).pipe(
-    Effect.provide(Sqlite.layerMemory),
-  );
+  Effect.scoped(
+    Effect.flatMap(makeHarness(buildCommit, extraShells, vanished, authFailures), body),
+  ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control listings", () => {
   it.effect("includes current boot phase timings in the authenticated install report", () =>
@@ -466,7 +503,7 @@ describe("control listings", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
   it.effect("lists active threads from live rows without the shell snapshot", () =>
-    run(({ threadIds, snapshotReads }) =>
+    run(({ threadIds, snapshotReads, targetedReads, shellReads }) =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* threadIds("/threads?active=true"), [
           "asks-waiting",
@@ -486,6 +523,11 @@ describe("control listings", () => {
           "live-queued",
         ]);
         assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        // One bounded read per list (indexed IN list), never one shell transaction per thread.
+        const targeted = yield* Ref.get(targetedReads);
+        assert.strictEqual(targeted.length, 4);
+        assert.ok(targeted.every((ids) => ids.length > 0 && ids.length <= 400));
+        assert.strictEqual(yield* Ref.get(shellReads), 0);
       }),
     ),
   );
@@ -843,5 +885,76 @@ describe("control listings", () => {
         assert.strictEqual(response.body.identity.robobThreadId, "migrated");
       }).pipe(Effect.provide(Sqlite.layerFromPath(path.join(dir, "state.sqlite"))));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A lane that never ran the session read (process replaced, admission queue full).
+  const laneUnavailable = () =>
+    new SqlError({
+      reason: classifySqliteError(new Error("Reader lane unavailable"), {
+        operation: "readerAdmission",
+        message: "Reader lane unavailable",
+      }),
+    });
+  // A started read whose reader process stopped under it.
+  const laneStopped = () =>
+    new Error("Session verification failed", {
+      cause: new Error("Database reader exited with code null"),
+    });
+
+  it.effect("retries a session read the auth lane never ran, once", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get(
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+          );
+          assert.strictEqual(response.status, 200);
+          assert.strictEqual(response.body.identity.robobThreadId, "migrated");
+        }),
+      undefined,
+      [],
+      new Set(),
+      [laneUnavailable()],
+    ),
+  );
+
+  it.effect("answers a busy reader lane with 503 and Retry-After, not 500", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          for (const path of [
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+            "/identity/resolve?nativeId=claude-session-uuid&driver=claudeAgent",
+            "/threads/migrated",
+          ]) {
+            const response = yield* get(path);
+            assert.strictEqual(response.status, 503);
+            assert.strictEqual(response.retryAfter, "1");
+            assert.strictEqual(response.body.error.code, "unavailable");
+          }
+          // A started read is not replayed: one failure, one 503.
+          assert.strictEqual((yield* get("/threads/migrated")).status, 200);
+        }),
+      undefined,
+      [],
+      new Set(),
+      // Two retryable failures in a row exhaust the single retry.
+      [laneUnavailable(), laneUnavailable(), laneStopped(), laneStopped()],
+    ),
+  );
+
+  it.effect("keeps a non-lane authentication failure an internal error", () =>
+    run(
+      ({ get }) =>
+        Effect.gen(function* () {
+          const response = yield* get("/threads/migrated");
+          assert.strictEqual(response.status, 500);
+          assert.isNull(response.retryAfter);
+        }),
+      undefined,
+      [],
+      new Set(),
+      [new Error("disk full")],
+    ),
   );
 });

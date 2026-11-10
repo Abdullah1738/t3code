@@ -117,3 +117,70 @@ it.live("does not retire a ready process when another acquisition is cancelled",
     );
   }).pipe(Effect.scoped),
 );
+
+// 10 Nov 2026: a client that gave up while the process opened retired it under
+// every other caller waiting for the same start (2,599 retirements, 6,189
+// "Reader lane unavailable" failures in 9 h).
+it.live("a cancelled acquisition does not reap a startup others still wait for", () =>
+  Effect.gen(function* () {
+    // The second caller is provably waiting on the same start before the first gives up.
+    const secondWaiting = Promise.withResolvers<void>();
+    let waits = 0;
+    const acquire = yield* makeAuthReader({ filename: "unused-synthetic.sqlite" }, (started) =>
+      Effect.promise(() => {
+        if (++waits === 2) secondWaiting.resolve();
+        return started;
+      }),
+    );
+    const created = Promise.withResolvers<void>();
+    transport.next = () => created.resolve();
+    const first = yield* acquire.pipe(Effect.forkChild);
+    yield* Effect.promise(() => created.promise);
+    const runtime = transport.runtimes.at(-1)!;
+    yield* Effect.gen(function* () {
+      yield* Effect.promise(() => runtime.listening);
+      const count = transport.runtimes.length;
+      const second = yield* acquire.pipe(Effect.forkChild);
+      yield* Effect.promise(() => secondWaiting.promise);
+      let retired = false;
+      void runtime.terminating.then(() => {
+        retired = true;
+      });
+      yield* Fiber.interrupt(first);
+      yield* Effect.yieldNow;
+      assert.isFalse(retired);
+      runtime.emit({ type: "ready" });
+      assert.isDefined(yield* Fiber.join(second));
+      assert.strictEqual(transport.runtimes.length, count);
+      // A failed assertion must not leave the scope waiting on a fake exit.
+    }).pipe(Effect.ensuring(Effect.sync(() => runtime.finish())));
+  }).pipe(Effect.scoped),
+);
+
+it.live("an acquisition whose start was retired by another caller tries a fresh process once", () =>
+  Effect.gen(function* () {
+    const acquire = yield* makeAuthReader({
+      filename: "unused-synthetic.sqlite",
+      readerStartupTimeout: "200 millis",
+    });
+    const created = Promise.withResolvers<void>();
+    transport.next = () => created.resolve();
+    const first = yield* acquire.pipe(Effect.forkChild);
+    yield* Effect.promise(() => created.promise);
+    const runtime = transport.runtimes.at(-1)!;
+    void runtime.terminating.then(() => runtime.finish());
+    yield* Effect.sleep("100 millis");
+    // Joins the same start; the first caller's timeout retires it at ~200 ms.
+    const retryCreated = Promise.withResolvers<void>();
+    const second = yield* acquire.pipe(Effect.forkChild);
+    assert.isUndefined(yield* Fiber.join(first));
+    transport.next = () => retryCreated.resolve();
+    yield* Effect.promise(() => retryCreated.promise);
+    const next = transport.runtimes.at(-1)!;
+    assert.notStrictEqual(next, runtime);
+    yield* Effect.promise(() => next.listening);
+    next.emit({ type: "ready" });
+    assert.isDefined(yield* Fiber.join(second));
+    next.finish();
+  }).pipe(Effect.scoped),
+);

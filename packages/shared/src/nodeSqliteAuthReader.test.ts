@@ -5,12 +5,16 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/sql/SqlClient";
 import { vi } from "vite-plus/test";
 import * as SqliteClient from "./nodeSqliteClient.ts";
 import * as ReaderProcess from "./nodeSqliteReaderProcess.ts";
 
-const withLaneClient = <A, E>(use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E>) =>
+const withLaneClient = <A, E>(
+  use: (sql: SqlClient.SqlClient) => Effect.Effect<A, E>,
+  extra: Partial<SqliteClient.SqliteClientConfig> = {},
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -28,6 +32,7 @@ const withLaneClient = <A, E>(use: (sql: SqlClient.SqlClient) => Effect.Effect<A
           readerWorker: true,
           authReaderProcess: true,
           readerStatementLimit: "1 second",
+          ...extra,
         }),
       ),
     );
@@ -406,4 +411,118 @@ it.live.each(["cancellation", "expiry"] as const)(
       ),
     );
   },
+);
+
+// --- Reserved-lane timeouts keep the process unless it is wedged (control-lane-fix) ---
+
+const countSpawns = () => {
+  const spawned = { count: 0 };
+  const start = ReaderProcess.startReaderProcess;
+  const spy = vi.spyOn(ReaderProcess, "startReaderProcess").mockImplementation((...args) => {
+    spawned.count++;
+    return start(...args);
+  });
+  return { spawned, restore: () => spy.mockRestore() };
+};
+
+// Autocommit statements of bounded and unbounded length.
+const countTo = (n: number) =>
+  `WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<${n}) SELECT SUM(x) AS total FROM n`;
+const FOREVER = countTo(1_000_000_000_000);
+
+const readUntilOk = (sql: SqlClient.SqlClient) =>
+  sql`SELECT revoked FROM sessions`.pipe(
+    SqliteClient.authReadOnly,
+    Effect.retry({ times: 100, schedule: Schedule.spaced("200 millis") }),
+  );
+
+it.live("a cancelled autocommit read keeps the reader process", () => {
+  const { spawned, restore } = countSpawns();
+  return withLaneClient((sql) =>
+    Effect.gen(function* () {
+      assert.deepEqual(yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly), [
+        { revoked: 0 },
+      ]);
+      const before = spawned.count;
+      const read = yield* sql
+        .unsafe(countTo(3_000_000))
+        .pipe(SqliteClient.authReadOnly, Effect.forkChild);
+      yield* Effect.sleep("50 millis");
+      yield* Fiber.interrupt(read);
+      assert.deepEqual(yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly), [
+        { revoked: 0 },
+      ]);
+      assert.equal(spawned.count, before);
+    }),
+  ).pipe(Effect.ensuring(Effect.sync(restore)));
+});
+
+it.live(
+  "a slow autocommit read answers busy at the statement limit and keeps the process",
+  () => {
+    const { spawned, restore } = countSpawns();
+    return withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly);
+          const before = spawned.count;
+          const started = performance.now();
+          const slow = yield* sql
+            .unsafe(countTo(40_000_000))
+            .pipe(SqliteClient.authReadOnly, Effect.flip);
+          const waited = performance.now() - started;
+          assert.equal(SqliteClient.readerLaneFailure(slow), "busy");
+          assert.isBelow(waited, 3_000);
+          // The process finishes the abandoned statement, then answers again.
+          assert.deepEqual(yield* readUntilOk(sql), [{ revoked: 0 }]);
+          assert.equal(spawned.count, before);
+        }),
+      { readerWedgeLimit: "60 seconds" },
+    ).pipe(Effect.ensuring(Effect.sync(restore)));
+  },
+  90_000,
+);
+
+it.live(
+  "an autocommit statement past the wedge limit retires the process",
+  () => {
+    const { spawned, restore } = countSpawns();
+    return withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly);
+          const before = spawned.count;
+          const wedged = yield* sql.unsafe(FOREVER).pipe(SqliteClient.authReadOnly, Effect.flip);
+          assert.equal(SqliteClient.readerLaneFailure(wedged), "busy");
+          assert.deepEqual(yield* readUntilOk(sql), [{ revoked: 0 }]);
+          assert.equal(spawned.count, before + 1);
+        }),
+      { readerWedgeLimit: "2 seconds" },
+    ).pipe(Effect.ensuring(Effect.sync(restore)));
+  },
+  60_000,
+);
+
+it.live(
+  "reads queued behind an abandoned statement answer busy without being started",
+  () =>
+    withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly);
+          const first = yield* sql
+            .unsafe(FOREVER)
+            .pipe(SqliteClient.authReadOnly, Effect.flip, Effect.forkChild);
+          yield* Effect.sleep("100 millis");
+          const queued = yield* sql`SELECT revoked FROM sessions`.pipe(
+            SqliteClient.authReadOnly,
+            Effect.flip,
+          );
+          assert.equal(SqliteClient.readerLaneFailure(yield* Fiber.join(first)), "busy");
+          // Nothing ran for the queued read: an idempotent caller may retry it.
+          assert.equal(SqliteClient.readerLaneFailure(queued), "retryable");
+        }),
+      { readerWedgeLimit: "60 seconds" },
+    ),
+  30_000,
 );
