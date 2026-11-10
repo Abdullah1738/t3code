@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -148,32 +149,33 @@ const fakeThreads = (
   const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-kanban-tools-test-",
   }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
-  const reply = <A extends KanbanCard | KanbanMessage>(card: A) =>
+  const reply = <A extends KanbanCard | KanbanMessage>(card: A): Effect.Effect<A, KanbanError> =>
     replyControl === undefined
       ? Effect.succeed(card)
       : Deferred.succeed(replyControl.saved, undefined).pipe(
           Effect.andThen(
-            replyControl.mode === "conflict"
-              ? Effect.fail(
+            Effect.suspend((): Effect.Effect<A, KanbanError> => {
+              if (replyControl.mode === "conflict")
+                return Effect.fail(
                   new KanbanError({
                     code: "conflict",
                     detail:
                       "Board changed during this operation. Re-read its state before retrying.",
                   }),
-                )
-              : replyControl.mode === "slow"
-                ? Effect.never
-                : replyControl.mode === "budget"
-                  ? Effect.succeed({ ...card, prompt: "x".repeat(6 * 1024 * 1024) })
-                  : Effect.sync(() =>
-                      Object.assign(card, {
-                        brokenReply: {
-                          toJSON() {
-                            throw new Error("reply encoding failed");
-                          },
-                        },
-                      }),
-                    ),
+                );
+              if (replyControl.mode === "slow") return Effect.never;
+              if (replyControl.mode === "budget")
+                return Effect.succeed({ ...card, prompt: "x".repeat(6 * 1024 * 1024) });
+              return Effect.sync(() =>
+                Object.assign(card, {
+                  brokenReply: {
+                    toJSON() {
+                      throw new Error("reply encoding failed");
+                    },
+                  },
+                }),
+              );
+            }),
           ),
         );
   const serviceLayer =
@@ -1649,7 +1651,7 @@ it.effect.each(
             authorName: "Agent",
             blocks: [{ _tag: "md", text: "Saved exactly once" }],
             answers: [],
-            createdAt: new Date(yield* Clock.currentTimeMillis).toISOString(),
+            createdAt: DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis)),
           });
           yield* store.putDiscussion({ ...discussion, lastSeq: 1 });
         }
