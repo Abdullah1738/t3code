@@ -8,6 +8,7 @@ import {
   EMPTY_NEEDS_YOU_FILTER,
   needsYouFocusOrder,
   needsYouKinds,
+  needsYouMarkOf,
   needsYouNextFocus,
   needsYouSections,
   needsYouStep,
@@ -102,6 +103,31 @@ describe("needsYouSections", () => {
     const one = sections(EMPTY_NEEDS_YOU_FILTER, new Map(), new Set(["card-b-robob-1:q1"]));
     expect(one[0]!.entries.map((item) => item._tag)).toEqual(["ask"]);
     expect(one[0]!.count).toBe(1);
+  });
+
+  it("sets a snoozed ask apart and brings it back as new when its time passes", () => {
+    const snoozed = needsYouFromFeed(
+      [
+        entry(1, { snoozedUntil: "2026-11-11T05:00:00.000Z" as never }),
+        entry(2, { snoozedUntil: "2026-11-10T11:30:00.000Z" as never }),
+        entry(3, {
+          snoozedUntil: "2026-11-12T05:00:00.000Z" as never,
+          backFromSnoozeAt: "2026-11-10T11:45:00.000Z" as never,
+        }),
+        entry(4),
+      ],
+      NOW,
+    );
+    const list = needsYouSections(snoozed, EMPTY_NEEDS_YOU_FILTER, BOARDS);
+    expect(shape(list)).toEqual([
+      ["fresh", 1],
+      ["open", 1],
+      ["snoozed", 2],
+    ]);
+    expect(snoozed.count).toBe(2);
+    const back = snoozed.items.find((item) => item.cardNumber === 2)!;
+    expect(needsYouMarkOf(back, {})).toBe("back");
+    expect(needsYouMarkOf(back, { [back.key]: "failed" })).toBe("failed");
   });
 
   it("moves a marked ask to New for you", () => {

@@ -107,6 +107,8 @@ export function NeedsYouPage(props: {
     };
   }, []);
 
+  // The React Compiler keeps these for as long as the feed and the minute stand,
+  // so the queue is ranked once per feed, not once per render.
   const open = feed?.open ?? [];
   const byKey = new Map<string, KanbanAskFeedItem>(open.map((entry) => [askKey(entry), entry]));
   const needsYou = needsYouFromFeed(open, nowMs);
@@ -139,6 +141,7 @@ export function NeedsYouPage(props: {
         ...needsYou.expired,
         ...needsYou.waitingOnAgent,
         ...needsYou.withEvaluator,
+        ...needsYou.snoozed,
         ...needsYou.notices,
       ].find((candidate) => candidate.key === focusKey);
     if (entry && item) focused = { _tag: "ask", entry, item };
@@ -299,6 +302,7 @@ export function NeedsYouPage(props: {
     boardNames,
     oneBoard: search.board !== undefined || boardNames.size <= 1,
     marks,
+    nowMs,
     onShortcuts: () => setShortcutsOpen(true),
   };
   const boardOf = (boardId: string) =>
@@ -325,9 +329,14 @@ export function NeedsYouPage(props: {
                   {owed.length}
                   <span className="max-sm:sr-only"> to answer</span>
                 </span>
-                {waiting > 0 ? (
+                {waiting > 0 || needsYou.counts.snoozed > 0 ? (
                   <span className="text-(--m-muted) tabular-nums max-md:hidden">
-                    {waiting} waiting on agents
+                    {[
+                      waiting > 0 ? `${waiting} waiting on agents` : null,
+                      needsYou.counts.snoozed > 0 ? `${needsYou.counts.snoozed} snoozed` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
                   </span>
                 ) : null}
               </>
@@ -389,7 +398,9 @@ export function NeedsYouPage(props: {
                 item={focused.item}
                 board={boardOf(focused.entry.boardId)}
                 layout={layout}
+                nowMs={nowMs}
                 handle={readerRef}
+                onLeave={() => focusOn(null)}
                 onOpenCard={() => openCard((focused as { entry: KanbanAskFeedItem }).entry)}
               />
             ) : focused?._tag === "batch" ? (
@@ -401,6 +412,7 @@ export function NeedsYouPage(props: {
                 entries={focused.entries}
                 layout={layout}
                 handle={readerRef}
+                onLeave={() => focusOn(null)}
                 onOpenAsk={pickRow}
               />
             ) : status === "loading" || status === "idle" ? (

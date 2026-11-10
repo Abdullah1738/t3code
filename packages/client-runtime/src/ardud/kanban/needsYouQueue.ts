@@ -63,7 +63,7 @@ export function needsYouMatches(
 }
 
 /** Why an ask sits in "New for you": something changed on it since he last looked. */
-export type NeedsYouMark = "reply" | "updated" | "failed";
+export type NeedsYouMark = "reply" | "updated" | "failed" | "back";
 
 export type NeedsYouSectionId =
   | "fresh"
@@ -72,6 +72,7 @@ export type NeedsYouSectionId =
   | "expired"
   | "agent"
   | "evaluator"
+  | "snoozed"
   | "notices";
 
 export interface NeedsYouSection {
@@ -95,6 +96,7 @@ const SECTION_LABELS: Record<NeedsYouSectionId, string> = {
   expired: "Out of date",
   agent: "Waiting on agents",
   evaluator: "With the evaluator",
+  snoozed: "Snoozed",
   notices: "Notices, nothing needed",
 };
 
@@ -130,10 +132,10 @@ export function needsYouSections(
     if (items.length >= 2) mine.push({ ...entry, items });
     else for (const item of items) mine.push({ _tag: "ask", item });
   }
+  // Back from a snooze is new for him too, until he acts on it.
+  const fresh1 = (item: NeedsYouItem) => marks.has(item.key) || item.backFromSnoozeAt !== null;
   const marked = (entry: NeedsYouEntry) =>
-    entry._tag === "ask"
-      ? marks.has(entry.item.key)
-      : entry.items.some((item) => marks.has(item.key));
+    entry._tag === "ask" ? fresh1(entry.item) : entry.items.some(fresh1);
   const blocking = (entry: NeedsYouEntry) =>
     entry._tag === "ask" ? entry.item.blocking : entry.items.some((item) => item.blocking);
 
@@ -146,6 +148,7 @@ export function needsYouSections(
     ["expired", single(needsYou.expired.filter(keep))],
     ["agent", single(needsYou.waitingOnAgent.filter(keep))],
     ["evaluator", single(needsYou.withEvaluator.filter(keep))],
+    ["snoozed", single(needsYou.snoozed.filter(keep))],
     ["notices", single(needsYou.notices.filter(keep))],
   ];
   return lists
@@ -219,6 +222,7 @@ export function needsYouKinds(
     needsYou.expired,
     needsYou.waitingOnAgent,
     needsYou.withEvaluator,
+    needsYou.snoozed,
     needsYou.notices,
   ]) {
     for (const item of list) counts.set(item.kind, (counts.get(item.kind) ?? 0) + 1);
@@ -242,3 +246,10 @@ export function askAge(ageMs: number): string {
   if (hours > 0) return `${hours}h`;
   return minutes > 0 ? `${minutes}m` : "now";
 }
+
+/** The mark a row shows: what the page saw change, else that it is back from a snooze. */
+export const needsYouMarkOf = (
+  item: Pick<NeedsYouItem, "key" | "backFromSnoozeAt">,
+  marks: Readonly<Record<string, NeedsYouMark>>,
+): NeedsYouMark | undefined =>
+  marks[item.key] ?? (item.backFromSnoozeAt !== null ? "back" : undefined);

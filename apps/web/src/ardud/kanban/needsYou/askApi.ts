@@ -171,6 +171,15 @@ export const askApi = {
     },
     keepalive = false,
   ) => call<AskHanded>("POST", `${cardPath(cardRef, askId)}/hand`, { body: input, keepalive }),
+  /** Puts an ask away until a time; `null` brings it back. */
+  snooze: (cardRef: string, askId: string, until: string | null) =>
+    call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/snooze`, { body: { until } }),
+  snoozeBatch: (items: ReadonlyArray<AskBatchItem>, until: string | null) =>
+    call<{ readonly snoozed: number; readonly results: AskBatchResult["results"] }>(
+      "POST",
+      "/asks/snooze",
+      { body: { until, items: items.map(({ card, askId }) => ({ card, askId })) } },
+    ),
   /** One discussion message with its big blocks whole. */
   message: (discussionId: string, seq: number) =>
     call<KanbanMessage>("GET", `/discussions/${encodeURIComponent(discussionId)}/messages/${seq}`),

@@ -24,6 +24,7 @@ import {
   CheckIcon,
   FileIcon,
   GripVerticalIcon,
+  LockIcon,
   RotateCcwIcon,
   UploadIcon,
   XIcon,
@@ -43,8 +44,7 @@ import { prepareDraftFile, revokePreview, type ComposerDraftFile } from "../Chat
 import { GrowingText, Problem } from "./AnswerParts";
 import { setAskValue } from "./askStore";
 import { AskHtmlFrame } from "./HtmlFrame";
-import { ASK_SECRETS_AVAILABLE, submitAskSecret } from "./secretChannel";
-import { Btn, IconBtn, Pill, fieldClass, linkClass } from "./ui";
+import { IconBtn, Pill, fieldClass } from "./ui";
 
 const isBlank = (value: unknown): boolean =>
   value === undefined ||
@@ -65,6 +65,9 @@ export function FieldRow(props: {
   /** The only field of a plain question: the section's heading is its label. */
   bare?: boolean;
   disabled: boolean;
+  /** A secret field's value and its setter: held by the reader, never by the form. */
+  secret?: string;
+  onSecret?: (value: string) => void;
 }) {
   const { entry, field, value } = props;
   const id = useId();
@@ -190,7 +193,11 @@ export function FieldRow(props: {
       break;
     case "secret":
       control = (
-        <SecretControl entry={entry} field={field} value={value} common={common} onChange={set} />
+        <SecretControl
+          value={props.secret ?? ""}
+          common={common}
+          onChange={(next) => props.onSecret?.(next)}
+        />
       );
       break;
     case "custom":
@@ -625,83 +632,30 @@ function FileRow(props: {
 }
 
 /**
- * A secret: typed masked, never kept in the form or the store. What leaves the
- * page goes through `submitAskSecret` only; the form holds `{ secret: true }`.
+ * A secret, typed masked. Its value lives in the reader's component state and
+ * nowhere else: not the form, the store or the undo queue. It leaves the page
+ * once, with the answer, over the app's private channel.
  */
 function SecretControl(props: {
-  entry: KanbanAskFeedItem;
-  field: KanbanAskField;
-  value: unknown;
+  value: string;
   common: CommonProps;
-  onChange: (value: unknown) => void;
+  onChange: (value: string) => void;
 }) {
-  const [typed, setTyped] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [refused, setRefused] = useState<string | null>(null);
-  const provided =
-    typeof props.value === "object" &&
-    props.value !== null &&
-    (props.value as { secret?: unknown }).secret === true;
-
-  if (provided) {
-    return (
-      <div className="flex items-center gap-3">
-        <Pill tone="accent">
-          <CheckIcon aria-hidden />
-          Provided
-        </Pill>
-        <button
-          type="button"
-          data-ny-at={props.common["data-ny-at"]}
-          onClick={() => props.onChange(undefined)}
-          className={cn(linkClass, "text-sm")}
-        >
-          Replace
-        </button>
-      </div>
-    );
-  }
-  const provide = async () => {
-    if (typed === "" || busy) return;
-    setBusy(true);
-    const result = await submitAskSecret({
-      cardRef: props.entry.cardRef,
-      askId: props.entry.ask.id,
-      fieldId: props.field.id,
-      value: typed,
-    });
-    setBusy(false);
-    setTyped("");
-    if (result.ok) props.onChange({ secret: true });
-    else setRefused(result.reason);
-  };
   return (
     <div className="flex max-w-[520px] flex-col gap-1.5">
-      <div className="flex items-center gap-2">
-        <input
-          {...props.common}
-          type="password"
-          autoComplete="off"
-          spellCheck={false}
-          value={typed}
-          onChange={(event) => {
-            setRefused(null);
-            setTyped(event.target.value);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") void provide();
-          }}
-          className={cn(fieldClass, "font-mono")}
-        />
-        <Btn disabled={typed === "" || busy} onClick={() => void provide()}>
-          Provide
-        </Btn>
-      </div>
-      {refused ? (
-        <Problem>{refused}</Problem>
-      ) : ASK_SECRETS_AVAILABLE ? (
-        <p className="text-sm text-(--m-muted)">Sent privately. It is never shown again.</p>
-      ) : null}
+      <input
+        {...props.common}
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        value={props.value}
+        onChange={(event) => props.onChange(event.target.value)}
+        className={cn(fieldClass, "font-mono")}
+      />
+      <p className="flex items-center gap-1.5 text-sm text-(--m-muted)">
+        <LockIcon aria-hidden className="size-3.5" />
+        Sent privately with your answer. Never shown again.
+      </p>
     </div>
   );
 }

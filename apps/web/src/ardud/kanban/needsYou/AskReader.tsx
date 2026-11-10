@@ -3,23 +3,44 @@ import {
   askAge,
   askFieldKind,
   askFormFor,
+  askFormWithSecrets,
   askKindLabel,
   askRefusal,
+  askSecretAnswerInput,
+  askSecretFailure,
+  askSecretFieldIds,
   buildAskAnswer,
   isPlainAnswerField,
+  needsYouMarkOf,
   type AskKeyAction,
+  type AskSecretAnswerInput,
   type NeedsYouItem,
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
 import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import {
   kanbanAskResponse,
   kanbanAskRevision,
   type KanbanAskFeedItem,
+  type KanbanAskSecretAnswerInput,
   type KanbanBoard,
 } from "@t3tools/contracts";
-import { useEffect, useImperativeHandle, useRef, type ReactNode, type RefObject } from "react";
+import {
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 
 import { cn } from "../../../lib/utils";
+import { usePrimaryEnvironmentId } from "../../../state/environments";
+import { serverEnvironment } from "../../../state/server";
+import { useAtomCommand } from "../../../state/use-atom-command";
 import { BoardIcon } from "../boardIcon";
 import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { ActionBar, type AskTurn } from "./ActionBar";
@@ -37,14 +58,19 @@ import {
   askKey,
   askNeedsDetail,
   loadAskDetail,
+  markAskTried,
+  noteAskAnswered,
+  noteAskStale,
   patchAskForm,
   replyOnAsk,
   retryAskSend,
   seeAsk,
+  snoozeAsks,
   takeBackAsk,
   useAskStore,
 } from "./askStore";
 import { DraftPart } from "./DraftPart";
+import { shortWhen, tomorrowMorning } from "./snoozeTimes";
 import { Btn, Label, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
@@ -67,8 +93,11 @@ export function AskReader(props: {
   item: NeedsYouItem;
   board: KanbanBoard | undefined;
   layout: PageLayout;
+  nowMs: number;
   handle: RefObject<AskReaderHandle | null>;
   onOpenCard: () => void;
+  /** He set the ask aside: the page moves on to the next one. */
+  onLeave: () => void;
 }) {
   const { entry, item, layout } = props;
   const key = askKey(entry);
@@ -80,7 +109,8 @@ export function AskReader(props: {
   const form = storedForm ?? askFormFor(entry.ask);
   const tried = useAskStore((state) => state.tried[key] === true);
   const refused = useAskStore((state) => state.refused[key]);
-  const mark = useAskStore((state) => state.marks[key]) as NeedsYouMark | undefined;
+  const marks = useAskStore((state) => state.marks);
+  const mark: NeedsYouMark | undefined = needsYouMarkOf(item, marks);
   const failed = useAskStore((state) => state.failed[key]);
   const response = kanbanAskResponse(ask);
   const refusal = askRefusal(response);
@@ -96,9 +126,21 @@ export function AskReader(props: {
   // What was new on the ask counts as seen once he moves on from it.
   useEffect(() => () => seeAsk(key), [key]);
 
+  // Secret values live here and nowhere else: gone when he sends, and when he leaves the ask.
+  const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
+  const [secretBusy, setSecretBusy] = useState(false);
+  const [secretError, setSecretError] = useState<string | null>(null);
+  const environmentId = usePrimaryEnvironmentId();
+  const answerSecrets = useAtomCommand(serverEnvironment.answerAskSecrets, {
+    label: "answer ask secrets",
+    // The failure cause holds the request; keep it out of the console.
+    reportFailure: false,
+    reportDefect: false,
+  });
+
   const built = buildAskAnswer(
     ask,
-    form,
+    askFormWithSecrets(ask, form, secrets),
     form.refusing ? "refuse" : "primary",
     kanbanAskRevision(ask),
   );
@@ -114,10 +156,56 @@ export function AskReader(props: {
       target?.scrollIntoView({ block: "nearest" });
     });
   };
+  // An answer that carries a secret is not held for Undo: it goes at once, over
+  // the private channel, and the typed value is dropped as it leaves.
+  const sendSecrets = async (input: AskSecretAnswerInput, label: string) => {
+    if (environmentId === null) {
+      setSecretError("Not connected to Robob.");
+      return;
+    }
+    setSecretBusy(true);
+    setSecretError(null);
+    setSecrets({});
+    const result = await answerSecrets({
+      environmentId,
+      input: { ...input, cardId: entry.cardId } as KanbanAskSecretAnswerInput,
+    }).finally(() => setSecretBusy(false));
+    if (result._tag === "Success") {
+      noteAskAnswered(entry, input.answer, label);
+      return;
+    }
+    if (isAtomCommandInterrupted(result)) return;
+    const failure = askSecretFailure(squashAtomCommandFailure(result));
+    setSecretError(failure.message);
+    if (failure.stale) noteAskStale(entry);
+    focusAt(`field:${failure.field ?? askSecretFieldIds(ask)[0] ?? ""}`);
+  };
   const send = (intent: "primary" | "refuse") => {
-    if (locked) return;
+    if (locked || secretBusy) return;
+    const now = buildAskAnswer(
+      ask,
+      askFormWithSecrets(ask, form, secrets),
+      intent,
+      kanbanAskRevision(ask),
+    );
+    if (!now.ok) {
+      markAskTried(entry);
+      focusAt(now.first);
+      return;
+    }
+    const input = askSecretAnswerInput(entry.cardId, ask, now.body, secrets);
+    if (input !== null) {
+      void sendSecrets(input, now.label);
+      return;
+    }
     const result = answerAsk({ ...entry, ask }, intent);
     if (!result.ok) focusAt(result.first);
+  };
+  const snooze = () => {
+    if (item.snoozed) return void snoozeAsks([entry], null, "");
+    const until = tomorrowMorning();
+    props.onLeave();
+    return void snoozeAsks([entry], until.iso, until.label);
   };
   const primary = () => send(form.refusing ? "refuse" : "primary");
   const refuse = () => {
@@ -143,6 +231,8 @@ export function AskReader(props: {
           return refuse();
         case "pick":
           return pick(action.index);
+        case "snooze":
+          return snooze();
         case "edit":
           if (response.edit === "draft") {
             root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
@@ -206,7 +296,7 @@ export function AskReader(props: {
                   {askAsker(entry).replace(/^the /, "")} · {askAge(item.ageMs)}
                 </span>
               </div>
-              <StatePills entry={entry} item={item} turn={turn} mark={mark} />
+              <StatePills entry={entry} item={item} turn={turn} mark={mark} nowMs={props.nowMs} />
               <h2
                 id="ny-ask-title"
                 className="text-xl leading-7 font-semibold text-balance [overflow-wrap:anywhere]"
@@ -225,6 +315,12 @@ export function AskReader(props: {
                 }
               >
                 Not sent. {failed.message}
+              </Banner>
+            ) : null}
+            {secretError ? <Banner tone="negative">{secretError}</Banner> : null}
+            {mark === "back" && item.backFromSnoozeAt ? (
+              <Banner tone="accent">
+                Back from snooze since {shortWhen(item.backFromSnoozeAt, props.nowMs)}.
               </Banner>
             ) : null}
             {mark === "updated" ? (
@@ -296,7 +392,12 @@ export function AskReader(props: {
                         required={field.required === true || response.task?.proof === field.id}
                         problem={problems[`field:${field.id}`]}
                         bare={plain}
-                        disabled={locked}
+                        disabled={locked || secretBusy}
+                        secret={secrets[field.id] ?? ""}
+                        onSecret={(value) => {
+                          setSecretError(null);
+                          setSecrets((current) => ({ ...current, [field.id]: value }));
+                        }}
                       />
                     ))}
                   </div>
@@ -318,6 +419,9 @@ export function AskReader(props: {
             form={form}
             turn={turn}
             phone={layout === "phone"}
+            busy={secretBusy}
+            snoozed={item.snoozed}
+            onSnooze={snooze}
             onPrimary={primary}
             onRefuse={refuse}
             onBack={() => patchAskForm(entry, { refusing: false })}
@@ -342,6 +446,7 @@ function StatePills(props: {
   item: NeedsYouItem;
   turn: AskTurn;
   mark: NeedsYouMark | undefined;
+  nowMs: number;
 }) {
   const { entry, item, turn } = props;
   const pills: Array<ReactNode> = [];
@@ -371,6 +476,18 @@ function StatePills(props: {
         Out of date
       </Pill>,
     );
+  if (props.mark === "back") {
+    pills.push(
+      <Pill key="back" tone="accent">
+        Back from snooze
+      </Pill>,
+    );
+  }
+  if (item.snoozed && entry.ask.snoozedUntil) {
+    pills.push(
+      <Pill key="snoozed">Snoozed until {shortWhen(entry.ask.snoozedUntil, props.nowMs)}</Pill>,
+    );
+  }
   if (item.notice) pills.push(<Pill key="notice">Nothing needed</Pill>);
   else if (item.blocking) {
     pills.push(

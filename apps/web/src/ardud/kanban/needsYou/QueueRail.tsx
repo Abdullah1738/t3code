@@ -2,6 +2,7 @@ import {
   askAge,
   askKindLabel,
   needsYouBatchKey,
+  needsYouMarkOf,
   type NeedsYouEntry,
   type NeedsYouFilter,
   type NeedsYouItem,
@@ -12,12 +13,14 @@ import { SearchIcon, XIcon } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 import { cn } from "../../../lib/utils";
+import { shortWhen } from "./snoozeTimes";
 import { Bar, FilterChip, Key, Pill, fieldClass, linkClass } from "./ui";
 
 const MARK_LABELS: Record<NeedsYouMark, string> = {
   reply: "Reply",
   updated: "Updated",
   failed: "Not sent",
+  back: "Back",
 };
 
 export interface QueueRailProps {
@@ -36,6 +39,7 @@ export interface QueueRailProps {
   /** With one board showing, rows leave its name out. */
   readonly oneBoard: boolean;
   readonly marks: Readonly<Record<string, NeedsYouMark>>;
+  readonly nowMs: number;
   readonly onShortcuts: () => void;
   /** In a sheet on a phone: no footer, rows a thumb can hit. */
   readonly inSheet?: boolean;
@@ -184,6 +188,7 @@ const rowProps = (rail: QueueRailProps) => ({
   boardNames: rail.boardNames,
   oneBoard: rail.oneBoard,
   marks: rail.marks,
+  nowMs: rail.nowMs,
 });
 
 function rowTone(item: NeedsYouItem): string {
@@ -198,11 +203,12 @@ function Row(props: {
   boardNames: ReadonlyMap<string, string>;
   oneBoard: boolean;
   marks: Readonly<Record<string, NeedsYouMark>>;
+  nowMs: number;
   nested?: boolean;
 }) {
   const { item } = props;
   const focused = props.focusKey === item.key;
-  const mark = props.marks[item.key];
+  const mark = needsYouMarkOf(item, props.marks);
   const board = props.boardNames.get(item.boardId) ?? "";
   return (
     <li>
@@ -233,7 +239,11 @@ function Row(props: {
                 {MARK_LABELS[mark]}
               </Pill>
             ) : null}
-            <span className="tabular-nums">{askAge(item.ageMs)}</span>
+            <span className="tabular-nums">
+              {item.snoozed && item.ask.snoozedUntil
+                ? shortWhen(item.ask.snoozedUntil, props.nowMs)
+                : askAge(item.ageMs)}
+            </span>
           </span>
         </span>
         <span className={cn("truncate text-sm", focused || mark ? "font-medium" : "")}>

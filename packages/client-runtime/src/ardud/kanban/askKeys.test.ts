@@ -28,6 +28,7 @@ describe("askKeyAction", () => {
     expect(key("r")).toEqual({ _tag: "reply" });
     expect(key("c")).toEqual({ _tag: "card" });
     expect(key("z")).toEqual({ _tag: "undo" });
+    expect(key("s")).toEqual({ _tag: "snooze" });
     expect(key("/")).toEqual({ _tag: "search" });
     expect(key("?")).toEqual({ _tag: "shortcuts" });
     expect(key("Escape")).toEqual({ _tag: "close" });

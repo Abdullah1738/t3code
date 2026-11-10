@@ -15,6 +15,10 @@ export function ActionBar(props: {
   form: AskForm;
   turn: AskTurn;
   phone: boolean;
+  /** The answer is on its way and can't be sent twice. */
+  busy?: boolean;
+  snoozed: boolean;
+  onSnooze: () => void;
   onPrimary: () => void;
   onRefuse: () => void;
   onBack: () => void;
@@ -54,10 +58,11 @@ export function ActionBar(props: {
       {props.phone ? props.lead : null}
       <Btn
         tone="primary"
+        disabled={props.busy}
         onClick={props.onPrimary}
         className={props.phone ? "min-w-0 flex-1" : undefined}
       >
-        <span className="truncate">{askPrimaryLabel(ask, form)}</span>
+        <span className="truncate">{props.busy ? "Sending" : askPrimaryLabel(ask, form)}</span>
         <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
       </Btn>
       {form.refusing ? (
@@ -67,6 +72,12 @@ export function ActionBar(props: {
       ) : (
         <>
           {props.phone ? null : props.children}
+          {props.phone ? null : (
+            <Btn tone="ghost" onClick={props.onSnooze}>
+              {props.snoozed ? "Bring back" : "Snooze"}
+              <Key>S</Key>
+            </Btn>
+          )}
           {refusal && !props.phone ? (
             <Btn tone="ghost" onClick={props.onRefuse}>
               {refusal.label}

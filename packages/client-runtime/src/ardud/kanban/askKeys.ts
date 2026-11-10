@@ -13,6 +13,7 @@ export type AskKeyAction =
   | { readonly _tag: "card" }
   | { readonly _tag: "edit" }
   | { readonly _tag: "undo" }
+  | { readonly _tag: "snooze" }
   | { readonly _tag: "search" }
   | { readonly _tag: "shortcuts" }
   | { readonly _tag: "view" }
@@ -79,6 +80,8 @@ export function askKeyAction(event: AskKeyEvent, context: AskKeyContext): AskKey
       return { _tag: "primary" };
     case "x":
       return context.refusable ? { _tag: "refuse" } : null;
+    case "s":
+      return { _tag: "snooze" };
     case "n":
       return { _tag: "note" };
     case "r":
@@ -115,6 +118,7 @@ export const ASK_SHORTCUTS: ReadonlyArray<{
   { keys: ["N"], does: "Add a note for the agent" },
   { keys: ["R"], does: "Reply in the discussion" },
   { keys: ["X"], does: "Reject, Fails or Couldn't" },
+  { keys: ["S"], does: "Snooze until tomorrow morning, or bring back" },
   { keys: ["Z"], does: "Undo, for six seconds" },
   { keys: ["C"], does: "Open the card" },
   { keys: ["/"], does: "Search" },

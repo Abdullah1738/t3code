@@ -86,6 +86,8 @@ export interface AskToast {
   readonly undoSendId?: number;
   readonly retryKey?: string;
   readonly viewKey?: string;
+  /** The asks a snooze just put away, so Undo can bring them back. */
+  readonly undoSnooze?: ReadonlyArray<AskSendRef>;
 }
 
 interface AskState {
@@ -331,6 +333,11 @@ export function patchAskForm(entry: KanbanAskFeedItem, patch: Partial<AskForm>) 
 export function setAskValue(entry: KanbanAskFeedItem, fieldId: string, value: unknown) {
   const form = formOf(get(), entry);
   patchAskForm(entry, { values: { ...form.values, [fieldId]: value } });
+}
+
+/** He tried to send with something missing: every problem on the ask shows from now on. */
+export function markAskTried(entry: KanbanAskFeedItem) {
+  set({ tried: { ...get().tried, [askKey(entry)]: true } });
 }
 
 /** He opened the ask: what was new on it has been seen. */
@@ -623,10 +630,19 @@ export function handAsk(entry: KanbanAskFeedItem, words?: string) {
   );
 }
 
-/** Takes back the held answer. Returns what to focus again, or null when nothing was held. */
+/**
+ * Takes back the last thing he did: the held answer, or the snooze the toast
+ * still offers to undo. Returns what to focus again, or null when there was nothing.
+ */
 export function undoAskSend(): string | null {
   const send = queue.undo();
-  if (send === null) return null;
+  if (send === null) {
+    const snoozed = get().toast?.undoSnooze;
+    if (snoozed === undefined || snoozed.length === 0) return null;
+    dismissAskToast();
+    void snoozeRefs(snoozed, null).then(() => refreshAsks());
+    return snoozed[0]!.key;
+  }
   const state = get();
   set({
     hidden: without(
@@ -688,6 +704,76 @@ export async function replyOnAsk(
     text: `Reply sent to ${askAsker(entry)}. ${entry.boardName} #${entry.cardNumber} waits until it answers.`,
   });
   await refreshAsks();
+}
+
+const snoozeRefs = (refs: ReadonlyArray<AskSendRef>, until: string | null) =>
+  refs.length === 1
+    ? askApi.snooze(refs[0]!.cardRef, refs[0]!.askId, until)
+    : askApi.snoozeBatch(
+        refs.map((ref) => ({ card: ref.cardRef, askId: ref.askId })),
+        until,
+      );
+
+/**
+ * Puts asks away until a time, or brings them back with `null`. They stay open
+ * and keep holding their cards; they leave the count and the list until then.
+ */
+export async function snoozeAsks(
+  entries: ReadonlyArray<KanbanAskFeedItem>,
+  until: string | null,
+  untilLabel: string,
+): Promise<void> {
+  const first = entries[0];
+  if (!first) return;
+  const refs = entries.map(refOf);
+  const what =
+    entries.length > 1 ? `${entries.length} asks` : `${first.boardName} #${first.cardNumber}`;
+  try {
+    await snoozeRefs(refs, until);
+    if (until === null)
+      showAskToast({ text: `${what} ${entries.length > 1 ? "are" : "is"} back in the queue.` });
+    else showAskToast({ text: `Snoozed until ${untilLabel} · ${what}.`, undoSnooze: refs }, 8_000);
+  } catch (error) {
+    showAskToast({
+      text: `Couldn't snooze ${what}. ${error instanceof Error ? error.message : ""}`.trim(),
+    });
+  }
+  await refreshAsks();
+}
+
+/**
+ * An answer that carried a secret went out over the private channel and was
+ * taken: it joins this session's answers (without the secret) and the queue
+ * moves on.
+ */
+export function noteAskAnswered(entry: KanbanAskFeedItem, body: AskAnswerBody, label: string) {
+  const key = askKey(entry);
+  const send: AskSend = {
+    ...baseSend(entry, key),
+    kind: "answer",
+    refs: [refOf(entry)],
+    body,
+    label,
+    state: "sent",
+  };
+  const state = get();
+  set({
+    hidden: { ...state.hidden, [key]: send.id },
+    sent: [send, ...state.sent],
+    forms: without(state.forms, [key]),
+    tried: without(state.tried, [key]),
+    refused: without(state.refused, [key]),
+    failed: without(state.failed, [key]),
+    marks: without(state.marks, [key]),
+  });
+  showAskToast({ text: `${label} · ${refLabel(send)}. Sent to ${send.to}.` });
+  void refreshAsks();
+}
+
+/** The ask changed under an answer that could not be held: read it again and say so. */
+export function noteAskStale(entry: KanbanAskFeedItem) {
+  set({ marks: { ...get().marks, [askKey(entry)]: "updated" } });
+  void refreshAsks();
 }
 
 /** For tests and the stories: back to an empty store. */

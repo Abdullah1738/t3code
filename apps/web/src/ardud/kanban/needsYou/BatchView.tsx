@@ -10,7 +10,8 @@ import { useImperativeHandle, useRef, useState, type RefObject } from "react";
 import { cn } from "../../../lib/utils";
 import { GrowingText, Problem } from "./AnswerParts";
 import type { AskReaderHandle } from "./AskReader";
-import { answerAskBatch, askKey } from "./askStore";
+import { answerAskBatch, askKey, snoozeAsks } from "./askStore";
+import { tomorrowMorning } from "./snoozeTimes";
 import { Btn, Key, Label, Pill, linkClass, type PageLayout } from "./ui";
 
 /**
@@ -25,6 +26,7 @@ export function BatchView(props: {
   layout: PageLayout;
   handle: RefObject<AskReaderHandle | null>;
   onOpenAsk: (key: string) => void;
+  onLeave: () => void;
 }) {
   const plan = planAskBatch(props.entries);
   const included = plan.included.slice(0, ASK_BATCH_MAX);
@@ -81,10 +83,17 @@ export function BatchView(props: {
     return go("answered", "Answer sent", { text: text.trim() });
   };
 
+  const snooze = () => {
+    const until = tomorrowMorning();
+    props.onLeave();
+    void snoozeAsks(props.entries.slice(0, ASK_BATCH_MAX), until.iso, until.label);
+  };
+
   useImperativeHandle(props.handle, () => ({
     act: (action: AskKeyAction) => {
       if (action._tag === "primary") send("primary");
       else if (action._tag === "refuse" && shape === "verdict") send("refuse");
+      else if (action._tag === "snooze") snooze();
       else if (action._tag === "note") {
         root.current?.querySelector<HTMLElement>("[data-ny-at='note']")?.focus();
       } else if (action._tag === "pick") {
@@ -254,6 +263,10 @@ export function BatchView(props: {
                 <Key>X</Key>
               </Btn>
             ) : null}
+            <Btn tone="ghost" onClick={snooze} className="max-sm:hidden">
+              Snooze {all}
+              <Key>S</Key>
+            </Btn>
           </div>
         </div>
       ) : null}

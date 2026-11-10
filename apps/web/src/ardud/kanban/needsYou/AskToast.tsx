@@ -58,6 +58,12 @@ export function AskToastView(props: {
               <Key className="text-(--m-ground)/80 ring-(--m-ground)/40">Z</Key>
             </Btn>
           ) : null}
+          {toast.undoSnooze ? (
+            <Btn size="sm" onClick={props.onUndo} className={onDark}>
+              Undo
+              <Key className="text-(--m-ground)/80 ring-(--m-ground)/40">Z</Key>
+            </Btn>
+          ) : null}
           {toast.retryKey ? (
             <Btn size="sm" onClick={() => retryAskSend(toast.retryKey!)} className={onDark}>
               Retry
