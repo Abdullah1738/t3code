@@ -15,8 +15,6 @@ import type { SqliteClientConfig } from "./nodeSqliteClient.ts";
 import { startReaderProcess, type ReaderRuntime } from "./nodeSqliteReaderProcess.ts";
 import { markNotStarted, readerBusy } from "./nodeSqliteReaderLanes.ts";
 
-// Autocommit reads a process may still be finishing for callers that left.
-const MAX_ABANDONED_READS = 16;
 export const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReadOnly",
   { defaultValue: () => undefined },
@@ -439,11 +437,18 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           !transactionOpen &&
           !beginsTransaction &&
           !/^\s*(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(input.sql);
-        // Backpressure: a process still finishing many abandoned reads answers
-        // new ones with "busy" at once instead of queueing them behind it.
-        if (autocommit && abandonedCount >= MAX_ABANDONED_READS)
+        // While the child is still finishing a statement its caller abandoned,
+        // new work (an autocommit read or a BEGIN) answers "busy" at once and is
+        // never sent, instead of queueing behind it. Every lane permit is then
+        // released within the statement limit (an autocommit read by abandonment,
+        // a transaction by the watchdog), so admission waits are bounded too and
+        // a queue of identity reads drains in milliseconds, not one statement
+        // limit each (review r2). A retry of the same never-started read fails
+        // just as fast, so the caller's deadline holds.
+        const runningEntry = running === undefined ? undefined : pending.get(running);
+        if ((autocommit || (beginsTransaction && !transactionOpen)) && runningEntry?.abandoned)
           return Effect.fail(
-            readerBusy(`Reader lane busy: ${abandonedCount} abandoned reads still running`, false),
+            readerBusy("Reader lane busy: the reader is still finishing an abandoned statement", false),
           );
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {

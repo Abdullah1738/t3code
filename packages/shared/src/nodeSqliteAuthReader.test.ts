@@ -526,3 +526,38 @@ it.live(
     ),
   30_000,
 );
+
+it.live(
+  "concurrent reads behind an abandoned statement all answer within about one statement limit",
+  () => {
+    const { spawned, restore } = countSpawns();
+    return withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly);
+          const before = spawned.count;
+          const wedged = yield* sql
+            .unsafe(FOREVER)
+            .pipe(SqliteClient.authReadOnly, Effect.flip, Effect.forkChild);
+          yield* Effect.sleep("100 millis");
+          const started = performance.now();
+          // Eight identity reads queue for the lane behind it. Before review r2 each
+          // waited its own statement limit in turn (~8 s at a 1 s limit).
+          const failures = yield* Effect.forEach(
+            Array.from({ length: 8 }, () => undefined),
+            () => sql`SELECT revoked FROM sessions`.pipe(SqliteClient.authReadOnly, Effect.flip),
+            { concurrency: "unbounded" },
+          );
+          const waited = performance.now() - started;
+          assert.isBelow(waited, 2_500);
+          for (const failure of failures)
+            assert.equal(SqliteClient.readerLaneFailure(failure), "retryable");
+          assert.equal(SqliteClient.readerLaneFailure(yield* Fiber.join(wedged)), "busy");
+          // Nothing was retired: the process is still finishing the long statement.
+          assert.equal(spawned.count, before);
+        }),
+      { readerWedgeLimit: "60 seconds" },
+    ).pipe(Effect.ensuring(Effect.sync(restore)));
+  },
+  30_000,
+);
