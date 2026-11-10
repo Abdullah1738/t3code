@@ -107,6 +107,74 @@ it.live("every failure is logged with its reason and the worker is restarted", (
   );
 });
 
+const heldWorker = (notify: boolean) =>
+  exportWorkerSource(
+    `() => { throw Object.assign(new Error('Automatic rebuild held back: source event sequence regressed'), { code: 'READONLY_REBUILD_HELD', notify: ${notify} }) }`,
+  );
+
+it.live("a held-back rebuild is reported as its own stage, quiet between notices", () =>
+  Effect.gen(function* () {
+    const loud = JSON.stringify(
+      yield* Effect.exit(superviseExportWorker(() => evalWorker(heldWorker(true)).worker, fast)),
+    );
+    assert.include(loud, '"stage":"rebuild-held"');
+    assert.include(loud, '"quiet":false');
+    const quiet = JSON.stringify(
+      yield* Effect.exit(superviseExportWorker(() => evalWorker(heldWorker(false)).worker, fast)),
+    );
+    assert.include(quiet, '"quiet":true');
+  }),
+);
+
+it.live("while a rebuild is held back the supervisor reopens rarely and stays quiet", () => {
+  const warnings: string[] = [];
+  const logger = Logger.make(({ message, logLevel }) => {
+    if (logLevel === "Warn") warnings.push(String(message));
+  });
+  let spawned = 0;
+  return superviseReadonlyExport(
+    () => {
+      spawned++;
+      return evalWorker(heldWorker(false)).worker;
+    },
+    { ...fast, heldRestartDelay: "10 seconds" },
+  ).pipe(
+    Effect.timeoutOption("1 second"),
+    Effect.andThen(
+      Effect.sync(() => {
+        // fast.restartDelay is 20 ms; a held rebuild waits heldRestartDelay.
+        assert.strictEqual(spawned, 1);
+        assert.deepStrictEqual(warnings, []);
+      }),
+    ),
+    Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+  );
+});
+
+it.live("a slow refresh cycle is logged with its duration", () => {
+  const warnings: string[] = [];
+  const logger = Logger.make(({ message, logLevel }) => {
+    if (logLevel === "Warn") warnings.push(String(message));
+  });
+  return superviseExportWorker(
+    () =>
+      evalWorker(
+        "const {parentPort}=require('node:worker_threads'); parentPort.postMessage({type:'published',cycleMs:95000}); setInterval(() => parentPort.postMessage({type:'step'}), 50)",
+      ).worker,
+    fast,
+  ).pipe(
+    Effect.timeoutOption("500 millis"),
+    Effect.andThen(
+      Effect.sync(() => {
+        assert.deepStrictEqual(warnings, [
+          "Readonly export cycle took 95s; outside readers allow 45-120s",
+        ]);
+      }),
+    ),
+    Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+  );
+});
+
 function staleRemountedReplica() {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "readonly-supervisor-"));
   cleanups.push(() => NodeFS.rmSync(dir, { recursive: true, force: true }));

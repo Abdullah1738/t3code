@@ -838,3 +838,238 @@ test("the packaged worker function has no external runtime dependencies", async 
   ).resolves.toBe("ok");
   await worker.terminate();
 });
+
+const HOUR = 60 * 60 * 1000;
+
+/** Stored sequence 5; then the source loses events 3..5 (e.g. restored from a backup). */
+function regressedFixture() {
+  const f = fixture();
+  f.source.exec(`INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES
+    ('thread.metadata-updated','a','{}'),('thread.metadata-updated','a','{}'),
+    ('thread.metadata-updated','a','{}'),('thread.metadata-updated','a','{}')`);
+  f.finish();
+  f.exporter.close();
+  return f;
+}
+const openExporter = (f: ReturnType<typeof fixture>) => {
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
+  cleanups.push(() => exporter.close());
+  return exporter;
+};
+const drive = (exporter: ReturnType<typeof createReadonlyReplica>) => {
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw new Error("export did not converge");
+  }
+};
+
+test("a regression that persists after a rebuild does not rebuild again inside the window", () => {
+  let now = Date.parse("2026-11-10T10:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = regressedFixture();
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence>=3");
+  drive(openExporter(f));
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source event sequence regressed");
+  expect(metaValue(out, "last_rebuild_at")).toBe("2026-11-10T10:00:00.000Z");
+  expect(metaValue(out, "ready")).toBe("1");
+  // It happens again an hour later: no second 4.5 GB re-bootstrap.
+  now += HOUR;
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence>=2");
+  let held: (Error & { code?: string; notify?: boolean }) | undefined;
+  try {
+    openExporter(f);
+  } catch (error) {
+    held = error as typeof held;
+  }
+  expect(held?.code).toBe("READONLY_REBUILD_HELD");
+  expect(held?.notify).toBe(true);
+  expect(held?.message).toContain("source event sequence regressed");
+  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_error")).toContain("Automatic rebuild held back");
+  expect(metaValue(out, "rebuild_held_until")).toBe("2026-11-10T16:00:00.000Z");
+  expect(metaValue(out, "last_rebuild_at")).toBe("2026-11-10T10:00:00.000Z");
+  // Nothing was dropped: the old rows are still there, just not published.
+  expect(
+    out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
+  ).toBe(3);
+  // The window is in meta, so a worker or server restart does not reset it,
+  // and the repeat inside the notice interval is quiet.
+  now += 15_000;
+  expect(() => openExporter(f)).toThrow(
+    expect.objectContaining({ code: "READONLY_REBUILD_HELD", notify: false }),
+  );
+  now += HOUR;
+  expect(() => openExporter(f)).toThrow(
+    expect.objectContaining({ code: "READONLY_REBUILD_HELD", notify: true }),
+  );
+  expect(metaValue(out, "last_rebuild_at")).toBe("2026-11-10T10:00:00.000Z");
+});
+
+test("after the backoff window the same reason may rebuild once more", () => {
+  let now = Date.parse("2026-11-10T10:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = regressedFixture();
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence>=3");
+  drive(openExporter(f));
+  now += HOUR;
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence>=2");
+  expect(() => openExporter(f)).toThrow("Automatic rebuild held back");
+  now = Date.parse("2026-11-10T16:00:00.001Z");
+  const exporter = openExporter(f);
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_at")).toBe("2026-11-10T16:00:00.001Z");
+  expect(metaValue(out, "rebuild_held_until")).toBeUndefined();
+  drive(exporter);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "sequence")).toBe("1");
+  // ...and that rebuild starts a new window.
+  exporter.close();
+  now += HOUR;
+  f.source.exec("DELETE FROM orchestration_events");
+  expect(() => openExporter(f)).toThrow("Automatic rebuild held back");
+});
+
+test("a different rebuild reason is not held back by the window", () => {
+  let now = Date.parse("2026-11-10T10:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = regressedFixture();
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence>=3");
+  drive(openExporter(f));
+  now += HOUR;
+  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  drive(openExporter(f));
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test("a rebuild pages the source exactly like a first bootstrap", () => {
+  const f = fixture();
+  for (let i = 0; i < 9; i++)
+    f.source
+      .prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}')")
+      .run(`t${i}`);
+  f.finish();
+  f.exporter.close();
+  f.source.exec("DELETE FROM orchestration_events");
+  const exporter = openExporter(f);
+  const out = f.connect();
+  const count = () =>
+    Number(out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n);
+  expect(count()).toBe(0);
+  let steps = 0;
+  let previous = 0;
+  while (exporter.step()) {
+    // One bounded page per step (batch size 2 here, 100 in production),
+    // committed on its own: the same page size and the same worker yield
+    // between steps as the normal catchup.
+    expect(count() - previous).toBeLessThanOrEqual(2);
+    previous = count();
+    if (++steps > 500) throw new Error("export did not converge");
+  }
+  expect(count()).toBe(12);
+  expect(steps).toBeGreaterThanOrEqual(6);
+});
+
+test("a busy source cannot hold a cycle open; updated_at tracks what was confirmed", () => {
+  // Slow-step fixture: every step takes 3 s and the source commits a new event
+  // before every step, as on 8 Nov (~34 events/s against 10 ms step gaps).
+  // Before 2026-11-10 the publish step went back for another lap whenever the
+  // source had moved, so this cycle never published (readers: "stale").
+  const f = fixture();
+  for (let i = 0; i < 12; i++)
+    f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')").run(`task${i}`);
+  let now = Date.parse("2026-11-08T22:00:00.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const bump = f.source.prepare(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{\"id\":\"a\"}')",
+  );
+  let n = 0;
+  let maxAge = 0;
+  let longestCycle = 0;
+  let oldestPublish = 0;
+  for (let cycle = 0; cycle < 4; cycle++) {
+    now += 15_000; // the worker's idle gap between cycles
+    const cycleStart = now;
+    let steps = 0;
+    let auxStartedBy = Infinity;
+    for (;;) {
+      maxAge = Math.max(maxAge, now - Date.parse(String(metaValue(out, "updated_at"))));
+      expect(metaValue(out, "ready")).toBe("1");
+      f.source
+        .prepare(
+          "UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id='a'",
+        )
+        .run(JSON.stringify({ n: ++n }));
+      bump.run();
+      now += 3_000;
+      if (steps === 1) auxStartedBy = now;
+      if (!f.exporter.step()) break;
+      if (++steps > 100) throw new Error("a busy source held the cycle open");
+    }
+    const updated = Date.parse(String(metaValue(out, "updated_at")));
+    longestCycle = Math.max(longestCycle, now - cycleStart);
+    oldestPublish = Math.max(oldestPublish, now - updated);
+    // Honest: no later than the publish snapshot, and no earlier than the start
+    // of the small-table copy (not the start of the cycle, as before).
+    expect(updated).toBeLessThanOrEqual(now);
+    expect(updated).toBeGreaterThanOrEqual(auxStartedBy);
+    // Everything committed before the publish snapshot is in this generation.
+    expect(metaValue(out, "sequence")).toBe(
+      String(f.source.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n),
+    );
+    expect(
+      out
+        .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+        .get()?.payload_json,
+    ).toBe(JSON.stringify({ n }));
+  }
+  // Bounded by the cycle itself, never by how busy the source is: the worst
+  // age a reader saw is one publish's own age + the idle gap + one cycle.
+  expect(longestCycle).toBeLessThan(100 * 3_000);
+  expect(maxAge).toBeLessThanOrEqual(oldestPublish + 15_000 + longestCycle);
+});
+
+test("a publish backlog beyond the drain budget keeps its pages and converges", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  const published = metaValue(out, "updated_at");
+  // Fix this cycle's target, then let the source run far ahead of it.
+  expect(f.exporter.step()).toBe(true);
+  const add = f.source.prepare(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  for (let i = 0; i < 200; i++) add.run(); // 100 pages at batch size 2 > 20-page budget
+  let steps = 0;
+  while (f.exporter.step()) {
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "updated_at")).toBe(published);
+    if (++steps > 500) throw new Error("export did not converge");
+  }
+  expect(metaValue(out, "sequence")).toBe("201");
+  expect(out.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n).toBe(201);
+});
+
+test("identical rows are not rewritten into the replica", () => {
+  const f = fixture();
+  f.source.exec("INSERT INTO ardud_kanban_cards VALUES ('card','a','{\"big\":true}')");
+  f.finish();
+  // Test-only probe on the replica copy: count real row updates.
+  const probe = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  cleanups.push(() => probe.close());
+  probe.exec(`CREATE TABLE probe_updates (id TEXT);
+    CREATE TRIGGER probe_card_update AFTER UPDATE ON ardud_kanban_cards
+    BEGIN INSERT INTO probe_updates VALUES (new.id); END;`);
+  const updates = () => Number(probe.prepare("SELECT count(*) AS n FROM probe_updates").get()?.n);
+  f.finish(); // a full cycle re-reads every small table
+  expect(updates()).toBe(0);
+  f.source.exec("UPDATE ardud_kanban_cards SET json='{\"big\":false}'");
+  f.finish();
+  expect(updates()).toBe(1);
+  expect(f.connect().prepare("SELECT json FROM ardud_kanban_cards").get()?.json).toBe(
+    '{"big":false}',
+  );
+});

@@ -9,6 +9,10 @@ export interface ReadonlyReplicaOptions {
   readonly boardPath?: string;
   readonly archivePath?: string;
   readonly batchSize?: number;
+  /** A second automatic rebuild for the same reason waits this long (default 6 h). */
+  readonly rebuildBackoffMs?: number;
+  /** While a rebuild is held back, the failure is reported this often (default 1 h). */
+  readonly rebuildNoticeMs?: number;
 }
 
 /** Self-contained for the packaged server's eval worker. No live write handle. */
@@ -19,6 +23,12 @@ export function createReadonlyReplica(
   options: ReadonlyReplicaOptions,
 ) {
   const batchSize = Math.max(1, Math.min(options.batchSize ?? 100, 500));
+  const rebuildBackoffMs = options.rebuildBackoffMs ?? 6 * 60 * 60 * 1000;
+  const rebuildNoticeMs = options.rebuildNoticeMs ?? 60 * 60 * 1000;
+  // Pages a publish may drain inside one pinned source snapshot. Doubles after
+  // each miss so a busy source cannot keep a cycle open (see publishStep).
+  const drainPagesInitial = 20;
+  const drainPagesMax = 640;
   if (!Number.isInteger(batchSize))
     throw new Error("Readonly export batch size must be an integer");
   const replicaName = path.resolve(options.replicaPath);
@@ -298,6 +308,31 @@ export function createReadonlyReplica(
             ? "source event sequence regressed"
             : undefined;
     if (rebuildReason) {
+      // A rebuild re-bootstraps the whole export (4.5 GB in production) by
+      // paging the live source. Never loop: the same reason may rebuild again
+      // only after the backoff window; until then stay unready and say why.
+      // The window lives in meta, so worker and server restarts keep it.
+      const lastReason = getMeta("last_rebuild_reason");
+      const lastAt = Date.parse(getMeta("last_rebuild_at") ?? "");
+      const now = Date.now();
+      if (
+        lastReason === rebuildReason &&
+        Number.isFinite(lastAt) &&
+        now - lastAt < rebuildBackoffMs
+      ) {
+        const lastNotice = Date.parse(getMeta("rebuild_held_notice_at") ?? "");
+        const notify = !(Number.isFinite(lastNotice) && now - lastNotice < rebuildNoticeMs);
+        const until = new Date(lastAt + rebuildBackoffMs).toISOString();
+        meta("ready", "0");
+        meta("rebuild_held_until", until);
+        if (notify) meta("rebuild_held_notice_at", new Date(now).toISOString());
+        throw Object.assign(
+          new Error(
+            `Automatic rebuild held back: ${rebuildReason} again within ${Math.round(rebuildBackoffMs / 60_000)} min of the last rebuild (${new Date(lastAt).toISOString()}); next allowed after ${until}`,
+          ),
+          { code: "READONLY_REBUILD_HELD", notify },
+        );
+      }
       const exported = [...projections, ...auxiliary].filter((name) =>
         out.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name),
       );
@@ -322,7 +357,12 @@ export function createReadonlyReplica(
         meta("sequence", String(sequence()));
         meta("schema_version", "1");
         meta("last_rebuild_reason", rebuildReason);
-        meta("last_rebuild_at", new Date().toISOString());
+        meta("last_rebuild_at", new Date(now).toISOString());
+        out
+          .prepare(
+            "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
+          )
+          .run();
       });
     } else if (storedSource !== undefined && storedSource !== identity) {
       meta("source", identity);
@@ -396,15 +436,18 @@ export function createReadonlyReplica(
       const primary = String(info.find((row) => row.pk === 1)?.name ?? "");
       if (!primary || info.some((row) => Number(row.pk) > 1))
         throw new Error(`Unsupported export key: ${name}`);
+      const values = columns.filter((c) => c !== primary);
       tables.set(name, {
         db,
         columns,
         primary,
+        // Identical rows are left alone: each cycle re-reads the small tables
+        // (75 MB of kanban card JSON on 10 Nov), and rewriting every unchanged
+        // row turned that into 75 MB of replica WAL per cycle.
         upsert: out.prepare(
-          `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${columns
-            .filter((c) => c !== primary)
+          `INSERT INTO ${q(name)} (${columns.map(q).join(",")}) VALUES (${columns.map(() => "?").join(",")}) ON CONFLICT(${q(primary)}) DO UPDATE SET ${values
             .map((c) => `${q(c)}=excluded.${q(c)}`)
-            .join(",")}`,
+            .join(",")} WHERE ${values.map((c) => `${q(c)} IS NOT excluded.${q(c)}`).join(" OR ")}`,
         ),
       });
       // These indexes touch the exported copy only; no live schema changes.
@@ -474,7 +517,6 @@ export function createReadonlyReplica(
       message: "messages",
     };
     let cycleTarget: number | undefined;
-    let capturedAt = Date.now();
     let auxiliaryCapturedAt: number | undefined;
     let auxiliaryGeneration = nextGeneration();
     let auxiliaryIndex = 0,
@@ -517,6 +559,58 @@ export function createReadonlyReplica(
       return { pruneCursor: Number(rows.at(-1)?.__rowid ?? cursor), done: rows.length < batchSize };
     };
     let auxiliaryPruneCursor = 0;
+    // While a publish drains its backlog, every source read shares one
+    // pinned snapshot (main, delta archive and base, pinned in that order).
+    let pinned = false;
+    const rollback = (db: NodeSqlite.DatabaseSync | undefined) => {
+      try {
+        db?.exec("ROLLBACK");
+      } catch {
+        // No transaction was open.
+      }
+    };
+    const unpin = () => {
+      pinned = false;
+      rollback(baseArchive);
+      rollback(archive);
+      rollback(source);
+    };
+    const pin = () => {
+      try {
+        // Pin main first: if it sees a deletion, the copy-first archive
+        // commit is already visible to the later archive snapshot.
+        source.exec("BEGIN");
+        source.prepare("SELECT max(sequence) AS n FROM orchestration_events").get();
+        archive?.exec("BEGIN");
+        archive?.prepare("SELECT max(sequence) AS n FROM ardud_events").get();
+        baseArchive?.exec("BEGIN");
+        baseArchive?.prepare("SELECT max(sequence) AS n FROM orchestration_events").get();
+        pinned = true;
+      } catch (error) {
+        unpin();
+        throw error;
+      }
+    };
+    /** One read snapshot of main for one page, or the pinned one. */
+    const sourceRead = <A>(body: () => A): A => {
+      if (pinned) return body();
+      source.exec("BEGIN");
+      try {
+        return body();
+      } finally {
+        source.exec("ROLLBACK");
+      }
+    };
+    /** Event pages read main, then the archives, each in its own snapshot. */
+    const eventRead = (body: () => void) => {
+      if (pinned) return body();
+      try {
+        pin();
+        body();
+      } finally {
+        unpin();
+      }
+    };
     const stepOnce = (): boolean => {
       if (closed) throw new Error("Readonly exporter is closed");
       if (invalidated) throw new Error(invalidated);
@@ -607,31 +701,53 @@ export function createReadonlyReplica(
         }
         return true;
       }
-      if (cycleTarget === undefined) {
-        cycleTarget = sequence();
-        capturedAt = Date.now();
+      if (cycleTarget === undefined) cycleTarget = sequence();
+      if (catchUpWork()) return true;
+      if (auxiliaryIndex < auxiliary.length) {
+        auxiliaryCapturedAt ??= Date.now();
+        const name = auxiliary[auxiliaryIndex]!,
+          table = tables.get(name)!;
+        if (!pruning) {
+          const rows = page(name, auxiliaryCursor);
+          transaction(() => {
+            for (const row of rows) {
+              copyRow(name, row);
+              markSeen(name, row[table.primary]!, auxiliaryGeneration);
+            }
+          });
+          auxiliaryCursor = Number(rows.at(-1)?.__rowid ?? auxiliaryCursor);
+          pruning = rows.length < batchSize;
+        } else {
+          const result = transaction(() => prune(name, auxiliaryPruneCursor, auxiliaryGeneration));
+          auxiliaryPruneCursor = result.pruneCursor;
+          if (result.done) {
+            auxiliaryIndex++;
+            auxiliaryCursor = 0;
+            pruning = false;
+            auxiliaryPruneCursor = 0;
+          }
+        }
+        return true;
       }
+      return publishStep();
+    };
+    /**
+     * Event catchup, dirty turn items and the archive deletion journal: one
+     * bounded page of whichever is pending. False when caught up to cycleTarget.
+     */
+    const catchUpWork = (): boolean => {
       const cursor = Number(getMeta("sequence"));
-      if (cursor < cycleTarget) {
-        source.exec("BEGIN");
-        let archiveTransaction = false;
-        let baseTransaction = false;
-        try {
-          // Pin main first: if it sees a deletion, the copy-first archive
-          // commit is already visible to the later archive snapshot.
-          sequence();
-          const liveRows = eventPage(source, "orchestration_events", cursor, cycleTarget);
+      if (cursor < cycleTarget!) {
+        eventRead(() => {
+          const through = cycleTarget!;
+          const liveRows = eventPage(source, "orchestration_events", cursor, through);
           const merged = new Map<number, Record<string, NodeSqlite.SQLOutputValue>>();
           if (archive) {
-            archive.exec("BEGIN");
-            archiveTransaction = true;
-            const coldRows = eventPage(archive, "ardud_events", cursor, cycleTarget);
-            for (const row of coldRows) merged.set(Number(row.sequence), row);
+            for (const row of eventPage(archive, "ardud_events", cursor, through))
+              merged.set(Number(row.sequence), row);
           }
           if (baseArchive) {
-            baseArchive.exec("BEGIN");
-            baseTransaction = true;
-            for (const row of eventPage(baseArchive, "orchestration_events", cursor, cycleTarget)) {
+            for (const row of eventPage(baseArchive, "orchestration_events", cursor, through)) {
               if (!merged.has(Number(row.sequence))) merged.set(Number(row.sequence), row);
             }
           }
@@ -669,7 +785,7 @@ export function createReadonlyReplica(
             auxiliaryPruneCursor = 0;
             auxiliaryCapturedAt = undefined;
             auxiliaryGeneration = nextGeneration();
-            return true;
+            return;
           }
           transaction(() => {
             for (const row of rows) {
@@ -696,11 +812,7 @@ export function createReadonlyReplica(
             }
             meta("sequence", String(rows.at(-1)!.sequence));
           });
-        } finally {
-          if (baseTransaction) baseArchive!.exec("ROLLBACK");
-          if (archiveTransaction) archive!.exec("ROLLBACK");
-          source.exec("ROLLBACK");
-        }
+        });
         return true;
       }
       const dirty = out
@@ -711,29 +823,31 @@ export function createReadonlyReplica(
       if (dirty) {
         const name = "orchestration_v2_projection_turn_items";
         if (Number(dirty.target_cursor) >= 0) {
+          // Every item the replica holds for the thread is re-read by id, so
+          // a type change or removal is applied here...
           const rows = out
             .prepare(
               `SELECT rowid AS __rowid,turn_item_id FROM ${q(name)} WHERE thread_id=? AND rowid>? ORDER BY rowid LIMIT ?`,
             )
             .all(dirty.thread_id!, dirty.target_cursor!, batchSize);
-          source.exec("BEGIN");
-          try {
+          sourceRead(() =>
             transaction(() => {
               for (const row of rows) refresh(name, row.turn_item_id!);
               out
                 .prepare("UPDATE ardud_readonly_dirty_items SET target_cursor=? WHERE thread_id=?")
                 .run(rows.length < batchSize ? -1 : rows.at(-1)!.__rowid!, dirty.thread_id!);
-            });
-          } finally {
-            source.exec("ROLLBACK");
-          }
+            }),
+          );
           return true;
         }
-        source.exec("BEGIN");
-        try {
+        // ...and the source scan only has to find exported types the replica
+        // lacks. Scanning every tool item of an active thread (thousands)
+        // after each turn-item event kept busy cycles from finishing.
+        sourceRead(() => {
           const rows = source
             .prepare(`SELECT ${selectColumns(name)} FROM ${q(name)}
-            WHERE thread_id=? AND (ordinal,turn_item_id)>(?,?) ORDER BY ordinal,turn_item_id LIMIT ?`)
+            WHERE thread_id=? AND type IN ('user_message','error','run_interrupt_request')
+              AND (ordinal,turn_item_id)>(?,?) ORDER BY ordinal,turn_item_id LIMIT ?`)
             .all(dirty.thread_id!, dirty.ordinal!, dirty.item_id!, batchSize);
           transaction(() => {
             for (const row of rows) copyRow(name, row);
@@ -750,77 +864,59 @@ export function createReadonlyReplica(
                 .run(last.ordinal!, last.turn_item_id!, dirty.thread_id!);
             }
           });
-        } finally {
-          source.exec("ROLLBACK");
-        }
+        });
         return true;
       }
-      if (
-        source
-          .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_archive_deletions'")
-          .get()
-      ) {
+      return sourceRead(() => {
+        if (
+          !source
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_archive_deletions'")
+            .get()
+        )
+          return false;
         const journalCursor = Number(getMeta("archive_deletion_sequence") ?? 0);
         const removals = source
           .prepare(
             "SELECT sequence,table_name,row_key,through_event_sequence FROM ardud_history_archive_deletions WHERE sequence>? ORDER BY sequence LIMIT ?",
           )
           .all(journalCursor, batchSize);
-        if (removals.length) {
-          transaction(() => {
-            for (const removal of removals) {
-              if (removal.table_name !== "orchestration_v2_projection_turn_items") continue;
-              const fence = out
-                .prepare("SELECT sequence FROM ardud_readonly_item_fences WHERE item_id=?")
-                .get(removal.row_key!);
-              if (!fence || Number(fence.sequence) <= Number(removal.through_event_sequence)) {
-                out
-                  .prepare(
-                    "DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id=?",
-                  )
-                  .run(removal.row_key!);
-                out
-                  .prepare("DELETE FROM ardud_readonly_item_fences WHERE item_id=?")
-                  .run(removal.row_key!);
-              }
+        if (!removals.length) return false;
+        transaction(() => {
+          for (const removal of removals) {
+            if (removal.table_name !== "orchestration_v2_projection_turn_items") continue;
+            const fence = out
+              .prepare("SELECT sequence FROM ardud_readonly_item_fences WHERE item_id=?")
+              .get(removal.row_key!);
+            if (!fence || Number(fence.sequence) <= Number(removal.through_event_sequence)) {
+              out
+                .prepare("DELETE FROM orchestration_v2_projection_turn_items WHERE turn_item_id=?")
+                .run(removal.row_key!);
+              out
+                .prepare("DELETE FROM ardud_readonly_item_fences WHERE item_id=?")
+                .run(removal.row_key!);
             }
-            meta("archive_deletion_sequence", String(removals.at(-1)!.sequence));
-          });
-          return true;
-        }
-      }
-      if (auxiliaryIndex < auxiliary.length) {
-        auxiliaryCapturedAt ??= Date.now();
-        const name = auxiliary[auxiliaryIndex]!,
-          table = tables.get(name)!;
-        if (!pruning) {
-          const rows = page(name, auxiliaryCursor);
-          transaction(() => {
-            for (const row of rows) {
-              copyRow(name, row);
-              markSeen(name, row[table.primary]!, auxiliaryGeneration);
-            }
-          });
-          auxiliaryCursor = Number(rows.at(-1)?.__rowid ?? auxiliaryCursor);
-          pruning = rows.length < batchSize;
-        } else {
-          const result = transaction(() => prune(name, auxiliaryPruneCursor, auxiliaryGeneration));
-          auxiliaryPruneCursor = result.pruneCursor;
-          if (result.done) {
-            auxiliaryIndex++;
-            auxiliaryCursor = 0;
-            pruning = false;
-            auxiliaryPruneCursor = 0;
           }
-        }
+          meta("archive_deletion_sequence", String(removals.at(-1)!.sequence));
+        });
         return true;
-      }
-      // Refreshing a projection may observe a commit beyond this window.
-      // Include its companion events too (especially Stop items) before
-      // publishing, otherwise the replica could combine a new run with an
-      // older interrupt view. A busy source defers outside actions safely.
+      });
+    };
+    let drainPages = drainPagesInitial;
+    /**
+     * Publish a generation. Refreshing a projection may observe a commit
+     * beyond the catchup window, so its companion events (especially Stop
+     * items) must be included first, or the replica could combine a new run
+     * with an older interrupt view. Before 2026-11-10 this step went back for
+     * another lap whenever the source had moved on; at the ~34 events/s a busy
+     * evening writes, that almost never stopped, and a cycle stayed open for
+     * minutes (readers saw "replica is stale"). Now the remaining backlog is
+     * drained inside one pinned source snapshot, so nothing can arrive in
+     * between: the publish is exactly as fresh as that snapshot. The snapshot
+     * holds a page budget; a miss keeps the pages done and doubles the budget.
+     */
+    const publishStep = (): boolean => {
       // Gradually reconcile physical archival deletes / out-of-band updates.
-      const name = projections[reconcileIndex++ % projections.length]!,
+      const name = projections[reconcileIndex % projections.length]!,
         table = tables.get(name)!;
       const saved = progress(`reconcile:${name}`);
       const rows = out
@@ -828,24 +924,20 @@ export function createReadonlyReplica(
           `SELECT rowid AS __rowid,${q(table.primary)} AS id FROM ${q(name)} WHERE rowid>? ORDER BY rowid LIMIT ?`,
         )
         .all(saved.cursor, batchSize);
-      source.exec("BEGIN");
+      // Taken before the snapshot starts: it never claims more than it holds.
+      const confirmedAt = Date.now();
+      pin();
       try {
-        const latest = sequence();
-        if (
-          source
-            .prepare("SELECT 1 FROM sqlite_schema WHERE name='ardud_history_archive_deletions'")
-            .get()
-        ) {
-          const journalLatest = Number(
-            source.prepare("SELECT max(sequence) AS n FROM ardud_history_archive_deletions").get()
-              ?.n ?? 0,
-          );
-          if (journalLatest > Number(getMeta("archive_deletion_sequence") ?? 0)) return true;
+        cycleTarget = Math.max(cycleTarget!, sequence());
+        let pages = 0;
+        while (catchUpWork()) {
+          if (resettingEvents) return true;
+          if (++pages >= drainPages) {
+            drainPages = Math.min(drainPages * 2, drainPagesMax);
+            return true;
+          }
         }
-        if (latest > cursor) {
-          cycleTarget = latest;
-          return true;
-        }
+        reconcileIndex++;
         transaction(() => {
           for (const row of rows) refresh(name, row.id!);
           checkpoint(`reconcile:${name}`, {
@@ -867,18 +959,28 @@ export function createReadonlyReplica(
               "DELETE FROM orchestration_events WHERE sequence IN (SELECT sequence FROM orchestration_events WHERE sequence<? ORDER BY sequence LIMIT ?)",
             )
             .run(Math.max(0, cycleTarget! - 20_000), batchSize);
+          // Readers treat updated_at as "everything up to here is in the
+          // replica" (stream-recovery defers threads newer than it). Events
+          // and projections are current to the drain snapshot; the small
+          // tables to the start of their copy. The older of the two is honest.
           const previous = Date.parse(getMeta("updated_at") ?? "") || 0;
           meta(
             "updated_at",
             new Date(
-              Math.max(Math.min(capturedAt, auxiliaryCapturedAt ?? capturedAt), previous + 1),
+              Math.max(Math.min(confirmedAt, auxiliaryCapturedAt ?? confirmedAt), previous + 1),
             ).toISOString(),
           );
           meta("ready", "1");
+          out
+            .prepare(
+              "DELETE FROM ardud_readonly_meta WHERE key IN ('rebuild_held_until','rebuild_held_notice_at')",
+            )
+            .run();
         });
       } finally {
-        source.exec("ROLLBACK");
+        unpin();
       }
+      drainPages = drainPagesInitial;
       // Readers switch from the previous generation to this one atomically.
       if (cycleTransaction) {
         cycleTransaction = false;

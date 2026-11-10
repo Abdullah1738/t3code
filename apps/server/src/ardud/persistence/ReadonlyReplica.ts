@@ -5,7 +5,6 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../../config.ts";
@@ -19,13 +18,24 @@ class ReadonlyReplica extends Context.Service<
 
 export class ReadonlyExportUnavailable extends Schema.TaggedError<ReadonlyExportUnavailable>()(
   "ReadonlyExportUnavailable",
-  { stage: Schema.String, reason: Schema.String },
+  {
+    stage: Schema.String,
+    reason: Schema.String,
+    /** A held-back rebuild repeats every restart; only some are worth a warning. */
+    quiet: Schema.optional(Schema.Boolean),
+  },
 ) {}
 
 /** Messages the export worker posts to its supervisor. */
 type WorkerMessage =
-  | { readonly type: "opened" | "step" | "published" }
-  | { readonly type: "failed"; readonly stage: string; readonly error: string };
+  | { readonly type: "opened" | "step" }
+  | { readonly type: "published"; readonly cycleMs?: number }
+  | {
+      readonly type: "failed";
+      readonly stage: string;
+      readonly error: string;
+      readonly quiet?: boolean;
+    };
 
 /** What the supervisor needs from a worker; a node Worker satisfies it. */
 export interface ExportWorker {
@@ -42,6 +52,10 @@ export interface SupervisorOptions {
   readonly restartDelay: Duration.Input;
   /** A worker stuck in native code may never exit; stop waiting for it. */
   readonly terminateTimeout: Duration.Input;
+  /** While an automatic rebuild is held back, reopen this rarely (default 5 min). */
+  readonly heldRestartDelay?: Duration.Input;
+  /** A refresh cycle slower than this is logged (default 30 s, at most every 10 min). */
+  readonly slowCycle?: Duration.Input;
 }
 
 const defaultSupervisorOptions: SupervisorOptions = {
@@ -49,7 +63,11 @@ const defaultSupervisorOptions: SupervisorOptions = {
   stallTimeout: "10 minutes",
   restartDelay: "15 seconds",
   terminateTimeout: "30 seconds",
+  heldRestartDelay: "5 minutes",
+  slowCycle: "30 seconds",
 };
+
+const SLOW_CYCLE_LOG_INTERVAL_MS = 10 * 60_000;
 
 const HEARTBEAT_MS = 5_000;
 
@@ -64,16 +82,26 @@ const { parentPort, workerData } = require('node:worker_threads');
 const describe = (error) => String((error && error.message) || error).slice(0, 2000);
 let replica;
 let lastBeat = 0;
+let cycleStarted = Date.now();
 const beat = (type) => {
   const now = Date.now();
-  if (type !== 'step' || now - lastBeat >= ${HEARTBEAT_MS}) {
+  if (type === 'published') {
+    lastBeat = now;
+    parentPort.postMessage({ type, cycleMs: now - cycleStarted });
+  } else if (type !== 'step' || now - lastBeat >= ${HEARTBEAT_MS}) {
     lastBeat = now;
     parentPort.postMessage({ type });
   }
 };
 const fail = (stage, error) => {
   try { replica?.close(); } catch {}
-  parentPort.postMessage({ type: 'failed', stage, error: describe(error) });
+  const held = error && error.code === 'READONLY_REBUILD_HELD';
+  parentPort.postMessage({
+    type: 'failed',
+    stage: held ? 'rebuild-held' : stage,
+    error: describe(error),
+    quiet: held && error.notify === false,
+  });
 };
 try {
   replica = (${replicaFactory})(require('node:sqlite'), require('node:fs'), require('node:path'), workerData);
@@ -82,6 +110,7 @@ try {
     try {
       const more = replica.step();
       beat(more ? 'step' : 'published');
+      if (!more) cycleStarted = Date.now() + ${idleMs};
       setTimeout(step, more ? 10 : ${idleMs});
     } catch (error) {
       fail('step', error);
@@ -104,17 +133,28 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const clock = yield* Clock.Clock;
   const stallMs = Duration.toMillis(Duration.fromInputUnsafe(options.stallTimeout));
   let lastBeat = clock.currentTimeMillisUnsafe();
+  const slowMs = Duration.toMillis(
+    Duration.fromInputUnsafe(options.slowCycle ?? defaultSupervisorOptions.slowCycle!),
+  );
+  let slowCycleMs: number | undefined;
+  let slowLoggedAt = Number.NEGATIVE_INFINITY;
   const signal = (worker: ExportWorker) =>
     Effect.callback<never, ReadonlyExportUnavailable>((resume) => {
       const onMessage = (message: WorkerMessage) => {
         if (message?.type === "failed") {
           resume(
             Effect.fail(
-              new ReadonlyExportUnavailable({ stage: message.stage, reason: message.error }),
+              new ReadonlyExportUnavailable({
+                stage: message.stage,
+                reason: message.error,
+                quiet: message.quiet === true,
+              }),
             ),
           );
         } else {
           lastBeat = clock.currentTimeMillisUnsafe();
+          if (message?.type === "published" && (message.cycleMs ?? 0) > slowMs)
+            slowCycleMs = Math.max(slowCycleMs ?? 0, message.cycleMs!);
         }
       };
       const onError = (error: Error) =>
@@ -141,7 +181,19 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const watchdog = Effect.gen(function* () {
     while (true) {
       yield* Effect.sleep(Duration.millis(Math.max(10, Math.min(stallMs / 4, 30_000))));
-      const silent = clock.currentTimeMillisUnsafe() - lastBeat;
+      const now = clock.currentTimeMillisUnsafe();
+      if (slowCycleMs !== undefined && now - slowLoggedAt >= SLOW_CYCLE_LOG_INTERVAL_MS) {
+        // Its own span: the worker span stays open while the worker is healthy.
+        yield* Effect.logWarning(
+          `Readonly export cycle took ${Math.round(slowCycleMs / 1000)}s; outside readers allow 45-120s`,
+        ).pipe(
+          Effect.annotateLogs({ cycleMs: slowCycleMs }),
+          Effect.withSpan("ardud.readonlyExport.slowCycle"),
+        );
+        slowLoggedAt = now;
+        slowCycleMs = undefined;
+      }
+      const silent = now - lastBeat;
       if (silent > stallMs) {
         return yield* new ReadonlyExportUnavailable({
           stage: "stalled",
@@ -165,22 +217,34 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   );
 });
 
-/** Supervise forever: every failure is logged with its reason, then retried. */
+/**
+ * Supervise forever: every failure is logged with its reason, then retried.
+ * A held-back rebuild (same reason inside the backoff window) reopens every
+ * 5 minutes and warns only when the exporter says a notice is due (hourly).
+ */
 export const superviseReadonlyExport = (
   spawn: () => ExportWorker,
   options: SupervisorOptions = defaultSupervisorOptions,
 ): Effect.Effect<never> =>
-  superviseExportWorker(spawn, options).pipe(
-    Effect.catch((error) =>
-      Effect.logWarning(
-        `Readonly export unavailable (${error.stage}): ${error.reason}; restarting the export worker`,
-      ).pipe(Effect.annotateLogs({ stage: error.stage, reason: error.reason })),
+  Effect.forever(
+    superviseExportWorker(spawn, options).pipe(
+      Effect.catch((error) => {
+        const message = `Readonly export unavailable (${error.stage}): ${error.reason}; restarting the export worker`;
+        const held = error.stage === "rebuild-held";
+        return (error.quiet ? Effect.logDebug(message) : Effect.logWarning(message)).pipe(
+          Effect.annotateLogs({ stage: error.stage, reason: error.reason }),
+          Effect.as(
+            held
+              ? (options.heldRestartDelay ?? defaultSupervisorOptions.heldRestartDelay!)
+              : options.restartDelay,
+          ),
+        );
+      }),
+      // A span, so the warning lands in server.trace.ndjson; the server's plain
+      // stdout is only persisted when the server itself crashes.
+      Effect.withSpan("ardud.readonlyExport.worker"),
+      Effect.flatMap((delay) => Effect.sleep(delay)),
     ),
-    // A span, so the warning lands in server.trace.ndjson; the server's plain
-    // stdout is only persisted when the server itself crashes.
-    Effect.withSpan("ardud.readonlyExport.worker"),
-    Effect.repeat(Schedule.spaced(options.restartDelay)),
-    Effect.andThen(Effect.never),
   );
 
 const make = Effect.gen(function* () {
