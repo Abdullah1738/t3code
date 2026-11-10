@@ -357,63 +357,371 @@ export interface KanbanBlocking {
   readonly urgency: number;
 }
 
+/** A waiting To-Do card gains one priority step for every this long it has been startable. */
+export const KANBAN_AGING_STEP_MS = 3 * 24 * 60 * 60 * 1000;
+/** Most priority steps waiting alone can add. */
+export const KANBAN_AGING_MAX_STEPS = 2;
+/** Open cards a card must hold up (the whole chain) to gain one priority step, then two. */
+export const KANBAN_FANOUT_STEPS: ReadonlyArray<number> = [10, 100];
+/**
+ * Fan-out and waiting never lift a card above this priority. P1 stays what the
+ * owner marked P1, or what holds a P1 card up.
+ */
+export const KANBAN_BOOST_FLOOR = 2;
+
+export interface KanbanSchedule extends KanbanBlocking {
+  /**
+   * The priority the card is picked at: `urgency`, lifted one step per
+   * KANBAN_FANOUT_STEPS threshold its `holds` reaches and one step per
+   * KANBAN_AGING_STEP_MS it has waited, never above KANBAN_BOOST_FLOOR.
+   */
+  readonly rank: number;
+  /** Steps `holds` earned (0 to KANBAN_FANOUT_STEPS.length), before the floor. */
+  readonly fanoutSteps: number;
+  /** Steps waiting earned (0 to KANBAN_AGING_MAX_STEPS), before the floor. */
+  readonly agingSteps: number;
+  /**
+   * Since when a To-Do card has had nothing unfinished to wait on: its last move, or
+   * the last move of its latest finished blocker. Null for a card outside To-Do or
+   * one that still waits on an unfinished card, which doesn't age.
+   */
+  readonly waitingSince: string | null;
+}
+
+export interface KanbanScheduleOptions {
+  /**
+   * The clock waiting is measured against. Left out, it is the newest `updatedAt` on
+   * the board, so the same cards always give the same order.
+   */
+  readonly nowMs?: number | undefined;
+  /**
+   * Memory the exact `holds` count may use, in 32-bit words. Past it, the rest of the
+   * counts are upper bounds (a card reached along two paths counts twice).
+   */
+  readonly maxWords?: number | undefined;
+}
+
+/** Default memory for exact counts: 64 MB, enough for about 20,000 open linked cards. */
+const SCHEDULE_MAX_WORDS = 16_000_000;
+
+const popcount = (word: number): number => {
+  let v = word - ((word >>> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+  return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+};
+
+/**
+ * The blocking graph of a board, walked once: for every open card, how many open
+ * cards it holds up (the whole chain) and the most urgent priority among them.
+ * Done and settled cards are left out, and a backlog card waiting on another doesn't
+ * count: nobody is going to do it.
+ *
+ * Cards in a loop of blocks are one group (Tarjan), and the groups come out waiters
+ * first, so each group's set of held-up cards is the union of the sets of the groups
+ * right behind it. The sets are bitsets: the cost is cards plus edges, times one
+ * word per 32 open cards for each edge.
+ */
+function blockingGraph(cards: ReadonlyArray<KanbanCard>, maxWords: number) {
+  const open: Array<KanbanCard> = [];
+  const index = new Map<string, number>();
+  for (const card of cards) {
+    if (!isOpenCard(card) || index.has(card.id)) continue;
+    index.set(card.id, open.length);
+    open.push(card);
+  }
+  const n = open.length;
+  // Edges run blocker -> waiter, stored per blocker.
+  const start = new Int32Array(n + 1);
+  for (const waiter of open) {
+    if (waiter.priority === KANBAN_BACKLOG) continue;
+    for (const id of waiter.blockedBy) {
+      const blocker = index.get(id);
+      if (blocker !== undefined) start[blocker + 1] = (start[blocker + 1] ?? 0) + 1;
+    }
+  }
+  for (let i = 0; i < n; i += 1) start[i + 1] = (start[i + 1] ?? 0) + (start[i] ?? 0);
+  const targets = new Int32Array(start[n] ?? 0);
+  const fill = start.slice(0, n);
+  for (let w = 0; w < n; w += 1) {
+    const waiter = open[w]!;
+    if (waiter.priority === KANBAN_BACKLOG) continue;
+    for (const id of waiter.blockedBy) {
+      const blocker = index.get(id);
+      if (blocker === undefined) continue;
+      targets[fill[blocker]!] = w;
+      fill[blocker] = fill[blocker]! + 1;
+    }
+  }
+
+  // Tarjan's strongly connected components, with its own stack: a chain of blocks
+  // can be thousands of cards long.
+  const seenAt = new Int32Array(n).fill(-1);
+  const low = new Int32Array(n);
+  const group = new Int32Array(n).fill(-1);
+  const onStack = new Uint8Array(n);
+  const stack = new Int32Array(n);
+  const callNode = new Int32Array(n);
+  const callEdge = new Int32Array(n);
+  let stackSize = 0;
+  let counter = 0;
+  let groups = 0;
+  let depth = 0;
+  const enter = (v: number) => {
+    seenAt[v] = counter;
+    low[v] = counter;
+    counter += 1;
+    stack[stackSize] = v;
+    stackSize += 1;
+    onStack[v] = 1;
+    callNode[depth] = v;
+    callEdge[depth] = start[v]!;
+    depth += 1;
+  };
+  for (let root = 0; root < n; root += 1) {
+    if (seenAt[root] !== -1) continue;
+    enter(root);
+    while (depth > 0) {
+      const v = callNode[depth - 1]!;
+      const edge = callEdge[depth - 1]!;
+      if (edge < start[v + 1]!) {
+        callEdge[depth - 1] = edge + 1;
+        const w = targets[edge]!;
+        if (seenAt[w] === -1) enter(w);
+        else if (onStack[w] === 1 && seenAt[w]! < low[v]!) low[v] = seenAt[w]!;
+        continue;
+      }
+      depth -= 1;
+      if (low[v] === seenAt[v]) {
+        for (;;) {
+          stackSize -= 1;
+          const member = stack[stackSize]!;
+          onStack[member] = 0;
+          group[member] = groups;
+          if (member === v) break;
+        }
+        groups += 1;
+      }
+      if (depth > 0) {
+        const parent = callNode[depth - 1]!;
+        if (low[v]! < low[parent]!) low[parent] = low[v]!;
+      }
+    }
+  }
+
+  // Members per group. Group ids are in the order Tarjan closed them: every group a
+  // group holds up has a smaller id, so one pass in id order sees waiters first.
+  const memberStart = new Int32Array(groups + 1);
+  for (let v = 0; v < n; v += 1) memberStart[group[v]! + 1] = memberStart[group[v]! + 1]! + 1;
+  for (let g = 0; g < groups; g += 1) memberStart[g + 1] = memberStart[g + 1]! + memberStart[g]!;
+  const members = new Int32Array(n);
+  const memberFill = memberStart.slice(0, groups);
+  for (let v = 0; v < n; v += 1) {
+    const g = group[v]!;
+    members[memberFill[g]!] = v;
+    memberFill[g] = memberFill[g]! + 1;
+  }
+
+  const words = (n + 31) >>> 5;
+  let wordsLeft = maxWords;
+  /** Cards each group holds up beyond itself; null for a group that holds none, or past the memory limit. */
+  const reach: Array<Uint32Array | null> = Array.from({ length: groups }, () => null);
+  const held = new Int32Array(groups);
+  const exact = new Uint8Array(groups).fill(1);
+  /** The most urgent priority in the group, and among the cards it holds up. */
+  const own = new Int32Array(groups).fill(KANBAN_BACKLOG);
+  const below = new Int32Array(groups).fill(KANBAN_BACKLOG);
+  const lastUnion = new Int32Array(groups).fill(-1);
+  for (let g = 0; g < groups; g += 1) {
+    let set: Uint32Array | null = null;
+    let sum = 0;
+    let isExact = true;
+    for (let m = memberStart[g]!; m < memberStart[g + 1]!; m += 1) {
+      const v = members[m]!;
+      const priority = open[v]!.priority;
+      if (priority < own[g]!) own[g] = priority;
+      for (let edge = start[v]!; edge < start[v + 1]!; edge += 1) {
+        const child = group[targets[edge]!]!;
+        if (child === g || lastUnion[child] === g) continue;
+        lastUnion[child] = g;
+        const urgent = Math.min(own[child]!, below[child]!);
+        if (urgent < below[g]!) below[g] = urgent;
+        const size = memberStart[child + 1]! - memberStart[child]!;
+        sum += held[child]! + size;
+        if (exact[child] === 0) isExact = false;
+        if (!isExact) continue;
+        if (set === null) {
+          if (wordsLeft < words) {
+            isExact = false;
+            continue;
+          }
+          wordsLeft -= words;
+          set = new Uint32Array(words);
+        }
+        const theirs = reach[child];
+        if (theirs) for (let i = 0; i < words; i += 1) set[i] = set[i]! | theirs[i]!;
+        for (let c = memberStart[child]!; c < memberStart[child + 1]!; c += 1) {
+          const bit = members[c]!;
+          set[bit >>> 5] = set[bit >>> 5]! | (1 << (bit & 31));
+        }
+      }
+    }
+    if (isExact && set !== null) {
+      let count = 0;
+      for (let i = 0; i < words; i += 1) count += popcount(set[i]!);
+      held[g] = count;
+      reach[g] = set;
+    } else if (!isExact) {
+      // An upper bound: every open card but this group's own.
+      held[g] = Math.min(sum, n - (memberStart[g + 1]! - memberStart[g]!));
+      exact[g] = 0;
+    }
+  }
+
+  return {
+    open,
+    /** What the card at `open[v]` holds up: the others in its loop, and everything behind it. */
+    of: (v: number): KanbanBlocking => {
+      const g = group[v]!;
+      const card = open[v]!;
+      return {
+        holds: held[g]! + (memberStart[g + 1]! - memberStart[g]!) - 1,
+        // A backlog card stays at the bottom whatever waits on it; only the owner takes it out.
+        urgency: card.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : Math.min(own[g]!, below[g]!),
+      };
+    },
+  };
+}
+
 /**
  * What each open card holds up. Done and settled cards are left out, and a
  * backlog card waiting on another doesn't count: nobody is going to do it.
  */
 export function kanbanBlocking(cards: ReadonlyArray<KanbanCard>): Map<string, KanbanBlocking> {
+  const graph = blockingGraph(cards, SCHEDULE_MAX_WORDS);
+  return new Map(graph.open.map((card, v) => [card.id as string, graph.of(v)]));
+}
+
+/**
+ * How every open card on a board is ranked for pick-up, from one pass over the
+ * blocking graph. A card's rank starts at its urgency (its own priority, or that of
+ * the most urgent card it holds up) and is lifted, never above KANBAN_BOOST_FLOOR:
+ * one step when it holds up 10 open cards and two at 100, and one step for every
+ * 3 days a To-Do card has been startable, at most two.
+ */
+export function kanbanSchedule(
+  cards: ReadonlyArray<KanbanCard>,
+  options: KanbanScheduleOptions = {},
+): Map<string, KanbanSchedule> {
+  const graph = blockingGraph(cards, options.maxWords ?? SCHEDULE_MAX_WORDS);
   const byId = new Map(cards.map((card) => [card.id as string, card]));
-  const waiters = new Map<string, Array<string>>();
-  for (const card of cards) {
-    if (!isOpenCard(card) || card.priority === KANBAN_BACKLOG) continue;
-    for (const id of card.blockedBy) {
-      const list = waiters.get(id) ?? [];
-      list.push(card.id);
-      waiters.set(id, list);
-    }
+  let nowMs = options.nowMs;
+  if (nowMs === undefined) {
+    let newest = "";
+    for (const card of cards) if (card.updatedAt > newest) newest = card.updatedAt;
+    nowMs = newest === "" ? 0 : Date.parse(newest);
   }
-  const result = new Map<string, KanbanBlocking>();
-  for (const card of cards) {
-    if (!isOpenCard(card)) continue;
-    // Breadth-first over the waiters; `seen` also ends a loop of blocks.
-    const seen = new Set<string>([card.id]);
-    const queue: Array<string> = [card.id];
-    let urgency = card.priority;
-    for (let i = 0; i < queue.length; i += 1) {
-      for (const id of waiters.get(queue[i] ?? "") ?? []) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        queue.push(id);
-        urgency = Math.min(urgency, byId.get(id)?.priority ?? urgency);
+  const result = new Map<string, KanbanSchedule>();
+  graph.open.forEach((card, v) => {
+    const blocking = graph.of(v);
+    let waitingSince: string | null = card.stage === "todo" ? card.movedAt : null;
+    if (waitingSince !== null) {
+      for (const id of card.blockedBy) {
+        const blocker = byId.get(id);
+        if (blocker === undefined) continue;
+        if (!KANBAN_DONE_STAGES.has(blocker.stage) || kanbanAwaitsMerge(blocker)) {
+          waitingSince = null;
+          break;
+        }
+        if (blocker.movedAt > waitingSince) waitingSince = blocker.movedAt;
       }
     }
-    // A backlog card stays at the bottom whatever waits on it; only the owner takes it out.
-    result.set(card.id, {
-      holds: seen.size - 1,
-      urgency: card.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : urgency,
-    });
-  }
+    const waited = waitingSince === null ? 0 : nowMs - Date.parse(waitingSince);
+    // A stamp that doesn't parse ages nothing, rather than poisoning the order with NaN.
+    const agingSteps = Number.isFinite(waited)
+      ? Math.max(0, Math.min(KANBAN_AGING_MAX_STEPS, Math.floor(waited / KANBAN_AGING_STEP_MS)))
+      : 0;
+    const fanoutSteps = KANBAN_FANOUT_STEPS.filter((least) => blocking.holds >= least).length;
+    const rank =
+      blocking.urgency <= KANBAN_BOOST_FLOOR || card.priority === KANBAN_BACKLOG
+        ? blocking.urgency
+        : Math.max(KANBAN_BOOST_FLOOR, blocking.urgency - fanoutSteps - agingSteps);
+    result.set(card.id, { ...blocking, rank, fanoutSteps, agingSteps, waitingSince });
+  });
   return result;
 }
 
 /**
- * The order todo cards get picked up in: most urgent first, where a card
- * holding up an urgent card is as urgent as that card; then the one holding
- * up the most other cards; then the one waiting longest. The dispatcher uses
- * it and the board's To-Do column shows it.
+ * The order todo cards get picked up in: best rank first (see kanbanSchedule:
+ * a card holding up an urgent card is as urgent as that card, and holding up
+ * many cards or waiting for days lifts it); then the one holding up the most
+ * other cards; then the one waiting longest. The dispatcher uses it and the
+ * board's To-Do column shows it.
  */
-export function kanbanPickOrder(cards: ReadonlyArray<KanbanCard>) {
-  const blocking = kanbanBlocking(cards);
-  const of = (card: KanbanCard) => blocking.get(card.id) ?? { holds: 0, urgency: card.priority };
+export function kanbanPickOrder(
+  cards: ReadonlyArray<KanbanCard>,
+  options: KanbanScheduleOptions = {},
+) {
+  const schedule = kanbanSchedule(cards, options);
+  const of = (card: KanbanCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
   return (a: KanbanCard, b: KanbanCard) => {
     const x = of(a);
     const y = of(b);
     return (
-      x.urgency - y.urgency ||
+      x.rank - y.rank ||
       y.holds - x.holds ||
       a.movedAt.localeCompare(b.movedAt) ||
       a.number - b.number
     );
+  };
+}
+
+export interface KanbanCardFlow {
+  /** Open cards that can't start until this one is done, the whole chain. */
+  readonly unblocks: number;
+  /** The priority it is picked at; see kanbanSchedule. Its own priority for a done card. */
+  readonly rank: number;
+  /** A To-Do card nothing on the card itself keeps from starting (the board's pause and pools aside). */
+  readonly ready: boolean;
+  /** The unfinished cards it lists as blockers, including one its own work thread does first. */
+  readonly waitsOn: ReadonlyArray<KanbanCard>;
+  /** The card actually holding it up, if any; see kanbanHeldUpBy. */
+  readonly heldUpBy: KanbanCard | undefined;
+}
+
+/**
+ * What a board shows about one card's place in the queue. `schedule` is
+ * kanbanSchedule of the same cards, built once per board.
+ */
+export function kanbanCardFlow(
+  card: KanbanCard,
+  byId: ReadonlyMap<string, KanbanCard>,
+  schedule: ReadonlyMap<string, KanbanSchedule>,
+): KanbanCardFlow {
+  const entry = schedule.get(card.id);
+  const open = isOpenCard(card);
+  const waitsOn = open
+    ? card.blockedBy.flatMap((id) => {
+        const blocker = byId.get(id);
+        return blocker !== undefined &&
+          (!KANBAN_DONE_STAGES.has(blocker.stage) || kanbanAwaitsMerge(blocker))
+          ? [blocker]
+          : [];
+      })
+    : [];
+  const heldUpBy = open ? kanbanHeldUpBy(card, byId) : undefined;
+  return {
+    unblocks: entry?.holds ?? 0,
+    rank: entry?.rank ?? card.priority,
+    ready:
+      open &&
+      card.stage === "todo" &&
+      card.activeThreadId === null &&
+      card.stalled === null &&
+      card.priority !== KANBAN_BACKLOG &&
+      !kanbanWaitsOnEvaluator(card) &&
+      heldUpBy === undefined,
+    waitsOn,
+    heldUpBy,
   };
 }
 
