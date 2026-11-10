@@ -36,6 +36,7 @@ import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
+import * as Asks from "./engine/asks.ts";
 import { textProblem } from "./engine/text.ts";
 import { stubMessage } from "./engine/messagePages.ts";
 import * as BoardReplies from "./engine/boardReplies.ts";
@@ -137,7 +138,8 @@ const AnswerBody = Schema.Struct({
   text: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
-const AskVerdict = Schema.Literals(["approved", "rejected", "picked", "answered"]);
+// Which verdicts an ask takes depends on its response parts: the engine checks.
+const AskVerdict = Schema.String;
 const AskAnswerFields = {
   verdict: AskVerdict,
   optionIds: Schema.optional(Schema.Array(Schema.String)),
@@ -149,6 +151,8 @@ const AskAnswerBody = Schema.Struct({
   ...AskAnswerFields,
   /** A draft ask: the text to post, as the owner left it. */
   finalDraft: Text,
+  /** Field id to value, for an ask with fields. A file field takes the uploads' attachments. */
+  values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   /** The revision the client showed; a newer one answers with 409. */
   revision: Schema.optional(Schema.Int),
 });
@@ -164,6 +168,10 @@ const AskBatchBody = Schema.Struct({
 });
 const AskHandBody = Schema.Struct({
   action: Schema.optional(Schema.Literals(["hand", "take_back"])),
+  /** With hand: also ask an evaluator to take asks like this one from now on. */
+  always: Schema.optional(Schema.Boolean),
+  /** With always: what the owner said, passed to that evaluator word for word. */
+  text: Text,
 });
 /** At most this many asks in one batch answer. */
 const ASK_BATCH_MAX = 50;
@@ -581,9 +589,28 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         if (items.length > ASK_BATCH_MAX) {
           return yield* fail("invalid", `At most ${ASK_BATCH_MAX} asks in one batch.`);
         }
+        // One answer fits several asks only when they take the same thing back.
+        let shape: string | null = null;
         const results = yield* Effect.forEach(items, (item) =>
           Effect.gen(function* () {
             const card = yield* cardOf(item.card);
+            const open = Asks.findOpenAsk(card, item.askId);
+            if (open) {
+              const own = Asks.batchShape(open);
+              if (own === null) {
+                return yield* fail(
+                  "invalid",
+                  `${item.askId} on card #${card.number} takes more than one answer can give several asks: answer it on its own.`,
+                );
+              }
+              shape ??= own;
+              if (own !== shape) {
+                return yield* fail(
+                  "invalid",
+                  `${item.askId} on card #${card.number} doesn't take the same answer as the first ask in the batch: answer it on its own.`,
+                );
+              }
+            }
             const result = yield* service.answerAsk(
               card.id,
               item.askId,
@@ -628,7 +655,44 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const card = yield* cardOf(yield* param("card"));
         const askId = yield* param("ask");
         const input = yield* body(AskHandBody);
-        return askOf(yield* service.handAsk(card.id, askId, input.action ?? "hand", OWNER), askId);
+        const action = input.action ?? "hand";
+        const always = action === "hand" && input.always === true;
+        if (!always) return askOf(yield* service.handAsk(card.id, askId, action, OWNER), askId);
+        const words = input.text?.trim() ?? "";
+        const problem =
+          textProblem([["text", words]]) ??
+          (words.length > Asks.ASK_LIMITS.note
+            ? `text is at most ${Asks.ASK_LIMITS.note} characters.`
+            : null);
+        if (problem) return yield* fail("invalid", problem);
+        const board = yield* boardOf(card.boardId);
+        const handed = yield* service.handAsk(card.id, askId, "hand", OWNER, true);
+        const ask = handed.asks.find((entry) => entry.id === askId);
+        if (!ask) return askOf(handed, askId);
+        // The hand-over stands whether or not the evaluator starts: it is a second step,
+        // outside the hand-over's board write.
+        const started = yield* service
+          .startEvaluator(board.id, {
+            kind: "request",
+            text: Asks.alwaysText(handed, `${board.slug}:${handed.number}`, ask, words),
+          })
+          .pipe(
+            Effect.map((threadId) => ({ threadId, error: null })),
+            Effect.catchTags({
+              KanbanError: (error) => Effect.succeed({ threadId: null, error: error.detail }),
+            }),
+          );
+        if (started.threadId === null) {
+          return {
+            ...askOf(handed, askId),
+            evaluator: { started: false, threadId: null, error: started.error },
+          };
+        }
+        const noted = yield* service.noteHandEvaluator(card.id, askId, started.threadId);
+        return {
+          ...askOf(noted, askId),
+          evaluator: { started: true, threadId: started.threadId, error: null },
+        };
       }),
     );
 

@@ -155,9 +155,13 @@ describe("askFields", () => {
     );
     assert.strictEqual(mixed.code, "invalid");
     assert.include(mixed.detail, "can't carry action");
+    // A kind is a label: one exhibit under any other label is fine, two never are.
+    assert.isFalse(Asks.isAskProblem(Asks.askFields({ kind: "question", draft: { text: "Hi" } })));
     assert.include(
-      problem(Asks.askFields({ kind: "question", draft: { text: "Hi" } })).detail,
-      "draft",
+      problem(
+        Asks.askFields({ kind: "release", draft: { text: "Hi" }, action: { summary: "Deploy" } }),
+      ).detail,
+      "can't carry draft and action: ask one thing per ask",
     );
   });
 
@@ -472,13 +476,18 @@ describe("answerFor and answerText", () => {
     );
     assert.include(detail({ verdict: "picked", optionIds: ["o1", "o2"] }), "takes one option");
     assert.include(detail({ verdict: "answered" }), "needs text");
-    assert.include(detail({ verdict: "approved", finalDraft: "x" }), "has no draft");
+    assert.include(detail({ verdict: "approved" }), 'takes picked, answered (got "approved")');
+    assert.include(detail({ verdict: "maybe" }, draftAsk), "takes approved, rejected, answered");
+    assert.include(
+      detail({ verdict: "picked", optionIds: ["o1"], finalDraft: "x" }),
+      "has no draft",
+    );
     assert.include(
       detail({ verdict: "approved", finalDraft: "  " }, draftAsk),
       "reject the draft instead",
     );
     assert.include(
-      detail({ verdict: "approved", note: "x".repeat(4_001) }),
+      detail({ verdict: "approved", note: "x".repeat(4_001) }, draftAsk),
       "note is at most 4000",
     );
   });

@@ -6,6 +6,7 @@
  * the threads started since the last list.
  */
 import {
+  kanbanAskIsNotice,
   kanbanAskWaitsOn,
   type KanbanBoard,
   type KanbanBoardListEntry,
@@ -50,7 +51,7 @@ const cardCount = (card: SummaryCard): CardCount | null => {
   let ownerUntil = 0;
   let open = 0;
   for (const ask of card.asks) {
-    if (ask.closedAt !== null) continue;
+    if (ask.closedAt !== null || kanbanAskIsNotice(ask)) continue;
     open += 1;
     if (kanbanAskWaitsOn(ask) !== "owner") continue;
     ownerUntil = Math.max(

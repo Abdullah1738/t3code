@@ -6,6 +6,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  kanbanAskChanges,
   kanbanAskWaitsOn,
   type KanbanActor,
 } from "@t3tools/contracts";
@@ -178,12 +179,14 @@ it.effect("card_ask takes a template with blocks and answers with a small summar
     });
     assert.notInclude(asked.text, "Long prompt text");
     const ask = (yield* kanban.card(card.id)).card.asks[0]!;
-    assert.deepStrictEqual(ask.change, {
-      label: "card_get description",
-      before: "One card.",
-      after: "One card with its history.",
-      format: "markdown",
-    });
+    assert.deepStrictEqual(kanbanAskChanges(ask), [
+      {
+        label: "card_get description",
+        before: "One card.",
+        after: "One card with its history.",
+        format: "markdown",
+      },
+    ]);
     assert.strictEqual(ask.batchKey, "tool-texts");
     assert.strictEqual(ask.blocks?.length, 3);
 
@@ -379,14 +382,20 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
   }).pipe(Effect.provide(testLayer())),
 );
 
-it("the card_ask description teaches the five templates and blocks, and stays short", () => {
+it("the card_ask description says what he can give back, and stays short", () => {
   const description = KanbanToolkit.tools.card_ask.description ?? "";
   for (const word of [
-    "question",
-    "decision",
-    "draft",
-    "action",
-    "change",
+    "approve or reject",
+    "a pick",
+    "values he fills in",
+    "a file",
+    "an edit of your draft",
+    "a step he does himself",
+    "seen",
+    "Shortcuts",
+    "One thing per ask",
+    "notice",
+    "respond",
     "blocks",
     "html",
     "alt text",

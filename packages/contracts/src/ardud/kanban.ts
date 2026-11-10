@@ -210,14 +210,30 @@ export const KanbanAskBlock = Schema.Union([
 ]);
 export type KanbanAskBlock = typeof KanbanAskBlock.Type;
 
-export const KANBAN_ASK_KINDS = ["question", "decision", "draft", "action", "change"] as const;
 /**
- * What an ask is for: an open question, a pick between options, a text to
- * approve before it is posted or sent, an action to approve before it runs, or
- * a text being replaced.
+ * Kinds with a ready layout and ready response parts. A kind is a label, not a
+ * closed list: any other string is valid, and clients render every ask from
+ * `kanbanAskResponse`, never by switching on its kind.
  */
-export const KanbanAskKind = Schema.Literals(KANBAN_ASK_KINDS);
-export type KanbanAskKind = typeof KanbanAskKind.Type;
+export const KANBAN_ASK_PRESETS = [
+  "question",
+  "decision",
+  "draft",
+  "action",
+  "change",
+  "input",
+  "secret",
+  "file",
+  "task",
+  "signoff",
+  "notice",
+  "rank",
+] as const;
+export type KanbanAskPreset = (typeof KANBAN_ASK_PRESETS)[number];
+/** @deprecated The same list under its first name. */
+export const KANBAN_ASK_KINDS = KANBAN_ASK_PRESETS;
+export const KanbanAskKind = Schema.String;
+export type KanbanAskKind = string;
 
 export const KanbanAskTextFormat = Schema.Literals(["markdown", "text"]);
 export type KanbanAskTextFormat = typeof KanbanAskTextFormat.Type;
@@ -226,9 +242,13 @@ export type KanbanAskTextFormat = typeof KanbanAskTextFormat.Type;
 export const KanbanAskOption = Schema.Struct({
   id: TrimmedNonEmptyString,
   label: TrimmedNonEmptyString,
-  /** What picking it leads to. */
+  /** What the option is. */
   detail: Schema.optional(Schema.String),
   recommended: Schema.optional(Schema.Boolean),
+  /** What happens once it is picked, when the label doesn't say. */
+  consequence: Schema.optional(Schema.String),
+  /** Index into the ask's `blocks`: the picture or page that shows this option. */
+  block: Schema.optional(NonNegativeInt),
 });
 export type KanbanAskOption = typeof KanbanAskOption.Type;
 
@@ -260,22 +280,121 @@ export const KanbanAskChange = Schema.Struct({
 });
 export type KanbanAskChange = typeof KanbanAskChange.Type;
 
+/**
+ * The types of value a field takes. A client shows a type it doesn't know as
+ * text, so a newer server never breaks an older client.
+ */
+export const KANBAN_ASK_FIELD_TYPES = [
+  "text",
+  "longtext",
+  "number",
+  "date",
+  "datetime",
+  "toggle",
+  "select",
+  "rank",
+  "file",
+  "secret",
+  "custom",
+] as const;
+export type KanbanAskFieldType = (typeof KANBAN_ASK_FIELD_TYPES)[number];
+
+export const KanbanAskFieldOption = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  label: TrimmedNonEmptyString,
+});
+export type KanbanAskFieldOption = typeof KanbanAskFieldOption.Type;
+
+/**
+ * One value the owner fills in. The keys after `default` belong to one type
+ * each: `unit`, `min`, `max` to number; `options` to select (the choices) and
+ * rank (the items to order); `multi` to select; `accepts` and `maxFiles` to
+ * file; `block` to custom.
+ */
+export const KanbanAskField = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  label: Schema.String,
+  /** One of `KANBAN_ASK_FIELD_TYPES`. */
+  type: Schema.String,
+  required: Schema.optional(Schema.Boolean),
+  hint: Schema.optional(Schema.String),
+  /** What the field starts with; the same shape as its value. */
+  default: Schema.optional(Schema.Json),
+  unit: Schema.optional(Schema.String),
+  min: Schema.optional(Schema.Finite),
+  max: Schema.optional(Schema.Finite),
+  options: Schema.optional(Schema.Array(KanbanAskFieldOption)),
+  multi: Schema.optional(Schema.Boolean),
+  /** Mime types (`image/*`, `application/pdf`) or extensions (`.csv`) a file field takes. */
+  accepts: Schema.optional(Schema.Array(Schema.String)),
+  maxFiles: Schema.optional(PositiveInt),
+  /** A custom field: index into the ask's `blocks` of the html page that produces its value. */
+  block: Schema.optional(NonNegativeInt),
+});
+export type KanbanAskField = typeof KanbanAskField.Type;
+
+export const KanbanAskTaskStep = Schema.Struct({
+  text: Schema.String,
+  link: Schema.optional(Schema.String),
+});
+export type KanbanAskTaskStep = typeof KanbanAskTaskStep.Type;
+
+/**
+ * What the owner gives back, as parts that combine. Stored on asks whose
+ * asker wrote them or whose kind is not one of the first five; read every ask
+ * through `kanbanAskResponse`.
+ */
+export const KanbanAskRespond = Schema.Struct({
+  /** Approve or reject, under these labels when given ("Deploy" / "Don't deploy"). */
+  verdict: Schema.optional(
+    Schema.Struct({
+      approve: Schema.optional(Schema.String),
+      reject: Schema.optional(Schema.String),
+    }),
+  ),
+  /** Pick from the ask's `options`; `multi` on the ask says whether several. */
+  choose: Schema.optional(
+    Schema.Struct({
+      min: Schema.optional(NonNegativeInt),
+      max: Schema.optional(PositiveInt),
+    }),
+  ),
+  /** A small form. */
+  fields: Schema.optional(Schema.Array(KanbanAskField)),
+  /** The exhibit he may edit before approving. Only "draft" today. */
+  edit: Schema.optional(Schema.String),
+  /** Steps he does himself; he answers done or couldn't. `proof` names the field that shows it. */
+  task: Schema.optional(
+    Schema.Struct({
+      steps: Schema.Array(KanbanAskTaskStep),
+      proof: Schema.optional(Schema.String),
+    }),
+  ),
+  /** Nothing to decide: he only marks it seen. Never combined with another part. */
+  ack: Schema.optional(Schema.Boolean),
+});
+export type KanbanAskRespond = typeof KanbanAskRespond.Type;
+
+/** The verdicts this build writes. Read as a string: a newer build may add one. */
 export const KANBAN_ASK_VERDICTS = [
   "approved",
   "rejected",
   "picked",
   "answered",
+  "done",
+  "cant",
+  "acknowledged",
   "handed",
   "dropped",
 ] as const;
-export const KanbanAskVerdict = Schema.Literals(KANBAN_ASK_VERDICTS);
-export type KanbanAskVerdict = typeof KanbanAskVerdict.Type;
+export const KanbanAskVerdict = Schema.String;
+export type KanbanAskVerdict = string;
 
 /** How an ask closed. Asks closed before typed asks existed have none. */
 export const KanbanAskAnswer = Schema.Struct({
   verdict: KanbanAskVerdict,
   /** With `handed`: what the evaluator decided on the owner's behalf. */
-  decision: Schema.optional(Schema.Literals(["approved", "rejected", "picked", "answered"])),
+  decision: Schema.optional(Schema.String),
   optionIds: Schema.optional(Schema.Array(Schema.String)),
   /** The answer in the answerer's own words. */
   text: Schema.optional(Schema.String),
@@ -285,6 +404,15 @@ export const KanbanAskAnswer = Schema.Struct({
   finalDraft: Schema.optional(Schema.String),
   /** True when `finalDraft` differs from the draft the agent wrote. */
   draftEdited: Schema.optional(Schema.Boolean),
+  /**
+   * Field id to the value given. A file field holds the attachments the board
+   * kept; a secret field holds `{ "secret": true }`, never the value.
+   */
+  values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+  /** He handed it over with "every time": an evaluator was asked to take asks like it from now on. */
+  always: Schema.optional(Schema.Boolean),
+  /** The evaluator thread that "every time" started. */
+  evaluatorThreadId: Schema.optional(ThreadId),
   by: KanbanActor,
   at: IsoDateTime,
 });
@@ -295,12 +423,14 @@ export type KanbanAskAnswer = typeof KanbanAskAnswer.Type;
  * async one lets its work go on and can be made blocking later.
  *
  * Everything after `closedAt` is optional and absent on asks stored before
- * typed asks: read `kind` and `revision` through `kanbanAskKind` and
- * `kanbanAskRevision`.
+ * typed asks: read `kind`, `revision`, the changes and what he gives back
+ * through `kanbanAskKind`, `kanbanAskRevision`, `kanbanAskChanges` and
+ * `kanbanAskResponse`.
  */
 export const KanbanOwnerAsk = Schema.Struct({
   /** `q1`, `q2`, ... per card; also the id of its pick block when it has options. */
   id: TrimmedNonEmptyString,
+  /** The question. It must read alone: it is all an older client shows. */
   text: Schema.String,
   blocking: Schema.Boolean,
   by: KanbanActor,
@@ -309,7 +439,7 @@ export const KanbanOwnerAsk = Schema.Struct({
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
-  /** Absent means "question". */
+  /** A label for the layout; absent means "question". Behaviour comes from `kanbanAskResponse`. */
   kind: Schema.optional(KanbanAskKind),
   /** One short line saying what is being asked. */
   title: Schema.optional(Schema.String),
@@ -320,7 +450,14 @@ export const KanbanOwnerAsk = Schema.Struct({
   multi: Schema.optional(Schema.Boolean),
   draft: Schema.optional(KanbanAskDraft),
   action: Schema.optional(KanbanAskAction),
+  /** One text being replaced, as first stored. New asks write `changes`. */
   change: Schema.optional(KanbanAskChange),
+  /** The texts being replaced, e.g. one per file. */
+  changes: Schema.optional(Schema.Array(KanbanAskChange)),
+  /** What he gives back, when it isn't what the kind and contents imply. */
+  respond: Schema.optional(KanbanAskRespond),
+  /** Who it is for: absent means the owner. "evaluator" asks the board's evaluator instead. */
+  to: Schema.optional(Schema.String),
   /** The facts the ask rests on (a head commit, a version). */
   basis: Schema.optional(Schema.String),
   /** Past this time the ask is stale and can't be answered until its asker renews it. */
@@ -337,8 +474,12 @@ export const KanbanOwnerAsk = Schema.Struct({
   answer: Schema.optional(KanbanAskAnswer),
   /** The owner asked a clarifying question: the ask waits for the agent, not for him. */
   clarifyAskedAt: Schema.optional(IsoDateTime),
-  /** The owner handed it to the evaluator, which answers on his behalf. */
+  /** It is with the evaluator: the owner handed it over, or it was asked `to` the evaluator. */
   handedAt: Schema.optional(IsoDateTime),
+  /** He handed it over with "every time"; copied to the answer when it closes. */
+  handedAlways: Schema.optional(Schema.Boolean),
+  /** The evaluator thread "every time" started; copied to the answer when it closes. */
+  handedThreadId: Schema.optional(ThreadId),
   /**
    * Evidence and visuals shown with the ask: text, an html page, images and
    * files. On the card a big md, collapse or html body is a stub (`truncated`,
@@ -352,6 +493,106 @@ export const kanbanAskKind = (ask: Pick<KanbanOwnerAsk, "kind">): KanbanAskKind 
   ask.kind ?? "question";
 export const kanbanAskRevision = (ask: Pick<KanbanOwnerAsk, "revision">): number =>
   ask.revision ?? 0;
+/** The texts an ask replaces, whichever way it stored them. */
+export const kanbanAskChanges = (
+  ask: Pick<KanbanOwnerAsk, "change" | "changes">,
+): ReadonlyArray<KanbanAskChange> => ask.changes ?? (ask.change ? [ask.change] : []);
+
+/** The id of the one field a plain question takes; its value is stored as the answer's `text`. */
+export const KANBAN_ASK_ANSWER_FIELD = "answer";
+
+/** What the owner gives back on an ask, with every default filled in. */
+export interface KanbanAskResponse {
+  /** Approve or reject, under these labels. */
+  readonly verdict: { readonly approve: string; readonly reject: string } | null;
+  /** Pick `min` to `max` of these options. */
+  readonly choose: {
+    readonly options: ReadonlyArray<KanbanAskOption>;
+    readonly multi: boolean;
+    readonly min: number;
+    readonly max: number;
+  } | null;
+  /** Values to fill in. A plain question is one required longtext field, `answer`. */
+  readonly fields: ReadonlyArray<KanbanAskField>;
+  /** The exhibit he may edit before approving. */
+  readonly edit: "draft" | null;
+  /** Steps he does himself, answered with done or couldn't. */
+  readonly task: {
+    readonly steps: ReadonlyArray<KanbanAskTaskStep>;
+    readonly proof?: string | undefined;
+  } | null;
+  /** Nothing to decide: he marks it seen. */
+  readonly ack: boolean;
+}
+
+type AskResponseFields = Pick<
+  KanbanOwnerAsk,
+  "kind" | "options" | "multi" | "draft" | "action" | "change" | "changes" | "respond"
+>;
+
+const chooseOf = (
+  ask: Pick<KanbanOwnerAsk, "options" | "multi">,
+  limits: { readonly min?: number | undefined; readonly max?: number | undefined } = {},
+): KanbanAskResponse["choose"] => {
+  const options = ask.options ?? [];
+  if (options.length === 0) return null;
+  const multi = ask.multi === true;
+  const max = Math.min(limits.max ?? (multi ? options.length : 1), options.length);
+  return { options, multi, min: Math.min(limits.min ?? 1, max), max };
+};
+
+/**
+ * The response parts of any ask: the ones its asker wrote, or the ones its
+ * kind and contents imply. An ask stored before typed asks (no kind, no
+ * options) takes a free-text reply and nothing else. Clients render from
+ * this and never switch on `kind` for behaviour.
+ */
+export const kanbanAskResponse = (ask: AskResponseFields): KanbanAskResponse => {
+  const stored = ask.respond;
+  if (stored !== undefined) {
+    return {
+      verdict: stored.verdict
+        ? {
+            approve: stored.verdict.approve ?? "Approve",
+            reject: stored.verdict.reject ?? "Reject",
+          }
+        : null,
+      choose: stored.choose ? chooseOf(ask, stored.choose) : null,
+      fields: stored.fields ?? [],
+      edit: stored.edit === "draft" && ask.draft !== undefined ? "draft" : null,
+      task: stored.task ?? null,
+      ack: stored.ack === true,
+    };
+  }
+  const choose = chooseOf(ask);
+  const exhibit =
+    ask.draft !== undefined || ask.action !== undefined || kanbanAskChanges(ask).length > 0;
+  return {
+    // Options stand in for approve and reject, as the ask's pick block always showed them.
+    verdict: choose === null && exhibit ? { approve: "Approve", reject: "Reject" } : null,
+    choose,
+    fields:
+      choose === null && !exhibit
+        ? [
+            {
+              id: KANBAN_ASK_ANSWER_FIELD as KanbanAskField["id"],
+              label: "Your answer",
+              type: "longtext",
+              required: true,
+            },
+          ]
+        : [],
+    edit: ask.draft !== undefined ? "draft" : null,
+    task: null,
+    ack: false,
+  };
+};
+
+/** A notice: nothing to decide, he only marks it seen. Never blocking, never in the needs-owner count. */
+export const kanbanAskIsNotice = (ask: {
+  readonly respond?: { readonly ack?: boolean | undefined } | undefined;
+}): boolean => ask.respond?.ack === true;
+
 /** An open ask the owner is not expected to act on right now, and why. */
 export const kanbanAskWaitsOn = (
   ask: Pick<KanbanOwnerAsk, "clarifyAskedAt" | "handedAt" | "closedAt">,
@@ -435,11 +676,17 @@ export const kanbanOpenAsks = (card: Pick<KanbanCard, "asks">): ReadonlyArray<Ka
 export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "settledAt">) =>
   card.settledAt === null && (card.stage === "needs_owner" || kanbanOpenAsks(card).length > 0);
 
-type AskTurnFields = Pick<KanbanOwnerAsk, "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt">;
+type AskTurnFields = Pick<
+  KanbanOwnerAsk,
+  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt"
+> & { readonly respond?: { readonly ack?: boolean | undefined } | undefined };
 
-/** An open ask the owner can answer now: his turn, and not past its `expiresAt`. */
+/**
+ * An open ask that needs the owner now: his turn, not past its `expiresAt`,
+ * and something to decide (a notice only wants to be seen).
+ */
 export const kanbanAskNeedsOwner = (ask: AskTurnFields, nowMs: number): boolean =>
-  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs);
+  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs) && !kanbanAskIsNotice(ask);
 
 export interface KanbanAskTurns {
   /** His turn, and answerable. */
@@ -450,6 +697,8 @@ export interface KanbanAskTurns {
   readonly evaluator: number;
   /** His turn, but past `expiresAt`: their asker must renew them. */
   readonly expired: number;
+  /** His to see, nothing to decide. */
+  readonly notices: number;
 }
 
 /** A card's open asks, counted by whose turn they are. A settled card has none. */
@@ -457,13 +706,14 @@ export const kanbanAskTurns = (
   card: { readonly settledAt: string | null; readonly asks: ReadonlyArray<AskTurnFields> },
   nowMs: number,
 ): KanbanAskTurns => {
-  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0 };
+  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, notices: 0 };
   if (card.settledAt !== null) return turns;
   for (const ask of card.asks) {
     const turn = kanbanAskWaitsOn(ask);
     if (turn === null) continue;
     if (turn !== "owner") turns[turn] += 1;
     else if (kanbanAskExpired(ask, nowMs)) turns.expired += 1;
+    else if (kanbanAskIsNotice(ask)) turns.notices += 1;
     else turns.owner += 1;
   }
   return turns;
@@ -471,7 +721,7 @@ export const kanbanAskTurns = (
 
 /**
  * Whether a card counts in the "needs you" numbers: it has an ask the owner can
- * answer now, or it sits in Needs Owner with no open ask (a hold set by hand).
+ * answer now, or it sits in Needs Owner with no open ask to decide (a hold set by hand).
  * A card whose open asks are all handed over, waiting on their asker or expired
  * does not count, though a blocking one still holds it in Needs Owner.
  */
@@ -485,7 +735,8 @@ export const kanbanCardNeedsOwner = (
 ): boolean =>
   card.settledAt === null &&
   (card.asks.some((ask) => kanbanAskNeedsOwner(ask, nowMs)) ||
-    (card.stage === "needs_owner" && card.asks.every((ask) => ask.closedAt !== null)));
+    (card.stage === "needs_owner" &&
+      card.asks.every((ask) => ask.closedAt !== null || kanbanAskIsNotice(ask))));
 
 /** The step the card is on: the first with an open subtask, or null when none is open. */
 export const kanbanOpenStep = (card: Pick<KanbanCard, "subtasks">): number | null =>

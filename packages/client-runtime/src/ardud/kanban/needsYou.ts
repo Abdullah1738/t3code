@@ -7,12 +7,15 @@
 import {
   KANBAN_DONE_STAGES,
   kanbanAskExpired,
+  kanbanAskIsNotice,
   kanbanAskKind,
+  kanbanAskResponse,
   kanbanAskRevision,
   kanbanAskWaitsOn,
   kanbanOpenAsks,
   type KanbanAskFeedItem,
   type KanbanAskKind,
+  type KanbanAskResponse,
   type KanbanAskTurns,
   type KanbanCard,
   type KanbanOwnerAsk,
@@ -31,7 +34,12 @@ export interface NeedsYouItem {
   readonly stage: KanbanStage;
   readonly priority: number;
   readonly ask: KanbanOwnerAsk;
+  /** A label for the layout; any string. Render from `response`, never from this. */
   readonly kind: KanbanAskKind;
+  /** What he gives back, with defaults filled in: the parts to render and to send. */
+  readonly response: KanbanAskResponse;
+  /** Nothing to decide: he only marks it seen. */
+  readonly notice: boolean;
   readonly revision: number;
   readonly blocking: boolean;
   /** Unfinished cards that wait on this ask's card. */
@@ -65,9 +73,11 @@ export interface NeedsYou {
   readonly withEvaluator: ReadonlyArray<NeedsYouItem>;
   /** His turn, but stale: shown, not answerable. */
   readonly expired: ReadonlyArray<NeedsYouItem>;
+  /** His to see, nothing to decide: apart from the asks, never counted, never blocking. */
+  readonly notices: ReadonlyArray<NeedsYouItem>;
   /** How many asks are his turn and answerable: the number a badge shows. */
   readonly count: number;
-  /** Every open ask by whose turn it is; the four add up to all open asks. */
+  /** Every open ask by whose turn it is; the five add up to all open asks. */
   readonly counts: KanbanAskTurns;
   /** Of those, how many hold their card. */
   readonly blocking: number;
@@ -100,8 +110,10 @@ const itemOf = (
   priority: card.priority,
   ask,
   kind: kanbanAskKind(ask),
+  response: kanbanAskResponse(ask),
+  notice: kanbanAskIsNotice(ask),
   revision: kanbanAskRevision(ask),
-  blocking: ask.blocking,
+  blocking: ask.blocking && !kanbanAskIsNotice(ask),
   unblocks,
   ageMs: Math.max(0, nowMs - Date.parse(ask.at)),
   expired: kanbanAskExpired(ask, nowMs),
@@ -114,15 +126,19 @@ export function rankNeedsYou(all: ReadonlyArray<NeedsYouItem>): NeedsYou {
   const waitingOnAgent: Array<NeedsYouItem> = [];
   const withEvaluator: Array<NeedsYouItem> = [];
   const expired: Array<NeedsYouItem> = [];
+  const notices: Array<NeedsYouItem> = [];
   for (const item of all) {
     const turn = kanbanAskWaitsOn(item.ask);
     if (turn === null) continue;
     if (turn === "agent") waitingOnAgent.push(item);
     else if (turn === "evaluator") withEvaluator.push(item);
     else if (item.expired) expired.push(item);
+    else if (item.notice) notices.push(item);
     else mine.push(item);
   }
-  for (const list of [mine, waitingOnAgent, withEvaluator, expired]) list.sort(compareNeedsYou);
+  for (const list of [mine, waitingOnAgent, withEvaluator, expired, notices]) {
+    list.sort(compareNeedsYou);
+  }
 
   // Asks with the same key on a board fold into one entry, placed at its best item.
   const batches = new Map<string, Array<NeedsYouItem>>();
@@ -158,12 +174,14 @@ export function rankNeedsYou(all: ReadonlyArray<NeedsYouItem>): NeedsYou {
     waitingOnAgent,
     withEvaluator,
     expired,
+    notices,
     count: mine.length,
     counts: {
       owner: mine.length,
       agent: waitingOnAgent.length,
       evaluator: withEvaluator.length,
       expired: expired.length,
+      notices: notices.length,
     },
     blocking: mine.filter((item) => item.blocking).length,
   };

@@ -371,12 +371,22 @@ export interface KanbanServiceShape {
     blocks: ReadonlyArray<KanbanBlock>,
     role: Rules.MoveRole,
   ) => Effect.Effect<KanbanMessage, KanbanError>;
-  /** The owner hands one ask to the evaluator or takes it back; an evaluator returns it. */
+  /**
+   * The owner hands one ask to the evaluator or takes it back; an evaluator
+   * returns it. `always` marks a hand-over as "and asks like it from now on".
+   */
   readonly handAsk: (
     cardId: KanbanCard["id"],
     askId: string,
     action: "hand" | "take_back" | "return",
     actor: KanbanActor,
+    always?: boolean,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** Records the evaluator thread an "every time" hand-over started, while the ask is still handed. */
+  readonly noteHandEvaluator: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    threadId: ThreadId,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /** One ask, open or closed, with its blocks whole (the card holds big ones as stubs). */
   readonly askDetail: (
@@ -6923,8 +6933,14 @@ const make = Effect.gen(function* () {
         yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
-        const written = Asks.askFields(input);
+        const written = Asks.askFields(input, { blocking: input.blocking });
         if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
+        if (written.to === "evaluator" && actor._tag !== "thread") {
+          return yield* failWith(
+            "invalid",
+            "only a card's thread asks the evaluator: ask the owner",
+          );
+        }
         const fields = yield* adoptAskFiles(card.boardId, written);
         if (card.settledAt !== null) return yield* failWith("denied", "card is settled");
         const at = yield* nowIso;
@@ -6943,7 +6959,18 @@ const make = Effect.gen(function* () {
           yield* evaluatorTurn(card, next, actor);
         }
         const ask = next.asks.at(-1);
-        return ask ? yield* postAsk(next, ask, [], false, fields) : next;
+        if (!ask) return next;
+        const asked = yield* postAsk(next, ask, [], false, fields);
+        if (fields.to !== "evaluator") return asked;
+        // Asked to the evaluator: it starts out where a handed ask is.
+        const handed = { ...Asks.markHanded(asked, ask.id, at), updatedAt: at };
+        yield* saveCard(handed);
+        const stored = handed.asks.find((entry) => entry.id === ask.id) ?? ask;
+        yield* toEvaluator(
+          yield* cardDiscussionUnlocked(card.id),
+          Asks.handText(handed, stored, false),
+        );
+        return handed;
       }),
     );
 
@@ -7053,11 +7080,7 @@ const make = Effect.gen(function* () {
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor) =>
     guard(
       Effect.gen(function* () {
-        yield* checkText([
-          ["answer", input.text],
-          ["note", input.note],
-          ["finalDraft", input.finalDraft],
-        ]);
+        yield* checkText(Asks.answerTextFields(input));
         const card = yield* cardOf(cardId);
         const ask = card.asks.find((entry) => entry.id === askId);
         if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
@@ -7068,8 +7091,29 @@ const make = Effect.gen(function* () {
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
           );
         }
-        const answer = Asks.answerFor(card, ask, input, actor, yield* nowIso);
-        if (Asks.isAskProblem(answer)) return yield* failWith(answer.code, answer.detail);
+        const checked = Asks.answerFor(card, ask, input, actor, yield* nowIso);
+        if (Asks.isAskProblem(checked)) return yield* failWith(checked.code, checked.detail);
+        // The files he gave are kept before the card changes: one that can't be refuses the answer.
+        let answer = checked;
+        const given = Asks.answerFiles(ask, checked);
+        if (given.length > 0) {
+          const claim = yield* attachments.claim(
+            card.boardId,
+            given.flatMap((entry) =>
+              entry.files.map((attachment) => ({ _tag: "attachment" as const, attachment })),
+            ),
+          );
+          const kept = claim.blocks.flatMap((block) =>
+            block._tag === "attachment" ? [block.attachment] : [],
+          );
+          let from = 0;
+          const values: Record<string, unknown> = { ...checked.values };
+          for (const entry of given) {
+            values[entry.fieldId] = kept.slice(from, from + entry.files.length);
+            from += entry.files.length;
+          }
+          answer = { ...checked, values: values as NonNullable<KanbanAskAnswer["values"]> };
+        }
         const discussion = yield* cardDiscussionUnlocked(card.id);
         // The ask's pick block shows the answer to clients that only read the discussion.
         const asked = ask.seq === null ? null : yield* store.message(discussion.id, ask.seq);
@@ -7094,7 +7138,7 @@ const make = Effect.gen(function* () {
         const result = yield* answerAsks(
           discussion,
           fresh,
-          Asks.answerText(fresh, ask, answer),
+          Asks.answerText(fresh, ask, answer, attachments.pathOf),
           (open) => open.id === ask.id,
           actor,
           false,
@@ -7162,7 +7206,7 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const handAsk: KanbanServiceShape["handAsk"] = (cardId, askId, action, actor) =>
+  const handAsk: KanbanServiceShape["handAsk"] = (cardId, askId, action, actor, always) =>
     guard(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
@@ -7195,12 +7239,25 @@ const make = Effect.gen(function* () {
           return yield* failWith("invalid", `${ref} is already with the evaluator`);
         }
         const discussion = yield* cardDiscussionUnlocked(card.id);
-        const next = { ...Asks.markHanded(yield* cardOf(card.id), ask.id, at), updatedAt: at };
+        const next = {
+          ...Asks.markHanded(yield* cardOf(card.id), ask.id, at, always === true),
+          updatedAt: at,
+        };
         yield* logEvent(next, actor, "comment", {
-          body: `Owner handed ${ask.id} to the evaluator`,
+          body: `Owner handed ${ask.id} to the evaluator${always === true ? ", and asks like it from now on" : ""}`,
         });
         yield* saveCard(next);
         yield* toEvaluator(discussion, Asks.handText(next, ask));
+        return next;
+      }),
+    );
+
+  const noteHandEvaluator: KanbanServiceShape["noteHandEvaluator"] = (cardId, askId, threadId) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const next = Asks.markHandEvaluator(card, askId, threadId);
+        if (next !== card) yield* saveCard(next);
         return next;
       }),
     );
@@ -8512,6 +8569,7 @@ const make = Effect.gen(function* () {
     answerAsk,
     replyOnAsk,
     handAsk,
+    noteHandEvaluator,
     askDetail,
     askFeed,
     reviewResult,

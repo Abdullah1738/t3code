@@ -5,6 +5,7 @@ import {
   KanbanDiscussionId,
   KanbanGoalId,
   OrchestratorMcpFailure,
+  kanbanAskIsNotice,
   ProjectId,
   type KanbanActor,
   type KanbanBlock,
@@ -87,6 +88,9 @@ const askFieldsOf = (input: Asks.AskFieldsInput): Asks.AskFieldsInput => ({
   draft: input.draft,
   action: input.action,
   change: input.change,
+  changes: input.changes,
+  respond: input.respond,
+  to: input.to,
   basis: input.basis,
   expiresAt: input.expiresAt,
   batchKey: input.batchKey,
@@ -550,6 +554,11 @@ const handlers = {
         const open = changed.asks.find((entry) => entry.id === askId && entry.closedAt === null);
         // Asking for blocking on an ask that already blocks is fine when it came with an edit.
         if ((action === "block" || blocking === true) && !(edits && open?.blocking === true)) {
+          if (open && kanbanAskIsNotice(open)) {
+            return yield* invalid(
+              "A notice can't block: there is nothing for the card to wait for. Ask a real question instead.",
+            );
+          }
           changed = yield* service.changeAsk(card.id, askId, "block", caller.actor, role);
         }
         return { card: Asks.askSummary(changed, askId) };
@@ -569,6 +578,7 @@ const handlers = {
             verdict: input.verdict,
             optionIds: input.optionIds,
             text: input.text,
+            values: input.values,
             note: input.note,
             finalDraft: input.finalDraft,
           },

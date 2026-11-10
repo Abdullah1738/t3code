@@ -388,7 +388,9 @@ const make = Effect.gen(function* () {
                 json_object(
                   'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
                   'handedAt', json_extract(ask.value, '$.handedAt'),
-                  'expiresAt', json_extract(ask.value, '$.expiresAt')
+                  'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                  'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
+                    THEN json_object('ack', json('true')) END
                 )
               ))
               FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
