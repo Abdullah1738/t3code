@@ -842,9 +842,9 @@ export type WaitStep =
 /**
  * Applies a check's answer to a waiting card, whoever gave it: one of the
  * board's own checks, a board script's check, or a wake a script pushed.
- * Ending wins over expiring. `stamp` also records the time of an answer that
- * changed nothing; a caller that checks every tick leaves it off, so a quiet
- * wait costs no writes.
+ * Ending wins over expiring. An answer that changes nothing the wait shows
+ * (a hold with the same status, no failure to clear) saves nothing, so a quiet
+ * wait costs no writes however often it is checked.
  */
 export function applyAnswer(
   card: KanbanCard,
@@ -852,7 +852,6 @@ export function applyAnswer(
   facts: Pick<WaitFacts, "nowMs" | "cards">,
   ctx: WaitContext,
   at: string,
-  options: { readonly stamp?: boolean } = {},
 ): WaitStep {
   const wait = kanbanWait(card);
   if (wait === null || !kanbanWaiting(card)) return { _tag: "none" };
@@ -888,14 +887,13 @@ export function applyAnswer(
   }
   const status = answer.status == null ? null : oneLine(answer.status, WAIT_STATUS_MAX) || null;
   const changed = status !== wait.status || wait.failures !== 0 || wait.problem !== null;
-  const held: KanbanCard =
-    changed || options.stamp === true
-      ? {
-          ...card,
-          wait: { ...wait, status, failures: 0, problem: null, lastCheckedAt: checkedAt },
-          updatedAt: at,
-        }
-      : card;
+  const held: KanbanCard = changed
+    ? {
+        ...card,
+        wait: { ...wait, status, failures: 0, problem: null, lastCheckedAt: checkedAt },
+        updatedAt: at,
+      }
+    : card;
   const expired = expireWait(held, facts, at);
   if (expired !== null) return { _tag: "expire", ...expired };
   return { _tag: "hold", save: held === card ? null : held };

@@ -1476,6 +1476,54 @@ it.effect("a pushed wake can name the wait it means, and is refused once that wa
   ),
 );
 
+it.effect(
+  "a batch of answers is one write: each card gets its own outcome and a refusal stops nothing",
+  () =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const parkOn = (title: string) =>
+          Effect.gen(function* () {
+            const card = yield* placed(board, title);
+            return yield* kanban.waitCard(
+              card.id,
+              { on: "time", until: iso(T0 + 48 * HOUR), note: `${title}: later` },
+              owner,
+            );
+          });
+        const first = yield* parkOn("First");
+        const second = yield* parkOn("Second");
+        const free = yield* placed(board, "Not waiting");
+        const script: KanbanActor = { _tag: "system", component: "test" };
+        const outcomes = yield* kanban.answerWaits(
+          board.id,
+          [
+            // By number, as a script names its cards; by id, as a check's own batch does.
+            { card: first.number, answer: { result: "wake", note: "go" }, script: null },
+            { card: free.id, answer: { result: "wake", note: "go" }, script: null },
+            { card: 9999, answer: { result: "wake", note: "go" }, script: null },
+            { card: second.id, answer: { result: "hold" }, script: null },
+            {
+              card: second.id,
+              answer: { result: "wake", note: "go" },
+              script: null,
+              expect: "2020-01-01T00:00:00.000Z",
+            },
+          ],
+          script,
+        );
+        assert.deepStrictEqual(
+          outcomes.map((outcome) => (outcome.ok ? "ok" : outcome.code)),
+          ["ok", "conflict", "not-found", "invalid", "conflict"],
+        );
+        assert.isUndefined((yield* cardOf(first.id)).wait);
+        // Refused answers left the second card exactly as it was.
+        assert.deepStrictEqual(yield* cardOf(second.id), second);
+      }),
+    ),
+);
+
 // The event kinds a client built before the tolerant decoder knows: a closed list.
 const OldEventKind = Schema.Literals([
   "created",

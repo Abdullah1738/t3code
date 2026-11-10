@@ -826,11 +826,8 @@ describe("applyAnswer", () => {
         AT,
       ),
     ).toEqual({ _tag: "hold", save: null });
-    // A caller that checks rarely stamps the time even when nothing changed.
-    expect(applyAnswer(waiting, hold, known, ctx, AT, { stamp: true })).toMatchObject({
-      _tag: "hold",
-      save: { wait: { lastCheckedAt: AT, status: null } },
-    });
+    // Nothing new to show: nothing to save, however rarely the caller checks.
+    expect(applyAnswer(waiting, hold, known, ctx, AT)).toEqual({ _tag: "hold", save: null });
   });
 
   it("wake: ends the wait and wakes who the answer names, else the wait's role, else the next actor", () => {

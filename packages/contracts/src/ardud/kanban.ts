@@ -765,7 +765,11 @@ export const KanbanWait = Schema.Struct({
   expiredAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** The check's latest one-line progress note ("CI 3 of 5 passed"), or null. */
   status: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
-  /** When the check last answered. */
+  /**
+   * When a check last changed what the wait shows (its status, a failure, a failure
+   * cleared). A check that changes nothing does not write the card, so this is not
+   * the time of the latest check: a script's runs record that.
+   */
   lastCheckedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** Checks in a row that failed or gave no readable answer; 0 after one that answered. */
   failures: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),

@@ -50,7 +50,7 @@ import * as Stream from "effect/Stream";
 import { runProcess, scriptEnv } from "./scriptRunner.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanStore } from "../store/KanbanStore.ts";
-import { KanbanService } from "./KanbanService.ts";
+import { KanbanService, type WaitAnswerFor } from "./KanbanService.ts";
 import { modelSelectionResult } from "./defaults.ts";
 import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import * as Rules from "./rules.ts";
@@ -467,7 +467,10 @@ const make = Effect.gen(function* () {
 
   // Applies what the script printed about waits. A check run also answers for
   // the cards it printed nothing about: no line is a hold, and a run that
-  // failed is a failed check for each of them.
+  // failed is a failed check for each of them. The answers go to the board in
+  // one write (`answerWaits`), which reads the board once however many cards
+  // wait on the script; a park line is its own write, so the answers printed
+  // before it are applied first.
   const applyWaits = Effect.fn("KanbanScripts.applyWaits")(function* (
     script: KanbanScript,
     lines: ReadonlyArray<Scripts.WaitLine>,
@@ -477,7 +480,6 @@ const make = Effect.gen(function* () {
     const notes: Array<string> = [];
     if (lines.length === 0 && check === null) return notes;
     const actor: KanbanActor = { _tag: "script", scriptId: script.id };
-    const cards = yield* io(store.cards(script.boardId));
     const answered = new Set<string>();
     // The waits this check was asked about, as they were when its input was built.
     // An answer is for that wait: if the card waits on another one by now (the
@@ -487,16 +489,48 @@ const make = Effect.gen(function* () {
         card.wait === undefined ? [] : [[card.id as string, Waits.waitIdentity(card.wait)]],
       ),
     );
-    for (const line of lines) {
-      const card = cards.find((entry) => entry.number === line.card);
-      if (!card) {
-        notes.push(`Refused for card #${line.card}: No card #${line.card} on this board.`);
-        continue;
+    const askedByNumber = new Map((check?.cards ?? []).map((card) => [card.number, card.id]));
+    // Answers not yet sent, each with the card number its note names (null: no note).
+    let pending: Array<{ readonly answer: WaitAnswerFor; readonly line: number | null }> = [];
+    const flush = Effect.gen(function* () {
+      if (pending.length === 0) return;
+      const sending = pending;
+      pending = [];
+      const result = yield* Effect.result(
+        service.answerWaits(
+          script.boardId,
+          sending.map((entry) => entry.answer),
+          actor,
+        ),
+      );
+      for (const [index, entry] of sending.entries()) {
+        const outcome = Result.isSuccess(result) ? result.success[index] : undefined;
+        // The card may have moved on while the script ran; for a card the script
+        // printed nothing about, that refusal is not news.
+        if (entry.line === null) continue;
+        notes.push(
+          outcome?.ok === true
+            ? outcome.text
+            : `Refused for card #${entry.line}: ${
+                outcome?.detail ??
+                (Result.isFailure(result) ? result.failure.detail : "nothing changed")
+              }`,
+        );
       }
+    });
+    for (const line of lines) {
       if (line._tag === "park") {
+        yield* flush;
+        const card = yield* io(store.cardByNumber(script.boardId, line.card));
+        if (!card) {
+          notes.push(`Refused for card #${line.card}: No card #${line.card} on this board.`);
+          continue;
+        }
         const target =
-          line.waitsOn === null ? null : cards.find((entry) => entry.number === line.waitsOn);
-        if (target === undefined) {
+          line.waitsOn === null
+            ? null
+            : yield* io(store.cardByNumber(script.boardId, line.waitsOn));
+        if (line.waitsOn !== null && target === null) {
           notes.push(`Couldn't park card #${line.card}: No card #${line.waitsOn} on this board.`);
           continue;
         }
@@ -510,35 +544,35 @@ const make = Effect.gen(function* () {
         );
         continue;
       }
-      if (line._tag === "answer") answered.add(card.id);
-      const result = yield* Effect.result(
-        service.answerWait(
-          card.id,
-          line.answer,
+      const askedId = askedByNumber.get(line.card);
+      // Answered, as far as the rest of this run goes, whatever the board makes of it.
+      if (line._tag === "answer" && askedId !== undefined) answered.add(askedId);
+      pending.push({
+        line: line.card,
+        answer:
           line._tag === "wake"
-            ? { script: null, expect: line.wait }
-            : { script: script.name, expect: asked.get(card.id) ?? null },
-          actor,
-        ),
-      );
-      notes.push(
-        Result.isSuccess(result)
-          ? result.success
-          : `Refused for card #${line.card}: ${result.failure.detail}`,
-      );
+            ? { card: line.card, answer: line.answer, script: null, expect: line.wait }
+            : {
+                card: line.card,
+                answer: line.answer,
+                script: script.name,
+                expect: askedId === undefined ? null : (asked.get(askedId) ?? null),
+              },
+      });
     }
     for (const card of check?.cards ?? []) {
       if (answered.has(card.id)) continue;
-      // The card may have moved on while the script ran; that refusal is not news.
-      yield* Effect.result(
-        service.answerWait(
-          card.id,
-          failed === null ? { result: "hold" } : { result: "fail", reason: failed },
-          { script: script.name, expect: asked.get(card.id) ?? null },
-          actor,
-        ),
-      );
+      pending.push({
+        line: null,
+        answer: {
+          card: card.id,
+          answer: failed === null ? { result: "hold" } : { result: "fail", reason: failed },
+          script: script.name,
+          expect: asked.get(card.id) ?? null,
+        },
+      });
     }
+    yield* flush;
     return notes;
   });
 
@@ -910,16 +944,18 @@ const make = Effect.gen(function* () {
           : found.length === 0
             ? `This board has no script named ${name}`
             : `This board has ${found.length} scripts named ${name}`;
-      for (const card of batch) {
-        yield* Effect.result(
-          service.answerWait(
-            card.id,
-            { result: "fail", reason },
-            { script: name },
-            { _tag: "system", component: "wait-checks" },
-          ),
-        );
-      }
+      yield* Effect.result(
+        service.answerWaits(
+          board.id,
+          batch.map((card) => ({
+            card: card.id,
+            answer: { result: "fail" as const, reason },
+            script: name,
+            expect: card.wait === undefined ? null : Waits.waitIdentity(card.wait),
+          })),
+          { _tag: "system", component: "wait-checks" },
+        ),
+      );
       return;
     }
     const done = yield* Deferred.make<void>();
