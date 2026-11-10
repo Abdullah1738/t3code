@@ -201,7 +201,10 @@ const fakeProbe = (script) => {
 
 test("host preflight passes a healthy mount without restarting ovnfs", async () => {
   const logs = [];
-  const { probe, calls } = fakeProbe([{ state: "ok", stdout: ".\n..\n.hidden\nrobob-1\n" }, { state: "ok", stdout: "" }]);
+  const { probe, calls } = fakeProbe([
+    { state: "ok", stdout: ".\n..\n.hidden\nrobob-1\n" },
+    { state: "ok", stdout: "" },
+  ]);
   let restarted = false;
   const result = await hostPreflight({
     checkoutsDir: "/c",
@@ -270,16 +273,31 @@ test("host preflight refuses a hung mount when no ovnfs restart is available", a
 
 test("host preflight tolerates a missing ~/checkouts", async () => {
   const { probe } = fakeProbe([{ state: "absent" }]);
-  const result = await hostPreflight({ checkoutsDir: "/c", probe, uState: async () => [], log: async () => {} });
+  const result = await hostPreflight({
+    checkoutsDir: "/c",
+    probe,
+    uState: async () => [],
+    log: async () => {},
+  });
   assert.equal(result.result.state, "absent");
 });
 
 test("a failed host preflight stops the install before the cancel window and quit", async () => {
   const calls = [];
   const ops = Object.fromEntries(
-    ["stage", "verify", "migrations", "cancelWindow", "quit", "backup", "swap", "launch", "readReady", "report", "phase"].map(
-      (name) => [name, async () => calls.push(name)],
-    ),
+    [
+      "stage",
+      "verify",
+      "migrations",
+      "cancelWindow",
+      "quit",
+      "backup",
+      "swap",
+      "launch",
+      "readReady",
+      "report",
+      "phase",
+    ].map((name) => [name, async () => calls.push(name)]),
   );
   ops.hostPreflight = async () => {
     calls.push("hostPreflight");
@@ -297,8 +315,10 @@ test("probeDirectory reports a real directory, a missing one, and a hang", async
     assert.equal(ok.state, "ok");
     assert.match(ok.stdout, /\bx\b/);
     assert.equal((await probeDirectory(join(root, "missing"), 5000)).state, "absent");
-    // A FIFO-free stand-in for a hung lookup: a timeout of 0 ms always expires first.
-    assert.equal((await probeDirectory(root, 0)).state, "hang");
+    // A stand-in for a lookup stuck on a hung mount: a command that outlives the timeout.
+    const hung = await probeDirectory(root, 200, ["/bin/sleep", ["30"]]);
+    assert.equal(hung.state, "hang");
+    assert.equal(hung.timeoutMs, 200);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -306,7 +326,8 @@ test("probeDirectory reports a real directory, a missing one, and a hang", async
 
 test("uStateProcesses keeps only U-state rows", async () => {
   const rows = await uStateProcesses(async () => ({
-    stdout: "  1 Ss   /sbin/launchd\n5646 U    /Applications/Robob.app/Contents/MacOS/Robob\n 77 U+   git\n",
+    stdout:
+      "  1 Ss   /sbin/launchd\n5646 U    /Applications/Robob.app/Contents/MacOS/Robob\n 77 U+   git\n",
   }));
   assert.deepEqual(
     rows.map((r) => r.pid),
@@ -422,8 +443,16 @@ for (const [name, overrides, message] of [
     { readBundleId: async () => undefined, topLevel: async () => ["Contents", "evil"] },
     /not a Robob staging bundle/,
   ],
-  ["a running installer", { otherInstallers: async () => [4242] }, /Another installer is running \(pid 4242\)/],
-  ["a process running from it", { runningFrom: async () => [{ pid: 99 }] }, /Processes run from .* \(pid 99\)/],
+  [
+    "a running installer",
+    { otherInstallers: async () => [4242] },
+    /Another installer is running \(pid 4242\)/,
+  ],
+  [
+    "a process running from it",
+    { runningFrom: async () => [{ pid: 99 }] },
+    /Processes run from .* \(pid 99\)/,
+  ],
 ])
   test(`staging bundle is kept when it has ${name}`, async () => {
     const { deps, calls } = stagingDeps(overrides);

@@ -81,15 +81,14 @@ export async function install(ops, { rollback = false } = {}) {
   await ops.report();
 }
 
-
 /** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
  * the child in U state, where even SIGKILL waits, so it is abandoned. */
-export function probeDirectory(dir, timeoutMs = 10_000) {
+export function probeDirectory(dir, timeoutMs = 10_000, command = ["/bin/ls", ["-f", dir]]) {
   return new Promise((resolve) => {
     let settled = false;
     let stdout = "";
     let stderr = "";
-    const child = spawn("/bin/ls", ["-f", dir], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command[0], command[1], { stdio: ["ignore", "pipe", "pipe"] });
     const finish = (value) => {
       if (settled) return;
       settled = true;
@@ -139,7 +138,10 @@ export async function probeCheckouts(checkoutsDir, probe = probeDirectory) {
   return inner.state === "ok" ? { state: "ok", dir: inner.dir } : inner;
 }
 
-export async function uStateProcesses(runPs = () => exec("/bin/ps", ["-axo", "pid=,stat=,comm="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 })) {
+export async function uStateProcesses(
+  runPs = () =>
+    exec("/bin/ps", ["-axo", "pid=,stat=,comm="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
+) {
   const { stdout } = await runPs();
   return stdout
     .split("\n")
@@ -166,7 +168,11 @@ export async function hostPreflight({
   const listU = async (when) => {
     try {
       const processes = await uState();
-      await log("host_preflight_u_state", { when, count: processes.length, processes: processes.slice(0, 50) });
+      await log("host_preflight_u_state", {
+        when,
+        count: processes.length,
+        processes: processes.slice(0, 50),
+      });
       return processes;
     } catch (error) {
       await log("host_preflight_u_state", { when, error: String(error) });
@@ -179,7 +185,9 @@ export async function hostPreflight({
   if (first.state !== "hang") return { restarted: false, result: first };
   if (restart === undefined)
     throw new Error(`${first.dir} is hung and no ovnfs restart is available; not quitting Robob`);
-  await log("host_preflight_ovnfs_restart", { reason: `${first.dir} did not answer in ${first.timeoutMs} ms` });
+  await log("host_preflight_ovnfs_restart", {
+    reason: `${first.dir} did not answer in ${first.timeoutMs} ms`,
+  });
   try {
     await restart();
   } catch (error) {
@@ -188,7 +196,10 @@ export async function hostPreflight({
   let again = first;
   for (let attempt = 1; attempt <= recheckAttempts; attempt++) {
     again = await probeCheckouts(checkoutsDir, probe);
-    await log("host_preflight_mount", { when: `after-restart-${attempt}`, ...summarizeProbe(again) });
+    await log("host_preflight_mount", {
+      when: `after-restart-${attempt}`,
+      ...summarizeProbe(again),
+    });
     if (again.state !== "hang") break;
     if (attempt < recheckAttempts) await sleep(recheckDelayMs);
   }
@@ -231,7 +242,10 @@ export async function relaunchAfterFailure({
     if (alive !== undefined && alive.length === 0) break;
     if (now() - started >= boundMs) {
       const pids = alive?.map((p) => p.pid ?? p) ?? "unknown";
-      await log("relaunch_skipped", { reason: "old Robob processes did not exit", survivors: pids });
+      await log("relaunch_skipped", {
+        reason: "old Robob processes did not exit",
+        survivors: pids,
+      });
       await notify(
         `Robob install failed and the old app was NOT relaunched: processes ${JSON.stringify(pids)} are still running after ${Math.round(boundMs / 1000)} s. Check for hung mounts (ovnfs restart), then open Robob.`,
       );
@@ -301,10 +315,14 @@ export async function clearStaleStaging({
     );
   const installers = await otherInstallers();
   if (installers.length)
-    throw new Error(`Another installer is running (pid ${installers.join(", ")}); staging bundle ${next} may be in use`);
+    throw new Error(
+      `Another installer is running (pid ${installers.join(", ")}); staging bundle ${next} may be in use`,
+    );
   const users = await runningFrom(next);
   if (users.length)
-    throw new Error(`Processes run from ${next} (pid ${users.map((p) => p.pid ?? p).join(", ")}); not replacing it`);
+    throw new Error(
+      `Processes run from ${next} (pid ${users.map((p) => p.pid ?? p).join(", ")}); not replacing it`,
+    );
   const info = await stat(next).catch(() => undefined);
   const aside = `${next}.stale-${stamp}`;
   await log("stale_staging_found", {
