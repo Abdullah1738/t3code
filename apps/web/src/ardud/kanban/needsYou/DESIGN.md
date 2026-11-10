@@ -38,6 +38,7 @@ typography:
     fontSize: "0.75rem"
     fontWeight: 400
 rounded:
+  mark: "3px"
   field: "12px"
   panel: "16px"
   pill: "9999px"
@@ -127,7 +128,7 @@ Flat. Panels are a fill one step from the ground or a 1 px ring in
 ## Shapes
 
 Pills for buttons, chips and state marks. 12 px corners for fields, options
-and rows. 16 px corners for panels and the main sheet. Hairline rings instead
+and rows. 3 px on the added and removed words inside a change. 16 px corners for panels and the main sheet. Hairline rings instead
 of borders so corners stay clean.
 
 ## Components
