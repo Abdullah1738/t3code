@@ -1,0 +1,522 @@
+import {
+  EMPTY_NEEDS_YOU_FILTER,
+  askFieldKind,
+  askKeyAction,
+  askKindLabel,
+  askRefusal,
+  needsYouBatchKey,
+  needsYouFiltered,
+  needsYouFocusOrder,
+  needsYouFromFeed,
+  needsYouKinds,
+  needsYouNextFocus,
+  needsYouSections,
+  needsYouStep,
+  type NeedsYouEntry,
+  type NeedsYouFilter,
+  type NeedsYouItem,
+  type NeedsYouMark,
+} from "@t3tools/client-runtime/ardud/kanban";
+import { kanbanAskChanges, kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
+import { ListIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+
+import { SidebarInset } from "../../../components/ui/sidebar";
+import { WorkspacePageHeader } from "../../../components/WorkspacePageHeader";
+import { isElectron } from "../../../env";
+import { useStableCallback } from "../../../hooks/useStableCallback";
+import { cn } from "../../../lib/utils";
+import { CardDrawer, noteDrawerOpener } from "../CardDrawer";
+import { useBoardState, useBoards } from "../kanbanStore";
+import { KanbanLinksProvider } from "../links";
+import { useNowMs } from "../useNowMs";
+import { AskReader, askTurn, type AskReaderHandle } from "./AskReader";
+import { AskToastView } from "./AskToast";
+import {
+  askKey,
+  flushAskSends,
+  noteAskFocus,
+  refreshAsks,
+  undoAskSend,
+  useAskStore,
+  watchAsks,
+} from "./askStore";
+import { BatchView } from "./BatchView";
+import { QueueRail } from "./QueueRail";
+import { patchNeedsYouSearch, type NeedsYouSearch } from "./search";
+import { Bar, Btn, FilterChip, Layer, linkClass, usePageLayout } from "./ui";
+import "../tokens.css";
+import "../kanban.css";
+import "./needsYou.css";
+
+const NO_MARKS: Readonly<Record<string, NeedsYouMark>> = {};
+
+type Focused =
+  | { readonly _tag: "ask"; readonly entry: KanbanAskFeedItem; readonly item: NeedsYouItem }
+  | {
+      readonly _tag: "batch";
+      readonly key: string;
+      readonly batch: Extract<NeedsYouEntry, { _tag: "batch" }>;
+      readonly entries: ReadonlyArray<KanbanAskFeedItem>;
+    }
+  | null;
+
+const textLike = (target: HTMLElement): boolean => {
+  if (target.isContentEditable) return true;
+  if (target.tagName === "TEXTAREA" || target.tagName === "SELECT") return true;
+  if (target.tagName !== "INPUT") return false;
+  const type = (target as HTMLInputElement).type;
+  return !["checkbox", "radio", "button", "submit", "range", "file"].includes(type);
+};
+
+/** Every ask that waits on him, across boards, answered without opening a card. */
+export function NeedsYouPage(props: {
+  search: NeedsYouSearch;
+  onSearch: (next: NeedsYouSearch, options?: { readonly replace?: boolean }) => void;
+}) {
+  const { search, onSearch } = props;
+  const status = useAskStore((state) => state.status);
+  const error = useAskStore((state) => state.error);
+  const feed = useAskStore((state) => state.feed);
+  const marks = useAskStore((state) => state.marks) ?? NO_MARKS;
+  const hiddenMap = useAskStore((state) => state.hidden);
+  const boards = useBoards();
+  const nowMs = useNowMs();
+  const sheetRef = useRef<HTMLElement>(null);
+  const layout = usePageLayout(sheetRef);
+  const readerRef = useRef<AskReaderHandle | null>(null);
+
+  const [local, setLocal] = useState<Omit<NeedsYouFilter, "boardId">>({
+    kind: null,
+    holds: false,
+    query: "",
+  });
+  const [openBatches, setOpenBatches] = useState<ReadonlySet<string>>(new Set());
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [card, setCard] = useState<{ boardId: string; cardId: string } | null>(null);
+
+  useEffect(() => watchAsks(true), []);
+  // A held answer goes out when he leaves the page or closes the tab.
+  useEffect(() => {
+    const leave = () => flushAskSends(true);
+    window.addEventListener("pagehide", leave);
+    return () => {
+      window.removeEventListener("pagehide", leave);
+      flushAskSends(false);
+    };
+  }, []);
+
+  const open = feed?.open ?? [];
+  const byKey = new Map<string, KanbanAskFeedItem>(open.map((entry) => [askKey(entry), entry]));
+  const needsYou = needsYouFromFeed(open, nowMs);
+  const boardNames = new Map<string, string>(open.map((entry) => [entry.boardId, entry.boardName]));
+  const filter: NeedsYouFilter = { ...local, boardId: search.board ?? null };
+  const filtered = needsYouFiltered(filter);
+  const hidden = new Set(Object.keys(hiddenMap));
+  const sections = needsYouSections(
+    needsYou,
+    filter,
+    boardNames,
+    new Map(Object.entries(marks)),
+    hidden,
+  );
+  // An ask whose answer is on its way no longer counts.
+  const owed = needsYou.items.filter((item) => !hidden.has(item.key));
+  const order = needsYouFocusOrder(sections, openBatches);
+  const focusKey =
+    search.ask !== undefined && order.includes(search.ask)
+      ? search.ask
+      : needsYouNextFocus(sections, openBatches);
+
+  let focused: Focused = null;
+  if (focusKey !== null) {
+    const entry = byKey.get(focusKey);
+    const item =
+      entry &&
+      [
+        ...needsYou.items,
+        ...needsYou.expired,
+        ...needsYou.waitingOnAgent,
+        ...needsYou.withEvaluator,
+        ...needsYou.notices,
+      ].find((candidate) => candidate.key === focusKey);
+    if (entry && item) focused = { _tag: "ask", entry, item };
+    else {
+      for (const section of sections) {
+        for (const candidate of section.entries) {
+          if (candidate._tag === "batch" && needsYouBatchKey(candidate) === focusKey) {
+            focused = {
+              _tag: "batch",
+              key: focusKey,
+              batch: candidate,
+              entries: candidate.items.flatMap((entry) => byKey.get(entry.key) ?? []),
+            };
+          }
+        }
+      }
+    }
+  }
+  const openAskKey = focused?._tag === "ask" ? focusKey : null;
+  useEffect(() => {
+    noteAskFocus(openAskKey);
+    return () => noteAskFocus(null);
+  }, [openAskKey]);
+
+  const focusOn = (key: string | null, replace = true) => {
+    onSearch(patchNeedsYouSearch(search, { ask: key ?? undefined }), { replace });
+  };
+  const pickRow = (key: string) => {
+    // An ask inside a folded batch is shown by unfolding its batch.
+    for (const entry of needsYou.entries) {
+      if (entry._tag === "batch" && entry.items.some((item) => item.key === key)) {
+        setOpenBatches((current) => new Set(current).add(needsYouBatchKey(entry)));
+      }
+    }
+    focusOn(key, false);
+    setQueueOpen(false);
+  };
+  const setBoard = (boardId: string | null) =>
+    onSearch(patchNeedsYouSearch(search, { board: boardId ?? undefined, ask: undefined }), {
+      replace: true,
+    });
+  const clearFilter = () => {
+    setLocal({ kind: EMPTY_NEEDS_YOU_FILTER.kind, holds: false, query: "" });
+    if (search.board !== undefined) setBoard(null);
+  };
+  const undo = () => {
+    const key = undoAskSend();
+    if (key !== null) focusOn(key);
+  };
+  const openCard = (entry: KanbanAskFeedItem) => {
+    noteDrawerOpener();
+    setCard({ boardId: entry.boardId, cardId: entry.cardId });
+  };
+
+  const onKey = useStableCallback((event: KeyboardEvent) => {
+    if (event.defaultPrevented || event.isComposing) return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const typing = target !== null && textLike(target);
+    const layerOpen =
+      card !== null ||
+      queueOpen ||
+      shortcutsOpen ||
+      document.querySelector("[role=dialog]") !== null;
+    const ask = focused?._tag === "ask" ? focused : null;
+    const response = ask ? kanbanAskResponse(ask.entry.ask) : null;
+    const turn = ask ? askTurn(ask.entry, ask.item) : null;
+    const action = askKeyAction(event, {
+      typing,
+      onControl:
+        target?.closest("button, a, summary, [role=button], [role=radio], [role=checkbox]") != null,
+      layerOpen,
+      answerable:
+        focused?._tag === "batch" || (ask !== null && (turn === "owner" || turn === "agent")),
+      single: ask !== null,
+      options: response?.choose
+        ? response.choose.options.length +
+          (!response.choose.multi && response.verdict === null ? 1 : 0)
+        : focused?._tag === "batch"
+          ? 9
+          : 0,
+      changes: ask ? kanbanAskChanges(ask.entry.ask).length : 0,
+      editable:
+        response !== null &&
+        (response.edit === "draft" ||
+          response.fields.some((field) => {
+            const kind = askFieldKind(field);
+            return kind === "text" || kind === "longtext";
+          })),
+      refusable: focused?._tag === "batch" || (response !== null && askRefusal(response) !== null),
+    });
+    if (action === null) return;
+    switch (action._tag) {
+      case "close":
+        // Escape leaves a text box; a sheet closes itself.
+        if (typing && !layerOpen) {
+          target?.blur();
+          event.preventDefault();
+        }
+        return;
+      case "shortcuts":
+        setShortcutsOpen((current) => !current);
+        break;
+      case "search":
+        if (layout === "phone") setQueueOpen(true);
+        requestAnimationFrame(() => {
+          const input = document.querySelector<HTMLInputElement>("[data-ny-search]");
+          input?.focus();
+          input?.select();
+        });
+        break;
+      case "move":
+        focusOn(needsYouStep(order, focusKey, action.delta));
+        break;
+      case "undo":
+        undo();
+        break;
+      case "card":
+        if (ask) openCard(ask.entry);
+        break;
+      default:
+        readerRef.current?.act(action);
+    }
+    event.preventDefault();
+  });
+  useEffect(() => {
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onKey]);
+
+  const boardChips = [...boardNames]
+    .map(([id, name]) => ({
+      id,
+      name,
+      count: owed.filter((item) => item.boardId === id).length,
+    }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  const railProps = {
+    status,
+    sections,
+    focusKey,
+    onFocus: pickRow,
+    openBatches,
+    onToggleBatch: (key: string) =>
+      setOpenBatches((current) => {
+        const next = new Set(current);
+        if (!next.delete(key)) next.add(key);
+        return next;
+      }),
+    filter,
+    onFilter: (patch: Partial<NeedsYouFilter>) => {
+      const { boardId, ...rest } = patch;
+      if (Object.keys(rest).length > 0) setLocal((current) => ({ ...current, ...rest }));
+      if (boardId !== undefined) setBoard(boardId);
+    },
+    filtered,
+    onClearFilter: clearFilter,
+    kinds: needsYouKinds(needsYou),
+    boardNames,
+    oneBoard: search.board !== undefined || boardNames.size <= 1,
+    marks,
+    onShortcuts: () => setShortcutsOpen(true),
+  };
+  const boardOf = (boardId: string) =>
+    boards?.find((summary) => summary.board.id === boardId)?.board;
+  const waiting = needsYou.counts.agent + needsYou.counts.evaluator;
+
+  return (
+    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
+      <div
+        data-ny
+        className="flex min-h-0 min-w-0 flex-1 flex-col bg-(--m-surface) text-(--m-text)"
+      >
+        <WorkspacePageHeader
+          electron={isElectron}
+          reserveNativeControls
+          inert={card !== null}
+          className="relative gap-3 bg-(--m-surface)"
+        >
+          <h1 className="shrink-0 font-semibold">Needs you</h1>
+          <p className="flex min-w-0 shrink-0 items-baseline gap-3 text-sm">
+            {feed ? (
+              <>
+                <span className="font-medium tabular-nums">
+                  {owed.length}
+                  <span className="max-sm:sr-only"> to answer</span>
+                </span>
+                {waiting > 0 ? (
+                  <span className="text-(--m-muted) tabular-nums max-md:hidden">
+                    {waiting} waiting on agents
+                  </span>
+                ) : null}
+              </>
+            ) : null}
+          </p>
+          <span className="min-w-0 flex-1" />
+          {layout === "phone" ? (
+            <Btn size="sm" onClick={() => setQueueOpen(true)}>
+              <ListIcon aria-hidden />
+              Queue
+            </Btn>
+          ) : boardChips.length > 1 ? (
+            <div
+              role="group"
+              aria-label="Board"
+              className="flex min-w-0 shrink gap-1 overflow-x-auto [scrollbar-width:none]"
+            >
+              <FilterChip pressed={search.board === undefined} onClick={() => setBoard(null)}>
+                All <span className="tabular-nums">{owed.length}</span>
+              </FilterChip>
+              {boardChips.map((chip) => (
+                <FilterChip
+                  key={chip.id}
+                  pressed={search.board === chip.id}
+                  onClick={() => setBoard(search.board === chip.id ? null : chip.id)}
+                >
+                  {chip.name} <span className="tabular-nums">{chip.count}</span>
+                </FilterChip>
+              ))}
+            </div>
+          ) : null}
+        </WorkspacePageHeader>
+
+        <main
+          ref={sheetRef}
+          className="relative mx-2 mb-2 flex min-h-0 flex-1 overflow-hidden rounded-2xl bg-(--m-ground) ring-1 ring-(--m-rule)"
+        >
+          {layout === "phone" ? null : (
+            <nav
+              aria-label="Asks"
+              inert={card !== null}
+              className={cn(
+                "flex min-h-0 shrink-0 flex-col border-e border-(--m-rule)",
+                layout === "desktop" ? "w-[320px]" : "w-[272px]",
+              )}
+            >
+              <QueueRail {...railProps} />
+            </nav>
+          )}
+          <section
+            aria-label="Ask"
+            inert={card !== null}
+            className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+          >
+            {focused?._tag === "ask" ? (
+              <AskReader
+                key={focusKey}
+                entry={focused.entry}
+                item={focused.item}
+                board={boardOf(focused.entry.boardId)}
+                layout={layout}
+                handle={readerRef}
+                onOpenCard={() => openCard((focused as { entry: KanbanAskFeedItem }).entry)}
+              />
+            ) : focused?._tag === "batch" ? (
+              <BatchView
+                key={focused.key}
+                batchKey={focused.key}
+                title={`${focused.entries.length} alike: ${askKindLabel(focused.batch.batchKey).toLowerCase()}`}
+                boardName={boardNames.get(focused.batch.boardId) ?? ""}
+                entries={focused.entries}
+                layout={layout}
+                handle={readerRef}
+                onOpenAsk={pickRow}
+              />
+            ) : status === "loading" || status === "idle" ? (
+              <ReaderSkeleton />
+            ) : status === "error" ? (
+              <Empty
+                title="Couldn't load asks."
+                detail={error ?? undefined}
+                action={<Btn onClick={() => void refreshAsks()}>Retry</Btn>}
+              />
+            ) : filtered ? (
+              <Empty
+                title="No asks match."
+                action={
+                  <button type="button" onClick={clearFilter} className={linkClass}>
+                    Clear filters
+                  </button>
+                }
+              />
+            ) : (
+              <Empty
+                title="Nothing waits on you."
+                detail="New asks show up here as agents raise them."
+              />
+            )}
+            <AskToastView onUndo={undo} onView={(key) => focusOn(key)} bottom={focused ? 76 : 20} />
+          </section>
+
+          {card ? (
+            <CardPeek
+              boardId={card.boardId}
+              cardId={card.cardId}
+              onOpenCard={(cardId) => setCard({ boardId: card.boardId, cardId })}
+              onClose={() => setCard(null)}
+            />
+          ) : null}
+        </main>
+      </div>
+
+      <Layer
+        open={queueOpen && layout === "phone"}
+        onClose={() => setQueueOpen(false)}
+        title="Queue"
+        meta={`${owed.length} to answer`}
+        side="bottom"
+        tall
+        bodyClassName="flex min-h-0 flex-col p-0"
+      >
+        {boardChips.length > 1 ? (
+          <div
+            role="group"
+            aria-label="Board"
+            className="flex shrink-0 gap-1 overflow-x-auto px-3 pt-3 [scrollbar-width:none]"
+          >
+            <FilterChip pressed={search.board === undefined} onClick={() => setBoard(null)}>
+              All <span className="tabular-nums">{owed.length}</span>
+            </FilterChip>
+            {boardChips.map((chip) => (
+              <FilterChip
+                key={chip.id}
+                pressed={search.board === chip.id}
+                onClick={() => setBoard(search.board === chip.id ? null : chip.id)}
+              >
+                {chip.name} <span className="tabular-nums">{chip.count}</span>
+              </FilterChip>
+            ))}
+          </div>
+        ) : null}
+        <QueueRail {...railProps} inSheet />
+      </Layer>
+    </SidebarInset>
+  );
+}
+
+/** The card behind an ask, opened in place; its board is read only when asked for. */
+function CardPeek(props: {
+  boardId: string;
+  cardId: string;
+  onOpenCard: (cardId: string) => void;
+  onClose: () => void;
+}) {
+  const state = useBoardState(props.boardId);
+  if (state === undefined) return null;
+  return (
+    <KanbanLinksProvider boardId={props.boardId}>
+      <CardDrawer
+        boardId={props.boardId}
+        cardId={props.cardId}
+        state={state}
+        steps={null}
+        onStepCard={() => undefined}
+        onClose={props.onClose}
+        onOpenCard={props.onOpenCard}
+      />
+    </KanbanLinksProvider>
+  );
+}
+
+function Empty(props: { title: string; detail?: string | undefined; action?: React.ReactNode }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-start gap-2 px-7 pt-8 max-sm:px-4">
+      <p className="text-lg font-semibold">{props.title}</p>
+      {props.detail ? <p className="text-sm text-(--m-muted)">{props.detail}</p> : null}
+      {props.action ? <div className="mt-1">{props.action}</div> : null}
+    </div>
+  );
+}
+
+function ReaderSkeleton() {
+  return (
+    <div aria-hidden className="flex max-w-[620px] flex-col gap-4 px-7 pt-7 max-sm:px-4">
+      <Bar className="h-3 w-48" />
+      <Bar className="h-6 w-4/5" />
+      <Bar className="h-3.5" />
+      <Bar className="h-3.5 w-11/12" />
+      <Bar className="mt-3 h-28 rounded-xl" />
+    </div>
+  );
+}
