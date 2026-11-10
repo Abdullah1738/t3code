@@ -1112,32 +1112,8 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
 
-// Wait checks. The engine keeps them inert until waits are live; these tests
-// run the script side as it will run then, with answers applied for real.
-const liveWaits = Layer.effect(
-  KanbanService.KanbanService,
-  Effect.gen(function* () {
-    const real = yield* KanbanService.KanbanService;
-    return KanbanService.KanbanService.of({
-      ...real,
-      answerWait: (cardId, answer, from, actor) =>
-        real.answerWait(cardId, answer, from, actor, true),
-    });
-  }),
-);
-
-const waitTestLayer = ScriptService.layer.pipe(
-  Layer.provide(liveWaits),
-  Layer.provideMerge(KanbanService.layer),
-  Layer.provideMerge(KanbanModels.layerTest(null)),
-  Layer.provideMerge(threads),
-  Layer.provideMerge(KanbanStore.layer),
-  Layer.provideMerge(Sqlite.layerMemory),
-  Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
-  Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
-  Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
-  Layer.provideMerge(boardFilesLayer()),
-);
+// Wait checks: cards parked on a board script, checked by ScriptService.checkWaits.
+const waitTestLayer = testLayer;
 
 /** A card as a review leaves it (in review, no thread), parked on `script`. */
 const parkedOn = (
@@ -1254,7 +1230,7 @@ it.effect(
       assert.strictEqual(after.stage, "todo");
       assert.include(
         after.wakeNote ?? "",
-        "ENG-1 is Done. It was waiting on the linear-state script's check",
+        "ENG-1 is Done. It was waiting for the linear-state script's check",
       );
       assert.deepInclude((yield* waitOf(noted.id)).wait, { status: "In Review", failures: 0 });
       // No line is a hold: still waiting, checked, nothing wrong.
@@ -1323,7 +1299,7 @@ it.effect(
       assert.strictEqual(failing.card.wait?.failures, 3);
       assert.strictEqual(
         failing.events.at(-1)?.body,
-        "The check for the linear-state script's check failed 3 times in a row: The linear-state script exited with code 3",
+        "Wait check failing: 3 failures in a row while waiting for the linear-state script's check: The linear-state script exited with code 3",
       );
       assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 3);
 
@@ -1422,7 +1398,7 @@ it.effect(
       );
       assert.include(output, "Refused for card #999: No card #999 on this board.");
       assert.include(output, `Card #${plain.number} now waits (time).`);
-      assert.include(output, `Couldn't park card #${todo.number}: card #${todo.number} is in todo`);
+      assert.include(output, `Card #${todo.number} now waits (time).`);
       assert.include(
         output,
         `Couldn't park card #${plain.number}: this board has no script named no-such-check`,
@@ -1441,42 +1417,34 @@ it.effect(
         status: null,
         failures: 0,
       });
-      assert.isUndefined((yield* waitOf(todo.id)).wait);
+      // A To-Do card can be parked too: the dispatcher leaves it until the wait ends.
+      assert.deepInclude((yield* waitOf(todo.id)).wait, { on: "time" });
     }).pipe(Effect.provide(waitTestLayer)),
 );
 
-it.effect(
-  "stays inert until waits are live: the scheduler runs no checks and a pushed wake changes nothing",
-  () =>
-    Effect.gen(function* () {
-      const scripts = yield* ScriptService.KanbanScripts;
-      const board = yield* toyBoard;
-      const script = yield* register(
-        board,
-        scriptFile("exit 0\n", "noop.sh"),
-        manual,
-        "linear-state",
-      );
-      const card = yield* parkedOn(board, "linear-state", "Parked", {});
-      yield* scripts.tick;
-      yield* scripts.idle;
-      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 0);
-
-      const hook = yield* register(
-        board,
-        scriptFile(
-          `echo '${JSON.stringify({ kanban: { wake: { card: `#${card.number}`, note: "deployed" } } })}'\n`,
-          "hook.sh",
-        ),
-        manual,
-        "deploy-hook",
-      );
-      yield* scripts.run(hook.id, "manual");
-      yield* scripts.idle;
-      const [run] = yield* scripts.runs(hook.id, 1);
-      assert.include(run?.output, "waits are not live on this board yet: nothing changed");
-      assert.deepInclude((yield* waitOf(card.id)).wait, { on: "script", failures: 0 });
-    }).pipe(Effect.provide(testLayer)),
+it.effect("the script scheduler runs the wait checks, once per rest", () =>
+  Effect.gen(function* () {
+    const scripts = yield* ScriptService.KanbanScripts;
+    const board = yield* toyBoard;
+    const script = yield* register(
+      board,
+      scriptFile("exit 0\n", "noop.sh"),
+      manual,
+      "linear-state",
+    );
+    const card = yield* parkedOn(board, "linear-state", "Parked", {});
+    // The board's 30-second loop calls scripts.tick after its own tick.
+    yield* scripts.tick;
+    yield* scripts.idle;
+    const runs = yield* scripts.runs(script.id, 10);
+    assert.strictEqual(runs.length, 1);
+    assert.strictEqual(runs[0]?.trigger, ScriptService.WAIT_CHECK_TRIGGER);
+    assert.isNotNull((yield* waitOf(card.id)).wait?.lastCheckedAt);
+    yield* TestClock.adjust(30_000);
+    yield* scripts.tick;
+    yield* scripts.idle;
+    assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 1);
+  }).pipe(Effect.provide(waitTestLayer)),
 );
 
 it.effect(

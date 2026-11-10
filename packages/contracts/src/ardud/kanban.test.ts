@@ -30,6 +30,7 @@ import {
   KanbanSubtask,
   KanbanThreadLink,
 } from "./kanban.ts";
+import { KanbanCardDetail } from "./kanbanRpc.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
 
@@ -565,6 +566,81 @@ describe("KanbanCard wait", () => {
     const moved = { ...waiting, movedAt: "2026-10-25T11:00:00.000Z" as never };
     expect(kanbanWaitStale(moved)).toBe(true);
     expect(kanbanWaiting(moved)).toBe(false);
+  });
+
+  it("an old-shape client reads a waiting card's detail while wait events are written as edits", () => {
+    // A build from before the tolerant decoder: a closed event-kind list and no wait field.
+    const { wait: _wait, ...oldCardFields } = KanbanCard.fields;
+    const OldCardDetail = Schema.Struct({
+      card: Schema.Struct(oldCardFields),
+      events: Schema.Array(
+        Schema.Struct({
+          ...KanbanCardEvent.fields,
+          kind: Schema.Literals([
+            "created",
+            "moved",
+            "edited",
+            "linked",
+            "flagged",
+            "comment",
+            "thread",
+            "review",
+            "subtask",
+          ]),
+        }),
+      ),
+      threads: KanbanCardDetail.fields.threads,
+    });
+    const event = (id: number, kind: KanbanCardEvent["kind"], body: string): KanbanCardEvent => ({
+      id: id as KanbanCardEvent["id"],
+      cardId: "stored" as KanbanCardEvent["cardId"],
+      at: "2026-10-25T10:00:00.000Z" as KanbanCardEvent["at"],
+      actor: { _tag: "system", component: "waits" },
+      kind,
+      fromStage: null,
+      toStage: null,
+      body,
+      head: null,
+    });
+    const detail = (events: ReadonlyArray<KanbanCardEvent>): unknown =>
+      JSON.parse(
+        JSON.stringify(
+          Schema.encodeSync(KanbanCardDetail)({
+            card: card("stored", {
+              wait: wait({
+                on: "script",
+                pr: null,
+                sinceHead: null,
+                script: "linear-state" as never,
+                args: { issue: "ENG-123" },
+                status: "In Review",
+                failures: 3,
+              }),
+            }),
+            events,
+            threads: [],
+          }),
+        ),
+      );
+    // What the server writes while its event-kind switch is off.
+    const asEdits = detail([
+      event(1, "edited", "Waiting for the linear-state script's check: ENG-123 to be Done"),
+      event(2, "edited", "Wait check failing: 3 failures in a row"),
+      event(3, "edited", "Wait expired: waited 7d with no change"),
+      event(4, "edited", "Wait ended: ENG-123 is Done"),
+    ]);
+    const old = Schema.decodeUnknownSync(OldCardDetail)(asEdits);
+    expect(old.events.map((entry) => entry.kind)).toEqual(["edited", "edited", "edited", "edited"]);
+    expect(old.card.id).toBe("stored");
+    expect("wait" in old.card).toBe(false);
+    // The same history under its own kinds fails that client's whole card read.
+    const asKinds = detail([event(1, "wait_set", "Waiting for ENG-123 to be Done")]);
+    expect(() => Schema.decodeUnknownSync(OldCardDetail)(asKinds)).toThrow();
+    // This build reads both, with the wait.
+    expect(Schema.decodeUnknownSync(KanbanCardDetail)(asKinds).events[0]?.kind).toBe("wait_set");
+    expect(Schema.decodeUnknownSync(KanbanCardDetail)(asEdits).card.wait?.script).toBe(
+      "linear-state",
+    );
   });
 
   it("drops the wait key, not sets it to undefined", () => {

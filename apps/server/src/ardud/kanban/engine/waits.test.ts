@@ -28,8 +28,12 @@ import {
   WAIT_SCRIPT_EVERY_MAX_MS,
   WAIT_SCRIPT_EVERY_MIN_MS,
   WAIT_SCRIPT_EVERY_MS,
+  WAIT_EVENT_KINDS_LIVE,
   waitCheckName,
+  waitClearedBody,
+  waitEndedBody,
   waitEventKind,
+  WAITS_ENGINE_WIRED,
   waitExpired,
   waitHidesIdle,
   waitHoldsDispatch,
@@ -39,6 +43,7 @@ import {
   waitSkipsNudge,
   waitSlotProblem,
   waitTarget,
+  withLandedLinks,
   type WaitAnswer,
   type WaitChecker,
   type WaitFacts,
@@ -283,7 +288,7 @@ describe("the board's own checks, through the check contract", () => {
     const step = resolveWait(waiting, after, ctx, AT);
     expect(step).toMatchObject({ _tag: "end", wake: { to: "work" } });
     expect(step._tag === "end" && step.card.wakeNote).toContain(
-      'Card #2 is done. It was waiting on card #2 ("needs #2\'s schema").',
+      'Card #2 is done. It was waiting for card #2 ("needs #2\'s schema").',
     );
   });
 
@@ -374,7 +379,7 @@ describe("PR readings from the reader and the work thread", () => {
       AT,
     );
     expect(step).toMatchObject({ _tag: "end", card: { stage: "todo" }, wake: { to: "work" } });
-    expect(step._tag === "end" && step.event.body).toBe("trading-core#513 merged");
+    expect(step._tag === "end" && step.event.body).toBe("Wait ended: trading-core#513 merged");
   });
 
   it("a PR closed without merging ends the wait and tells the evaluator why", () => {
@@ -391,7 +396,7 @@ describe("PR readings from the reader and the work thread", () => {
     expect(step.card.stage).toBe("in_review");
     expect(step.wake.to).toBe("evaluator");
     expect(step.wake.to === "evaluator" && step.wake.text).toContain(
-      'is no longer waiting: trading-core#512 was closed without merging. It was waiting on trading-core#512 to merge ("D4 parent").',
+      'is no longer waiting: trading-core#512 was closed without merging. It was waiting for trading-core#512 to merge ("D4 parent").',
     );
     // The same for a push wait, even one that asked to wake the worker.
     const push = resolveWait(
@@ -563,6 +568,30 @@ describe("PR readings from the reader and the work thread", () => {
     expect(waitPrRequests([linked], board)).toEqual([
       { url: OTHER_PR, projectId: "project-default", needsHead: true, live: null },
     ]);
+  });
+});
+
+describe("withLandedLinks", () => {
+  it("gives a tracked PR link the merge or close a host reported, and nothing else", () => {
+    const context = { kind: "pr", url: OTHER_PR, label: null, state: null, checkedAt: null };
+    const before = card(1, {
+      links: [...card(1).links, context] as never,
+    });
+    // Open, draft and unknown readings leave the card as it is.
+    expect(withLandedLinks(before, [{ url: PR, state: "draft", at: AT }], AT)).toBe(before);
+    expect(withLandedLinks(before, [], AT)).toBe(before);
+    // A link attached as context has no state for the board to track.
+    expect(withLandedLinks(before, [{ url: OTHER_PR, state: "merged", at: AT }], AT)).toBe(before);
+    const merged = withLandedLinks(before, [{ url: `${PR}/files`, state: "merged", at: AT }], AT);
+    expect(merged.links).toEqual([
+      { kind: "pr", url: PR, label: null, state: "merged", checkedAt: AT },
+      context,
+    ]);
+    expect(merged.updatedAt).toBe(AT);
+    expect(withLandedLinks(merged, [{ url: PR, state: "merged", at: AT }], AT)).toBe(merged);
+    expect(withLandedLinks(before, [{ url: PR, state: "closed" }], AT).links[0]?.state).toBe(
+      "closed",
+    );
   });
 });
 
@@ -806,7 +835,7 @@ describe("applyAnswer", () => {
       AT,
     );
     expect(step._tag === "end" && step.card.wakeNote).toBe(
-      'ENG-123 is Done. It was waiting on the linear-state script\'s check ("ENG-123 to reach Done"). Carry on with card #5.',
+      'ENG-123 is Done. It was waiting for the linear-state script\'s check ("ENG-123 to reach Done"). Carry on with card #5.',
     );
     expect(step._tag === "end" && "wait" in step.card).toBe(false);
   });
@@ -849,7 +878,7 @@ describe("applyAnswer", () => {
     if (third._tag !== "failing") return;
     expect(third.card.wait).toMatchObject({ failures: KANBAN_WAIT_CHECK_FAILURES, on: "script" });
     expect(third.event.body).toBe(
-      "The check for the linear-state script's check failed 3 times in a row: Linear said 401",
+      "Wait check failing: 3 failures in a row while waiting for the linear-state script's check: Linear said 401",
     );
     expect(third.wake.to).toBe("evaluator");
     expect(waitHidesIdle(third.card, NOW)).toBe(false);
@@ -875,8 +904,12 @@ describe("applyAnswer", () => {
 });
 
 describe("wait events", () => {
-  it("are written as plain edits until the engine is live, and under their own kinds after", () => {
+  it("are written as plain edits until the event kinds are live, and under their own kinds after", () => {
     // An installed client that doesn't know the wait kinds can't load a card whose history has one.
+    // The engine acting on waits and the kinds being written are separate switches.
+    expect(WAITS_ENGINE_WIRED).toBe(true);
+    expect(WAIT_EVENT_KINDS_LIVE).toBe(false);
+    expect(waitEventKind("wait_set")).toBe("edited");
     expect(waitEventKind("wait_set", false)).toBe("edited");
     expect(waitEventKind("wait_cleared", false)).toBe("edited");
     expect(waitEventKind("wait_expired", false)).toBe("edited");
@@ -898,7 +931,7 @@ describe("expiry", () => {
     expect(expired?.card.stage).toBe("in_review");
     expect(expired?.event).toEqual({
       kind: waitEventKind("wait_expired"),
-      body: 'Waited 3d on the author to push to trading-core#512 with no change ("Pavan to push the F1-F3 fixes")',
+      body: 'Wait expired: waited 3d for the author to push to trading-core#512 with no change ("Pavan to push the F1-F3 fixes")',
       fromStage: null,
       toStage: null,
     });
@@ -976,7 +1009,7 @@ describe("endWait", () => {
     expect(end.card.updatedAt).toBe(AT);
     expect(end.event).toEqual({
       kind: waitEventKind("wait_cleared"),
-      body: pushed.note,
+      body: `Wait ended: ${pushed.note}`,
       fromStage: null,
       toStage: null,
     });
@@ -985,7 +1018,7 @@ describe("endWait", () => {
       "Card #9 (Card 9, in in_review) is no longer waiting: The author pushed 2 commits",
     );
     expect(end.wake.to === "evaluator" && end.wake.text).toContain(
-      'It was waiting on the author to push to trading-core#512 ("Pavan to push the F1-F3 fixes").',
+      'It was waiting for the author to push to trading-core#512 ("Pavan to push the F1-F3 fixes").',
     );
   });
 
@@ -1098,7 +1131,7 @@ describe("resolveWait", () => {
     expect("wait" in step.card).toBe(false);
     expect(step.card.stage).toBe("todo");
     expect(step.event.body).toBe(
-      "The card was moved to todo while it waited on the author to push to trading-core#512",
+      "Wait ended: the card was moved to todo while it waited for the author to push to trading-core#512",
     );
     expect(step.wake.to).toBe("none");
   });
@@ -1293,7 +1326,17 @@ describe("helpers", () => {
       waitTarget(wait({ on: "card", card: "card-5" as never }), new Map([["card-5", card(5)]])),
     ).toBe("card #5");
     expect(waitSetBody(wait({ on: "merge", note: "D4 parent" }))).toBe(
-      "Waiting on trading-core#512 to merge: D4 parent",
+      "Waiting for trading-core#512 to merge: D4 parent",
+    );
+    // A time wait reads "until", and each history line stands by itself as a plain edit.
+    expect(
+      waitSetBody(
+        wait({ on: "time", pr: null, until: "2026-11-14T05:00:00.000Z" as never, note: "recheck" }),
+      ),
+    ).toBe("Waiting until 2026-11-14T05:00:00.000Z: recheck");
+    expect(waitEndedBody("trading-core#512 merged")).toBe("Wait ended: trading-core#512 merged");
+    expect(waitClearedBody(wait({ on: "merge" }))).toBe(
+      "Wait ended: cleared by hand (was waiting for trading-core#512 to merge)",
     );
   });
 
