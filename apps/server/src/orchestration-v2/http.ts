@@ -8,6 +8,7 @@ import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import {
   annotateEnvironmentRequest,
@@ -186,7 +187,7 @@ export const layer = HttpApiBuilder.group(
               failEnvironmentInternal("orchestration_snapshot_failed", cause),
             ),
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadSnapshot",
@@ -203,7 +204,7 @@ export const layer = HttpApiBuilder.group(
               projection: snapshot.projection,
             }),
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadTranscript",
@@ -229,7 +230,7 @@ export const layer = HttpApiBuilder.group(
             ),
             checkJsonReply,
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadBoundedSnapshot",
@@ -252,7 +253,7 @@ export const layer = HttpApiBuilder.group(
               }),
             }),
           );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       )
       .handle(
         "threadHistoryPage",
@@ -287,7 +288,7 @@ export const layer = HttpApiBuilder.group(
               ),
               checkJsonReply,
             );
-        }),
+        }, NodeSqliteClient.foregroundReads),
       );
   }),
 );

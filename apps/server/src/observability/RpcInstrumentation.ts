@@ -6,6 +6,7 @@ import {
   WS_METHODS,
   type WsRpcGroup,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as References from "effect/References";
@@ -244,6 +245,9 @@ export const rpcInstrumentationLayer = Layer.succeed(RpcInstrumentation)((effect
   const method = rpc._tag;
   const measured = effect.pipe(
     withMetrics({ counter: rpcRequestsTotal, timer: rpcRequestDuration, attributes: { method } }),
+    // ardud: WS RPCs come from the owner's clients (shell, thread, board and
+    // discussion views, their actions): their reads use the foreground reader lane.
+    NodeSqliteClient.foregroundReads,
   );
 
   if (RPC_METHODS_WITH_TRACING_DISABLED.has(method)) {

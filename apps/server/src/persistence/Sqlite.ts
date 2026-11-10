@@ -14,6 +14,7 @@ import { initializeHistoryArchive } from "../ardud/persistence/HistoryArchive.ts
 import { historyReaderSql, baseArchiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
 import { archiveCheckpointLayer } from "../ardud/persistence/archiveCheckpoint.ts";
 import { ArchiveSnapshotGate } from "../ardud/persistence/archiveSnapshotGate.ts";
+import { readerLaneOptions, STATEV2_READER_LANES } from "../ardud/persistence/readerLanes.ts";
 import * as Semaphore from "effect/Semaphore";
 // Reads only a tiny installation marker before constructing reader workers.
 import * as NodeSqlite from "node:sqlite";
@@ -150,6 +151,8 @@ export const layerFromPath = Effect.fn("makeSqlitePersistenceLive")(function* (d
             filename: dbPath,
             readerWorker: true,
             authReaderProcess: true,
+            // ardud: interactive views get their own reader slots (readerLanes.ts).
+            ...readerLaneOptions(STATEV2_READER_LANES),
             readerInitializationSql: historyReaderSql(dbPath, baseFilename),
             readerSnapshotSql: [
               "SELECT rootpage FROM main.sqlite_schema LIMIT 1",

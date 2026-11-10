@@ -14,6 +14,7 @@ import { ensureRunFollowTables } from "../schedules/runFollow.ts";
 import { controlDDL, controlTables } from "./boardsSchema.ts";
 import { kanbanDDL } from "./kanbanSchema.ts";
 import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
+import { BOARDS_READER_LANES, readerLaneOptions } from "./readerLanes.ts";
 
 export class BoardsDatabase extends Context.Service<
   BoardsDatabase,
@@ -191,6 +192,10 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
             filename: dbPath,
             readerWorker: true,
             identityReaderProcess: true,
+            // Foreground (board/discussion views) and background (tick, dispatch,
+            // sweeps) readers; each boards cache is capped, statev2 keeps its budget.
+            ...readerLaneOptions(BOARDS_READER_LANES),
+            readerInitializationSql: [`PRAGMA cache_size = -${BOARDS_READER_LANES.foregroundCacheKiB}`],
             checkpointWorker: true,
             beforeAcquire: Effect.flatMap(bypassReady, (bypass) =>
               bypass ? Effect.void : Deferred.await(ready),

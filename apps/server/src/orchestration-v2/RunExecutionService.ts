@@ -29,6 +29,7 @@ import {
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1534,6 +1535,9 @@ export const layer: Layer.Layer<
           ),
           Effect.ensuring(endPreviewActivity),
           Effect.ensuring(eventSubscription.close),
+          // ardud: provider ingest can wait; it must not inherit a foreground lane from
+          // the request that started the turn.
+          NodeSqliteClient.backgroundReads,
           Effect.forkDetach,
         );
 
