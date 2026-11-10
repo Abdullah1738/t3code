@@ -551,10 +551,12 @@ export function resolveSidebarRowThreadId(
 }
 
 /**
- * ardud: the Active shelf draws a bounded slice (`boundedSidebarTail`), so a drop target's
- * active order names only drawn rows. This places the moved row in the whole shelf instead:
- * before the drawn row that follows it, or right after the drawn row above it. Hidden rows
- * keep their places, and a drop at the end of the slice stays above them.
+ * ardud: the Active shelf draws a bounded slice (`boundedSidebarTail`): the start of the shelf,
+ * plus the open thread's row below it when that row sits further down. A drop target's active
+ * order names only drawn rows, so this places the moved row in the whole shelf instead. Next to
+ * a row from the start of the shelf it lands right there; hidden rows keep their places, and a
+ * drop at the end of the slice stays above them. Next to the open thread's row it lands next to
+ * that row's real place.
  */
 export function withWholeActiveOrder(
   target: SidebarDropTarget,
@@ -567,15 +569,20 @@ export function withWholeActiveOrder(
   const drawn = new Set(target.activeOrder);
   if (activeOrder.every((key) => drawn.has(key))) return target;
   const order = activeOrder.filter((key) => key !== movedKey);
+  // The drawn start of the shelf; a drawn row past it is the open thread's row.
+  let start = 0;
+  while (start < order.length && drawn.has(order[start]!)) start++;
   const next = target.activeOrder[at + 1];
   const previous = target.activeOrder[at - 1];
+  const nextIndex = next === undefined ? -1 : order.indexOf(next);
+  const previousIndex = previous === undefined ? -1 : order.indexOf(previous);
   const index =
-    next !== undefined
-      ? order.indexOf(next)
-      : previous !== undefined
-        ? order.indexOf(previous) + 1
+    nextIndex !== -1 && (nextIndex < start || previousIndex === -1 || previousIndex >= start)
+      ? nextIndex
+      : previousIndex !== -1
+        ? previousIndex + 1
         : 0;
-  order.splice(index === -1 ? order.length : index, 0, movedKey);
+  order.splice(index, 0, movedKey);
   return { ...target, activeOrder: order };
 }
 

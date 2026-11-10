@@ -44,8 +44,11 @@ export interface ShellLoadPageEntry {
 export class ShellLoadJournal extends Context.Service<
   ShellLoadJournal,
   {
-    /** The most recently written load with every page in place. */
-    readonly read: (environmentId: EnvironmentId) => Effect.Effect<Option.Option<StoredShellLoad>>;
+    /** The most recently written load for this progress key with every page in place. */
+    readonly read: (
+      environmentId: EnvironmentId,
+      key: string,
+    ) => Effect.Effect<Option.Option<StoredShellLoad>>;
     readonly append: (
       environmentId: EnvironmentId,
       entry: ShellLoadPageEntry,
@@ -139,14 +142,15 @@ export function makeKeyValueShellLoadJournal<E>(
     return found.sort((a, b) => b.updatedAt - a.updatedAt);
   });
   return ShellLoadJournal.of({
-    read: (environmentId) =>
+    read: (environmentId, key) =>
       !usable(environmentId)
         ? Effect.succeed(Option.none())
         : quietly(
             "read",
             Effect.gen(function* () {
               for (const record of yield* records(environmentId)) {
-                if (record.pages === 0) continue;
+                // Another window's load for other options, or one still writing its first page.
+                if (record.key !== key || record.pages === 0) continue;
                 const bodies: string[] = [];
                 for (let index = 0; index < record.pages; index++) {
                   const body = yield* store.get(

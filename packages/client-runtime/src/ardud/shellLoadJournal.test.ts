@@ -56,12 +56,12 @@ describe("shell load journal", () => {
       const journal = makeKeyValueShellLoadJournal(memoryStore().store);
       yield* journal.append(ENVIRONMENT, entry(0));
       yield* journal.append(ENVIRONMENT, entry(1));
-      const stored = Option.getOrThrow(yield* journal.read(ENVIRONMENT));
+      const stored = Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key"));
       expect(stored.bodies).toEqual(['{"page":0}', '{"page":1}']);
       expect(stored.nextAfter).toBe("cursor-1");
       expect(stored.loadId).toBe("load-a");
       yield* journal.clear(ENVIRONMENT, "load-a");
-      expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);
+      expect(Option.isNone(yield* journal.read(ENVIRONMENT, "key"))).toBe(true);
     }),
   );
 
@@ -73,15 +73,25 @@ describe("shell load journal", () => {
       yield* journal.append(ENVIRONMENT, entry(0, "old"));
       yield* journal.append(ENVIRONMENT, { ...entry(0, "new"), updatedAt: 2_000 });
       yield* journal.append(ENVIRONMENT, entry(1, "old"));
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("new");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).loadId).toBe("new");
       // "old" finishing leaves "new" alone.
       yield* journal.clear(ENVIRONMENT, "old");
       expect([...values.keys()].filter((key) => key.includes("old"))).toEqual([]);
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).bodies).toHaveLength(1);
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).bodies).toHaveLength(1);
       // A newest load missing a page falls back to an older whole one.
       yield* journal.append(ENVIRONMENT, { ...entry(0, "older"), updatedAt: 500 });
       values.delete(shellLoadPageKey(ENVIRONMENT, "new", 0));
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("older");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).loadId).toBe("older");
+    }),
+  );
+
+  it.effect("reads the newest load for the caller's key, not another window's", () =>
+    Effect.gen(function* () {
+      const journal = makeKeyValueShellLoadJournal(memoryStore().store);
+      yield* journal.append(ENVIRONMENT, entry(0, "mine"));
+      yield* journal.append(ENVIRONMENT, { ...entry(0, "theirs"), key: "other", updatedAt: 5_000 });
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).loadId).toBe("mine");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "other")).loadId).toBe("theirs");
     }),
   );
 
@@ -94,7 +104,7 @@ describe("shell load journal", () => {
       yield* journal.append(ENVIRONMENT, { ...entry(0, "live"), updatedAt: 9_000 });
       yield* journal.sweep(ENVIRONMENT, 5_000);
       expect([...values.keys()].filter((key) => key.includes("stale"))).toEqual([]);
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("live");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).loadId).toBe("live");
       // A failed page write leaves the record where it was.
       fail = true;
       yield* journal.append(ENVIRONMENT, { ...entry(1, "live"), updatedAt: 9_001 });
@@ -109,12 +119,12 @@ describe("shell load journal", () => {
           updatedAt: 9_500,
         }),
       );
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("live");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, "key")).loadId).toBe("live");
       yield* journal.sweep(ENVIRONMENT, 9_600);
       expect([...values.keys()].filter((key) => key.includes("torn"))).toEqual([]);
       // Unreadable records are ignored.
       values.set(shellLoadRecordKey(ENVIRONMENT, "live"), "not json");
-      expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);
+      expect(Option.isNone(yield* journal.read(ENVIRONMENT, "key"))).toBe(true);
     }),
   );
 
@@ -219,7 +229,10 @@ describe("shell loader with a journal", () => {
       const first = shellServer(new Set([3]));
       const crashed = yield* (yield* makeLoader(first.fetchFn, journal)).load(prepared("1.0.0"));
       expect(Option.isNone(crashed)).toBe(true);
-      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).bodies).toHaveLength(2);
+      const progressKey = [ENVIRONMENT, TARGET.httpBaseUrl, "1.0.0", ""].join("\u001f");
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT, progressKey)).bodies).toHaveLength(
+        2,
+      );
 
       // A fresh loader (a new renderer) asks only for the page after the stored cursor.
       const second = shellServer();

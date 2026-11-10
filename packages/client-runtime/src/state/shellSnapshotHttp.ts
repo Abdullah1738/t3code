@@ -337,12 +337,10 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
       if (serverVersion === "") return undefined;
       const environmentId = prepared.environmentId;
       yield* journal.value.sweep(environmentId, now - SHELL_LOAD_RESUME_MAX_AGE_MS);
-      const stored = yield* journal.value.read(environmentId);
+      const stored = yield* journal.value.read(environmentId, key);
       if (Option.isNone(stored)) return undefined;
       const { value } = stored;
-      if (value.key !== key || now - value.updatedAt > SHELL_LOAD_RESUME_MAX_AGE_MS) {
-        return undefined;
-      }
+      if (now - value.updatedAt > SHELL_LOAD_RESUME_MAX_AGE_MS) return undefined;
       const pages = yield* Effect.forEach(value.bodies, (body) =>
         decodeJsonBody(body).pipe(Effect.flatMap(decodeShellSnapshotDeferringPullRequests)),
       ).pipe(Effect.option);

@@ -2486,6 +2486,40 @@ describe("withWholeActiveOrder", () => {
     expect(byKey.map(({ id }) => id)).toEqual(["b", "c", "a", "d", "e"]);
   });
 
+  it("never crosses the hidden rows to reach the open thread's row", () => {
+    // a, b drawn from the start; e is the open thread, drawn below them.
+    expect(withWholeActiveOrder(drop(["b", "a", "e"]), whole, "a").activeOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+      "e",
+    ]);
+    // Moved to the top, it stays at the top.
+    expect(withWholeActiveOrder(drop(["b", "a", "e"]), whole, "b").activeOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+      "e",
+    ]);
+    // The open thread's row dropped among the start rows lands there.
+    expect(withWholeActiveOrder(drop(["a", "e", "b"]), whole, "e").activeOrder).toEqual([
+      "a",
+      "e",
+      "b",
+      "c",
+      "d",
+    ]);
+    expect(withWholeActiveOrder(drop(["b", "e", "a"]), whole, "a").activeOrder).toEqual([
+      "b",
+      "c",
+      "d",
+      "e",
+      "a",
+    ]);
+  });
+
   it("places rows from other sections and leaves whole shelves alone", () => {
     expect(withWholeActiveOrder(drop(["a", "p", "b", "c"]), whole, "p").activeOrder).toEqual([
       "a",
