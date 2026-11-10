@@ -2,6 +2,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthSessionId,
   CommandId,
   EnvironmentId,
@@ -14,9 +16,12 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   RunId,
+  SecretRef,
   ThreadId,
   WS_METHODS,
+  WsRpcGroup,
   WsSubscribeServerConfigRpc,
+  type KanbanAskSecretAnswerInput,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderSession,
@@ -29,14 +34,18 @@ import {
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { makeLocalFileTracer, type TraceRecord } from "@t3tools/shared/observability";
+import * as Cause from "effect/Cause";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
@@ -109,6 +118,10 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import * as AskTestkit from "./ardud/kanban/engine/askFlows.testkit.ts";
+import { SecretRedeemer } from "./ardud/auth/heldSecrets.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
+import { RpcInstrumentation, rpcInstrumentationLayer } from "./observability/RpcInstrumentation.ts";
 import { SHELL_RECENT_PAGE_SIZE } from "./ardud/perf/shellPages.ts";
 import { readSpeedups, ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
@@ -2551,4 +2564,301 @@ it.effect("thread resume across compacted history keeps message order and final 
       ),
     ),
   ),
+);
+
+// ardud: a board ask's secret fields. The same production handler layer, behind the same
+// authorization and instrumentation middleware a real connection gets.
+it.effect(
+  "secrets.answerAsk takes a value only from the owner's app, hands the asker a ref, and shows the value nowhere",
+  () =>
+    Effect.gen(function* () {
+      const SECRET = "whsec_W5-rpc-V4lue+71c2e5d09a";
+      const dump = (value: unknown) =>
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify(value, (_key, entry: unknown) =>
+          typeof entry === "bigint" ? entry.toString() : entry,
+        ) ?? "";
+      const VALUE = "staging-eu-7";
+      const fake = yield* AskTestkit.makeFake;
+      const logs: Array<string> = [];
+      const logger = Logger.make<unknown, void>((entry) => {
+        logs.push(`${dump(entry.message)} ${Cause.pretty(entry.cause)}`);
+      });
+      // The server's own tracer, writing to memory what it would write to the trace file.
+      const traced: Array<TraceRecord> = [];
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1_000_000,
+        maxFiles: 1,
+        batchWindowMs: 0,
+        sink: {
+          filePath: "unused",
+          push: (record) => void traced.push(record),
+          flush: Effect.void,
+          close: () => Effect.void,
+        },
+      }).pipe(Effect.provide(NodeServices.layer));
+      yield* Effect.gen(function* () {
+        const { card, worker, threadId } = yield* AskTestkit.workingCard("Hook");
+        const kanban = yield* KanbanService;
+        const realSecrets = yield* SecretRequests.SecretRequests;
+        // Every value kept and not yet used or forgotten.
+        const held = new Set<string>();
+        const secrets = SecretRequests.SecretRequests.of({
+          ...realSecrets,
+          hold: (input, by) =>
+            realSecrets
+              .hold(input, by)
+              .pipe(Effect.tap((kept) => Effect.sync(() => held.add(kept.ref)))),
+          discard: (ref) =>
+            realSecrets.discard(ref).pipe(Effect.tap(() => Effect.sync(() => held.delete(ref)))),
+        });
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "What is the webhook signing secret?",
+            blocking: true,
+            respond: {
+              fields: [
+                { id: "token", label: "Signing secret", type: "secret", required: true },
+                { id: "env", label: "Environment", type: "text" },
+              ],
+            },
+          },
+          worker,
+          "cardThread",
+        );
+
+        const group = WsRpcGroup.omit(
+          ...[...WsRpcGroup.requests.keys()].filter(
+            (
+              tag,
+            ): tag is Exclude<
+              keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES,
+              typeof WS_METHODS.secretsAnswerAsk
+            > => tag !== WS_METHODS.secretsAnswerAsk,
+          ),
+        ).middleware(RpcInstrumentation);
+        const services = Layer.mergeAll(
+          Layer.succeed(KanbanService, kanban),
+          Layer.succeed(SecretRequests.SecretRequests, secrets),
+          Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+          Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+          Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+          Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: process.cwd(),
+          }),
+          Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+          Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+          Layer.mock(Keybindings.Keybindings)({}),
+        );
+        const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+        const browser = yield* ServerBrowser.ServerBrowser;
+        let requests = 0;
+        /** One call on a connection of this session, from this kind of client. */
+        const call = (
+          session: EnvironmentAuth.AuthenticatedSession,
+          surface: "web" | "cli" | undefined,
+          payload: KanbanAskSecretAnswerInput,
+        ) =>
+          Effect.gen(function* () {
+            const done = yield* Deferred.make<Exit.Exit<unknown, unknown>>();
+            const server = yield* RpcServer.makeNoSerialization(group, {
+              ...WS_RPC_SERVER_OPTIONS,
+              onFromServer: (response) =>
+                response._tag === "Exit"
+                  ? Deferred.succeed(done, response.exit as Exit.Exit<unknown, unknown>)
+                  : Effect.void,
+            }).pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  layerWsRpc(
+                    session,
+                    surface === undefined ? {} : { surface },
+                    {},
+                    broker,
+                    browser,
+                  ).pipe(Layer.provide(services), Layer.provide(layerUnusedConfigRpcServices)),
+                  RpcAuthorization.layer(session.scopes),
+                  rpcInstrumentationLayer,
+                ),
+              ),
+            );
+            yield* server.write(0, {
+              _tag: "Request",
+              id: RpcMessage.RequestId(`ask-secret-${++requests}`),
+              tag: WS_METHODS.secretsAnswerAsk,
+              payload,
+              headers: Headers.empty,
+            });
+            return yield* Deferred.await(done);
+          }).pipe(Effect.scoped);
+
+        const scopes = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+        const session = (
+          origin: EnvironmentAuth.AuthenticatedSession["origin"],
+          granted: EnvironmentAuth.AuthenticatedSession["scopes"] = scopes,
+        ): EnvironmentAuth.AuthenticatedSession => ({
+          sessionId: AuthSessionId.make("ask-secret-test"),
+          subject: "ask-secret-test",
+          method: "browser-session-cookie",
+          scopes: granted,
+          ...(origin === undefined ? {} : { origin }),
+        });
+        const ownerOrigin = { _tag: "owner", source: "paired-client" } as const;
+        const owner = session(ownerOrigin);
+        const input = (
+          patch: Partial<KanbanAskSecretAnswerInput["answer"]> = {},
+          given: Record<string, string> = { token: SECRET },
+        ): KanbanAskSecretAnswerInput => ({
+          cardId: card.id,
+          askId: "q1",
+          answer: { verdict: "answered", values: { env: VALUE }, ...patch },
+          secrets: given,
+        });
+        /** Every reply and refusal, as a client or a log would see it. */
+        const seen: Array<readonly [string, string]> = [];
+        const refusedWith = (name: string, exit: Exit.Exit<unknown, unknown>) => {
+          assert.isTrue(Exit.isFailure(exit), name);
+          const error = Exit.isFailure(exit)
+            ? (Cause.squash(exit.cause) as { _tag?: string; message?: string; code?: string })
+            : {};
+          seen.push([name, `${error.message} ${dump(error)} ${dump(exit)}`]);
+          // Whatever happened inside, no value is left behind.
+          assert.strictEqual(held.size, 0, `a value is still held after: ${name}`);
+          return error;
+        };
+        const stillOpen = Effect.gen(function* () {
+          const ask = AskTestkit.askOf((yield* kanban.card(card.id)).card);
+          assert.isNull(ask.closedAt);
+          assert.isUndefined(ask.answer);
+        });
+
+        // Without the owner's app proof: refused before anything is read or kept.
+        for (const [name, who, surface] of [
+          ["a session the owner did not pair", session(undefined), "web"],
+          ["a component's session", session({ _tag: "component", component: "telegram" }), "web"],
+          ["the owner's token from the CLI", owner, "cli"],
+          ["the owner's session saying no surface", owner, undefined],
+          [
+            "an owner session without the operate scope",
+            session(ownerOrigin, [AuthOrchestrationReadScope]),
+            "web",
+          ],
+        ] as const) {
+          const error = refusedWith(name, yield* call(who, surface, input()));
+          assert.strictEqual(error._tag, "EnvironmentAuthorizationError", name);
+          yield* stillOpen;
+        }
+
+        // The owner's app, with an answer the ask can't take.
+        const wrongField = refusedWith(
+          "a field that is not a secret",
+          yield* call(owner, "web", input({}, { env: SECRET })),
+        );
+        assert.deepStrictEqual([wrongField._tag, wrongField.code], ["KanbanError", "invalid"]);
+        const unknownField = refusedWith(
+          "a field the ask doesn't have",
+          yield* call(owner, "web", input({}, { nope: SECRET })),
+        );
+        assert.deepStrictEqual([unknownField._tag, unknownField.code], ["KanbanError", "invalid"]);
+        const stale = refusedWith(
+          "a stale revision",
+          yield* call(owner, "web", input({ revision: 9 })),
+        );
+        assert.deepStrictEqual([stale._tag, stale.code], ["KanbanError", "conflict"]);
+        yield* stillOpen;
+
+        // The owner's app, answering it.
+        const before = (yield* fake.heard(threadId)).length;
+        const answered = yield* call(owner, "web", input());
+        assert.isTrue(Exit.isSuccess(answered));
+        seen.push(["the reply", dump(answered)]);
+        const stored = (yield* kanban.card(card.id)).card;
+        assert.deepStrictEqual(AskTestkit.askOf(stored).answer?.values, {
+          token: { secret: true },
+          env: VALUE,
+        });
+        assert.strictEqual(held.size, 1);
+        const wake = [...(yield* fake.heard(threadId)).slice(before), stored.wakeNote ?? ""].join(
+          "\n",
+        );
+        const ref = /secret-ref:[0-9a-f]{32}/.exec(wake)?.[0];
+        assert.isDefined(ref);
+        assert.isTrue(held.has(ref!));
+
+        // A closed ask takes no second value.
+        const closed = refusedWith.bind(null, "a closed ask");
+        held.clear();
+        const again = closed(yield* call(owner, "web", input()));
+        assert.deepStrictEqual([again._tag, again.code], ["KanbanError", "conflict"]);
+
+        // The agent that asked redeems the ref, as its own thread, once.
+        const redeem = (as: string) =>
+          realSecrets
+            .consume({ ref: SecretRef.make(ref!), projectId: ProjectId.make("project-1") })
+            .pipe(Effect.provideService(SecretRedeemer, ThreadId.make(as)));
+        assert.strictEqual(
+          (yield* redeem("thread-someone-else").pipe(Effect.flip)).reason,
+          "ref_other_thread",
+        );
+        assert.strictEqual(yield* redeem(threadId), SECRET);
+        assert.strictEqual((yield* redeem(threadId).pipe(Effect.flip)).reason, "ref_unavailable");
+
+        // The instrumentation saw every call, and recorded what was called, never what was sent.
+        const rpcSpans = traced.filter((record) => record.name === "ws.rpc.secrets.answerAsk");
+        assert.strictEqual(rpcSpans.length, requests);
+        assert.deepStrictEqual(rpcSpans.at(-1)!.attributes, {
+          "rpc.transport": "websocket",
+          "rpc.system": "effect-rpc",
+          "rpc.method": "secrets.answerAsk",
+          "rpc.aggregate": "secrets",
+          "kanban.card_id": card.id,
+          "kanban.ask_id": "q1",
+        });
+        // Every span of the path is here, the ones that kept, answered and handed out the value too.
+        const names = new Set(traced.map((record) => record.name));
+        for (const name of [
+          "KanbanAskSecrets.answer",
+          "HeldSecrets.hold",
+          "KanbanService.answerAsks",
+          "HeldSecrets.take",
+          "SecretRequests.consume",
+        ]) {
+          assert.isTrue(names.has(name), `no span recorded for ${name}`);
+        }
+        seen.push(["trace records", traced.map(dump).join("\n")]);
+        seen.push(["logs", logs.join("\n")]);
+        assert.isAbove(traced.length, requests);
+        for (const [where, output] of seen) {
+          assert.isFalse(output.includes(SECRET), `the value shows in: ${where}`);
+          assert.isFalse(
+            output.includes(SECRET.slice(6, 20)),
+            `part of the value shows in: ${where}`,
+          );
+        }
+        // What he typed into the plain field is not in the telemetry either.
+        for (const where of ["trace records", "logs"]) {
+          const output = seen.find(([name]) => name === where)![1];
+          assert.isFalse(output.includes(VALUE), `answer.values shows in: ${where}`);
+        }
+      }).pipe(
+        Effect.withTracer(tracer),
+        Effect.provide(
+          Layer.mergeAll(
+            SecretRequests.layer.pipe(
+              Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
+              Layer.provideMerge(ServerSecretStore.layer),
+              Layer.provideMerge(AskTestkit.testLayer(fake.layer)),
+            ),
+            Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+            Layer.mock(ServerBrowser.ServerBrowser)({}),
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
+        Effect.scoped,
+      );
+    }),
 );

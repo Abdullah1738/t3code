@@ -441,8 +441,9 @@ it.effect(
       });
       assert.isTrue(withDefault.isError);
       assert.include(withDefault.text, "takes no default");
-      // An evaluator can't give it for him, even on an ask he handed over.
-      yield* kanban.handAsk(card.id, "q1", "hand", owner);
+      // An evaluator can't give it for him, and he can't hand it over either.
+      const hand = yield* kanban.handAsk(card.id, "q1", "hand", owner).pipe(Effect.flip);
+      assert.include(hand.detail, "the evaluator can't answer it");
       const forHim = yield* tool("card_ask_answer", {
         card: card.id,
         ask: "q1",
@@ -450,15 +451,7 @@ it.effect(
         values: { token: value },
       });
       assert.isTrue(forHim.isError);
-      assert.include(forHim.text, "private field");
-      const without = yield* tool("card_ask_answer", {
-        card: card.id,
-        ask: "q1",
-        verdict: "answered",
-        text: "ok",
-      });
-      assert.isTrue(without.isError);
-      assert.include(without.text, "Return the ask to him");
+      assert.include(forHim.text, "only the owner answers it");
 
       yield* answerAskSecrets(kanban, secrets)(
         {
@@ -475,7 +468,7 @@ it.effect(
       yield* tool("discussion_read", {
         discussion: (yield* kanban.card(card.id)).card.discussionId,
       });
-      assert.isAbove(replies.length, 6);
+      assert.isAbove(replies.length, 5);
       for (const reply of replies) assert.notInclude(reply, value);
       assert.deepStrictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.values, {
         token: { secret: true },

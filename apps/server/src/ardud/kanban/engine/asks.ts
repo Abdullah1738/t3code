@@ -1329,6 +1329,21 @@ const without = (
 export const clearClarify = (card: KanbanCard, askId: string): KanbanCard =>
   without(card, askId, "clarifyAskedAt");
 
+/**
+ * Why an ask can't be handed to the evaluator, or undefined. An evaluator has
+ * no way to give a secret, so an ask that requires one would only come back.
+ */
+export const handProblem = (card: KanbanCard, ask: KanbanOwnerAsk): AskProblem | undefined => {
+  const secret = kanbanAskResponse(ask).fields.find(
+    (field) => field.type === "secret" && field.required === true,
+  );
+  return secret === undefined
+    ? undefined
+    : invalid(
+        `${ask.id} on card #${card.number} needs a secret (${secret.label}) that only you can give, in the app's private field, so the evaluator can't answer it. Answer it yourself, or reject it`,
+      );
+};
+
 export const markHanded = (
   card: KanbanCard,
   askId: string,
