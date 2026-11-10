@@ -11,7 +11,7 @@
  * main thread. Meanwhile the probes run sequentially, so each measures its
  * own queue wait and nothing else:
  *
- * - foreground: shell page (500 rows), thread snapshot window, thread projection
+ * - foreground: shell page (500 rows), thread snapshot window, full thread snapshot
  *   (wrapped in `foregroundReads` when the tree has it; base has no lanes);
  * - reserved: auth and identity lane round trips;
  * - background: a small untagged read (it should wait; that is the design).
@@ -40,7 +40,7 @@ if (lanes === "off") {
 }
 
 export const readsLaneWorkload = {
-  version: 1,
+  version: 2,
   idleCycles: 30,
   holders: 2,
   holderWarmupMs: 1000,
@@ -123,13 +123,18 @@ const program = Effect.gen(function* () {
       const start = performance.now();
       return Effect.map(effect, () => performance.now() - start);
     });
+  // Same routing as production: Orchestrator wraps these ProjectionStore reads in
+  // `readOnly` (Orchestrator.ts getShellSnapshot / getThreadSnapshotWindow /
+  // getThreadSnapshot / getThreadShell); WS RPCs and environment HTTP add
+  // `foregroundReads` on the candidate.
+  const ro = NodeSqliteClient.readOnly as <A>(effect: Eff<A>) => Eff<A>;
   const run: Record<string, () => Eff<unknown>> = {
-    shellPage: () => foreground(store.getShellSnapshot({ location: "active", limit: 501 })),
-    threadWindow: () => foreground(store.getThreadSnapshotWindow(thread, { rowLimit: 200 })),
-    threadProjection: () => foreground(store.getThreadProjection(thread)),
+    shellPage: () => foreground(ro(store.getShellSnapshot({ location: "active", limit: 501 }))),
+    threadWindow: () => foreground(ro(store.getThreadSnapshotWindow(thread, { rowLimit: 200 }))),
+    threadSnapshot: () => foreground(ro(store.getThreadSnapshot(thread))),
     auth: () => NodeSqliteClient.authReadOnly(sql`SELECT count(*) AS n FROM sqlite_schema`),
     identity: () => NodeSqliteClient.identityReadOnly(sql`SELECT count(*) AS n FROM sqlite_schema`),
-    backgroundSmall: () => store.getThreadShell(thread),
+    backgroundSmall: () => ro(store.getThreadShell(thread)),
   };
   const cycle = (phase: string) =>
     Effect.forEach(
