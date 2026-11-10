@@ -15,8 +15,12 @@
 export const SHELL_PAGE_SIZE = 500;
 export const SHELL_RECENT_PAGE_SIZE = 150;
 
-/** `nextAfter` of the recent-first page. Not a thread id: it starts the id walk. */
-export const SHELL_WALK_START_CURSOR = "!recent-first";
+/**
+ * `nextAfter` of the recent-first page: it starts the id walk. It must never equal a thread
+ * id, or the page ending at that thread would send the walk back to its start for ever, with
+ * or without the switch. Thread ids are non-blank (`ThreadId`), so the cursor is blank.
+ */
+export const SHELL_WALK_START_CURSOR = " ";
 
 export interface ShellPageRead {
   readonly recentFirst?: true;

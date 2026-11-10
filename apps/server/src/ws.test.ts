@@ -653,11 +653,24 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
     yield* Effect.gen(function* () {
       const fixture = yield* fileReplayFixture;
       const base = (yield* fixture.orchestrator.getThreadShell(fixture.threadId))!;
+      // Row 500, the last of page one, is named like the walk cursor's earlier spelling
+      // ("!recent-first", a legal thread id): its cursor must continue the walk, not
+      // restart it. Ids stay in id order.
       const rows = Array.from({ length: 1101 }, (_, index) => ({
         ...base,
-        id: ThreadId.make(`thread:${String(index).padStart(5, "0")}`),
+        id: ThreadId.make(
+          index < 499
+            ? `!a:${String(index).padStart(5, "0")}`
+            : index === 499
+              ? "!recent-first"
+              : `thread:${String(index).padStart(5, "0")}`,
+        ),
         lastError: "x".repeat(16_000),
       }));
+      assert.deepEqual(
+        rows.map((row) => row.id),
+        rows.map((row) => row.id).toSorted(),
+      );
       const cursors: Array<string | undefined> = [];
       yield* Effect.gen(function* () {
         const threads = yield* ThreadManagement.ThreadManagementService;

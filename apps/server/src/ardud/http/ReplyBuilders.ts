@@ -18,7 +18,8 @@ import * as Semaphore from "effect/Semaphore";
  *   pages in a row with a 20 s deadline each; on the shared snapshot lane they queued
  *   behind board snapshots and whole-list reads that held it for 7-45 s (10 Nov 2026:
  *   pages waited up to 13 s for a permit and two gave up after 20-25 s unadmitted).
- *   A page is at most 500 rows (under 1 MiB), so three at once stay cheap.
+ *   A page is at most 500 rows (0.7 MB on the synthetic fixture, about 1.3 MB in the
+ *   live traces; rows are not capped in bytes), so three at once stay cheap.
  * - poll: the per-thread control message read, so bridge polls queue only
  *   behind each other, never behind lists, snapshots or MCP reads.
  * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).

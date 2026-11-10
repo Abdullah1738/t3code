@@ -93,29 +93,68 @@ export async function install(ops, { rollback = false } = {}) {
  */
 export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
   return new Promise((resolve, reject) => {
-    const target = new URL(url);
-    const request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
-      target,
-      { headers, agent: false },
-      (response) => {
-        const chunks = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("error", reject);
-        response.on("end", () => {
+    let request;
+    let settled = false;
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      request?.destroy();
+      settle(value);
+    };
+    const fail = (error) => finish(reject, error);
+    // One deadline for the whole exchange, redirects included, as AbortSignal.timeout gave
+    // fetch: a socket inactivity timeout never fires on a reply that trickles in.
+    const deadline = setTimeout(() => fail(new Error("Request timed out")), timeoutMs);
+    const origin = new URL(url).origin;
+    const send = (target, redirectsLeft) => {
+      request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
+        target,
+        // Credentials stay with the origin they were given for.
+        { headers: target.origin === origin ? headers : {}, agent: false },
+        (response) => {
           const status = response.statusCode ?? 0;
-          if (status < 200 || status > 299) return reject(new Error(`HTTP ${status}`));
-          try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-          } catch (error) {
-            reject(error);
+          const location = response.headers.location;
+          if ([301, 302, 303, 307, 308].includes(status) && location !== undefined) {
+            response.resume();
+            if (redirectsLeft <= 0) return fail(new Error("Too many redirects"));
+            let next;
+            try {
+              next = new URL(location, target);
+            } catch (error) {
+              return fail(error);
+            }
+            if (next.protocol !== "http:" && next.protocol !== "https:")
+              return fail(new Error(`Unsupported redirect to ${next.protocol}`));
+            request.destroy();
+            return send(next, redirectsLeft - 1);
           }
-        });
-      },
-    );
-    request.setTimeout(timeoutMs, () => request.destroy(new Error("Request timed out")));
-    request.on("error", reject);
+          const chunks = [];
+          let bytes = 0;
+          response.on("data", (chunk) => {
+            bytes += chunk.length;
+            if (bytes > JSON_REPLY_LIMIT_BYTES) return fail(new Error("Reply too large"));
+            chunks.push(chunk);
+          });
+          response.on("error", fail);
+          response.on("end", () => {
+            if (status < 200 || status > 299) return fail(new Error(`HTTP ${status}`));
+            try {
+              finish(resolve, JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            } catch (error) {
+              fail(error);
+            }
+          });
+        },
+      );
+      request.on("error", fail);
+    };
+    send(new URL(url), JSON_REDIRECT_LIMIT);
   });
 }
+// The readiness replies are a few hundred bytes; fetch followed up to 20 redirects.
+const JSON_REPLY_LIMIT_BYTES = 1024 * 1024;
+const JSON_REDIRECT_LIMIT = 5;
 
 export function probeDirectory(dir, timeoutMs = 10_000, command = ["/bin/ls", ["-f", dir]]) {
   return new Promise((resolve) => {

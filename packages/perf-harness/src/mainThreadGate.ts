@@ -157,6 +157,11 @@ try {
         threadsWithPullRequests: summarize(sweeps.threadsWithPullRequests),
         limitRecoveryCandidates: summarize(sweeps.limitRecoveryCandidates),
       };
+      // A failed read is not a timing of the read.
+      for (const [name, samples] of Object.entries(sweeps)) {
+        const failed = samples.find((sample) => sample.failure !== undefined);
+        if (failed !== undefined) throw new Error(`${name} failed: ${failed.failure}`);
+      }
 
       // The check turn start and run finalize make: is this run still current/active?
       const threadId = ThreadId.make("synthetic-thread-20");
@@ -175,11 +180,19 @@ try {
           : store.getRuntimeRecoveryProjection(threadId);
       const started = performance.now();
       let worst = 0;
+      let failures = 0;
+      let firstFailure: string | undefined;
       for (let i = 0; i < mainThreadWorkload.runControlRepeats; i++) {
         const callStarted = performance.now();
-        yield* Effect.exit(check);
+        const exit = yield* Effect.exit(check);
         worst = Math.max(worst, performance.now() - callStarted);
+        if (exit._tag === "Failure") {
+          failures++;
+          firstFailure ??= String(exit.cause).slice(0, 300);
+        }
       }
+      // A failed read is not a timing of the read: the run fails below.
+      if (failures > 0) throw new Error(`run-control read failed ${failures}x: ${firstFailure}`);
       result.runControl = {
         read: typeof narrow === "function" ? "getRunControlState" : "getRuntimeRecoveryProjection",
         n: mainThreadWorkload.runControlRepeats,

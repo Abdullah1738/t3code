@@ -485,8 +485,46 @@ test("readiness polls reject on every failure and never use global fetch", async
       return res.end("starting");
     }
     if (req.url === "/text") return res.end("not json");
+    if (req.url === "/moved") {
+      res.statusCode = 302;
+      res.setHeader("location", "/ok");
+      return res.end();
+    }
+    if (req.url === "/loop") {
+      res.statusCode = 307;
+      res.setHeader("location", "/loop");
+      return res.end();
+    }
+    if (req.url === "/elsewhere") {
+      res.statusCode = 302;
+      res.setHeader("location", `http://127.0.0.1:${other.address().port}/ok`);
+      return res.end();
+    }
+    if (req.url === "/trickle") {
+      // Bytes arrive faster than any inactivity timeout, and the reply never ends.
+      res.setHeader("content-type", "application/json");
+      const timer = setInterval(() => res.write(" "), 10);
+      res.on("close", () => {
+        clearInterval(timer);
+        trickleClosed = true;
+      });
+      return;
+    }
+    if (req.url === "/huge") {
+      res.setHeader("content-type", "application/json");
+      return res.end(`"${"x".repeat(1024 * 1024 + 1)}"`);
+    }
     // "/slow" never answers.
   });
+  let trickleClosed = false;
+  // Another origin (same host, other port) that the first one redirects to.
+  const otherHits = [];
+  const other = createServer((req, res) => {
+    otherHits.push(req.headers.authorization);
+    res.setHeader("content-type", "application/json");
+    res.end('{"bootId":"b2"}');
+  });
+  await new Promise((resolve) => other.listen(0, "127.0.0.1", resolve));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const origin = `http://127.0.0.1:${port}`;
@@ -498,9 +536,33 @@ test("readiness polls reject on every failure and never use global fetch", async
     await assert.rejects(getJson(`${origin}/bad`), /HTTP 503/);
     await assert.rejects(getJson(`${origin}/text`), SyntaxError);
     await assert.rejects(getJson(`${origin}/slow`, { timeoutMs: 50 }), /timed out/);
+    // The deadline bounds the whole exchange: a reply that keeps trickling still ends,
+    // and its connection is closed.
+    const trickleStarted = Date.now();
+    await assert.rejects(getJson(`${origin}/trickle`, { timeoutMs: 80 }), /timed out/);
+    assert.ok(Date.now() - trickleStarted < 1000);
+    for (let i = 0; i < 50 && !trickleClosed; i++) await new Promise((ok) => setTimeout(ok, 10));
+    assert.equal(trickleClosed, true);
+    await assert.rejects(getJson(`${origin}/huge`), /too large/);
+    // Redirects are followed as fetch followed them, within a bound; the credential goes
+    // only to the origin it was given for.
+    hits.length = 0;
+    assert.deepEqual(await getJson(`${origin}/moved`, { headers: { authorization: "Bearer t" } }), {
+      bootId: "b1",
+    });
+    assert.deepEqual(hits, ["Bearer t", "Bearer t"]);
+    hits.length = 0;
+    assert.deepEqual(
+      await getJson(`${origin}/elsewhere`, { headers: { authorization: "Bearer t" } }),
+      { bootId: "b2" },
+    );
+    assert.deepEqual([hits, otherHits], [["Bearer t"], [undefined]]);
+    await assert.rejects(getJson(`${origin}/loop`), /Too many redirects/);
   } finally {
     server.closeAllConnections();
+    other.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => other.close(resolve));
   }
   // The server is gone: what the installer polls right after launching the new app.
   for (let i = 0; i < 20; i++) await assert.rejects(getJson(`${origin}/ok`), /ECONNREFUSED/);
