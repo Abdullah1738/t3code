@@ -294,7 +294,7 @@ export function TaskSteps(props: {
         const done = form.steps.includes(index);
         return (
           // oxlint-disable-next-line react/no-array-index-key -- Steps have no id; their order is fixed for one revision.
-          <li key={index} className="flex min-w-0 flex-wrap items-start gap-x-3 gap-y-1">
+          <li key={index} className="flex min-w-0 flex-col items-start">
             <button
               type="button"
               role="checkbox"
@@ -307,7 +307,7 @@ export function TaskSteps(props: {
                     : [...form.steps, index],
                 })
               }
-              className="group flex min-w-0 flex-1 items-start gap-3 rounded-lg py-1.5 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="group flex w-full min-w-0 items-start gap-3 rounded-lg py-1.5 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
             >
               <span
                 aria-hidden
@@ -329,7 +329,7 @@ export function TaskSteps(props: {
                 href={step.link}
                 target="_blank"
                 rel="noreferrer"
-                className={cn(linkClass, "inline-flex items-center gap-1.5 py-1.5 text-sm")}
+                className={cn(linkClass, "ms-8 mb-1 inline-flex items-center gap-1.5 text-sm")}
               >
                 <ExternalLinkIcon aria-hidden className="size-3.5" />
                 Open {linkHost(step.link)}
