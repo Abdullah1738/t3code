@@ -21,7 +21,8 @@ RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() el
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
 SECRET_EXCLUDES = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.p8", "*.mobileprovision",
                    ".aws/", ".ssh/", ".netrc", ".npmrc", ".pypirc", ".docker/config.json", "*.tfstate", "*.tfstate.*",
-                   ".terraform.d/", "credentials.json", "id_rsa*", "id_ed25519*"]
+                   ".terraform.d/", "credentials.json", "id_rsa*", "id_ed25519*",
+                   ".gnupg/", "gnupg/", "private-keys-v1.d/", "*.keystore", "*.kdbx"]
 SAFE_ENV_TEMPLATES = [".env.example", ".env.sample", ".env.template", ".env.dist"]
 # node_modules without the trailing slash: worktrees often symlink it to the main checkout, and a dir-only
 # pattern would sync that (dangling) symlink over the box's own install.
@@ -188,6 +189,11 @@ def _soft_partial(stderr: str) -> list[str] | None:
     return bad or None
 
 
+def _include_refused(inc: str) -> OffboxError:
+    return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
+                       "so it won't send it (git inspection failed)", code=2)
+
+
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
     """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
     tops: list[str] = []
@@ -198,8 +204,10 @@ def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
             try:
                 p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
                                    capture_output=True, timeout=10)
-            except Exception:  # noqa: BLE001 - no git: keep today's rules
-                return tops
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise _include_refused(inc) from e
+            if p.returncode not in (0, 1):
+                raise _include_refused(inc)
             if p.returncode == 0:
                 if anc not in tops:
                     tops.append(anc)
@@ -242,17 +250,46 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
+    ancestors: set[str] = set()
     for inc in includes or []:      # explicit opt-in (e.g. committed test certs); wins over every exclude
         inc = inc.strip("/")
         parts = inc.split("/")
         for i in range(1, len(parts)):
-            f.append("--filter=+ /" + "/".join(parts[:i]) + "/")
+            anc = "/".join(parts[:i])
+            ancestors.add(anc)
+            f.append(f"--filter=+ /{anc}/")
         f.append(f"--filter=+ /{inc}")
         f.append(f"--filter=+ /{inc}/**")
+    is_git = False
+    if includes:
+        try:
+            p = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                               capture_output=True, timeout=10)
+            is_git = p.returncode == 0 and p.stdout.strip() == b"true"
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # No Git index: guard every opened ancestor.
+    guarded = ancestors.copy()
+    if is_git and ancestors:
+        try:
+            p = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
+                               capture_output=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise _include_refused(includes[0]) from e
+        if p.returncode != 0:
+            raise _include_refused(includes[0])
+        for raw in p.stdout.split(b"\0"):
+            if raw:
+                parts = os.fsdecode(raw).split("/")
+                for i in range(1, len(parts)):
+                    guarded.discard("/".join(parts[:i]))
+    # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
+    # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
+    for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
+        f.append(f"--filter=- /{anc}/*")
     # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
     # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
     # Protect the rest of that dir on the box; the included path itself still mirrors.
-    for top in _ignored_include_tops(root, includes):
+    for top in _ignored_include_tops(root, includes) if is_git else []:
         f.append(f"--filter=P /{top}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
