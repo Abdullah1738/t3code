@@ -678,17 +678,18 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.map((resolved) => new Map(resolved)));
   };
 
-  const projectShell = (projectId: ProjectId): ProjectShellRead =>
-    Effect.gen(function* () {
-      const memo = yield* SweepProjectShells;
-      if (memo === null) return yield* projects.getShell(projectId);
-      let read = memo.get(projectId);
-      if (read === undefined) {
-        read = yield* Effect.cached(projects.getShell(projectId));
-        memo.set(projectId, read);
-      }
-      return yield* read;
-    });
+  const projectShell: (projectId: ProjectId) => ProjectShellRead = Effect.fn(
+    "PullRequestService.projectShell",
+  )(function* (projectId: ProjectId) {
+    const memo = yield* SweepProjectShells;
+    if (memo === null) return yield* projects.getShell(projectId);
+    let read = memo.get(projectId);
+    if (read === undefined) {
+      read = yield* Effect.cached(projects.getShell(projectId));
+      memo.set(projectId, read);
+    }
+    return yield* read;
+  });
 
   const listWorkspaceProjects = (
     filter: Pick<PullRequestListInput, "projectId" | "projectIds" | "host">,

@@ -97,7 +97,7 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
         ? fetchPageOnce(after, baseTimeoutMs * (n + 1))
         : fetchPageOnce(after, baseTimeoutMs * (n + 1)).pipe(
             // Only a timeout says "busy, ask again"; other failures repeat themselves.
-            Effect.catchTag("RemoteEnvironmentAuthTimeoutError", () => attempt(n + 1)),
+            Effect.catchTags({ RemoteEnvironmentAuthTimeoutError: () => attempt(n + 1) }),
           );
     return attempt(0);
   };

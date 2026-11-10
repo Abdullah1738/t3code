@@ -927,7 +927,7 @@ const makeRoutes = Effect.gen(function* () {
    * only for the threads returned (or for the changed range when a state filter needs them).
    * Same filters, order and exact `total` as the full listing.
    */
-  const listUpdatedSince = (input: {
+  const listUpdatedSince = Effect.fn("ControlApi.listUpdatedSince")(function* (input: {
     readonly location: "active" | "archive";
     readonly since: number;
     readonly active: boolean | undefined;
@@ -938,8 +938,7 @@ const makeRoutes = Effect.gen(function* () {
     readonly creationSources: ReadonlyArray<string> | undefined;
     readonly origin: string | null;
     readonly limit: number;
-  }) =>
-    Effect.gen(function* () {
+  }) {
       const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
       // updated_at is an ISO string; widen by a second so precision differences can't drop a
       // row at the edge, then compare instants exactly.
@@ -984,11 +983,10 @@ const makeRoutes = Effect.gen(function* () {
       // total; the next candidates refill the page.
       let dropped = 0;
       let offset = 0;
-      while (offset < matched.length && (needsState || shells.length < limit)) {
-        const batch = matched.slice(
-          offset,
-          needsState ? matched.length : offset + limit - shells.length,
-        );
+      // With a state filter every candidate is loaded: the state decides what the page holds.
+      const wanted = needsState ? Number.POSITIVE_INFINITY : limit;
+      while (offset < matched.length && shells.length < wanted) {
+        const batch = matched.slice(offset, offset + wanted - shells.length);
         offset += batch.length;
         const loaded = (yield* shellsFor(
           batch.map((row) => row.threadId),
