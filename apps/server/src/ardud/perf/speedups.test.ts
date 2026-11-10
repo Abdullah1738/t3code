@@ -12,6 +12,7 @@ it("turns every speed-up on when nothing is set", () => {
     shellRecentFirst: true,
     threadsPullRequestIndex: true,
     ingestDedupeForeground: true,
+    shellResumeAcrossSessions: true,
   });
   expect(readSpeedups({ ROBOB_SWEEP_READS_ON_WRITER: " ", ROBOB_THREAD_REPLY_LANE: "" })).toEqual(
     readSpeedups({}),
@@ -29,6 +30,7 @@ it("restores each old behaviour from its documented value", () => {
       ROBOB_SHELL_RECENT_FIRST: "off",
       ROBOB_THREADS_PR_INDEX: "0",
       ROBOB_INGEST_DEDUPE_LANE: "background",
+      ROBOB_SHELL_KEEP_RESUMABLE: "0",
     }),
   ).toEqual({
     sweepReadsOffWriter: false,
@@ -39,6 +41,7 @@ it("restores each old behaviour from its documented value", () => {
     shellRecentFirst: false,
     threadsPullRequestIndex: false,
     ingestDedupeForeground: false,
+    shellResumeAcrossSessions: false,
   });
 });
 

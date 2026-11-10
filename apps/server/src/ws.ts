@@ -1864,6 +1864,7 @@ export const layerWsRpc = (
           settings,
           shellResumeCompletionMarker: true,
           shellSnapshotPagination: true,
+          ...((yield* Switches).shellResumeAcrossSessions ? { shellResumeAcrossSessions: true } : {}),
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
           threadFind: true,

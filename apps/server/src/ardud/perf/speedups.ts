@@ -24,6 +24,10 @@
  *   behind sweeps and reports, instead of the foreground pool.
  * - `ROBOB_SHELL_RECENT_FIRST=0`: a client asking for the most recently updated threads
  *   as the first page of a paged thread list gets pages by thread id from the start.
+ * - `ROBOB_SHELL_KEEP_RESUMABLE=0`: clients are no longer told they may keep a complete
+ *   thread list resumable across sessions and resubscribes; a session that ends before its
+ *   "synchronized" marker makes the next one load every page again (the old client rule).
+ *   Works for installed clients without a client build.
  */
 import * as Context from "effect/Context";
 
@@ -61,6 +65,7 @@ export interface Speedups {
   readonly shellRecentFirst: boolean;
   readonly threadsPullRequestIndex: boolean;
   readonly ingestDedupeForeground: boolean;
+  readonly shellResumeAcrossSessions: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -78,6 +83,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   shellRecentFirst: !isOff(env, "ROBOB_SHELL_RECENT_FIRST"),
   threadsPullRequestIndex: !isOff(env, "ROBOB_THREADS_PR_INDEX"),
   ingestDedupeForeground: text(env, "ROBOB_INGEST_DEDUPE_LANE")?.toLowerCase() !== "background",
+  shellResumeAcrossSessions: !isOff(env, "ROBOB_SHELL_KEEP_RESUMABLE"),
 });
 
 /** Process-wide switches, read once at start. */
