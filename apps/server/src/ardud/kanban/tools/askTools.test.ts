@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { McpSchema, McpServer } from "effect/ai";
 
+import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
@@ -22,8 +23,10 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
+import { answerAskSecrets } from "../askSecrets.ts";
 import * as KanbanService from "../engine/KanbanService.ts";
 import * as KanbanModels from "../engine/models.ts";
 import { opencodeTestProvider } from "../engine/testProviders.ts";
@@ -404,3 +407,85 @@ it("the card_ask description says what he can give back, and stays short", () =>
   }
   assert.isBelow(description.length, 1_800);
 });
+
+it.effect(
+  "a secret field over the tools: asked with card_ask, and no tool reply ever shows the value",
+  () =>
+    Effect.gen(function* () {
+      const { kanban, card } = yield* setup;
+      const secrets = yield* SecretRequests.SecretRequests;
+      const value = "ghp_T00L-reply-N3ver-shows-this";
+      const replies: Array<string> = [];
+      const tool = (name: string, args: Record<string, unknown>) =>
+        call(evaluator, name, args).pipe(
+          Effect.tap((result) =>
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            Effect.sync(() => replies.push(`${result.text} ${JSON.stringify(result.structured)}`)),
+          ),
+        );
+
+      const asked = yield* tool("card_ask", {
+        card: card.id,
+        question: "What is the GitHub token for the mirror job?",
+        respond: {
+          fields: [{ id: "token", label: "GitHub token", type: "secret", required: true }],
+        },
+      });
+      assert.isFalse(asked.isError, asked.text);
+      assert.strictEqual(asked.structured.card.ask.open, true);
+      // A default would put a value on the card: refused, without repeating it.
+      const withDefault = yield* tool("card_ask", {
+        card: card.id,
+        question: "And the other token?",
+        respond: { fields: [{ label: "Token", type: "secret", default: value }] },
+      });
+      assert.isTrue(withDefault.isError);
+      assert.include(withDefault.text, "takes no default");
+      // An evaluator can't give it for him, even on an ask he handed over.
+      yield* kanban.handAsk(card.id, "q1", "hand", owner);
+      const forHim = yield* tool("card_ask_answer", {
+        card: card.id,
+        ask: "q1",
+        verdict: "answered",
+        values: { token: value },
+      });
+      assert.isTrue(forHim.isError);
+      assert.include(forHim.text, "private field");
+      const without = yield* tool("card_ask_answer", {
+        card: card.id,
+        ask: "q1",
+        verdict: "answered",
+        text: "ok",
+      });
+      assert.isTrue(without.isError);
+      assert.include(without.text, "Return the ask to him");
+
+      yield* answerAskSecrets(kanban, secrets)(
+        {
+          cardId: card.id,
+          askId: "q1",
+          answer: { verdict: "answered" },
+          secrets: { token: value },
+        },
+        { _tag: "owner-app", surface: "desktop", sessionId: "session-1" },
+      );
+      const got = yield* tool("card_get", { card: card.id });
+      assert.isFalse(got.isError, got.text);
+      yield* tool("card_search", { query: "token" });
+      yield* tool("discussion_read", {
+        discussion: (yield* kanban.card(card.id)).card.discussionId,
+      });
+      assert.isAbove(replies.length, 6);
+      for (const reply of replies) assert.notInclude(reply, value);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.values, {
+        token: { secret: true },
+      });
+    }).pipe(
+      Effect.provide(
+        SecretRequests.layer.pipe(
+          Layer.provide(ServerSecretStore.layer),
+          Layer.provideMerge(testLayer()),
+        ),
+      ),
+    ),
+);

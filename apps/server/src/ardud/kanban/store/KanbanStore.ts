@@ -389,6 +389,7 @@ const make = Effect.gen(function* () {
                   'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
                   'handedAt', json_extract(ask.value, '$.handedAt'),
                   'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                  'snoozedUntil', json_extract(ask.value, '$.snoozedUntil'),
                   'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
                     THEN json_object('ack', json('true')) END
                 )

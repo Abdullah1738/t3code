@@ -406,7 +406,26 @@ export interface KanbanServiceShape {
     askId: string,
     input: Asks.AskAnswerInput,
     actor: KanbanActor,
+    /** The refs for the secret fields he filled in privately; only the wake text carries them. */
+    secrets?: Asks.AskSecretRefs,
   ) => Effect.Effect<{ readonly card: KanbanCard; readonly heard: boolean }, KanbanError>;
+  /**
+   * Who may use the refs for an open ask's secret fields (`fieldIds`), and the
+   * project its card's threads run in. Fails when the ask is closed or one of
+   * the ids is not a secret field on it.
+   */
+  readonly askSecretPlan: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    fieldIds: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    {
+      readonly redeemer: Asks.AskSecretRef["redeemer"];
+      readonly threadId: string | null;
+      readonly projectId: ProjectId | null;
+    },
+    KanbanError
+  >;
   /**
    * A message in one ask's discussion. From the owner it does not answer the
    * ask: the ask waits on its asker, who is woken to reply or fix the ask.
@@ -429,6 +448,16 @@ export interface KanbanServiceShape {
     action: "hand" | "take_back" | "return",
     actor: KanbanActor,
     always?: boolean,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * The owner puts one ask away until a time, or (null) takes the snooze off.
+   * The ask stays open and keeps holding its card; no thread is told.
+   */
+  readonly snoozeAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    until: string | null,
+    actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /** Records the evaluator thread an "every time" hand-over started, while the ask is still handed. */
   readonly noteHandEvaluator: (
@@ -8159,7 +8188,20 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor) =>
+  const askSecretPlan: KanbanServiceShape["askSecretPlan"] = (cardId, askId, fieldIds) =>
+    readDb(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const plan = Asks.secretPlan(card, ask, fieldIds);
+        if (Asks.isAskProblem(plan)) return yield* failWith(plan.code, plan.detail);
+        const projectId = card.projectId ?? (yield* boardOf(card.boardId)).defaultProjectId;
+        return { ...plan, projectId };
+      }),
+    );
+
+  const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
     guardDeferred(
       Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
@@ -8173,7 +8215,14 @@ const make = Effect.gen(function* () {
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
           );
         }
-        const checked = Asks.answerFor(card, ask, input, actor, yield* nowIso);
+        const checked = Asks.answerFor(
+          card,
+          ask,
+          input,
+          actor,
+          yield* nowIso,
+          new Set(Object.keys(secrets ?? {})),
+        );
         if (Asks.isAskProblem(checked)) return yield* failWith(checked.code, checked.detail);
         // The files he gave are kept before the card changes: one that can't be refuses the answer.
         let answer = checked;
@@ -8220,7 +8269,7 @@ const make = Effect.gen(function* () {
         const result = yield* answerAsks(
           discussion,
           fresh,
-          Asks.answerText(fresh, ask, answer, attachments.pathOf),
+          Asks.answerText(fresh, ask, answer, attachments.pathOf, secrets),
           (open) => open.id === ask.id,
           actor,
           false,
@@ -8264,8 +8313,12 @@ const make = Effect.gen(function* () {
         );
         const fresh = yield* cardOf(card.id);
         if (actor._tag !== "owner") {
-          // The agent replied: it is the owner's turn again.
-          const next = Asks.clearClarify(fresh, ask.id);
+          // The agent replied: it is the owner's turn again, and a snoozed ask comes back.
+          const next = Asks.wakeFromSnooze(
+            Asks.clearClarify(fresh, ask.id),
+            ask.id,
+            message.createdAt,
+          );
           if (next !== fresh) yield* saveCard({ ...next, updatedAt: message.createdAt });
           return message;
         }
@@ -8368,6 +8421,24 @@ const make = Effect.gen(function* () {
           { kind: "toEvaluator", discussionId: discussion.id, text, note: false },
           toEvaluator(discussion, text),
         );
+        return next;
+      }),
+    );
+
+  const snoozeAsk: KanbanServiceShape["snoozeAsk"] = (cardId, askId, until, actor) =>
+    guard(
+      Effect.gen(function* () {
+        if (actor._tag !== "owner") {
+          return yield* failWith("denied", "only the owner snoozes an ask");
+        }
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const at = yield* nowIso;
+        const snoozed = Asks.snoozeAsk(card, ask, until, at);
+        if (Asks.isAskProblem(snoozed)) return yield* failWith(snoozed.code, snoozed.detail);
+        const next = { ...snoozed, updatedAt: at };
+        yield* saveCard(next);
         return next;
       }),
     );
@@ -9912,6 +9983,8 @@ const make = Effect.gen(function* () {
     answerAsk,
     replyOnAsk,
     handAsk,
+    snoozeAsk,
+    askSecretPlan,
     noteHandEvaluator,
     askDetail,
     askFeed,

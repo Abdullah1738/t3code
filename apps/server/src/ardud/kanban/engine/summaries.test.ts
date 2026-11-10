@@ -326,6 +326,37 @@ describe("board summaries", () => {
     expect(counts(NOW)).toEqual([3, 1]);
   });
 
+  it("leaves a snoozed ask out until its time, and counts it again after", () => {
+    const until = "2026-10-26T13:00:00Z";
+    const tallies = tallyBoards([
+      {
+        board: board("b1"),
+        cards: [
+          card("snoozed", { stage: "needs_owner", asks: [ask("q1", { snoozedUntil: until })] }),
+          // One ask snoozed, one not: the card still counts.
+          card("mixed", { asks: [ask("q1", { snoozedUntil: until }), ask("q2")] }),
+          // Snoozed past its own expiry: never his.
+          card("gone", { asks: [ask("q1", { snoozedUntil: until, expiresAt: at })] }),
+        ],
+        discussions: [],
+        threadIds: [],
+      },
+    ]);
+    const needs = (nowMs: number) => summaries(tallies, nowMs)[0]?.needsOwner;
+    expect(needs(NOW)).toBe(1);
+    expect(needs(Date.parse(until) - 1)).toBe(1);
+    expect(needs(Date.parse(until))).toBe(2);
+    // Snoozing and unsnoozing are changes that move the count.
+    const set = (asks: ReadonlyArray<KanbanOwnerAsk>) =>
+      applyChange(tallies, "b1", { _tag: "card", card: card("mixed", { asks }) });
+    expect(set([ask("q1", { snoozedUntil: until }), ask("q2", { snoozedUntil: until })])).toBe(
+      true,
+    );
+    expect(needs(NOW)).toBe(0);
+    expect(set([ask("q1"), ask("q2", { snoozedUntil: until })])).toBe(true);
+    expect(needs(NOW)).toBe(1);
+  });
+
   it.effect("drops an expired ask from the list at the next change", () =>
     Effect.gen(function* () {
       const expiresAt = "2026-10-26T12:30:00Z";

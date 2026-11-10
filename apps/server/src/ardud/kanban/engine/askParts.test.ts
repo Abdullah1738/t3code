@@ -447,7 +447,7 @@ it.effect("a batch takes only asks that take the same thing back", () =>
   }),
 );
 
-it.effect("a secret is never taken through an ask, and its value is stored nowhere", () =>
+it.effect("a secret sent as a plain value is refused, and it is stored nowhere", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.scoped(
@@ -455,43 +455,25 @@ it.effect("a secret is never taken through an ask, and its value is stored nowhe
         const { kanban, card, worker, threadId } = yield* workingCard();
         const http = yield* makeHttp;
         const sql = yield* SqlClient.SqlClient;
-        const refused = yield* Effect.flip(
-          kanban.askOwner(
-            card.id,
-            {
-              question: "What is the Stripe key?",
-              blocking: false,
-              respond: { fields: [{ label: "Stripe key", type: "secret" }] },
-            },
-            worker,
-            "cardThread",
-          ),
-        );
-        assert.include(refused.detail, "request_secret");
-        assert.strictEqual((yield* kanban.card(card.id)).card.asks.length, 0);
-
-        // An ask that carries a secret field anyway (as a later build might store one).
         yield* kanban.askOwner(
           card.id,
-          { question: "What is the Stripe key?", blocking: false },
+          {
+            question: "What is the Stripe key?",
+            blocking: false,
+            respond: {
+              fields: [{ id: "key", label: "Stripe key", type: "secret", required: true }],
+            },
+          },
           worker,
           "cardThread",
         );
-        const respond = JSON.stringify({
-          fields: [{ id: "key", label: "Stripe key", type: "secret", required: true }],
-        });
-        yield* sql`
-          UPDATE ardud_kanban_cards
-          SET json = json_set(json, '$.asks[0].respond', json(${respond}))
-          WHERE id = ${card.id}
-        `;
         const value = "sk_live_NEVER_STORE_THIS_4242";
         const answered = yield* http.post("/cards/toy:1/asks/q1/answer", {
           verdict: "answered",
           values: { key: value },
         });
         assert.strictEqual(answered.status, 400);
-        assert.include(answered.body.error.message, "request_secret");
+        assert.include(answered.body.error.message, "private field");
         assert.notInclude(JSON.stringify(answered.body), value);
 
         // Not on the card, in a message, an event, a route, the feed or anything a thread heard.

@@ -251,10 +251,24 @@ describe("response parts", () => {
     );
   });
 
-  it("a secret field is refused with where to ask instead", () => {
-    const detail = refused({ respond: { fields: [{ label: "API key", type: "secret" }] } });
-    assert.include(detail, "request_secret");
-    assert.include(refused({ kind: "secret", title: "Stripe key" }), "request_secret");
+  it("a secret field is stored as a field, with no default, and only for the owner", () => {
+    const one = ask({
+      respond: { fields: [{ label: "API key", type: "secret", required: true }] },
+    });
+    assert.deepStrictEqual(one.respond?.fields, [
+      { id: "f1", label: "API key", type: "secret", required: true },
+    ]);
+    assert.deepStrictEqual(ask({ kind: "secret", title: "Stripe key" }).respond?.fields, [
+      { id: "secret", label: "Stripe key", type: "secret", required: true },
+    ]);
+    assert.include(
+      refused({ respond: { fields: [{ label: "API key", type: "secret", default: "sk_x" }] } }),
+      "takes no default",
+    );
+    assert.include(
+      refused({ to: "evaluator", respond: { fields: [{ label: "API key", type: "secret" }] } }),
+      "a secret field is for the owner",
+    );
   });
 
   it("options carry a consequence and the block that shows them; several changes are one ask", () => {

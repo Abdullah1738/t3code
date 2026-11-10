@@ -1,5 +1,7 @@
 /** The Needs-you feed stays cheap on a big board: it never decodes the cards that hold no matching ask. */
 import { assert, it } from "@effect/vitest";
+import { needsYouFromFeed, needsYouItems } from "@t3tools/client-runtime/ardud/kanban/needsYou";
+import { kanbanSchedule, type KanbanCard } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -148,8 +150,95 @@ it.effect("reads the open asks of a 3,700-card board without decoding the board"
     assert.isTrue(history.value.closed.every((item) => item.waitsOn === null));
 
     // Measured at about 35 ms open and 75 ms with the closed window (in-memory SQLite, M-series
-    // Mac). The bounds are generous: they catch a read that goes back to decoding the board.
+    // Mac), the same with the whole-chain count as with the direct one it replaced (21-run
+    // medians on a busy machine: 67 to 81 ms against 75 ms). The bounds are generous: they
+    // catch a read that goes back to decoding the board.
     assert.isBelow(open.ms, 1_000);
     assert.isBelow(history.ms, 2_000);
   }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect(
+  "what a card unblocks is the whole chain, and the feed, the selector and the scheduler agree",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* KanbanStore.KanbanStore;
+      const boardId = "board-chain";
+      yield* sql`INSERT INTO ardud_kanban_boards (id, slug, json) VALUES (${boardId}, 'chain', '{"name":"Chain"}')`;
+      const id = (number: number) => `card-${boardId}-${number}`;
+      const ask = {
+        id: "q1",
+        text: "Go?",
+        blocking: true,
+        by: { _tag: "owner" },
+        at: AT,
+        seq: null,
+        closedAt: null,
+      };
+      // Card 7 of the generator has no asks and waits on nothing.
+      const plain = JSON.parse(cardJson(7, boardId)) as Record<string, unknown>;
+      const made = (number: number, patch: Record<string, unknown>) => ({
+        ...plain,
+        id: id(number),
+        number,
+        title: `Card ${number}`,
+        prompt: "p",
+        stage: "todo",
+        ...patch,
+      });
+      const WAITERS = 400;
+      const cards = [
+        // A holds an ask; B waits on A; 400 cards wait on B.
+        made(1, { stage: "needs_owner", asks: [ask] }),
+        made(2, { blockedBy: [id(1)] }),
+        ...Array.from({ length: WAITERS }, (_, index) => made(index + 3, { blockedBy: [id(2)] })),
+        // Not counted: a backlog card nobody is going to do, and a finished one.
+        made(403, { priority: 5, blockedBy: [id(1)] }),
+        made(404, { stage: "verified", blockedBy: [id(1)] }),
+        // Another asker that nothing waits on.
+        made(405, { stage: "needs_owner", asks: [ask] }),
+      ];
+      yield* sql.withTransaction(
+        Effect.forEach(
+          cards,
+          (card) =>
+            sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, active_thread_id, json)
+              VALUES (${card.id}, ${boardId}, ${card.number}, ${card.stage as string}, NULL, ${JSON.stringify(card)})`,
+          { discard: true },
+        ),
+      );
+
+      const started = performance.now();
+      const feed = yield* readAskFeed(sql, { boardId: boardId as never }, AT);
+      const ms = performance.now() - started;
+      assert.deepStrictEqual(
+        feed.open.map((item) => [item.cardRef, item.blocks]),
+        [
+          ["chain:1", WAITERS + 1],
+          ["chain:405", 0],
+        ],
+      );
+
+      const typed = cards as unknown as ReadonlyArray<KanbanCard>;
+      const now = Date.parse(AT);
+      const selector = needsYouItems(
+        { cards: new Map(typed.map((card) => [card.id, card])) } as never,
+        now,
+      );
+      const fromFeed = needsYouFromFeed(feed.open, now);
+      const schedule = kanbanSchedule(typed, { nowMs: now });
+      for (const list of [selector, fromFeed]) {
+        assert.deepStrictEqual(
+          list.items.map((item) => [item.cardNumber, item.unblocks]),
+          [
+            [1, WAITERS + 1],
+            [405, 0],
+          ],
+        );
+      }
+      assert.strictEqual(schedule.get(id(1))?.holds, WAITERS + 1);
+      assert.strictEqual(schedule.get(id(405))?.holds, 0);
+      assert.isBelow(ms, 1_000);
+    }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
