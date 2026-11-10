@@ -387,12 +387,31 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.isTrue(workerReturn.isError);
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
+    // An approval is answered for the revision that was read: without one it is refused
+    // with the current revision, and one from before an edit is refused as stale.
+    const blind = yield* call(boardEvaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
+    assert.isTrue(blind.isError);
+    assert.include(blind.text, "It is at revision 0");
+    const stale = yield* call(boardEvaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+      revision: 3,
+    });
+    assert.isTrue(stale.isError);
+    assert.include(stale.text, "revision 0, you answered revision 3");
+    assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
     const decided = yield* call(boardEvaluator, "card_ask_answer", {
       card: card.id,
       ask: "q1",
       verdict: "approved",
       finalDraft: "Hello, and thanks.",
       note: "Friendlier.",
+      revision: 0,
     });
     assert.isFalse(decided.isError, decided.text);
     assert.isFalse(decided.structured.card.ask.open);
@@ -475,7 +494,7 @@ it.effect(
         {
           cardId: card.id,
           askId: "q1",
-          answer: { verdict: "answered" },
+          answer: { verdict: "answered", revision: 0 },
           secrets: { token: value },
         },
         { _tag: "owner-app", surface: "desktop", sessionId: "session-1" },

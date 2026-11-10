@@ -1537,7 +1537,10 @@ export interface AskAnswerInput {
   readonly finalDraft?: string | undefined;
   /** Field id to value, for the ask's fields. */
   readonly values?: Readonly<Record<string, unknown>> | undefined;
-  /** The revision the answerer saw; a newer one refuses the answer. */
+  /**
+   * The revision the answerer saw; a newer one refuses the answer. Required
+   * unless the ask is answered in words alone (`kanbanAskIsFreeText`).
+   */
   readonly revision?: number | undefined;
 }
 
@@ -1649,6 +1652,12 @@ export const answerFor = (
   const ref = `${ask.id} on card #${card.number}`;
   if (ask.closedAt !== null) return conflict(`${ref} is already closed`);
   const revision = kanbanAskRevision(ask);
+  // Only an ask answered in words alone may be answered without saying which version was read.
+  if (input.revision === undefined && !kanbanAskIsFreeText(ask)) {
+    return invalid(
+      `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
+    );
+  }
   if (input.revision !== undefined && input.revision !== revision) {
     return conflict(
       `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
@@ -2011,6 +2020,9 @@ const askInFull = (ask: KanbanOwnerAsk) => {
       ? `Options${ask.multi === true ? " (several may be picked)" : ""}: ${options.map((option) => `${option.id} = ${option.label}`).join("; ")}`
       : null,
     `It takes the verdict ${verdictsFor(kanbanAskResponse(ask)).join(" or ")}.`,
+    kanbanAskIsFreeText(ask)
+      ? null
+      : `It is at revision ${kanbanAskRevision(ask)}: an answer to it must say so (revision ${kanbanAskRevision(ask)}).`,
   ]
     .filter((entry) => entry !== null)
     .join("\n\n");

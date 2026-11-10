@@ -582,6 +582,7 @@ const handlers = {
             values: input.values,
             note: input.note,
             finalDraft: input.finalDraft,
+            revision: input.revision,
           },
           caller.actor,
         );

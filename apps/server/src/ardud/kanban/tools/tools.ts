@@ -466,6 +466,12 @@ const CardAskAnswer = tool(
     finalDraft: Schema.optional(
       describe(Schema.String, "A draft ask: the text to post, when you changed the draft."),
     ),
+    revision: Schema.optional(
+      describe(
+        Schema.Int,
+        "The ask's revision as you read it (you are told it; card_get shows it). Needed for every ask but a plain question; an ask edited since is refused.",
+      ),
+    ),
   },
   { card: Record },
   { readonly: false },
@@ -487,7 +493,7 @@ const CardFlag = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  'Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing "waiting for the dev to push" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card\'s last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card\'s stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only.' +
+  "Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only." +
     (WAITS_ENGINE_WIRED
       ? ""
       : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
@@ -495,7 +501,10 @@ const CardWait = tool(
     card: Schema.optional(CardRef),
     on: Schema.optional(describe(KanbanWaitKind, "What it waits on. Required unless clear.")),
     note: Schema.optional(
-      describe(Schema.String, "One line: what exactly is awaited and from whom. Required unless clear."),
+      describe(
+        Schema.String,
+        "One line: what exactly is awaited and from whom. Required unless clear.",
+      ),
     ),
     pr: Schema.optional(
       describe(
@@ -504,7 +513,9 @@ const CardWait = tool(
       ),
     ),
     waitsOn: Schema.optional(describe(CardRef, "card: the card that has to be done first.")),
-    ask: Schema.optional(describe(TrimmedNonEmptyString, "owner_go: the open question's id, e.g. q2.")),
+    ask: Schema.optional(
+      describe(TrimmedNonEmptyString, "owner_go: the open question's id, e.g. q2."),
+    ),
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,
@@ -512,7 +523,10 @@ const CardWait = tool(
       ),
     ),
     head: Schema.optional(
-      describe(TrimmedNonEmptyString, "push: the commit you reviewed, when the card's last review didn't record it."),
+      describe(
+        TrimmedNonEmptyString,
+        "push: the commit you reviewed, when the card's last review didn't record it.",
+      ),
     ),
     wakeRole: Schema.optional(
       describe(

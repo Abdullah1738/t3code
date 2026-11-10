@@ -81,7 +81,7 @@ const input = (
 ): KanbanAskSecretAnswerInput => ({
   cardId,
   askId: "q1",
-  answer: { verdict: "answered", values: { env: "staging" }, ...answer },
+  answer: { verdict: "answered", values: { env: "staging" }, revision: 0, ...answer },
   secrets,
 });
 
@@ -166,6 +166,7 @@ it.effect(
           const overHttp = yield* http.post("/cards/toy:1/asks/q1/answer", {
             verdict: "answered",
             values: { token: SECRET, env: "staging" },
+            revision: 0,
           });
           assert.strictEqual(overHttp.status, 400);
           assert.include(text(overHttp.body), "private field");
@@ -173,6 +174,7 @@ it.effect(
           const without = yield* http.post("/cards/toy:1/asks/q1/answer", {
             verdict: "answered",
             values: { env: "staging" },
+            revision: 0,
           });
           assert.strictEqual(without.status, 400);
           seen.push(["http refusal without it", text(without.body)]);
@@ -182,6 +184,7 @@ it.effect(
             ["an unknown field", input(card.id, { nope: SECRET }), ownerApp],
             ["too long", input(card.id, { token: SECRET.repeat(2000) }), ownerApp],
             ["a stale revision", input(card.id, undefined, { revision: 7 }), ownerApp],
+            ["no revision", input(card.id, undefined, { revision: undefined }), ownerApp],
             [
               "a verdict the ask doesn't take",
               input(card.id, undefined, { verdict: "approved" }),
@@ -191,6 +194,11 @@ it.effect(
             const error = yield* answer(bad, by).pipe(Effect.flip);
             seen.push([`refusal: ${name}`, `${error.message} ${text(error)}`]);
           }
+          // An answer that names no revision is refused with the one to send.
+          assert.include(
+            seen.find(([name]) => name === "refusal: no revision")![1],
+            "It is at revision 0",
+          );
           assert.isNull(askOf((yield* kanban.card(card.id)).card).closedAt);
 
           const before = (yield* fake.heard(threadId)).length;
@@ -319,7 +327,12 @@ it.effect(
 
           // He can still say no without giving it.
           const no = yield* kanban
-            .answerAsk(card.id, "q1", { verdict: "answered", text: "Use the old one." }, owner)
+            .answerAsk(
+              card.id,
+              "q1",
+              { verdict: "answered", text: "Use the old one.", revision: 0 },
+              owner,
+            )
             .pipe(Effect.flip);
           assert.include(no.detail, "is a secret only the owner can give");
         }),
@@ -553,7 +566,7 @@ it("a secret field takes no default, is the owner's alone, and never accepts a v
   const byEvaluator = Asks.answerFor(
     card,
     handed,
-    { verdict: "answered", text: "ok" },
+    { verdict: "answered", text: "ok", revision: 0 },
     { _tag: "evaluator", threadId: ThreadId.make("evaluator-main") },
     "2026-11-10T10:06:00.000Z",
   );

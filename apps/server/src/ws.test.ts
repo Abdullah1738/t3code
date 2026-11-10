@@ -2714,7 +2714,7 @@ it.effect(
         ): KanbanAskSecretAnswerInput => ({
           cardId: card.id,
           askId: "q1",
-          answer: { verdict: "answered", values: { env: VALUE }, ...patch },
+          answer: { verdict: "answered", values: { env: VALUE }, revision: 0, ...patch },
           secrets: given,
         });
         /** Every reply and refusal, as a client or a log would see it. */
@@ -2768,6 +2768,13 @@ it.effect(
           yield* call(owner, "web", input({ revision: 9 })),
         );
         assert.deepStrictEqual([stale._tag, stale.code], ["KanbanError", "conflict"]);
+        // No revision at all: refused with the one to send, and the value is not kept.
+        const blind = refusedWith(
+          "no revision",
+          yield* call(owner, "web", input({ revision: undefined })),
+        );
+        assert.deepStrictEqual([blind._tag, blind.code], ["KanbanError", "invalid"]);
+        assert.include(blind.message ?? "", "It is at revision 0");
         yield* stillOpen;
 
         // The owner's app, answering it.
