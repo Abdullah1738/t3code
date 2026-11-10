@@ -7814,9 +7814,13 @@ const make = Effect.gen(function* () {
         const handed = { ...Asks.markHanded(asked, ask.id, at), updatedAt: at };
         yield* saveCard(handed);
         const stored = handed.asks.find((entry) => entry.id === ask.id) ?? ask;
-        yield* toEvaluator(
-          yield* cardDiscussionUnlocked(card.id),
-          Asks.handText(handed, stored, false),
+        const talk = yield* cardDiscussionUnlocked(card.id);
+        const text = Asks.handText(handed, stored, false);
+        yield* later(
+          handed.boardId,
+          talk.id,
+          { kind: "toEvaluator", discussionId: talk.id, text, note: false },
+          toEvaluator(talk, text),
         );
         return handed;
       }),
@@ -7926,7 +7930,7 @@ const make = Effect.gen(function* () {
     );
 
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor) =>
-    guard(
+    guardDeferred(
       Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
         const card = yield* cardOf(cardId);
@@ -7993,17 +7997,26 @@ const make = Effect.gen(function* () {
           { answer, moved },
         );
         const self = byOwner ? null : (actor as { readonly threadId?: string }).threadId;
+        // Deferred, the telling runs after this write: who will hear is read from the card
+        // instead (a worker running the card, or an evaluator other than the answerer).
+        const sink = yield* effectSink;
+        const willHear =
+          sink !== undefined &&
+          !sink.closed &&
+          ((ask.by._tag === "thread" && ask.by.threadId === result.card.activeThreadId) ||
+            (ask.by._tag === "evaluator" && ask.by.threadId !== self));
         return {
           card: result.card,
           heard:
             result.card.wakeNote !== fresh.wakeNote ||
+            willHear ||
             [...result.told].some((threadId) => threadId !== self),
         };
       }),
     );
 
   const replyOnAsk: KanbanServiceShape["replyOnAsk"] = (cardId, askId, actor, blocks, role) =>
-    guard(
+    guardDeferred(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
@@ -8039,23 +8052,46 @@ const make = Effect.gen(function* () {
             ? by.threadId === next.activeThreadId
             : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
         // A live asker hears it itself; a parked or ended one is the evaluator's to handle.
+        // Either way the send is a follow-on of this write (see `later`), never made under it.
         if (live && (by._tag === "thread" || by._tag === "evaluator")) {
-          yield* deliver(
-            current,
-            by,
-            by._tag === "evaluator" ? "Evaluator" : roleName(next.activeRole ?? "work"),
-            by.threadId,
-            Asks.clarifyText(next, ask, said, false),
-          );
+          const name = by._tag === "evaluator" ? "Evaluator" : roleName(next.activeRole ?? "work");
+          const text = Asks.clarifyText(next, ask, said, false);
+          const sink = yield* effectSink;
+          if (sink === undefined || sink.closed) {
+            yield* deliver(current, by, name, by.threadId, text);
+          } else {
+            // What `deliver` records about the asker is board state, so it is written here.
+            yield* saveDiscussion(
+              withParticipant(current, by, name, {
+                lastReadSeq: current.lastSeq,
+                typingUntil: yield* typingUntil,
+                owes: "asked",
+              }),
+            );
+            yield* later(
+              next.boardId,
+              current.id,
+              by._tag === "evaluator"
+                ? { kind: "tellEvaluator", threadId: by.threadId, text }
+                : { kind: "send", threadId: by.threadId, text },
+              Effect.void,
+            );
+          }
         } else {
-          yield* toEvaluator(current, Asks.clarifyText(next, ask, said, true));
+          const text = Asks.clarifyText(next, ask, said, true);
+          yield* later(
+            next.boardId,
+            current.id,
+            { kind: "toEvaluator", discussionId: current.id, text, note: false },
+            toEvaluator(current, text),
+          );
         }
         return message;
       }),
     );
 
   const handAsk: KanbanServiceShape["handAsk"] = (cardId, askId, action, actor, always) =>
-    guard(
+    guardDeferred(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const ask = yield* openAskOf(card, askId);
@@ -8095,7 +8131,13 @@ const make = Effect.gen(function* () {
           body: `Owner handed ${ask.id} to the evaluator${always === true ? ", and asks like it from now on" : ""}`,
         });
         yield* saveCard(next);
-        yield* toEvaluator(discussion, Asks.handText(next, ask));
+        const text = Asks.handText(next, ask);
+        yield* later(
+          next.boardId,
+          discussion.id,
+          { kind: "toEvaluator", discussionId: discussion.id, text, note: false },
+          toEvaluator(discussion, text),
+        );
         return next;
       }),
     );
