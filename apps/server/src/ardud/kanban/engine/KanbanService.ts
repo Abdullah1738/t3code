@@ -1016,6 +1016,16 @@ const make = Effect.gen(function* () {
   const pendingStops = new Map<string, Map<string, string>>();
   const stoppedRoutes = new Set<string>();
   const stopping = yield* Semaphore.make(1);
+  // Everything the board does that sets a thread's model (a switch, a send that
+  // carries a model) holds that thread's model lock, so a saved switch that read
+  // an older model can never land after a newer one. Never taken under a gate.
+  const modelLocks = new Map<string, Semaphore.Semaphore>();
+  const withThreadModel = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      let lock = modelLocks.get(threadId);
+      if (!lock) modelLocks.set(threadId, (lock = Semaphore.makeUnsafe(1)));
+      return lock.withPermits(1)(effect);
+    });
   const addPendingStop = (threadId: string, routeKey: string, reason: string) => {
     let stops = pendingStops.get(threadId);
     if (!stops) pendingStops.set(threadId, (stops = new Map()));
@@ -1152,18 +1162,20 @@ const make = Effect.gen(function* () {
         const delivered = yield* ownerDelivered;
         const answer = input.key === undefined;
         if (answer && delivered?.has(input.threadId)) return;
+        const sent = touching(
+          input.threadId,
+          threadIo.send({
+            ...input,
+            ...(key === undefined
+              ? {}
+              : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
+          }),
+        );
         return yield* locks.outside(
           Effect.andThen(
             runPendingStops(input.threadId),
-            touching(
-            input.threadId,
-            threadIo.send({
-              ...input,
-              ...(key === undefined
-                ? {}
-                : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
-            }),
-            ),
+            // A send that carries a model sets it: ordered with model switches.
+            input.model === undefined ? sent : withThreadModel(input.threadId, sent),
           ).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
@@ -1173,7 +1185,8 @@ const make = Effect.gen(function* () {
           ),
         );
       }),
-    setModel: (id, model) => locks.outside(touching(id, threadIo.setModel(id, model))),
+    setModel: (id, model) =>
+      locks.outside(withThreadModel(id, touching(id, threadIo.setModel(id, model)))),
     // Best effort, as before, for the board's own inline stops; saved stops use `runPendingStops`.
     interrupt: (id, reason) =>
       locks.outside(touching(id, threadIo.interrupt(id, reason)).pipe(Effect.ignore)),
@@ -1186,11 +1199,12 @@ const make = Effect.gen(function* () {
   };
   // A saved model switch applies the model the thread's cards have now, not the
   // one it was saved with: switches saved on different card lanes may run in
-  // any order, and the last to run must leave the newest model. One at a time,
-  // and the read is a plain committed read, taken without any board gate.
-  const modelSwitching = yield* Semaphore.make(1);
+  // any order, and the last to run must leave the newest model. It holds the
+  // thread's model lock from that read to its switch, so any newer model (an
+  // edit, a dispatch send) lands after it. The read is a plain committed read.
   const switchToLatestModel = (threadId: string) =>
-    modelSwitching.withPermits(1)(
+    withThreadModel(
+      threadId,
       Effect.gen(function* () {
         const cards = yield* rawStore.cardsByThread(threadId);
         const working = cards.find((card) => card.activeRole === "work");
@@ -3189,7 +3203,7 @@ const make = Effect.gen(function* () {
       yield* boardSql`
         UPDATE ardud_kanban_owner_routes
         SET done_at = ${at}, json = json_set(json, '$.outcome', ${outcome})
-        WHERE id = ${id}
+        WHERE id = ${id} AND done_at IS NULL
       `;
     },
     (effect, id) =>
@@ -3656,10 +3670,43 @@ const make = Effect.gen(function* () {
    * Closes a route given up on. The notice is posted before the row closes, so
    * a stop in between posts it again on replay rather than never.
    */
+  /**
+   * A stop that could not be delivered is closed under the stop lock, so it
+   * either already ran from a send (and stays delivered) or is dropped from
+   * the pending stops before any send could run it: the barrier ends with the
+   * row, and the notice says so. False when a send had run it.
+   */
+  const giveUpStop = (record: OwnerRouteRecord, threadId: string) =>
+    locks.outside(
+      stopping.withPermits(1)(
+        Effect.gen(function* () {
+          const at = yield* nowIso;
+          const closed = yield* boardSql<{ id: number }>`
+            UPDATE ardud_kanban_owner_routes
+            SET done_at = ${at}, json = json_set(json, '$.outcome', 'undeliverable')
+            WHERE id = ${record.id} AND done_at IS NULL
+            RETURNING id
+          `;
+          const stops = pendingStops.get(threadId);
+          stops?.delete(record.route_key);
+          if (stops?.size === 0) pendingStops.delete(threadId);
+          stoppedRoutes.delete(record.route_key);
+          return closed.length > 0;
+        }),
+      ),
+    );
   const giveUpOwnerRoute = Effect.fn("KanbanService.giveUpOwnerRoute")(function* (
     record: OwnerRouteRecord,
   ) {
     const discussionId = KanbanDiscussionId.make(record.discussion_id);
+    const stop = ownerRoutePayload(record);
+    if (stop.kind === "effect" && stop.effect.kind === "interrupt") {
+      if (!(yield* giveUpStop(record, stop.effect.threadId))) return;
+      return yield* routeNotice(
+        record.discussion_id,
+        `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board no longer holds its sends for this stop.`,
+      );
+    }
     yield* routeNotice(
       record.discussion_id,
       `${routeWhat(record)} delivery could not be confirmed (${record.route_key}) after 10 minutes of retries. Some of it may already have reached an agent, so check the discussion before posting it again.`,
@@ -4289,7 +4336,10 @@ const make = Effect.gen(function* () {
       yield* locks.outside(
         Effect.andThen(
           runPendingStops(reused),
-          touching(reused, threadIo.send({ threadId: reused, text, model: dispatch.model, key })),
+          withThreadModel(
+            reused,
+            touching(reused, threadIo.send({ threadId: reused, text, model: dispatch.model, key })),
+          ),
         ),
         () =>
           touching(
