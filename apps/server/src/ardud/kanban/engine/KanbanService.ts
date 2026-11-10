@@ -65,12 +65,13 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import type * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
 
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
+import { actorKey, KanbanStore, type KanbanStoreError } from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as Asks from "./asks.ts";
 import { modelProblem } from "./modelCheck.ts";
@@ -3404,11 +3405,14 @@ const make = Effect.gen(function* () {
   /** One saved write follow-on, as the write would have run it inline. */
   // Failures propagate, so the drain retries and finally closes the row
   // undeliverable with a notice; only success marks it delivered.
-  // Any failure is the drain's to retry or give up on; its kind doesn't matter here.
+  // Any failure is the drain's to retry or give up on.
   const runBoardEffect = (
     effect: BoardEffect,
     routeKey: string,
-  ): Effect.Effect<unknown, unknown> => {
+  ): Effect.Effect<
+    unknown,
+    KanbanError | KanbanStoreError | KanbanThreadError | SqlError.SqlError
+  > => {
     switch (effect.kind) {
       case "send":
         return threads.send({
