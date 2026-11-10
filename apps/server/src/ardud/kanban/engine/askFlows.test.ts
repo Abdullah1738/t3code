@@ -15,6 +15,7 @@ import {
   type KanbanBlock,
   type KanbanCard,
 } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -23,6 +24,7 @@ import * as Ref from "effect/Ref";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import { createPendingAttachmentId, resolveAttachmentPath } from "../../../attachmentStore.ts";
 import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
@@ -174,6 +176,7 @@ const writePending = (name: string, mimeType: string, bytes: string) =>
 /** The board's HTTP routes over the service under test, acting as the owner. */
 const makeHttp = Effect.gen(function* () {
   const kanban = yield* KanbanService.KanbanService;
+  const sql = yield* SqlClient.SqlClient;
   const web = yield* Effect.acquireRelease(
     Effect.sync(() =>
       HttpRouter.toWebHandler(
@@ -191,7 +194,7 @@ const makeHttp = Effect.gen(function* () {
               }),
               Layer.succeed(KanbanService.KanbanService, kanban),
               Layer.mock(KanbanScripts)({}),
-              ServerSettings.layerTest(),
+              Layer.succeed(SqlClient.SqlClient, sql),
             ).pipe(Layer.provideMerge(NodeServices.layer)),
           ),
           Layer.provide(
@@ -206,15 +209,20 @@ const makeHttp = Effect.gen(function* () {
     ),
     (handler) => Effect.promise(() => handler.dispose()),
   );
+  // The routes read the server settings per request.
+  const context = Context.make(
+    ServerSettings.ServerSettingsService,
+    yield* ServerSettings.ServerSettingsService,
+  );
   const call = (method: "GET" | "POST", path: string, body?: unknown) =>
     Effect.promise(async () => {
       const response = await web.handler(
         new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
           method,
           headers: { authorization: "Bearer owner", "content-type": "application/json" },
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         }),
+        context,
       );
       return { status: response.status, body: (await response.json()) as Record<string, any> };
     });
@@ -307,8 +315,15 @@ it.effect("a draft ask stores its template, posts a pick an old client can answe
       assert.strictEqual(full._tag === "html" ? full.html : "", page);
       assert.strictEqual(full._tag === "html" && full.truncated, undefined);
       const feed = yield* kanban.askFeed({});
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       assert.isBelow(JSON.stringify(feed).length, page.length);
+      // The board feed the web client already gets carries the ask with its new fields.
+      const snapshot = yield* kanban.snapshot(asked.boardId);
+      const fed = snapshot.cards.find((entry) => entry.id === card.id)!.asks[0]!;
+      assert.deepStrictEqual(
+        [fed.kind, fed.title, fed.draft?.target, fed.batchKey, fed.blocks?.length],
+        ["draft", "Reply to the reviewer", "comment on PR #512", "pr-replies", 5],
+      );
+      assert.isBelow(JSON.stringify(snapshot.cards).length, page.length);
       assert.isTrue(feed.open[0]!.messages[0]!.blocks.some((block) => block._tag === "html" && block.truncated));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),

@@ -50,7 +50,7 @@ describe("stored asks", () => {
 
   it("an ask stored before typed asks decodes unchanged and reads as a question at revision 0", () => {
     const decoded = decode(old);
-    assert.deepStrictEqual(encode(decoded), old);
+    assert.deepStrictEqual(encode(decoded) as unknown, old);
     assert.strictEqual(kanbanAskKind(decoded), "question");
     assert.strictEqual(kanbanAskRevision(decoded), 0);
     assert.strictEqual(kanbanAskWaitsOn(decoded), "owner");
@@ -88,7 +88,7 @@ describe("stored asks", () => {
         at: LATER,
       },
     };
-    assert.deepStrictEqual(encode(decode(full)), full);
+    assert.deepStrictEqual(encode(decode(full)) as unknown, full);
   });
 
   it("an ask can't hold a pick block", () => {
