@@ -329,6 +329,7 @@ interface ShellRequest {
   bytes?: number;
   finishedMs?: number;
   last?: boolean;
+  nextAfter?: string | null;
 }
 
 const runScenario = async (name: string, navigateTo: string, browserContextId?: string) => {
@@ -386,7 +387,9 @@ const runScenario = async (name: string, navigateTo: string, browserContextId?: 
             : body.body;
           request.last = /"nextAfter":null/.test(text.slice(-400));
           if (request.last && completeMs === null) completeMs = request.finishedMs!;
-          for (const thread of JSON.parse(text).threads ?? []) served.add(thread.id);
+          const page = JSON.parse(text);
+          request.nextAfter = page.page?.nextAfter ?? null;
+          for (const thread of page.threads ?? []) served.add(thread.id);
         })
         .catch(() => undefined);
       bodies.push(read);
@@ -440,6 +443,7 @@ const runScenario = async (name: string, navigateTo: string, browserContextId?: 
   }
   sampling = false;
   await sampler;
+  await Promise.race([Promise.all(bodies), delay(15_000)]);
   let retainedMb: number | null = null;
   let cachedRows: number | null = null;
   let profileFile: string | null = null;
@@ -463,7 +467,6 @@ const runScenario = async (name: string, navigateTo: string, browserContextId?: 
         ({ result }) => Number(result.value),
         () => -1,
       );
-    await Promise.all(bodies);
     if (serverRows === null && completeMs !== null) serverRows = served.size;
     // The cache is written in the background; give it up to 30 s to hold the whole list.
     for (let tries = 0; tries < 30 && cachedRows !== serverRows; tries++) {
@@ -481,6 +484,8 @@ const runScenario = async (name: string, navigateTo: string, browserContextId?: 
     pagesFinished: finished.length,
     pageOneRequests: shell.filter((r) => r.after === null).length,
     firstAfter: shell[0]?.after ?? null,
+    // Cursors of the pages that arrived, in request order.
+    cursors: finished.flatMap((r) => (typeof r.nextAfter === "string" ? [r.nextAfter] : [])),
     wireMb: finished.reduce((sum, r) => sum + (r.bytes ?? 0), 0) / MB,
     completeMs,
     peakUsedMb: peak.usedMb,
@@ -538,6 +543,16 @@ for (const result of results) {
     failures.push(`${result.name}: retained ${result.retainedMb.toFixed(0)} MB > ${maxRetainedMb}`);
   if (result.name === "crash-resume" && result.pageOneRequests > 0)
     failures.push("crash-resume: the new renderer started the walk at page one");
+  // The new renderer goes on from the last page the crashed one stored; the very last page's
+  // journal write may have been cut off by the crash, so the one before it also counts.
+  const crashRun = results.find((r) => r.name === "crash-first");
+  if (result.name === "crash-resume" && crashRun) {
+    const allowed = crashRun.cursors.slice(-2);
+    if (result.firstAfter === null || !allowed.includes(result.firstAfter))
+      failures.push(
+        `crash-resume: went on from ${result.firstAfter}, not the last stored cursor (${allowed.join(" or ")})`,
+      );
+  }
 }
 const report = {
   writer: { writesPerSecond, writes },
@@ -551,7 +566,7 @@ console.log(
   JSON.stringify(
     {
       ...report,
-      results: results.map(({ samples: _s, pages: _p, ...rest }) => rest),
+      results: results.map(({ samples: _s, pages: _p, cursors: _c, ...rest }) => rest),
     },
     null,
     2,
