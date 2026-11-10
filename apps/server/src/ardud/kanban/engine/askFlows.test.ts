@@ -488,12 +488,16 @@ it.effect(
         );
         assert.strictEqual(item.waitsOn, "owner");
 
-        // An old client's pick on the new version still answers it and wakes the card.
+        // An old client's pick on the new version still answers it and wakes the card: it is
+        // stored as the pick it is, checked like one sent to the ask.
         const talk = yield* kanban.cardDiscussion(card.id);
         yield* kanban.answer(talk.id, revised.seq!, "q1", ["o1"], owner);
         const answered = (yield* kanban.card(card.id)).card;
         assert.isNotNull(askOf(answered).closedAt);
-        assert.strictEqual(askOf(answered).answer?.verdict, "answered");
+        assert.deepStrictEqual(
+          [askOf(answered).answer?.verdict, askOf(answered).answer?.optionIds],
+          ["picked", ["o1"]],
+        );
         assert.strictEqual(answered.stage, "todo");
         assert.include(answered.wakeNote ?? "", "Yes");
       }).pipe(Effect.provide(testLayer(fake.layer)));

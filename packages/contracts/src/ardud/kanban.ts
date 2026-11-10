@@ -633,6 +633,25 @@ export const kanbanAskResponse = (ask: AskResponseFields): KanbanAskResponse => 
   };
 };
 
+/**
+ * An ask answered in words alone: a plain question, and every ask the build
+ * before typed asks made. Nothing to approve, pick, fill in, edit or do. Only
+ * these are closed by a plain reply in the card's discussion, and only these
+ * may be answered without saying which revision was read.
+ */
+export const kanbanAskIsFreeText = (ask: AskResponseFields): boolean => {
+  const response = kanbanAskResponse(ask);
+  return (
+    response.verdict === null &&
+    response.choose === null &&
+    response.edit === null &&
+    response.task === null &&
+    !response.ack &&
+    response.fields.length === 1 &&
+    response.fields[0]!.id === KANBAN_ASK_ANSWER_FIELD
+  );
+};
+
 /** A notice: nothing to decide, he only marks it seen. Never blocking, never in the needs-owner count. */
 export const kanbanAskIsNotice = (ask: {
   readonly respond?: { readonly ack?: boolean | undefined } | undefined;

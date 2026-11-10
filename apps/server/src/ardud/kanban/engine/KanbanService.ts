@@ -8,6 +8,9 @@ import {
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
   kanbanEvaluatorStep,
+  kanbanAskExpired,
+  kanbanAskIsFreeText,
+  kanbanAskRevision,
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
@@ -3406,6 +3409,8 @@ const make = Effect.gen(function* () {
     text: string,
     from: "owner" | "script" = "owner",
     pick?: (ask: KanbanOwnerAsk) => boolean,
+    /** When the owner wrote it: asks raised later are not what he replied to. */
+    asOf?: string,
   ) {
     let current = discussion;
     if (current.cardId !== null) {
@@ -3413,10 +3418,51 @@ const make = Effect.gen(function* () {
       let told = new Set<string>();
       if (from === "owner" && kanbanNeedsOwner(card)) {
         const frozen = yield* ownerRouteAsks;
+        const nowMs = yield* nowMillis;
+        // Words answer only asks that take words alone. One with a verdict, a pick,
+        // fields, a draft or a task is answered through the ask, where it is checked.
         const which = (ask: KanbanOwnerAsk) =>
-          (pick === undefined || pick(ask)) && (frozen === undefined || frozen.has(ask.id));
+          (pick === undefined || pick(ask)) &&
+          (frozen === undefined || frozen.has(ask.id)) &&
+          Asks.takesReply(ask, nowMs);
+        const left = kanbanOpenAsks(card).filter(
+          (ask) =>
+            (pick === undefined || pick(ask)) &&
+            !Asks.takesReply(ask, nowMs) &&
+            // One asked after he wrote this was never what he replied to.
+            (asOf === undefined || ask.at <= asOf),
+        );
+        // Whoever hears his words is told they did not answer those asks.
+        if (left.length > 0) text = `${text}\n\n${Asks.wordsOnlyNote(card, left, nowMs)}`;
         const result = yield* answerAsks(current, card, text, which);
         ({ told, discussion: current, card } = result);
+        // They stay open and wait on their askers, as after a reply on the ask itself.
+        const at = yield* nowIso;
+        const waiting = left
+          .filter((ask) => !kanbanAskExpired(ask, nowMs))
+          .reduce((next, ask) => Asks.markClarify(next, ask.id, at), card);
+        if (waiting !== card) {
+          card = { ...waiting, updatedAt: at };
+          yield* saveCard(card);
+        }
+        // Each one's asker hears it: itself when live, else the discussion's evaluator.
+        for (const ask of left) {
+          const by = ask.by;
+          const live =
+            by._tag === "thread"
+              ? by.threadId === card.activeThreadId
+              : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
+          if (live && (by._tag === "thread" || by._tag === "evaluator")) {
+            if (told.has(by.threadId)) continue;
+            const name =
+              by._tag === "evaluator" ? "Evaluator" : roleName(card.activeRole ?? "work");
+            current = yield* deliver(current, by, name, by.threadId, text);
+            told.add(by.threadId);
+          } else if (current.evaluatorThreadId === null || !told.has(current.evaluatorThreadId)) {
+            current = yield* toEvaluator(current, text);
+            if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
+          }
+        }
       }
       if (pick && told.size > 0) return;
       if (card.activeThreadId !== null && card.activeRole !== null) {
@@ -3597,12 +3643,14 @@ const make = Effect.gen(function* () {
       const card = initial?.cardId ? yield* rawStore.card(initial.cardId) : null;
       const specific = card?.asks.find((ask) => ask.id === askId);
       const recorded = row?.askers ?? null;
+      const nowMs = yield* nowMillis;
       const asks = recorded
         ? (card?.asks ?? []).filter((ask) => recorded.ids.includes(ask.id))
         : specific
           ? [specific]
           : card
-            ? kanbanOpenAsks(card)
+            ? // A reply in words answers only the asks that take words alone.
+              kanbanOpenAsks(card).filter((ask) => Asks.takesReply(ask, nowMs))
             : [];
       const needsOwner = recorded ? recorded.needsOwner : card?.stage === "needs_owner";
       if (row !== undefined && recorded === null) {
@@ -3663,7 +3711,13 @@ const make = Effect.gen(function* () {
         key,
         text,
         Effect.gen(function* () {
-          yield* routeToOwnerAgent(yield* discussionOf(message.discussionId), text);
+          yield* routeToOwnerAgent(
+            yield* discussionOf(message.discussionId),
+            text,
+            "owner",
+            undefined,
+            message.createdAt,
+          );
         }),
         undefined,
         row,
@@ -8221,7 +8275,13 @@ const make = Effect.gen(function* () {
     );
 
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
-    guardDeferred(
+    guardDeferred(answerAskUnlocked(cardId, askId, input, actor, secrets));
+  /** The one place an ask is answered: by the answer route, a tool, or a pick on its message. */
+  const answerAskUnlocked = (
+    ...[cardId, askId, input, actor, secrets]: Parameters<KanbanServiceShape["answerAsk"]>
+  ) =>
+    // Suspended only to keep the body where it was: it is `answerAsk` as before.
+    Effect.suspend(() =>
       Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
         const card = yield* cardOf(cardId);
@@ -9653,7 +9713,68 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * The ask a pick on this message is for, when it is one of an ask's own
+   * messages: its current one, or (`stale`) one from before the ask was edited.
+   */
+  const askPickOf = Effect.fn("KanbanService.askPickOf")(function* (
+    discussionId: KanbanDiscussion["id"],
+    seq: number,
+    blockId: string,
+  ) {
+    const discussion = yield* discussionOf(discussionId);
+    if (discussion.cardId === null) return null;
+    const card = yield* cardOf(discussion.cardId);
+    const ask = card.asks.find((entry) => entry.id === blockId);
+    if (!ask) return null;
+    const message = yield* store.message(discussionId, seq);
+    // An ask's messages carry its id; the first of one asked before that is known by its seq.
+    const own = message?.askId === ask.id || ask.seq === seq || ask.firstSeq === seq;
+    return own ? { card, ask, stale: ask.seq !== seq } : null;
+  });
+
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
+    by._tag !== "owner"
+      ? answerChoice(discussionId, seq, blockId, choice, by, text)
+      : readDb(askPickOf(discussionId, seq, blockId)).pipe(
+          Effect.flatMap((pick) => {
+            if (pick === null) return answerChoice(discussionId, seq, blockId, choice, by, text);
+            const ref = `${pick.ask.id} on card #${pick.card.number}`;
+            if (pick.stale) {
+              // An earlier version of the ask: answering it would answer something he no longer sees.
+              return failWith(
+                "conflict",
+                `${ref} was updated since this message (it is at revision ${kanbanAskRevision(pick.ask)} now). Nothing was answered: answer its current version.`,
+              );
+            }
+            // A closed ask's late pick, and an ask that takes words alone, go the way a reply does.
+            if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {
+              return answerChoice(discussionId, seq, blockId, choice, by, text);
+            }
+            // Anything else is answered as the ask's own answer route would, checks included.
+            return guardDeferred(
+              answerAskUnlocked(
+                pick.card.id,
+                pick.ask.id,
+                Asks.pickAnswer(pick.ask, choice, (text ?? "").trim()),
+                by,
+              ).pipe(
+                Effect.andThen(store.message(discussionId, seq)),
+                Effect.flatMap((message) =>
+                  message ? Effect.succeed(message) : failWith("not-found", `message ${seq}`),
+                ),
+              ),
+            );
+          }),
+        );
+  const answerChoice: KanbanServiceShape["answer"] = (
+    discussionId,
+    seq,
+    blockId,
+    choice,
+    by,
+    text,
+  ) =>
     guard(
       Effect.gen(function* () {
         yield* checkText([["answer", text]]);
