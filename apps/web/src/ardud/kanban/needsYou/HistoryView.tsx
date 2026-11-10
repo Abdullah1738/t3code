@@ -271,7 +271,6 @@ export function HistoryView(props: {
       )}
     >
       <div className="flex min-w-0 flex-col gap-3">
-        {props.layout === "desktop" ? null : <div className="mb-3">{aside}</div>}
         {closed === null && status !== "error" ? (
           <div aria-busy className="flex flex-col gap-3">
             <p role="status" className="sr-only">
@@ -317,6 +316,9 @@ export function HistoryView(props: {
             ) : null}
           </>
         ) : null}
+        {props.layout === "desktop" ? null : (
+          <div className="mt-4 border-t border-(--m-rule) pt-4">{aside}</div>
+        )}
       </div>
       {props.layout === "desktop" ? aside : null}
     </div>
