@@ -7,6 +7,7 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  NodeId,
   OrchestrationV2GetThreadProjectionError,
   ProjectId,
   ProviderDriverKind,
@@ -41,6 +42,8 @@ import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as Tracer from "effect/Tracer";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
@@ -798,6 +801,67 @@ it.live("background sweep scans stay off a held writer unless switched back", ()
       );
       const baseline = yield* sweeps;
       assert.deepEqual(yield* onWriter, baseline);
+
+      // Where each read runs, from its statement span.
+      const routes = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.gen(function* () {
+          const spans: Array<Tracer.Span> = [];
+          const observe: Statement.Transformer = (statement, _sql, _fiber, span) => {
+            spans.push(span);
+            return Effect.succeed(statement);
+          };
+          yield* effect.pipe(
+            Effect.provideService(Statement.CurrentTransformer, observe),
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+          );
+          return [
+            ...new Set(
+              spans.map((span) => {
+                const connection = String(span.attributes.get("db.connection"));
+                return connection === "reader"
+                  ? `reader:${String(span.attributes.get("db.reader.lane"))}`
+                  : connection;
+              }),
+            ),
+          ];
+        });
+      const nodeId = NodeId.make("node:ws-sweep-reader");
+      const dedupe = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return yield* store.isNodeStored({
+          id: nodeId,
+          threadId: fixture.threadId,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: nodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: fixture.now,
+          completedAt: null,
+        });
+      });
+      assert.deepEqual(yield* routes(sweeps), ["reader:background"]);
+      assert.deepEqual(yield* routes(dedupe), ["reader:foreground"]);
+      const switchedBack = ProjectionStore.layer.pipe(
+        Layer.fresh,
+        Layer.provide(
+          Layer.succeed(Switches, {
+            ...readSpeedups({}),
+            sweepReadsOffWriter: false,
+            ingestDedupeForeground: false,
+          }),
+        ),
+      );
+      assert.deepEqual(yield* routes(sweeps.pipe(Effect.provide(switchedBack))), ["writer"]);
+      assert.deepEqual(yield* routes(dedupe.pipe(Effect.provide(switchedBack))), [
+        "reader:background",
+      ]);
 
       const held = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
