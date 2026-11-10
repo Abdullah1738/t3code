@@ -413,7 +413,7 @@ it.live.each(["cancellation", "expiry"] as const)(
   },
 );
 
-// --- Reserved-lane timeouts keep the process unless it is wedged (control-lane-fix) ---
+// Reserved-lane timeouts keep the process unless it is wedged (control-lane-fix).
 
 const countSpawns = () => {
   const spawned = { count: 0 };

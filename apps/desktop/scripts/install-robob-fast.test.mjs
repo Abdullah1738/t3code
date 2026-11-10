@@ -183,9 +183,7 @@ for (const [name, overrides, message] of [
 ])
   test(`rejects ${name}`, () => assert.throws(() => checkSignature(signed(overrides)), message));
 
-// ---------------------------------------------------------------------------
-// Host preflight, failure relaunch and stale staging (install-20261110.1 issue 1)
-// ---------------------------------------------------------------------------
+// Host preflight, failure relaunch and stale staging (install-20261110.1 issue 1).
 
 const fakeProbe = (script) => {
   const calls = [];
