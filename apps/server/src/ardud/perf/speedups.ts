@@ -24,6 +24,8 @@
  *   behind sweeps and reports, instead of the foreground pool.
  * - `ROBOB_SHELL_RECENT_FIRST=0`: a client asking for the most recently updated threads
  *   as the first page of a paged thread list gets pages by thread id from the start.
+ * - `ROBOB_SHELL_PAGE_REPLY_LANE=0`: pages of the paged thread list queue on the shared
+ *   snapshot reply lane again, behind board snapshots and whole-list reads.
  * - `ROBOB_SHELL_KEEP_RESUMABLE=0`: clients are no longer told they may keep a complete
  *   thread list resumable across sessions and resubscribes; a session that ends before its
  *   "synchronized" marker makes the next one load every page again (the old client rule).
@@ -66,6 +68,7 @@ export interface Speedups {
   readonly threadsPullRequestIndex: boolean;
   readonly ingestDedupeForeground: boolean;
   readonly shellResumeAcrossSessions: boolean;
+  readonly shellPageReplyLane: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -84,6 +87,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   threadsPullRequestIndex: !isOff(env, "ROBOB_THREADS_PR_INDEX"),
   ingestDedupeForeground: text(env, "ROBOB_INGEST_DEDUPE_LANE")?.toLowerCase() !== "background",
   shellResumeAcrossSessions: !isOff(env, "ROBOB_SHELL_KEEP_RESUMABLE"),
+  shellPageReplyLane: !isOff(env, "ROBOB_SHELL_PAGE_REPLY_LANE"),
 });
 
 /** Process-wide switches, read once at start. */
@@ -119,4 +123,9 @@ export const ShellResumeLimits = Context.Reference<ShellResumeLimits>(
 /** Whether one thread's HTTP views have their own reply lane (off: the snapshot lane). */
 export const ThreadReplyLane = Context.Reference<boolean>("t3/ardud/perf/ThreadReplyLane", {
   defaultValue: () => speedups.threadReplyLane,
+});
+
+/** Whether paged thread-list pages have their own reply lane (off: the snapshot lane). */
+export const ShellPageReplyLane = Context.Reference<boolean>("t3/ardud/perf/ShellPageReplyLane", {
+  defaultValue: () => speedups.shellPageReplyLane,
 });
