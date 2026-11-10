@@ -273,7 +273,9 @@ class PrePoolLockDatabase(Isolated):
         self.con.executescript("""DROP TABLE pool_pending;
             CREATE TABLE pool_pending (
               token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL
-            );""")
+            );
+            PRAGMA user_version=0;""")
+        self.con.schema_ready = False
 
     def cols(self):
         return [r[1] for r in self.con.execute("PRAGMA table_info(pool_pending)")]
@@ -283,7 +285,7 @@ class PrePoolLockDatabase(Isolated):
         self.con.execute("INSERT INTO pool_pending VALUES ('create-old','repo',1,1)")
         self.con.commit()
         capacity.schema(self.con)
-        capacity.schema(self.con)  # a second run (every offbox call runs it) changes nothing
+        capacity.schema(self.con)  # a second run observes the migrated version
         self.assertEqual(self.cols(), ['token', 'pool_key', 'pid', 'created_at', 'source'])
         self.assertEqual([tuple(r) for r in self.con.execute("SELECT * FROM pool_pending")],
                          [('create-old', 'repo', 1, 1.0, None)])

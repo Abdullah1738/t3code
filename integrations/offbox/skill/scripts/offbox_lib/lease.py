@@ -1157,14 +1157,9 @@ def keep_images(box_id: str) -> None:
         event(db(), box_id, "keep_images_failed", str(e)[:300])
 
 
-_HOLDS_DDL = ("CREATE TABLE IF NOT EXISTS prune_holds ("
-              "box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL)")
-
-
 def ensure_holds(con) -> None:
-    """Create the prune_holds table if this database predates it. common.db() builds only the old schema, and
-    capacity.schema() is not guaranteed to have run first, so every hold path makes the table itself."""
-    con.execute(_HOLDS_DDL)
+    from .common import ensure_schema
+    ensure_schema(con)
 
 
 def clear_prune_hold(con, box_id: str) -> None:

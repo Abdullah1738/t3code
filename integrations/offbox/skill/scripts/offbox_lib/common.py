@@ -7,6 +7,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import random
 import secrets
 import sqlite3
 import sys
@@ -33,6 +34,7 @@ TZ = ZoneInfo("Asia/Dubai")
 EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
+EXIT_LOCAL = 93               # local state failure; never automatic local fallback
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)
@@ -148,7 +150,7 @@ def warn_loud(msg: str) -> None:
 
 
 class OffboxError(Exception):
-    """Raised for failures; code 90 = infra (fallback allowed), 91 = cap, 92 = pool busy, 2 = usage."""
+    """Raised for failures; code 90 = infra (fallback allowed), 91 = cap, 92 = pool busy, 93 = local state (no fallback), 2 = usage."""
 
     def __init__(self, msg: str, code: int = EXIT_INFRA, started: bool = False, outage: bool = False):
         super().__init__(msg)
@@ -206,12 +208,105 @@ CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT, ts REAL);
 """
 
 
-def db() -> sqlite3.Connection:
-    ensure_dirs()
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.executescript(SCHEMA)
+CAPACITY_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS start_requests (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, operation TEXT, box_id TEXT,
+          outcome TEXT NOT NULL DEFAULT 'reserved', legacy_event INTEGER UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS start_requests_ts ON start_requests(ts);
+        CREATE INDEX IF NOT EXISTS start_requests_box_ts ON start_requests(box_id,ts);
+        CREATE TABLE IF NOT EXISTS pool_members (box_id TEXT PRIMARY KEY, pool_key TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS pool_members_key ON pool_members(pool_key);
+        CREATE TABLE IF NOT EXISTS pool_callers (
+          owner TEXT, repo_root TEXT, box_id TEXT, remote_dir TEXT,
+          PRIMARY KEY(owner, repo_root)
+        );
+        -- A pool box being created: its slot is claimed under the pool lock, the box is made after it (pool._pending).
+        CREATE TABLE IF NOT EXISTS pool_pending (
+          token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL, source TEXT
+        );
+        -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
+        -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
+        CREATE TABLE IF NOT EXISTS prune_holds (
+          box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL
+        );
+"""
+
+
+SCHEMA_VERSION = 1
+DB_TIMEOUT = 30
+
+
+class StateConnection(sqlite3.Connection):
+    last_statement = "connect"
+
+    def execute(self, sql, parameters=(), /):
+        self.last_statement = " ".join(sql.split())[:100]
+        try:
+            return super().execute(sql, parameters)
+        except sqlite3.Error as error:
+            error.add_note(f"local state SQL: {self.last_statement}")
+            raise
+
+
+@contextlib.contextmanager
+def write(con):
+    """Reserve the writer before reading state; callers keep external work outside this scope."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+
+
+def busy(error):
+    return isinstance(error, sqlite3.OperationalError) and (
+        getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+        or any(word in str(error).lower() for word in ('locked', 'busy')))
+
+
+def db_retry(operation):
+    for attempt in range(3):
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if not busy(error) or attempt == 2:
+                raise
+            time.sleep(random.uniform(.03, .1) * (attempt + 1))
+
+
+def local_error(error, *, run_id=None, started=False):
+    notes = "; ".join(getattr(error, '__notes__', []))
+    label = "local state DB busy" if busy(error) else (
+        "local state DB error" if isinstance(error, sqlite3.Error) else "local error")
+    action = (f"command may have run; do not rerun it; read its result with: offbox wait {run_id}"
+              if started else "nothing ran, safe to retry")
+    prefix = f"{run_id}: " if run_id else ""
+    return OffboxError(f"{prefix}{label} ({notes or str(error)}); {action}", code=EXIT_LOCAL, started=started)
+
+
+def ensure_schema(con):
+    if getattr(con, 'schema_ready', False):
+        return
+    if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        # journal_mode is persistent. Do this only on upgrade, outside the migration transaction.
+        con.execute("PRAGMA journal_mode=WAL")
+        with write(con):
+            # Another process may have completed the upgrade while we waited for the writer.
+            if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                _migrate(con)
+                con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    if isinstance(con, StateConnection):
+        con.schema_ready = True
+
+
+def _migrate(con):
+    # executescript commits an existing transaction, so run each statement under our migration lock.
+    for statement in (SCHEMA + CAPACITY_SCHEMA).split(';'):
+        if statement.strip():
+            con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
                 "client_pid INTEGER"):
@@ -223,6 +318,29 @@ def db() -> sqlite3.Connection:
         for col in ("saved TEXT", "expired_at REAL"):
             if col.split()[0] not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+
+    have = {r[1] for r in con.execute("PRAGMA table_info(pool_pending)")}
+    if 'source' not in have:
+        con.execute("ALTER TABLE pool_pending ADD COLUMN source TEXT")
+    con.execute("""INSERT OR IGNORE INTO start_requests(ts,operation,box_id,outcome,legacy_event)
+        SELECT e.ts, e.kind, e.box_id, 'legacy', e.rowid FROM events e
+        WHERE e.ts>? AND e.kind IN ('lease_new','lease_resume','base_save','template_build_start')
+        AND NOT EXISTS (SELECT 1 FROM start_requests s WHERE s.legacy_event IS NULL
+          AND s.box_id=e.box_id AND s.ts BETWEEN e.ts-1800 AND e.ts+1)""", (now()-86400,))
+    con.execute("INSERT OR REPLACE INTO kv VALUES ('legacy_start_rowid',?,?)",
+                (str(con.execute('SELECT COALESCE(MAX(rowid),0) FROM events').fetchone()[0]), now()))
+
+
+def db() -> sqlite3.Connection:
+    ensure_dirs()
+    # Standalone writes commit immediately. Only read/modify/write units use write(), never network work.
+    con = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None, factory=StateConnection)
+    con.row_factory = sqlite3.Row
+    try:
+        db_retry(lambda: ensure_schema(con))
+    except BaseException:
+        con.close()
+        raise
     return con
 
 

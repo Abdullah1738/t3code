@@ -5,7 +5,7 @@ import contextlib
 import contextvars
 import hashlib
 
-from .common import OffboxError, db, file_lock, now
+from .common import OffboxError, db, file_lock, now, write
 
 UNANSWERED = ('uncertain', 'reserved', 'http_502', 'http_504', 'http_520', 'http_524')
 
@@ -13,27 +13,27 @@ UNANSWERED = ('uncertain', 'reserved', 'http_502', 'http_504', 'http_520', 'http
 def clear_resume(con, box_id):
     from . import capacity
     capacity.schema(con)
-    con.execute("DELETE FROM kv WHERE k IN (?,?)", (f"resume_unanswered:{box_id}", f"resume_provision:{box_id}"))
-    con.execute("UPDATE start_requests SET outcome='settled' WHERE box_id=? AND operation='resume' "
-                "AND outcome IN (?,?,?,?,?,?)", (box_id, *UNANSWERED))
-    con.commit()
+    with write(con):
+        con.execute("DELETE FROM kv WHERE k IN (?,?)", (f"resume_unanswered:{box_id}", f"resume_provision:{box_id}"))
+        con.execute("UPDATE start_requests SET outcome='settled' WHERE box_id=? AND operation='resume' "
+                    "AND outcome IN (?,?,?,?,?,?)", (box_id, *UNANSWERED))
 
 
 def recover_resumes(con, key):
     """Import pre-marker unanswered resumes during rollout; settled/quarantined boxes never re-enter the pool."""
     from . import capacity
     capacity.schema(con)
-    rows = con.execute("SELECT l.box_id, s.ts FROM leases l JOIN start_requests s ON s.box_id=l.box_id "
-                       "WHERE l.repo_key=? AND l.state IN ('running','stopped') AND s.operation='resume' "
-                       "AND s.ts>? AND s.outcome IN (?,?,?,?,?,?) "
-                       "AND s.id=(SELECT MAX(t.id) FROM start_requests t WHERE t.box_id=l.box_id "
-                       "AND t.operation='resume')", (key, now() - 900, *UNANSWERED)).fetchall()
-    seconds = capacity.setting('OFFBOX_RESUME_PROVISION_SECONDS', 300, minimum=1, maximum=900)
-    for row in rows:
-        con.execute("INSERT OR IGNORE INTO kv VALUES (?,?,?)", (f"resume_unanswered:{row['box_id']}", '', row['ts']))
-        con.execute("INSERT OR IGNORE INTO kv VALUES (?,?,?)",
-                    (f"resume_provision:{row['box_id']}", str(row['ts'] + seconds), row['ts']))
-    con.commit()
+    with write(con):
+        rows = con.execute("SELECT l.box_id, s.ts FROM leases l JOIN start_requests s ON s.box_id=l.box_id "
+                           "WHERE l.repo_key=? AND l.state IN ('running','stopped') AND s.operation='resume' "
+                           "AND s.ts>? AND s.outcome IN (?,?,?,?,?,?) "
+                           "AND s.id=(SELECT MAX(t.id) FROM start_requests t WHERE t.box_id=l.box_id "
+                           "AND t.operation='resume')", (key, now() - 900, *UNANSWERED)).fetchall()
+        seconds = capacity.setting('OFFBOX_RESUME_PROVISION_SECONDS', 300, minimum=1, maximum=900)
+        for row in rows:
+            con.execute("INSERT OR IGNORE INTO kv VALUES (?,?,?)", (f"resume_unanswered:{row['box_id']}", '', row['ts']))
+            con.execute("INSERT OR IGNORE INTO kv VALUES (?,?,?)",
+                        (f"resume_provision:{row['box_id']}", str(row['ts'] + seconds), row['ts']))
 
 
 _SCOPE = contextvars.ContextVar("allocation_scope", default=None)

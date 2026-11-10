@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import re
 import socket
 import subprocess
@@ -78,7 +79,7 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
 
 def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     con = db()
-    capacity.schema(con)
+    capacity.schema(con, import_legacy=False)
     if show_all:
         rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') ORDER BY last_used_at DESC").fetchall()
     else:
@@ -321,7 +322,11 @@ def _run_row(run_id: str):
     r = con.execute("SELECT * FROM runs WHERE run_id=? OR run_id LIKE ?", (run_id, f"%{run_id}")).fetchone()
     if not r:
         raise OffboxError(f"no run {run_id}", code=2)
-    return r
+    from .runs import finish, restore_run_state, terminal_result
+    recovered = restore_run_state(r)
+    if terminal_result(recovered) and r['status'] in ('starting','running'):
+        finish(r['run_id'], recovered['exit_code'], recovered['status'])
+    return recovered
 
 
 def logs(run_id: str, do_follow: bool) -> int:
@@ -671,14 +676,19 @@ def _finalize(r, code, log_path) -> int:
         finish(r['run_id'], EXIT_INFRA, 'infra')
         say('repo toolchain setup failed (exit 98), not your command')
         return EXIT_INFRA
-    pulls = json.loads(r["pulls"] or "[]")
-    if pulls:
-        con = db()
-        row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
-                               (r["run_id"],)).fetchone())
-        do_pulls(r["box_id"], row, pulls)
-    finish(r['run_id'], code)
-    go_std_glitch(r["box_id"], r["run_id"], log_path, code)
+    from .runs import state_warning
+    try:
+        pulls = json.loads(r["pulls"] or "[]")
+        if pulls:
+            con = db()
+            row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
+                                   (r["run_id"],)).fetchone())
+            do_pulls(r["box_id"], row, pulls)
+        finish(r['run_id'], code)
+        go_std_glitch(r["box_id"], r["run_id"], log_path, code)
+    except sqlite3.Error as error:
+        finish(r['run_id'], code)
+        state_warning(r['run_id'], code, error)
     out(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
 

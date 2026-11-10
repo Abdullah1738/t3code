@@ -6,10 +6,11 @@ import datetime as dt
 import fcntl
 import os
 import shlex
+import sqlite3
 import subprocess
 import time
 
-from .common import LOCAL_SEM, LOCKS_DIR, TZ, db, ensure_dirs, event, kv_get, kv_set, log, now, say, warn_loud
+from .common import LOCAL_SEM, LOCKS_DIR, TZ, db, db_retry, ensure_dirs, event, kv_get, kv_set, log, now, say, warn_loud
 from .identity import telegram
 
 SLOTS = 2
@@ -19,7 +20,8 @@ INFRA_ALERT_AT = 3
 
 def allowed(argv: list[str], error, cwd: str) -> bool:
     """Heavy commands never spill onto the Mac; small commands retain the existing fallback."""
-    if error.started:
+    from .common import EXIT_LOCAL
+    if error.started or error.code == EXIT_LOCAL:
         return False
     try:
         from classify import classify
@@ -126,10 +128,23 @@ def run_local(argv: list[str], reason: str, run_id: str | None = None) -> int:
             code = 130
     finally:
         sem.release()
-    con = db()
-    if run_id:
-        con.execute("UPDATE runs SET mode='local', status=?, exit_code=?, end_at=?, error=? WHERE run_id=?",
-                    ("done" if code == 0 else "failed", code, now(), reason[:500], run_id))
-        con.commit()
-    event(con, None, "local_run", f"exit={code} {round(now() - t)}s reason={reason[:200]}")
+    def persist():
+        con = db()
+        try:
+            if run_id:
+                con.execute("UPDATE runs SET mode='local', status=?, exit_code=?, end_at=?, error=? WHERE run_id=?",
+                            ("done" if code == 0 else "failed", code, now(), reason[:500], run_id))
+            event(con, None, "local_run", f"exit={code} {round(now() - t)}s reason={reason[:200]}")
+        finally:
+            con.close()
+    try:
+        db_retry(persist)
+    except sqlite3.Error as error:
+        from .runs import save_run_state
+        if run_id:
+            save_run_state(run_id, mode='local', status='done' if code == 0 else 'failed', exit_code=code, end_at=now())
+        message = (f"{run_id or 'local command'}: local exit {code}; bookkeeping failed: {error}. "
+                   f"Do not rerun the command; read/repair its result with: offbox wait {run_id or ''}")
+        say("warning: " + message)
+        log(message)
     return code

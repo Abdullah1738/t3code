@@ -18,7 +18,7 @@ from pathlib import Path
 from . import api, capacity, lease, ssh_sync
 from .identity import require_proven
 from .common import (BASES_SOFT_LIMIT, DATA_KEEP_S, RUN_TTL_S, TEMPLATES, TEMPLATES_DIR, OffboxError, ago,
-                     db, event, file_lock, iso, iso_ts, kv_get, kv_set, new_id, now, say)
+                     db, event, file_lock, write, iso, iso_ts, kv_get, kv_set, new_id, now, say)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
 
@@ -83,15 +83,15 @@ def _save(me: dict, name: str = "default", make_default: bool = False, note: str
     api.wait_state(bid, api.STOPPED_STATES, timeout=900)
     snap = api.latest_snapshot(bid) or {}
     with file_lock("bases"):
-        old = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
-        if make_default:
-            con.execute("UPDATE bases SET is_default=0 WHERE repo_key=?", (me["repo_key"],))
-        is_def = 1 if (make_default or (old and old["is_default"])) else 0
-        con.execute("""INSERT OR REPLACE INTO bases (name, repo_key, short, box_id, from_box, size, remote_dir, is_default,
-                       note, created_at, created_by, size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (full, me["repo_key"], name, bid, src, row["size"], row["remote_dir"], is_def, note, now(),
-                     me["owner"], snap.get("sizeBytes")))
-        con.commit()
+        with write(con):
+            old = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
+            if make_default:
+                con.execute("UPDATE bases SET is_default=0 WHERE repo_key=?", (me["repo_key"],))
+            is_def = 1 if (make_default or (old and old["is_default"])) else 0
+            con.execute("""INSERT OR REPLACE INTO bases (name, repo_key, short, box_id, from_box, size, remote_dir, is_default,
+                           note, created_at, created_by, size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (full, me["repo_key"], name, bid, src, row["size"], row["remote_dir"], is_def, note, now(),
+                         me["owner"], snap.get("sizeBytes")))
     event(con, bid, "base_save", f"{full} from={src} default={is_def} {round(now() - t)}s")
     keep_saved(con, "bases", full, bid, (old and old["saved"]) or saved_name("base", full))
     if old and old["box_id"] != bid:

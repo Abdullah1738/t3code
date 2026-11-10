@@ -490,27 +490,34 @@ def _acquire(con, me, size, template, base, fresh, run_id):
 def _claim(con, me, row, run_id):
     bid = row["box_id"]
     row["remote_dir"] = remote_dir_for(me["repo_root"])
-    con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (bid, me["repo_key"]))
-    con.execute("INSERT OR REPLACE INTO pool_callers VALUES (?,?,?,?)",
-                (me["owner"], me["repo_root"], bid, row["remote_dir"]))
-    # Shared leases outlive their original worker's archive state.
-    con.execute("UPDATE leases SET thread_gone_since=NULL, last_used_at=? WHERE box_id=?", (now(), bid))
-    if run_id:
-        con.execute("UPDATE runs SET box_id=?,remote_dir=?,size=? WHERE run_id=?",
-                    (bid, row["remote_dir"], row["size"], run_id))
-    con.commit()
+    from .common import write
+    with write(con):
+        con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (bid, me["repo_key"]))
+        con.execute("INSERT OR REPLACE INTO pool_callers VALUES (?,?,?,?)",
+                    (me["owner"], me["repo_root"], bid, row["remote_dir"]))
+        # Shared leases outlive their original worker's archive state.
+        con.execute("UPDATE leases SET thread_gone_since=NULL, last_used_at=? WHERE box_id=?", (now(), bid))
+        if run_id:
+            con.execute("UPDATE runs SET box_id=?,remote_dir=?,size=? WHERE run_id=?",
+                        (bid, row["remote_dir"], row["size"], run_id))
 
 
 def _refresh_background(con, key):
     """Detached runs have no lock holder; reclaim completed slots without waiting for the reaper."""
     from . import api, runs
     rows = con.execute("""SELECT r.* FROM runs r JOIN leases l USING(box_id)
-        WHERE l.repo_key=? AND r.mode='bg' AND r.status='running' AND r.process_id IS NOT NULL""", (key,)).fetchall()
+        WHERE l.repo_key=? AND r.mode='bg' AND r.status IN ('starting','running')""", (key,)).fetchall()
     for row in rows:
+        row = runs.restore_run_state(row)
         try:
             with file_lock('box-'+row['box_id'], timeout=0):
+                if runs.terminal_result(row):
+                    runs.finish(row['run_id'], row['exit_code'], row['status'])
+                    continue
+                if not row['process_id']:
+                    continue
                 st = api.cmd_status(row['box_id'], row['process_id'])
-                if st and not st.get('running') and st.get('status') == 'exited':
+                if st and not st.get('running') and st.get('status') in ('exited','lost'):
                     if (st.get('exitCode') == runs.EXIT_REPO_SETUP
                             and runs.REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
                         runs.finish(row['run_id'], EXIT_INFRA, 'infra')
@@ -519,7 +526,8 @@ def _refresh_background(con, key):
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:
                         runs.do_pulls(row['box_id'], dict(row), pulls)
-                    runs.finish(row['run_id'], st.get('exitCode'))
+                    status, code = runs.completed_result(row, st)
+                    runs.finish(row['run_id'], code, status)
         except OffboxError:
             pass
 

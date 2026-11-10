@@ -24,52 +24,31 @@ def setting(name: str, default: int, minimum: int = 1, maximum: int = 86400) -> 
         return default
 
 
-def _add_columns(con, table: str, cols) -> None:
-    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-    for col in cols:
-        if col.split()[0] in have:
-            continue
-        try:
-            con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e):  # another process added it between the check and the ALTER
-                raise
-
-
-def schema(con):
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS start_requests (
-          id INTEGER PRIMARY KEY, ts REAL NOT NULL, operation TEXT, box_id TEXT,
-          outcome TEXT NOT NULL DEFAULT 'reserved', legacy_event INTEGER UNIQUE
-        );
-        CREATE INDEX IF NOT EXISTS start_requests_ts ON start_requests(ts);
-        CREATE INDEX IF NOT EXISTS start_requests_box_ts ON start_requests(box_id,ts);
-        CREATE TABLE IF NOT EXISTS pool_members (box_id TEXT PRIMARY KEY, pool_key TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS pool_members_key ON pool_members(pool_key);
-        CREATE TABLE IF NOT EXISTS pool_callers (
-          owner TEXT, repo_root TEXT, box_id TEXT, remote_dir TEXT,
-          PRIMARY KEY(owner, repo_root)
-        );
-        -- A pool box being created: its slot is claimed under the pool lock, the box is made after it (pool._pending).
-        CREATE TABLE IF NOT EXISTS pool_pending (
-          token TEXT PRIMARY KEY, pool_key TEXT NOT NULL, pid INTEGER, created_at REAL NOT NULL, source TEXT
-        );
-        -- A box with a prune worker that is not confirmed finished must not be handed to anyone: it can still
-        -- rename a checkout a later run has reused. Cleared only when the worker is confirmed gone.
-        CREATE TABLE IF NOT EXISTS prune_holds (
-          box_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created_at REAL NOT NULL
-        );
-    """)
-    # CREATE TABLE IF NOT EXISTS never changes a table that already exists: columns added later need a migration.
-    _add_columns(con, "pool_pending", ("source TEXT",))
-    # Preserve the rolling history on deployment. New clients record before sending; older
-    # clients still in flight may emit legacy events, so import only unmatched events.
-    con.execute("""INSERT OR IGNORE INTO start_requests(ts,operation,box_id,outcome,legacy_event)
-        SELECT e.ts, e.kind, e.box_id, 'legacy', e.rowid FROM events e
-        WHERE e.ts>? AND e.kind IN ('lease_new','lease_resume','base_save','template_build_start')
-        AND NOT EXISTS (SELECT 1 FROM start_requests s WHERE s.legacy_event IS NULL
-          AND s.box_id=e.box_id AND s.ts BETWEEN e.ts-1800 AND e.ts+1)""", (now()-86400,))
-    con.commit()
+def schema(con, *, import_legacy=True):
+    # Compatibility for callers with their own connection (including older test fixtures).
+    from .common import ensure_schema
+    ensure_schema(con)
+    if not import_legacy:
+        return
+    # Older clients may still emit a legacy start event. Read first and only take the writer
+    # when there is new history to import, rather than scanning/reinserting a whole day on every call.
+    from .common import write
+    marker = con.execute("SELECT v FROM kv WHERE k='legacy_start_rowid'").fetchone()
+    after = int(marker[0]) if marker else 0
+    rows = con.execute("SELECT rowid,ts,kind,box_id FROM events WHERE rowid>? AND ts>? "
+                       "AND kind IN ('lease_new','lease_resume','base_save','template_build_start')",
+                       (after, now()-86400)).fetchall()
+    if not rows:
+        return
+    with write(con):
+        for rowid, ts, kind, box in rows:
+            con.execute("INSERT OR IGNORE INTO start_requests(ts,operation,box_id,outcome,legacy_event) "
+                        "SELECT ?,?,?,'legacy',? WHERE NOT EXISTS (SELECT 1 FROM start_requests "
+                        "WHERE legacy_event IS NULL AND box_id=? AND ts BETWEEN ? AND ?)",
+                        (ts, kind, box, rowid, box, ts-1800, ts+1))
+        con.execute("INSERT INTO kv VALUES ('legacy_start_rowid',?,?) ON CONFLICT(k) DO UPDATE "
+                    "SET v=CAST(MAX(CAST(v AS INTEGER),CAST(excluded.v AS INTEGER)) AS TEXT),ts=excluded.ts",
+                    (str(rows[-1][0]), now()))
 
 
 def snapshot(con=None) -> dict:
@@ -79,7 +58,7 @@ def snapshot(con=None) -> dict:
             return snapshot(con)
         finally:
             con.close()
-    schema(con)
+    schema(con, import_legacy=False)
     t = now()
     counts = []
     retry = t

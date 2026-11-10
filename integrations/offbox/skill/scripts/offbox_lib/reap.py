@@ -276,8 +276,15 @@ def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) 
 
 def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
-    from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
+    from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER, finish, restore_run_state, completed_result, terminal_result
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
+        saved = restore_run_state(run)
+        if terminal_result(saved):
+            if not dry:
+                finish(run['run_id'], saved['exit_code'], saved['status'])
+            actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
+            continue
+        run = saved
         status, code = None, None
         if run['status'] == 'starting' and not run['process_id'] and now()-(run['start_at'] or 0) < 3600:
             continue
@@ -294,8 +301,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
                 # Missing/unavailable status is not proof a process stopped.
                 continue
             elif not st.get("running") and st.get('status') in ('exited','lost'):
-                code = st.get("exitCode")
-                status = "lost" if st.get("status") == "lost" else ("done" if code == 0 else "failed")
+                status, code = completed_result(run, st)
                 # Detached runs may have no local log yet; cmd_status includes the remote stderr tail.
                 if (st.get('status') == 'exited' and code == EXIT_REPO_SETUP
                         and REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):

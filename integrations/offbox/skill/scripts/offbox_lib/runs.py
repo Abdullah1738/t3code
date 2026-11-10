@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -16,8 +17,8 @@ from pathlib import Path
 
 from . import api, lease, node_version, pool, ssh_sync
 from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
-                     atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
+from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
+                     atomic_write_json, db, db_retry, event, log, local_error, write, new_id, now, offsets_path, read_json, say, silence)
 
 BG_TTL_S = 6 * 3600
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
@@ -726,15 +727,21 @@ class Runner:
         self.box = None
         self.pid = None
         self.started = False
+        self.registered = False
+        self.remote_code = None
         self.killed = False
         self.lease_row = None
         self.log_path = LOGS_DIR / f"{self.run_id}.log"
 
     def record(self, **kw):
-        con = db()
-        cols = ", ".join(f"{k}=?" for k in kw)
-        con.execute(f"UPDATE runs SET {cols} WHERE run_id=?", (*kw.values(), self.run_id))
-        con.commit()
+        def update():
+            con = db()
+            try:
+                cols = ", ".join(f"{k}=?" for k in kw)
+                con.execute(f"UPDATE runs SET {cols} WHERE run_id=?", (*kw.values(), self.run_id))
+            finally:
+                con.close()
+        db_retry(update)
 
     def start(self) -> dict:
         a, me = self.a, self.me
@@ -746,12 +753,15 @@ class Runner:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
         wait_images = needs_image_wait(cmd_text, me["repo_root"])
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
-        con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
-                       log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
-                    (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
-                     cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
-                     json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
-        con.commit()
+        def register():
+            with write(con):
+                con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
+                               log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
+                            (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
+                             cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
+                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
+        db_retry(register)
+        self.registered = True
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
@@ -814,10 +824,14 @@ class Runner:
             raise
         self.pid = r["processId"]
         self.started = True
-        self.record(process_id=self.pid, command_id=r.get("commandId"), status="running")
-        lease.touch(self.box)
-        event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
-                                          f"cmd={cmd_text[:200]}")
+        save_run_state(self.run_id, box_id=self.box, process_id=self.pid, command_id=r.get("commandId"))
+        try:
+            self.record(process_id=self.pid, command_id=r.get("commandId"), status="running")
+            lease.touch(self.box)
+            event(con, self.box, "run_start", f"{self.run_id} pid={self.pid} env={','.join(explicit) or '-'} "
+                                              f"cmd={cmd_text[:200]}")
+        except sqlite3.Error as error:
+            state_warning(self.run_id, None, error)
         return row
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> None:
@@ -1196,25 +1210,87 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
     return True
 
 
+def save_run_state(run_id, **values):
+    path = LOGS_DIR / f"{run_id}.state.json"
+    previous = read_json(path, {})
+    atomic_write_json(path, {**previous, **values})
+
+
+def restore_run_state(row):
+    """A remote handle/result survives a failed SQLite write; wait and reap can repair the row."""
+    saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
+    return {**dict(row), **saved}
+
+
+def terminal_result(row):
+    return row['status'] not in ('starting', 'running') and row['exit_code'] is not None
+
+
+def completed_result(row, remote_status):
+    """Use durable local/box evidence before boat's synthetic lost/254 status."""
+    if terminal_result(row):
+        return row['status'], row['exit_code']
+    code = remote_status.get('exitCode')
+    state = remote_status.get('status')
+    if state == 'lost' or code in (None, 254):
+        recovered, _ = recover_lost_exit(row['box_id'], row['run_id'], None, 0)
+        if recovered is not None:
+            state, code = 'exited', recovered
+    return ('lost' if state == 'lost' else ('done' if code == 0 else 'failed')), code
+
+
+def state_warning(run_id, code, error):
+    result = f"remote exit {code}" if code is not None else "command may still be running"
+    statement = "; ".join(getattr(error, "__notes__", []))
+    detail = f"{error} ({statement})" if statement else str(error)
+    message = (f"{run_id}: {result}; local bookkeeping failed: {detail}. "
+               f"Read/repair its result with: offbox wait {run_id}; do not rerun the command")
+    say("warning: " + message)
+    log(message)
+
+
 def finish(run_id: str, code: int | None, status: str | None = None) -> None:
-    con = db()
-    r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-    if not r:
-        return
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
-    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? AND status IN ('starting','running')",
-                (st, code, now(), run_id))
-    con.commit()
-    if r["box_id"]:
+    def persist():
+        con = db()
+        try:
+            with write(con):
+                r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if r:
+                    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
+                                "AND status IN ('starting','running')", (st, code, now(), run_id))
+            return r
+        finally:
+            con.close()
+    try:
+        r = db_retry(persist)
+    except sqlite3.Error as error:
+        if code is not None:
+            save_run_state(run_id, status=st, exit_code=code, end_at=now())
+        if status == 'local_error':
+            say(f"{run_id}: local failure could not be recorded ({error}); nothing ran, safe to retry")
+        else:
+            state_warning(run_id, code, error)
+        return
+    if not r or not r["box_id"]:
+        return
+    # No transaction is open while Docker/TTL calls reach the box or boat.
+    con = None
+    try:
+        con = db()
         settle_docker(con, r, st)
-        # Extend auto-stop as well as the reaper threshold when the start budget is tight.
         lease.touch(r["box_id"])
         lease.idle_ttl(r['box_id'])
         event(con, r["box_id"], "run_end", f"{run_id} status={st} exit={code} {round(now() - (r['start_at'] or now()))}s")
+    except sqlite3.Error as error:
+        state_warning(run_id, code, error)
+    finally:
+        if con:
+            con.close()
 
 
 def run_remote(a, me: dict) -> int:
-    """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
+    """Foreground or --bg remote run. Local state errors use exit 93; infrastructure/capacity errors retain 90/91/92."""
     rn = Runner(a, me)
     try:
         return _run_remote(a, rn)
@@ -1225,11 +1301,27 @@ def run_remote(a, me: dict) -> int:
         if not rn.started:
             finish(rn.run_id, 130, 'killed')
         raise
+    except sqlite3.Error as error:
+        if rn.remote_code is not None:
+            finish(rn.run_id, rn.remote_code)
+            state_warning(rn.run_id, rn.remote_code, error)
+            report_exit("", rn.remote_code)
+            return rn.remote_code
+        if not rn.started and rn.registered:
+            finish(rn.run_id, EXIT_LOCAL, 'local_error')
+        raise local_error(error, run_id=rn.run_id if rn.registered else None, started=rn.started) from error
     except Exception as e:
-        if not rn.started:
-            finish(rn.run_id, None, 'infra')
-        rn.record(error=str(e)[:500])
-        raise OffboxError(f"remote run error: {type(e).__name__}: {e}", started=rn.started) from e
+        if rn.remote_code is not None:
+            state_warning(rn.run_id, rn.remote_code, e)
+            report_exit("", rn.remote_code)
+            return rn.remote_code
+        if not rn.started and rn.registered:
+            finish(rn.run_id, EXIT_LOCAL, 'local_error')
+        try:
+            rn.record(error=str(e)[:500])
+        except sqlite3.Error as error:
+            state_warning(rn.run_id, None, error)
+        raise local_error(e, run_id=rn.run_id if rn.registered else None, started=rn.started) from e
     finally:
         pool.release_guard(rn.lease_row)
 
@@ -1264,6 +1356,7 @@ def _run_remote(a, rn) -> int:
         code = None
         try:
             code = rn.stream()
+            rn.remote_code = code
         except KeyboardInterrupt:
             # Kill delivery may be uncertain. Keep the slot reserved until status proves exit.
             rn.record(error='interrupted; awaiting confirmed remote termination')
@@ -1275,6 +1368,7 @@ def _run_remote(a, rn) -> int:
         code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
+    rn.remote_code = code
     if code not in (0, None) and scope_failed(rn.log_path):
         rn.started = False
         rn.record(error="box could not start the command (systemd scope)")

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from collections.abc import Callable
 import hashlib
 import json
+import sqlite3
 import os
 import re
 import subprocess
@@ -211,61 +213,89 @@ def _resolve_identity(path: str, on_pending: Callable[[dict], None]) -> tuple[in
     return (200, last_pending) if last_pending is not None else (status, body)
 
 
+def _identity_cache_path(key):
+    from . import common
+    return common.STATE / ('identity-cache-' + hashlib.sha256(key.encode()).hexdigest() + '.json')
+
+
+def _cache_identity(con, key, value):
+    from .common import atomic_write_json
+    previous = con.execute("SELECT v,ts FROM kv WHERE k=?", (key,)).fetchone()
+    if previous and kv_get(con, key) == value and now() - previous['ts'] <= RESOLVED_TTL:
+        return
+    timeout = con.execute('PRAGMA busy_timeout').fetchone()[0]
+    try:
+        # Optional caching must not stall read-only commands for the ordinary writer timeout.
+        con.execute('PRAGMA busy_timeout=100')
+        kv_set(con, key, value)
+    except sqlite3.Error as error:
+        log(f"identity cache write skipped for {key}: {error}")
+        # Preserve every authoritative update: an old resolved owner must never return
+        # after an ambiguous/none/unavailable answer, or a changed resolved owner.
+        atomic_write_json(_identity_cache_path(key), {'ts': now(), 'identity': value})
+    finally:
+        con.execute(f'PRAGMA busy_timeout={timeout}')
+
+
 def identity_for(native: str, driver: str) -> dict:
     """C1's resolution for one native id, with a last resolved answer during control outages.
 
     A pending or unavailable answer is never reported as unowned: callers treat it as "not yet".
     """
-    con = db()
-    key = f"identity:{driver}:{native}"
-    row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
-    cached = None
-    age = 0
-    if row:
-        try:
-            cached = json.loads(row["v"])
-        except Exception:  # noqa: BLE001
-            cached = None
-        age = now() - (row["ts"] or 0)
-        if isinstance(cached, dict):
-            if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
-                return cached
-            if cached.get("resolution") not in ("resolved", "pending") and age <= UNRESOLVED_TTL:
-                return cached
-    path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
-
-    def invalidate_proof(answer):
-        nonlocal cached
-        cached = {**answer, "driver": driver, "nativeId": native}
-        kv_set(con, key, cached)
-
-    st, d = _resolve_identity(path, invalidate_proof)
-    had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
-    if st == 200 and isinstance(d.get("identity"), dict):
-        ident = dict(d["identity"])
-    else:
-        # Only short reason fields belong in diagnostics, never the response body or headers.
-        error = d.get("error")
-        reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
-        err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
-                    if isinstance(v, str) and v), "no error detail")
-        detail = f"status={st} {' '.join(err.split())[:120]}"
+    with contextlib.closing(db()) as con:
+        key = f"identity:{driver}:{native}"
+        row = con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()
+        from .common import read_json
+        pending = read_json(_identity_cache_path(key), {})
+        if pending.get('ts', 0) > (row['ts'] if row else 0):
+            row = {'v': json.dumps(pending['identity']), 'ts': pending['ts']}
+        cached = None
+        age = 0
         if row:
+            try:
+                cached = json.loads(row["v"])
+            except Exception:  # noqa: BLE001
+                cached = None
             age = now() - (row["ts"] or 0)
-        if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
-            log(f"identity resolve failed for {driver} {native[:8]} ({detail}); "
-                f"using last resolved identity from {age:.0f}s ago")
-            return cached
-        log(f"identity resolve failed for {driver} {native[:8]}: {detail}")
-        ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
-                 "executionKind": None, "acceptsMessages": False, "candidates": []}
-        if st != 200:
-            ident["lookupError"] = detail
-    ident.update(driver=driver, nativeId=native)
-    # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
-    if st == 200 or not had_resolved:
-        kv_set(con, key, ident)
-    return ident
+            if isinstance(cached, dict):
+                if cached.get("resolution") == "resolved" and age <= RESOLVED_TTL:
+                    return cached
+                if cached.get("resolution") not in ("resolved", "pending") and age <= UNRESOLVED_TTL:
+                    return cached
+        path = f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
+
+        def invalidate_proof(answer):
+            nonlocal cached
+            cached = {**answer, "driver": driver, "nativeId": native}
+            _cache_identity(con, key, cached)
+
+        st, d = _resolve_identity(path, invalidate_proof)
+        had_resolved = isinstance(cached, dict) and cached.get("resolution") == "resolved"
+        if st == 200 and isinstance(d.get("identity"), dict):
+            ident = dict(d["identity"])
+        else:
+            # Only short reason fields belong in diagnostics, never the response body or headers.
+            error = d.get("error")
+            reason = error.get("message") or error.get("reason") if isinstance(error, dict) else error
+            err = next((v for v in (d.get("errorDetail"), reason, d.get("message"), d.get("reason"))
+                        if isinstance(v, str) and v), "no error detail")
+            detail = f"status={st} {' '.join(err.split())[:120]}"
+            if row:
+                age = now() - (row["ts"] or 0)
+            if (st == 0 or st >= 500) and had_resolved and age <= STALE_RESOLVED_MAX:
+                log(f"identity resolve failed for {driver} {native[:8]} ({detail}); "
+                    f"using last resolved identity from {age:.0f}s ago")
+                return cached
+            log(f"identity resolve failed for {driver} {native[:8]}: {detail}")
+            ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
+                     "executionKind": None, "acceptsMessages": False, "candidates": []}
+            if st != 200:
+                ident["lookupError"] = detail
+        ident.update(driver=driver, nativeId=native)
+        # A failed lookup must not erase a confirmed mapping or refresh its timestamp.
+        if st == 200 or not had_resolved:
+            _cache_identity(con, key, ident)
+        return ident
 
 
 HOOKS_SRC = HOME / ".local/share/harness-hooks/src"
@@ -324,7 +354,10 @@ def _lookup_thread(ses: str) -> dict:
             if st2 == 200 and d2.get("thread"):
                 me["manager"] = d2["thread"]["threadId"]
     if me["thread"] or st in (200, 404):
-        kv_set(con, ck, me)
+        try:
+            _cache_identity(con, ck, me)
+        except sqlite3.Error as error:
+            log(f"whoami cache write skipped: {error}")
     return me
 
 

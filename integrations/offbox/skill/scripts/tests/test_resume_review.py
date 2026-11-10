@@ -177,14 +177,14 @@ class ResumeRecoveryTests(Isolated):
                          (self.clock.t - 901,))
         self.con.commit()
         allocation.recover_resumes(self.con, 'repo')
-        self.assertEqual(self.con.execute('SELECT count(*) FROM kv').fetchone()[0], 0)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM kv WHERE k LIKE 'resume_%'").fetchone()[0], 0)
         self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume','old','http_502')",
                          (self.clock.t - 2,))
         self.con.execute("INSERT INTO start_requests(ts,operation,box_id,outcome) VALUES (?,'resume','old','ok')",
                          (self.clock.t - 1,))
         self.con.commit()
         allocation.recover_resumes(self.con, 'repo')
-        self.assertEqual(self.con.execute('SELECT count(*) FROM kv').fetchone()[0], 0)
+        self.assertEqual(self.con.execute("SELECT count(*) FROM kv WHERE k LIKE 'resume_%'").fetchone()[0], 0)
 
 
 class BringUpOutageTests(Isolated):
