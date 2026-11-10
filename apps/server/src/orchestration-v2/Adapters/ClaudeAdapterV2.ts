@@ -8627,15 +8627,31 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               context.hadSuccessfulResponse &&
               message.subtype === "success" &&
               message.api_error_status === 404;
-            // A router's outer 503 does not erase its explicit inner 429/cooldown.
+            // Current 4xx evidence wins over history. Claude's synthetic 404 is the exception.
+            const currentPermanentFailure =
+              turnFailure?.category === "quota" ||
+              (message.subtype === "success" &&
+                message.api_error_status != null &&
+                message.api_error_status >= 400 &&
+                message.api_error_status < 500 &&
+                message.api_error_status !== 404);
             const cause =
-              (turnFailure?.category === "quota" ? turnFailure : undefined) ??
+              (currentPermanentFailure ? (turnFailure ?? undefined) : undefined) ??
               transcriptFailure ??
               (selectedModelAfterSuccess
                 ? latestFailure
                 : message.subtype !== "success" || message.api_error_status == null
                   ? (latestFailure ?? retryFailure)
                   : undefined);
+            const lastErrorMessage =
+              cause?.message !== undefined &&
+              cause.message !== "Claude gave up after repeated API errors."
+                ? cause.message
+                : selectedModelAfterSuccess
+                  ? "upstream 404 after successful responses in this session."
+                  : turnFailure?.message === "Claude gave up after repeated API errors."
+                    ? turnFailure.code?.replace("api_error_", "HTTP ")
+                    : turnFailure?.message;
             const failureWithRetryCause =
               turnFailure !== null &&
               apiExhausted &&
@@ -8660,7 +8676,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     (cause === undefined || cause.category === "model_invalid")
                       ? { category: "transient" as const }
                       : {}),
-                    message: `Claude gave up after repeated API errors. Last error: ${cause?.message ?? (selectedModelAfterSuccess ? "upstream 404 after successful responses in this session." : turnFailure.message === "Claude gave up after repeated API errors." ? turnFailure.code?.replace("api_error_", "HTTP ") : turnFailure.message)}`,
+                    message: `Claude gave up after repeated API errors. Last error: ${lastErrorMessage}`,
                   })
                 : turnFailure;
             const resultFailure = interrupted

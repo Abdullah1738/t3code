@@ -4471,6 +4471,115 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each(
+    [
+      { status: 400, text: "API Error: 400 invalid model requested", category: "model_invalid" },
+      { status: 400, text: "API Error: 400 malformed request", category: "unknown" },
+      {
+        status: 401,
+        text: "API Error: 401 Invalid authentication credentials",
+        category: "auth_expired",
+      },
+      { status: 403, text: "API Error: 403 forbidden", category: "config" },
+      { status: 413, text: "API Error: 413 request too large", category: "context_exhausted" },
+      { status: 429, text: "API Error: 429 rate_limit_error", category: "quota" },
+      { status: 418, text: "API Error: 418 unclassified request failure", category: "unknown" },
+      { status: 404, text: "There's an issue with the selected model", category: "transient" },
+      { status: null, text: "Claude could not complete the request", category: "unknown" },
+    ].flatMap((scenario) => [
+      { ...scenario, recovered: false },
+      { ...scenario, recovered: true },
+    ]),
+  )(
+    "keeps current terminal $status after a transcript retry (recovered=$recovered, $category)",
+    (scenario) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+        });
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-current-terminal-cause"),
+            text: "Continue.",
+            attachments: [],
+          }),
+        );
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000990",
+            text: "Saved earlier work.",
+          }),
+        );
+        const nativeResponse = {
+          type: "assistant",
+          timestamp: DateTime.formatIso(now),
+          message: { model: "claude-haiku-5-5" },
+        };
+        const projectDir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(projectDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(projectDir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          [
+            nativeResponse,
+            {
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(now),
+              error: { status: 502, formatted: "502 fetch connect timeout" },
+            },
+            ...(scenario.recovered ? [nativeResponse] : []),
+          ]
+            .map((record) => JSON.stringify(record))
+            .join("\n") + "\n",
+        );
+        if (scenario.recovered)
+          yield* harness.offerAndWait(
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000000991",
+              text: "Retry recovered; continuing work.",
+            }),
+          );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000992",
+            isError: true,
+            terminalReason: "api_error",
+            apiErrorStatus: scenario.status,
+            result: scenario.text,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        const usesTranscript =
+          !scenario.recovered && (scenario.status === null || scenario.status === 404);
+        assert.equal(terminal.failure.category, usesTranscript ? "transient" : scenario.category);
+        assert.equal(
+          terminal.failure.code,
+          usesTranscript
+            ? "api_error_502"
+            : scenario.status === null
+              ? "api_error"
+              : `api_error_${scenario.status}`,
+        );
+        if (scenario.recovered) assert.notInclude(terminal.failure.message, "502");
+        else if (usesTranscript)
+          assert.include(terminal.failure.message, "502 fetch connect timeout");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect("names an expired Claude login instead of the terminal API error", () =>
     Effect.gen(function* () {
       const configDir = "/synthetic/Claude config";
@@ -5033,11 +5142,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           }),
         );
         if (input.transcript) {
-          const projectDir = path.join(
-            configDir,
-            "projects",
-            "-workspace",
-          );
+          const projectDir = path.join(configDir, "projects", "-workspace");
           yield* fs.makeDirectory(projectDir, { recursive: true });
           yield* fs.writeFileString(
             path.join(projectDir, `${WAKE_NATIVE_SESSION}.jsonl`),
