@@ -10,6 +10,7 @@ import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as TestClock from "effect/testing/TestClock";
 import { createModelSelection } from "@t3tools/shared/model";
 import { expect } from "vite-plus/test";
 
@@ -213,6 +214,63 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
             }),
         );
       }),
+  );
+
+  // Board scribe calls set their own limit (or none); every other caller keeps the default.
+  const ProbeJson = Schema.Struct({ ok: Schema.Boolean });
+  const runStalledJson = (port: number, timeoutMs?: number | null) =>
+    withFakeCodexEnv({ output: "", lifecycle: { port, command: "exec" } }, (textGeneration) =>
+      textGeneration.generateJson!({
+        cwd: process.cwd(),
+        prompt: "Reply ok",
+        outputSchema: ProbeJson,
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }).pipe(Effect.flip),
+    );
+  // Past the CLI's 1-second force kill, so a run the clock timed out has ended by then.
+  const settle = Effect.sleep("2 seconds").pipe(TestClock.withLive);
+
+  it.effect("keeps the 3-minute default for generateJson without timeoutMs", () =>
+    Effect.gen(function* () {
+      const probe = yield* makeProcessProbe;
+      const fiber = yield* runStalledJson(probe.port).pipe(Effect.forkScoped);
+      yield* probe.started;
+      yield* TestClock.adjust("179 seconds");
+      yield* settle;
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust("1 second");
+      yield* probe.exited;
+      expect((yield* Fiber.join(fiber)).detail).toBe("Codex CLI request timed out.");
+    }),
+  );
+
+  it.effect("applies a request's own timeoutMs instead of the default", () =>
+    Effect.gen(function* () {
+      const probe = yield* makeProcessProbe;
+      const fiber = yield* runStalledJson(probe.port, 30 * 60_000).pipe(Effect.forkScoped);
+      yield* probe.started;
+      yield* TestClock.adjust("180 seconds");
+      yield* settle;
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust("27 minutes");
+      yield* probe.exited;
+      expect((yield* Fiber.join(fiber)).detail).toBe("Codex CLI request timed out.");
+    }),
+  );
+
+  it.effect("sets no limit for timeoutMs null and still kills the CLI on interrupt", () =>
+    Effect.gen(function* () {
+      const probe = yield* makeProcessProbe;
+      const fiber = yield* runStalledJson(probe.port, null).pipe(Effect.forkScoped);
+      yield* probe.started;
+      yield* TestClock.adjust("3 hours");
+      yield* settle;
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      const interrupted = yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped);
+      yield* probe.exited;
+      yield* Fiber.join(interrupted);
+    }),
   );
 
   it.effect.each(["gpt-5.6-luna", "openai.gpt-5.6-luna"])(
