@@ -59,12 +59,14 @@ function session(
   client: WsRpcProtocolClient,
   completionMarker = true,
   serverVersion = "1.0.0",
+  resumeAcrossSessions = false,
 ): RpcSession.RpcSession {
   return {
     client,
     initialConfig: Effect.succeed({
       environment: { serverVersion },
       ...(completionMarker ? { shellResumeCompletionMarker: true } : {}),
+      ...(resumeAcrossSessions ? { shellResumeAcrossSessions: true } : {}),
     } as never),
     subscribeServerConfig: (input) => client.subscribeServerConfig(input),
     ready: Effect.void,
@@ -655,6 +657,25 @@ describe("environment shell synchronization", () => {
       serverVersion: "1.0.0",
       refreshSequence: 20,
     },
+    {
+      // The load completed but no session reached its marker: the list is still complete.
+      name: "a complete load the marker never confirmed, on a server that keeps it resumable",
+      completionMarker: true,
+      synchronized: false,
+      resumeAcrossSessions: true,
+      resume: true,
+      serverVersion: "1.0.0",
+      refreshSequence: 20,
+    },
+    {
+      name: "a complete load on a new server version that keeps lists resumable",
+      completionMarker: true,
+      synchronized: false,
+      resumeAcrossSessions: true,
+      resume: false,
+      serverVersion: "1.0.1",
+      refreshSequence: 20,
+    },
   ])("resubscribes on foreground and reconnect after $name", (scenario) =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
@@ -686,7 +707,7 @@ describe("environment shell synchronization", () => {
           ),
       } as unknown as WsRpcProtocolClient;
       const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
-        Option.some(session(client)),
+        Option.some(session(client, true, "1.0.0", scenario.resumeAcrossSessions === true)),
       );
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
         target: TARGET,
@@ -776,7 +797,14 @@ describe("environment shell synchronization", () => {
 
       yield* SubscriptionRef.set(
         activeSession,
-        Option.some(session(client, scenario.completionMarker, scenario.serverVersion)),
+        Option.some(
+          session(
+            client,
+            scenario.completionMarker,
+            scenario.serverVersion,
+            scenario.resumeAcrossSessions === true,
+          ),
+        ),
       );
       expect(yield* Queue.take(subscriptions)).toEqual({
         afterSequence: scenario.resume ? 11 : scenario.refreshSequence,

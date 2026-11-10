@@ -3399,6 +3399,11 @@ export const OrchestrationV2SubscribeShellInput = Schema.Struct({
    * them; they stay readable by id). Clients that need every thread row omit it.
    */
   omitIdleSubagents: Schema.optionalKey(Schema.Boolean),
+  /**
+   * With acceptShellPages: send the most recently updated threads as the first page, then
+   * every page by thread id. Rows of the first page arrive again; clients merge by id.
+   */
+  recentFirst: Schema.optionalKey(Schema.Boolean),
   afterSequence: Schema.optionalKey(NonNegativeInt),
   requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
 });

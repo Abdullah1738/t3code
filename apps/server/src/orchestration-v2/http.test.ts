@@ -31,6 +31,8 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { middleware as replyMiddleware } from "../ardud/http/replyMiddleware.ts";
+import { SHELL_RECENT_PAGE_SIZE, SHELL_WALK_START_CURSOR } from "../ardud/perf/shellPages.ts";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import { ProjectEnrichmentService } from "../project/ProjectEnrichmentService.ts";
@@ -260,6 +262,47 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     expect(sidebarIds).toHaveLength(506);
     expect(sidebarIds).not.toContain("idle-subagent");
     expect(legacyData.threads.map((thread) => thread.id)).toContain("idle-subagent");
+    // ardud: a client that asks for it gets the most recently updated rows first, then the
+    // same walk by id from the start; every row still arrives, recent ones twice.
+    const sql = Context.get(services, SqlClient.SqlClient);
+    yield* sql`
+      UPDATE orchestration_v2_projection_threads
+      SET updated_at = '2099-01-01T00:00:00.000Z'
+      WHERE thread_id IN ('paged-0503', 'paged-0504')
+    `;
+    const recentPage = (after?: string) =>
+      Effect.promise(async () => {
+        const response = await handler(
+          new Request(
+            `http://localhost/api/orchestration/shell?paged=true&recentFirst=true${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`,
+            { headers: { [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT } },
+          ),
+        );
+        return (await response.json()) as typeof firstPage;
+      });
+    const recentFirst = yield* recentPage();
+    expect(recentFirst.threads).toHaveLength(SHELL_RECENT_PAGE_SIZE);
+    expect(recentFirst.threads.slice(0, 2).map((thread) => thread.id)).toEqual([
+      "paged-0503",
+      "paged-0504",
+    ]);
+    expect(recentFirst.page.nextAfter).toBe(SHELL_WALK_START_CURSOR);
+    const walkFirst = yield* recentPage(recentFirst.page.nextAfter!);
+    expect(walkFirst.threads.map((thread) => thread.id)).toEqual(
+      firstPage.threads.map((thread) => thread.id),
+    );
+    expect(walkFirst.page.nextAfter).toBe(firstPage.page.nextAfter);
+    const walkLast = yield* recentPage(walkFirst.page.nextAfter!);
+    expect(walkLast.page.nextAfter).toBeNull();
+    expect(
+      new Set([...walkFirst.threads, ...walkLast.threads].map((thread) => thread.id)).size,
+    ).toBe(507);
+    // Without the option the first page is unchanged, and the walk cursor works on its own.
+    const plainWalkResponse = yield* shellRequest(SHELL_WALK_START_CURSOR);
+    const plainWalk = (yield* Effect.promise(() => plainWalkResponse.json())) as typeof firstPage;
+    expect(plainWalk.threads.map((thread) => thread.id)).toEqual(
+      firstPage.threads.map((thread) => thread.id),
+    );
     yield* eventSink.write({
       events: items.map((item) => ({
         id: EventId.make(`create-${item.id}`),

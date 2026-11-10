@@ -14,6 +14,7 @@ import * as ServerHttp from "../../http.ts";
 import * as LargeReplyLog from "../../observability/LargeReplyLog.ts";
 import { checkJsonReply, jsonReply } from "./jsonReply.ts";
 import * as ReplyBuilders from "./ReplyBuilders.ts";
+import { ShellPageReplyLane, ThreadReplyLane } from "../perf/speedups.ts";
 import { KanbanService } from "../kanban/engine/KanbanService.ts";
 import { BoardsDatabase } from "../persistence/BoardsDatabase.ts";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
@@ -25,35 +26,74 @@ import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 it.effect.each([
-  ["HEAD", "/api/orchestration/shell"],
-  ["GET", "/api/orchestration/shell/"],
-  ["GET", "/API//ORCHESTRATION///SHELL/?paged=true"],
-  ["GET", "/api/orchestration/threads/test/transcript"],
-  ["HEAD", "/API//ARDUD/KANBAN//BOARDS/test/"],
-  ["GET", "/api/orchestration/%73hell?paged=true"],
-  ["GET", "/api/orchestration/shell;anything"],
-  ["HEAD", "/api/ardud/%6banban/boards/test;anything"],
-] as const)("bounds router-equivalent request %s before building", ([method, url]) =>
-  Effect.gen(function* () {
-    const builders = yield* ReplyBuilders.ReplyBuilders;
-    let owned = false;
-    yield* middleware(
-      Effect.gen(function* () {
-        const both = yield* builders.snapshot.takeIfAvailable(2);
-        if (both) yield* builders.snapshot.release(2);
-        owned = !both;
-        return jsonReply({ ready: true });
-      }),
-    ).pipe(
-      Effect.provideService(
-        HttpServerRequest.HttpServerRequest,
-        HttpServerRequest.fromWeb(new Request(`http://localhost${url}`, { method })),
-      ),
-    );
-    expect(owned).toBe(true);
-    expect(yield* builders.snapshot.takeIfAvailable(2)).toBe(true);
-    yield* builders.snapshot.release(2);
-  }).pipe(Effect.provide(ReplyBuilders.layer)),
+  // The unpaged whole list builds on the snapshot lane.
+  ["HEAD", "/api/orchestration/shell", "snapshot", true],
+  ["GET", "/api/orchestration/shell/", "snapshot", true],
+  ["GET", "/api/orchestration/shell;anything", "snapshot", true],
+  ["GET", "/api/orchestration/shell?paged=false", "snapshot", true],
+  ["GET", "/api/orchestration/shell?paged=TRUE", "snapshot", true],
+  // One page of the paged list has its own lane.
+  ["GET", "/API//ORCHESTRATION///SHELL/?paged=true", "shellPage", true],
+  ["GET", "/api/orchestration/%73hell?paged=true", "shellPage", true],
+  [
+    "GET",
+    "/api/orchestration/shell?after=thread%3Aa&paged=true&recentFirst=true",
+    "shellPage",
+    true,
+  ],
+  [
+    "HEAD",
+    "/api/orchestration/shell;anything?omitIdleSubagents=true&paged=true",
+    "shellPage",
+    true,
+  ],
+  // ROBOB_SHELL_PAGE_REPLY_LANE=0: pages share the snapshot lane again.
+  ["GET", "/api/orchestration/shell?paged=true", "snapshot", false],
+  ["GET", "/api/orchestration/threads/test/transcript", "thread", true],
+  ["GET", "/api/orchestration/threads/test", "thread", true],
+  ["GET", "/API//ORCHESTRATION/threads/test/bounded/?compactTurnItems=1", "thread", true],
+  ["HEAD", "/api/orchestration/threads/test/history;anything", "thread", true],
+  // ROBOB_THREAD_REPLY_LANE=0: thread views share the snapshot lane again.
+  ["GET", "/api/orchestration/threads/test/bounded", "snapshot", false],
+  ["GET", "/api/orchestration/threads/test/transcript", "snapshot", false],
+  ["HEAD", "/API//ARDUD/KANBAN//BOARDS/test/", "snapshot", true],
+  ["HEAD", "/api/ardud/%6banban/boards/test;anything", "snapshot", true],
+] as const)(
+  "bounds router-equivalent request %s %s on the %s lane before building (own lanes %s)",
+  ([method, url, lane, ownLanes]) =>
+    Effect.gen(function* () {
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      const all = (name: ReplyBuilders.Lane) => ReplyBuilders.PERMITS[name];
+      const others = (["snapshot", "thread", "shellPage"] as const).filter((name) => name !== lane);
+      let owned = false;
+      let othersFree = false;
+      yield* middleware(
+        Effect.gen(function* () {
+          const whole = yield* builders[lane].takeIfAvailable(all(lane));
+          if (whole) yield* builders[lane].release(all(lane));
+          owned = !whole;
+          // A thread view, a list page and a board snapshot never share permits.
+          othersFree = true;
+          for (const other of others) {
+            const free = yield* builders[other].takeIfAvailable(all(other));
+            if (free) yield* builders[other].release(all(other));
+            othersFree = othersFree && free;
+          }
+          return jsonReply({ ready: true });
+        }),
+      ).pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          HttpServerRequest.fromWeb(new Request(`http://localhost${url}`, { method })),
+        ),
+        Effect.provideService(ThreadReplyLane, ownLanes),
+        Effect.provideService(ShellPageReplyLane, ownLanes),
+      );
+      expect(owned).toBe(true);
+      expect(othersFree).toBe(true);
+      expect(yield* builders[lane].takeIfAvailable(all(lane))).toBe(true);
+      yield* builders[lane].release(all(lane));
+    }).pipe(Effect.provide(ReplyBuilders.layer)),
 );
 
 it.effect.each([

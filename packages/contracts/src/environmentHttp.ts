@@ -602,6 +602,8 @@ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
         paged: Schema.optionalKey(Schema.String),
         /** "true" leaves out long-idle subagents, as OrchestrationV2SubscribeShellInput. */
         omitIdleSubagents: Schema.optionalKey(Schema.String),
+        /** "true" asks for the most recently updated threads as the first page. */
+        recentFirst: Schema.optionalKey(Schema.String),
       }),
       headers: OrchestrationProtocolHeaders,
       success: OrchestrationV2ShellSnapshot,

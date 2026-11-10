@@ -7835,6 +7835,32 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       yield* syncPullRequests("unwatched", [link]);
       assert.deepEqual((yield* store.getThreadShell(threadId))?.pendingBackgroundTasks, []);
       assert.equal(yield* phase, "completed");
+
+      // ardud: the sweeps' list comes from the partial index over threads that have links,
+      // in the order the query asks for, and follows the links as they come and go.
+      const sql = yield* SqlClient.SqlClient;
+      const listed = () =>
+        store
+          .getThreadsWithPullRequests()
+          .pipe(Effect.map((threads) => threads.some((candidate) => candidate.id === threadId)));
+      assert.isTrue(yield* listed());
+      const plan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT payload_json
+        FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL
+          AND json_extract(payload_json, '$.archivedAt') IS NULL
+          AND json_array_length(payload_json, '$.pullRequests') > 0
+        ORDER BY updated_at ASC, thread_id ASC
+      `;
+      assert.deepEqual(
+        plan.map((row) => row.detail),
+        ["SCAN orchestration_v2_projection_threads USING INDEX ardud_v2_threads_pull_requests_idx"],
+      );
+      yield* syncPullRequests("unlinked", []);
+      assert.isFalse(yield* listed());
+      yield* syncPullRequests("relinked", [link]);
+      assert.isTrue(yield* listed());
     }),
   );
 
@@ -7979,6 +8005,23 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         (yield* store.getRuntimeRecoveryProjection(threadId)).runs.map((run) => run.id),
         [runId, newerRunId],
       );
+      // ardud: run-control checks read one run row; it must agree with the full recovery read.
+      for (const run of (yield* store.getThreadProjection(threadId)).runs) {
+        assert.deepEqual(yield* store.getRunControlState(threadId, run.id), {
+          activeAttemptId: run.activeAttemptId,
+          status: run.status,
+        });
+      }
+      assert.equal(yield* store.getRunControlState(threadId, RunId.make("run:absent")), null);
+      // A run of another thread is not this thread's run.
+      assert.equal(
+        yield* store.getRunControlState(threadId, RunId.make("run:held-completion:elsewhere")),
+        null,
+      );
+      const missingThread = yield* Effect.flip(
+        store.getRunControlState(ThreadId.make("thread:absent"), runId),
+      );
+      assert.equal(missingThread._tag, "ProjectionStoreThreadNotFoundError");
     }),
   );
 });

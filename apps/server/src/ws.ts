@@ -89,6 +89,7 @@ import {
   PersistChatAttachmentsError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  type OrchestrationV2ThreadShell,
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -146,6 +147,7 @@ import {
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
+  shellChangeEvents,
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
@@ -171,6 +173,9 @@ import {
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
+import type { OrchestrationEventStoreError } from "./persistence/Errors.ts";
+import { ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
+import { shellPageNextAfter, shellPageRead, shellPageSize } from "./ardud/perf/shellPages.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
@@ -558,9 +563,10 @@ const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
 const ServerWsCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
 // ardud: missions board
 const ServerWsKanbanRpcGroup = WsKanbanRpcGroup.middleware(RpcInstrumentation);
-// Replaying each intervening event costs a shell refetch; past this gap a
-// single O(active-threads) snapshot is cheaper and bounded.
-const SHELL_RESUME_MAX_GAP = 1_000;
+// Replaying each intervening event reads and decodes its body; past
+// ShellResumeLimits.replayMaxGap the resume reads only which threads changed
+// (getShellChanges), and past changesMaxGap a single O(active-threads) snapshot
+// is cheaper.
 // Row count alone does not bound replay memory: a few events with large tool
 // payloads can decode to gigabytes. Before replaying, sum the serialized
 // payload bytes of the range in SQL and reset with a snapshot past this budget.
@@ -691,6 +697,11 @@ function readClientAnalyticsProps(request: HttpServerRequest.HttpServerRequest) 
     ...(isClientConnectionMethod(connectionMethod) ? { connectionMethod } : {}),
   };
 }
+
+// ardud: a shell stream batch with at least this many changed threads reads their shells
+// together; a single thread keeps its one-row read. Chunked like the control live lists.
+const SHELL_STREAM_BATCH_READ_MIN_THREADS = 2;
+const SHELL_STREAM_BATCH_READ_CHUNK = 400;
 
 const canReplayPersistedRange = Effect.fnUntraced(function* (
   afterSequence: number,
@@ -975,6 +986,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     readonly requestCompletionMarker?: boolean;
     readonly acceptShellPages?: boolean;
     readonly omitIdleSubagents?: boolean;
+    readonly recentFirst?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -999,17 +1011,24 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         };
       },
     );
+    const recentFirst = input.recentFirst === true && (yield* Switches).shellRecentFirst;
     const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* (
       after?: string,
     ) {
+      const read =
+        input.acceptShellPages === true
+          ? shellPageRead(after, recentFirst)
+          : after === undefined
+            ? {}
+            : { afterThreadId: after };
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
-            ...(input.acceptShellPages === true ? { limit: 501 } : {}),
-            ...(after === undefined ? {} : { afterThreadId: after }),
+            ...(input.acceptShellPages === true ? { limit: shellPageSize(read) + 1 } : {}),
+            ...read,
           }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
@@ -1025,10 +1044,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         snapshot: {
           ...base,
           projects: enriched.projects,
-          threads: base.threads.slice(0, 500),
+          threads: base.threads.slice(0, shellPageSize(read)),
           page: {
             after: after ?? null,
-            nextAfter: base.threads.length > 500 ? base.threads[499]!.id : null,
+            nextAfter: shellPageNextAfter(read, base.threads),
           },
         } as OrchestrationV2ShellSnapshot,
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
@@ -1059,17 +1078,48 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       });
     });
 
+    /** Shells of these threads, archived ones included, from one read per chunk of ids. */
+    const readThreadShells = Effect.fn("ws.orchestrationV2.readThreadShells")(function* (
+      threadIds: ReadonlyArray<ThreadId>,
+    ) {
+      const shells = new Map<ThreadId, OrchestrationV2ThreadShell>();
+      for (let start = 0; start < threadIds.length; start += SHELL_STREAM_BATCH_READ_CHUNK) {
+        const snapshot = yield* threadManagement.getShellSnapshot({
+          threadIds: threadIds.slice(start, start + SHELL_STREAM_BATCH_READ_CHUNK),
+        });
+        for (const shell of snapshot.threads) shells.set(shell.id, shell);
+        for (const shell of snapshot.archivedThreads) shells.set(shell.id, shell);
+      }
+      return shells;
+    });
+
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
+      const coalesced = coalesceShellApplicationEvents(events);
+      // ardud: one read for the batch's changed threads instead of a reader transaction
+      // per thread. A resume replays hundreds of threads; on a busy server each
+      // transaction queued for a reader slot (a 125-thread catch-up took 16.7 s and a
+      // 450-event foreground resume 12-28 s under a loaded reader pool, 10 Nov 2026).
+      const changedThreadIds = coalesced.flatMap((stored) =>
+        "aggregateKind" in stored ? [] : [stored.event.threadId],
+      );
+      const batchedShells =
+        (yield* Switches).shellBatchedStreamReads &&
+        changedThreadIds.length >= SHELL_STREAM_BATCH_READ_MIN_THREADS
+          ? yield* readThreadShells(changedThreadIds)
+          : undefined;
       const items = yield* Effect.forEach(
-        coalesceShellApplicationEvents(events),
+        coalesced,
         (stored) =>
           Effect.gen(function* () {
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const shell = yield* threadManagement.getThreadShell(stored.event.threadId);
+            const shell =
+              batchedShells === undefined
+                ? yield* threadManagement.getThreadShell(stored.event.threadId)
+                : (batchedShells.get(stored.event.threadId) ?? null);
             return shellStreamItemFromThreadShell({ stored, shell });
           }),
         { concurrency: 8 },
@@ -1192,28 +1242,64 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         input.omitIdleSubagents === true && input.afterSequence > 0
           ? input.afterSequence - 1
           : input.afterSequence;
-      if (
-        input.afterSequence > highWater ||
-        !(yield* canReplayPersistedRange(
-          replayAfter,
-          highWater,
-          SHELL_RESUME_MAX_GAP + (input.afterSequence - replayAfter),
-        ))
-      ) {
+      if (input.afterSequence > highWater) {
         return yield* snapshotThenLive();
+      }
+      const cursorRepeat = input.afterSequence - replayAfter;
+      const limits = yield* ShellResumeLimits;
+      // ardud: a busy server passes the replay gap in under a minute (about 18 event
+      // batches a second on 10 Nov 2026), so a client that had just spent minutes
+      // loading every shell page was sent every page again. The shell stream refetches
+      // each changed aggregate anyway; it only needs to know which ones changed.
+      // At the legacy limit the switch is off: every range replay refuses gets a snapshot.
+      const changesAllowed =
+        limits.changesMaxGap > limits.replayMaxGap &&
+        highWater - replayAfter <= limits.changesMaxGap + cursorRepeat;
+      const readChanges = applicationEvents.getShellChanges({
+        afterSequence: replayAfter,
+        throughSequence: highWater,
+        maxThreads: limits.maxThreads,
+      });
+      // The list of changed threads is one indexed read. A range replay is a stats read
+      // plus the event bodies in pages, and each page became its own batch of thread
+      // reads: under a loaded reader pool a resume 450 events behind took 5-10 s that
+      // way (10 Nov 2026). So the list comes first for every gap it covers; the replay
+      // stays for an incomplete list and for ROBOB_SHELL_RESUME_CHANGES_FIRST=0.
+      let changes =
+        changesAllowed && (yield* Switches).shellResumeChangesFirst
+          ? yield* readChanges
+          : undefined;
+      let replayEvents: Stream.Stream<ShellApplicationEvent, OrchestrationEventStoreError>;
+      if (
+        changes?.complete !== true &&
+        (yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat))
+      ) {
+        replayEvents = applicationEvents
+          .readApplicationEvents({
+            afterSequence: replayAfter,
+            throughSequence: highWater,
+            // A row a newer build wrote (e.g. after a downgrade) must not fail
+            // every shell resubscribe. The live tail below resumes from
+            // highWater, so a dropped row never hides later events.
+            skipUnknownEventTypes: true,
+          })
+          .pipe(Stream.map(toShellApplicationEvent));
+      } else {
+        if (changes === undefined && changesAllowed) changes = yield* readChanges;
+        if (changes === undefined || !changes.complete) {
+          return yield* snapshotThenLive();
+        }
+        yield* Effect.annotateCurrentSpan({
+          "shell.resume": "changes",
+          "shell.resume.gap": highWater - replayAfter,
+          "shell.resume.threads": changes.threads.length,
+          "shell.resume.projects": changes.projects.length,
+        });
+        replayEvents = Stream.fromIterable(shellChangeEvents(changes));
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
-      const replay = toShellStream(
-        applicationEvents.readApplicationEvents({
-          afterSequence: replayAfter,
-          throughSequence: highWater,
-          // A row a newer build wrote (e.g. after a downgrade) must not fail
-          // every shell resubscribe. The live tail below resumes from
-          // highWater, so a dropped row never hides later events.
-          skipUnknownEventTypes: true,
-        }),
-      );
+      const replay = toShellStream(replayEvents);
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
         tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
@@ -1825,6 +1911,9 @@ export const layerWsRpc = (
           settings,
           shellResumeCompletionMarker: true,
           shellSnapshotPagination: true,
+          ...((yield* Switches).shellResumeAcrossSessions
+            ? { shellResumeAcrossSessions: true }
+            : {}),
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
           threadFind: true,

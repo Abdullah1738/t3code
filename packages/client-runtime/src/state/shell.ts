@@ -237,6 +237,20 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       if (nextSnapshot === null) continue;
       if (item.kind === "snapshot" && item.snapshot.page?.nextAfter == null)
         snapshotSession = session;
+      // A complete list from the server is as resumable as one the marker confirmed: the
+      // socket replays from its sequence either way. Without this, a session that ended
+      // before its marker (a reconnect, a foreground resume) loaded every page again.
+      if (
+        item.kind === "snapshot" &&
+        item.resolvedRepositoryIdentityRoots === undefined &&
+        nextSnapshot.page?.nextAfter == null
+      ) {
+        const config = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => null));
+        if (config?.shellResumeAcrossSessions === true) {
+          yield* Ref.set(synchronizedServerVersion, config.environment.serverVersion);
+          yield* Ref.set(synchronizedSnapshot, true);
+        }
+      }
       next = {
         snapshot: Option.some(nextSnapshot),
         status: waiting || nextSnapshot.page?.nextAfter != null ? "synchronizing" : "live",
@@ -347,7 +361,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         const omitIdleSubagents = yield* ShellSnapshotLoader.OmitIdleSubagents;
         const shellPages = {
           ...(initialConfig?.shellSnapshotPagination === true
-            ? { acceptShellPages: true as const }
+            ? { acceptShellPages: true as const, recentFirst: true as const }
             : {}),
           ...(omitIdleSubagents ? { omitIdleSubagents: true as const } : {}),
         };
@@ -367,7 +381,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               (yield* Ref.get(synchronizedSnapshot)) &&
               (yield* Ref.get(synchronizedServerVersion)) ===
                 initialConfig.environment.serverVersion));
-        yield* Ref.set(synchronizedSnapshot, false);
+        // Servers that keep lists resumable across sessions (shellResumeAcrossSessions) do
+        // not need the flag cleared per attempt: a partial list is refused above, a stream
+        // error clears it, and an interrupted replay leaves the list at a sequence the next
+        // session can resume from.
+        if (initialConfig?.shellResumeAcrossSessions !== true) {
+          yield* Ref.set(synchronizedSnapshot, false);
+        }
         let canResume = hasAuthoritativeSnapshot;
         let current = yield* SubscriptionRef.get(state);
         if (!hasAuthoritativeSnapshot || Option.isNone(current.snapshot)) {
