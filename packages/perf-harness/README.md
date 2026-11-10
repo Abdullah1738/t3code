@@ -216,6 +216,7 @@ Shell memory gates (renderer OOM, 10 Nov 2026):
 
   `ROBOB_PERF_PROFILE_AT_PAGE=N` saves a sampling heap profile and a CPU profile once N
   pages have landed, for attribution against the bundle's source maps.
+
 - `shellMemoryGate.ts` runs the client-runtime shell state and loader alone in Node
   (`node --expose-gc`), with an in-process fetch. It has no React, so it does not see what
   the sidebar draws; it guards the page merge and link fill.

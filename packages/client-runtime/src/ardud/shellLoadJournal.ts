@@ -2,6 +2,7 @@ import type { EnvironmentId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 /**
  * A paged shell load's pages as the server sent them, kept outside the client's memory by a
@@ -40,10 +41,13 @@ export class ShellLoadJournal extends Context.Service<
   ShellLoadJournal,
   {
     readonly read: (environmentId: EnvironmentId) => Effect.Effect<Option.Option<StoredShellLoad>>;
-    readonly append: (environmentId: EnvironmentId, entry: ShellLoadPageEntry) => Effect.Effect<void>;
+    readonly append: (
+      environmentId: EnvironmentId,
+      entry: ShellLoadPageEntry,
+    ) => Effect.Effect<void>;
     readonly clear: (environmentId: EnvironmentId) => Effect.Effect<void>;
   }
->()("@t3tools/client-runtime/ardud/shellLoadJournal/ShellLoadJournal") {}
+>()("@t3tools/client-runtime/ardud/shellLoadJournal") {}
 
 /** A string store the journal sits on; the web client passes its IndexedDB shell store. */
 export interface ShellLoadKeyValue<E> {
@@ -53,7 +57,7 @@ export interface ShellLoadKeyValue<E> {
   readonly removeRange: (from: string, to: string) => Effect.Effect<void, E>;
 }
 
-const JOURNAL_VERSION = 1;
+const JOURNAL_VERSION = 1 as const;
 
 /** Sorts after the environment's own shell key and never collides with an environment id. */
 export function shellLoadRecordKey(environmentId: EnvironmentId): string {
@@ -68,40 +72,23 @@ export function shellLoadPageKey(
   return `${shellLoadRecordKey(environmentId)}\u0000${loadId}\u0000${String(index).padStart(6, "0")}`;
 }
 
-interface JournalRecord {
-  readonly version: number;
-  readonly key: string;
-  readonly loadId: string;
-  readonly pages: number;
-  readonly nextAfter: string;
-  readonly updatedAt: number;
-}
-
-function parseRecord(raw: unknown): JournalRecord | null {
-  if (typeof raw !== "string") return null;
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof value !== "object" || value === null) return null;
-  const record = value as Record<string, unknown>;
-  return record.version === JOURNAL_VERSION &&
-    typeof record.key === "string" &&
-    typeof record.loadId === "string" &&
-    typeof record.nextAfter === "string" &&
-    typeof record.updatedAt === "number" &&
-    Number.isInteger(record.pages) &&
-    (record.pages as number) > 0
-    ? (record as unknown as JournalRecord)
-    : null;
-}
+const JournalRecord = Schema.Struct({
+  version: Schema.Literal(JOURNAL_VERSION),
+  key: Schema.String,
+  loadId: Schema.String,
+  pages: Schema.Int.check(Schema.isGreaterThan(0)),
+  nextAfter: Schema.String,
+  updatedAt: Schema.Number,
+});
+type JournalRecord = typeof JournalRecord.Type;
+const JournalRecordJson = Schema.fromJsonString(JournalRecord);
+const decodeRecord = Schema.decodeUnknownEffect(JournalRecordJson);
+const encodeRecord = Schema.encodeEffect(JournalRecordJson);
 
 export function makeKeyValueShellLoadJournal<E>(
   store: ShellLoadKeyValue<E>,
 ): ShellLoadJournal["Service"] {
-  const quietly = <A>(operation: string, effect: Effect.Effect<A, E>, fallback: A) =>
+  const quietly = <A, X>(operation: string, effect: Effect.Effect<A, X>, fallback: A) =>
     effect.pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("Shell load journal operation failed.").pipe(
@@ -119,8 +106,11 @@ export function makeKeyValueShellLoadJournal<E>(
       quietly(
         "read",
         Effect.gen(function* () {
-          const record = parseRecord(yield* store.get(shellLoadRecordKey(environmentId)));
-          if (record === null) return Option.none<StoredShellLoad>();
+          const raw = yield* store.get(shellLoadRecordKey(environmentId));
+          // A missing or unreadable record: nothing to resume.
+          const decoded = yield* decodeRecord(raw).pipe(Effect.option);
+          if (Option.isNone(decoded)) return Option.none<StoredShellLoad>();
+          const record = decoded.value;
           const bodies: string[] = [];
           for (let index = 0; index < record.pages; index++) {
             const body = yield* store.get(shellLoadPageKey(environmentId, record.loadId, index));
@@ -153,7 +143,7 @@ export function makeKeyValueShellLoadJournal<E>(
             nextAfter: entry.nextAfter,
             updatedAt: entry.updatedAt,
           };
-          yield* store.put(shellLoadRecordKey(environmentId), JSON.stringify(record));
+          yield* store.put(shellLoadRecordKey(environmentId), yield* encodeRecord(record));
         }),
         undefined,
       ),

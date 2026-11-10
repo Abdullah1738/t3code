@@ -33,7 +33,7 @@ function memoryStore(options: { readonly failPuts?: () => boolean } = {}) {
           }),
     removeRange: (from, to) =>
       Effect.sync(() => {
-        for (const key of [...values.keys()]) if (key >= from && key <= to) values.delete(key);
+        for (const key of values.keys()) if (key >= from && key <= to) values.delete(key);
       }),
   };
   return { values, store };
@@ -101,8 +101,6 @@ describe("shell load journal", () => {
     );
   });
 });
-
-// --- The loader resuming a load a previous client left in the journal -------------------
 
 const encodeRow = Schema.encodeSync(Schema.toCodecJson(OrchestrationV2ThreadShell));
 const row = (id: string) => encodeRow({ ...v2ThreadShell, id: ThreadId.make(id) });

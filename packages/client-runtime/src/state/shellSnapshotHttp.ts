@@ -9,6 +9,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientError, type HttpClientResponse } from "effect/http";
 
@@ -122,7 +123,12 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
     const after = snapshot.page.nextAfter;
     const updatedAt = yield* Clock.currentTimeMillis;
     if (input.onPageBody)
-      yield* input.onPageBody({ index: merged.pages.length - 1, body, nextAfter: after, updatedAt });
+      yield* input.onPageBody({
+        index: merged.pages.length - 1,
+        body,
+        nextAfter: after,
+        updatedAt,
+      });
     if (input.onProgress)
       yield* input.onProgress({ pages: [...merged.pages], nextAfter: after, updatedAt });
     if (input.onPage) yield* input.onPage(merged.snapshot());
@@ -210,6 +216,8 @@ export function mergeHttpShellPages(
   };
 }
 
+const decodeJsonBody = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+
 const decodeEnvironmentHttpCommonError = Schema.decodeUnknownEffect(
   Schema.toCodecJson(EnvironmentHttpCommonError),
 );
@@ -296,9 +304,8 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
         serverVersion,
         omitIdleSubagents ? "omit-idle-subagents" : "",
       ].join("\u001f");
-    const newLoadId = Effect.map(
-      Clock.currentTimeMillis,
-      (now) => `${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    const newLoadId = Effect.all([Clock.currentTimeMillis, Random.nextInt]).pipe(
+      Effect.map(([now, salt]) => `${now.toString(36)}-${Math.abs(salt).toString(36)}`),
     );
     // A journal from an earlier client: same key, still fresh, every page readable, and the
     // last page's cursor is the one recorded. Anything else starts over.
@@ -319,9 +326,7 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
         return undefined;
       }
       const pages = yield* Effect.forEach(value.bodies, (body) =>
-        Effect.try({ try: () => JSON.parse(body) as unknown, catch: (cause) => cause }).pipe(
-          Effect.flatMap(decodeShellSnapshotDeferringPullRequests),
-        ),
+        decodeJsonBody(body).pipe(Effect.flatMap(decodeShellSnapshotDeferringPullRequests)),
       ).pipe(Effect.option);
       if (
         Option.isNone(pages) ||

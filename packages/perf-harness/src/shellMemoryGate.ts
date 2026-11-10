@@ -23,6 +23,7 @@ import {
   EnvironmentId,
   ORCHESTRATION_V2_WS_METHODS,
   OrchestrationV2ThreadShell,
+  type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -46,8 +47,12 @@ import type * as RpcSession from "../../client-runtime/src/rpc/session.ts";
 import type { WsRpcProtocolClient } from "../../client-runtime/src/rpc/protocol.ts";
 import { makeEnvironmentShellState } from "../../client-runtime/src/state/shell.ts";
 import * as ShellSnapshotLoader from "../../client-runtime/src/state/shellSnapshotHttp.ts";
+import type { EnvironmentCatalogState } from "../../client-runtime/src/state/connections.ts";
 import { createEnvironmentThreadShellAtoms } from "../../client-runtime/src/state/threadShell.ts";
-import { v2Project, v2ThreadShell } from "../../client-runtime/src/state/orchestrationV2TestFixtures.ts";
+import {
+  v2Project,
+  v2ThreadShell,
+} from "../../client-runtime/src/state/orchestrationV2TestFixtures.ts";
 
 const out = process.argv[2];
 const threadCount = Number(process.env.ROBOB_PERF_SHELL_THREADS ?? 18_000);
@@ -239,14 +244,15 @@ const program = Effect.gen(function* () {
 
   // The web sidebar reads the list through these atoms; mount them like a screen does.
   const registry = AtomRegistry.make();
-  const snapshotSource = Atom.make<ReturnType<typeof Option.getOrNull<never>> | unknown>(null);
+  const snapshotSource = Atom.make<OrchestrationV2ShellSnapshot | null>(null);
+  const catalog = {
+    isReady: true,
+    entries: new Map([[environmentId, { enabled: true }]]),
+    disabledEnvironmentIds: new Set(),
+  } as unknown as EnvironmentCatalogState;
   const shells = createEnvironmentThreadShellAtoms({
-    catalogValueAtom: Atom.make({
-      isReady: true,
-      entries: new Map([[environmentId, { enabled: true }]]),
-      disabledEnvironmentIds: new Set(),
-    } as never),
-    snapshotAtom: () => snapshotSource as never,
+    catalogValueAtom: Atom.make(() => catalog),
+    snapshotAtom: () => snapshotSource,
   });
   const unmount = [
     registry.mount(shells.environmentThreadIndexAtom(environmentId)),
@@ -305,13 +311,22 @@ const peakAboveBaseline = report.peakHeapUsedMb - baselineMb;
 const retainedAboveBaseline = report.retainedMb - baselineMb;
 const failures = [
   ...(result.threads !== threadCount ? [`list has ${result.threads} of ${threadCount} rows`] : []),
-  ...(peakAboveBaseline > maxPeakMb ? [`peak ${peakAboveBaseline.toFixed(0)} MB > ${maxPeakMb}`] : []),
+  ...(peakAboveBaseline > maxPeakMb
+    ? [`peak ${peakAboveBaseline.toFixed(0)} MB > ${maxPeakMb}`]
+    : []),
   ...(retainedAboveBaseline > maxRetainedMb
     ? [`retained ${retainedAboveBaseline.toFixed(0)} MB > ${maxRetainedMb}`]
     : []),
 ];
-const summary = { ...report, peakAboveBaselineMb: peakAboveBaseline, retainedAboveBaselineMb: retainedAboveBaseline, failures };
+const summary = {
+  ...report,
+  peakAboveBaselineMb: peakAboveBaseline,
+  retainedAboveBaselineMb: retainedAboveBaseline,
+  failures,
+};
 if (out) NodeFS.writeFileSync(out, JSON.stringify(summary, null, 2));
 const { pageMarks: marks, ...printed } = summary;
-console.log(JSON.stringify({ ...printed, pageHeapMb: marks.map((m) => Math.round(m.heapUsedMb)) }, null, 2));
+console.log(
+  JSON.stringify({ ...printed, pageHeapMb: marks.map((m) => Math.round(m.heapUsedMb)) }, null, 2),
+);
 process.exit(failures.length === 0 ? 0 : 1);

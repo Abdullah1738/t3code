@@ -23,6 +23,7 @@
  * Requires apps/web/dist built from this tree. Never prints the pairing URL.
  */
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
@@ -64,7 +65,9 @@ const token = "synthetic-performance-credential-only";
 const MB = 1024 * 1024;
 const delay = (ms: number) => new Promise<void>((ok) => setTimeout(ok, ms));
 
-const fixture = JSON.parse(NodeFS.readFileSync(NodePath.resolve(fixtureDir, "fixture.json"), "utf8"));
+const fixture = JSON.parse(
+  NodeFS.readFileSync(NodePath.resolve(fixtureDir, "fixture.json"), "utf8"),
+);
 if (fixture.synthetic !== true) throw new Error("Synthetic fixture marker required");
 if (!NodeFS.existsSync(NodePath.resolve("apps/web/dist/index.html")))
   throw new Error("Build apps/web first (apps/web/dist/index.html is missing)");
@@ -87,7 +90,9 @@ const freePort = () =>
   });
 const port = await freePort();
 const origin = `http://127.0.0.1:${port}`;
-const serverEntry = NodePath.resolve(process.env.ROBOB_PERF_SERVER_ENTRY ?? "apps/server/src/bin.ts");
+const serverEntry = NodePath.resolve(
+  process.env.ROBOB_PERF_SERVER_ENTRY ?? "apps/server/src/bin.ts",
+);
 const switches = Object.fromEntries(
   Object.entries(process.env).filter(
     ([name]) => name.startsWith("ROBOB_") && !name.startsWith("ROBOB_PERF_"),
@@ -171,7 +176,7 @@ const pairUrl = await new Promise<string>((ok, fail) => {
   });
 });
 
-// --- Event writer: metadata updates on unsettled and settled rows, over the socket -------
+// The event writer: metadata updates on unsettled and settled rows, over the socket.
 let writing = writesPerSecond > 0;
 let writes = 0;
 const writerDone = (async () => {
@@ -189,8 +194,10 @@ const writerDone = (async () => {
   );
   const threadCount = Number(fixture.threads ?? 20_000);
   // The first rows the sidebar shows unsettled (every 60th) plus settled ones.
-  const targets = Array.from({ length: writerThreads }, (_, i) => (i % 2 === 0 ? i * 60 : i * 97 + 1) % threadCount)
-    .map((i) => (i % 10 === 9 ? i - 1 : i));
+  const targets = Array.from(
+    { length: writerThreads },
+    (_, i) => (i % 2 === 0 ? i * 60 : i * 97 + 1) % threadCount,
+  ).map((i) => (i % 10 === 9 ? i - 1 : i));
   await Effect.runPromise(
     Effect.gen(function* () {
       const client = yield* makeWsRpcProtocolClient;
@@ -200,7 +207,7 @@ const writerDone = (async () => {
         const thread = targets[writes % targets.length]!;
         yield* client["orchestration.dispatchCommand"]({
           type: "thread.metadata.update",
-          commandId: CommandId.make(crypto.randomUUID()),
+          commandId: CommandId.make(NodeCrypto.randomUUID()),
           threadId: ThreadId.make(`synthetic-thread-${thread}`),
           title: `Synthetic ${thread}: investigate and fix a realistic task, write ${writes}`,
         }).pipe(Effect.ignore);
@@ -213,7 +220,6 @@ const writerDone = (async () => {
   );
 })();
 
-// --- Chrome over CDP -------------------------------------------------------------------
 const chromePath =
   process.env.ROBOB_PERF_CHROME ??
   NodeChildProcess.execFileSync("taste", ["chrome"], { encoding: "utf8" }).trim();
@@ -248,13 +254,13 @@ const browserWs = await new Promise<string>((ok, fail) => {
 type Listener = (params: any, sessionId?: string) => void;
 const socket = new WebSocket(browserWs);
 await new Promise<void>((ok, fail) => {
-  socket.onopen = () => ok();
-  socket.onerror = () => fail(new Error("cdp connect"));
+  socket.addEventListener("open", () => ok(), { once: true });
+  socket.addEventListener("error", () => fail(new Error("cdp connect")), { once: true });
 });
 let nextId = 1;
 const pending = new Map<number, { ok: (v: any) => void; fail: (e: Error) => void }>();
 const listeners = new Map<string, Set<Listener>>();
-socket.onmessage = (event) => {
+socket.addEventListener("message", (event) => {
   const message = JSON.parse(String(event.data));
   if (message.id !== undefined) {
     const entry = pending.get(message.id);
@@ -263,8 +269,9 @@ socket.onmessage = (event) => {
     else entry?.ok(message.result);
     return;
   }
-  for (const listener of listeners.get(message.method) ?? []) listener(message.params, message.sessionId);
-};
+  for (const listener of listeners.get(message.method) ?? [])
+    listener(message.params, message.sessionId);
+});
 const send = (method: string, params: object = {}, sessionId?: string, timeoutMs = 60_000) =>
   new Promise<any>((ok, fail) => {
     const id = nextId++;
@@ -323,7 +330,11 @@ const runScenario = async (name: string, navigateTo: string) => {
       if (s !== sessionId || !String(p.request.url).includes("/api/orchestration/shell")) return;
       const url = new URL(p.request.url);
       if (url.searchParams.get("paged") !== "true") return;
-      const request = { requestId: p.requestId, after: url.searchParams.get("after"), startedMs: at() };
+      const request = {
+        requestId: p.requestId,
+        after: url.searchParams.get("after"),
+        startedMs: at(),
+      };
       requests.set(p.requestId, request);
       shell.push(request);
     }),
@@ -334,7 +345,9 @@ const runScenario = async (name: string, navigateTo: string) => {
       request.finishedMs = at();
       void send("Network.getResponseBody", { requestId: p.requestId }, sessionId)
         .then((body) => {
-          const text: string = body.base64Encoded ? Buffer.from(body.body, "base64").toString() : body.body;
+          const text: string = body.base64Encoded
+            ? Buffer.from(body.body, "base64").toString()
+            : body.body;
           request.last = /"nextAfter":null/.test(text.slice(-400));
           if (request.last && completeMs === null) completeMs = request.finishedMs!;
         })
@@ -361,14 +374,22 @@ const runScenario = async (name: string, navigateTo: string) => {
   const deadline = performance.now() + 300_000;
   let crashRequested = false;
   while (!crashed && performance.now() < deadline) {
-    if (name === "crash-first" && !crashRequested && shell.filter((r) => r.finishedMs).length >= crashAtPage) {
+    if (
+      name === "crash-first" &&
+      !crashRequested &&
+      shell.filter((r) => r.finishedMs).length >= crashAtPage
+    ) {
       crashRequested = true;
       await send("Page.crash", {}, sessionId, 5_000).catch(() => undefined);
       crashed = true;
       break;
     }
     if (completeMs !== null && at() - completeMs > 8_000) break;
-    if (profileAtPage > 0 && !profiledAtPage && shell.filter((r) => r.finishedMs).length >= profileAtPage) {
+    if (
+      profileAtPage > 0 &&
+      !profiledAtPage &&
+      shell.filter((r) => r.finishedMs).length >= profileAtPage
+    ) {
       profiledAtPage = true;
       const [{ profile: heap }, { profile: cpu }] = await Promise.all([
         send("HeapProfiler.getSamplingProfile", {}, sessionId, 300_000),
@@ -410,8 +431,14 @@ const runScenario = async (name: string, navigateTo: string) => {
     peakAtMs: peak.ms,
     retainedMb,
     profileFile,
-    samples: samples.filter((_, i) => i % 5 === 0).map((s) => [Math.round(s.ms), Math.round(s.usedMb)]),
-    pages: shell.map((r) => [Math.round(r.startedMs), Math.round(r.finishedMs ?? -1), Math.round((r.bytes ?? 0) / 1024)]),
+    samples: samples
+      .filter((_, i) => i % 5 === 0)
+      .map((s) => [Math.round(s.ms), Math.round(s.usedMb)]),
+    pages: shell.map((r) => [
+      Math.round(r.startedMs),
+      Math.round(r.finishedMs ?? -1),
+      Math.round((r.bytes ?? 0) / 1024),
+    ]),
   };
 };
 
