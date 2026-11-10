@@ -124,6 +124,11 @@ times out or prints too much) counts as `fail` for the cards it did not answer.
 - An answer is for the wait the check was asked about. If the card's wait was
   replaced while the check ran (even with the same script and other `args`),
   the answer is dropped and the new wait is checked on the next run.
+- A check run answers only for the cards in its input. A `wait` answer line
+  for any other card is refused, with the reason in the run's output, even
+  when that card waits on the same script by now (it started waiting while
+  the check ran): its wait is checked on the next run. To end a wait from
+  outside its check, print a `wake` line (below).
 - A script that is turned off or removed fails its waits, so the card shows it.
 
 ## Waking and parking from any script
