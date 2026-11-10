@@ -13,6 +13,7 @@ import {
   kanbanOpenAsks,
   type KanbanAskFeedItem,
   type KanbanAskKind,
+  type KanbanAskTurns,
   type KanbanCard,
   type KanbanOwnerAsk,
   type KanbanStage,
@@ -64,8 +65,10 @@ export interface NeedsYou {
   readonly withEvaluator: ReadonlyArray<NeedsYouItem>;
   /** His turn, but stale: shown, not answerable. */
   readonly expired: ReadonlyArray<NeedsYouItem>;
-  /** How many asks are his turn and answerable. */
+  /** How many asks are his turn and answerable: the number a badge shows. */
   readonly count: number;
+  /** Every open ask by whose turn it is; the four add up to all open asks. */
+  readonly counts: KanbanAskTurns;
   /** Of those, how many hold their card. */
   readonly blocking: number;
 }
@@ -156,6 +159,12 @@ export function rankNeedsYou(all: ReadonlyArray<NeedsYouItem>): NeedsYou {
     withEvaluator,
     expired,
     count: mine.length,
+    counts: {
+      owner: mine.length,
+      agent: waitingOnAgent.length,
+      evaluator: withEvaluator.length,
+      expired: expired.length,
+    },
     blocking: mine.filter((item) => item.blocking).length,
   };
 }

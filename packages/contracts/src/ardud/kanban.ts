@@ -433,6 +433,58 @@ export const kanbanOpenAsks = (card: Pick<KanbanCard, "asks">): ReadonlyArray<Ka
 export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "settledAt">) =>
   card.settledAt === null && (card.stage === "needs_owner" || kanbanOpenAsks(card).length > 0);
 
+type AskTurnFields = Pick<KanbanOwnerAsk, "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt">;
+
+/** An open ask the owner can answer now: his turn, and not past its `expiresAt`. */
+export const kanbanAskNeedsOwner = (ask: AskTurnFields, nowMs: number): boolean =>
+  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs);
+
+export interface KanbanAskTurns {
+  /** His turn, and answerable. */
+  readonly owner: number;
+  /** He replied on these: they wait on their asker. */
+  readonly agent: number;
+  /** He handed these to the evaluator. */
+  readonly evaluator: number;
+  /** His turn, but past `expiresAt`: their asker must renew them. */
+  readonly expired: number;
+}
+
+/** A card's open asks, counted by whose turn they are. A settled card has none. */
+export const kanbanAskTurns = (
+  card: { readonly settledAt: string | null; readonly asks: ReadonlyArray<AskTurnFields> },
+  nowMs: number,
+): KanbanAskTurns => {
+  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0 };
+  if (card.settledAt !== null) return turns;
+  for (const ask of card.asks) {
+    const turn = kanbanAskWaitsOn(ask);
+    if (turn === null) continue;
+    if (turn !== "owner") turns[turn] += 1;
+    else if (kanbanAskExpired(ask, nowMs)) turns.expired += 1;
+    else turns.owner += 1;
+  }
+  return turns;
+};
+
+/**
+ * Whether a card counts in the "needs you" numbers: it has an ask the owner can
+ * answer now, or it sits in Needs Owner with no open ask (a hold set by hand).
+ * A card whose open asks are all handed over, waiting on their asker or expired
+ * does not count, though a blocking one still holds it in Needs Owner.
+ */
+export const kanbanCardNeedsOwner = (
+  card: {
+    readonly stage: KanbanStage;
+    readonly settledAt: string | null;
+    readonly asks: ReadonlyArray<AskTurnFields>;
+  },
+  nowMs: number,
+): boolean =>
+  card.settledAt === null &&
+  (card.asks.some((ask) => kanbanAskNeedsOwner(ask, nowMs)) ||
+    (card.stage === "needs_owner" && card.asks.every((ask) => ask.closedAt !== null)));
+
 /** The step the card is on: the first with an open subtask, or null when none is open. */
 export const kanbanOpenStep = (card: Pick<KanbanCard, "subtasks">): number | null =>
   card.subtasks.reduce<number | null>(

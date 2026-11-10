@@ -53,7 +53,7 @@ export function BoardColumns(props: {
       if (entry) setWidth(entry.contentRect.width);
     });
   const { state, filter } = props;
-  const goals = activeGoals(state);
+  const goals = activeGoals(state, props.nowMs);
   if (visibleCards(state, filter).length === 0) {
     return <NoCardsMatch onClear={props.onClearFilters} />;
   }
@@ -300,7 +300,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       {ownerHidden ? (
         <HiddenColumnRail
           label={board.owner.label}
-          count={board.owner.cards.length}
+          count={board.owner.count}
           onShow={() => toggle("needs_owner")}
           className="me-5 mb-4"
         />
@@ -322,7 +322,7 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
             onCommit={(width) => setWidth("needs_owner", width)}
             onReset={() => resetWidth("needs_owner")}
           />
-          <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
+          <ColumnHeader label={board.owner.label} count={board.owner.count} tone="warn" />
           <div
             className={cn(
               "flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl bg-(--m-warnband) p-2",
@@ -604,7 +604,7 @@ function StageList(props: ColumnsProps) {
     >
       {board.owner.cards.length > 0 ? (
         <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
-          <ColumnHeader label={board.owner.label} count={board.owner.cards.length} tone="warn" />
+          <ColumnHeader label={board.owner.label} count={board.owner.count} tone="warn" />
           <div className={LIST_GRID}>
             {board.owner.cards.map((card) => (
               <CardTile

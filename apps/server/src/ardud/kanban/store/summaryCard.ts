@@ -10,6 +10,14 @@ export const SummaryCard = Schema.Struct({
   stage: KanbanCard.fields.stage,
   settledAt: KanbanCard.fields.settledAt,
   activeThreadId: KanbanCard.fields.activeThreadId,
-  asks: Schema.Array(Schema.Struct({ closedAt: Schema.NullOr(Schema.String) })),
+  // Whose turn each ask is: the three keys are absent on most asks, as on the card.
+  asks: Schema.Array(
+    Schema.Struct({
+      closedAt: Schema.NullOr(Schema.String),
+      clarifyAskedAt: Schema.optional(Schema.String),
+      handedAt: Schema.optional(Schema.String),
+      expiresAt: Schema.optional(Schema.String),
+    }),
+  ),
 });
 export type SummaryCard = typeof SummaryCard.Type;

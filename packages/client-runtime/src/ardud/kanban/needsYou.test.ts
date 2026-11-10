@@ -96,6 +96,8 @@ describe("needsYouItems", () => {
     expect(keys(list.expired)).toEqual(["card-1:q3"]);
     expect(list.count).toBe(1);
     expect(list.blocking).toBe(0);
+    // Each group has its own count; the badge number is `owner`.
+    expect(list.counts).toEqual({ owner: 1, agent: 1, evaluator: 1, expired: 1 });
   });
 
   it("folds asks with the same batch key on a board into one entry at its best item's place", () => {
