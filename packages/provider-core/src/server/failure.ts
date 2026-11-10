@@ -216,6 +216,20 @@ export function makeProviderFailure(input: {
   };
 }
 
+export function withPreviousFailure(
+  failure: OrchestrationV2ProviderFailure,
+  previous: OrchestrationV2ProviderFailure | undefined,
+): OrchestrationV2ProviderFailure {
+  if (previous === undefined || failure.message.startsWith("Automatic resume failed."))
+    return failure;
+  return makeProviderFailure({
+    ...failure,
+    category: failure.category ?? "unknown",
+    resetAt: failure.resetAt ?? null,
+    message: `Automatic resume failed. First error: ${previous.message.slice(0, 1500)} Resume error: ${failure.message.slice(0, 1500)} Files may be partly written.`,
+  });
+}
+
 export function makeProviderFailureTurnItem(input: {
   readonly driver: ProviderDriverKind;
   readonly threadId: ThreadId;

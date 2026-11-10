@@ -45,6 +45,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-turn.start"),
     runId: RunId,
+    retryDelayMs: Schema.optional(Schema.Number),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),

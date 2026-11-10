@@ -2207,3 +2207,39 @@ effectIt.effect("fails a run whose expanded assistant quotes exceed the provider
     ]);
   }),
 );
+
+effectIt.effect("fails an automatic recovery instead of replacing its native session", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("must not replace"),
+    });
+    const projection = harness.projection();
+    harness.setProjection({
+      ...projection,
+      runs: projection.runs.map((run) => ({
+        ...run,
+        transientRecovery: {
+          firstError: {
+            class: "provider_error",
+            category: "transient",
+            code: "api_error_529",
+            retryable: true,
+            message: "529 overloaded",
+          },
+          since: "2026-11-08T10:00:00.000Z",
+        },
+      })),
+    });
+    yield* harness.start;
+    expect(harness.resumeThread).toHaveBeenCalledOnce();
+    expect(harness.resumeFallbackEnsure).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    const failed = harness.projection().turnItems.findLast((item) => item.type === "error");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain("529 overloaded");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain("Resume error:");
+    expect(failed?.type === "error" ? failed.failure.message : "").toContain(
+      "native thread is gone",
+    );
+  }),
+);

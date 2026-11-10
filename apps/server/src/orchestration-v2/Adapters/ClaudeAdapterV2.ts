@@ -1,3 +1,4 @@
+import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -3018,6 +3019,7 @@ export function claudeFailureCategory(input: {
   /** Rate-limit evidence on the turn: a usage limit even when the CLI ends it as blocking_limit. */
   readonly usageLimited?: boolean | undefined;
   readonly text?: string | undefined;
+  readonly hadSuccessfulResponse?: boolean;
 }): OrchestrationV2ProviderFailureCategory {
   if (input.usageLimited === true) return "quota";
   const status = input.apiErrorStatus ?? input.retryStatus ?? null;
@@ -3041,7 +3043,7 @@ export function claudeFailureCategory(input: {
     // A bare invalid_request is also how the API refuses an over-long prompt, so it
     // is not called a config error here; the text check below decides it.
     case "model_not_found":
-      return "model_invalid";
+      return input.hadSuccessfulResponse ? "transient" : "model_invalid";
     default:
       break;
   }
@@ -3052,6 +3054,9 @@ export function claudeFailureCategory(input: {
   if (input.terminalReason === "prompt_too_long" || input.terminalReason === "blocking_limit") {
     return "context_exhausted";
   }
+  if (status === 404) return input.hadSuccessfulResponse ? "transient" : "model_invalid";
+  if (status === 403) return "config";
+  if (status === 413) return "context_exhausted";
   if (status === 400 && input.text !== undefined && CLAUDE_MODEL_CONFIG_TEXT.test(input.text)) {
     return "model_invalid";
   }
@@ -3140,14 +3145,18 @@ function providerFailureFromResult(
   });
 }
 
-function providerFailureFromApiRetry(message: SDKAPIRetryMessage): OrchestrationV2ProviderFailure {
+function providerFailureFromApiRetry(
+  message: SDKAPIRetryMessage,
+  hadSuccessfulResponse: boolean,
+): OrchestrationV2ProviderFailure {
   const errorName = message.error.replaceAll("_", " ");
   return makeProviderFailure({
-    message: `Claude API ${errorName}.`,
+    message: `Claude API ${message.error_status === null ? "no HTTP response" : Math.trunc(message.error_status)}: ${errorName}${message.no_response === undefined ? "" : ` (no_response: waited ${message.no_response.waited_ms}ms, retry wait ${message.no_response.retry_wait_ms}ms)`}. Attempt ${message.attempt}/${message.max_retries}; retry in ${message.retry_delay_ms}ms.`,
     category: claudeFailureCategory({
       retryError: message.error,
       retryStatus: message.error_status,
       noResponse: message.no_response !== undefined,
+      hadSuccessfulResponse,
     }),
     code:
       message.error_status === null
@@ -3367,6 +3376,8 @@ interface ActiveClaudeTurnContext {
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
+  hadSuccessfulResponse: boolean;
+  latestApiFailure: OrchestrationV2ProviderFailure | undefined;
   // Latest root API error, cleared when an error-free root assistant response recovers.
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
@@ -3972,6 +3983,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const subagentToolCalls = new Map<string, ActiveClaudeToolCall>();
         const pendingSubagentLaunchesByToolUseId = new Map<string, PendingClaudeSubagentLaunch>();
         const settledTurnByNativeThread = new Map<string, ActiveClaudeTurnContext>();
+        const successfulModelsByNativeThread = new Map<string, Set<string>>();
         const subagentStopOutcomes = new Map<
           string,
           Deferred.Deferred<ProviderAdapter.ProviderAdapterV2SubagentOutcome>
@@ -6699,6 +6711,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   ...(nativeThreadId !== null && goalsByNativeThread.has(nativeThreadId)
                     ? { goal: goalsByNativeThread.get(nativeThreadId) ?? null }
                     : {}),
+                  nativeMetadata: {
+                    ...input.context.input.providerThread.nativeMetadata,
+                    successfulModels: [
+                      ...new Set([
+                        ...(input.context.input.providerThread.nativeMetadata?.successfulModels ??
+                          []),
+                        ...(successfulModelsByNativeThread.get(input.context.nativeThreadId) ?? []),
+                      ]),
+                    ],
+                  },
                   firstRunOrdinal:
                     input.context.input.providerThread.firstRunOrdinal ??
                     input.context.input.runOrdinal,
@@ -7820,8 +7842,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               maxAttempts: Math.max(1, Math.trunc(message.max_retries)),
               retryDelayMs: Math.max(0, Math.trunc(message.retry_delay_ms)),
             };
-            const failure = providerFailureFromApiRetry(message);
+            const failure = providerFailureFromApiRetry(message, context.hadSuccessfulResponse);
             context.latestApiFailureCategory = failure.category;
+            context.latestApiFailure = failure;
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -7861,12 +7884,34 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const now = yield* DateTime.now;
             if (message.parent_tool_use_id === null) {
               if (message.error === undefined) {
+                if (message.message.model !== "<synthetic>") {
+                  context.hadSuccessfulResponse = true;
+                  const models =
+                    successfulModelsByNativeThread.get(context.nativeThreadId) ?? new Set<string>();
+                  models.add(context.input.modelSelection.model);
+                  successfulModelsByNativeThread.set(context.nativeThreadId, models);
+                }
+                context.latestApiFailure = undefined;
                 context.latestApiFailureCategory = undefined;
                 yield* completeProviderRetry(context, now);
               } else {
                 context.latestApiFailureCategory = claudeFailureCategory({
                   retryError: message.error,
+                  hadSuccessfulResponse: context.hadSuccessfulResponse,
                 });
+                const status = Reflect.get(message, "api_error_status");
+                context.latestApiFailure =
+                  message.error === "model_not_found" && context.latestApiFailure !== undefined
+                    ? context.latestApiFailure
+                    : makeProviderFailure({
+                        category: context.latestApiFailureCategory,
+                        class: "provider_error",
+                        code: typeof status === "number" ? `api_error_${status}` : message.error,
+                        message:
+                          context.hadSuccessfulResponse && message.error === "model_not_found"
+                            ? `Claude upstream returned ${typeof status === "number" ? status : "model_not_found"} after successful responses in this session.`
+                            : `Claude API ${typeof status === "number" ? `${status} ` : ""}${message.error}.`,
+                      });
               }
             }
             // `<synthetic>` frames (usage limits, sign-in errors, /goal status)
@@ -8346,7 +8391,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               );
             }
           }
-          const assistantText = assistantTextFromSdkMessage(message);
+          const nativeAssistantText = assistantTextFromSdkMessage(message);
+          const assistantText =
+            nativeAssistantText !== null &&
+            message.type === "assistant" &&
+            message.error === "model_not_found" &&
+            message.parent_tool_use_id === null &&
+            context.hadSuccessfulResponse
+              ? {
+                  ...nativeAssistantText,
+                  text: "Claude's upstream request failed after earlier successful responses in this session.",
+                }
+              : nativeAssistantText;
           if (
             assistantText !== null &&
             assistantText.text.length > 0 &&
@@ -8527,22 +8583,101 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const turnFailure = interrupted
               ? null
               : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
-            // A generic api_error result without a status repeats the latest SDK
-            // failure; an explicit terminal cause always takes precedence.
-            const latestApiFailureCategory = context.latestApiFailureCategory;
+            const apiExhausted = message.terminal_reason === "api_error";
+            const configDir = adapterOptions.environment.CLAUDE_CONFIG_DIR?.trim();
+            const transcriptError = apiExhausted
+              ? yield* ClaudeApiErrorTranscript.readLastApiError({
+                  configDir: configDir
+                    ? path.resolve(session.cwd, configDir)
+                    : path.join(yield* HostProcess.HomeDirectory, ".claude"),
+                  filePath: path.join(
+                    configDir
+                      ? path.resolve(session.cwd, configDir)
+                      : path.join(yield* HostProcess.HomeDirectory, ".claude"),
+                    "projects",
+                    session.cwd.replace(/[^a-zA-Z0-9]/g, "-"),
+                    `${context.nativeThreadId}.jsonl`,
+                  ),
+                  sessionId: context.nativeThreadId,
+                  since: DateTime.toEpochMillis(context.startedAt),
+                })
+              : undefined;
+            const transcriptFailure =
+              transcriptError === undefined
+                ? undefined
+                : makeProviderFailure({
+                    class: "provider_error",
+                    message: transcriptError.formatted,
+                    code:
+                      transcriptError.status === undefined
+                        ? "api_error_transport"
+                        : `api_error_${transcriptError.status}`,
+                    category: claudeFailureCategory({
+                      apiErrorStatus: transcriptError.status,
+                      noResponse: transcriptError.status === undefined,
+                      hadSuccessfulResponse: context.hadSuccessfulResponse,
+                      text: transcriptError.formatted,
+                    }),
+                  });
+            const latestFailure = context.latestApiFailure;
+            const retryFailure = (yield* Ref.get(providerRetries)).get(
+              context.providerTurnId,
+            )?.failure;
+            const selectedModelAfterSuccess =
+              context.hadSuccessfulResponse &&
+              message.subtype === "success" &&
+              message.api_error_status === 404;
+            // Current 4xx evidence wins over history. Claude's synthetic 404 is the exception.
+            const currentPermanentFailure =
+              turnFailure?.category === "quota" ||
+              (message.subtype === "success" &&
+                message.api_error_status != null &&
+                message.api_error_status >= 400 &&
+                message.api_error_status < 500 &&
+                message.api_error_status !== 404);
+            const cause =
+              (currentPermanentFailure ? (turnFailure ?? undefined) : undefined) ??
+              transcriptFailure ??
+              (selectedModelAfterSuccess
+                ? latestFailure
+                : message.subtype !== "success" || message.api_error_status == null
+                  ? (latestFailure ?? retryFailure)
+                  : undefined);
+            const lastErrorMessage =
+              cause?.message !== undefined &&
+              cause.message !== "Claude gave up after repeated API errors."
+                ? cause.message
+                : selectedModelAfterSuccess
+                  ? "upstream 404 after successful responses in this session."
+                  : turnFailure?.message === "Claude gave up after repeated API errors."
+                    ? turnFailure.code?.replace("api_error_", "HTTP ")
+                    : turnFailure?.message;
             const failureWithRetryCause =
               turnFailure !== null &&
-              turnFailure.category === "unknown" &&
-              message.terminal_reason === "api_error" &&
-              (message.subtype !== "success" || message.api_error_status == null) &&
-              latestApiFailureCategory !== undefined
-                ? {
+              apiExhausted &&
+              failureHint === undefined &&
+              resultUserFacingError(message) === undefined &&
+              (cause !== undefined ||
+                selectedModelAfterSuccess ||
+                turnFailure.message.startsWith("API Error:") ||
+                turnFailure.code?.startsWith("api_error_") === true)
+                ? makeProviderFailure({
                     ...turnFailure,
-                    category: latestApiFailureCategory,
-                    ...(latestApiFailureCategory === "quota"
-                      ? { class: "usage_limit" as const }
+                    category: turnFailure.category ?? "unknown",
+                    resetAt: turnFailure.resetAt ?? null,
+                    ...(cause === undefined
+                      ? {}
+                      : {
+                          category: cause.category ?? "unknown",
+                          code: cause.code,
+                          ...(cause.category === "quota" ? { class: "usage_limit" as const } : {}),
+                        }),
+                    ...(selectedModelAfterSuccess &&
+                    (cause === undefined || cause.category === "model_invalid")
+                      ? { category: "transient" as const }
                       : {}),
-                  }
+                    message: `Claude gave up after repeated API errors. Last error: ${lastErrorMessage}`,
+                  })
                 : turnFailure;
             const resultFailure = interrupted
               ? null
@@ -9469,6 +9604,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,
               latestApiFailureCategory: undefined,
+              latestApiFailure: undefined,
+              hadSuccessfulResponse:
+                successfulModelsByNativeThread
+                  .get(nativeThreadId)
+                  ?.has(turnInput.modelSelection.model) === true ||
+                turnInput.providerThread.nativeMetadata?.successfulModels?.includes(
+                  turnInput.modelSelection.model,
+                ) === true,
               refusalMessage: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),

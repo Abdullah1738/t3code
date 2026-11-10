@@ -205,6 +205,18 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
     description:
       "The original child run's start time in ISO format, or null if it has not started.",
   }),
+  retry: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        state: Schema.Literals(["retrying", "resuming", "failed_transient"]),
+        lastError: Schema.String,
+        since: IsoDateTime,
+        attempt: Schema.Number,
+        delayMs: Schema.Number,
+        filesMayBePartlyWritten: Schema.Boolean,
+      }),
+    ),
+  ),
   startPending: Schema.optional(Schema.Boolean).annotate({
     description:
       "True means the child's provider turn has not started yet (waiting for a server worker); it is not executing.",

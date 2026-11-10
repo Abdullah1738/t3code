@@ -4380,19 +4380,22 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       name: "an unflagged result with surrounding whitespace",
       isError: false,
       result: "  API Error: 400 Request rejected by a safeguard.\n",
-      expected: "API Error: 400 Request rejected by a safeguard.",
+      expected:
+        "Claude gave up after repeated API errors. Last error: API Error: 400 Request rejected by a safeguard.",
     },
     {
       name: "a secret crossing the truncation boundary",
       isError: true,
       result: `API Error: 400 ${"x".repeat(440)} {"token":"${"synthetic-secret".repeat(100)}"} ${"y".repeat(100)}`,
-      expected: `API Error: 400 ${"x".repeat(440)} {"token":"[REDACTED]"} `.padEnd(500, "y"),
+      expected:
+        "Claude gave up after repeated API errors. Last error: " +
+        `API Error: 400 ${"x".repeat(440)} {"token":"[REDACTED]"} `.padEnd(500, "y"),
     },
     {
       name: "ordinary assistant text",
       isError: true,
       result: "I found three files.",
-      expected: "Claude gave up after repeated API errors.",
+      expected: "Claude gave up after repeated API errors. Last error: HTTP 400",
     },
     {
       name: "a listed non-diagnostic error",
@@ -4406,14 +4409,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       isError: true,
       result: "API Error: 529 Specific overload detail.",
       apiErrorStatus: 529,
-      expected: "Claude API is overloaded (529). Try again shortly.",
+      expected:
+        "Claude gave up after repeated API errors. Last error: Claude API is overloaded (529). Try again shortly.",
     },
     {
       name: "an HTTP 429 rate limit",
       isError: true,
       result: "API Error: 429 Specific rate limit detail.",
       apiErrorStatus: 429,
-      expected: "Claude API rate limit reached. Try again later.",
+      expected:
+        "Claude gave up after repeated API errors. Last error: Claude API rate limit reached. Try again later.",
     },
     {
       name: "a different terminal reason",
@@ -4464,6 +4469,115 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+
+  it.effect.each(
+    [
+      { status: 400, text: "API Error: 400 invalid model requested", category: "model_invalid" },
+      { status: 400, text: "API Error: 400 malformed request", category: "unknown" },
+      {
+        status: 401,
+        text: "API Error: 401 Invalid authentication credentials",
+        category: "auth_expired",
+      },
+      { status: 403, text: "API Error: 403 forbidden", category: "config" },
+      { status: 413, text: "API Error: 413 request too large", category: "context_exhausted" },
+      { status: 429, text: "API Error: 429 rate_limit_error", category: "quota" },
+      { status: 418, text: "API Error: 418 unclassified request failure", category: "unknown" },
+      { status: 404, text: "There's an issue with the selected model", category: "transient" },
+      { status: null, text: "Claude could not complete the request", category: "unknown" },
+    ].flatMap((scenario) => [
+      { ...scenario, recovered: false },
+      { ...scenario, recovered: true },
+    ]),
+  )(
+    "keeps current terminal $status after a transcript retry (recovered=$recovered, $category)",
+    (scenario) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+        });
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-current-terminal-cause"),
+            text: "Continue.",
+            attachments: [],
+          }),
+        );
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000990",
+            text: "Saved earlier work.",
+          }),
+        );
+        const nativeResponse = {
+          type: "assistant",
+          timestamp: DateTime.formatIso(now),
+          message: { model: "claude-haiku-5-5" },
+        };
+        const projectDir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(projectDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(projectDir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          [
+            nativeResponse,
+            {
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(now),
+              error: { status: 502, formatted: "502 fetch connect timeout" },
+            },
+            ...(scenario.recovered ? [nativeResponse] : []),
+          ]
+            .map((record) => JSON.stringify(record))
+            .join("\n") + "\n",
+        );
+        if (scenario.recovered)
+          yield* harness.offerAndWait(
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000000991",
+              text: "Retry recovered; continuing work.",
+            }),
+          );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000992",
+            isError: true,
+            terminalReason: "api_error",
+            apiErrorStatus: scenario.status,
+            result: scenario.text,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        const usesTranscript =
+          !scenario.recovered && (scenario.status === null || scenario.status === 404);
+        assert.equal(terminal.failure.category, usesTranscript ? "transient" : scenario.category);
+        assert.equal(
+          terminal.failure.code,
+          usesTranscript
+            ? "api_error_502"
+            : scenario.status === null
+              ? "api_error"
+              : `api_error_${scenario.status}`,
+        );
+        if (scenario.recovered) assert.notInclude(terminal.failure.message, "502");
+        else if (usesTranscript)
+          assert.include(terminal.failure.message, "502 fetch connect timeout");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("names an expired Claude login instead of the terminal API error", () =>
@@ -4991,62 +5105,89 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
-  it.effect.each([
-    { status: 503, cooldown: "4m 6s", seconds: 246 },
-    { status: 503, cooldown: "1h 2m 3s", seconds: 3723 },
-    { status: 503, cooldown: "7s", seconds: 7 },
-    { status: 503, cooldown: "0s", seconds: 0 },
-    { status: 503, cooldown: "unknown", seconds: 0 },
-    { status: 503, cooldown: "999999999999999999999999h", seconds: 0 },
-    { status: 503, cooldown: "4m 6s", seconds: 0, errorType: "overloaded_error" },
-    { status: 401, cooldown: "4m 6s", seconds: 0 },
-  ])("recovers wrapped gateway limits with status $status and cooldown $cooldown", (input) =>
-    Effect.gen(function* () {
-      const harness = yield* makeWakeHarness;
-      const now = yield* DateTime.now;
-      yield* harness.runtime.startTurn(
-        makeClaudeTestTurnInput({
-          threadId: harness.threadId,
-          providerThread: harness.providerThread,
-          now,
-          attemptId: RunAttemptId.make("attempt-gateway-limit"),
-          text: "Continue.",
-          attachments: [],
-        }),
-      );
-      yield* Queue.offerAll(harness.sdkMessages, [
-        makeAssistantErrorFrame({
-          uuid: "00000000-0000-4000-8000-000000000652",
-          error: "server_error",
-        }),
-        makeResultFrame({
-          uuid: "00000000-0000-4000-8000-000000000653",
-          result: `API Error: ${input.status} [claude/claude-opus-5-5] [429]: {"type":"error","error":{"type":"${input.errorType ?? "rate_limit_error"}","message":"Please try again later."}} (reset after ${input.cooldown}).`,
-          terminalReason: "api_error",
-          isError: true,
-          apiErrorStatus: input.status,
-        }),
-      ]);
-      const terminal = yield* Queue.take(harness.terminalReceipts);
-      assert.equal(terminal.status, "failed");
-      if (terminal.status !== "failed") return;
-      assert.equal(terminal.failure.class, input.seconds > 0 ? "usage_limit" : "provider_error");
-      if (input.seconds > 0) {
-        assert.equal(terminal.failure.retryable, true);
-        assert.equal(
-          terminal.failure.resetAt,
-          DateTime.formatIso(
-            DateTime.makeUnsafe(DateTime.toEpochMillis(now) + input.seconds * 1_000),
-          ),
+  it.effect.each(
+    [
+      { status: 503, cooldown: "4m 6s", seconds: 246 },
+      { status: 503, cooldown: "1h 2m 3s", seconds: 3723 },
+      { status: 503, cooldown: "7s", seconds: 7 },
+      { status: 503, cooldown: "0s", seconds: 0 },
+      { status: 503, cooldown: "unknown", seconds: 0 },
+      { status: 503, cooldown: "999999999999999999999999h", seconds: 0 },
+      { status: 503, cooldown: "4m 6s", seconds: 0, errorType: "overloaded_error" },
+      { status: 401, cooldown: "4m 6s", seconds: 0 },
+    ].flatMap((input) => [
+      { ...input, transcript: false },
+      { ...input, transcript: true },
+    ]),
+  )(
+    "recovers wrapped gateway limits with status $status, cooldown $cooldown, transcript $transcript",
+    (input) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+        });
+        const now = yield* DateTime.now;
+        const result = `API Error: ${input.status} [claude/claude-opus-5-5] [429]: {"type":"error","error":{"type":"${input.errorType ?? "rate_limit_error"}","message":"Please try again later."}} (reset after ${input.cooldown}).`;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-gateway-limit"),
+            text: "Continue.",
+            attachments: [],
+          }),
         );
-      } else {
-        assert.isUndefined(terminal.failure.resetAt);
-      }
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        if (input.transcript) {
+          const projectDir = path.join(configDir, "projects", "-workspace");
+          yield* fs.makeDirectory(projectDir, { recursive: true });
+          yield* fs.writeFileString(
+            path.join(projectDir, `${WAKE_NATIVE_SESSION}.jsonl`),
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(now),
+              error: { status: input.status, formatted: result },
+            }) + "\n",
+          );
+        }
+        yield* Queue.offerAll(harness.sdkMessages, [
+          makeAssistantErrorFrame({
+            uuid: "00000000-0000-4000-8000-000000000652",
+            error: "server_error",
+          }),
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000653",
+            result,
+            terminalReason: "api_error",
+            isError: true,
+            apiErrorStatus: input.status,
+          }),
+        ]);
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(terminal.failure.class, input.seconds > 0 ? "usage_limit" : "provider_error");
+        if (input.seconds > 0) {
+          assert.equal(terminal.failure.category, "quota");
+          assert.equal(terminal.failure.retryable, true);
+          assert.equal(
+            terminal.failure.resetAt,
+            DateTime.formatIso(
+              DateTime.makeUnsafe(DateTime.toEpochMillis(now) + input.seconds * 1_000),
+            ),
+          );
+        } else {
+          assert.isUndefined(terminal.failure.resetAt);
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
       ),
-    ),
   );
 
   it("maps every Claude failure signal to one normalized category", () => {
@@ -7061,6 +7202,37 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
   it.effect.each([
     {
+      name: "first-request 404 is permanent",
+      retries: [],
+      resultStatus: 404,
+      expectedCategory: "model_invalid",
+    },
+    {
+      name: "mid-session 404 is upstream",
+      successBefore: true,
+      retries: [],
+      resultStatus: 404,
+      expectedCategory: "transient",
+    },
+    {
+      name: "mid-session authentication stays permanent",
+      successBefore: true,
+      retries: [],
+      resultStatus: 401,
+      expectedCategory: "auth_expired",
+    },
+    {
+      name: "first-request retry 404 stays permanent",
+      retries: [{ error: "model_not_found", status: 404 }],
+      expectedCategory: "model_invalid",
+    },
+    {
+      name: "mid-session retry 404 is upstream without a terminal status",
+      successBefore: true,
+      retries: [{ error: "model_not_found", status: 404 }],
+      expectedCategory: "transient",
+    },
+    {
       name: "first-byte timeout without a response",
       retries: [{ error: "unknown", status: null, noResponse: true }],
       expectedCategory: "transient",
@@ -7112,7 +7284,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       name: "newer forbidden result wins even when unclassified",
       retries: [{ error: "server_error", status: 500 }],
       resultStatus: 403,
-      expectedCategory: "unknown",
+      expectedCategory: "config",
     },
     {
       name: "newer rate limit result wins",
@@ -7169,6 +7341,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             attachments: [],
           }),
         );
+        if ("successBefore" in scenario) {
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeAssistantTextFrame({
+              uuid: "00000000-0000-4000-8000-000000000899",
+              text: "Saved the first file.",
+            }),
+          );
+        }
         for (const [index, retry] of scenario.retries.entries()) {
           yield* Queue.offer(
             harness.sdkMessages,
@@ -7238,7 +7419,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           scenario.expectedCategory === "quota" ? "usage_limit" : "provider_error",
         );
         if (!("recovered" in scenario)) {
-          assert.equal(terminal.retry?.attempt, scenario.retries.length);
+          assert.equal(terminal.retry?.attempt, scenario.retries.length || undefined);
         }
       }).pipe(
         Effect.provide(
@@ -18145,6 +18326,66 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
     );
   });
+  it.effect.each([false, true])(
+    "requires an actual response before treating a later 404 as upstream: %s",
+    (succeeded) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const start = (ordinal: number) =>
+            harness.runtime.startTurn({
+              ...makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now: DateTime.makeUnsafe("2026-11-08T10:00:00Z"),
+                attemptId: RunAttemptId.make(`proof-${ordinal}`),
+                providerTurnOrdinal: ordinal,
+                text: "Continue",
+                attachments: [],
+              }),
+              nativeThreadHasTurns: ordinal > 1,
+            });
+          yield* start(1);
+          if (succeeded)
+            yield* Queue.offer(
+              harness.sdkMessages,
+              makeAssistantTextFrame({
+                uuid: "00000000-0000-4000-8000-000000000997",
+                text: "Saved file.",
+              }),
+            );
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000000998",
+              result: succeeded ? "Saved file." : "Missing model",
+              isError: !succeeded,
+              ...(succeeded ? {} : { terminalReason: "api_error", apiErrorStatus: 404 }),
+            }),
+          );
+          yield* Queue.take(harness.terminalReceipts);
+          yield* start(2);
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000000999",
+              result: "There's an issue with the selected model",
+              isError: true,
+              terminalReason: "api_error",
+              apiErrorStatus: 404,
+            }),
+          );
+          const terminal = yield* Queue.take(harness.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (terminal.status === "failed")
+            assert.equal(terminal.failure.category, succeeded ? "transient" : "model_invalid");
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
 });
 
 describe("ClaudeAdapterV2 query message stream", () => {
@@ -18198,4 +18439,23 @@ describe("ClaudeAdapterV2 query message stream", () => {
       assert.isTrue(closed);
     }),
   );
+});
+
+describe("Claude upstream model errors after successful responses", () => {
+  it.each([
+    { status: 404, error: "model_not_found", successful: false, expected: "model_invalid" },
+    { status: 404, error: "model_not_found", successful: true, expected: "transient" },
+    { status: 401, error: "authentication_failed", successful: true, expected: "auth_expired" },
+    { status: 413, error: "invalid_request", successful: true, expected: "context_exhausted" },
+    { status: 529, error: "overloaded", successful: false, expected: "transient" },
+  ])("classifies $status after success=$successful", ({ status, error, successful, expected }) => {
+    assert.equal(
+      ClaudeAdapterV2.claudeFailureCategory({
+        apiErrorStatus: status,
+        retryError: error,
+        hadSuccessfulResponse: successful,
+      }),
+      expected,
+    );
+  });
 });
