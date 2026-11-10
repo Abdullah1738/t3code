@@ -11,6 +11,9 @@ import {
   shellPageSize,
 } from "./shellPages.ts";
 
+const isThreadId = Schema.is(ThreadId);
+const decodeThreadId = Schema.decodeUnknownOption(ThreadId);
+
 const rows = (count: number) =>
   Array.from({ length: count }, (_, index) => ({ id: `thread-${String(index).padStart(4, "0")}` }));
 
@@ -26,8 +29,8 @@ it("uses a walk cursor no thread id can equal", () => {
   // named like the cursor at a page boundary would restart the walk for ever.
   expect(SHELL_WALK_START_CURSOR.trim()).toBe("");
   expect(SHELL_WALK_START_CURSOR).not.toBe("");
-  expect(Schema.is(ThreadId)(SHELL_WALK_START_CURSOR)).toBe(false);
-  expect(Schema.decodeUnknownOption(ThreadId)(SHELL_WALK_START_CURSOR)._tag).toBe("None");
+  expect(isThreadId(SHELL_WALK_START_CURSOR)).toBe(false);
+  expect(decodeThreadId(SHELL_WALK_START_CURSOR)._tag).toBe("None");
   // The cursor's earlier spelling was a legal thread id; it pages like any other now.
   for (const recentFirst of [true, false]) {
     expect(shellPageRead("!recent-first", recentFirst)).toEqual({

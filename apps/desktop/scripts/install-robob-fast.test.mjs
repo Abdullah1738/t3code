@@ -500,6 +500,12 @@ test("readiness polls reject on every failure and never use global fetch", async
       res.setHeader("location", `http://127.0.0.1:${other.address().port}/ok`);
       return res.end();
     }
+    if (req.url === "/malformed") {
+      // A URL that parses but that node:http refuses to request.
+      res.statusCode = 302;
+      res.setHeader("location", `http://bad%ZZ@127.0.0.1:${server.address().port}/ok`);
+      return res.end();
+    }
     if (req.url === "/trickle") {
       // Bytes arrive faster than any inactivity timeout, and the reply never ends.
       res.setHeader("content-type", "application/json");
@@ -558,6 +564,9 @@ test("readiness polls reject on every failure and never use global fetch", async
     );
     assert.deepEqual([hits, otherHits], [["Bearer t"], [undefined]]);
     await assert.rejects(getJson(`${origin}/loop`), /Too many redirects/);
+    // A redirect node:http cannot request rejects the poll; it used to throw from the
+    // response callback and end the process.
+    await assert.rejects(getJson(`${origin}/malformed`), URIError);
   } finally {
     server.closeAllConnections();
     other.closeAllConnections();

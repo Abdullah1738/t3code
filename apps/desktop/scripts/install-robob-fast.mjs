@@ -108,46 +108,53 @@ export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
     const deadline = setTimeout(() => fail(new Error("Request timed out")), timeoutMs);
     const origin = new URL(url).origin;
     const send = (target, redirectsLeft) => {
-      request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
-        target,
-        // Credentials stay with the origin they were given for.
-        { headers: target.origin === origin ? headers : {}, agent: false },
-        (response) => {
-          const status = response.statusCode ?? 0;
-          const location = response.headers.location;
-          if ([301, 302, 303, 307, 308].includes(status) && location !== undefined) {
-            response.resume();
-            if (redirectsLeft <= 0) return fail(new Error("Too many redirects"));
-            let next;
-            try {
-              next = new URL(location, target);
-            } catch (error) {
-              return fail(error);
+      // Node throws synchronously for a URL it cannot turn into a request (a redirect to
+      // `http://bad%ZZ@host/`). In a response callback nothing else would catch that, and
+      // the installer would exit.
+      try {
+        request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
+          target,
+          // Credentials stay with the origin they were given for.
+          { headers: target.origin === origin ? headers : {}, agent: false },
+          (response) => {
+            const status = response.statusCode ?? 0;
+            const location = response.headers.location;
+            if ([301, 302, 303, 307, 308].includes(status) && location !== undefined) {
+              response.resume();
+              if (redirectsLeft <= 0) return fail(new Error("Too many redirects"));
+              let next;
+              try {
+                next = new URL(location, target);
+              } catch (error) {
+                return fail(error);
+              }
+              if (next.protocol !== "http:" && next.protocol !== "https:")
+                return fail(new Error(`Unsupported redirect to ${next.protocol}`));
+              request.destroy();
+              return send(next, redirectsLeft - 1);
             }
-            if (next.protocol !== "http:" && next.protocol !== "https:")
-              return fail(new Error(`Unsupported redirect to ${next.protocol}`));
-            request.destroy();
-            return send(next, redirectsLeft - 1);
-          }
-          const chunks = [];
-          let bytes = 0;
-          response.on("data", (chunk) => {
-            bytes += chunk.length;
-            if (bytes > JSON_REPLY_LIMIT_BYTES) return fail(new Error("Reply too large"));
-            chunks.push(chunk);
-          });
-          response.on("error", fail);
-          response.on("end", () => {
-            if (status < 200 || status > 299) return fail(new Error(`HTTP ${status}`));
-            try {
-              finish(resolve, JSON.parse(Buffer.concat(chunks).toString("utf8")));
-            } catch (error) {
-              fail(error);
-            }
-          });
-        },
-      );
-      request.on("error", fail);
+            const chunks = [];
+            let bytes = 0;
+            response.on("data", (chunk) => {
+              bytes += chunk.length;
+              if (bytes > JSON_REPLY_LIMIT_BYTES) return fail(new Error("Reply too large"));
+              chunks.push(chunk);
+            });
+            response.on("error", fail);
+            response.on("end", () => {
+              if (status < 200 || status > 299) return fail(new Error(`HTTP ${status}`));
+              try {
+                finish(resolve, JSON.parse(Buffer.concat(chunks).toString("utf8")));
+              } catch (error) {
+                fail(error);
+              }
+            });
+          },
+        );
+        request.on("error", fail);
+      } catch (error) {
+        fail(error);
+      }
     };
     send(new URL(url), JSON_REDIRECT_LIMIT);
   });
