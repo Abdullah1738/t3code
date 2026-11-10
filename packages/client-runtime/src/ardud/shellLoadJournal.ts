@@ -35,7 +35,8 @@ export interface ShellLoadPageEntry {
  * renderer out of memory, a reload) goes on from its last page instead of page one. Each page
  * is one small write; nothing rewrites the whole list. Optional: without it, progress lives in
  * memory only (mobile today). Implementations never fail: a lost journal only means the next
- * load starts over.
+ * load starts over. Windows sharing one store take turns: the newest load to write its first
+ * page owns the journal, and an older load's later pages are not kept.
  */
 export class ShellLoadJournal extends Context.Service<
   ShellLoadJournal,
@@ -45,7 +46,12 @@ export class ShellLoadJournal extends Context.Service<
       environmentId: EnvironmentId,
       entry: ShellLoadPageEntry,
     ) => Effect.Effect<void>;
-    readonly clear: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    /**
+     * Drops one load's pages, and the record when it still names that load. Another client
+     * (a second window on the same storage) may have started a newer load meanwhile; its
+     * journal stays.
+     */
+    readonly clear: (environmentId: EnvironmentId, loadId: string) => Effect.Effect<void>;
   }
 >()("@t3tools/client-runtime/ardud/shellLoadJournal") {}
 
@@ -101,6 +107,11 @@ export function makeKeyValueShellLoadJournal<E>(
     const prefix = shellLoadRecordKey(environmentId);
     return store.removeRange(prefix, `${prefix}\uffff`);
   };
+  const recordLoadId = (environmentId: EnvironmentId) =>
+    store.get(shellLoadRecordKey(environmentId)).pipe(
+      Effect.flatMap((raw) => decodeRecord(raw).pipe(Effect.option)),
+      Effect.map(Option.map((record) => record.loadId)),
+    );
   return ShellLoadJournal.of({
     read: (environmentId) =>
       quietly(
@@ -133,6 +144,11 @@ export function makeKeyValueShellLoadJournal<E>(
         "append",
         Effect.gen(function* () {
           if (entry.index === 0) yield* removeAll(environmentId);
+          else {
+            // A newer load (another window) took the journal over: keep its pages.
+            const owner = yield* recordLoadId(environmentId);
+            if (Option.getOrUndefined(owner) !== entry.loadId) return;
+          }
           yield* store.put(shellLoadPageKey(environmentId, entry.loadId, entry.index), entry.body);
           // The record names a page only after that page is written.
           const record: JournalRecord = {
@@ -147,6 +163,19 @@ export function makeKeyValueShellLoadJournal<E>(
         }),
         undefined,
       ),
-    clear: (environmentId) => quietly("clear", removeAll(environmentId), undefined),
+    clear: (environmentId, loadId) =>
+      quietly(
+        "clear",
+        Effect.gen(function* () {
+          const pages = `${shellLoadRecordKey(environmentId)}\u0000${loadId}\u0000`;
+          yield* store.removeRange(pages, `${pages}\uffff`);
+          const owner = yield* recordLoadId(environmentId);
+          if (Option.getOrUndefined(owner) === loadId) {
+            const record = shellLoadRecordKey(environmentId);
+            yield* store.removeRange(record, record);
+          }
+        }),
+        undefined,
+      ),
   });
 }

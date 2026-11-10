@@ -58,8 +58,24 @@ describe("shell load journal", () => {
       expect(stored.bodies).toEqual(['{"page":0}', '{"page":1}']);
       expect(stored.nextAfter).toBe("cursor-1");
       expect(stored.loadId).toBe("load-a");
-      yield* journal.clear(ENVIRONMENT);
+      yield* journal.clear(ENVIRONMENT, "load-a");
       expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);
+    }),
+  );
+
+  it.effect("leaves a newer load's journal alone when an older load finishes or goes on", () =>
+    Effect.gen(function* () {
+      const { values, store } = memoryStore();
+      const journal = makeKeyValueShellLoadJournal(store);
+      // Two windows on one store: "old" started first, "new" started after it.
+      yield* journal.append(ENVIRONMENT, entry(0, "old"));
+      yield* journal.append(ENVIRONMENT, entry(0, "new"));
+      yield* journal.append(ENVIRONMENT, entry(1, "old"));
+      yield* journal.clear(ENVIRONMENT, "old");
+      const stored = Option.getOrThrow(yield* journal.read(ENVIRONMENT));
+      expect(stored.loadId).toBe("new");
+      expect(stored.bodies).toHaveLength(1);
+      expect([...values.keys()].filter((key) => key.includes("old"))).toEqual([]);
     }),
   );
 
@@ -166,6 +182,16 @@ const makeLoader = (fetchFn: typeof fetch, journal: ShellLoadJournal["Service"])
 
 const ids = (snapshot: OrchestrationV2ShellSnapshot) => snapshot.threads.map((t) => t.id);
 
+const pageBody = (after: string | null, nextAfter: string, snapshotSequence: number) =>
+  JSON.stringify({
+    schemaVersion: 1,
+    snapshotSequence,
+    projects: [],
+    threads: [row(`r-${snapshotSequence}`)],
+    archivedThreads: [],
+    page: { after, nextAfter },
+  });
+
 describe("shell loader with a journal", () => {
   it.effect("a new client goes on from the page the previous one stored", () =>
     Effect.gen(function* () {
@@ -231,6 +257,35 @@ describe("shell loader with a journal", () => {
       const stale = shellServer();
       yield* (yield* makeLoader(stale.fetchFn, journal)).load(prepared("1.0.0"));
       expect(stale.afters[0]).toBeNull();
+    }),
+  );
+
+  it.effect("starts over when stored pages do not follow one another", () =>
+    Effect.gen(function* () {
+      const { store } = memoryStore();
+      const journal = makeKeyValueShellLoadJournal(store);
+      // Two windows wrote one load: page 1 answers a cursor page 0 never gave.
+      const write = (index: number, body: string, nextAfter: string) =>
+        journal.append(ENVIRONMENT, {
+          key: [ENVIRONMENT, TARGET.httpBaseUrl, "1.0.0", ""].join("\u001f"),
+          loadId: "shared",
+          index,
+          body,
+          nextAfter,
+          updatedAt: 0,
+        });
+      yield* write(0, pageBody(null, "walk:0", 10), "walk:0");
+      yield* write(1, pageBody("walk:0-other", "walk:1", 11), "walk:1");
+      const server = shellServer();
+      yield* (yield* makeLoader(server.fetchFn, journal)).load(prepared("1.0.0"));
+      expect(server.afters[0]).toBeNull();
+
+      // The same pages in a proper chain do resume.
+      yield* write(0, pageBody(null, "walk:0", 10), "walk:0");
+      yield* write(1, pageBody("walk:0", "walk:1", 11), "walk:1");
+      const resumed = shellServer();
+      yield* (yield* makeLoader(resumed.fetchFn, journal)).load(prepared("1.0.0"));
+      expect(resumed.afters).toEqual(["walk:1"]);
     }),
   );
 

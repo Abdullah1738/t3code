@@ -551,6 +551,35 @@ export function resolveSidebarRowThreadId(
 }
 
 /**
+ * ardud: the Active shelf draws a bounded slice (`boundedSidebarTail`), so a drop target's
+ * active order names only drawn rows. This places the moved row in the whole shelf instead:
+ * before the drawn row that follows it, or right after the drawn row above it. Hidden rows
+ * keep their places, and a drop at the end of the slice stays above them.
+ */
+export function withWholeActiveOrder(
+  target: SidebarDropTarget,
+  activeOrder: readonly string[],
+  movedKey: string,
+): SidebarDropTarget {
+  if (target.section !== "active") return target;
+  const at = target.activeOrder.indexOf(movedKey);
+  if (at === -1) return target;
+  const drawn = new Set(target.activeOrder);
+  if (activeOrder.every((key) => drawn.has(key))) return target;
+  const order = activeOrder.filter((key) => key !== movedKey);
+  const next = target.activeOrder[at + 1];
+  const previous = target.activeOrder[at - 1];
+  const index =
+    next !== undefined
+      ? order.indexOf(next)
+      : previous !== undefined
+        ? order.indexOf(previous) + 1
+        : 0;
+  order.splice(index === -1 ? order.length : index, 0, movedKey);
+  return { ...target, activeOrder: order };
+}
+
+/**
  * The first `count` rows of a shelf, plus the route's row when it sits further down so the
  * open thread stays visible. Returns `rows` itself when nothing is cut.
  */

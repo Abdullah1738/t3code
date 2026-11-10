@@ -18,8 +18,10 @@
  *        (write sampling heap profiles next to OUT.json), ROBOB_PERF_SCENARIOS
  *        (default "cold,reload,crash"), ROBOB_PERF_WRITES_PER_S (default 30),
  *        ROBOB_PERF_PROFILE_AT_PAGE=N (heap + CPU profile once N pages landed).
- * Fails when a renderer crashes, a list never completes, the heap peak or the heap kept after
- * a forced GC passes its limit, or the renderer after a crash starts the walk at page one.
+ * Fails when a renderer crashes, a list never completes, the client's saved list (its shell
+ * cache, written from the rows it applied) differs in size from the server's, the heap peak or
+ * the heap kept after a forced GC passes its limit, or the renderer after a crash starts the
+ * walk at page one.
  * Requires apps/web/dist built from this tree. Never prints the pairing URL.
  */
 import * as NodeChildProcess from "node:child_process";
@@ -175,6 +177,35 @@ const pairUrl = await new Promise<string>((ok, fail) => {
     }
   });
 });
+
+// Rows a complete client list holds: the server's whole shell, read once.
+const serverRows: number = await fetch(`${origin}/api/orchestration/shell`, {
+  headers: { authorization: `Bearer ${token}` },
+})
+  .then((r) => r.json())
+  .then((snapshot) => snapshot.threads.length);
+
+// Rows in the client's saved shell list (IndexedDB), as JSON the client wrote after applying
+// them. Journal entries (keys with a NUL) are skipped.
+const CACHED_ROWS = `new Promise((ok) => {
+  const open = indexedDB.open("t3code:connection-runtime");
+  open.onerror = () => ok(-1);
+  open.onsuccess = () => {
+    const db = open.result;
+    if (!db.objectStoreNames.contains("shell")) return ok(-1);
+    const request = db.transaction("shell").objectStore("shell").openCursor();
+    let rows = -1;
+    request.onerror = () => ok(-1);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) { db.close(); return ok(rows); }
+      if (!String(cursor.key).includes("\\u0000") && typeof cursor.value === "string") {
+        try { rows = Math.max(rows, JSON.parse(cursor.value).snapshot.threads.length); } catch {}
+      }
+      cursor.continue();
+    };
+  };
+})`;
 
 // The event writer: metadata updates on unsettled and settled rows, over the socket.
 let writing = writesPerSecond > 0;
@@ -403,6 +434,7 @@ const runScenario = async (name: string, navigateTo: string) => {
   sampling = false;
   await sampler;
   let retainedMb: number | null = null;
+  let cachedRows: number | null = null;
   let profileFile: string | null = null;
   if (!crashed) {
     if (heapProfiles) {
@@ -414,6 +446,17 @@ const runScenario = async (name: string, navigateTo: string) => {
     await send("HeapProfiler.collectGarbage", {}, sessionId, 120_000);
     const usage = await send("Runtime.getHeapUsage", {}, sessionId);
     retainedMb = usage.usedSize / MB;
+    // The cache is written in the background; give it up to 30 s to hold the whole list.
+    for (let tries = 0; tries < 30 && cachedRows !== serverRows; tries++) {
+      if (tries > 0) await delay(1_000);
+      const { result } = await send(
+        "Runtime.evaluate",
+        { expression: CACHED_ROWS, awaitPromise: true, returnByValue: true },
+        sessionId,
+        60_000,
+      ).catch(() => ({ result: { value: -1 } }));
+      cachedRows = Number(result.value);
+    }
   }
   for (const stop of stops) stop();
   await send("Target.closeTarget", { targetId }).catch(() => undefined);
@@ -430,6 +473,7 @@ const runScenario = async (name: string, navigateTo: string) => {
     peakUsedMb: peak.usedMb,
     peakAtMs: peak.ms,
     retainedMb,
+    cachedRows,
     profileFile,
     samples: samples
       .filter((_, i) => i % 5 === 0)
@@ -465,6 +509,8 @@ for (const result of results) {
   if (result.name === "crash-first") continue;
   if (result.crashed) failures.push(`${result.name}: renderer crashed`);
   if (result.completeMs === null) failures.push(`${result.name}: list never completed`);
+  else if (result.cachedRows !== serverRows)
+    failures.push(`${result.name}: client saved ${result.cachedRows} rows, server has ${serverRows}`);
   if (result.peakUsedMb > maxPeakMb)
     failures.push(`${result.name}: peak ${result.peakUsedMb.toFixed(0)} MB > ${maxPeakMb}`);
   if (result.retainedMb !== null && result.retainedMb > maxRetainedMb)
@@ -474,7 +520,7 @@ for (const result of results) {
 }
 const report = {
   writer: { writesPerSecond, writes },
-  fixture: { threads: fixture.threads ?? null, hash: fixture.fixtureHash ?? null },
+  fixture: { threads: fixture.threads ?? null, hash: fixture.fixtureHash ?? null, serverRows },
   gate: { maxPeakMb, maxRetainedMb, crashAtPage },
   results,
   failures,

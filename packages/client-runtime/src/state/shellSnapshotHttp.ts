@@ -216,6 +216,20 @@ export function mergeHttpShellPages(
   };
 }
 
+/**
+ * Stored pages resume a load only when each one answers the cursor of the page before it and
+ * the last one gives the recorded cursor. Two windows writing the same load can leave pages
+ * from different walks side by side; those are read again instead.
+ */
+function isPageChain(pages: ReadonlyArray<DeferredShellSnapshot>, nextAfter: string): boolean {
+  let cursor: string | null | undefined;
+  for (const [index, { page }] of pages.entries()) {
+    if (page === undefined || (index > 0 && page.after !== cursor)) return false;
+    cursor = page.nextAfter;
+  }
+  return pages.length > 0 && cursor === nextAfter;
+}
+
 const decodeJsonBody = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const decodeEnvironmentHttpCommonError = Schema.decodeUnknownEffect(
@@ -322,17 +336,14 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
       if (Option.isNone(stored)) return undefined;
       const { value } = stored;
       if (value.key !== key || now - value.updatedAt > SHELL_LOAD_RESUME_MAX_AGE_MS) {
-        yield* journal.value.clear(prepared.environmentId);
+        yield* journal.value.clear(prepared.environmentId, value.loadId);
         return undefined;
       }
       const pages = yield* Effect.forEach(value.bodies, (body) =>
         decodeJsonBody(body).pipe(Effect.flatMap(decodeShellSnapshotDeferringPullRequests)),
       ).pipe(Effect.option);
-      if (
-        Option.isNone(pages) ||
-        pages.value[pages.value.length - 1]?.page?.nextAfter !== value.nextAfter
-      ) {
-        yield* journal.value.clear(prepared.environmentId);
+      if (Option.isNone(pages) || !isPageChain(pages.value, value.nextAfter)) {
+        yield* journal.value.clear(prepared.environmentId, value.loadId);
         return undefined;
       }
       return {
@@ -388,7 +399,9 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
               progressByConnection.delete(key);
             }).pipe(
               Effect.andThen(
-                Option.isSome(journal) ? journal.value.clear(prepared.environmentId) : Effect.void,
+                Option.isSome(journal)
+                  ? journal.value.clear(prepared.environmentId, loadId)
+                  : Effect.void,
               ),
             ),
           ),

@@ -198,6 +198,7 @@ import {
   filterSidebarProjectScopeItems,
   formatWorkingDurationLabel,
   boundedSidebarTail,
+  withWholeActiveOrder,
   firstValidTimestampMs,
   hasUnseenCompletion,
   isSidebarNestedLinkClick,
@@ -3727,8 +3728,9 @@ export default function Sidebar() {
     if (source === undefined) return createSidebarCollisionDetection(() => false);
     return createSidebarCollisionDetection(
       (id) => {
-        const target = resolveSidebarDropTarget(sidebarListItems, draggedThreadKey, id);
-        if (target === null) return false;
+        const drop = resolveSidebarDropTarget(sidebarListItems, draggedThreadKey, id);
+        if (drop === null) return false;
+        const target = withWholeActiveOrder(drop, activeKeys, draggedThreadKey);
         return (
           planSidebarThreadDrop({
             activeKey: draggedThreadKey,
@@ -3758,10 +3760,11 @@ export default function Sidebar() {
   const handleThreadDragEnd = (event: DragEndEvent) => {
     const activeKey = String(event.active.id);
     const activeSection = sectionByThreadKey.get(activeKey);
-    const target =
+    const drop =
       event.over === null
         ? null
         : resolveSidebarDropTarget(sidebarListItems, activeKey, String(event.over.id));
+    const target = drop === null ? null : withWholeActiveOrder(drop, activeKeys, activeKey);
     const activeThread = threadByKey.get(activeKey);
     if (activeSection === undefined || target === null || activeThread === undefined) return;
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
