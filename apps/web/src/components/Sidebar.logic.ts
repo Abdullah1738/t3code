@@ -550,6 +550,25 @@ export function resolveSidebarRowThreadId(
   return thread?.id ?? threadId;
 }
 
+/**
+ * The first `count` rows of a shelf, plus the route's row when it sits further down so the
+ * open thread stays visible. Returns `rows` itself when nothing is cut.
+ */
+export function boundedSidebarTail<T>(
+  rows: readonly T[],
+  count: number,
+  routeKey: string | null,
+  keyOf: (row: T) => string,
+): readonly T[] {
+  if (rows.length <= count) return rows;
+  const visible = rows.slice(0, count);
+  if (routeKey !== null) {
+    const route = rows.slice(count).find((row) => keyOf(row) === routeKey);
+    if (route !== undefined) visible.push(route);
+  }
+  return visible;
+}
+
 export function filterSidebarV2VisibleThreads<
   T extends Pick<SidebarThreadSummary, "archivedAt" | "lineage"> & {
     environmentId: string;

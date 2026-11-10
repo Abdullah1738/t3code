@@ -405,11 +405,16 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
               }),
             ),
           );
-          const httpSnapshot = yield* snapshotLoader.load(prepared, (page) =>
-            applyItems(
-              [[session, { kind: "snapshot", snapshot: withoutDeferredPullRequests(page) }]],
-              new Set(page.loadPullRequests ? page.threads.map((thread) => thread.id) : []),
-            ),
+          const httpSnapshot = yield* snapshotLoader.load(
+            prepared,
+            (page) =>
+              applyItems(
+                [[session, { kind: "snapshot", snapshot: withoutDeferredPullRequests(page) }]],
+                new Set(page.loadPullRequests ? page.threads.map((thread) => thread.id) : []),
+              ),
+            initialConfig === null
+              ? undefined
+              : { serverVersion: initialConfig.environment.serverVersion },
           );
           if (Option.isSome(httpSnapshot)) {
             yield* cancelActiveFill;

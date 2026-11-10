@@ -18,6 +18,12 @@ import {
   makeStoredShellSnapshotEncoder,
 } from "@t3tools/client-runtime/platform";
 import { TokenStore } from "@t3tools/client-runtime/authorization";
+// ardud: a paged shell load's pages, so a renderer that died mid-load resumes.
+import {
+  ShellLoadJournal,
+  makeKeyValueShellLoadJournal,
+  shellLoadRecordKey,
+} from "@t3tools/client-runtime/ardud/shellLoadJournal";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
@@ -915,6 +921,14 @@ export const layer = Layer.effectContext(
             removeDatabaseValue(database, SHELL_STORE_NAME, environmentId),
             removeDatabaseValuesInRange(
               database,
+              SHELL_STORE_NAME,
+              IDBKeyRange.bound(
+                shellLoadRecordKey(environmentId),
+                `${shellLoadRecordKey(environmentId)}\uffff`,
+              ),
+            ),
+            removeDatabaseValuesInRange(
+              database,
               THREAD_STORE_NAME,
               IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
             ),
@@ -929,7 +943,18 @@ export const layer = Layer.effectContext(
         ).pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });
 
+    // ardud: journal records sit in the shell store under keys no environment id can take
+    // (`<environment>\0shell-load...`), so builds without the journal never see them and no
+    // database version change is needed.
+    const shellLoadJournal = makeKeyValueShellLoadJournal({
+      get: (key) => readDatabaseValue(database, SHELL_STORE_NAME, key),
+      put: (key, value) => writeDatabaseValue(database, SHELL_STORE_NAME, key, value),
+      removeRange: (from, to) =>
+        removeDatabaseValuesInRange(database, SHELL_STORE_NAME, IDBKeyRange.bound(from, to)),
+    });
+
     return Context.make(Persistence.ConnectionTargetStore, targetStore).pipe(
+      Context.add(ShellLoadJournal, shellLoadJournal),
       Context.add(GitHubRoutingPermissions, githubRoutingPermissions),
       Context.add(Persistence.ConnectionRegistrationStore, registrationStore),
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),

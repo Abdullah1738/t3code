@@ -21,7 +21,51 @@ export const scales = {
   "1x": { threads: 20000, nodes: 1260000, agents: 32, boards: 8 },
   "5x": { threads: 100000, nodes: 6300000, agents: 128, boards: 40 },
   "10x": { threads: 200000, nodes: 12600000, agents: 512, boards: 80 },
+  // The live desktop thread list (10 Nov 2026): ~18,000 active rows at 2.2-3.4 KB each.
+  // Rows only; the shell memory gate does not read turn items.
+  shell: { threads: 20000, nodes: 0, agents: 0, boards: 1 },
 } as const;
+const richRows: ReadonlySet<keyof typeof scales> = new Set(["shell"]);
+/** Pull request links as the live list carries them, so a row weighs what a live row does. */
+function richRowFields(i: number) {
+  const linkedAt = new Date(Date.UTC(2026, 9, 1) + i * 60_000).toISOString();
+  const link = (n: number) => ({
+    host: "github.com",
+    repository: `synthetic-org/repository-${i % 40}`,
+    number: n,
+    url: `https://github.com/synthetic-org/repository-${i % 40}/pull/${n}`,
+    repositoryWebUrl: `https://github.com/synthetic-org/repository-${i % 40}`,
+    source: "created",
+    linkedAt,
+    snapshot: {
+      state: "open",
+      title: `Synthetic pull request ${n} for thread ${i}: a change with a descriptive title`,
+      headBranch: `robob/synthetic-task-${i}-${n}`,
+      baseBranch: "main",
+      isDraft: false,
+      updatedAt: linkedAt,
+      syncedAt: linkedAt,
+      author: { login: "synthetic-author", name: "Synthetic Author", avatarUrl: null },
+      additions: 120 + (i % 500),
+      deletions: 30 + (i % 90),
+      changedFiles: 3 + (i % 20),
+      reviewDecision: "review-required",
+      checksState: "passing",
+    },
+    stack: null,
+  });
+  // The live desktop list (10 Nov 2026) had 7% of its rows settled; 13,800 unsettled
+  // top-level rows were in the sidebar's active section whenever its filters let them through.
+  const settled = i % 14 === 0;
+  return {
+    settledOverride: settled ? "settled" : null,
+    settledAt: settled ? linkedAt : null,
+    title: `Synthetic ${i}: investigate and fix a realistic task with a long descriptive title`,
+    branch: `robob/synthetic-task-${i}`,
+    worktreePath: `/Users/synthetic/checkouts/synthetic-task-${i}`,
+    pullRequests: [link(1 + (i % 900)), link(1001 + (i % 900))],
+  };
+}
 export function random(seed: number) {
   let s = seed >>> 0;
   return () => {
@@ -98,6 +142,7 @@ export async function fixture(directory: string, scale: keyof typeof scales, see
       payload = JSON.parse(String(template.payload_json));
     payload.id = id;
     payload.title = `Synthetic ${i}`;
+    if (richRows.has(scale)) Object.assign(payload, richRowFields(i));
     payload.lineage.rootThreadId = id;
     const archived = i % 10 === 9 ? at : null;
     payload.archivedAt = archived;

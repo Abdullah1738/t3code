@@ -197,6 +197,7 @@ import {
   deleteSelectedThreadEntries,
   filterSidebarProjectScopeItems,
   formatWorkingDurationLabel,
+  boundedSidebarTail,
   firstValidTimestampMs,
   hasUnseenCompletion,
   isSidebarNestedLinkClick,
@@ -374,6 +375,11 @@ const EMPTY_THREADS: readonly EnvironmentThreadShell[] = [];
 
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
+// ardud: every drawn row keeps its own fibers, hooks and tooltip state (~200 KB of heap
+// measured), so the active shelf draws its first rows and a "Show more" for the rest. The
+// live list had 13,800 unsettled rows; drawn in full they ran the renderer out of memory.
+const ACTIVE_TAIL_INITIAL_COUNT = 300;
+const ACTIVE_TAIL_PAGE_COUNT = 300;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
@@ -521,6 +527,15 @@ function useSidebarThreads(input: {
   }
   const settledVisibleCount =
     settledTail.scopeKey === projectScopeKey ? settledTail.count : SETTLED_TAIL_INITIAL_COUNT;
+  const [activeTail, setActiveTail] = useState({
+    scopeKey: projectScopeKey,
+    count: ACTIVE_TAIL_INITIAL_COUNT,
+  });
+  if (activeTail.scopeKey !== projectScopeKey) {
+    setActiveTail({ scopeKey: projectScopeKey, count: ACTIVE_TAIL_INITIAL_COUNT });
+  }
+  const activeVisibleCount =
+    activeTail.scopeKey === projectScopeKey ? activeTail.count : ACTIVE_TAIL_INITIAL_COUNT;
 
   const partition = partitionSidebarThreads({
     threads,
@@ -549,6 +564,12 @@ function useSidebarThreads(input: {
   const renderedSettledThreads = settledShelfExpanded
     ? visibleSettledThreads
     : routeThreadOnly(visibleSettledThreads, routeRowThreadKey);
+  const renderedActiveThreads = boundedSidebarTail(
+    activeThreads,
+    activeVisibleCount,
+    routeRowThreadKey,
+    threadShellKey,
+  );
   const visibleSnoozedThreads = snoozedShelfExpanded
     ? snoozedThreads
     : routeThreadOnly(snoozedThreads, routeRowThreadKey);
@@ -557,7 +578,7 @@ function useSidebarThreads(input: {
     : routeThreadOnly(workingThreads, routeRowThreadKey);
   const orderedThreads = [
     ...pinnedThreads,
-    ...activeThreads,
+    ...renderedActiveThreads,
     ...visibleWorkingThreads,
     ...visibleSnoozedThreads,
     ...renderedSettledThreads,
@@ -586,6 +607,13 @@ function useSidebarThreads(input: {
     ],
     settledVisibleCount,
     hiddenSettledCount: settledThreads.length - visibleSettledThreads.length,
+    renderedActiveThreads,
+    hiddenActiveCount: Math.max(0, activeThreads.length - renderedActiveThreads.length),
+    showMoreActive: () =>
+      setActiveTail((current) => ({
+        scopeKey: current.scopeKey,
+        count: current.count + ACTIVE_TAIL_PAGE_COUNT,
+      })),
     showMoreSettled: () =>
       setSettledTail((current) => ({
         scopeKey: current.scopeKey,
@@ -3026,6 +3054,9 @@ export default function Sidebar() {
     settledVisibleCount,
     hiddenSettledCount,
     showMoreSettled,
+    renderedActiveThreads,
+    hiddenActiveCount,
+    showMoreActive,
     settledShelfExpanded,
     toggleSettledShelf,
     snoozedShelfExpanded,
@@ -3594,7 +3625,7 @@ export default function Sidebar() {
     const pinnedRows = rowsOf(pinnedThreads, "pinned");
     items.push(...pinnedRows);
     items.push({ kind: "marker", marker: "pinned-divider" });
-    const activeRows = rowsOf(activeThreads, "active");
+    const activeRows = rowsOf(renderedActiveThreads, "active");
     items.push({ kind: "marker", marker: "active-placeholder" });
     items.push(...activeRows);
     if (workingThreads.length > 0) {
@@ -4960,10 +4991,33 @@ export default function Sidebar() {
                           onDraftContextMenu={handleDraftContextMenu}
                         />,
                       ];
+                      let activeMoreShown = false;
                       for (const item of sidebarListItems) {
                         if (item.kind === "thread") {
                           items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
                           continue;
+                        }
+                        // ardud: the active shelf ends at the first shelf header after it.
+                        if (
+                          !activeMoreShown &&
+                          hiddenActiveCount > 0 &&
+                          (item.marker === "working-header" ||
+                            item.marker === "snoozed-header" ||
+                            item.marker === "settled-header")
+                        ) {
+                          activeMoreShown = true;
+                          items.push(
+                            <li key="active-show-more" className="list-none">
+                              <button
+                                type="button"
+                                onClick={showMoreActive}
+                                className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+                              >
+                                <PlusIcon aria-hidden className="size-4 shrink-0" />
+                                Show {Math.min(hiddenActiveCount, ACTIVE_TAIL_PAGE_COUNT)} more
+                              </button>
+                            </li>,
+                          );
                         }
                         switch (item.marker) {
                           case "pinned-header":

@@ -6,6 +6,7 @@ import { defaultAnimateLayoutChanges, type AnimateLayoutChanges } from "@dnd-kit
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import {
+  boundedSidebarTail,
   animateSidebarLayoutChanges,
   archiveSelectedThreadEntries,
   buildBulkTitleRegenerationContextMenuItem,
@@ -2436,5 +2437,24 @@ describe("Working shelf (beta)", () => {
         unsnooze: false,
       });
     });
+  });
+});
+
+describe("boundedSidebarTail", () => {
+  const rows = Array.from({ length: 5 }, (_, index) => ({ key: `row-${index}` }));
+  const keyOf = (row: { readonly key: string }) => row.key;
+
+  it("returns the shelf itself when it fits", () => {
+    expect(boundedSidebarTail(rows, 5, null, keyOf)).toBe(rows);
+  });
+
+  it("cuts the shelf and keeps the open thread visible", () => {
+    expect(boundedSidebarTail(rows, 2, null, keyOf).map(keyOf)).toEqual(["row-0", "row-1"]);
+    expect(boundedSidebarTail(rows, 2, "row-4", keyOf).map(keyOf)).toEqual([
+      "row-0",
+      "row-1",
+      "row-4",
+    ]);
+    expect(boundedSidebarTail(rows, 2, "row-1", keyOf).map(keyOf)).toEqual(["row-0", "row-1"]);
   });
 });

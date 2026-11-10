@@ -71,6 +71,10 @@
       "types": "./src/ardud/kanban/index.ts",
       "default": "./src/ardud/kanban/index.ts"
     },
+    "./ardud/shellLoadJournal": {
+      "types": "./src/ardud/shellLoadJournal.ts",
+      "default": "./src/ardud/shellLoadJournal.ts"
+    },
     "./ardud/models/harnessRouting": {
       "types": "./src/ardud/models/harnessRouting.ts",
       "default": "./src/ardud/models/harnessRouting.ts"
