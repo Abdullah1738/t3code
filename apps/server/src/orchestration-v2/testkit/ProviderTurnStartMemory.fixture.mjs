@@ -92,6 +92,14 @@ const dependencies = Layer.mergeAll(
       }),
     getTurnStartHistory: () => Effect.sync(() => current.turnItems),
     getRuntimeRecoveryProjection: () => Effect.sync(() => current),
+    // ardud: the run-control checks read one run's attempt and status, not the projection.
+    getRunControlState: (_threadId, runId) =>
+      Effect.sync(() => {
+        const run = current.runs.find((candidate) => candidate.id === runId);
+        return run === undefined
+          ? null
+          : { activeAttemptId: run.activeAttemptId, status: run.status };
+      }),
   }),
   Layer.mock(Sessions.ProviderSessionManagerV2)({ open: () => Effect.succeed(session) }),
   Layer.mock(Policy.RuntimePolicyV2)({

@@ -406,7 +406,7 @@ export const KanbanAskAnswer = Schema.Struct({
   draftEdited: Schema.optional(Schema.Boolean),
   /**
    * Field id to the value given. A file field holds the attachments the board
-   * kept; a secret field holds `{ "secret": true }`, never the value.
+   * kept; a secret field holds `KANBAN_ASK_SECRET_PROVIDED`, never the value.
    */
   values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   /** He handed it over with "every time": an evaluator was asked to take asks like it from now on. */
@@ -476,6 +476,14 @@ export const KanbanOwnerAsk = Schema.Struct({
   clarifyAskedAt: Schema.optional(IsoDateTime),
   /** It is with the evaluator: the owner handed it over, or it was asked `to` the evaluator. */
   handedAt: Schema.optional(IsoDateTime),
+  /**
+   * The owner put it away until this time. It stays open and keeps holding its
+   * card, but leaves his count and list until the time passes, or until its
+   * asker edits it or replies on it. Only the owner sets and clears it.
+   */
+  snoozedUntil: Schema.optional(IsoDateTime),
+  /** Its asker ended a snooze early by editing or replying: it is back since then. */
+  backFromSnoozeAt: Schema.optional(IsoDateTime),
   /** He handed it over with "every time"; copied to the answer when it closes. */
   handedAlways: Schema.optional(Schema.Boolean),
   /** The evaluator thread "every time" started; copied to the answer when it closes. */
@@ -500,6 +508,41 @@ export const kanbanAskChanges = (
 
 /** The id of the one field a plain question takes; its value is stored as the answer's `text`. */
 export const KANBAN_ASK_ANSWER_FIELD = "answer";
+
+/** What a secret field holds in a stored answer: that he gave it, never the value. */
+export const KANBAN_ASK_SECRET_PROVIDED = { secret: true } as const;
+
+/**
+ * The owner's answer to an ask with secret fields, sent over the app's
+ * private channel (WS `secrets.answerAsk`), never the board's HTTP routes.
+ * `answer` is what the answer route takes, without the secret fields.
+ * `secrets` maps a secret field's id to the value he typed: it goes to the
+ * server's secret store, in memory, and the asking agent gets a one-use
+ * secretRef for it. The card stores only `KANBAN_ASK_SECRET_PROVIDED`.
+ */
+export const KanbanAskSecretAnswerInput = Schema.Struct({
+  cardId: KanbanCardId,
+  askId: Schema.String,
+  answer: Schema.Struct({
+    verdict: Schema.String,
+    optionIds: Schema.optional(Schema.Array(Schema.String)),
+    text: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+    finalDraft: Schema.optional(Schema.String),
+    values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+    /** The revision the client showed; a newer one refuses the answer. */
+    revision: Schema.optional(Schema.Int),
+  }),
+  secrets: Schema.Record(Schema.String, Schema.String),
+});
+export type KanbanAskSecretAnswerInput = typeof KanbanAskSecretAnswerInput.Type;
+
+/** The same reply as the answer route: where the card is now, and the ask as stored. */
+export const KanbanAskSecretAnswerResult = Schema.Struct({
+  card: Schema.Struct({ id: KanbanCardId, number: Schema.Number, stage: KanbanStage }),
+  ask: Schema.NullOr(KanbanOwnerAsk),
+});
+export type KanbanAskSecretAnswerResult = typeof KanbanAskSecretAnswerResult.Type;
 
 /** What the owner gives back on an ask, with every default filled in. */
 export interface KanbanAskResponse {
@@ -607,6 +650,59 @@ export const kanbanAskWaitsOn = (
 /** Past its `expiresAt`: its asker must renew it before it can be answered. */
 export const kanbanAskExpired = (ask: Pick<KanbanOwnerAsk, "expiresAt">, nowMs: number): boolean =>
   ask.expiresAt !== undefined && Date.parse(ask.expiresAt) <= nowMs;
+/** Put away by the owner and not back yet. It is still his turn (`kanbanAskWaitsOn` says "owner"). */
+export const kanbanAskSnoozed = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "closedAt">,
+  nowMs: number,
+): boolean =>
+  ask.closedAt === null && ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) > nowMs;
+/**
+ * When an open ask came back from a snooze: the time it was snoozed until, or
+ * the earlier time its asker edited it or replied. Null when it was never
+ * snoozed, is still snoozed, or the owner has acted on it since.
+ */
+export const kanbanAskBackFromSnooze = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt" | "closedAt">,
+  nowMs: number,
+): string | null =>
+  ask.closedAt !== null
+    ? null
+    : (ask.backFromSnoozeAt ??
+      (ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) <= nowMs
+        ? ask.snoozedUntil
+        : null));
+
+/**
+ * One automatic retry on a card's current attempt. A failed run, or a reviewer that
+ * ended without a verdict, is run again once before the card is flagged; this
+ * records which, so the second failure of the same kind flags.
+ */
+export const KanbanCardRetry = Schema.Struct({
+  /** What went wrong: the run failed, or a nudged reviewer still gave no verdict. */
+  kind: Schema.Literals(["run_failed", "no_verdict"]),
+  role: Schema.Literals(["work", "review"]),
+  /** The failed run, so the same failure reported again isn't counted twice; null for no_verdict. */
+  runId: Schema.NullOr(Schema.String),
+  /** Why, in the provider's words or the board's. */
+  reason: Schema.String,
+  /** When the failure was seen; for a failed run the retry may start KANBAN_RETRY_BACKOFF_MS later. */
+  at: IsoDateTime,
+  /**
+   * waiting: a failed run's one retry. The card went back to its queue with its
+   * thread and no slot, isn't started before the backoff is over, and keeps the
+   * record until the retried turn ends. restarted: a review with no verdict,
+   * started again at once.
+   */
+  state: Schema.Literals(["waiting", "restarted"]),
+});
+export type KanbanCardRetry = typeof KanbanCardRetry.Type;
+
+/**
+ * How long a failed run's card waits in its queue before the dispatcher may start
+ * it again, so a provider that just failed is not hit again at once. The card holds
+ * no pool slot meanwhile.
+ */
+export const KANBAN_RETRY_BACKOFF_MS = 60_000;
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -657,6 +753,12 @@ export const KanbanCard = Schema.Struct({
   wakeNote: Schema.NullOr(Schema.String),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
+  /**
+   * Automatic retries used on the current attempt, at most one per kind. Absent on
+   * most cards and on every card stored before retries existed. Cleared by a real
+   * move, a turn that ends normally, a review verdict and a flag.
+   */
+  retries: Schema.optional(Schema.Array(KanbanCardRetry)),
   settledAt: Schema.NullOr(IsoDateTime),
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
@@ -664,6 +766,33 @@ export const KanbanCard = Schema.Struct({
   movedAt: IsoDateTime,
 });
 export type KanbanCard = typeof KanbanCard.Type;
+
+/**
+ * The retry a card is in the middle of, for a board to show "Retrying": a failed
+ * run waiting in its queue to be started again, or the retried run that hasn't
+ * ended. A flagged card is past retrying.
+ */
+export const kanbanRetrying = (
+  card: Pick<KanbanCard, "retries" | "stalled" | "settledAt">,
+): KanbanCardRetry | undefined =>
+  card.stalled !== null || card.settledAt !== null ? undefined : card.retries?.at(-1);
+
+/**
+ * The time (epoch ms) before which the dispatcher must not start a card: the end
+ * of a failed run's backoff. Null when the card waits on no retry. It says nothing
+ * about a card that is running; the dispatcher only asks it of cards in a queue.
+ */
+export const kanbanRetryNotBefore = (card: Pick<KanbanCard, "retries">): number | null => {
+  let notBefore: number | null = null;
+  for (const retry of card.retries ?? []) {
+    if (retry.state !== "waiting") continue;
+    const at = Date.parse(retry.at);
+    // A stamp that doesn't parse holds nothing back.
+    if (!Number.isFinite(at)) continue;
+    notBefore = Math.max(notBefore ?? 0, at + KANBAN_RETRY_BACKOFF_MS);
+  }
+  return notBefore;
+};
 
 /** The models a card's work may start on, highest weight first. */
 export const kanbanCardModels = (card: KanbanCard): ReadonlyArray<KanbanCardModel> =>
@@ -678,15 +807,18 @@ export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "sett
 
 type AskTurnFields = Pick<
   KanbanOwnerAsk,
-  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt"
+  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt" | "snoozedUntil"
 > & { readonly respond?: { readonly ack?: boolean | undefined } | undefined };
 
 /**
  * An open ask that needs the owner now: his turn, not past its `expiresAt`,
- * and something to decide (a notice only wants to be seen).
+ * not snoozed, and something to decide (a notice only wants to be seen).
  */
 export const kanbanAskNeedsOwner = (ask: AskTurnFields, nowMs: number): boolean =>
-  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs) && !kanbanAskIsNotice(ask);
+  kanbanAskWaitsOn(ask) === "owner" &&
+  !kanbanAskExpired(ask, nowMs) &&
+  !kanbanAskSnoozed(ask, nowMs) &&
+  !kanbanAskIsNotice(ask);
 
 export interface KanbanAskTurns {
   /** His turn, and answerable. */
@@ -697,6 +829,8 @@ export interface KanbanAskTurns {
   readonly evaluator: number;
   /** His turn, but past `expiresAt`: their asker must renew them. */
   readonly expired: number;
+  /** His turn, but he put them away until later. */
+  readonly snoozed: number;
   /** His to see, nothing to decide. */
   readonly notices: number;
 }
@@ -706,13 +840,14 @@ export const kanbanAskTurns = (
   card: { readonly settledAt: string | null; readonly asks: ReadonlyArray<AskTurnFields> },
   nowMs: number,
 ): KanbanAskTurns => {
-  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, notices: 0 };
+  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, snoozed: 0, notices: 0 };
   if (card.settledAt !== null) return turns;
   for (const ask of card.asks) {
     const turn = kanbanAskWaitsOn(ask);
     if (turn === null) continue;
     if (turn !== "owner") turns[turn] += 1;
     else if (kanbanAskExpired(ask, nowMs)) turns.expired += 1;
+    else if (kanbanAskSnoozed(ask, nowMs)) turns.snoozed += 1;
     else if (kanbanAskIsNotice(ask)) turns.notices += 1;
     else turns.owner += 1;
   }
@@ -722,8 +857,8 @@ export const kanbanAskTurns = (
 /**
  * Whether a card counts in the "needs you" numbers: it has an ask the owner can
  * answer now, or it sits in Needs Owner with no open ask to decide (a hold set by hand).
- * A card whose open asks are all handed over, waiting on their asker or expired
- * does not count, though a blocking one still holds it in Needs Owner.
+ * A card whose open asks are all handed over, waiting on their asker, expired or
+ * snoozed does not count, though a blocking one still holds it in Needs Owner.
  */
 export const kanbanCardNeedsOwner = (
   card: {
@@ -798,7 +933,13 @@ export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
   "verified",
 ]);
 
-const isOpenCard = (card: KanbanCard) =>
+/** The card fields the blocking graph reads: what a list read has to select to count what a card holds up. */
+export type KanbanBlockingCard = Pick<
+  KanbanCard,
+  "id" | "stage" | "settledAt" | "priority" | "blockedBy"
+>;
+
+const isOpenCard = (card: Pick<KanbanCard, "stage" | "settledAt">) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
@@ -865,63 +1006,382 @@ export interface KanbanBlocking {
   readonly urgency: number;
 }
 
+/** A waiting To-Do card gains one priority step for every this long it has been startable. */
+export const KANBAN_AGING_STEP_MS = 3 * 24 * 60 * 60 * 1000;
+/** Most priority steps waiting alone can add. */
+export const KANBAN_AGING_MAX_STEPS = 2;
+/** Open cards a card must hold up (the whole chain) to gain one priority step, then two. */
+export const KANBAN_FANOUT_STEPS: ReadonlyArray<number> = [10, 100];
+/**
+ * Fan-out and waiting never lift a card above this priority. P1 stays what the
+ * owner marked P1, or what holds a P1 card up.
+ */
+export const KANBAN_BOOST_FLOOR = 2;
+
+export interface KanbanSchedule extends KanbanBlocking {
+  /**
+   * The priority the card is picked at: `urgency`, lifted one step per
+   * KANBAN_FANOUT_STEPS threshold its `holds` reaches and one step per
+   * KANBAN_AGING_STEP_MS it has waited, never above KANBAN_BOOST_FLOOR.
+   */
+  readonly rank: number;
+  /** Steps `holds` earned (0 to KANBAN_FANOUT_STEPS.length), before the floor. */
+  readonly fanoutSteps: number;
+  /** Steps waiting earned (0 to KANBAN_AGING_MAX_STEPS), before the floor. */
+  readonly agingSteps: number;
+  /**
+   * Since when a To-Do card has had nothing unfinished to wait on: its last move, or
+   * the last move of its latest finished blocker. Null for a card outside To-Do or
+   * one that still waits on an unfinished card, which doesn't age.
+   */
+  readonly waitingSince: string | null;
+}
+
+export interface KanbanScheduleOptions {
+  /**
+   * The clock waiting is measured against. Left out, it is the newest `updatedAt` on
+   * the board, so the same cards always give the same order.
+   */
+  readonly nowMs?: number | undefined;
+  /**
+   * Memory the exact `holds` count may use, in 32-bit words. Past it, the rest of the
+   * counts are upper bounds (a card reached along two paths counts twice).
+   */
+  readonly maxWords?: number | undefined;
+}
+
+/** Default memory for exact counts: 64 MB, enough for about 20,000 open linked cards. */
+const SCHEDULE_MAX_WORDS = 16_000_000;
+
+const popcount = (word: number): number => {
+  let v = word - ((word >>> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+  return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+};
+
+/**
+ * The blocking graph of a board, walked once: for every open card, how many open
+ * cards it holds up (the whole chain) and the most urgent priority among them.
+ * Done and settled cards are left out, and a backlog card waiting on another doesn't
+ * count: nobody is going to do it.
+ *
+ * Cards in a loop of blocks are one group (Tarjan), and the groups come out waiters
+ * first, so each group's set of held-up cards is the union of the sets of the groups
+ * right behind it. The sets are bitsets: the cost is cards plus edges, times one
+ * word per 32 open cards for each edge.
+ */
+function blockingGraph<C extends KanbanBlockingCard>(cards: ReadonlyArray<C>, maxWords: number) {
+  const open: Array<C> = [];
+  const index = new Map<string, number>();
+  for (const card of cards) {
+    if (!isOpenCard(card) || index.has(card.id)) continue;
+    index.set(card.id, open.length);
+    open.push(card);
+  }
+  const n = open.length;
+  // Edges run blocker -> waiter, stored per blocker.
+  const start = new Int32Array(n + 1);
+  for (const waiter of open) {
+    if (waiter.priority === KANBAN_BACKLOG) continue;
+    for (const id of waiter.blockedBy) {
+      const blocker = index.get(id);
+      if (blocker !== undefined) start[blocker + 1] = (start[blocker + 1] ?? 0) + 1;
+    }
+  }
+  for (let i = 0; i < n; i += 1) start[i + 1] = (start[i + 1] ?? 0) + (start[i] ?? 0);
+  const targets = new Int32Array(start[n] ?? 0);
+  const fill = start.slice(0, n);
+  for (let w = 0; w < n; w += 1) {
+    const waiter = open[w]!;
+    if (waiter.priority === KANBAN_BACKLOG) continue;
+    for (const id of waiter.blockedBy) {
+      const blocker = index.get(id);
+      if (blocker === undefined) continue;
+      targets[fill[blocker]!] = w;
+      fill[blocker] = fill[blocker]! + 1;
+    }
+  }
+
+  // Tarjan's strongly connected components, with its own stack: a chain of blocks
+  // can be thousands of cards long.
+  const seenAt = new Int32Array(n).fill(-1);
+  const low = new Int32Array(n);
+  const group = new Int32Array(n).fill(-1);
+  const onStack = new Uint8Array(n);
+  const stack = new Int32Array(n);
+  const callNode = new Int32Array(n);
+  const callEdge = new Int32Array(n);
+  let stackSize = 0;
+  let counter = 0;
+  let groups = 0;
+  let depth = 0;
+  const enter = (v: number) => {
+    seenAt[v] = counter;
+    low[v] = counter;
+    counter += 1;
+    stack[stackSize] = v;
+    stackSize += 1;
+    onStack[v] = 1;
+    callNode[depth] = v;
+    callEdge[depth] = start[v]!;
+    depth += 1;
+  };
+  for (let root = 0; root < n; root += 1) {
+    if (seenAt[root] !== -1) continue;
+    enter(root);
+    while (depth > 0) {
+      const v = callNode[depth - 1]!;
+      const edge = callEdge[depth - 1]!;
+      if (edge < start[v + 1]!) {
+        callEdge[depth - 1] = edge + 1;
+        const w = targets[edge]!;
+        if (seenAt[w] === -1) enter(w);
+        else if (onStack[w] === 1 && seenAt[w]! < low[v]!) low[v] = seenAt[w]!;
+        continue;
+      }
+      depth -= 1;
+      if (low[v] === seenAt[v]) {
+        for (;;) {
+          stackSize -= 1;
+          const member = stack[stackSize]!;
+          onStack[member] = 0;
+          group[member] = groups;
+          if (member === v) break;
+        }
+        groups += 1;
+      }
+      if (depth > 0) {
+        const parent = callNode[depth - 1]!;
+        if (low[v]! < low[parent]!) low[parent] = low[v]!;
+      }
+    }
+  }
+
+  // Members per group. Group ids are in the order Tarjan closed them: every group a
+  // group holds up has a smaller id, so one pass in id order sees waiters first.
+  const memberStart = new Int32Array(groups + 1);
+  for (let v = 0; v < n; v += 1) memberStart[group[v]! + 1] = memberStart[group[v]! + 1]! + 1;
+  for (let g = 0; g < groups; g += 1) memberStart[g + 1] = memberStart[g + 1]! + memberStart[g]!;
+  const members = new Int32Array(n);
+  const memberFill = memberStart.slice(0, groups);
+  for (let v = 0; v < n; v += 1) {
+    const g = group[v]!;
+    members[memberFill[g]!] = v;
+    memberFill[g] = memberFill[g]! + 1;
+  }
+
+  const words = (n + 31) >>> 5;
+  let wordsLeft = maxWords;
+  /** Cards each group holds up beyond itself; null for a group that holds none, or past the memory limit. */
+  const reach: Array<Uint32Array | null> = Array.from({ length: groups }, () => null);
+  const held = new Int32Array(groups);
+  const exact = new Uint8Array(groups).fill(1);
+  /** The most urgent priority in the group, and among the cards it holds up. */
+  const own = new Int32Array(groups).fill(KANBAN_BACKLOG);
+  const below = new Int32Array(groups).fill(KANBAN_BACKLOG);
+  const lastUnion = new Int32Array(groups).fill(-1);
+  for (let g = 0; g < groups; g += 1) {
+    let set: Uint32Array | null = null;
+    let sum = 0;
+    let isExact = true;
+    for (let m = memberStart[g]!; m < memberStart[g + 1]!; m += 1) {
+      const v = members[m]!;
+      const priority = open[v]!.priority;
+      if (priority < own[g]!) own[g] = priority;
+      for (let edge = start[v]!; edge < start[v + 1]!; edge += 1) {
+        const child = group[targets[edge]!]!;
+        if (child === g || lastUnion[child] === g) continue;
+        lastUnion[child] = g;
+        const urgent = Math.min(own[child]!, below[child]!);
+        if (urgent < below[g]!) below[g] = urgent;
+        const size = memberStart[child + 1]! - memberStart[child]!;
+        sum += held[child]! + size;
+        if (exact[child] === 0) isExact = false;
+        if (!isExact) continue;
+        if (set === null) {
+          if (wordsLeft < words) {
+            isExact = false;
+            continue;
+          }
+          wordsLeft -= words;
+          set = new Uint32Array(words);
+        }
+        const theirs = reach[child];
+        if (theirs) for (let i = 0; i < words; i += 1) set[i] = set[i]! | theirs[i]!;
+        for (let c = memberStart[child]!; c < memberStart[child + 1]!; c += 1) {
+          const bit = members[c]!;
+          set[bit >>> 5] = set[bit >>> 5]! | (1 << (bit & 31));
+        }
+      }
+    }
+    if (isExact && set !== null) {
+      let count = 0;
+      for (let i = 0; i < words; i += 1) count += popcount(set[i]!);
+      held[g] = count;
+      reach[g] = set;
+    } else if (!isExact) {
+      // An upper bound: every open card but this group's own.
+      held[g] = Math.min(sum, n - (memberStart[g + 1]! - memberStart[g]!));
+      exact[g] = 0;
+    }
+  }
+
+  return {
+    open,
+    /** What the card at `open[v]` holds up: the others in its loop, and everything behind it. */
+    of: (v: number): KanbanBlocking => {
+      const g = group[v]!;
+      const card = open[v]!;
+      return {
+        holds: held[g]! + (memberStart[g + 1]! - memberStart[g]!) - 1,
+        // A backlog card stays at the bottom whatever waits on it; only the owner takes it out.
+        urgency: card.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : Math.min(own[g]!, below[g]!),
+      };
+    },
+  };
+}
+
 /**
  * What each open card holds up. Done and settled cards are left out, and a
  * backlog card waiting on another doesn't count: nobody is going to do it.
+ * The one count of "unblocks": the dispatcher schedules by it, and the board's
+ * To-Do order, the ask feed and the Needs-you list all show it.
  */
-export function kanbanBlocking(cards: ReadonlyArray<KanbanCard>): Map<string, KanbanBlocking> {
+export function kanbanBlocking(
+  cards: ReadonlyArray<KanbanBlockingCard>,
+): Map<string, KanbanBlocking> {
+  const graph = blockingGraph(cards, SCHEDULE_MAX_WORDS);
+  return new Map(graph.open.map((card, v) => [card.id as string, graph.of(v)]));
+}
+
+/**
+ * The clock of a caller that has none: the newest stamp on any of the board's
+ * cards. It never runs ahead of the real time, so nothing ages or comes due early;
+ * on a board nothing has touched for a while it runs behind. The dispatcher passes
+ * the real time instead.
+ */
+export function kanbanBoardClock(cards: ReadonlyArray<Pick<KanbanCard, "updatedAt">>): number {
+  let newest = "";
+  for (const card of cards) if (card.updatedAt > newest) newest = card.updatedAt;
+  return newest === "" ? 0 : Date.parse(newest);
+}
+
+/**
+ * How every open card on a board is ranked for pick-up, from one pass over the
+ * blocking graph. A card's rank starts at its urgency (its own priority, or that of
+ * the most urgent card it holds up) and is lifted, never above KANBAN_BOOST_FLOOR:
+ * one step when it holds up 10 open cards and two at 100, and one step for every
+ * 3 days a To-Do card has been startable, at most two.
+ */
+export function kanbanSchedule(
+  cards: ReadonlyArray<KanbanCard>,
+  options: KanbanScheduleOptions = {},
+): Map<string, KanbanSchedule> {
+  const graph = blockingGraph(cards, options.maxWords ?? SCHEDULE_MAX_WORDS);
   const byId = new Map(cards.map((card) => [card.id as string, card]));
-  const waiters = new Map<string, Array<string>>();
-  for (const card of cards) {
-    if (!isOpenCard(card) || card.priority === KANBAN_BACKLOG) continue;
-    for (const id of card.blockedBy) {
-      const list = waiters.get(id) ?? [];
-      list.push(card.id);
-      waiters.set(id, list);
-    }
-  }
-  const result = new Map<string, KanbanBlocking>();
-  for (const card of cards) {
-    if (!isOpenCard(card)) continue;
-    // Breadth-first over the waiters; `seen` also ends a loop of blocks.
-    const seen = new Set<string>([card.id]);
-    const queue: Array<string> = [card.id];
-    let urgency = card.priority;
-    for (let i = 0; i < queue.length; i += 1) {
-      for (const id of waiters.get(queue[i] ?? "") ?? []) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        queue.push(id);
-        urgency = Math.min(urgency, byId.get(id)?.priority ?? urgency);
+  const nowMs = options.nowMs ?? kanbanBoardClock(cards);
+  const result = new Map<string, KanbanSchedule>();
+  graph.open.forEach((card, v) => {
+    const blocking = graph.of(v);
+    let waitingSince: string | null = card.stage === "todo" ? card.movedAt : null;
+    if (waitingSince !== null) {
+      for (const id of card.blockedBy) {
+        const blocker = byId.get(id);
+        if (blocker === undefined) continue;
+        if (!KANBAN_DONE_STAGES.has(blocker.stage) || kanbanAwaitsMerge(blocker)) {
+          waitingSince = null;
+          break;
+        }
+        if (blocker.movedAt > waitingSince) waitingSince = blocker.movedAt;
       }
     }
-    // A backlog card stays at the bottom whatever waits on it; only the owner takes it out.
-    result.set(card.id, {
-      holds: seen.size - 1,
-      urgency: card.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : urgency,
-    });
-  }
+    const waited = waitingSince === null ? 0 : nowMs - Date.parse(waitingSince);
+    // A stamp that doesn't parse ages nothing, rather than poisoning the order with NaN.
+    const agingSteps = Number.isFinite(waited)
+      ? Math.max(0, Math.min(KANBAN_AGING_MAX_STEPS, Math.floor(waited / KANBAN_AGING_STEP_MS)))
+      : 0;
+    const fanoutSteps = KANBAN_FANOUT_STEPS.filter((least) => blocking.holds >= least).length;
+    const rank =
+      blocking.urgency <= KANBAN_BOOST_FLOOR || card.priority === KANBAN_BACKLOG
+        ? blocking.urgency
+        : Math.max(KANBAN_BOOST_FLOOR, blocking.urgency - fanoutSteps - agingSteps);
+    result.set(card.id, { ...blocking, rank, fanoutSteps, agingSteps, waitingSince });
+  });
   return result;
 }
 
 /**
- * The order todo cards get picked up in: most urgent first, where a card
- * holding up an urgent card is as urgent as that card; then the one holding
- * up the most other cards; then the one waiting longest. The dispatcher uses
- * it and the board's To-Do column shows it.
+ * The order todo cards get picked up in: best rank first (see kanbanSchedule:
+ * a card holding up an urgent card is as urgent as that card, and holding up
+ * many cards or waiting for days lifts it); then the one holding up the most
+ * other cards; then the one waiting longest. The dispatcher uses it and the
+ * board's To-Do column shows it.
  */
-export function kanbanPickOrder(cards: ReadonlyArray<KanbanCard>) {
-  const blocking = kanbanBlocking(cards);
-  const of = (card: KanbanCard) => blocking.get(card.id) ?? { holds: 0, urgency: card.priority };
+export function kanbanPickOrder(
+  cards: ReadonlyArray<KanbanCard>,
+  options: KanbanScheduleOptions = {},
+) {
+  const schedule = kanbanSchedule(cards, options);
+  const of = (card: KanbanCard) => schedule.get(card.id) ?? { holds: 0, rank: card.priority };
   return (a: KanbanCard, b: KanbanCard) => {
     const x = of(a);
     const y = of(b);
     return (
-      x.urgency - y.urgency ||
+      x.rank - y.rank ||
       y.holds - x.holds ||
       a.movedAt.localeCompare(b.movedAt) ||
       a.number - b.number
     );
+  };
+}
+
+export interface KanbanCardFlow {
+  /** Open cards that can't start until this one is done, the whole chain. */
+  readonly unblocks: number;
+  /** The priority it is picked at; see kanbanSchedule. Its own priority for a done card. */
+  readonly rank: number;
+  /** A To-Do card nothing on the card itself keeps from starting (the board's pause and pools aside). */
+  readonly ready: boolean;
+  /** The unfinished cards it lists as blockers, including one its own work thread does first. */
+  readonly waitsOn: ReadonlyArray<KanbanCard>;
+  /** The card actually holding it up, if any; see kanbanHeldUpBy. */
+  readonly heldUpBy: KanbanCard | undefined;
+}
+
+/**
+ * What a board shows about one card's place in the queue. `schedule` is
+ * kanbanSchedule of the same cards, built once per board.
+ */
+export function kanbanCardFlow(
+  card: KanbanCard,
+  byId: ReadonlyMap<string, KanbanCard>,
+  schedule: ReadonlyMap<string, KanbanSchedule>,
+): KanbanCardFlow {
+  const entry = schedule.get(card.id);
+  const open = isOpenCard(card);
+  const waitsOn = open
+    ? card.blockedBy.flatMap((id) => {
+        const blocker = byId.get(id);
+        return blocker !== undefined &&
+          (!KANBAN_DONE_STAGES.has(blocker.stage) || kanbanAwaitsMerge(blocker))
+          ? [blocker]
+          : [];
+      })
+    : [];
+  const heldUpBy = open ? kanbanHeldUpBy(card, byId) : undefined;
+  return {
+    unblocks: entry?.holds ?? 0,
+    rank: entry?.rank ?? card.priority,
+    ready:
+      open &&
+      card.stage === "todo" &&
+      card.activeThreadId === null &&
+      card.stalled === null &&
+      card.priority !== KANBAN_BACKLOG &&
+      !kanbanWaitsOnEvaluator(card) &&
+      heldUpBy === undefined,
+    waitsOn,
+    heldUpBy,
   };
 }
 
@@ -1137,7 +1597,7 @@ export const KanbanAskFeedItem = Schema.Struct({
   stage: KanbanStage,
   priority: KanbanPriority,
   discussionId: Schema.NullOr(KanbanDiscussionId),
-  /** Unfinished cards that list this card in `blockedBy`. */
+  /** Open cards this card holds up, the whole chain (`kanbanBlocking(...).holds`): what the dispatcher schedules by. */
   blocks: NonNegativeInt,
   ask: KanbanOwnerAsk,
   /** `ask.kind` and `ask.revision` with their defaults applied. */
@@ -1146,6 +1606,10 @@ export const KanbanAskFeedItem = Schema.Struct({
   /** Whose turn it is on an open ask; null once closed. */
   waitsOn: Schema.NullOr(Schema.Literals(["owner", "agent", "evaluator"])),
   expired: Schema.Boolean,
+  /** True while the owner has it put away (`ask.snoozedUntil` is still ahead). */
+  snoozed: Schema.optional(Schema.Boolean),
+  /** Set on an open ask that came back from a snooze and he has not acted on since: when it came back. */
+  backFromSnoozeAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   /** The message that asked it and every message posted on the ask, oldest first. Big blocks are stubs. */
   messages: Schema.Array(KanbanMessage),
 });

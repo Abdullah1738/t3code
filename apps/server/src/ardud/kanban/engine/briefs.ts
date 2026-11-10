@@ -8,6 +8,7 @@ import {
   type KanbanStage,
 } from "@t3tools/contracts";
 
+import { reviewRetryNote } from "./retries.ts";
 import { MAX_BATCH } from "./rules.ts";
 import { REVIEW_DELEGATION_GUIDANCE } from "./reviewerRouting.ts";
 import { subtaskIds, subtaskLines } from "./subtasks.ts";
@@ -177,7 +178,11 @@ export const reviewBrief = (
   const steps = chain?.steps.length ?? 1;
   const step = Math.min(card.reviewStep, steps - 1) + 1;
   const continuing = card.reviewStep > 0 && !freshThread;
+  // A review the board restarted after a failed run or a missing verdict says so first.
+  const retried = freshThread ? null : reviewRetryNote(card);
   return lines(
+    retried,
+    retried === null ? null : "",
     continuing
       ? `The previous review step came back clear. This is step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, on a different model: check the same change again with fresh eyes, using the context above.`
       : `You are the reviewer for a card on the "${board.name}" Missions board. Review step ${step} of ${steps}${chain ? ` (${chain.name})` : ""}, round ${card.reviewRound + 1}.`,

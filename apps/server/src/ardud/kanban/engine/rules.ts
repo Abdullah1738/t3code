@@ -1,10 +1,18 @@
 import {
+  KANBAN_AGING_MAX_STEPS,
+  KANBAN_AGING_STEP_MS,
   KANBAN_BACKLOG,
+  KANBAN_BOOST_FLOOR,
   KANBAN_DONE_STAGES,
+  KANBAN_FANOUT_STEPS,
   KANBAN_THREAD_STAGES,
+  kanbanCardFlow,
   kanbanCardModels,
   kanbanHeldUpBy,
+  kanbanBoardClock,
   kanbanPickOrder,
+  kanbanRetryNotBefore,
+  kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
@@ -406,6 +414,27 @@ function weightedModel(
   return tied[index]?.model ?? null;
 }
 
+/**
+ * How To-Do is ordered, and the numbers a board shows for it. The rule lives in the
+ * contracts package because the To-Do column lists cards in the order the dispatcher
+ * takes them; these are the names the engine uses.
+ *
+ * A startable card is picked by rank, then by how many open cards it unblocks, then
+ * by how long it has sat in To-Do. Its rank is its own priority, or that of the most
+ * urgent open card it unblocks (the whole chain), lifted one step when it unblocks
+ * FANOUT_STEPS[0] cards and two at FANOUT_STEPS[1], and one step per AGING_STEP_MS
+ * it has been startable (at most AGING_MAX_STEPS). Lifts stop at BOOST_FLOOR: only a
+ * card the owner marked P1, or one that unblocks a P1 card, ranks as P1.
+ */
+export const AGING_STEP_MS = KANBAN_AGING_STEP_MS;
+export const AGING_MAX_STEPS = KANBAN_AGING_MAX_STEPS;
+export const FANOUT_STEPS = KANBAN_FANOUT_STEPS;
+export const BOOST_FLOOR = KANBAN_BOOST_FLOOR;
+/** Rank, unblock count and waiting time of every open card, from one pass over the blocking graph. */
+export const schedule = kanbanSchedule;
+/** One card's place in the queue: what it unblocks, whether it is ready, what it waits on. */
+export const cardFlow = kanbanCardFlow;
+
 export interface Dispatch {
   readonly cardId: KanbanCard["id"];
   readonly role: "work" | "review";
@@ -447,12 +476,21 @@ export function poolThreads(
 
 /**
  * Fill free pool slots: reviews first (oldest first), then todo in pick
- * order, skipping blocked, settled and backlog cards. Lowering a pool below what is
+ * order (see `schedule`), skipping blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
  * A card with no work thread yet starts on its highest-weight model with a
  * free slot; `pick(n)` returns an index below n to break a tie.
+ *
+ * Not before: a card whose run failed waits in its queue for its one retry and
+ * is not started until its backoff is over (kanbanRetryNotBefore). It holds no
+ * slot meanwhile, and once due it is a card like any other: same rank, same
+ * age, same wait for a free slot.
+ *
+ * `nowMs` is the one clock both the retry backoff and the aging of waiting cards
+ * are measured against. The dispatcher passes the real time. Left out (tests, a
+ * caller with no clock) it is the board's newest card stamp (kanbanBoardClock).
  */
 export function planDispatch(
   board: KanbanBoard,
@@ -460,6 +498,7 @@ export function planDispatch(
   pools: ReadonlyArray<KanbanPool>,
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
+  nowMs?: number,
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -475,6 +514,11 @@ export function planDispatch(
   const free = new Map<string, number>();
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const clock = nowMs ?? kanbanBoardClock(cards);
+  const retryHeld = (card: KanbanCard) => {
+    const notBefore = kanbanRetryNotBefore(card);
+    return notBefore !== null && notBefore > clock;
+  };
   const waiting = cards.filter(
     (card) =>
       (kept === null || kept.has(card.id)) &&
@@ -482,6 +526,7 @@ export function planDispatch(
       card.activeThreadId === null &&
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
+      !retryHeld(card) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
       !kanbanWaitsOnEvaluator(card),
@@ -491,7 +536,7 @@ export function planDispatch(
     .toSorted((a, b) => a.movedAt.localeCompare(b.movedAt));
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .toSorted(kanbanPickOrder(cards));
+    .toSorted(kanbanPickOrder(cards, { nowMs: clock }));
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 

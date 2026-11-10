@@ -102,6 +102,8 @@ import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingEr
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+// ardud: who is redeeming a secretRef
+import { SecretRedeemer } from "../ardud/auth/heldSecrets.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
   clientRuntimeModeCeiling,
@@ -2024,13 +2026,13 @@ const make = Effect.gen(function* () {
               }),
             }),
       };
-      const { task } = yield* scheduledTasks
-        .upsert(upsertInput)
-        .pipe(
-          Effect.mapError((error) =>
-            failure("orchestration_error", `Could not schedule task: ${error.message}`),
-          ),
-        );
+      const { task } = yield* scheduledTasks.upsert(upsertInput).pipe(
+        // ardud: a secretRef from a board ask is only for the thread it was given to.
+        Effect.provideService(SecretRedeemer, parent?.thread.id ?? null),
+        Effect.mapError((error) =>
+          failure("orchestration_error", `Could not schedule task: ${error.message}`),
+        ),
+      );
       return yield* summarizeScheduledTask(scope, { parent, limits }, task);
     }),
     listScheduledTasks: Effect.fn("OrchestratorMcpService.listScheduledTasks")(
@@ -2100,13 +2102,13 @@ const make = Effect.gen(function* () {
           createdBy: existing.createdBy,
           creationSource: existing.creationSource,
         };
-        const { task } = yield* scheduledTasks
-          .upsert(upsertInput)
-          .pipe(
-            Effect.mapError((error) =>
-              failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
-            ),
-          );
+        const { task } = yield* scheduledTasks.upsert(upsertInput).pipe(
+          // ardud: a secretRef from a board ask is only for the thread it was given to.
+          Effect.provideService(SecretRedeemer, parent?.thread.id ?? null),
+          Effect.mapError((error) =>
+            failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
+          ),
+        );
         return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       },
     ),

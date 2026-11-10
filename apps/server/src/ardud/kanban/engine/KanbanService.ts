@@ -83,6 +83,7 @@ import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Defaults from "./defaults.ts";
+import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
@@ -359,7 +360,26 @@ export interface KanbanServiceShape {
     askId: string,
     input: Asks.AskAnswerInput,
     actor: KanbanActor,
+    /** The refs for the secret fields he filled in privately; only the wake text carries them. */
+    secrets?: Asks.AskSecretRefs,
   ) => Effect.Effect<{ readonly card: KanbanCard; readonly heard: boolean }, KanbanError>;
+  /**
+   * Who may use the refs for an open ask's secret fields (`fieldIds`), and the
+   * project its card's threads run in. Fails when the ask is closed or one of
+   * the ids is not a secret field on it.
+   */
+  readonly askSecretPlan: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    fieldIds: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    {
+      readonly redeemer: Asks.AskSecretRef["redeemer"];
+      readonly threadId: string | null;
+      readonly projectId: ProjectId | null;
+    },
+    KanbanError
+  >;
   /**
    * A message in one ask's discussion. From the owner it does not answer the
    * ask: the ask waits on its asker, who is woken to reply or fix the ask.
@@ -382,6 +402,16 @@ export interface KanbanServiceShape {
     action: "hand" | "take_back" | "return",
     actor: KanbanActor,
     always?: boolean,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * The owner puts one ask away until a time, or (null) takes the snooze off.
+   * The ask stays open and keeps holding its card; no thread is told.
+   */
+  readonly snoozeAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    until: string | null,
+    actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /** Records the evaluator thread an "every time" hand-over started, while the ask is still handed. */
   readonly noteHandEvaluator: (
@@ -1984,7 +2014,8 @@ const make = Effect.gen(function* () {
       : card;
     const asked = options.question?.trim() || null;
     let next: KanbanCard = {
-      ...base,
+      // A real move ends the attempt its automatic retry belonged to.
+      ...Retries.withoutRetries(base),
       stage: to,
       movedAt: at,
       updatedAt: at,
@@ -4745,6 +4776,9 @@ const make = Effect.gen(function* () {
                     Rules.maskDownPools(yield* store.pools(board.id), downKeys),
                     yield* boardHolds(board.id),
                     pick,
+                    // The real time: a waiting retry's backoff and the aging of
+                    // waiting cards are measured against it.
+                    yield* nowMillis,
                   );
                   return { boardId: board.id, cards, plan };
                 }),
@@ -5106,10 +5140,39 @@ const make = Effect.gen(function* () {
       yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
       return;
     }
-    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
-    const reason = "Reviewer stopped without a verdict";
+    // A reviewer that still has no verdict after the nudge frees its slot. The first
+    // time the review is started again once (see Retries); the second time it is flagged.
+    const reason = Retries.NO_VERDICT_REASON;
+    const retry = Retries.decideRetry({
+      kind: "no_verdict",
+      role: "review",
+      retries: card.retries,
+      paused: Retries.heldByPause(board, card),
+      nowMs: Date.parse(at),
+      at,
+    });
+    if (retry._tag === "hold" || retry._tag === "wait") return;
+    if (retry._tag === "restart") {
+      const again: KanbanCard = {
+        ...release(card),
+        stage: "needs_review",
+        stalled: null,
+        nudgedAt: null,
+        retries: retry.retries,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(again, system, "moved", {
+        fromStage: card.stage,
+        toStage: again.stage,
+        body: Retries.NO_VERDICT_RESTARTED_EVENT,
+      });
+      yield* saveCard(again);
+      yield* kick;
+      return;
+    }
     const next: KanbanCard = {
-      ...release(card),
+      ...Retries.withoutRetries(release(card)),
       stage: "needs_review",
       stalled: { reason, by: system, at },
       nudgedAt: null,
@@ -5696,20 +5759,56 @@ const make = Effect.gen(function* () {
             yield* saveCard(fresh);
             continue;
           }
-          const next: KanbanCard = {
-            ...release(entry),
-            stage: "todo",
-            stalled: { reason, by: system, at },
-            nudgedAt: null,
-            movedAt: at,
-            updatedAt: at,
-          };
+          // The first failure a retry can help is run again once (see Retries): the
+          // card goes back to To-Do unflagged, with its thread and no slot. The
+          // dispatcher holds it back for the backoff, then wakes the same thread like
+          // any other start. Anything else is flagged.
+          const retry = Retries.decideRetry({
+            kind: "run_failed",
+            role: "work",
+            failure,
+            retries: entry.retries,
+            paused: Retries.heldByPause(yield* boardOf(entry.boardId), entry),
+            nowMs: Date.parse(at),
+            at,
+            startedAtMs: Date.parse(entry.movedAt),
+          });
+          if (retry._tag === "hold") continue;
+          const next: KanbanCard =
+            retry._tag === "wait"
+              ? {
+                  ...release(entry),
+                  stage: "todo",
+                  stalled: null,
+                  nudgedAt: null,
+                  retries: retry.retries,
+                  wakeNote: Retries.withRetryNote(entry.wakeNote, failure.message),
+                  // movedAt stays: back in the queue the card keeps the age it had.
+                  updatedAt: at,
+                }
+              : {
+                  ...Retries.withoutRetries(release(entry)),
+                  stage: "todo",
+                  stalled: { reason, by: system, at },
+                  nudgedAt: null,
+                  movedAt: at,
+                  updatedAt: at,
+                };
           if (
             expectedFailedWorkRunId !== undefined &&
             compactSent?._tag !== "Success" &&
             !(yield* failedRunIsCurrent())
           )
             return;
+          if (retry._tag === "wait") {
+            yield* logEvent(next, system, "moved", {
+              fromStage: entry.stage,
+              toStage: "todo",
+              body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+            });
+            yield* saveCard(next);
+            continue;
+          }
           yield* logEvent(next, system, "flagged", {
             fromStage: entry.stage,
             toStage: "todo",
@@ -5731,10 +5830,18 @@ const make = Effect.gen(function* () {
       const view = yield* threads.view(threadId);
       // A repeated run event can arrive while the thread runs again.
       if (view === null || view.state !== "idle") return;
+      // The run ended without failing: a retry it was on is over, and the next
+      // failure on these cards gets its own.
+      const settled = yield* Effect.forEach(carried, (entry) => {
+        const cleared = Retries.withoutRoleRetries(entry, "work");
+        if (cleared === entry) return Effect.succeed(entry);
+        const next: KanbanCard = { ...cleared, updatedAt: at };
+        return saveCard(next).pipe(Effect.as(next));
+      });
       // A worker waiting on its own subagents hasn't stopped.
       if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       if (discussionAttempted) return;
-      yield* nudgeWorker(threadId, carried);
+      yield* nudgeWorker(threadId, settled);
       return;
     }
     if (!card) return;
@@ -5778,8 +5885,40 @@ const make = Effect.gen(function* () {
         return;
       }
       const reason = `Run failed: ${failure.message}`;
+      // As for a worker: the first failure a retry can help is run again once. The
+      // card goes back to Needs review with no slot and waits out the backoff there.
+      const retry = Retries.decideRetry({
+        kind: "run_failed",
+        role: "review",
+        failure,
+        retries: card.retries,
+        paused: Retries.heldByPause(yield* boardOf(card.boardId), card),
+        nowMs: Date.parse(at),
+        at,
+        startedAtMs: Date.parse(card.movedAt),
+      });
+      if (retry._tag === "hold") return;
+      if (retry._tag === "wait") {
+        const waiting: KanbanCard = {
+          ...release(card),
+          stage: "needs_review",
+          stalled: null,
+          nudgedAt: null,
+          retries: retry.retries,
+          // movedAt stays: back in the queue the card keeps the age it had.
+          updatedAt: at,
+        };
+        yield* logEvent(waiting, system, "moved", {
+          fromStage: card.stage,
+          toStage: waiting.stage,
+          body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+        });
+        yield* saveCard(waiting);
+        yield* kick;
+        return;
+      }
       const next: KanbanCard = {
-        ...release(card),
+        ...Retries.withoutRetries(release(card)),
         stage: "needs_review",
         stalled: { reason, by: system, at },
         nudgedAt: null,
@@ -7929,7 +8068,20 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor) =>
+  const askSecretPlan: KanbanServiceShape["askSecretPlan"] = (cardId, askId, fieldIds) =>
+    readDb(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const plan = Asks.secretPlan(card, ask, fieldIds);
+        if (Asks.isAskProblem(plan)) return yield* failWith(plan.code, plan.detail);
+        const projectId = card.projectId ?? (yield* boardOf(card.boardId)).defaultProjectId;
+        return { ...plan, projectId };
+      }),
+    );
+
+  const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
     guardDeferred(
       Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
@@ -7943,7 +8095,14 @@ const make = Effect.gen(function* () {
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
           );
         }
-        const checked = Asks.answerFor(card, ask, input, actor, yield* nowIso);
+        const checked = Asks.answerFor(
+          card,
+          ask,
+          input,
+          actor,
+          yield* nowIso,
+          new Set(Object.keys(secrets ?? {})),
+        );
         if (Asks.isAskProblem(checked)) return yield* failWith(checked.code, checked.detail);
         // The files he gave are kept before the card changes: one that can't be refuses the answer.
         let answer = checked;
@@ -7990,7 +8149,7 @@ const make = Effect.gen(function* () {
         const result = yield* answerAsks(
           discussion,
           fresh,
-          Asks.answerText(fresh, ask, answer, attachments.pathOf),
+          Asks.answerText(fresh, ask, answer, attachments.pathOf, secrets),
           (open) => open.id === ask.id,
           actor,
           false,
@@ -8034,8 +8193,12 @@ const make = Effect.gen(function* () {
         );
         const fresh = yield* cardOf(card.id);
         if (actor._tag !== "owner") {
-          // The agent replied: it is the owner's turn again.
-          const next = Asks.clearClarify(fresh, ask.id);
+          // The agent replied: it is the owner's turn again, and a snoozed ask comes back.
+          const next = Asks.wakeFromSnooze(
+            Asks.clearClarify(fresh, ask.id),
+            ask.id,
+            message.createdAt,
+          );
           if (next !== fresh) yield* saveCard({ ...next, updatedAt: message.createdAt });
           return message;
         }
@@ -8138,6 +8301,24 @@ const make = Effect.gen(function* () {
           { kind: "toEvaluator", discussionId: discussion.id, text, note: false },
           toEvaluator(discussion, text),
         );
+        return next;
+      }),
+    );
+
+  const snoozeAsk: KanbanServiceShape["snoozeAsk"] = (cardId, askId, until, actor) =>
+    guard(
+      Effect.gen(function* () {
+        if (actor._tag !== "owner") {
+          return yield* failWith("denied", "only the owner snoozes an ask");
+        }
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const at = yield* nowIso;
+        const snoozed = Asks.snoozeAsk(card, ask, until, at);
+        if (Asks.isAskProblem(snoozed)) return yield* failWith(snoozed.code, snoozed.detail);
+        const next = { ...snoozed, updatedAt: at };
+        yield* saveCard(next);
         return next;
       }),
     );
@@ -8486,7 +8667,8 @@ const make = Effect.gen(function* () {
           : card.subtasks;
         const moreWork = passed && Subtasks.workAfterReview({ subtasks });
         const next: KanbanCard = {
-          ...release(card),
+          // A verdict is a review that ended normally: its retry record goes.
+          ...Retries.withoutRetries(release(card)),
           // The dispatcher's no-verdict flag is answered by the verdict; a
           // reviewer's own flag stays for the evaluator.
           stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
@@ -9460,6 +9642,8 @@ const make = Effect.gen(function* () {
     answerAsk,
     replyOnAsk,
     handAsk,
+    snoozeAsk,
+    askSecretPlan,
     noteHandEvaluator,
     askDetail,
     askFeed,

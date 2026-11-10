@@ -353,6 +353,11 @@ import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts
 // ardud: missions board
 import { KanbanRpcs } from "./ardud/kanbanRpc.ts";
 import {
+  KanbanAskSecretAnswerInput,
+  KanbanAskSecretAnswerResult,
+  KanbanError,
+} from "./ardud/kanban.ts";
+import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
   ProjectCloneListEvent,
@@ -512,6 +517,8 @@ export const WS_METHODS = {
   scheduledTasksRunNow: "scheduledTasks.runNow",
   scheduledTasksRotateWebhookToken: "scheduledTasks.rotateWebhookToken",
   secretsAnswerRequest: "secrets.answerRequest",
+  // ardud: a board ask's secret fields, over the same owner-only channel
+  secretsAnswerAsk: "secrets.answerAsk",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
 
@@ -1811,6 +1818,13 @@ const WsSecretsAnswerRequestRpc = Rpc.make(WS_METHODS.secretsAnswerRequest, {
   error: Schema.Union([SecretRequestError, EnvironmentAuthorizationError]),
 });
 
+// ardud: a board ask's secret fields, over the same owner-only channel
+const WsSecretsAnswerAskRpc = Rpc.make(WS_METHODS.secretsAnswerAsk, {
+  payload: KanbanAskSecretAnswerInput,
+  success: KanbanAskSecretAnswerResult,
+  error: Schema.Union([KanbanError, SecretRequestError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksListWebhookDeliveriesRpc = Rpc.make(
   WS_METHODS.scheduledTasksListWebhookDeliveries,
   {
@@ -1919,6 +1933,7 @@ export const WsCoreRpcGroup = RpcGroup.make(
   WsScheduledTasksRunNowRpc,
   WsScheduledTasksRotateWebhookTokenRpc,
   WsSecretsAnswerRequestRpc,
+  WsSecretsAnswerAskRpc,
   WsScheduledTasksListWebhookDeliveriesRpc,
   WsScheduledTasksGetWebhookDeliveryRpc,
   WsServerReportClientActivityRpc,
