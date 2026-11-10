@@ -3328,7 +3328,12 @@ const make = Effect.gen(function* () {
       return started;
     });
     if (state === "settled") yield* Deferred.succeed(waiter, undefined);
-    else if (state !== null) yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
+    // Deferred delivery (and its retries) is background work even when an owner's RPC triggered it.
+    else if (state !== null)
+      yield* runOwnerDrain(discussionId, state).pipe(
+        NodeSqliteClient.backgroundReads,
+        Effect.forkIn(scope),
+      );
     return waiter;
   });
 
@@ -8120,6 +8125,7 @@ const make = Effect.gen(function* () {
 
   const runJob = (job: Job) =>
     read(job._tag === "kick" ? dispatchUnlocked() : turnEndedUnlocked(job.threadId)).pipe(
+      NodeSqliteClient.backgroundReads,
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban job failed", { job: job._tag, cause }),
       ),
@@ -8310,9 +8316,9 @@ const make = Effect.gen(function* () {
     claimCard,
     createForThread,
     nextCards,
-    dispatchNow: read(dispatchUnlocked()),
+    dispatchNow: read(dispatchUnlocked()).pipe(NodeSqliteClient.backgroundReads),
     turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
-    tick: read(tickUnlocked()),
+    tick: read(tickUnlocked()).pipe(NodeSqliteClient.backgroundReads),
     probeOutages: read(probeOutagesNow()),
     notifyTurnEnded: (threadId) =>
       Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),

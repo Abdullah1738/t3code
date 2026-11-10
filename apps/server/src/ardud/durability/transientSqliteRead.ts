@@ -12,7 +12,7 @@ import * as Schedule from "effect/Schedule";
  * Retrying such a read is safe; nothing was written.
  */
 const TRANSIENT_READ_MESSAGE =
-  /Database (?:auth )?reader (?:retired|failed|exited)|Reader lane unavailable|database reader is unavailable|database is locked|SQLITE_BUSY/i;
+  /Database (?:auth )?reader (?:retired|failed|exited)|Reader lane unavailable|Reader lane admission queue full|database reader is unavailable|database is locked|SQLITE_BUSY/i;
 
 export const isTransientSqliteReadFailure = (failure: unknown): boolean => {
   const seen = new Set<unknown>();

@@ -341,4 +341,4 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(function* () 
   yield* advance(thread.thread_id);
   yield* sql`DELETE FROM ardud_history_archive_progress WHERE thread_id = ${thread.thread_id}`;
   return { moved };
-});
+}, NodeSqliteClient.backgroundReads);
