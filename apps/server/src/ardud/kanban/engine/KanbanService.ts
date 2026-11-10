@@ -1032,6 +1032,7 @@ const make = Effect.gen(function* () {
     if (!stops) pendingStops.set(threadId, (stops = new Map()));
     stops.set(routeKey, reason);
   };
+  // A failed close fails the stop like a failed interrupt: the send waiting on it fails too.
   const closeStopRows = (keys: ReadonlyArray<string>) =>
     Effect.gen(function* () {
       const at = yield* nowIso;
@@ -1040,7 +1041,11 @@ const make = Effect.gen(function* () {
         SET done_at = ${at}, json = json_set(json, '$.outcome', 'delivered')
         WHERE route_key IN ${boardSql.in(keys)} AND done_at IS NULL
       `;
-    });
+    }).pipe(
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "interrupt", detail: `stop not saved: ${error.message}` }),
+      ),
+    );
   /**
    * Runs the thread's pending stops, if any; callers hold no board gate. A
    * drain passes its own route: skipped when a send already ran it.
@@ -3399,7 +3404,11 @@ const make = Effect.gen(function* () {
   /** One saved write follow-on, as the write would have run it inline. */
   // Failures propagate, so the drain retries and finally closes the row
   // undeliverable with a notice; only success marks it delivered.
-  const runBoardEffect = (effect: BoardEffect, routeKey: string) => {
+  // Any failure is the drain's to retry or give up on; its kind doesn't matter here.
+  const runBoardEffect = (
+    effect: BoardEffect,
+    routeKey: string,
+  ): Effect.Effect<unknown, unknown> => {
     switch (effect.kind) {
       case "send":
         return threads.send({
