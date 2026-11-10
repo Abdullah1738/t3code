@@ -583,10 +583,12 @@ export const OrchestrationV2Run = Schema.Struct({
       planId: PlanId,
     }),
   ),
-  transientRecovery: Schema.optional(Schema.Struct({
-    firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
-    since: Schema.DateTimeUtc,
-  })),
+  transientRecovery: Schema.optional(
+    Schema.Struct({
+      firstError: Schema.suspend(() => OrchestrationV2ProviderFailure),
+      since: IsoDateTime,
+    }),
+  ),
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
   /** ardud: this run starts a fresh provider thread (agent-requested context reset). */
@@ -888,6 +890,7 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
   seededHistory: Schema.optional(OrchestrationV2SeededHistory),
+  successfulModels: Schema.optional(Schema.Array(Schema.String)),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;

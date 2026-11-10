@@ -55,6 +55,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import {
   ContextHandoffBackgroundWorkError,
   makeProviderFailure,
+  withPreviousFailure,
 } from "@t3tools/provider-core/server/failure";
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
@@ -137,6 +138,7 @@ export const layer: Layer.Layer<
     const makeRunControls = (input: {
       readonly threadId: ThreadId;
       readonly runId: RunId;
+      readonly parentThreadId: ThreadId | null;
       readonly attemptId: OrchestrationV2RunAttempt["id"];
       readonly providerThreadId: OrchestrationV2ProviderThread["id"];
       readonly runOrdinal: number;
@@ -153,6 +155,16 @@ export const layer: Layer.Layer<
         );
       return {
         isCurrentAttemptInStatus,
+        loadDelegatedTask: () =>
+          input.parentThreadId === null
+            ? Effect.succeed(undefined)
+            : projectionStore
+                .getThreadRecords(input.parentThreadId, ["subagents"])
+                .pipe(
+                  Effect.map((parent) =>
+                    parent.subagents.find((task) => task.childThreadId === input.threadId),
+                  ),
+                ),
         loadInheritedBackgroundTurnItems: () =>
           projectionStore.getRuntimeRecoveryProjection(input.threadId).pipe(
             Effect.map((current) =>
@@ -344,6 +356,14 @@ export const layer: Layer.Layer<
             completedAt: now,
             updatedAt: now,
             ...input.item,
+            ...(input.item.type === "error"
+              ? {
+                  failure: withPreviousFailure(
+                    input.item.failure,
+                    run.transientRecovery?.firstError,
+                  ),
+                }
+              : {}),
           };
           const eventPayloads = [
             { type: "turn-item.updated", payload: item },
@@ -544,6 +564,7 @@ export const layer: Layer.Layer<
       const runControls = makeRunControls({
         threadId: projection.thread.id,
         runId: run.id,
+        parentThreadId: projection.thread.lineage?.parentThreadId ?? null,
         attemptId: attempt.id,
         providerThreadId: providerThread.id,
         runOrdinal: run.ordinal,
@@ -610,7 +631,8 @@ export const layer: Layer.Layer<
         },
       );
       if (sessionResult._tag === "Failure") {
-        if (input.willRetry === true) return yield* sessionResult.failure;
+        if (input.willRetry === true && run.transientRecovery === undefined)
+          return yield* sessionResult.failure;
         yield* settleStartFailure({
           signal: "provider-session-open-failure",
           title: "Provider session failed to open",
@@ -625,7 +647,8 @@ export const layer: Layer.Layer<
       ) {
         const loaded = yield* Effect.result(load);
         if (loaded._tag === "Success") return loaded.success;
-        if (input.willRetry === true) return yield* loaded.failure;
+        if (input.willRetry === true && run.transientRecovery === undefined)
+          return yield* loaded.failure;
         yield* settleStartFailure({
           signal: "provider-thread-load-failure",
           title: "Provider turn failed to start",
@@ -918,6 +941,21 @@ export const layer: Layer.Layer<
               }),
             ),
           );
+        const failRecoveryResume = () =>
+          loadFromProvider(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId,
+                cause:
+                  "The original native session could not be resumed during automatic recovery.",
+              }),
+            ),
+          );
+        if (run.transientRecovery !== undefined && providerThread.nativeThreadRef?.nativeId == null)
+          return yield* failRecoveryResume();
         if (nativeForkTransfer !== undefined) {
           if (seededGuard) return yield* failSeededResume();
           const sourceProjection = yield* projectionStore.getThreadRecords(
@@ -1110,6 +1148,7 @@ export const layer: Layer.Layer<
             Effect.catchTags({ ContextHandoffBudgetError: () => Effect.succeed(false) }),
           );
           if (fits) return resumed.success;
+          if (run.transientRecovery !== undefined) return yield* failRecoveryResume();
           if (seededGuard) return yield* failSeededResume();
           const freshThread = { ...resumed.success, nativeThreadRef: null };
           const freshContext = handoffContextForThread(freshThread);
@@ -1146,6 +1185,10 @@ export const layer: Layer.Layer<
             );
           }
         }
+        if (run.transientRecovery !== undefined)
+          return yield* resumed._tag === "Failure"
+            ? loadFromProvider(Effect.fail(resumed.failure))
+            : failRecoveryResume();
         if (seededGuard) return yield* failSeededResume();
         resumedHandoffContext = undefined;
         resumedRetryHandoff = [];
@@ -1507,6 +1550,7 @@ export const layer: Layer.Layer<
         attempt: runningAttempt,
         attemptId: attempt.id,
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,
+        loadDelegatedTask: runControls.loadDelegatedTask,
         relatedThreadIds: routableSubagents.flatMap((subagent) =>
           subagent.childThreadId === null ? [] : [subagent.childThreadId],
         ),
@@ -1532,10 +1576,14 @@ export const layer: Layer.Layer<
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {
           messageId: message.id,
-          text: run.transientRecovery !== undefined && attempt.reason === "retry"
-            ? "Continue where you left off after the transient API failure. Check work already completed and any partly written files before continuing; do not repeat completed actions."
-            : userText,
-          attachments: run.transientRecovery !== undefined && attempt.reason === "retry" ? [] : message.attachments,
+          text:
+            run.transientRecovery !== undefined && attempt.reason === "retry"
+              ? "Continue where you left off after the transient API failure. Check work already completed and any partly written files before continuing; do not repeat completed actions."
+              : userText,
+          attachments:
+            run.transientRecovery !== undefined && attempt.reason === "retry"
+              ? []
+              : message.attachments,
           createdBy: message.createdBy,
           creationSource: message.creationSource,
           ...(message.scheduledTaskId === undefined

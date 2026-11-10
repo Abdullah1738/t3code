@@ -4253,6 +4253,13 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly delegated?: boolean;
+  readonly legacyOwnership?:
+    | "app_owned"
+    | "provider_native"
+    | "missing"
+    | "other_child"
+    | "other_task"
+    | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
   readonly rejectTerminalWrite?: boolean;
@@ -4362,10 +4369,12 @@ function captureRootRunTermination(input: {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${input.key}`),
-        appThread: { id: ids.threadId,
+        appThread: {
+          id: ids.threadId,
           lineage: { relationshipToParent: input.delegated ? "subagent" : null },
-          forkedFrom: input.delegated ? { type: "node" } : null,
-          archivedAt: null, deletedAt: null,
+          forkedFrom: input.delegated ? { type: "node", nodeId: ids.subagentNodeId } : null,
+          archivedAt: null,
+          deletedAt: null,
         } as OrchestrationV2AppThread,
         providerSessionId: ProviderSessionId.make(`session:${input.key}`),
         session: {
@@ -4410,6 +4419,9 @@ function captureRootRunTermination(input: {
           ordinal: 1,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          ...(input.delegated && input.legacyOwnership === undefined
+            ? { delegatedTaskId: ids.subagentNodeId }
+            : {}),
         } as OrchestrationV2Run,
         rootNode: {
           id: ids.rootNodeId,
@@ -4428,6 +4440,36 @@ function captureRootRunTermination(input: {
           providerTurnId: ids.rootProviderTurnId,
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
+        ...(input.legacyOwnership === undefined
+          ? {}
+          : {
+              loadDelegatedTask: () =>
+                input.legacyOwnership === "read_error"
+                  ? Effect.fail(
+                      new ProjectionStore.ProjectionStoreReadError({
+                        threadId: ids.threadId,
+                        cause: "parent read failed",
+                      }),
+                    )
+                  : Effect.succeed(
+                      input.legacyOwnership === "missing"
+                        ? undefined
+                        : {
+                            id:
+                              input.legacyOwnership === "other_task"
+                                ? NodeId.make("wrong-task")
+                                : ids.subagentNodeId,
+                            childThreadId:
+                              input.legacyOwnership === "other_child"
+                                ? ThreadId.make("wrong-child")
+                                : ids.threadId,
+                            origin:
+                              input.legacyOwnership === "provider_native"
+                                ? ("provider_native" as const)
+                                : ("app_owned" as const),
+                          },
+                    ),
+            }),
         providerTurnOrdinal: 1,
         shouldFinalizeRun: input.shouldFinalizeRun,
         ...(input.shouldStartProviderTurn === undefined
@@ -4766,7 +4808,7 @@ function makeRunOwnedSubagentChildNodeFixture(input: {
 function rootTerminalEvent(
   ids: BackgroundScenarioIds,
   status: "completed" | "interrupted" | "cancelled" | "failed",
-): ProviderAdapter.ProviderAdapterV2Event {
+): Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn.terminal" }> {
   const common = {
     type: "turn.terminal" as const,
     driver,
@@ -5176,36 +5218,150 @@ it.effect("releases ingestion after idle subagent rows and items settle", () =>
   }),
 );
 
-
-it.effect.each(["transient", "auth_expired", "model_invalid", "quota", "context_exhausted"] as const)(
-  "resumes delegated exhaustion only for transient failures: %s", (category) => Effect.gen(function* () {
-    const result = yield* captureRootRunTermination({ key: `recovery-${category}`, delegated: true,
+it.effect.each([
+  "transient",
+  "auth_expired",
+  "model_invalid",
+  "quota",
+  "context_exhausted",
+] as const)("resumes delegated exhaustion only for transient failures: %s", (category) =>
+  Effect.gen(function* () {
+    const result = yield* captureRootRunTermination({
+      key: `recovery-${category}`,
+      delegated: true,
       shouldFinalizeRun: () => Effect.succeed(true),
-      events: (ids) => Stream.make({ ...rootTerminalEvent(ids, "failed"), status: "failed" as const,
-        failure: { class: "provider_error" as const, category, code: "api_error_529", retryable: null,
-          message: "Claude gave up after repeated API errors. Last error: 529 overloaded." }, threadDisposition: "reusable" as const }),
+      events: (ids) =>
+        Stream.make({
+          ...rootTerminalEvent(ids, "failed"),
+          status: "failed" as const,
+          failureItemOrdinal: 101,
+          failure: {
+            class: "provider_error" as const,
+            category,
+            code: "api_error_529",
+            retryable: null,
+            message: "Claude gave up after repeated API errors. Last error: 529 overloaded.",
+          },
+          threadDisposition: "reusable" as const,
+        }),
     });
-    const resumes = result.committedEffects.filter((effect) => effect.id.startsWith("effect:delegated-transient-resume:"));
+    const resumes = result.committedEffects.filter((effect) =>
+      effect.id.startsWith("effect:delegated-transient-resume:"),
+    );
     assert.lengthOf(resumes, category === "transient" ? 1 : 0);
     if (category === "transient") {
       const run = result.finalEvents.findLast((event) => event.type === "run.updated");
       assert.equal(run?.payload.status, "starting");
-      if (run?.type === "run.updated") assert.include(run.payload.transientRecovery?.firstError.message ?? "", "529");
+      if (run?.type === "run.updated")
+        assert.include(run.payload.transientRecovery?.firstError.message ?? "", "529");
     }
   }),
 );
 
-it.effect("stops a second delegated failure and reports both errors", () => Effect.gen(function* () {
-  const result = yield* captureRootRunTermination({ key: "second-recovery", delegated: true,
-    recoveryRun: { firstError: { class: "provider_error", category: "transient", code: "api_error_529", retryable: true,
-      message: "529 overloaded" }, since: yield* DateTime.now },
-    shouldFinalizeRun: () => Effect.succeed(true),
-    events: (ids) => Stream.make({ ...rootTerminalEvent(ids, "failed"), status: "failed" as const,
-      failure: { class: "provider_error" as const, category: "transient" as const, code: "api_error_502", retryable: true,
-        message: "502 connection reset" }, threadDisposition: "reusable" as const }),
-  });
-  assert.lengthOf(result.committedEffects, 0);
-  const error = result.written.find((item) => item.type === "error");
-  assert.include(error?.failure.message ?? "", "529 overloaded");
-  assert.include(error?.failure.message ?? "", "502 connection reset");
-}));
+it.effect.each([
+  "app_owned",
+  "provider_native",
+  "missing",
+  "other_child",
+  "other_task",
+  "read_error",
+] as const)("checks the parent's task record for a legacy child: %s", (legacyOwnership) =>
+  Effect.gen(function* () {
+    const result = yield* captureRootRunTermination({
+      key: `legacy-recovery-${legacyOwnership}`,
+      delegated: true,
+      legacyOwnership,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          ...rootTerminalEvent(ids, "failed"),
+          status: "failed" as const,
+          failureItemOrdinal: 101,
+          failure: {
+            class: "provider_error" as const,
+            category: "transient" as const,
+            code: "api_error_529",
+            retryable: true,
+            message: "Claude gave up after repeated API errors. Last error: 529 overloaded.",
+          },
+        }),
+    });
+    const resumes = result.committedEffects.filter((effect) =>
+      effect.id.startsWith("effect:delegated-transient-resume:"),
+    );
+    assert.lengthOf(resumes, legacyOwnership === "app_owned" ? 1 : 0);
+  }),
+);
+
+it.effect("stops a second delegated failure and reports both errors", () =>
+  Effect.gen(function* () {
+    const result = yield* captureRootRunTermination({
+      key: "second-recovery",
+      delegated: true,
+      recoveryRun: {
+        firstError: {
+          class: "provider_error",
+          category: "transient",
+          code: "api_error_529",
+          retryable: true,
+          message: "529 overloaded",
+        },
+        since: DateTime.formatIso(yield* DateTime.now),
+      },
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make({
+          ...rootTerminalEvent(ids, "failed"),
+          status: "failed" as const,
+          failureItemOrdinal: 101,
+          failure: {
+            class: "provider_error" as const,
+            category: "transient" as const,
+            code: "api_error_502",
+            retryable: true,
+            message: "502 connection reset",
+          },
+          threadDisposition: "reusable" as const,
+        }),
+    });
+    assert.lengthOf(result.committedEffects, 0);
+    const error = result.written.find((item) => item.type === "error");
+    assert.include(error?.failure.message ?? "", "529 overloaded");
+    assert.include(error?.failure.message ?? "", "502 connection reset");
+  }),
+);
+
+it.effect("retains the first failure when the resumed provider throws at startup", () =>
+  Effect.gen(function* () {
+    const result = yield* captureRootRunTermination({
+      key: "recovery-start-throws",
+      afterStart: (closed) => Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+      delegated: true,
+      recoveryRun: {
+        firstError: {
+          class: "provider_error",
+          category: "transient",
+          code: "api_error_529",
+          retryable: true,
+          message: "529 overloaded",
+        },
+        since: "2026-11-08T10:00:00.000Z",
+      },
+      shouldFinalizeRun: () => Effect.succeed(true),
+      startTurn: () =>
+        Effect.fail(
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver,
+            threadId: ThreadId.make("thread:recovery-start-throws"),
+            providerThreadId: ProviderThreadId.make("provider-thread:recovery-start-throws"),
+            runId: RunId.make("run:recovery-start-throws"),
+            cause: "resume failed",
+          }),
+        ),
+    });
+    const error = result.written.find((item) => item.type === "error");
+    assert.include(error?.type === "error" ? error.failure.message : "", "529 overloaded");
+    assert.include(error?.type === "error" ? error.failure.message : "", "Resume error:");
+    assert.lengthOf(result.committedEffects, 0);
+  }),
+);
