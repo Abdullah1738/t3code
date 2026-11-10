@@ -18,7 +18,7 @@ import {
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { kanbanAskChanges, kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
-import { ListIcon } from "lucide-react";
+import { HistoryIcon, KeyboardIcon, ListIcon, ShapesIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { SidebarInset } from "../../../components/ui/sidebar";
@@ -42,14 +42,23 @@ import {
   watchAsks,
 } from "./askStore";
 import { BatchView } from "./BatchView";
+import { HistoryView } from "./HistoryView";
 import { QueueRail } from "./QueueRail";
-import { patchNeedsYouSearch, type NeedsYouSearch } from "./search";
-import { Bar, Btn, FilterChip, Layer, linkClass, usePageLayout } from "./ui";
+import { ReferenceView } from "./ReferenceView";
+import { patchNeedsYouSearch, type NeedsYouSearch, type NeedsYouView } from "./search";
+import { ShortcutsSheet } from "./ShortcutsSheet";
+import { Bar, Btn, FilterChip, IconBtn, Layer, linkClass, usePageLayout } from "./ui";
 import "../tokens.css";
 import "../kanban.css";
 import "./needsYou.css";
 
 const NO_MARKS: Readonly<Record<string, NeedsYouMark>> = {};
+
+const VIEW_TITLES: Record<NeedsYouView, string> = {
+  queue: "Needs you",
+  history: "History",
+  reference: "What an ask can be",
+};
 
 type Focused =
   | { readonly _tag: "ask"; readonly entry: KanbanAskFeedItem; readonly item: NeedsYouItem }
@@ -75,6 +84,9 @@ export function NeedsYouPage(props: {
   onSearch: (next: NeedsYouSearch, options?: { readonly replace?: boolean }) => void;
 }) {
   const { search, onSearch } = props;
+  const view: NeedsYouView = search.view ?? "queue";
+  const setView = (next: NeedsYouView) =>
+    onSearch(patchNeedsYouSearch(search, { view: next === "queue" ? undefined : next }));
   const status = useAskStore((state) => state.status);
   const error = useAskStore((state) => state.error);
   const feed = useAskStore((state) => state.feed);
@@ -167,7 +179,9 @@ export function NeedsYouPage(props: {
   }, [openAskKey]);
 
   const focusOn = (key: string | null, replace = true) => {
-    onSearch(patchNeedsYouSearch(search, { ask: key ?? undefined }), { replace });
+    onSearch(patchNeedsYouSearch(search, { ask: key ?? undefined, view: undefined }), {
+      replace: replace && view === "queue",
+    });
   };
   const pickRow = (key: string) => {
     // An ask inside a folded batch is shown by unfolding its batch.
@@ -205,6 +219,16 @@ export function NeedsYouPage(props: {
       queueOpen ||
       shortcutsOpen ||
       document.querySelector("[role=dialog]") !== null;
+    if (view !== "queue") {
+      // Off the queue only the keys that make sense anywhere act.
+      if (typing || layerOpen || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "?") setShortcutsOpen(true);
+      else if (event.key === "Escape") setView("queue");
+      else if (event.key.toLowerCase() === "z") undo();
+      else return;
+      event.preventDefault();
+      return;
+    }
     const ask = focused?._tag === "ask" ? focused : null;
     const response = ask ? kanbanAskResponse(ask.entry.ask) : null;
     const turn = ask ? askTurn(ask.entry, ask.item) : null;
@@ -321,9 +345,9 @@ export function NeedsYouPage(props: {
           inert={card !== null}
           className="relative gap-3 bg-(--m-surface)"
         >
-          <h1 className="shrink-0 font-semibold">Needs you</h1>
+          <h1 className="min-w-0 shrink truncate font-semibold">{VIEW_TITLES[view]}</h1>
           <p className="flex min-w-0 shrink-0 items-baseline gap-3 text-sm">
-            {feed ? (
+            {feed && view === "queue" ? (
               <>
                 <span className="font-medium tabular-nums">
                   {owed.length}
@@ -343,7 +367,12 @@ export function NeedsYouPage(props: {
             ) : null}
           </p>
           <span className="min-w-0 flex-1" />
-          {layout === "phone" ? (
+          {view !== "queue" ? (
+            <Btn size="sm" onClick={() => setView("queue")}>
+              Needs you
+              <span className="tabular-nums">{owed.length}</span>
+            </Btn>
+          ) : layout === "phone" ? (
             <Btn size="sm" onClick={() => setQueueOpen(true)}>
               <ListIcon aria-hidden />
               Queue
@@ -368,13 +397,38 @@ export function NeedsYouPage(props: {
               ))}
             </div>
           ) : null}
+          <div className="flex shrink-0 items-center">
+            <IconBtn
+              label="History"
+              aria-pressed={view === "history"}
+              onClick={() => setView(view === "history" ? "queue" : "history")}
+              className="aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)"
+            >
+              <HistoryIcon />
+            </IconBtn>
+            <IconBtn
+              label="What an ask can be"
+              aria-pressed={view === "reference"}
+              onClick={() => setView(view === "reference" ? "queue" : "reference")}
+              className="aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)"
+            >
+              <ShapesIcon />
+            </IconBtn>
+            <IconBtn
+              label="Keyboard shortcuts"
+              onClick={() => setShortcutsOpen(true)}
+              className="pointer-coarse:hidden"
+            >
+              <KeyboardIcon />
+            </IconBtn>
+          </div>
         </WorkspacePageHeader>
 
         <main
           ref={sheetRef}
           className="relative mx-2 mb-2 flex min-h-0 flex-1 overflow-hidden rounded-2xl bg-(--m-ground) ring-1 ring-(--m-rule)"
         >
-          {layout === "phone" ? null : (
+          {layout === "phone" || view !== "queue" ? null : (
             <nav
               aria-label="Asks"
               inert={card !== null}
@@ -387,11 +441,27 @@ export function NeedsYouPage(props: {
             </nav>
           )}
           <section
-            aria-label="Ask"
+            aria-label={view === "queue" ? "Ask" : VIEW_TITLES[view]}
             inert={card !== null}
             className="relative flex min-h-0 min-w-0 flex-1 flex-col"
           >
-            {focused?._tag === "ask" ? (
+            {view === "history" ? (
+              <HistoryView
+                layout={layout}
+                nowMs={nowMs}
+                toAnswer={owed.length}
+                waiting={waiting}
+                onBack={() => setView("queue")}
+                onUndo={undo}
+                onOpenCard={openCard}
+              />
+            ) : view === "reference" ? (
+              <ReferenceView
+                layout={layout}
+                onBack={() => setView("queue")}
+                onOpenAsk={(key) => focusOn(key, false)}
+              />
+            ) : focused?._tag === "ask" ? (
               <AskReader
                 key={focusKey}
                 entry={focused.entry}
@@ -445,7 +515,11 @@ export function NeedsYouPage(props: {
                 detail="New asks show up here as agents raise them."
               />
             )}
-            <AskToastView onUndo={undo} onView={(key) => focusOn(key)} bottom={focused ? 76 : 20} />
+            <AskToastView
+              onUndo={undo}
+              onView={(key) => focusOn(key)}
+              bottom={focused && view === "queue" ? 76 : 20}
+            />
           </section>
 
           {card ? (
@@ -459,6 +533,7 @@ export function NeedsYouPage(props: {
         </main>
       </div>
 
+      <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       <Layer
         open={queueOpen && layout === "phone"}
         onClose={() => setQueueOpen(false)}

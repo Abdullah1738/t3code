@@ -170,7 +170,7 @@ export function Chat(props: {
   );
 }
 
-const Message = memo(function Message(props: {
+export const Message = memo(function Message(props: {
   boardId: string;
   message: KanbanMessage;
   cards: KanbanBoardState["cards"];

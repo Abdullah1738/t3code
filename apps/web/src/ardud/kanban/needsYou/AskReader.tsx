@@ -13,6 +13,8 @@ import {
   buildAskAnswer,
   isPlainAnswerField,
   needsYouMarkOf,
+  diffPieces,
+  wordDiff,
   type AskKeyAction,
   type AskSecretAnswerInput,
   type NeedsYouItem,
@@ -30,6 +32,7 @@ import {
   type KanbanAskSecretAnswerInput,
   type KanbanBoard,
 } from "@t3tools/contracts";
+import { MessageSquareIcon } from "lucide-react";
 import {
   useEffect,
   useImperativeHandle,
@@ -48,6 +51,7 @@ import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { ActionBar, type AskTurn } from "./ActionBar";
 import { ActionDetails } from "./ActionDetails";
 import {
+  NoteField,
   OptionList,
   TaskSteps,
   WhyField,
@@ -55,6 +59,7 @@ import {
   type AskProblems,
 } from "./AnswerParts";
 import { AskBlocks, BlockPicture, useAskMedia } from "./AskBlocks";
+import { AskDiscussion } from "./AskDiscussion";
 import { FieldRow } from "./AskFields";
 import {
   answerAsk,
@@ -76,9 +81,10 @@ import {
 } from "./askStore";
 import { ChangeViewer } from "./ChangeView";
 import { DraftPart } from "./DraftPart";
+import { EvaluatorThreadLink, HandOver } from "./HandOver";
 import { MediaViewer } from "./MediaViewer";
 import { shortWhen, tomorrowMorning } from "./snoozeTimes";
-import { Btn, Label, Pill, linkClass, type PageLayout } from "./ui";
+import { Btn, Key, Label, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
   /** Runs a key's action on the ask in focus. */
@@ -121,6 +127,9 @@ export function AskReader(props: {
   const marks = useAskStore((state) => state.marks);
   const mark: NeedsYouMark | undefined = needsYouMarkOf(item, marks);
   const failed = useAskStore((state) => state.failed[key]);
+  const previous = useAskStore((state) => state.previous[key]);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [replyOpen, setReplyOpen] = useState(false);
   const response = kanbanAskResponse(ask);
   const refusal = askRefusal(response);
   const locked = turn === "evaluator" || turn === "expired";
@@ -238,6 +247,23 @@ export function AskReader(props: {
     patchAskForm(entry, { refusing: true });
     focusAt("why");
   };
+  const canTalk = turn === "owner" || turn === "agent";
+  const canNote = canTalk && !response.ack;
+  const addNote = () => {
+    if (!canNote) return;
+    setNoteOpen(true);
+    focusAt("note");
+  };
+  const reply = () => {
+    setReplyOpen(true);
+    requestAnimationFrame(() => {
+      const editor = root.current?.querySelector<HTMLElement>(
+        "[data-ny-discussion] [contenteditable='true']",
+      );
+      editor?.focus();
+      editor?.scrollIntoView({ block: "nearest" });
+    });
+  };
   const pick = (index: number) => {
     root.current?.querySelector<HTMLElement>(`[data-ny-option="${index}"]`)?.click();
   };
@@ -257,6 +283,10 @@ export function AskReader(props: {
           return pick(action.index);
         case "snooze":
           return snooze();
+        case "note":
+          return addNote();
+        case "reply":
+          return reply();
         case "edit":
           if (response.edit === "draft") {
             root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
@@ -277,13 +307,27 @@ export function AskReader(props: {
 
   const title = ask.title ?? entry.cardTitle;
   const plain = response.fields.length === 1 && isPlainAnswerField(ask, response.fields[0]!);
+  const showNote = canNote && (noteOpen || form.note !== "");
   const hasAnswerParts =
     response.choose !== null ||
     response.fields.length > 0 ||
     form.refusing ||
+    showNote ||
     response.task !== null;
 
-  const aside = <AskFacts entry={entry} item={item} turn={turn} onOpenCard={props.onOpenCard} />;
+  const aside = (
+    <AskFacts
+      entry={entry}
+      item={item}
+      turn={turn}
+      onOpenCard={props.onOpenCard}
+      handOver={
+        canTalk && !response.ack && ask.to !== "evaluator" ? (
+          <HandOver entry={entry} phone={layout === "phone"} onLeave={props.onLeave} />
+        ) : null
+      }
+    />
+  );
 
   return (
     <KanbanLinksProvider boardId={entry.boardId}>
@@ -357,6 +401,30 @@ export function AskReader(props: {
               <Banner tone="accent">
                 Its agent changed this ask{ask.revisionNote ? `: ${ask.revisionNote}` : "."} What
                 you typed is kept.
+                {previous && previous.text !== ask.text ? (
+                  <span className="mt-1.5 block text-(--m-text)">
+                    {diffPieces(wordDiff(previous.text, ask.text), "both").map((piece, index) =>
+                      piece.kind === "same" ? (
+                        // oxlint-disable-next-line react/no-array-index-key -- Pieces of one diff have no identity but their order.
+                        <span key={index}>{piece.text}</span>
+                      ) : piece.kind === "removed" ? (
+                        // oxlint-disable-next-line react/no-array-index-key -- Pieces of one diff have no identity but their order.
+                        <del key={index}>{piece.text}</del>
+                      ) : (
+                        // oxlint-disable-next-line react/no-array-index-key -- Pieces of one diff have no identity but their order.
+                        <ins key={index}>{piece.text}</ins>
+                      ),
+                    )}
+                  </span>
+                ) : null}
+              </Banner>
+            ) : null}
+            {turn === "evaluator" && ask.handedThreadId ? (
+              <Banner tone="accent">
+                Handed over with your words.{" "}
+                <EvaluatorThreadLink threadId={ask.handedThreadId}>
+                  Open the evaluator thread
+                </EvaluatorThreadLink>
               </Banner>
             ) : null}
             {turn === "expired" ? (
@@ -472,8 +540,23 @@ export function AskReader(props: {
                 {form.refusing ? (
                   <WhyField entry={entry} response={response} form={form} problem={problems.why} />
                 ) : null}
+                {showNote ? (
+                  <NoteField
+                    entry={entry}
+                    form={form}
+                    problem={problems.note}
+                    disabled={secretBusy}
+                  />
+                ) : null}
               </section>
             ) : null}
+
+            <AskDiscussion
+              entry={entry}
+              waiting={turn === "agent"}
+              open={replyOpen}
+              onOpenCard={props.onOpenLinkedCard}
+            />
 
             {layout === "desktop" ? null : aside}
           </article>
@@ -489,6 +572,13 @@ export function AskReader(props: {
             busy={secretBusy}
             snoozed={item.snoozed}
             onSnooze={snooze}
+            lead={
+              canTalk ? (
+                <Btn aria-label="Reply in the discussion" onClick={reply} className="px-3">
+                  <MessageSquareIcon aria-hidden />
+                </Btn>
+              ) : null
+            }
             onPrimary={primary}
             onRefuse={refuse}
             onBack={() => patchAskForm(entry, { refusing: false })}
@@ -501,7 +591,21 @@ export function AskReader(props: {
                 },
               ]).catch(() => undefined)
             }
-          />
+          >
+            {canNote && !showNote ? (
+              <Btn onClick={addNote}>
+                Add a note
+                <Key>N</Key>
+              </Btn>
+            ) : null}
+            {canTalk ? (
+              <Btn onClick={reply}>
+                <MessageSquareIcon aria-hidden />
+                Reply
+                <Key>R</Key>
+              </Btn>
+            ) : null}
+          </ActionBar>
         </div>
         {viewing !== null && media.items.length > 0 ? (
           <MediaViewer
@@ -609,6 +713,7 @@ function AskFacts(props: {
   item: NeedsYouItem;
   turn: AskTurn;
   onOpenCard: () => void;
+  handOver: ReactNode;
 }) {
   const { entry, item } = props;
   const ask = entry.ask;
@@ -653,6 +758,7 @@ function AskFacts(props: {
           ))}
         </dl>
       </div>
+      {props.handOver}
     </aside>
   );
 }

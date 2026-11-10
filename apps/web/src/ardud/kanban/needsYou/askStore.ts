@@ -481,6 +481,8 @@ async function deliver(send: AskSend, leaving: boolean) {
   }
   if (leaving) return;
   void refreshAsks();
+  // History, once read, shows the answer as its agent left it.
+  if (get().closed !== null) void loadClosedAsks();
   if (outcome === "stale") {
     showAskToast(
       {

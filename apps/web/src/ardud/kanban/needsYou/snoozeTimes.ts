@@ -30,3 +30,14 @@ export function shortWhen(iso: string, nowMs: number): string {
   if (days === -1) return `yesterday ${time}`;
   return Math.abs(days) < 7 ? `${DAY.format(at)} ${time}` : `${DATE.format(at)} ${time}`;
 }
+
+/** True when the two times fall on the same day here. */
+export function sameDay(iso: string, nowMs: number): boolean {
+  const at = new Date(iso);
+  const now = new Date(nowMs);
+  return (
+    at.getFullYear() === now.getFullYear() &&
+    at.getMonth() === now.getMonth() &&
+    at.getDate() === now.getDate()
+  );
+}

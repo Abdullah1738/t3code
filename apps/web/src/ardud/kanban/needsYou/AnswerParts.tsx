@@ -229,6 +229,34 @@ export function WhyField(props: {
   );
 }
 
+/** A note that rides along with the answer to the agent that acts on it. */
+export function NoteField(props: {
+  entry: KanbanAskFeedItem;
+  form: AskForm;
+  problem: string | undefined;
+  disabled: boolean;
+}) {
+  const id = useId();
+  return (
+    <div>
+      <label htmlFor={id} className="mb-1.5 flex items-baseline gap-2 text-sm font-medium">
+        Note for the agent
+        <span className="font-normal text-(--m-muted)">Goes with your answer</span>
+      </label>
+      <GrowingText
+        id={id}
+        data-ny-at="note"
+        disabled={props.disabled}
+        aria-invalid={props.problem ? true : undefined}
+        aria-describedby={props.problem ? `${id}-problem` : undefined}
+        value={props.form.note}
+        onChange={(event) => patchAskForm(props.entry, { note: event.target.value })}
+      />
+      {props.problem ? <Problem id={`${id}-problem`}>{props.problem}</Problem> : null}
+    </div>
+  );
+}
+
 const linkHost = (link: string): string => {
   try {
     return new URL(link).host.replace(/^www\./, "");
