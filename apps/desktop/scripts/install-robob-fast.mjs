@@ -3,7 +3,7 @@ import {
   cleanupOwnedTree,
   survivingOwned,
 } from "../../../packages/shared/src/ownedProcessTree.ts";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -15,6 +15,7 @@ export const INSTALL_PLAN = [
   "pre-stage",
   "signature",
   "migration-check",
+  "host-preflight (hung ~/checkouts mount, U-state processes)",
   "cancel-window (10s)",
   "quit (15s maximum)",
   "clone-backup",
@@ -62,6 +63,9 @@ export async function install(ops, { rollback = false } = {}) {
     await ops.verifyPrevious();
     await ops.migrations();
   }
+  // A hung NFS mount (ovnfs ~/checkouts) blocks the old server's exit in
+  // uv_thread_join, so the quit would time out into an outage (10 Nov 2026).
+  await ops.hostPreflight();
   await ops.cancelWindow();
   await ops.phase("quit");
   await ops.quit();
@@ -75,6 +79,244 @@ export async function install(ops, { rollback = false } = {}) {
   await ops.readReady();
   await ops.phase("ready");
   await ops.report();
+}
+
+
+/** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
+ * the child in U state, where even SIGKILL waits, so it is abandoned. */
+export function probeDirectory(dir, timeoutMs = 10_000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    const child = spawn("/bin/ls", ["-f", dir], { stdio: ["ignore", "pipe", "pipe"] });
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      finish({ state: "hang", dir, timeoutMs });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < 1 << 20) stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 4096) stderr += chunk;
+    });
+    child.once("error", (error) => finish({ state: "error", dir, message: String(error) }));
+    child.once("close", (code) =>
+      finish(
+        code === 0
+          ? { state: "ok", dir, stdout }
+          : {
+              state: /No such file or directory/.test(stderr) ? "absent" : "error",
+              dir,
+              message: stderr.trim().slice(0, 500) || `ls exited ${code}`,
+            },
+      ),
+    );
+  });
+}
+
+/** Root listing, then one checkout inside it: on 10 Nov the root answered
+ * while readdir/lookups inside hung. */
+export async function probeCheckouts(checkoutsDir, probe = probeDirectory) {
+  const root = await probe(checkoutsDir);
+  if (root.state !== "ok") return root;
+  const name = root.stdout
+    .split("\n")
+    .find((entry) => entry && entry !== "." && entry !== ".." && !entry.startsWith("."));
+  if (name === undefined) return { state: "ok", dir: checkoutsDir, empty: true };
+  const inner = await probe(path.join(checkoutsDir, name));
+  return inner.state === "ok" ? { state: "ok", dir: inner.dir } : inner;
+}
+
+export async function uStateProcesses(runPs = () => exec("/bin/ps", ["-axo", "pid=,stat=,comm="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 })) {
+  const { stdout } = await runPs();
+  return stdout
+    .split("\n")
+    .map((line) => line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/))
+    .filter((m) => m !== null && m[2].startsWith("U"))
+    .map((m) => ({ pid: Number(m[1]), stat: m[2], command: m[3].slice(0, 200) }));
+}
+
+/**
+ * Refuse to quit into a hang. A hung ~/checkouts gets one keep-mount
+ * `ovnfs restart` and is probed again; if it still hangs the install stops
+ * here, before anything is shut down.
+ */
+export async function hostPreflight({
+  checkoutsDir,
+  probe = probeDirectory,
+  restart,
+  uState = () => uStateProcesses(),
+  log,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  recheckAttempts = 3,
+  recheckDelayMs = 20_000,
+}) {
+  const listU = async (when) => {
+    try {
+      const processes = await uState();
+      await log("host_preflight_u_state", { when, count: processes.length, processes: processes.slice(0, 50) });
+      return processes;
+    } catch (error) {
+      await log("host_preflight_u_state", { when, error: String(error) });
+      return [];
+    }
+  };
+  await listU("before");
+  const first = await probeCheckouts(checkoutsDir, probe);
+  await log("host_preflight_mount", { when: "before", ...summarizeProbe(first) });
+  if (first.state !== "hang") return { restarted: false, result: first };
+  if (restart === undefined)
+    throw new Error(`${first.dir} is hung and no ovnfs restart is available; not quitting Robob`);
+  await log("host_preflight_ovnfs_restart", { reason: `${first.dir} did not answer in ${first.timeoutMs} ms` });
+  try {
+    await restart();
+  } catch (error) {
+    await log("host_preflight_ovnfs_restart_failed", { error: String(error) });
+  }
+  let again = first;
+  for (let attempt = 1; attempt <= recheckAttempts; attempt++) {
+    again = await probeCheckouts(checkoutsDir, probe);
+    await log("host_preflight_mount", { when: `after-restart-${attempt}`, ...summarizeProbe(again) });
+    if (again.state !== "hang") break;
+    if (attempt < recheckAttempts) await sleep(recheckDelayMs);
+  }
+  await listU("after-restart");
+  if (again.state === "hang")
+    throw new Error(
+      `${again.dir} still hangs after ovnfs restart; not quitting Robob (a hung mount blocks the old server's exit). Fix the mount, then retry.`,
+    );
+  return { restarted: true, result: again };
+}
+
+const summarizeProbe = (result) => {
+  const { stdout: _stdout, ...rest } = result;
+  return rest;
+};
+
+/** Relaunch the old app after a failed quit only once every old process is
+ * gone: a survivor still holds the server owner lock, and a relaunch beside it
+ * leaves Robob with no server (10 Nov 2026, pid 5646). */
+export async function relaunchAfterFailure({
+  survivors,
+  launch,
+  log,
+  notify = async () => {},
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(),
+  boundMs = 10 * 60_000,
+  reportEveryMs = 30_000,
+}) {
+  const started = now();
+  let reported = -Infinity;
+  for (;;) {
+    let alive;
+    try {
+      alive = await survivors();
+    } catch (error) {
+      alive = undefined;
+      await log("relaunch_survivor_check_failed", { error: String(error) });
+    }
+    if (alive !== undefined && alive.length === 0) break;
+    if (now() - started >= boundMs) {
+      const pids = alive?.map((p) => p.pid ?? p) ?? "unknown";
+      await log("relaunch_skipped", { reason: "old Robob processes did not exit", survivors: pids });
+      await notify(
+        `Robob install failed and the old app was NOT relaunched: processes ${JSON.stringify(pids)} are still running after ${Math.round(boundMs / 1000)} s. Check for hung mounts (ovnfs restart), then open Robob.`,
+      );
+      return false;
+    }
+    if (now() - reported >= reportEveryMs) {
+      reported = now();
+      await log("relaunch_waiting", { survivors: alive?.map((p) => p.pid ?? p) ?? "unknown" });
+    }
+    await sleep(500);
+  }
+  await log("relaunch_old_app");
+  await launch();
+  return true;
+}
+
+const psRows = (stdout) =>
+  stdout
+    .split("\n")
+    .map((line) => line.trim().match(/^(\d+)\s+(.*)$/))
+    .filter((m) => m !== null)
+    .map((m) => ({ pid: Number(m[1]), rest: m[2] }));
+
+/** Other real installer runs (`ps -axo pid=,command=`), never this one or a dry run. */
+export const otherInstallerPids = (stdout, self = process.pid) =>
+  psRows(stdout)
+    .filter(
+      ({ pid, rest }) =>
+        pid !== self &&
+        /(?:^|\/)node\s.*install-robob-fast\.mjs(?:\s|$)/.test(rest) &&
+        !/\s--dry-run(?:\s|$)/.test(rest),
+    )
+    .map(({ pid }) => pid);
+
+/** Processes whose executable lives inside BUNDLE (`ps -axo pid=,comm=`). */
+export const pidsRunningFrom = (stdout, bundle) =>
+  psRows(stdout)
+    .filter(({ rest }) => rest.startsWith(`${bundle}/`))
+    .map(({ pid }) => ({ pid }));
+
+/**
+ * A failed run can leave /Applications/.Robob.next.app behind. Replace it only
+ * when it is provably a stale Robob staging copy: a Robob bundle (or a partial
+ * copy holding only Contents/), no other installer running, and no process
+ * running from it.
+ */
+export async function clearStaleStaging({
+  next,
+  stamp,
+  log,
+  exists,
+  readBundleId,
+  topLevel,
+  otherInstallers,
+  runningFrom,
+  remove,
+  rename,
+  stat,
+}) {
+  if (!(await exists(next))) return "absent";
+  const bundleId = await readBundleId(next).catch(() => undefined);
+  const entries = await topLevel(next);
+  const partial = bundleId === undefined && entries.every((name) => name === "Contents");
+  if (bundleId !== EXPECTED_SIGNATURE.identifier && !partial)
+    throw new Error(
+      `Staging path ${next} holds ${bundleId ?? `unknown content (${entries.slice(0, 5).join(", ")})`}, not a Robob staging bundle; inspect it before retrying`,
+    );
+  const installers = await otherInstallers();
+  if (installers.length)
+    throw new Error(`Another installer is running (pid ${installers.join(", ")}); staging bundle ${next} may be in use`);
+  const users = await runningFrom(next);
+  if (users.length)
+    throw new Error(`Processes run from ${next} (pid ${users.map((p) => p.pid ?? p).join(", ")}); not replacing it`);
+  const info = await stat(next).catch(() => undefined);
+  const aside = `${next}.stale-${stamp}`;
+  await log("stale_staging_found", {
+    path: next,
+    bundleId: bundleId ?? null,
+    partial,
+    modifiedAt: info ? new Date(info.mtimeMs).toISOString() : null,
+  });
+  await rename(next, aside);
+  await remove(aside);
+  await log("stale_staging_removed", { path: next, movedTo: aside });
+  return "removed";
 }
 
 async function main(args) {
@@ -143,6 +385,7 @@ async function main(args) {
     oldBootId = (await get("/api/ardud/control/install-report")).bootId;
   } catch {}
   let mount;
+  let quitTree;
   let ownsStaging = false;
   let swapped = false;
   const poll = async (fn) => {
@@ -171,6 +414,30 @@ async function main(args) {
     stage: async () => {
       const dmg = args[dmgIndex + 1];
       if (dmgIndex < 0 || !path.isAbsolute(dmg)) throw new Error("--dmg requires an absolute path");
+      // A failed run can leave its staging copy; replace it only when provably stale.
+      await clearStaleStaging({
+        next,
+        stamp,
+        log: phase,
+        exists,
+        readBundleId: async (bundle) =>
+          (
+            await run("/usr/bin/plutil", [
+              "-extract",
+              "CFBundleIdentifier",
+              "raw",
+              path.join(bundle, "Contents/Info.plist"),
+            ])
+          ).stdout.trim(),
+        topLevel: (bundle) => fs.readdir(bundle),
+        otherInstallers: async () =>
+          otherInstallerPids((await run("/bin/ps", ["-axo", "pid=,command="], 5000)).stdout),
+        runningFrom: async (bundle) =>
+          pidsRunningFrom((await run("/bin/ps", ["-axo", "pid=,comm="], 5000)).stdout, bundle),
+        rename: fs.rename,
+        remove: (target) => fs.rm(target, { recursive: true, force: true }),
+        stat: fs.stat,
+      });
       mount = await fs.mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
       await run(
         "/usr/bin/hdiutil",
@@ -216,6 +483,16 @@ async function main(args) {
       }
     },
     verifyPrevious: () => verifyBundle(prev),
+    hostPreflight: async () => {
+      const ovnfs = path.join(os.homedir(), ".local/bin/ovnfs");
+      await hostPreflight({
+        checkoutsDir: path.join(os.homedir(), "checkouts"),
+        log: phase,
+        // Keep-mount restart (ovnfs >= 0.3.0). Never `ovnfs stop`: it unmounts
+        // and can wedge the kernel mount point while processes still use it.
+        restart: (await exists(ovnfs)) ? () => run(ovnfs, ["restart"], 6 * 60_000) : undefined,
+      });
+    },
     cancelWindow: () => sleep(10_000),
     quit: async () => {
       quitAt = Date.now();
@@ -233,6 +510,7 @@ async function main(args) {
         quitAbort,
         path.join(app, "Contents/MacOS/Robob"),
       );
+      quitTree = tree;
       try {
         await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
       } catch {}
@@ -328,13 +606,59 @@ async function main(args) {
     await install(ops, { rollback });
   } catch (e) {
     await phase("failed", { error: String(e), swapped });
-    // Before the swap no new binary has touched the data. Reopen the existing app.
-    // After it, a rollback must pass the previous binary's migration preflight.
-    if (quitAt !== undefined && !swapped) await launch().catch(() => {});
+    // Before the swap no new binary has touched the data. Reopen the existing app,
+    // but only once every old process is gone (its server holds the owner lock).
+    // After the swap, a rollback must pass the previous binary's migration preflight.
+    if (quitAt !== undefined && !swapped) {
+      await relaunchAfterFailure({
+        survivors: async () =>
+          quitTree !== undefined
+            ? survivingOwned(quitTree, true, AbortSignal.timeout(10_000))
+            : // The quit failed before the tree was captured: any process from the bundle.
+              pidsRunningFrom(
+                (
+                  await exec("/bin/ps", ["-axo", "pid=,comm="], {
+                    timeout: 5000,
+                    maxBuffer: 8 * 1024 * 1024,
+                  })
+                ).stdout,
+                app,
+              ),
+        // Not bounded by the 3 minute install clock: waiting for the old tree can outlast it.
+        launch: () =>
+          exec(
+            "/bin/zsh",
+            [path.join(path.dirname(fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
+            { timeout: 35_000, maxBuffer: 2 ** 20 },
+          ),
+        log: phase,
+        notify: (text) =>
+          exec(
+            "/Users/ardud/.bun/bin/bun",
+            [
+              "/Users/ardud/.local/share/telegram-bridge/src/cli.ts",
+              "notify",
+              "--source",
+              "Robob install",
+              "--severity",
+              "attention",
+              "--key",
+              `robob-install:${stamp}:no-relaunch`,
+              "--text",
+              text,
+            ],
+            { timeout: 5000 },
+          ).catch(() => {}),
+      }).catch((error) => phase("relaunch_failed", { error: String(error) }));
+    }
     throw e;
   } finally {
-    if (ownsStaging && !swapped && quitAt === undefined)
+    // Our own unswapped staging copy is useless after a failure; drop it so the
+    // next run does not trip on it, but only while the live app is in place.
+    if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
       await fs.rm(next, { recursive: true, force: true });
+      if (quitAt !== undefined) await phase("staging_removed", { path: next });
+    }
     if (mount) {
       await run("/usr/bin/hdiutil", ["detach", "-quiet", mount]).catch(() => {});
       await fs.rmdir(mount).catch(() => {});
