@@ -2,9 +2,11 @@ import { expect, it } from "@effect/vitest";
 
 import {
   SHELL_PAGE_SIZE,
+  SHELL_RECENT_PAGE_SIZE,
   SHELL_WALK_START_CURSOR,
   shellPageNextAfter,
   shellPageRead,
+  shellPageSize,
 } from "./shellPages.ts";
 
 const rows = (count: number) =>
@@ -22,16 +24,25 @@ it("starts the id walk from the recent page's cursor, whatever the switch says",
   expect(shellPageRead(SHELL_WALK_START_CURSOR, false)).toEqual({});
 });
 
+it("keeps the recent page small and the walk pages full size", () => {
+  expect(shellPageSize({ recentFirst: true })).toBe(SHELL_RECENT_PAGE_SIZE);
+  expect(shellPageSize({})).toBe(SHELL_PAGE_SIZE);
+  expect(shellPageSize({ afterThreadId: "a" })).toBe(SHELL_PAGE_SIZE);
+  expect(SHELL_RECENT_PAGE_SIZE).toBeLessThan(SHELL_PAGE_SIZE);
+});
+
 it("hands out the walk cursor after a full recent page and thread ids during the walk", () => {
+  expect(shellPageNextAfter({ recentFirst: true }, rows(SHELL_RECENT_PAGE_SIZE + 1))).toBe(
+    SHELL_WALK_START_CURSOR,
+  );
   const full = rows(SHELL_PAGE_SIZE + 1);
-  expect(shellPageNextAfter({ recentFirst: true }, full)).toBe(SHELL_WALK_START_CURSOR);
   expect(shellPageNextAfter({}, full)).toBe("thread-0499");
   expect(shellPageNextAfter({ afterThreadId: "a" }, full)).toBe("thread-0499");
 });
 
 it("ends the load when a page holds every remaining row", () => {
-  // A list that fits one page is complete after the recent page: no second read.
-  expect(shellPageNextAfter({ recentFirst: true }, rows(SHELL_PAGE_SIZE))).toBeNull();
+  // A list that fits the recent page is complete after it: no second read.
+  expect(shellPageNextAfter({ recentFirst: true }, rows(SHELL_RECENT_PAGE_SIZE))).toBeNull();
   expect(shellPageNextAfter({ recentFirst: true }, rows(3))).toBeNull();
   expect(shellPageNextAfter({}, rows(SHELL_PAGE_SIZE))).toBeNull();
   expect(shellPageNextAfter({ afterThreadId: "a" }, [])).toBeNull();

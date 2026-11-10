@@ -175,7 +175,7 @@ import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import type { OrchestrationEventStoreError } from "./persistence/Errors.ts";
 import { ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
-import { SHELL_PAGE_SIZE, shellPageNextAfter, shellPageRead } from "./ardud/perf/shellPages.ts";
+import { shellPageNextAfter, shellPageRead, shellPageSize } from "./ardud/perf/shellPages.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
@@ -1027,7 +1027,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
-            ...(input.acceptShellPages === true ? { limit: SHELL_PAGE_SIZE + 1 } : {}),
+            ...(input.acceptShellPages === true ? { limit: shellPageSize(read) + 1 } : {}),
             ...read,
           }),
           listProjects: projects.listShells(),
@@ -1044,7 +1044,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         snapshot: {
           ...base,
           projects: enriched.projects,
-          threads: base.threads.slice(0, SHELL_PAGE_SIZE),
+          threads: base.threads.slice(0, shellPageSize(read)),
           page: {
             after: after ?? null,
             nextAfter: shellPageNextAfter(read, base.threads),

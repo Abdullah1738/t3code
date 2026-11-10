@@ -35,7 +35,7 @@ import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.
 import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
 import { checkJsonReply } from "../ardud/http/jsonReply.ts";
-import { SHELL_PAGE_SIZE, shellPageNextAfter, shellPageRead } from "../ardud/perf/shellPages.ts";
+import { shellPageNextAfter, shellPageRead, shellPageSize } from "../ardud/perf/shellPages.ts";
 import { Switches } from "../ardud/perf/speedups.ts";
 
 const isThreadTranscriptTooLargeError = Schema.is(
@@ -96,7 +96,7 @@ export const layer = HttpApiBuilder.group(
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(omitIdleSubagents ? { omitIdleSubagents: true } : {}),
-            ...(paged ? { limit: SHELL_PAGE_SIZE + 1 } : {}),
+            ...(paged ? { limit: shellPageSize(read) + 1 } : {}),
             ...read,
           }),
           listProjects: projectStore.listShells(),
@@ -108,7 +108,7 @@ export const layer = HttpApiBuilder.group(
       return {
         ...base,
         projects,
-        threads: base.threads.slice(0, SHELL_PAGE_SIZE),
+        threads: base.threads.slice(0, shellPageSize(read)),
         page: {
           after: after ?? null,
           nextAfter: shellPageNextAfter(read, base.threads),

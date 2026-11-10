@@ -109,6 +109,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { SHELL_RECENT_PAGE_SIZE } from "./ardud/perf/shellPages.ts";
 import { readSpeedups, ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
@@ -756,11 +757,11 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
         const recentPages = yield* pagesFor({ shellRecentFirst: true });
         assert.deepEqual(
           recentPages.map((item) => item.snapshot.threads.length),
-          [500, 500, 500, 101],
+          [SHELL_RECENT_PAGE_SIZE, 500, 500, 101],
         );
         assert.deepEqual(
           recentPages[0]!.snapshot.threads.map((thread) => thread.id),
-          recentRows.slice(0, 500).map((row) => row.id),
+          recentRows.slice(0, SHELL_RECENT_PAGE_SIZE).map((row) => row.id),
         );
         assert.deepEqual(
           recentPages.slice(1).flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),

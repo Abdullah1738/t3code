@@ -31,7 +31,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { middleware as replyMiddleware } from "../ardud/http/replyMiddleware.ts";
-import { SHELL_WALK_START_CURSOR } from "../ardud/perf/shellPages.ts";
+import { SHELL_RECENT_PAGE_SIZE, SHELL_WALK_START_CURSOR } from "../ardud/perf/shellPages.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
@@ -281,7 +281,7 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
         return (await response.json()) as typeof firstPage;
       });
     const recentFirst = yield* recentPage();
-    expect(recentFirst.threads).toHaveLength(500);
+    expect(recentFirst.threads).toHaveLength(SHELL_RECENT_PAGE_SIZE);
     expect(recentFirst.threads.slice(0, 2).map((thread) => thread.id)).toEqual([
       "paged-0503",
       "paged-0504",
