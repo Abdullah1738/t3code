@@ -18,8 +18,10 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -27,7 +29,6 @@ import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
-import * as NodeFS from "node:fs";
 
 import {
   ProjectId,
@@ -83,7 +84,7 @@ const makeThreads = Effect.gen(function* () {
       yield* hold(READ_MS);
       const thread = threads.get(threadId);
       if (!thread) return null;
-      const at = new Date(yield* Clock.currentTimeMillis).toISOString();
+      const at = DateTime.formatIso(yield* DateTime.now);
       const view: KanbanThreadView = {
         threadId,
         projectId: ProjectId.make("project-1"),
@@ -491,8 +492,13 @@ it.live(
         turnEnd: { attempts: turnEndAttempts, failedAttempts: turnEndFailedAttempts },
         threadIo: fake.counts,
       };
-      if (process.env.KANBAN_LOCK_BENCH_OUT)
-        NodeFS.writeFileSync(process.env.KANBAN_LOCK_BENCH_OUT, JSON.stringify(report, null, 2));
+      const out = process.env.KANBAN_LOCK_BENCH_OUT;
+      if (out) {
+        yield* Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.writeFileString(out, JSON.stringify(report, null, 2));
+        }).pipe(Effect.provide(NodeServices.layer), Effect.orDie);
+      }
       for (const name of ["owner.createCard", "owner.post", "agent.postStatus"]) {
         assert.isAbove(report.writes[name]?.n ?? 0, 0, `${name} completed at least once`);
       }

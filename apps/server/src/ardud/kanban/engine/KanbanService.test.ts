@@ -13148,7 +13148,8 @@ it.effect("worker-triggered evaluator handoffs use distinct keys for every prior
       for (const id of [first, second]) {
         assert.isTrue(
           fake.sends.some(
-            (send) => send.threadId === id && send.key === `handoff:${replacement}:${id}`,
+            // The question reaches the evaluator from its route row, whose key prefixes the send.
+            (send) => send.threadId === id && send.key?.endsWith(`handoff:${replacement}:${id}`),
           ),
         );
       }
