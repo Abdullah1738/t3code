@@ -651,6 +651,170 @@ class FactScopeTests(unittest.TestCase):
                     self.assertTrue(index.search_facts(['Use Talabat again.'], CWD, session_id='other'))
                     self.assertEqual(0, index.import_transcripts(self.corpus)['rows'])
 
+    def test_nownow_cleanup_safeguard_reaches_checker_despite_incidental_ids_and_states(self):
+        skill = self.root / 'noon/SKILL.md'
+        skill.parent.mkdir()
+        skill.write_text(FIXTURE['rule_4255'])
+        self.index.import_files([skill])
+        message = ('NowNow cleanup returned an uncertain delete and failed readback. '
+                   'I will resend the delete through the app to clear the cart.')
+        with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+            rules, result = self.check(message)
+        self.assertEqual([FIXTURE['rule_4255']], [r['text'] for r in rules])
+        model.assert_called_once()
+        self.assertEqual('deny', result['decision'])
+
+    def test_identifiers_do_not_turn_non_ci_facts_into_ci_outcomes(self):
+        from recall_fact_scope import comparison_text
+        identifiers = ('commit 1afee3e483', 'PR #4', 'flow 686c475e-a777-4f41-97fc-7dbdd2510c70',
+                       'product P5997551102819847A', 'reference 42819961468')
+        for identity in identifiers:
+            for state in ('ACTIVE', 'blocked', 'failed', 'completed', 'pending'):
+                fact = f'NowNow cleanup {identity} is {state}. Never resend an uncertain delete through the app.'
+                with self.subTest(identity=identity, state=state):
+                    self.assertEqual(fact, comparison_text(fact, 'Resend the uncertain NowNow delete through the app.'))
+
+    def test_identifier_bearing_ci_policies_reach_checker_for_same_pr(self):
+        cases = (
+            ('PR compact', 'Never merge PR1145 unless CI checks passed.'),
+            ('PR hash', 'Never claim CI passed for PR #1145 without verifying it.'),
+            ('PR long label', 'Owner rule: when writing pull request #1145 comments, never claim CI passed before verifying it.'),
+            ('head', 'Never claim CI passed for head 66cfd86f without verifying it.'),
+            ('run', 'Never claim CI passed for run 42644775814 without verifying it.'),
+            ('CI requirement', 'PR1145 CI checks must pass before publishing.'),
+            ('conditional', 'If PR1145 CI checks are red, do not merge.'),
+            ('owner prefix', 'Owner rule: run CI checks for PR1145 before publishing.'),
+            ('next time prefix', 'Next time verify CI checks passed for PR1145 before publishing.'),
+            ('from now on prefix', 'From now on check CI passed for PR1145 before publishing.'),
+            ('remember prefix', 'Remember this next time: verify CI passed for PR1145 before publishing.'),
+            ('conditional hold', 'Unless CI checks passed, hold the merge.'),
+            ('conditional stop', 'If CI checks are red, stop.'),
+            ('conditional keep', 'Until CI checks are green, keep the PR open.'),
+            ('conditional polite', 'If PR1145 CI checks are red, please stop.'),
+            ('run ID command', 'Only run 42644775814 for PR1145 unless CI checks passed.'),
+            ('check ID command', 'Never check 42644775814 for PR1145 without verifying CI passed.'),
+        )
+        message = 'Merge PR1145 head 66cfd86f while CI checks for run 42644775814 are pending, and claim CI passed.'
+        for i, (label, policy) in enumerate(cases):
+            with self.subTest(label=label):
+                index = RuleIndex(self.root / f'policy-{i}.db')
+                index.remember(policy, scope=CWD, source_session='owner')
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    rules, result = preflight('t3_thread_send', {'message': message}, CWD, index.path, session_id='other')
+                self.assertEqual([policy], [r['text'] for r in rules])
+                model.assert_called_once()
+                self.assertEqual('deny', result['decision'])
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    records = engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]
+                    self.assertEqual([policy], [r['text'] for r in records])
+
+    def test_identifier_bearing_policy_does_not_exempt_an_adjacent_stale_ci_result(self):
+        from recall_fact_scope import comparison_text
+        policy = 'Never merge PR1145 unless CI checks passed.'
+        fact = policy + ' PR1145 head 66cfd86f: Both CI checks SUCCESS.'
+        self.assertEqual(policy, comparison_text(fact, FIXTURE['messages']['3231']))
+
+    def test_ci_shorthand_separator_and_pr_label_class(self):
+        from recall_fact_scope import comparison_text
+        labels = ('PR1145', 'PR #1145', 'PR:1145', 'PR=1145', 'PR-1145',
+                  'pull request #1145', 'https://github.com/org/repo/pull/1145')
+        separators = (' ', ': ', '= ', ' - ', ' — ', ' is ', ' was ', ': is ', ': was ')
+        changed = 'PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        for label in labels:
+            for separator in separators:
+                for head in ('66cfd86f', '`66cfd86f`'):
+                    fact = label + ' head ' + head + separator + 'green.'
+                    with self.subTest(label=label, separator=separator, head=head):
+                        self.assertEqual('', comparison_text(fact, changed))
+                        self.assertEqual(fact, comparison_text(fact, matching))
+        for predicate in ('has passed', 'had failed', 'did pass', 'will pass', 'has been green'):
+            fact = 'PR1145 head 66cfd86f ' + predicate + '.'
+            with self.subTest(predicate=predicate):
+                self.assertEqual('', comparison_text(fact, changed))
+                self.assertEqual(fact, comparison_text(fact, matching))
+
+    def test_temporal_and_hedged_ci_reports_do_not_become_policies(self):
+        facts = ('Until yesterday PR1145 head 66cfd86f CI was green.',
+                 'If I remember correctly, PR1145 head 66cfd86f CI passed.',
+                 "Unless I'm mistaken, PR1145 head 66cfd86f CI passed.",
+                 'When we last checked, PR1145 head 66cfd86f CI passed.',
+                 'After CI passed for PR1145 head 66cfd86f, we merged.',
+                 'Once CI succeeded for PR1145 head 66cfd86f, we published.',
+                 'Only PR1145 head 66cfd86f has green CI checks.',
+                 'Never before had CI passed for PR1145 head 66cfd86f.',
+                 'PR1145 head 66cfd86f: green.', 'PR1145 head 66cfd86f is green.')
+        changed = 'PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        for i, fact in enumerate(facts):
+            with self.subTest(fact=fact):
+                index = RuleIndex(self.root / f'result-{i}.db')
+                index.remember(fact, scope=CWD)
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+                    model.assert_not_called()
+                    rules, result = preflight('t3_thread_send', {'message': matching}, CWD, index.path)
+                    self.assertEqual([fact], [r['text'] for r in rules])
+                    self.assertEqual('deny', result['decision'])
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+
+    def test_ci_subject_number_and_result_state_class(self):
+        from recall_fact_scope import comparison_text
+        for subject in ('CI', 'CIcheck', 'CIchecks', 'check', 'checks', 'workflow', 'workflows', 'run', 'runs'):
+            for state in ('passed', 'failed', 'green', 'red', 'pending', 'queued', 'running', 'cancelled', 'SUCCESS'):
+                fact = f'PR1145 head 66cfd86f: {subject} {state}.'
+                with self.subTest(subject=subject, state=state):
+                    self.assertEqual('', comparison_text(fact, 'PR1145 head 72a10c19 checks pending.'))
+                    self.assertEqual(fact, comparison_text(fact, 'PR1145 head 66cfd86f checks failed.'))
+
+    def test_instruction_verbs_and_descriptive_prefixes_are_distinct(self):
+        from recall_fact_scope import comparison_text
+        for prefix in ('Always', 'Never', 'Only'):
+            for description in ('before had PR1145 head 66cfd86f CI passed.',
+                                'PR1145 head 66cfd86f had green CI checks.'):
+                fact = prefix + ' ' + description
+                with self.subTest(fact=fact):
+                    self.assertEqual('', comparison_text(fact, 'PR1145 head 72a10c19 checks pending.'))
+        for verb in ('check', 'run', 'use', 'verify', 'wait', 'claim', 'say', 'report', 'mark', 'keep',
+                     'reuse', 'avoid', 'ensure', 'require', 'confirm', 'inspect', 'test', 'prefer',
+                     'retain', 'review', 'send', 'push', 'deploy', 'merge', 'publish', 'record', 'write', 'stop', 'hold'):
+            for prefix in ('Never ', 'If CI checks are red, ', 'If CI checks are red, please ',
+                           'Unless CI checks passed, ', 'Until CI checks are green, '):
+                policy = prefix + verb + ' PR1145 before CI checks passed.'
+                with self.subTest(prefix=prefix, verb=verb):
+                    self.assertEqual(policy, comparison_text(policy, 'PR1145 head 72a10c19 checks pending.'))
+
+    def test_named_run_or_check_result_is_not_an_imperative(self):
+        from recall_fact_scope import comparison_text
+        changed = 'PR1145 head 72a10c19 run 42644775808 checks pending.'
+        matching = 'PR1145 head 66cfd86f run 42644775814 checks failed.'
+        for noun in ('run', 'check'):
+            for reference in ('42644775814', '#42644775814', 'id: 42644775814', '`42644775814`'):
+                for prefix in ('Only ', 'If I remember correctly, '):
+                    for state in ('passed', 'failed', 'succeeded', 'is green', 'was red', 'SUCCESS', 'pending',
+                                  'queued', 'running', 'active', 'cancelled', 'timed_out', 'skipped', 'neutral',
+                                  'completed', 'in_progress', 'action_required', 'blocked', 'waiting', 'error',
+                                  'has passed', 'had failed', 'did pass', 'will pass', 'has been green'):
+                        fact = f'{prefix}{noun} {reference} for PR1145 head 66cfd86f {state}.'
+                        with self.subTest(noun=noun, reference=reference, prefix=prefix, state=state):
+                            self.assertEqual('', comparison_text(fact, changed))
+                            self.assertEqual(fact, comparison_text(fact, matching))
+        for i, fact in enumerate(('Only run 42644775814 for PR1145 head 66cfd86f passed.',
+                                  'If I remember correctly, run 42644775814 for PR1145 head 66cfd86f passed.')):
+            with self.subTest(fact=fact):
+                index = RuleIndex(self.root / f'noun-run-{i}.db')
+                index.remember(fact, scope=CWD)
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+                    model.assert_not_called()
+                    self.assertEqual('deny', preflight('t3_thread_send', {'message': matching}, CWD, index.path)[1]['decision'])
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+
 
 if __name__ == '__main__':
     unittest.main()

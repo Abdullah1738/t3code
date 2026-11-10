@@ -40,17 +40,21 @@ def normalized(text):
     return " ".join(re.sub(r"\d+", "<n>", text).split())
 
 
+def standing_formulation(text):
+    return bool(re.match(
+        r"\s*(?:[-*]\s*)?(?:\[Abdullah\]\s*)?(?:remember (?:this|that)(?: for)? next time|"
+        r"next time|from now on|owner rule:|always\b|never\b|"
+        r"(?:don't|do not)\b[^.!?]{0,240}\bagain\b|a revision\b[^\n]*new essay)",
+        directive_body(text), re.I))
+
+
 def durable(text):
     # Transcript corrections default to their task. Only an explicit standing
     # formulation generalizes; saving with remember() remains an intentional scope.
     text = directive_body(text)
     if any(ci_ids(text)) or re.search(r"(?:/tmp/|tmp/|current head|translation rows)", text, re.I):
         return False
-    return bool(re.match(
-        r"\s*(?:[-*]\s*)?(?:\[Abdullah\]\s*)?(?:remember (?:this|that)(?: for)? next time|"
-        r"next time|from now on|owner rule:|always\b|never\b|"
-        r"(?:don't|do not)\b[^.!?]{0,240}\bagain\b|a revision\b[^\n]*new essay)",
-        text.replace("’", "'"), re.I))
+    return standing_formulation(text)
 
 
 def ci_ids(text):
@@ -61,21 +65,36 @@ def ci_ids(text):
     )
 
 
+_CI_STATES = (r"success(?:ful(?:ly)?)?|succeed(?:ed|s)?|pass(?:ed|ing)?|fail(?:ed|ure|ing)?|"
+              r"green|red|pending|queued|running|active|cancel(?:led|ed)|timed[_ -]?out|skipped|"
+              r"neutral|completed|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
+
+
 def standing_instruction(text):
     policy = re.sub(r"^(?:remember (?:this|that)(?: for)? next time|next time|from now on|owner rule)\s*[:,]?\s*",
                     "", directive_body(text), flags=re.I)
-    if not any(ci_ids(text)) and (
-            re.match(r"(?:if|unless|until)\b", policy, re.I)
-            or re.match(r"(?:when|once|before|after)\b", policy, re.I) and re.search(
-                r"\b(?:always|never|don't|do not|only)\s+(?:claim|say|report|mark|merge|publish|check|verify|run|record|write)\b|"
-                r"(?:,\s*|\bthen\s+)(?:claim|say|report|mark|merge|publish|check|verify|run|record|write)\b", policy, re.I)
-            or re.search(r"\b(?:must|should|needs? to|required to)\s+(?:pass|succeed|be|run|finish|complete|remain|stay)\b", policy, re.I)
-            or re.match(r"(?:always|never|don't|do not|only)\s+(?!(?:CI(?:checks?)?|checks?|workflows?|runs?|both|all|the|our)\b)", policy, re.I)):
+    # Policy wording determines intent; a named PR/head/run does not turn
+    # an instruction into a historical result. Prefixes alone aren't intent:
+    # "only PR1145 passed" and "never before had CI passed" are results.
+    reference = r"(?:id\s*[:=#]?\s*|#\s*)?`?\d+`?"
+    pr = r"(?:PR|pull request)\s*[:=#-]?\s*\d+"
+    context = r"(?:\s+for\s+" + pr + r"(?:\s+head\s+`?[0-9a-f]{7,40}`?)?)?"
+    result = r"(?:(?:is|was|are|were|has|had|did|will)|" + _CI_STATES + r")\b"
+    # "Only run 123 passed" names a result; "only run 123 unless CI passed"
+    # remains an instruction. Look past the reference before choosing intent.
+    named_result = r"\s+" + reference + context + r"\s+" + result
+    verb = (r"(?:(?:check|run)(?!" + named_result + r")|use|verify|wait|claim|say|report|mark|keep|reuse|avoid|ensure|require|confirm|inspect|test|"
+            r"prefer|retain|review|send|push|deploy|merge|publish|record|write|stop|hold)\b")
+    conditional = re.match(r"(?:if|unless|until|when|once|before|after)\b", policy, re.I)
+    if conditional and re.search(r"\b(?:always|never|don't|do not|only)\s+" + verb +
+                                 r"|(?:,\s*|\bthen\s+)(?:please\s+)?" + verb, policy, re.I):
+        return True
+    if re.search(r"\b(?:must|should|needs? to|required to)\s+(?:pass|succeed|be|run|finish|complete|remain|stay)\b", policy, re.I):
+        return True
+    if re.match(r"(?:always|never|don't|do not|only)\s+" + verb, policy, re.I):
         return True
     policy = re.sub(r"^(?:always|never|don't|do not|only)\s+", "", policy, flags=re.I)
-    return durable(text) and bool(re.match(
-        r"(?:check|run|use|verify|wait|claim|say|report|mark|keep|reuse|avoid|ensure|require|confirm|inspect|test|"
-        r"prefer|retain|review|send|push|deploy)\b|a revision\b[^\n]*new essay", policy, re.I))
+    return standing_formulation(text) and bool(re.match(verb + r"|a revision\b[^\n]*new essay", policy, re.I))
 
 
 def standing_text(text):
@@ -86,19 +105,25 @@ def standing_text(text):
 
 
 def comparison_text(fact, message):
-    states = (r"success(?:ful(?:ly)?)?|succeed(?:ed|s)?|pass(?:ed|ing)?|fail(?:ed|ure|ing)?|"
-              r"green|red|pending|queued|running|active|cancel(?:led|ed)|timed[_ -]?out|skipped|"
-              r"neutral|completed|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
+    states = _CI_STATES
     state = r"(?<!\w)(?:" + states + r")(?!\w)"
-    subject = r"(?:CI(?:checks?)?|checks?|workflow|runs?)"
+    subject = r"(?:CI(?:checks?)?|checks?|workflows?|runs?)"
     saved, outgoing = ci_ids(fact), ci_ids(message)
     def outcome(part):
         if standing_instruction(part):
             return False
+        # A result needs a CI/check/workflow/run subject; incidental identifiers
+        # and status words in unrelated safeguards are not CI evidence.
         # Compact transcript spellings still need complete status words.
         part = re.sub(r"\b(" + subject + r")(?=(?:" + states + r")(?!\w))", r"\1 ", part, flags=re.I)
+        # Keep the compact PR/head result form, rather than treating an ID
+        # anywhere in a paragraph as evidence that every status describes CI.
+        pr = r"(?:(?:PR|pull request)\s*[:=#-]?\s*\d+|https?://[^\s]+/pull/\d+)"
+        if re.fullmatch(r"\s*" + pr + r"\s+head\s+`?[0-9a-f]{7,40}`?(?:\s*[:=—-]\s*|\s+)"
+                        r"(?:(?:is|was|are|were|has|had|did|will)(?:\s+been)?\s+)?(?:" + states + r")[.!]?\s*", part, re.I):
+            return True
         return bool(re.search(r"\b" + subject + r"\b.{0,100}" + state + r"|" + state + r".{0,100}\b" + subject + r"\b",
-                              part, re.I | re.S) or any(saved) and re.search(state, part, re.I))
+                              part, re.I | re.S))
     if not any(outcome(p) for p in re.split(r"(?<=[.!?;])\s+|\n+", fact)):
         return fact
     # CI claims are point-in-time. Unknown or mismatched identities cannot
