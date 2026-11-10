@@ -13631,3 +13631,202 @@ it.live("a give-up decided before a restart posts its notice on replay and never
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+// ---- Writes reply on commit; thread follow-ons run from route rows (board-lock-diet) ----
+
+/** A working card on the toy board: its id and work thread. */
+const workingCard = Effect.gen(function* () {
+  const { kanban, board } = yield* toyBoard;
+  const created = yield* kanban.createCard(board.id, { prompt: "Work", title: "Work" }, owner);
+  yield* kanban.dispatchNow;
+  const card = (yield* kanban.card(created.id)).card;
+  assert.strictEqual(card.stage, "working");
+  assert.isNotNull(card.activeThreadId);
+  return { kanban, board, card, threadId: card.activeThreadId! };
+});
+
+const effectRows = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql<{ kind: string | null; done_at: string | null; outcome: string | null }>`
+    SELECT json_extract(json, '$.effect.kind') AS kind, done_at,
+           json_extract(json, '$.outcome') AS outcome
+    FROM ardud_kanban_owner_routes WHERE json_extract(json, '$.kind') = 'effect' ORDER BY id`;
+});
+
+/** Interrupts wait for `release`; `entered` resolves when the first one starts. */
+const gatedInterrupts = (
+  fake: Effect.Success<typeof makeFake>,
+  entered: Deferred.Deferred<void>,
+  release: Effect.Effect<void>,
+) =>
+  Layer.effect(
+    KanbanThreads,
+    Effect.map(KanbanThreads, (real) =>
+      KanbanThreads.of({
+        ...real,
+        interrupt: (threadId, reason) =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(release),
+            Effect.andThen(real.interrupt(threadId, reason)),
+          ),
+      }),
+    ),
+  ).pipe(Layer.provide(fake.layer));
+
+it.live("an owner move of a working card replies before its thread is let go", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = gatedInterrupts(fake, entered, Deferred.await(release));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      const moved = yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      // Committed and returned while the interrupt is still blocked.
+      assert.strictEqual(moved.stage, "todo");
+      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "todo");
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      assert.notInclude(fake.interrupted, threadId);
+      assert.deepStrictEqual(
+        (yield* effectRows).map((row) => [row.kind, row.done_at]),
+        [["interrupt", null]],
+      );
+      yield* Deferred.succeed(release, undefined);
+      const rows = yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      assert.deepStrictEqual(
+        rows.map((row) => row.outcome),
+        ["delivered"],
+      );
+      assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);
+
+it.live("a worker's question posts on commit and reaches the evaluator from its route", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const gated = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          launch: (input) =>
+            input.title.startsWith("Evaluator")
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(real.launch(input)),
+                )
+              : real.launch(input),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      const posted = yield* kanban.postToCard(card.id, { _tag: "thread", threadId }, [
+        { _tag: "md", text: "Should I split this into two PRs?" },
+      ]);
+      assert.strictEqual(posted.author._tag, "thread");
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      assert.deepStrictEqual(
+        (yield* effectRows).map((row) => [row.kind, row.done_at]),
+        [["toEvaluator", null]],
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      const discussion = yield* kanban.discussion(posted.discussionId);
+      assert.isNotNull(discussion.evaluatorThreadId);
+      const evaluators = [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+        thread.title.startsWith("Evaluator"),
+      );
+      assert.lengthOf(evaluators, 1);
+      assert.strictEqual(
+        evaluators[0]!.messages.filter((text) => text.includes("two PRs")).length,
+        1,
+      );
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(gated), "deferred")));
+  }),
+);
+
+it.live("an owner's ask drop closes the ask in the reply; its asker hears it from the route", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      const worker: KanbanActor = { _tag: "thread", threadId };
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Which API?", blocking: false },
+        worker,
+        "cardThread",
+      );
+      const ask = asked.asks.at(-1)!;
+      const dropped = yield* kanban.changeAsk(card.id, ask.id, "drop", owner, "owner");
+      assert.isNotNull(dropped.asks.find((entry) => entry.id === ask.id)!.closedAt);
+      const rows = yield* eventually(effectRows, (all) =>
+        all.some((row) => row.kind === "tellAnswered" && row.done_at !== null),
+      );
+      assert.isTrue(rows.every((row) => row.outcome === "delivered" || row.done_at === null));
+      const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+      assert.strictEqual(messages.filter((text) => text.includes("Which API?")).length, 1);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(fake.layer), "deferred")));
+  }),
+);
+
+it.effect("with deferred write effects off, a move lets its thread go inside the reply", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      assert.include(fake.interrupted, threadId);
+      assert.deepStrictEqual(yield* effectRows, []);
+    }).pipe(
+      Effect.provide(
+        withOwnerRouteMode(testLayer(fake.layer), "deferred").pipe(
+          Layer.provide(Layer.succeed(KanbanService.DeferWriteEffects, false)),
+        ),
+      ),
+    );
+  }),
+);
+
+it.live("a saved follow-on cut by a stop is run once after the restart", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-kanban-effect-" });
+    const dbPath = path.join(directory, "state.sqlite");
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    let cut = true;
+    const layer = gatedInterrupts(
+      fake,
+      entered,
+      Effect.suspend(() => (cut ? Effect.never : Effect.void)),
+    );
+    const { cardId, threadId } = yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      // The process stops while the interrupt is out.
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      return { cardId: card.id, threadId };
+    }).pipe(Effect.provide(withOwnerRouteMode(fileTestLayer(layer, dbPath), "deferred")));
+    assert.notInclude(fake.interrupted, threadId);
+    cut = false;
+    yield* Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      yield* kanban.ready;
+      const rows = yield* eventually(effectRows, (all) =>
+        all.length > 0 && all.every((row) => row.done_at !== null),
+      );
+      assert.deepStrictEqual(
+        rows.map((row) => [row.kind, row.outcome]),
+        [["interrupt", "delivered"]],
+      );
+      assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
+      assert.strictEqual((yield* kanban.card(cardId)).card.stage, "todo");
+    }).pipe(Effect.provide(withOwnerRouteMode(fileTestLayer(layer, dbPath), "deferred")));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
