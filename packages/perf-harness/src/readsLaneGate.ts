@@ -126,10 +126,18 @@ const program = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Projection.ProjectionStoreV2;
   const thread = ThreadId.make("synthetic-thread-20");
-  const time = <A>(effect: Eff<A>) =>
+  const tracing = process.env.READS_GATE_TRACE === "1";
+  const trace = (event: string) =>
+    tracing ? console.error(`[${label}] ${Math.round(performance.now())} ${event}`) : undefined;
+  const time = <A>(effect: Eff<A>, name = "op") =>
     Effect.suspend(() => {
       const start = performance.now();
-      return Effect.map(effect, () => performance.now() - start);
+      trace(`start ${name}`);
+      return Effect.map(effect, () => {
+        const ms = performance.now() - start;
+        trace(`end ${name} ${Math.round(ms)}ms`);
+        return ms;
+      });
     });
   // Same routing as production: Orchestrator wraps these ProjectionStore reads in
   // `readOnly` (Orchestrator.ts getShellSnapshot / getThreadSnapshotWindow /
@@ -148,7 +156,7 @@ const program = Effect.gen(function* () {
     Effect.forEach(
       Object.keys(run),
       (probe) =>
-        time(run[probe]!()).pipe(
+        time(run[probe]!(), probe).pipe(
           Effect.tap((ms) => Effect.sync(() => record(phase, probe, ms))),
           Effect.catchCause((cause) =>
             Effect.sync(() => (failures[probe] ??= []).push(String(cause).slice(0, 300))),
@@ -159,7 +167,7 @@ const program = Effect.gen(function* () {
   // Warm every lane and slot (prepared statements, page cache).
   for (let i = 0; i < 3; i++)
     yield* Effect.all(
-      Object.values(run).map((f) => f()),
+      Object.entries(run).map(([name, f]) => time(f(), `warm.${name}`)),
       { concurrency: "unbounded" },
     );
   yield* Effect.sync(() => console.error(`[${label}] warmed t=${Math.round(performance.now())}ms`));
@@ -172,7 +180,7 @@ const program = Effect.gen(function* () {
       ),
     )
     .pipe(NodeSqliteClient.readOnly);
-  const holderIdleMs = yield* time(holderTransaction);
+  const holderIdleMs = yield* time(holderTransaction, "holder.alone");
   yield* Effect.sync(() => console.error(`[${label}] holder alone ${Math.round(holderIdleMs)}ms`));
   sample("idle-start");
   for (let i = 0; i < readsLaneWorkload.idleCycles; i++) yield* cycle("idle");
@@ -182,7 +190,7 @@ const program = Effect.gen(function* () {
     Effect.forkChild(
       Effect.gen(function* () {
         while (!load.stop) {
-          const exit = yield* Effect.exit(time(holderTransaction));
+          const exit = yield* Effect.exit(time(holderTransaction, "holder"));
           if (exit._tag === "Success") holders.loadedMs.push(exit.value);
           else holders.failures++;
         }
@@ -194,7 +202,7 @@ const program = Effect.gen(function* () {
       let id = 0;
       while (!load.stop) {
         const exit = yield* Effect.exit(
-          time(sql`INSERT INTO gate_scratch (body) VALUES (${`w${id++}`})`),
+          time(sql`INSERT INTO gate_scratch (body) VALUES (${`w${id++}`})`, "write"),
         );
         if (exit._tag === "Success") writer.commitMs.push(exit.value);
         else writer.failures++;
