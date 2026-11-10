@@ -815,6 +815,144 @@ class FactScopeTests(unittest.TestCase):
                 for trigger in ('first_prompt', 'compaction'):
                     self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
 
+    def test_markdown_ci_outcomes_keep_strict_identity_matching(self):
+        from recall_fact_scope import comparison_text
+        wrappers = (('', ''), ('`', '`'), ('``', '``'), ('**', '**'), ('__', '__'),
+                    ('*', '*'), ('_', '_'), ('***', '***'), ('**`', '`**'))
+        changed = 'PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        for start, end in wrappers:
+            for position in ('pr', 'head', 'state', 'whole'):
+                fields = {'pr': 'PR1145', 'head': '66cfd86f', 'state': 'green'}
+                if position != 'whole':
+                    fields[position] = start + fields[position] + end
+                fact = f"{fields['pr']} head {fields['head']} is {fields['state']}."
+                if position == 'whole':
+                    fact = start + fact + end
+                with self.subTest(wrapper=(start, end), position=position):
+                    self.assertEqual('', comparison_text(fact, changed))
+                    self.assertEqual(fact, comparison_text(fact, matching))
+                    self.assertEqual('', comparison_text(fact, 'PR289 head 66cfd86f CI checks failed.'))
+                    self.assertEqual('', comparison_text(fact, matching + ' Run 42819961468 is pending.'))
+        facts = ('`PR1145` head `66cfd86f` is green.', 'PR1145 head 66cfd86f: **green**.')
+        for i, fact in enumerate(facts):
+            index = RuleIndex(self.root / f'markdown-result-{i}.db')
+            index.remember(fact, scope=CWD)
+            with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+                model.assert_not_called()
+                rules, result = preflight('t3_thread_send', {'message': matching}, CWD, index.path)
+                self.assertEqual([fact], [r['text'] for r in rules])
+                self.assertEqual('deny', result['decision'])
+            engine = CheckEngine(rules_path=index.path)
+            for trigger in ('first_prompt', 'compaction'):
+                self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+                self.assertEqual([fact], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
+
+    def test_ci_prohibitions_and_conditionals_do_not_depend_on_a_verb_list(self):
+        from recall_fact_scope import comparison_text
+        policies = ('Never approve PR1145 unless CI checks passed.',
+                    'Never bypass verification for PR1145 while CI checks are pending.',
+                    'Only retry PR1145 after CI checks passed.',
+                    'Do not approve PR1145 unless CI checks passed.',
+                    "Don't bypass verification for PR1145 while CI checks are pending.",
+                    'Must not approve PR1145 unless CI checks passed.',
+                    'Should not approve PR1145 unless CI checks passed.',
+                    'Cannot approve PR1145 unless CI checks passed.',
+                    'No approval for PR1145 unless CI checks passed.')
+        message = 'Approve PR1145, bypass verification and retry while CI checks are pending.'
+        for i, policy in enumerate(policies):
+            with self.subTest(policy=policy):
+                index = RuleIndex(self.root / f'ordinary-policy-{i}.db')
+                index.remember(policy, scope=CWD, source_session='owner')
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    rules, result = preflight('t3_thread_send', {'message': message}, CWD, index.path, session_id='other')
+                    self.assertEqual([policy], [r['text'] for r in rules])
+                    self.assertEqual('deny', result['decision'])
+                    model.assert_called_once()
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([policy], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]])
+        for verb in ('approve', 'bypass', 'retry', 'commit', 'rebase', 'squash', 'enable', 'disable', 'revoke', 'reauthorize'):
+            for prefix, suffix in (('Never ', ' unless CI checks passed.'),
+                                   ('Do not ', ' while CI checks are pending.'),
+                                   ('Only ', ' after CI checks passed.'),
+                                   ('Must not ', ' unless CI checks passed.'),
+                                   ('Should not ', ' while CI checks are pending.'),
+                                   ('Cannot ', ' until CI checks passed.'),
+                                   ('If CI checks are pending, ', '.'),
+                                   ('Unless CI checks passed, please ', '.'),
+                                   ('Owner rule: ', ' only after CI checks passed.')):
+                policy = prefix + verb + ' PR1145' + suffix
+                with self.subTest(verb=verb, prefix=prefix):
+                    self.assertEqual(policy, comparison_text(policy, message))
+
+    def test_negative_ci_outcomes_are_reports_for_each_subject(self):
+        from recall_fact_scope import comparison_text
+        changed = 'PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        for subject in ('CI checks', 'check', 'checks', 'workflow', 'workflows', 'run', 'runs'):
+            for predicate in ('passed', 'is green', 'was green', 'has passed'):
+                fact = f'No {subject} {predicate} for PR1145 head 66cfd86f.'
+                with self.subTest(subject=subject, predicate=predicate):
+                    self.assertEqual('', comparison_text(fact, changed))
+                    self.assertEqual(fact, comparison_text(fact, matching))
+        index = RuleIndex(self.root / 'negative-result.db')
+        index.remember('No runs passed for PR1145 head 66cfd86f.', scope=CWD)
+        with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+            self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+            model.assert_not_called()
+            self.assertEqual('deny', preflight('t3_thread_send', {'message': matching}, CWD, index.path)[1]['decision'])
+        engine = CheckEngine(rules_path=index.path)
+        for trigger in ('first_prompt', 'compaction'):
+            self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+
+    def test_no_prohibitions_survive_list_and_address_prefixes(self):
+        from recall_fact_scope import comparison_text
+        message = 'Approve PR1145 while CI checks are pending.'
+        prefixes = ('', '- ', '* ', '1. ', '12. ', '[Abdullah] ', '1. [Abdullah] ',
+                    'Please ', 'Actually, ', '- Please ', '1. Actually, ')
+        for i, prefix in enumerate(prefixes):
+            policy = prefix + 'No approval for PR1145 unless CI checks passed.'
+            with self.subTest(prefix=prefix):
+                index = RuleIndex(self.root / f'no-policy-{i}.db')
+                index.remember(policy, scope=CWD)
+                self.assertEqual(policy, comparison_text(policy, message))
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)):
+                    self.assertEqual('deny', preflight('t3_thread_send', {'message': message}, CWD, index.path)[1]['decision'])
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([policy], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]])
+        for verb in ('run', 'check'):
+            policy = f'Never {verb} failed tests for PR1145 unless CI checks passed.'
+            self.assertEqual(policy, comparison_text(policy, message))
+
+    def test_no_policies_survive_removal_of_a_stale_ci_sentence(self):
+        from recall_fact_scope import comparison_text
+        message = 'Approve PR1145 head 72a10c19 while CI checks are pending.'
+        prefixes = (('', ''), ('- ', ''), ('* ', ''), ('1. ', ''), ('12. ', ''),
+                    ('[Abdullah] ', '[Abdullah] '), ('1. [Abdullah] ', '[Abdullah] '),
+                    ('Please ', 'Please '), ('Actually, ', 'Actually, '),
+                    ('- Please ', 'Please '), ('1. Actually, ', 'Actually, '))
+        outcomes = (' PR1145 head 66cfd86f: CI checks passed.',
+                    '\n`PR1145` head `66cfd86f` is **green**.', ' Both CIchecksSUCCESS.')
+        for i, (prefix, retained) in enumerate(prefixes):
+            for j, outcome in enumerate(outcomes):
+                policy = 'No approval for PR1145 unless CI checks passed.'
+                fact, expected = prefix + policy + outcome, retained + policy
+                with self.subTest(prefix=prefix, outcome=outcome):
+                    self.assertEqual(expected, comparison_text(fact, message))
+                    index = RuleIndex(self.root / f'mixed-no-policy-{i}-{j}.db')
+                    index.remember(fact, scope=CWD)
+                    with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                        rules, result = preflight('t3_thread_send', {'message': message}, CWD, index.path)
+                        self.assertEqual([expected], [r['text'] for r in rules])
+                        self.assertEqual('deny', result['decision'])
+                        model.assert_called_once()
+                    engine = CheckEngine(rules_path=index.path)
+                    for trigger in ('first_prompt', 'compaction'):
+                        self.assertEqual([expected], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]])
+
 
 if __name__ == '__main__':
     unittest.main()

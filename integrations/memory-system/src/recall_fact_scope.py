@@ -22,8 +22,12 @@ def owner_body(text):
                   "", text, flags=re.S)
 
 
+def directive_prefix(text):
+    return re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", text.replace("’", "'"))
+
+
 def directive_body(text):
-    text = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", text.replace("’", "'"))
+    text = directive_prefix(text)
     return re.sub(r"^\s*(?:\[Abdullah\]\s*|(?:please|actually|no)[,:]?\s+)", "", text, flags=re.I)
 
 
@@ -58,6 +62,7 @@ def durable(text):
 
 
 def ci_ids(text):
+    text = presentation_text(text)
     return (
         set(re.findall(r"(?:\b(?:PR|pull request)\s*[:=#-]?\s*|/pull/)(\d+)", text, re.I)),
         {s.lower() for s in re.findall(r"\b[0-9a-f]{7,40}\b", text, re.I) if not s.isdigit()},
@@ -70,35 +75,78 @@ _CI_STATES = (r"success(?:ful(?:ly)?)?|succeed(?:ed|s)?|pass(?:ed|ing)?|fail(?:e
               r"neutral|completed|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
 
 
-def standing_instruction(text):
-    policy = re.sub(r"^(?:remember (?:this|that)(?: for)? next time|next time|from now on|owner rule)\s*[:,]?\s*",
-                    "", directive_body(text), flags=re.I)
-    # Policy wording determines intent; a named PR/head/run does not turn
-    # an instruction into a historical result. Prefixes alone aren't intent:
-    # "only PR1145 passed" and "never before had CI passed" are results.
-    reference = r"(?:id\s*[:=#]?\s*|#\s*)?`?\d+`?"
+def presentation_text(text):
+    # Strip paired inline code/emphasis before recognition and identifier
+    # extraction; keep the original fact text and compare every extracted ID.
+    for _ in range(4):
+        plain = re.sub(r"(`+)([^`\n]+)\1", r"\2", text)
+        plain = re.sub(r"(?<!\w)(\*\*|__|\*|_)(?=\S)(.+?)(?<=\S)\1(?!\w)", r"\2", plain)
+        if plain == text:
+            break
+        text = plain
+    return text
+
+
+def describes_result(text):
+    reference = r"(?:id\s*[:=#]?\s*|#\s*)?\d+"
     pr = r"(?:PR|pull request)\s*[:=#-]?\s*\d+"
-    context = r"(?:\s+for\s+" + pr + r"(?:\s+head\s+`?[0-9a-f]{7,40}`?)?)?"
+    context = r"(?:\s+for\s+" + pr + r"(?:\s+head\s+[0-9a-f]{7,40})?)?"
     result = r"(?:(?:is|was|are|were|has|had|did|will)|" + _CI_STATES + r")\b"
-    # "Only run 123 passed" names a result; "only run 123 unless CI passed"
-    # remains an instruction. Look past the reference before choosing intent.
-    named_result = r"\s+" + reference + context + r"\s+" + result
-    verb = (r"(?:(?:check|run)(?!" + named_result + r")|use|verify|wait|claim|say|report|mark|keep|reuse|avoid|ensure|require|confirm|inspect|test|"
-            r"prefer|retain|review|send|push|deploy|merge|publish|record|write|stop|hold)\b")
-    conditional = re.match(r"(?:if|unless|until|when|once|before|after)\b", policy, re.I)
-    if conditional and re.search(r"\b(?:always|never|don't|do not|only)\s+" + verb +
-                                 r"|(?:,\s*|\bthen\s+)(?:please\s+)?" + verb, policy, re.I):
+    subject = r"(?:(?:check|run)\s+" + reference + r"|(?:commit|head|sha)\s+[0-9a-f]{7,40})"
+    ci = r"(?:(?:CI(?:checks?)?|checks?|workflows?|runs?)\s*)?"
+    if re.match(subject + context + r"\s+" + ci + result, text, re.I):
+        return True
+    bare_result = r"(?:(?:is|was|are|were|has|had|did|will)(?:\s+been)?\s+)?(?:" + _CI_STATES + r")\b"
+    if re.match(r"(?:run|check)\s+" + bare_result + r"(?=\s+for\b|\s*[.!?;]?$)", text, re.I):
+        return True
+    # Reject descriptive subjects and temporal reports, rather than listing
+    # every verb an owner may use in a prohibition or conditional instruction.
+    return bool(re.match(
+        r"(?:PR\s*[:=#-]?\s*\d+|pull request\b|CI(?:checks?)?\b|checks\b|workflows?\b|runs\b|"
+        r"(?:I|we|you|they|he|she|it|this|that|the|a|an|our|both|all|one|two|before|after|when|once|if|unless|until|"
+        r"yesterday|previously|already|has|had|have|was|were|is|are|did)\b)", text, re.I))
+
+
+_MODAL = r"(?:always|never|don't|do not|only|must not|should not|cannot|can't)"
+
+
+def directive_clause(text):
+    text = directive_body(text).strip()
+    text = re.sub(r"^" + _MODAL + r"\s+", "", text, flags=re.I)
+    if re.match(r"a revision\b[^\n]*new essay", text, re.I):
+        return True
+    return bool(text) and not describes_result(text)
+
+
+def conditional_instruction(text):
+    if not re.match(r"(?:if|unless|until|when|once|before|after)\b", text, re.I):
+        return False
+    parts = re.split(r",|\bthen\b", text, maxsplit=1, flags=re.I)
+    if len(parts) == 2:
+        return directive_clause(parts[1])
+    modal = re.search(r"\b" + _MODAL + r"\s+.+", text, re.I)
+    return bool(modal and directive_clause(modal[0]))
+
+
+def standing_instruction(text):
+    presented = presentation_text(text)
+    prefix = re.sub(r"^\s*(?:\[Abdullah\]\s*|(?:please|actually)[,:]?\s+)", "",
+                    directive_prefix(presented), flags=re.I)
+    negative = bool(re.match(r"\s*No\b", prefix, re.I))
+    policy = re.sub(r"^(?:remember (?:this|that)(?: for)? next time|next time|from now on|owner rule)\s*[:,]?\s*",
+                    "", directive_body(presented), flags=re.I)
+    if conditional_instruction(policy):
         return True
     if re.search(r"\b(?:must|should|needs? to|required to)\s+(?:pass|succeed|be|run|finish|complete|remain|stay)\b", policy, re.I):
         return True
-    if re.match(r"(?:always|never|don't|do not|only)\s+" + verb, policy, re.I):
-        return True
-    policy = re.sub(r"^(?:always|never|don't|do not|only)\s+", "", policy, flags=re.I)
-    return standing_formulation(text) and bool(re.match(verb + r"|a revision\b[^\n]*new essay", policy, re.I))
+    if negative or re.match(_MODAL + r"\s+", policy, re.I):
+        remainder = re.sub(r"^" + _MODAL + r"\s+", "", policy, flags=re.I)
+        return conditional_instruction(remainder) or directive_clause(policy)
+    return standing_formulation(presentation_text(text)) and directive_clause(policy)
 
 
 def standing_text(text):
-    parts = re.split(r"(?<=[.!?;])\s+|\n+", directive_body(text))
+    parts = re.split(r"(?<=[.!?;])\s+|\n+", directive_prefix(text))
     if not parts or not standing_instruction(parts[0]):
         return ""
     return " ".join(p for p in parts if standing_instruction(p))
@@ -110,6 +158,7 @@ def comparison_text(fact, message):
     subject = r"(?:CI(?:checks?)?|checks?|workflows?|runs?)"
     saved, outgoing = ci_ids(fact), ci_ids(message)
     def outcome(part):
+        part = presentation_text(part)
         if standing_instruction(part):
             return False
         # A result needs a CI/check/workflow/run subject; incidental identifiers
