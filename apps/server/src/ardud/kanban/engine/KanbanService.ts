@@ -895,6 +895,10 @@ interface OwnerRouteAnswer {
  * whether to). Saved as its own route row after the write commits and run by
  * the lane's drain, so the write replies without waiting on thread I/O.
  */
+/** A stop or a drop/pause note saved for a thread and not yet run (see `pendingStops`). */
+type PendingRelease =
+  | { readonly kind: "interrupt"; readonly reason: string }
+  | { readonly kind: "note"; readonly text: string };
 type BoardEffect =
   | {
       readonly kind: "send";
@@ -904,6 +908,13 @@ type BoardEffect =
       readonly bestEffort?: boolean;
     }
   | { readonly kind: "interrupt"; readonly threadId: string; readonly reason: string }
+  /**
+   * A card taken off a thread that keeps other cards (drop or pause note).
+   * Pending like a stop: it reaches the thread before anything the board
+   * sends or attaches to it next, so it can't land after the thread takes
+   * the card again.
+   */
+  | { readonly kind: "release"; readonly threadId: string; readonly text: string }
   /** A card's new model on its open work thread; a failed switch is retried. */
   | { readonly kind: "setModel"; readonly threadId: string; readonly model: ModelSelection }
   /** Sent only while the evaluator thread is live, as a dropped ask's note. */
@@ -1014,7 +1025,8 @@ const make = Effect.gen(function* () {
   // moment its route row is saved until it runs. Nothing this board sends to
   // that thread goes out before it: the send runs the stop first, so a late
   // interrupt never cuts a run started after it was asked for. Keyed by route.
-  const pendingStops = new Map<string, Map<string, string>>();
+  // Drop and pause notes (`release`) are pending the same way.
+  const pendingStops = new Map<string, Map<string, PendingRelease>>();
   const stoppedRoutes = new Set<string>();
   const stopping = yield* Semaphore.make(1);
   // Everything the board does that sets a thread's model (a switch, a send that
@@ -1028,11 +1040,17 @@ const make = Effect.gen(function* () {
       return lock.withPermits(1)(effect);
     });
   const stopResource = (threadId: string) => `stops:${threadId}`;
-  const addPendingStop = (threadId: string, routeKey: string, reason: string) => {
+  const addPendingStop = (threadId: string, routeKey: string, entry: PendingRelease) => {
     let stops = pendingStops.get(threadId);
     if (!stops) pendingStops.set(threadId, (stops = new Map()));
-    stops.set(routeKey, reason);
+    stops.set(routeKey, entry);
   };
+  const releaseOf = (effect: BoardEffect): PendingRelease | null =>
+    effect.kind === "interrupt"
+      ? { kind: "interrupt", reason: effect.reason }
+      : effect.kind === "release"
+        ? { kind: "note", text: effect.text }
+        : null;
   // A failed close fails the stop like a failed interrupt: the send waiting on it fails too.
   const closeStopRows = Effect.fn("KanbanService.closeStopRows")(
     function* (keys: ReadonlyArray<string>) {
@@ -1052,12 +1070,15 @@ const make = Effect.gen(function* () {
     ),
   );
   /**
-   * Runs the thread's pending stops, if any; callers hold no board gate. A
-   * drain passes its own route: skipped when a send already ran it.
+   * Runs the thread's pending stops and notes, if any; callers hold no board
+   * gate. A drain passes its own route: skipped when a send already ran it.
+   * Notes go first, in the order they were saved, each a keyed send (a retry
+   * never delivers it twice), then one interrupt. A thread with a pending stop
+   * carries no card, so no note is saved after its stop.
    */
   const runPendingStops = (
     threadId: string,
-    route?: { readonly key: string; readonly reason: string },
+    route?: { readonly key: string; readonly entry: PendingRelease },
   ) =>
     Effect.suspend(() =>
       route === undefined && !pendingStops.has(threadId)
@@ -1066,11 +1087,33 @@ const make = Effect.gen(function* () {
             Effect.suspend(() => {
               if (route !== undefined && stoppedRoutes.delete(route.key)) return Effect.void;
               const stops = pendingStops.get(threadId);
-              const keys = [...(stops?.keys() ?? [])];
-              if (route !== undefined && !keys.includes(route.key)) keys.push(route.key);
-              if (keys.length === 0) return Effect.void;
-              const reason = route?.reason ?? stops!.values().next().value!;
-              return touching(threadId, threadIo.interrupt(ThreadId.make(threadId), reason)).pipe(
+              const entries = [...(stops?.entries() ?? [])];
+              if (route !== undefined && !entries.some(([key]) => key === route.key)) {
+                entries.push([route.key, route.entry]);
+              }
+              if (entries.length === 0) return Effect.void;
+              const keys = entries.map(([key]) => key);
+              const id = ThreadId.make(threadId);
+              const stop = entries.find(([, entry]) => entry.kind === "interrupt")?.[1];
+              const run = Effect.forEach(
+                entries,
+                ([key, entry]) =>
+                  entry.kind === "note"
+                    ? threadIo.send({ threadId: id, text: entry.text, key: `${key}:note` }).pipe(
+                        // A thread that is gone has nothing left to drop.
+                        Effect.catchIf(
+                          (error) => error.detail === "thread not found",
+                          () => Effect.void,
+                        ),
+                      )
+                    : Effect.void,
+                { discard: true },
+              ).pipe(
+                Effect.andThen(
+                  stop?.kind === "interrupt" ? threadIo.interrupt(id, stop.reason) : Effect.void,
+                ),
+              );
+              return touching(threadId, run).pipe(
                 // Closed durably before the lock is released: a restart must not
                 // reload a stop that already ran and cut the run a send starts
                 // next (packages/protocol-models/stops.qnt, `stepVolatile`).
@@ -1799,7 +1842,7 @@ const make = Effect.gen(function* () {
     yield* later(
       card.boardId,
       cardLane(card),
-      { kind: "send", threadId, text, bestEffort: true },
+      { kind: "release", threadId, text },
       threads.send({ threadId, text }).pipe(Effect.ignore),
     );
     return true;
@@ -3427,9 +3470,10 @@ const make = Effect.gen(function* () {
           key: "effect",
         });
       case "interrupt":
+      case "release":
         // Already run if a send to the thread came first (see `pendingStops`).
         return locks.outside(
-          runPendingStops(effect.threadId, { key: routeKey, reason: effect.reason }),
+          runPendingStops(effect.threadId, { key: routeKey, entry: releaseOf(effect)! }),
         );
       case "setModel":
         return locks.outside(switchToLatestModel(effect.threadId));
@@ -3507,14 +3551,16 @@ const make = Effect.gen(function* () {
     effects: EffectSink["effects"],
   ) {
     const lanes = new Set<string>();
-    const stops: Array<[string, string, string]> = [];
+    const stops: Array<[string, string, PendingRelease, string]> = [];
     yield* boardSql.withTransaction(
       Effect.forEach(
         effects,
         ({ boardId, lane, effect }) => {
           lanes.add(lane);
           const routeKey = `effect:${uuid()}`;
-          if (effect.kind === "interrupt") stops.push([effect.threadId, routeKey, effect.reason]);
+          if (effect.kind === "interrupt" || effect.kind === "release") {
+            stops.push([effect.threadId, routeKey, releaseOf(effect)!, boardId]);
+          }
           return saveOwnerRoute(
             KanbanBoardId.make(boardId),
             KanbanDiscussionId.make(lane),
@@ -3528,27 +3574,40 @@ const make = Effect.gen(function* () {
     // Registered before the thread's stop resource moves: a dispatch that saw
     // the old value is stale on its return; one that sees the new value finds
     // the stop pending and runs it before its send.
-    for (const [threadId, routeKey, reason] of stops) addPendingStop(threadId, routeKey, reason);
-    for (const [threadId] of stops) {
-      const boardId = effects.find(
-        ({ effect }) => effect.kind === "interrupt" && effect.threadId === threadId,
-      )!.boardId;
+    for (const [threadId, routeKey, entry] of stops) addPendingStop(threadId, routeKey, entry);
+    for (const [threadId, , , boardId] of stops) {
       yield* locks.access(boardId, Effect.void, true, stopResource(threadId));
     }
     return lanes;
   });
   /** After a restart, stops saved and not yet run hold their threads' sends again. */
   const loadPendingStops = Effect.fn("KanbanService.loadPendingStops")(function* () {
-    const rows = yield* boardSql<{ route_key: string; thread_id: string; reason: string }>`
+    const rows = yield* boardSql<{
+      route_key: string;
+      thread_id: string;
+      kind: string;
+      reason: string | null;
+      text: string | null;
+    }>`
       SELECT route_key,
              json_extract(json, '$.effect.threadId') AS thread_id,
-             json_extract(json, '$.effect.reason') AS reason
+             json_extract(json, '$.effect.kind') AS kind,
+             json_extract(json, '$.effect.reason') AS reason,
+             json_extract(json, '$.effect.text') AS text
       FROM ardud_kanban_owner_routes
       WHERE done_at IS NULL AND json_extract(json, '$.kind') = 'effect'
-        AND json_extract(json, '$.effect.kind') = 'interrupt'
+        AND json_extract(json, '$.effect.kind') IN ('interrupt', 'release')
       ORDER BY id
     `;
-    for (const row of rows) addPendingStop(row.thread_id, row.route_key, row.reason);
+    for (const row of rows) {
+      addPendingStop(
+        row.thread_id,
+        row.route_key,
+        row.kind === "release"
+          ? { kind: "note", text: row.text ?? "" }
+          : { kind: "interrupt", reason: row.reason ?? "" },
+      );
+    }
   });
   /**
    * Follow-ons of a write that failed, saved after its operation ended: each
@@ -3748,11 +3807,16 @@ const make = Effect.gen(function* () {
   ) {
     const discussionId = KanbanDiscussionId.make(record.discussion_id);
     const stop = ownerRoutePayload(record);
-    if (stop.kind === "effect" && stop.effect.kind === "interrupt") {
+    if (
+      stop.kind === "effect" &&
+      (stop.effect.kind === "interrupt" || stop.effect.kind === "release")
+    ) {
       if (!(yield* stopRowOpen(record))) return;
       yield* routeNotice(
         record.discussion_id,
-        `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board stops holding its sends for this stop once this outcome is saved.`,
+        stop.effect.kind === "interrupt"
+          ? `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board stops holding its sends for this stop once this outcome is saved.`
+          : `Telling thread ${stop.effect.threadId} to let go of a card could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on it. The board stops holding its sends for this note once this outcome is saved.`,
       );
       return yield* closeGivenUpStop(record, stop.effect.threadId);
     }
@@ -6962,13 +7026,44 @@ const make = Effect.gen(function* () {
    * follow-ups, cutover restores). Checked under the board gate before any
    * write; stops are only registered in board-wide operations.
    */
-  const refusePendingStop = (threadId: string) =>
-    pendingStops.has(threadId)
+  const refusePendingStop = (threadId: string) => {
+    const pending = [...(pendingStops.get(threadId)?.values() ?? [])];
+    if (pending.length === 0) return Effect.void;
+    return pending.some((entry) => entry.kind === "interrupt")
       ? failWith(
           "conflict",
           "This thread is being stopped (the board let it go of a card); it can't take another card until that stop has run.",
         )
-      : Effect.void;
+      : failWith(
+          "conflict",
+          "The board is still telling this thread to let go of a card; try again in a moment.",
+        );
+  };
+  /**
+   * A thread taking a card first gets the drop and pause notes still pending
+   * for it (outside the gate, as dispatch does before reusing a thread). A
+   * note saved meanwhile moves the thread's stop resource, so the take reruns
+   * and sends it too. Pending stops are left to refuse the take.
+   */
+  const settlePendingNotes = (boardId: string, threadId: string) =>
+    Effect.suspend(() => {
+      const pending = [...(pendingStops.get(threadId)?.values() ?? [])];
+      if (pending.length === 0 || pending.some((entry) => entry.kind === "interrupt")) {
+        return Effect.void;
+      }
+      // A note that fails to go out stays pending; the take is then refused below.
+      return locks
+        .access(boardId, Effect.void, false, stopResource(threadId))
+        .pipe(
+          Effect.andThen(
+            locks.outside(
+              runPendingStops(threadId).pipe(
+                Effect.catchTag("KanbanThreadError", () => Effect.void),
+              ),
+            ),
+          ),
+        );
+    });
   const checkTake = Effect.fn("KanbanService.checkTake")(function* (
     thread: {
       readonly board: KanbanBoard;
@@ -6980,6 +7075,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     card: KanbanCard,
   ) {
+    yield* settlePendingNotes(thread.board.id, threadId);
     yield* refusePendingStop(threadId);
     if (starting.has(`${card.boardId}:${card.id}`)) {
       return yield* failWith(

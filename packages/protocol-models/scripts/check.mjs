@@ -9,6 +9,7 @@ const cases = [
   ['sync', 'step', 'invariant', false],
   ['readers', 'step', 'invariant', false],
   ['stops', 'step', 'safe', false],
+  ['stops', 'stepUnguarded', 'safe', true],
   ['restart', 'step', 'preparationContinues', false],
   ['restart', 'step', 'nativePreparationContinues', false],
   ['restart', 'step', 'queuedContinues', false],

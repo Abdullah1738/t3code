@@ -14275,3 +14275,108 @@ it.live("a cutover restore waits for a stop still pending on its thread", () =>
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
   }),
 );
+
+/** Sends of a drop/pause note go through `gate` first; everything else is sent as usual. */
+const gatedNotes = (
+  fake: Effect.Success<typeof makeFake>,
+  gate: (input: { readonly threadId: ThreadId; readonly text: string }) => Effect.Effect<
+    void,
+    KanbanThreadError
+  >,
+) =>
+  Layer.effect(
+    KanbanThreads,
+    Effect.map(KanbanThreads, (real) =>
+      KanbanThreads.of({
+        ...real,
+        send: (input) =>
+          input.text.includes("no longer yours") || input.text.includes("pause it")
+            ? gate(input).pipe(Effect.andThen(real.send(input)))
+            : real.send(input),
+      }),
+    ),
+  ).pipe(Layer.provide(fake.layer));
+
+const notesTo = (fake: Effect.Success<typeof makeFake>, threadId: ThreadId, card: number) =>
+  Ref.get(fake.threads).pipe(
+    Effect.map((all) =>
+      all
+        .get(threadId)!
+        .messages.filter((text) => text.startsWith(`Card #${card} `) && text.includes("Carry on")),
+    ),
+  );
+
+it.live("a drop note still going out holds the thread's reclaim of that card until it lands", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = gatedNotes(fake, () =>
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, card: a, threadId } = yield* workingCard;
+      const b = (yield* kanban.createForThread(threadId, { prompt: "B", title: "B" })).card;
+      // The owner pulls A back; the thread keeps B, so it gets a drop note, held on its way out.
+      yield* kanban.moveCard(a.id, "todo", "owner", owner);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      const pulled = (yield* kanban.card(a.id)).card;
+      assert.strictEqual(pulled.stage, "todo");
+      assert.isNull(pulled.workThreadId);
+      // The thread claims A again meanwhile: the claim waits for the note.
+      const claiming = yield* Effect.forkChild(kanban.claimCard(threadId, a.id));
+      yield* Effect.sleep("150 millis");
+      assert.strictEqual((yield* kanban.card(a.id)).card.stage, "todo");
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 0);
+      yield* Deferred.succeed(release, undefined);
+      const claimed = yield* Fiber.join(claiming);
+      assert.strictEqual(claimed.card.activeThreadId, threadId);
+      // The note landed before the claim, once, and nothing tells the thread to drop A after it.
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 1);
+      const rows = yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      assert.isTrue(rows.every((row) => row.outcome === "delivered"));
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 1);
+      assert.strictEqual((yield* kanban.card(a.id)).card.activeThreadId, threadId);
+      assert.strictEqual((yield* kanban.card(b.id)).card.activeThreadId, threadId);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);
+
+it.live("a pause note that can't go out refuses the thread's take until it has gone out", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let failing = true;
+    let attempts = 0;
+    const layer = gatedNotes(fake, () =>
+      Effect.suspend(() => {
+        attempts += 1;
+        return failing
+          ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "provider down" }))
+          : Effect.void;
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const { kanban, board, card: a, threadId } = yield* workingCard;
+      yield* kanban.createForThread(threadId, { prompt: "B", title: "B" });
+      const other = yield* kanban.createCard(board.id, { prompt: "C", title: "C" }, owner);
+      // A waits on the owner while the thread keeps B: a pause note, failing for now.
+      yield* kanban.moveCard(a.id, "needs_owner", "owner", owner, { question: "Which one?" });
+      yield* eventually(
+        Effect.sync(() => attempts),
+        (count) => count > 0,
+      );
+      const refused = yield* kanban.claimCard(threadId, other.id).pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, "let go of a card");
+      assert.isNull((yield* kanban.card(other.id)).card.activeThreadId);
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 0);
+      // Once sends work again the take goes through, after the note.
+      failing = false;
+      const claimed = yield* kanban.claimCard(threadId, other.id);
+      assert.strictEqual(claimed.card.activeThreadId, threadId);
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 1);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 1);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);
