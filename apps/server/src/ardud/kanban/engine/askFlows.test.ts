@@ -942,6 +942,163 @@ it.effect("an evaluator gives a handed ask back to the owner", () =>
   }),
 );
 
+it.effect("an edited ask from before messages carried askId keeps its first message", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard();
+      const sql = yield* SqlClient.SqlClient;
+      const asker: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("evaluator-main") };
+      const card = yield* kanban.createCard(board.id, { prompt: "Ship", title: "Ship" }, owner);
+      const asked = yield* kanban.askOwner(
+        card.id,
+        { question: "Ship tonight?", blocking: false },
+        asker,
+        "evaluator",
+      );
+      const firstSeq = askOf(asked).seq!;
+      // The way asks were stored before this branch: no askId on the message that asked.
+      yield* sql`UPDATE ardud_kanban_messages SET json = json_remove(json, '$.askId')`;
+      const before = (yield* kanban.askFeed({})).open[0]!;
+      assert.deepStrictEqual(
+        before.messages.map((message) => [message.seq, message.askId]),
+        [[firstSeq, undefined]],
+      );
+
+      const edited = yield* kanban.editAsk(
+        card.id,
+        "q1",
+        { question: "Ship to staging tonight?", revisionNote: "Said where" },
+        asker,
+        "evaluator",
+      );
+      const ask = askOf(edited);
+      assert.strictEqual(ask.firstSeq, firstSeq);
+      assert.isAbove(ask.seq!, firstSeq);
+      const after = (yield* kanban.askFeed({})).open[0]!;
+      assert.deepStrictEqual(
+        after.messages.map((message) => [message.seq, message.askId]),
+        [
+          [firstSeq, undefined],
+          [ask.seq!, "q1"],
+        ],
+      );
+
+      // A second edit keeps pointing at the first message, not at the version in between.
+      const again = yield* kanban.editAsk(
+        card.id,
+        "q1",
+        { title: "Staging go", revisionNote: "Titled" },
+        asker,
+        "evaluator",
+      );
+      assert.strictEqual(askOf(again).firstSeq, firstSeq);
+      assert.strictEqual((yield* kanban.askFeed({})).open[0]!.messages.length, 3);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "a batch answer with a note tells each card once, and a stale item doesn't hold the rest",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const { kanban, board } = yield* toyBoard();
+          yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+          const http = yield* makeHttp;
+          const note = "After 6pm only.";
+          const workers: Array<{ id: KanbanCard["id"]; threadId: ThreadId }> = [];
+          for (const title of ["Deploy A", "Deploy B", "Deploy C"]) {
+            const card = yield* kanban.createCard(board.id, { prompt: title, title }, owner);
+            yield* kanban.dispatchNow;
+            const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
+            yield* kanban.askOwner(
+              card.id,
+              {
+                question: `Deploy ${title}?`,
+                blocking: true,
+                action: { summary: `Deploy ${title}`, command: "make deploy" },
+                batchKey: "deploy-go",
+              },
+              { _tag: "thread", threadId },
+              "cardThread",
+            );
+            workers.push({ id: card.id, threadId });
+          }
+          // The third was revised after the list the owner answers from was read.
+          yield* kanban.editAsk(
+            workers[2]!.id,
+            "q1",
+            { action: { summary: "Deploy C, build 42" }, revisionNote: "Newer build" },
+            { _tag: "evaluator", threadId: ThreadId.make("evaluator-main") },
+            "evaluator",
+          );
+
+          const batch = yield* http.post("/asks/answer", {
+            verdict: "approved",
+            note,
+            items: [
+              { card: "toy:1", askId: "q1", revision: 0 },
+              { card: "toy:3", askId: "q1", revision: 0 },
+              { card: "toy:2", askId: "q1", revision: 0 },
+            ],
+          });
+          assert.strictEqual(batch.status, 200);
+          assert.strictEqual(batch.body.answered, 2);
+          assert.deepStrictEqual(
+            batch.body.results.map((result: Record<string, any>) => [
+              result.card,
+              result.ok,
+              result.stage,
+              result.error?.code,
+            ]),
+            [
+              ["toy:1", true, "todo", undefined],
+              ["toy:3", false, undefined, "conflict"],
+              ["toy:2", true, "todo", undefined],
+            ],
+          );
+          assert.include(
+            batch.body.results[1].error.message,
+            "revision 1, you answered revision 0",
+          );
+
+          // Each answered card carries the verdict and the note once, for its own ask.
+          const occurrences = (text: string, part: string) => text.split(part).length - 1;
+          for (const [index, title] of [
+            [0, "Deploy A"],
+            [1, "Deploy B"],
+          ] as const) {
+            const card = (yield* kanban.card(workers[index]!.id)).card;
+            assert.strictEqual(
+              card.wakeNote,
+              `The owner APPROVED q1 on card #${card.number}: "Deploy ${title}?".\n\n` +
+                `Owner's note, read this before you act:\n${note}`,
+            );
+            assert.strictEqual(askOf(card).answer?.note, note);
+          }
+          // The stale one is untouched: still open, still holding its card.
+          const stale = (yield* kanban.card(workers[2]!.id)).card;
+          assert.strictEqual(stale.stage, "needs_owner");
+          assert.isNull(askOf(stale).closedAt);
+          assert.isNull(stale.wakeNote);
+
+          // Each worker is woken with its own card's note, once, and the third hears nothing.
+          yield* kanban.dispatchNow;
+          for (const index of [0, 1]) {
+            const heard = (yield* fake.heard(workers[index]!.threadId)).join("\n---\n");
+            assert.strictEqual(occurrences(heard, note), 1, heard);
+            assert.strictEqual(occurrences(heard, "The owner APPROVED q1"), 1, heard);
+          }
+          const quiet = (yield* fake.heard(workers[2]!.threadId)).join("\n");
+          assert.strictEqual(occurrences(quiet, note), 0);
+        }),
+      ).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("the HTTP routes: feed shape, single answer, batch answer, reply and hand", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

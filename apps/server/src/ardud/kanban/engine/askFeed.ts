@@ -141,7 +141,11 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
     const asked = cards.flatMap((card) =>
       card.discussionId === null
         ? []
-        : card.asks.flatMap((ask) => (ask.seq === null ? [] : [[card.discussionId, ask.seq]])),
+        : card.asks.flatMap((ask) =>
+            [ask.seq, ask.firstSeq].flatMap((seq) =>
+              seq === null || seq === undefined ? [] : [[card.discussionId, seq]],
+            ),
+          ),
     );
     // @effect-diagnostics-next-line preferSchemaOverJson:off
     const idList = JSON.stringify(discussionIds);
@@ -177,8 +181,12 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
     for (const ask of card.asks) {
       if (ask.closedAt === null && card.settledAt !== null) continue;
       const own = thread.filter(
+        // An ask from before messages carried `askId` is found by the seq it was asked
+        // at, which an edit keeps as `firstSeq`.
         (message) =>
-          message.askId === ask.id || (message.askId === undefined && message.seq === ask.seq),
+          message.askId === ask.id ||
+          (message.askId === undefined &&
+            (message.seq === ask.seq || message.seq === ask.firstSeq)),
       );
       const item: KanbanAskFeedItem = {
         boardId: card.boardId,

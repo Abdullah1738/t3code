@@ -7034,6 +7034,7 @@ const make = Effect.gen(function* () {
           ...revised,
           ...Asks.storedBlocks(message.blocks, rich.length),
           seq: message.seq,
+          ...(ask.firstSeq === undefined && ask.seq !== null ? { firstSeq: ask.seq } : {}),
         });
         const next: KanbanCard = {
           ...edited,

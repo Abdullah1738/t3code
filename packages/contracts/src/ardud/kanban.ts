@@ -331,6 +331,8 @@ export const KanbanOwnerAsk = Schema.Struct({
   revision: Schema.optional(NonNegativeInt),
   revisedAt: Schema.optional(IsoDateTime),
   revisionNote: Schema.optional(Schema.String),
+  /** The message that first asked it, kept once an edit moves `seq` to the new version. */
+  firstSeq: Schema.optional(PositiveInt),
   /** Set when it closes through the answer path, a hand-over or a drop. */
   answer: Schema.optional(KanbanAskAnswer),
   /** The owner asked a clarifying question: the ask waits for the agent, not for him. */
