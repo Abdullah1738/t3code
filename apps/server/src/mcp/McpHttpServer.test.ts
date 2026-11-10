@@ -226,7 +226,7 @@ it.effect("returns a clear bounded tool error before serializing a giant result"
   );
 });
 
-it.effect("a large-read tool that waits holds no reply builder until its result is measured", () =>
+it.effect("a large-read tool that waits holds only its own mcp lane", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
@@ -261,10 +261,15 @@ it.effect("a large-read tool that waits holds no reply builder until its result 
       );
       yield* Deferred.await(entered);
       const builders = yield* ReplyBuilders.ReplyBuilders;
-      for (const lane of ["agent", "snapshot", "poll"] as const) {
+      // Control, snapshot and poll lanes stay free while large reads wait.
+      for (const lane of ["agent", "snapshot", "poll", "interactive"] as const) {
         expect(yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane])).toBe(true);
         yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
       }
+      // The two waiting reads hold two mcp permits: large results stay bounded.
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 1)).toBe(false);
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 2)).toBe(true);
+      yield* builders.mcp.release(ReplyBuilders.PERMITS.mcp - 2);
       yield* Deferred.succeed(release, undefined);
       for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);
     }).pipe(Effect.provide(layer));

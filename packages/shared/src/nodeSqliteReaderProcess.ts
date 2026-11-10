@@ -30,8 +30,8 @@ process.once("message", data => { workerData = data; start(); });
 function start() {
 const { Worker } = require("node:worker_threads");
 const deadline = new BigInt64Array(new SharedArrayBuffer(8));
-const arm = () => {
-  const next = process.hrtime.bigint() / 1000000n + BigInt(workerData.statementLimitMs);
+const arm = (limitMs = workerData.statementLimitMs) => {
+  const next = process.hrtime.bigint() / 1000000n + BigInt(limitMs);
   const prior = Atomics.load(deadline, 0);
   Atomics.store(deadline, 0, prior === 0n || next < prior ? next : prior);
 };
@@ -48,7 +48,11 @@ const parentPort = {
   postMessage: value => { if (value.type === "ready") Atomics.store(deadline, 0, 0n); process.send(value); },
   on: (_event, listener) => process.on("message", input => {
     arm();
-    try { listener(input); } finally { if (db && !db.isTransaction) Atomics.store(deadline, 0, 0n); }
+    try { listener(input); } finally {
+      if (db && !db.isTransaction) Atomics.store(deadline, 0, 0n);
+      // An open transaction keeps its own (usually shorter) bound from its first statement.
+      else if (db && workerData.transactionLimitMs !== undefined) arm(workerData.transactionLimitMs);
+    }
   }),
 };`,
     ) + "\n}";

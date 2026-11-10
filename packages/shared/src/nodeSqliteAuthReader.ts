@@ -231,11 +231,14 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       prepareCacheSize: options.prepareCacheSize ?? 200,
       initializationSql: options.readerInitializationSql ?? [],
       reportStarted: false,
-      // The child's own SIGKILL guard (it also bounds an orphan). The watchdog
-      // below enforces the transaction and snapshot limits; arming the guard at
-      // the statement limit killed every slow autocommit read in-process
-      // ("exited with code null"), whatever the parent decided.
+      // The child's own SIGKILL guard, which also bounds an orphan or a stalled
+      // parent. Arming it at the statement limit for every statement killed each
+      // slow autocommit read in-process ("exited with code null") whatever the
+      // parent decided; autocommit statements now get the wedge limit, and an
+      // open transaction keeps the statement limit from its first statement so
+      // a WAL snapshot is still released within it even if the parent stalls.
       statementLimitMs: wedgeLimitMs,
+      transactionLimitMs: statementLimitMs,
     };
     const worker: ReaderRuntime = startReaderProcess(readerWorkerSource, data);
     runtimes.add(worker);
@@ -251,6 +254,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     });
     let stoppedMessage: string | undefined;
     interface PendingRead {
+      readonly id: number;
       readonly endsTransaction: boolean;
       readonly sql: string;
       readonly resume: (reply: ReaderReply) => void;
@@ -260,7 +264,9 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       readonly enqueuedAt: number;
       readonly settle: () => void;
       readonly settled: Promise<void>;
-      /** When the worker (which runs one statement at a time) reached it. */
+      /** Sends the statement to the child. */
+      readonly post: () => void;
+      /** When it was sent. Unset means the child never saw it: it ran nothing. */
       execAt?: number;
       reported?: boolean;
       /** The caller gave up; the child still finishes it and its reply is dropped. */
@@ -270,29 +276,36 @@ export const makeAuthReader = Effect.fnUntraced(function* (
     let abandonedCount = 0;
     // A BEGIN posted on this connection and not yet ended by COMMIT/ROLLBACK.
     let transactionOpen = false;
-    // The worker runs one statement at a time; this is the one it last started.
+    // The statement the child is running (sent, no reply yet).
     let running: number | undefined;
     let snapshotStartedAt: number | undefined;
-    const startRunning = (id: number | undefined) => {
-      running = id;
-      const next = id === undefined ? undefined : pending.get(id);
-      if (next !== undefined && next.execAt === undefined) next.execAt = performance.now();
+    // The child runs one statement at a time, so the parent sends one at a
+    // time and keeps the rest queued here. "Never sent" is then exact: a read
+    // is marked retryable only if the child never received it (the child may
+    // start the next pipelined statement before the parent hears the last
+    // reply, so a pipelined queue could not prove that).
+    const dispatch = () => {
+      if (running !== undefined || stoppedMessage !== undefined) return;
+      const next = pending.values().next().value;
+      if (next === undefined) return;
+      running = next.id;
+      next.execAt = performance.now();
+      next.post();
     };
     // A caller that waited past the statement limit gets a typed "busy" and
     // leaves; the process keeps running the statement (an I/O stall is not a
     // wedge). Only autocommit reads are abandoned: a transaction keeps the
-    // retire-on-limit rule below, which protects WAL checkpoints.
+    // retire-on-limit rule below, which protects WAL checkpoints. A read still
+    // queued in the parent is dropped without ever being sent.
     const abandon = (entry: PendingRead) => {
       if (entry.abandoned) return;
       entry.abandoned = true;
-      abandonedCount++;
-      entry.reject(
-        readerBusy(
-          `Reader lane busy: no answer within ${statementLimitMs} ms`,
-          entry.execAt !== undefined,
-        ),
-      );
+      const sent = entry.execAt !== undefined;
+      if (sent) abandonedCount++;
+      else pending.delete(entry.id);
+      entry.reject(readerBusy(`Reader lane busy: no answer within ${statementLimitMs} ms`, sent));
       entry.settle();
+      if (pending.size === 0) worker.unref();
     };
     // One statement must not hold every read in the process: report a slow one
     // with its SQL, and past the limit retire the worker so new reads get a
@@ -385,7 +398,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       const request = pending.get(reply.id);
       if (request === undefined) return;
       pending.delete(reply.id);
-      startRunning(pending.keys().next().value);
+      dispatch();
       if (!("error" in reply)) {
         if (/^\s*BEGIN\b/i.test(request.sql)) snapshotStartedAt = performance.now();
         if (/^\s*(?:COMMIT|ROLLBACK)\s*;?\s*$/i.test(request.sql)) snapshotStartedAt = undefined;
@@ -439,13 +452,17 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           const settled = new Promise<void>((resolve) => {
             settle = resolve;
           });
+          const cached = input.cached && !hasLargeBinding(input.params);
           const entry: PendingRead = {
+            id,
             endsTransaction,
             sql: input.sql,
             autocommit,
             enqueuedAt: performance.now(),
             settle,
             settled,
+            // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
+            post: () => worker.postMessage({ id, safeIntegers, ...input, cached }),
             reject: (error) => resume(Effect.fail(error)),
             resume: (reply) => {
               if ("rows" in reply) {
@@ -467,18 +484,20 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           pending.set(id, entry);
           if (beginsTransaction) transactionOpen = true;
           if (endsWholeTransaction) transactionOpen = false;
-          if (pending.size === 1) {
-            worker.ref();
-            startRunning(id);
-          }
-          const cached = input.cached && !hasLargeBinding(input.params);
-          // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
-          worker.postMessage({ id, safeIntegers, ...input, cached });
+          if (pending.size === 1) worker.ref();
+          dispatch();
           return Effect.suspend(() => {
             if (!pending.has(id) || entry.abandoned)
               return stoppedMessage === undefined
                 ? Effect.void
                 : Effect.asVoid(Effect.promise(() => retiring));
+            // A cancelled autocommit read the child never received is just dropped.
+            if (entry.autocommit && entry.execAt === undefined) {
+              pending.delete(id);
+              entry.settle();
+              if (pending.size === 0) worker.unref();
+              return Effect.void;
+            }
             // An autocommit read keeps its permit until the statement finishes
             // or passes the statement limit (then it is abandoned and the child
             // finishes it); a cancelled HTTP request no longer kills the process.

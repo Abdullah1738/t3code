@@ -1009,9 +1009,10 @@ const withToolAnalytics =
               const result = options
                 .handle(payload)
                 .pipe(Effect.provideService(ReplyRejection, rejection));
-              // The tool (reads, waits, acknowledgements) runs without a reply-builder
-              // permit; a large read takes one only to measure its built result
-              // (10 Nov 2026: t3_thread_read held a permit up to 153 s).
+              // Large reads run on their own "mcp" lane (whole call, so at most
+              // PERMITS.mcp large results are built at once). They queue only behind
+              // each other, never behind control polls, lists or snapshots (10 Nov
+              // 2026: t3_thread_read held the shared agent lane up to 153 s).
               const check = <A>(built: A): A | McpSchema.CallToolResult => {
                 // MCP repeats the result as text and structuredContent; leave envelope headroom.
                 if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
@@ -1029,6 +1030,10 @@ const withToolAnalytics =
                 });
               };
               return yield* result.pipe(
+                (call) =>
+                  LARGE_READ_TOOLS.has(options.tool.name)
+                    ? ReplyBuilders.bounded(Effect.map(call, check), "mcp")
+                    : Effect.map(call, check),
                 Effect.catchCauseIf(
                   (cause) =>
                     cause.reasons.some(
@@ -1050,11 +1055,6 @@ const withToolAnalytics =
                       }),
                     );
                   },
-                ),
-                Effect.flatMap((built) =>
-                  LARGE_READ_TOOLS.has(options.tool.name)
-                    ? ReplyBuilders.bounded(Effect.sync(() => check(built)))
-                    : Effect.sync(() => check(built)),
                 ),
                 Effect.onExit((exit) => {
                   const result = exit._tag === "Success" ? exit.value : undefined;

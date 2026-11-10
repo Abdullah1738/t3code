@@ -5,27 +5,30 @@ import * as Semaphore from "effect/Semaphore";
 
 /**
  * - interactive: the web UI's snapshot builds (WebSocket).
- * - agent: build/serialize step only, for control API replies and large MCP
- *   reads. Nothing that reads the database, waits or writes holds it.
+ * - agent: build/serialize step only, for control API replies. Nothing that
+ *   reads the database, waits or writes holds it.
  * - snapshot: whole-request admission for the orchestration snapshot and board
  *   HTTP routes and the full-shell control list, whose reads build the reply.
  * - poll: the per-thread control message read, so bridge polls queue only
  *   behind each other, never behind lists, snapshots or MCP reads.
+ * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).
+ *   It bounds how many large results are built at once; a slow one delays
+ *   only other large MCP reads.
  *
  * Light control reads (identity, thread status, health) take no lane at all.
  * On 10 Nov 2026 one shared 2-permit lane was held ~1.8 permits by
  * GET /threads (p95 14.6 s) and MCP reads (t3_thread_read up to 153 s, while
  * waiting for reader slots), and everything else on it hit client timeouts.
  */
-export type Lane = "interactive" | "agent" | "snapshot" | "poll";
+export type Lane = "interactive" | "agent" | "snapshot" | "poll" | "mcp";
 
 export class ReplyBuilders extends Context.Service<
   ReplyBuilders,
   { readonly [K in Lane]: Semaphore.Semaphore }
 >()("t3/ardud/http/ReplyBuilders") {}
 
-// Payload construction is still bounded: at most 2 + 2 + 2 admitted 16 MiB
-// builds (96 MiB, excluding object/encoding overhead); poll reads are one
+// Payload construction is still bounded: at most 2 + 2 + 2 + 4 admitted 16 MiB
+// builds (160 MiB, excluding object/encoding overhead); poll reads are one
 // thread's messages each. Each lane is shared across connections, not
 // allocated per board or request.
 export const PERMITS: { readonly [K in Lane]: number } = {
@@ -33,6 +36,7 @@ export const PERMITS: { readonly [K in Lane]: number } = {
   agent: 2,
   snapshot: 2,
   poll: 4,
+  mcp: 4,
 };
 
 export const layer = Layer.effect(
@@ -43,6 +47,7 @@ export const layer = Layer.effect(
       agent: yield* Semaphore.make(PERMITS.agent),
       snapshot: yield* Semaphore.make(PERMITS.snapshot),
       poll: yield* Semaphore.make(PERMITS.poll),
+      mcp: yield* Semaphore.make(PERMITS.mcp),
     };
   }),
 );
