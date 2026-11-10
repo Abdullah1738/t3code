@@ -133,6 +133,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     outputSchema: outputSchemaJson,
     modelSelection,
     investigate,
+    timeoutMs,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
     TextGenerationError,
@@ -277,19 +278,25 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       return stdout;
     });
 
-    const rawStdout = yield* runClaudeCommand().pipe(
-      Effect.scoped,
-      Effect.timeoutOption(investigate?.timeoutMs ?? CLAUDE_TIMEOUT_MS),
-      Effect.flatMap(
-        Option.match({
-          onNone: () =>
-            Effect.fail(
-              new TextGenerationError({ operation, detail: "Claude CLI request timed out." }),
-            ),
-          onSome: (value) => Effect.succeed(value),
-        }),
-      ),
+    const limitMs = TextGenerationOperations.requestTimeoutMs(
+      { investigate, timeoutMs },
+      CLAUDE_TIMEOUT_MS,
     );
+    const claudeRun = runClaudeCommand().pipe(Effect.scoped);
+    const rawStdout = yield* limitMs === null
+      ? claudeRun
+      : claudeRun.pipe(
+          Effect.timeoutOption(limitMs),
+          Effect.flatMap(
+            Option.match({
+              onNone: () =>
+                Effect.fail(
+                  new TextGenerationError({ operation, detail: "Claude CLI request timed out." }),
+                ),
+              onSome: (value) => Effect.succeed(value),
+            }),
+          ),
+        );
 
     const output = yield* decodeClaudeOutput(rawStdout).pipe(
       Effect.catchTags({

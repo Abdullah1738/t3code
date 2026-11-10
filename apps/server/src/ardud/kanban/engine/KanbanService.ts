@@ -1509,6 +1509,19 @@ const make = Effect.gen(function* () {
   const proposalsChecked = yield* Ref.make<ReadonlyMap<KanbanBoardId, number>>(new Map());
   // Boards with a goal-ideas model call still running: a second one would post the same proposal.
   const proposalsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
+  // Boards with a groups or goals scribe call still running. A call can outlast the
+  // SCRIBE_EVERY_MS cooldown, and the next tick must not start a second one beside it.
+  const groupsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
+  const goalsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
+  // Cards with a title writer running, each with the write asked for meanwhile (null when
+  // none): its fields and the card's title and description at the time. One writer per card; the asked-for write runs after it, on the latest card.
+  type WriterFields = { readonly title: boolean; readonly description: boolean };
+  type WriterAsk = {
+    readonly fields: WriterFields;
+    readonly asked: Pick<KanbanCard, "title" | "description">;
+  };
+  type WritersRunning = ReadonlyMap<KanbanCardId, WriterAsk | null>;
+  const titlesRunning = yield* Ref.make<WritersRunning>(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -1993,6 +2006,8 @@ const make = Effect.gen(function* () {
   const writeTitle = Effect.fn("KanbanService.writeTitle")(function* (
     cardId: KanbanCard["id"],
     fields: { readonly title: boolean; readonly description: boolean },
+    // The card's title and description when the write was asked for; an edit after that wins.
+    asked?: Pick<KanbanCard, "title" | "description">,
   ) {
     const generateJson = textGeneration.generateJson;
     if (!generateJson) return;
@@ -2007,22 +2022,29 @@ const make = Effect.gen(function* () {
       prompt: Briefs.writerPrompt(card),
       outputSchema: WriterOutput,
       modelSelection: board.managerModel,
+      timeoutMs: Scribe.BOARD_TEXT_HANG_GUARD_MS,
     });
     yield* locks.run(
       Effect.gen(function* () {
         const current = yield* cardOf(cardId);
         const title = written.title.trim().slice(0, 80);
         const description = written.description.trim();
+        const basis = asked ?? card;
         yield* saveCard({
           ...current,
           title:
-            fields.title && title && current.title === card.title && current.prompt === card.prompt
+            fields.title &&
+            title &&
+            current.title === card.title &&
+            current.title === basis.title &&
+            current.prompt === card.prompt
               ? title
               : current.title,
           description:
             fields.description &&
             description &&
             current.description === card.description &&
+            current.description === basis.description &&
             current.prompt === card.prompt
               ? description
               : current.description,
@@ -2033,15 +2055,65 @@ const make = Effect.gen(function* () {
     );
   });
 
-  const forkWriter = (
+  // Runs the writer, then any write asked for while it ran, until none is left.
+  const writerRuns = (
     cardId: KanbanCard["id"],
-    fields: { readonly title: boolean; readonly description: boolean },
-  ) =>
-    writeTitle(cardId, fields).pipe(
+    fields: WriterFields,
+    asked?: WriterAsk["asked"],
+  ): Effect.Effect<void> =>
+    writeTitle(cardId, fields, asked).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban title writer failed", { cardId, cause }),
       ),
-      Effect.forkIn(scope),
+      Effect.andThen(
+        Ref.modify(titlesRunning, (all): [WriterAsk | null, WritersRunning] => {
+          const next = all.get(cardId) ?? null;
+          if (next !== null) return [next, new Map(all).set(cardId, null)];
+          const rest = new Map(all);
+          rest.delete(cardId);
+          return [null, rest];
+        }),
+      ),
+      Effect.flatMap((next) =>
+        next === null ? Effect.void : writerRuns(cardId, next.fields, next.asked),
+      ),
+    );
+  // At most one writer per card. A later ask (an edited prompt) waits for it, and the newest
+  // ask's fields win: each reflects what the owner had written by then.
+  // The claim and the fork are one step, so an interrupt cannot leave a claim with no writer;
+  // the writer itself stays interruptible, so closing the scope still kills its CLI child.
+  const forkWriter = (cardId: KanbanCard["id"], fields: WriterFields) =>
+    cardOf(cardId).pipe(
+      Effect.flatMap((card) => {
+        const ask: WriterAsk = {
+          fields,
+          asked: { title: card.title, description: card.description },
+        };
+        return Effect.uninterruptibleMask((restore) =>
+          Ref.modify(titlesRunning, (all): [boolean, WritersRunning] => [
+            !all.has(cardId),
+            new Map(all).set(cardId, all.has(cardId) ? ask : null),
+          ]).pipe(
+            Effect.flatMap((start) =>
+              start
+                ? restore(writerRuns(cardId, fields, ask.asked)).pipe(
+                    Effect.onInterrupt(() =>
+                      Ref.update(titlesRunning, (all) => {
+                        const rest = new Map(all);
+                        rest.delete(cardId);
+                        return rest;
+                      }),
+                    ),
+                    Effect.forkIn(scope),
+                  )
+                : Effect.void,
+            ),
+          ),
+        );
+      }),
+      Effect.catch((error) =>
+        Effect.logWarning("kanban title writer failed", { cardId, cause: error }),
+      ),
       Effect.asVoid,
     );
 
@@ -2059,6 +2131,7 @@ const make = Effect.gen(function* () {
       prompt: Scribe.groupsPrompt(yield* store.cards(boardId), yield* store.groups(boardId)),
       outputSchema: Scribe.ScribeGroupsOutput,
       modelSelection: board.managerModel,
+      timeoutMs: Scribe.BOARD_TEXT_HANG_GUARD_MS,
     });
     yield* locks.run(
       Effect.gen(function* () {
@@ -2082,9 +2155,13 @@ const make = Effect.gen(function* () {
       }),
     );
   });
+  // The tick adds the board to groupsRunning before forking; the run takes it out however it ends.
   const forkGroups = (boardId: KanbanBoardId) =>
     writeGroups(boardId).pipe(
       Effect.catchCause((cause) => Effect.logWarning("kanban scribe failed", { boardId, cause })),
+      Effect.ensuring(
+        Ref.update(groupsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
+      ),
       Effect.forkIn(scope),
       Effect.asVoid,
     );
@@ -2101,11 +2178,13 @@ const make = Effect.gen(function* () {
     // Cards that finish during the call wait for the next pass: the Story cutoff is the
     // time this snapshot was read, not the time the write lands.
     const snapshotMs = yield* nowMillis;
+    const snapshotGoals = yield* store.goals(boardId);
     const output = yield* generateJson({
       cwd: project.value.workspaceRoot,
-      prompt: Scribe.goalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId)),
+      prompt: Scribe.goalsPrompt(yield* store.cards(boardId), snapshotGoals),
       outputSchema: Scribe.ScribeGoalsOutput,
       modelSelection: board.managerModel,
+      timeoutMs: Scribe.BOARD_TEXT_HANG_GUARD_MS,
     });
     yield* locks.run(
       Effect.gen(function* () {
@@ -2128,8 +2207,12 @@ const make = Effect.gen(function* () {
         for (const update of updates.goals) {
           const goal = goals.find((entry) => entry.id === update.id);
           if (!goal) continue;
+          // A Now written while the call ran is newer than the answer, however long it took.
+          const was = snapshotGoals.find((entry) => entry.id === goal.id)?.now ?? null;
           const keepNow =
             update.now === "" ||
+            was?.at !== goal.now?.at ||
+            was?.text !== goal.now?.text ||
             (goal.now !== null && nowMs - Date.parse(goal.now.at) < SCRIBE_KEEPS_NOW_MS);
           if (keepNow && update.now !== "") held = true;
           if (keepNow && update.story === null) continue;
@@ -2160,6 +2243,9 @@ const make = Effect.gen(function* () {
     writeGoals(boardId).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban goal scribe failed", { boardId, cause }),
+      ),
+      Effect.ensuring(
+        Ref.update(goalsRunning, (all) => new Set([...all].filter((id) => id !== boardId))),
       ),
       Effect.forkIn(scope),
       Effect.asVoid,
@@ -2209,6 +2295,7 @@ const make = Effect.gen(function* () {
       ),
       outputSchema: Scribe.ScribeProposalsOutput,
       modelSelection: board.managerModel,
+      timeoutMs: Scribe.BOARD_TEXT_HANG_GUARD_MS,
     });
     yield* locks.run(
       Effect.gen(function* () {
@@ -5816,11 +5903,13 @@ const make = Effect.gen(function* () {
               const due =
                 fingerprint !== "" &&
                 cooled &&
+                !(yield* Ref.get(groupsRunning)).has(board.id) &&
                 (last === undefined || !last.done || fingerprint !== last.fingerprint);
               if (due) {
                 yield* Ref.update(scribed, (all) =>
                   new Map(all).set(board.id, { fingerprint, at: now, done: false }),
                 );
+                yield* Ref.update(groupsRunning, (all) => new Set(all).add(board.id));
                 yield* forkGroups(board.id);
               }
               const goalsPrint = Scribe.goalsFingerprint(
@@ -5831,6 +5920,7 @@ const make = Effect.gen(function* () {
               // A failed or held-back attempt is retried after the cooldown, cards unchanged or not.
               const goalsDue =
                 goalsPrint !== "" &&
+                !(yield* Ref.get(goalsRunning)).has(board.id) &&
                 (lastGoals === undefined || now - lastGoals.at >= Scribe.SCRIBE_EVERY_MS) &&
                 (lastGoals === undefined ||
                   !lastGoals.done ||
@@ -5839,6 +5929,7 @@ const make = Effect.gen(function* () {
                 yield* Ref.update(goalsScribed, (all) =>
                   new Map(all).set(board.id, { fingerprint: goalsPrint, at: now, done: false }),
                 );
+                yield* Ref.update(goalsRunning, (all) => new Set(all).add(board.id));
                 yield* forkGoals(board.id);
               }
               // Goal ideas: checked every PROPOSAL_CHECK_MS per board, asked only when due.
