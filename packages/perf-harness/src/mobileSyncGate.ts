@@ -11,7 +11,14 @@
  *   meanwhile, as agents do on the live server;
  * - resume: the socket dropped while events kept arriving (app in the background), then one
  *   resubscribe from the last applied sequence, for several gap sizes;
- * - thread open: the bounded thread window over HTTP while shell loads are in flight.
+ * - thread open: the bounded thread window over HTTP while shell loads are in flight;
+ * - contended sync (what the owner's phone met on 10 Nov 2026): the phone syncs with its
+ *   own user agent and a 20 s deadline per page while a desktop client pages the list in
+ *   a loop (idle subagents omitted) and whole-list requests hold the snapshot reply lane,
+ *   as board snapshots and control lists did live (7-45 s holds). The installed phone
+ *   build starts again from page one when a page times out; a client built from this
+ *   tree asks for the same page again with a longer deadline. Then foreground resumes
+ *   15 s apart under the same load.
  *
  * HTTP bodies are paced by `shapedFetch`. Socket frames are not paced; their link time is
  * added arithmetically (one round trip + bytes at the link rate) and reported separately.
@@ -68,7 +75,19 @@ export const mobileSyncWorkload = {
   resumeRepeats: 3,
   threadOpens: 40,
   shellLoaders: 3,
+  contended: {
+    pageTimeoutMs: 20_000,
+    snapshotLaneHolders: 3,
+    desktopPauseMs: 1_000,
+    giveUpAfterMs: 240_000,
+    foregroundResumes: 3,
+    backgroundMs: 15_000,
+  },
 } as const;
+
+const NATIVE_USER_AGENT = "Robob/1 CFNetwork/3896.100.1.2.1 Darwin/27.0.0";
+const DESKTOP_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Robob/0.1.0 Chrome/152.0.0.0 Electron/42.0.0 Safari/537.36";
 
 // A client built from this tree asks for the most recently updated threads first; the
 // installed mobile app does not. Older servers ignore the option.
@@ -171,42 +190,96 @@ const pagedLoad = async (input: {
   readonly shaped: boolean;
   readonly recent?: ReadonlySet<string>;
   readonly stop?: () => boolean;
+  readonly userAgent?: string;
+  readonly omitIdleSubagents?: boolean;
+  /** Client deadline for one page, body included (default: none within the run). */
+  readonly pageTimeoutMs?: number;
+  /**
+   * What a timed-out page does: "restart" loads from page one again (the installed phone
+   * build), "retry" asks for the same page with 2x then 3x the deadline (this tree's client).
+   */
+  readonly onPageTimeout?: "restart" | "retry";
+  readonly giveUpAt?: number;
 }) => {
   const started = performance.now();
-  const pages: Array<{ ms: number; bytes: number; threads: number }> = [];
-  const seen = new Set<string>();
+  let pages: Array<{ ms: number; bytes: number; threads: number }> = [];
+  const allPageMs: number[] = [];
+  let seen = new Set<string>();
   let minSequence = Number.POSITIVE_INFINITY;
   let after: string | undefined;
   let recentCompleteMs: number | null = null;
   let recentCompletePage: number | null = null;
+  let pageTimeouts = 0;
+  let restartsFromPageOne = 0;
+  let requests = 0;
+  let bytesFetched = 0;
+  let attempt = 0;
+  let gaveUp = false;
+  const requestHeaders =
+    input.userAgent === undefined ? headers : { ...headers, "user-agent": input.userAgent };
   while (input.stop?.() !== true) {
-    const path = `/api/orchestration/shell?paged=true${recentFirst ? "&recentFirst=true" : ""}${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`;
+    if (input.giveUpAt !== undefined && performance.now() > input.giveUpAt) {
+      gaveUp = true;
+      break;
+    }
+    const path = `/api/orchestration/shell?paged=true${recentFirst ? "&recentFirst=true" : ""}${input.omitIdleSubagents === true ? "&omitIdleSubagents=true" : ""}${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`;
     const pageStarted = performance.now();
     let text = "";
     let bytes = 0;
-    if (input.shaped) {
-      const result = await shapedFetch(async () => {
-        const response = await fetch(origin + path, {
-          headers,
-          signal: AbortSignal.timeout(120_000),
+    const deadlineMs =
+      input.pageTimeoutMs === undefined ? 120_000 : input.pageTimeoutMs * (attempt + 1);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), deadlineMs);
+    requests++;
+    try {
+      if (input.shaped) {
+        const result = await shapedFetch(async () => {
+          const response = await fetch(origin + path, {
+            headers: requestHeaders,
+            signal: abort.signal,
+          });
+          // The shaped reader paces the body; keep a copy to decode the cursor.
+          const [paced, copy] = response.body!.tee();
+          void new Response(copy)
+            .text()
+            .then((value) => (text = value))
+            .catch(() => undefined);
+          return new Response(paced, { status: response.status });
         });
-        // The shaped reader paces the body; keep a copy to decode the cursor.
-        const [paced, copy] = response.body!.tee();
-        void new Response(copy).text().then((value) => (text = value));
-        return new Response(paced, { status: response.status });
-      });
-      bytes = result.bytes;
-      // The copy settles with the paced branch.
-      for (let i = 0; i < 100 && text.length === 0; i++) await delay(5);
-    } else {
-      const response = await fetch(origin + path, {
-        headers,
-        signal: AbortSignal.timeout(120_000),
-      });
-      text = await response.text();
-      if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
-      bytes = Buffer.byteLength(text);
+        bytes = result.bytes;
+        // The copy settles with the paced branch.
+        for (let i = 0; i < 100 && text.length === 0; i++) await delay(5);
+      } else {
+        const response = await fetch(origin + path, {
+          headers: requestHeaders,
+          signal: abort.signal,
+        });
+        text = await response.text();
+        if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+        bytes = Buffer.byteLength(text);
+      }
+    } catch (error) {
+      if (!abort.signal.aborted || input.pageTimeoutMs === undefined) throw error;
+      pageTimeouts++;
+      allPageMs.push(performance.now() - pageStarted);
+      if (input.onPageTimeout === "retry" && attempt < 2) {
+        attempt++;
+      } else {
+        // The load is thrown away: every page fetched so far is fetched again.
+        restartsFromPageOne++;
+        attempt = 0;
+        after = undefined;
+        pages = [];
+        seen = new Set();
+        minSequence = Number.POSITIVE_INFINITY;
+      }
+      continue;
+    } finally {
+      clearTimeout(timer);
     }
+    attempt = 0;
+    bytesFetched += bytes;
+    allPageMs.push(performance.now() - pageStarted);
     const page = JSON.parse(text) as ShellPage;
     for (const thread of page.threads) seen.add(thread.id);
     minSequence = Math.min(minSequence, page.snapshotSequence);
@@ -225,8 +298,14 @@ const pagedLoad = async (input: {
   }
   return {
     ms: performance.now() - started,
+    complete: !gaveUp && input.stop?.() !== true,
     pages: pages.length,
     bytes: pages.reduce((sum, page) => sum + page.bytes, 0),
+    requests,
+    bytesFetched,
+    pageTimeouts,
+    restartsFromPageOne,
+    pageMsMax: allPageMs.length === 0 ? null : Math.max(...allPageMs),
     threads: seen.size,
     firstPageMs: pages[0]?.ms ?? null,
     firstPageBytes: pages[0]?.bytes ?? null,
@@ -503,6 +582,114 @@ try {
           underShellLoadMsP50: pct(loaded, 0.5),
           underShellLoadMsP95: pct(loaded, 0.95),
           underShellLoadMsMax: Math.max(...loaded),
+        };
+
+        // Contended sync: the phone against a desktop paging loop and a held snapshot lane.
+        const contended = mobileSyncWorkload.contended;
+        let contending = true;
+        let contendedWrites = 0;
+        yield* Effect.gen(function* () {
+          const everyMs = 1000 / mobileSyncWorkload.writesPerSecond;
+          let next = performance.now();
+          while (contending) {
+            yield* touch(
+              recentIndexes[contendedWrites % mobileSyncWorkload.writerThreads]!,
+              `c${contendedWrites}`,
+            ).pipe(Effect.ignore);
+            contendedWrites++;
+            next += everyMs;
+            const wait = next - performance.now();
+            if (wait > 0) yield* Effect.sleep(`${wait} millis`);
+          }
+        }).pipe(Effect.forkScoped);
+        // Whole-list requests: each builds every row while holding a snapshot-lane permit.
+        const holds: number[] = [];
+        const holders = Array.from({ length: contended.snapshotLaneHolders }, async () => {
+          while (contending) {
+            const holdStarted = performance.now();
+            try {
+              const response = await fetch(`${origin}/api/orchestration/shell`, {
+                headers,
+                signal: AbortSignal.timeout(120_000),
+              });
+              await response.arrayBuffer();
+            } catch {
+              // A holder that fails still held the lane; keep going.
+            }
+            holds.push(performance.now() - holdStarted);
+          }
+        });
+        let desktopLoads = 0;
+        let desktopPages = 0;
+        const desktop = (async () => {
+          while (contending) {
+            const load = await pagedLoad({
+              shaped: false,
+              stop: () => !contending,
+              userAgent: DESKTOP_USER_AGENT,
+              omitIdleSubagents: true,
+            }).catch(() => null);
+            if (load !== null) {
+              desktopLoads++;
+              desktopPages += load.pages;
+            }
+            await delay(contended.desktopPauseMs);
+          }
+        })();
+        yield* Effect.sleep("3 seconds");
+
+        const phoneStarted = performance.now();
+        const phoneHttp = yield* Effect.promise(() =>
+          pagedLoad({
+            shaped: true,
+            recent,
+            userAgent: NATIVE_USER_AGENT,
+            pageTimeoutMs: contended.pageTimeoutMs,
+            onPageTimeout: recentFirst ? "retry" : "restart",
+            giveUpAt: phoneStarted + contended.giveUpAfterMs,
+          }),
+        );
+        let phoneSocket: Effect.Success<ReturnType<typeof subscribeUntilSynchronized>> | null =
+          null;
+        const foreground: Array<Record<string, unknown>> = [];
+        if (phoneHttp.complete) {
+          phoneSocket = yield* subscribeUntilSynchronized(phoneHttp.minSequence);
+          let phoneCursor = phoneSocket.lastSequence;
+          for (let i = 0; i < contended.foregroundResumes; i++) {
+            yield* Effect.sleep(`${contended.backgroundMs} millis`);
+            const before = yield* Effect.promise(headSequence);
+            const sample = yield* subscribeUntilSynchronized(phoneCursor);
+            foreground.push({
+              eventsBehind: before - phoneCursor,
+              fullReload: sample.fullReload,
+              serverMs: sample.ms,
+              mobileMs: sample.mobileMs,
+              bytes: sample.bytes,
+            });
+            phoneCursor = sample.lastSequence;
+          }
+        }
+        const synchronizedMs = phoneSocket === null ? null : phoneHttp.ms + phoneSocket.mobileMs;
+        contending = false;
+        yield* Effect.promise(() => Promise.all([...holders, desktop]));
+        result.contendedSync = {
+          phoneClient: recentFirst ? "this tree" : "installed build",
+          synchronized: phoneSocket !== null,
+          synchronizedMs,
+          firstPageMs: phoneHttp.firstPageMs,
+          recentCompleteMs: phoneHttp.recentCompleteMs,
+          http: phoneHttp,
+          socket: phoneSocket,
+          totalBytes: phoneHttp.bytesFetched + (phoneSocket?.bytes ?? 0),
+          foreground,
+          load: {
+            snapshotLaneHolds: holds.length,
+            snapshotLaneHoldMsP50: pct(holds, 0.5),
+            snapshotLaneHoldMsMax: holds.length === 0 ? null : Math.max(...holds),
+            desktopLoads,
+            desktopPages,
+            writes: contendedWrites,
+          },
         };
       }),
     ),
