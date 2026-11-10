@@ -17,7 +17,8 @@
 // lock), then closes its row and drops it from the pending stops in the lock.
 //
 // A drop note (`release`, the thread keeps other cards) is pending the same
-// way and runs in the same two halves (notes are sent, no interrupt). The
+// way and runs in the same two halves (notes are sent, no interrupt; with a
+// stop captured too, the stop runs alone and the notes close unsent). The
 // thread may take that card back (`reclaim`, a claim under the board gate)
 // only once no note is pending for it; before that the claim sends pending
 // notes itself (`sendCapture`/`sendStops` model that too) or is refused. A
@@ -62,8 +63,11 @@ module stops {
     s' = { ...s, cardHeld: true, superseded: s.superseded.union(s.noteIds) } }
   action reclaimUnguarded = all { s.alive, not(s.cardHeld), s.noteIds != Set(),
     s' = { ...s, cardHeld: true, superseded: s.superseded.union(s.noteIds) } }
-  // Running keys `ks`: notes are sent (late if their card was taken back), stops cut once.
-  def sent(ks: Set[int]): Set[int] = s.lateNotes.union(ks.intersect(s.noteIds).intersect(s.superseded))
+  // Running keys `ks`: with a stop among them the notes close unsent (the stop
+  // supersedes them); otherwise notes are sent, late if their card was taken back.
+  def sent(ks: Set[int]): Set[int] =
+    if (ks.exclude(s.noteIds) != Set()) s.lateNotes
+    else s.lateNotes.union(ks.intersect(s.noteIds).intersect(s.superseded))
   def runAfter(ks: Set[int]): bool = if (ks.exclude(s.noteIds) == Set()) s.running else false
   action runEnds = all { s.alive, s.running, s' = { ...s, running: false } }
   // One interrupt for stops `ks` cuts the running assignment; it is a wrong cut
@@ -187,6 +191,9 @@ module stops {
   run noteCrashTest = init.then(noteRequest(2)).then(crash).then(recover)
     .then(drainCapture(2)).then(drainStops(true, true)).then(reclaim)
     .then(all { assert(safe and s.cardHeld), s' = s })
+  run stopSupersedesNoteTest = init.then(noteRequest(2)).then(request(0)).then(runEnds)
+    .then(drainCapture(0)).then(drainStops(true, true)).then(reclaim)
+    .then(all { assert(safe and s.rows == Set() and s.pending == Set() and s.cardHeld), s' = s })
   run unguardedReclaimCounterexampleTest = init.then(noteRequest(2)).then(reclaimUnguarded)
     .then(drainCapture(2)).then(drainStops(true, true))
     .then(all { assert(not(noLateNote)), s' = s })

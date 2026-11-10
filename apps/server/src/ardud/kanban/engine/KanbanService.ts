@@ -1052,14 +1052,25 @@ const make = Effect.gen(function* () {
         ? { kind: "note", text: effect.text }
         : null;
   // A failed close fails the stop like a failed interrupt: the send waiting on it fails too.
+  // Notes a stop made obsolete close as `superseded`, never as delivered.
   const closeStopRows = Effect.fn("KanbanService.closeStopRows")(
-    function* (keys: ReadonlyArray<string>) {
+    function* (keys: ReadonlyArray<string>, superseded: ReadonlyArray<string> = []) {
       const at = yield* nowIso;
-      yield* boardSql`
-        UPDATE ardud_kanban_owner_routes
-        SET done_at = ${at}, json = json_set(json, '$.outcome', 'delivered')
-        WHERE route_key IN ${boardSql.in(keys)} AND done_at IS NULL
-      `;
+      yield* boardSql.withTransaction(
+        Effect.gen(function* () {
+          yield* boardSql`
+            UPDATE ardud_kanban_owner_routes
+            SET done_at = ${at}, json = json_set(json, '$.outcome', 'delivered')
+            WHERE route_key IN ${boardSql.in(keys)} AND done_at IS NULL
+          `;
+          if (superseded.length === 0) return;
+          yield* boardSql`
+            UPDATE ardud_kanban_owner_routes
+            SET done_at = ${at}, json = json_set(json, '$.outcome', 'superseded')
+            WHERE route_key IN ${boardSql.in(superseded)} AND done_at IS NULL
+          `;
+        }),
+      );
     },
     Effect.mapError(
       (error) =>
@@ -1072,9 +1083,11 @@ const make = Effect.gen(function* () {
   /**
    * Runs the thread's pending stops and notes, if any; callers hold no board
    * gate. A drain passes its own route: skipped when a send already ran it.
-   * Notes go first, in the order they were saved, each a keyed send (a retry
-   * never delivers it twice), then one interrupt. A thread with a pending stop
-   * carries no card, so no note is saved after its stop.
+   * Notes are keyed sends (a retry never delivers one twice), in the order
+   * they were saved. A pending stop supersedes them: the thread has no card
+   * left to carry on with, so they close unsent and the stop runs alone (a
+   * failing note can't hold it up). No note is saved after a stop: a thread
+   * with a stop pending takes no card until it has run.
    */
   const runPendingStops = (
     threadId: string,
@@ -1095,29 +1108,37 @@ const make = Effect.gen(function* () {
               const keys = entries.map(([key]) => key);
               const id = ThreadId.make(threadId);
               const stop = entries.find(([, entry]) => entry.kind === "interrupt")?.[1];
-              const run = Effect.forEach(
-                entries,
-                ([key, entry]) =>
-                  entry.kind === "note"
-                    ? threadIo.send({ threadId: id, text: entry.text, key: `${key}:note` }).pipe(
-                        // A thread that is gone has nothing left to drop.
-                        Effect.catchIf(
-                          (error) => error.detail === "thread not found",
-                          () => Effect.void,
-                        ),
-                      )
-                    : Effect.void,
-                { discard: true },
-              ).pipe(
-                Effect.andThen(
-                  stop?.kind === "interrupt" ? threadIo.interrupt(id, stop.reason) : Effect.void,
-                ),
-              );
+              const notes = entries.filter(([, entry]) => entry.kind === "note");
+              const superseded = stop === undefined ? [] : notes.map(([key]) => key);
+              const run =
+                stop?.kind === "interrupt"
+                  ? threadIo.interrupt(id, stop.reason)
+                  : Effect.forEach(
+                      notes,
+                      ([key, entry]) =>
+                        entry.kind === "note"
+                          ? threadIo
+                              .send({ threadId: id, text: entry.text, key: `${key}:note` })
+                              .pipe(
+                                // A thread that is gone has nothing left to drop.
+                                Effect.catchIf(
+                                  (error) => error.detail === "thread not found",
+                                  () => Effect.void,
+                                ),
+                              )
+                          : Effect.void,
+                      { discard: true },
+                    );
               return touching(threadId, run).pipe(
                 // Closed durably before the lock is released: a restart must not
                 // reload a stop that already ran and cut the run a send starts
                 // next (packages/protocol-models/stops.qnt, `stepVolatile`).
-                Effect.andThen(closeStopRows(keys)),
+                Effect.andThen(
+                  closeStopRows(
+                    keys.filter((key) => !superseded.includes(key)),
+                    superseded,
+                  ),
+                ),
                 Effect.tap(() =>
                   Effect.sync(() => {
                     for (const key of keys) {
@@ -7056,10 +7077,14 @@ const make = Effect.gen(function* () {
         .access(boardId, Effect.void, false, stopResource(threadId))
         .pipe(
           Effect.andThen(
+            // Safe to rerun when stale (a note saved meanwhile): sends are keyed and
+            // closes durable, so a rerun sends only what is still pending.
             locks.outside(
               runPendingStops(threadId).pipe(
                 Effect.catchTags({ KanbanThreadError: () => Effect.void }),
               ),
+              undefined,
+              true,
             ),
           ),
         );
