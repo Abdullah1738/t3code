@@ -175,7 +175,9 @@ class CheckEngine:
                 generation += (info.st_mtime_ns, info.st_size)
         except OSError:
             generation = ()
-        key = hashlib.sha256(json.dumps([body, generation], sort_keys=True, default=str).encode()).hexdigest()
+        from recall_local import rule_preflight_enabled
+        # A result cached while the rule index was on must not outlive turning it off.
+        key = hashlib.sha256(json.dumps([body, generation, rule_preflight_enabled()], sort_keys=True, default=str).encode()).hexdigest()
         with self.lock:
             hit = self.cache.get(key)
             if hit and time.monotonic() - hit[0] < 60:

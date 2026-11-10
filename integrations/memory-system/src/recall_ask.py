@@ -191,25 +191,40 @@ def build_sources(sessions: list[dict], *, budget: int, per_hit: tuple[int, int,
     return "\n\n".join(blocks), sources
 
 
-def project_context(here: str | None, sources: list[dict]) -> str:
-    """Where the agent works and which project each excerpt came from, for the model."""
+def project_context(here: str | None, sources: list[dict], timeout: float = 0.3) -> str:
+    """Where the agent works and which project each excerpt came from, for the model.
+
+    Context only: bounded (a stalled checkout mount can't hold up the answer)
+    and never raises.
+    """
+    import threading
     import recall_project
-    parts = []
-    try:
+    out: dict = {}
+
+    def work():
         where = recall_project.describe(here) if here else ""
-    except Exception:  # noqa: BLE001 - context only, never a reason to fail the answer
-        where = ""
-    if where:
-        parts.append("<agent_location>\n" + neutral(where) + "\n</agent_location>")
-    try:
-        found = recall_project.labels(s.get("cwd") for s in sources)
-    except Exception:  # noqa: BLE001
-        found = {}
-    rows = [f"[{s['n']}] {neutral(s['cwd'])}: {found[s['cwd']] or 'project unknown'}" for s in sources
+        out["where"] = where
+        out["found"] = recall_project.labels((s.get("cwd") for s in sources), budget=timeout / 2)
+
+    worker = threading.Thread(target=lambda: _quiet(work), daemon=True)
+    worker.start()
+    worker.join(timeout)
+    parts = []
+    if out.get("where"):
+        parts.append("<agent_location>\n" + neutral(out["where"]) + "\n</agent_location>")
+    found = out.get("found") or {}
+    rows = [f"[{s['n']}] {neutral(s['cwd'])}: {neutral(found[s['cwd']]) or 'project unknown'}" for s in sources
             if s.get("cwd") and s["cwd"] in found]
     if rows:
         parts.append("<excerpt_projects>\n" + "\n".join(rows) + "\n</excerpt_projects>")
     return "".join(part + "\n\n" for part in parts)
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 - context only
+        pass
 
 
 def public(sources: list[dict]) -> list[dict]:

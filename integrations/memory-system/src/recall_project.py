@@ -93,6 +93,11 @@ def remote_repo(url: str) -> str | None:
     return parts[-2].lower() + "/" + re.sub(r"\.git$", "", parts[-1].lower())
 
 
+def _clean(value: str) -> str:
+    """Repository metadata is data: keep it to plain path/name characters."""
+    return re.sub(r"[^\w./:@+ -]", "", value)[:200]
+
+
 def project_of_repo(repo: str | None) -> str | None:
     if not repo:
         return None
@@ -166,14 +171,17 @@ def resolve(cwd: str, depth: int = 0) -> dict:
     result["root"] = str(root)
     try:
         remotes = config_remotes(common) if key else {}
+        # Included files can change without touching the main config: don't cache those.
+        if key and re.search(r"^\s*\[\s*include", _read(common / "config"), re.I | re.M):
+            key = None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         remotes = {}
     labels = []
     for name, urls in remotes.items():
         repos = [remote_repo(url) for url in urls]
         named = [repo for repo in repos if repo]
-        result["remotes"][name] = named[0] if named and len(set(named)) == 1 and len(named) == len(repos) else ", ".join(
-            repo or url for repo, url in zip(repos, urls))
+        result["remotes"][_clean(name)] = _clean(named[0] if named and len(set(named)) == 1 and len(named) == len(repos) else ", ".join(
+            repo or url for repo, url in zip(repos, urls)))
         labels.extend(project_of_repo(repo) or "" for repo in named)
     source = _source_repo(common)
     if source and _abs(source) != str(root):
