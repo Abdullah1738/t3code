@@ -413,3 +413,87 @@ it.effect("a stale read-only operation reruns before any write or external side 
     assert.strictEqual(sent, 1);
   }),
 );
+
+/**
+ * A board-wide operation that reads outside the gate, once a card write
+ * lands during its first read. `fence` is what the read describes.
+ */
+const staleOnce = (bumpFenceDuringRead: boolean) =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    let fence = 0;
+    let reads = 0;
+    let attempts = 0;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const read = locks.outsideRead(
+      "view:thread-1",
+      () => fence,
+      Effect.gen(function* () {
+        reads += 1;
+        if (reads === 1) {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }
+        return `state-${reads}`;
+      }),
+    );
+    const op = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Effect.gen(function* () {
+          attempts += 1;
+          const seen = yield* read;
+          yield* locks.access("a", Effect.void, true);
+          return seen;
+        }),
+      ),
+    );
+    yield* Deferred.await(entered);
+    // Another writer on the board while the read is out: the operation is stale.
+    yield* locks.run(locks.access("a", Effect.void, true), "card-b");
+    if (bumpFenceDuringRead) fence += 1;
+    yield* Deferred.succeed(release, undefined);
+    const seen = yield* Fiber.join(op);
+    return { seen, reads, attempts };
+  });
+
+it.effect("a stale rerun replays its earlier read instead of queueing for it again", () =>
+  Effect.gen(function* () {
+    const { seen, reads, attempts } = yield* staleOnce(false);
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(reads, 1);
+    assert.strictEqual(seen, "state-1");
+  }),
+);
+
+it.effect("a rerun reads again when the fence moved during the earlier read", () =>
+  Effect.gen(function* () {
+    const { seen, reads, attempts } = yield* staleOnce(true);
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(reads, 2);
+    assert.strictEqual(seen, "state-2");
+  }),
+);
+
+it.effect("reads within one attempt and in separate operations are never replayed", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    let reads = 0;
+    const read = locks.outsideRead(
+      "view:thread-1",
+      () => 0,
+      Effect.sync(() => (reads += 1)),
+    );
+    const both = yield* locks.board(
+      "a",
+      Effect.gen(function* () {
+        return [yield* read, yield* read] as const;
+      }),
+    );
+    assert.deepStrictEqual(both, [1, 2]);
+    assert.strictEqual(yield* locks.board("a", read), 3);
+    // Outside any operation it is a plain read.
+    assert.strictEqual(yield* read, 4);
+  }),
+);

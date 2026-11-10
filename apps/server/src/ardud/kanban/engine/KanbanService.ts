@@ -852,6 +852,10 @@ const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set(Object.keys(FINISHED_
 const OWNER_ROUTE_TITLE_DEADLINE = "20 seconds";
 /** `noticed` value of a route whose give-up is decided but whose notice may not be posted yet. */
 const OWNER_ROUTE_GIVING_UP = 2;
+/** Whether stale reruns reuse their earlier attempt's thread reads (see `BoardLocks.outsideRead`). */
+export const ReplayReads = Context.Reference<boolean>("KanbanReplayReads", {
+  defaultValue: () => true,
+});
 export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
   defaultValue: () => "await",
 });
@@ -888,6 +892,7 @@ const make = Effect.gen(function* () {
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
   const ownerRouteMode = yield* OwnerRouteMode;
+  const replayReads = yield* ReplayReads;
   const durableOwnerRoutes = ownerRouteMode !== "inline";
   const routingEnabled = locks.outside(
     selectionRoutingEnabled.pipe(Effect.provideContext(context)),
@@ -907,6 +912,20 @@ const make = Effect.gen(function* () {
   const boardSql = yield* BoardsDatabase.client;
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
+  // Bumped before and after anything this process does to a thread, so a stale
+  // rerun never replays a read of it taken across that change (see `outsideRead`).
+  const threadFences = new Map<string, number>();
+  const touch = (threadId: string) =>
+    void threadFences.set(threadId, (threadFences.get(threadId) ?? 0) + 1);
+  const touching = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      touch(threadId);
+      return effect.pipe(Effect.ensuring(Effect.sync(() => touch(threadId))));
+    });
+  const threadRead = <A, E, R>(read: string, threadId: string, effect: Effect.Effect<A, E, R>) =>
+    replayReads
+      ? locks.outsideRead(`${read}:${threadId}`, () => threadFences.get(threadId) ?? 0, effect)
+      : locks.outside(effect, undefined, true);
   const abandonLaunch = Effect.fn("KanbanService.abandonLaunch")(
     function* (input: Parameters<typeof threadIo.launch>[0], id: ThreadId) {
       // The ended link comes first: a keyed owner-route replay must see this
@@ -938,21 +957,22 @@ const make = Effect.gen(function* () {
     (effect, _input, id) =>
       effect.pipe(
         Effect.ignore,
-        Effect.ensuring(threadIo.interrupt(id, "Board state changed during launch")),
+        Effect.ensuring(touching(id, threadIo.interrupt(id, "Board state changed during launch"))),
       ),
   );
   const threads: typeof threadIo = {
-    view: (id) => locks.outside(threadIo.view(id), undefined, true),
-    find: (id) => locks.outside(threadIo.find(id), undefined, true),
-    model: (id) => locks.outside(threadIo.model(id), undefined, true),
-    lastFailure: (id) => locks.outside(threadIo.lastFailure(id), undefined, true),
-    findLastFailure: (id) => locks.outside(threadIo.findLastFailure(id), undefined, true),
-    latestRun: (id) => locks.outside(threadIo.latestRun(id), undefined, true),
-    compactRun: (id, run) => locks.outside(threadIo.compactRun(id, run)),
+    view: (id) => threadRead("view", id, threadIo.view(id)),
+    find: (id) => threadRead("find", id, threadIo.find(id)),
+    model: (id) => threadRead("model", id, threadIo.model(id)),
+    lastFailure: (id) => threadRead("lastFailure", id, threadIo.lastFailure(id)),
+    findLastFailure: (id) => threadRead("findLastFailure", id, threadIo.findLastFailure(id)),
+    latestRun: (id) => threadRead("latestRun", id, threadIo.latestRun(id)),
+    compactRun: (id, run) => locks.outside(touching(id, threadIo.compactRun(id, run))),
     launch: (input) =>
       locks
         .outside(
           threadIo.launch(input).pipe(
+            Effect.tap((id) => Effect.sync(() => touch(id))),
             Effect.tap((id) =>
               Effect.gen(function* () {
                 (yield* ownerDelivered)?.add(id);
@@ -983,24 +1003,25 @@ const make = Effect.gen(function* () {
         const answer = input.key === undefined;
         if (answer && delivered?.has(input.threadId)) return;
         return yield* locks.outside(
-          threadIo
-            .send({
+          touching(
+            input.threadId,
+            threadIo.send({
               ...input,
               ...(key === undefined
                 ? {}
                 : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
-            })
-            .pipe(
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  if (answer) delivered?.add(input.threadId);
-                }),
-              ),
+            }),
+          ).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                if (answer) delivered?.add(input.threadId);
+              }),
             ),
+          ),
         );
       }),
-    setModel: (id, model) => locks.outside(threadIo.setModel(id, model)),
-    interrupt: (id, reason) => locks.outside(threadIo.interrupt(id, reason)),
+    setModel: (id, model) => locks.outside(touching(id, threadIo.setModel(id, model))),
+    interrupt: (id, reason) => locks.outside(touching(id, threadIo.interrupt(id, reason))),
   };
   const modelIo = yield* KanbanModels;
   const models = { ...modelIo, listed: locks.outside(modelIo.listed, undefined, true) };
@@ -3855,7 +3876,7 @@ const make = Effect.gen(function* () {
       const reused = threadId;
       const key = wakeKey(reused, `${card.id}:${at}`);
       yield* locks.outside(
-        threadIo.send({ threadId: reused, text, model: dispatch.model, key }),
+        touching(reused, threadIo.send({ threadId: reused, text, model: dispatch.model, key })),
         () =>
           threadIo
             .send({

@@ -12,6 +12,7 @@ import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
 import {
   KanbanService,
   OwnerRouteMode,
+  ReplayReads,
   layer as KanbanServiceLayer,
 } from "./engine/KanbanService.ts";
 import { layer as KanbanModelsLayer } from "./engine/models.ts";
@@ -49,6 +50,18 @@ const ownerRouteModeLayer = Layer.effect(
     );
     return inline ? "inline" : "deferred";
   }).pipe(Effect.orElseSucceed((): OwnerRouteMode => "deferred")),
+);
+
+/**
+ * A stale rerun of a board operation reuses the thread reads its earlier
+ * attempt made (see `outsideRead`). `ROBOB_KANBAN_REPLAY_READS=0` reads again.
+ */
+const replayReadsLayer = Layer.effect(
+  ReplayReads,
+  Config.Boolean("ROBOB_KANBAN_REPLAY_READS").pipe(
+    Config.withDefault(true),
+    Effect.orElseSucceed(() => true),
+  ),
 );
 
 /** Typing heartbeat, review completion and the dispatcher's safety net. */
@@ -111,7 +124,10 @@ export const ArdudKanbanLive = Layer.effectDiscard(
   }),
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
-  Layer.provideMerge(KanbanServiceLayer.pipe(Layer.provide(ownerRouteModeLayer))),
+  Layer.provideMerge(KanbanServiceLayer.pipe(
+      Layer.provide(ownerRouteModeLayer),
+      Layer.provide(replayReadsLayer),
+    )),
   Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),
