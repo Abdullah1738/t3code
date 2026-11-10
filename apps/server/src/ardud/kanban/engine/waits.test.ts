@@ -467,7 +467,12 @@ describe("checkWait", () => {
     pr: PR,
     ...patch,
   });
-  const reason = (target: KanbanCard, req: WaitRequest, actor = evaluator, wired = false) => {
+  const reason = (
+    target: KanbanCard,
+    req: WaitRequest,
+    actor: KanbanActor = evaluator,
+    wired = false,
+  ) => {
     const check = checkWait(target, req, actor, NOW, wired);
     return check.ok ? "ok" : `${check.code}: ${check.reason}`;
   };

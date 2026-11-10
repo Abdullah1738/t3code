@@ -68,12 +68,14 @@ export function guessWait(text: string | null | undefined): WaitGuess | null {
     cardNumber,
     from: cut(text),
   });
-  if (CI.test(text)) return guess("ci");
+  // "Dependency hold, not a CI wait: ..." names CI only to rule it out.
+  if (CI.test(text.replace(/\bnot (?:a |an )?CI\b[^.;:,\n]*/gi, ""))) return guess("ci");
   if (PUSH.test(text)) return guess("push");
   const card = CARD.exec(text);
   if (card?.[1]) return guess("card", Number(card[1]));
-  if (MERGE.test(text)) return guess("merge");
+  // Before merge: "held for the owner's go on the merge" waits on him, not on the PR.
   if (OWNER.test(text)) return guess("owner_go");
+  if (MERGE.test(text)) return guess("merge");
   if (PERSON.test(text)) return guess("push");
   if (TIME.test(text)) return guess("time");
   return null;
