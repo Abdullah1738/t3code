@@ -127,6 +127,26 @@ export const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(filesLayer),
   );
 
+/**
+ * The same service over a database file, so a test can stop one service and
+ * start another on what it left behind. `store` stands in for the board store.
+ */
+export const fileTestLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  dbPath: string,
+  store: Layer.Layer<KanbanStore.KanbanStore, never, SqlClient.SqlClient> = KanbanStore.layer,
+) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(store),
+    Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(filesLayer),
+  );
+
 export const toyBoard = (slug = "toy") =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
