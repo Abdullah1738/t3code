@@ -17,6 +17,7 @@ code here, test here, then sync it over.
 | `catalog-guard` | `~/.local/share/catalog-guard` | `com.ardud.catalog-guard` (repairs a partial OpenCode model catalog, every 150s) |
 | `message-archive` | `~/.local/share/message-archive` | `com.ardud.message-archive` (local mail mirror + `msgs` search over email, iMessage, WhatsApp) |
 | `offbox` | `~/.config/opencode/skills/remote-compute` + gate plugin, `~/.local/bin/{offbox,boat}` | `com.ardud.offbox-monitor` (boat.dev offload gate, monitor and reaper; deploy via `offbox/install.zsh`) |
+| `opencode-plugins` | `~/.config/opencode/{plugin,lib}` | none (Code Mode guard; install via `opencode-plugins/install.zsh`, then owner-approved OpenCode restart) |
 | `local-helpers` | `~/.local/libexec/{mail,card-preview,qcard}`, `~/.local/bin/{himalaya-heal,mailsearch,qcard}` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh` (mail OAuth heal, OTP watcher, card helpers; deploy via `local-helpers/install.zsh`) |
 | `tail-gateway` | `~/.local/share/tail-gateway`, `~/.local/bin/tailname` | `com.ardud.tail-gateway-{node,dns,proxy}` (friendly `https://<name>.tail` names for local services, tailnet only; deploy via `tail-gateway/install.zsh`) |
 | `robob-cards` | none (runs from the repo; builds and enrollments in `~/.local/share/robob-cards`) | none (iMessage card app; `bin/robob-cards-build`, `bin/robob-cards-enroll`) |

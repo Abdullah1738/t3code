@@ -1,6 +1,7 @@
 """Resume retries and pool failover, with a fake boat and clock."""
 import contextlib
 import io
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -19,8 +20,11 @@ class Clock:
     def time(self):
         return self.t
 
+    def monotonic(self):
+        return self.t
+
     def sleep(self, seconds):
-        self.t += seconds
+        self.t += max(seconds, 0.000001)
 
 
 class ResumeStuckTests(Isolated):
@@ -29,6 +33,7 @@ class ResumeStuckTests(Isolated):
         self.clock = Clock()
         self.resumes = []
         self.stack.enter_context(patch.object(api, 'time', self.clock))
+        self.stack.enter_context(patch.object(lease, 'time', self.clock))
         self.stack.enter_context(patch.object(lease, 'now', self.clock.time))
         self.stack.enter_context(patch.object(api, 'resume', side_effect=self.resume))
         self.stack.enter_context(patch.object(lease.ssh_sync, 'setup'))
@@ -64,6 +69,94 @@ class ResumeStuckTests(Isolated):
         self.assertGreaterEqual(self.resumes[1][3] - self.resumes[0][3], lease.RESUME_STUCK_S)
         self.assertEqual(len(self.events('cold', 'resume_resent')), 1)
         self.assertEqual(len(self.events('cold', 'resume_stuck')), 0)
+
+    def test_bare_502_on_archived_retry_caps_provisioning_then_creates_first(self):
+        self.box('cold', 'stopped', used=200, member=True)
+        self.box('sibling', 'stopped', used=100, member=True)
+        new = {'box_id': 'new', 'state': 'running', 'size': 'large', 'source': 'fresh'}
+
+        def resume(box_id, ttl, size=None):
+            self.resume(box_id, ttl, size)
+            if len(self.resumes) == 2:
+                raise api.ApiError(502, 'http_502', '')
+            return {}
+
+        def get(box_id, **kwargs):
+            if kwargs:
+                self.assertIsNotNone(self.con.execute(
+                    "SELECT v FROM kv WHERE k='resume_unanswered:cold'").fetchone())
+            return self.state(box_id, 'provisioning' if len(self.resumes) >= 2 else 'archived')
+
+        with patch.dict(os.environ, {'OFFBOX_RESUME_PROVISION_SECONDS': '4'}), \
+                patch.object(api, 'resume', side_effect=resume), patch.object(api, 'get', side_effect=get), \
+                patch.object(lease, 'acquire_private', return_value=new) as create, \
+                patch.object(api, 'delete') as delete:
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'new')
+            self.assertEqual([r[0] for r in self.resumes], ['cold', 'cold'])
+            self.assertAlmostEqual(self.clock.t - self.resumes[1][3], 4)
+            self.assertFalse(create.call_args.args[4])
+            self.assertEqual(self.row('cold')['state'], 'resume_stalled')
+            self.assertEqual(self.row('sibling')['state'], 'resume_stalled')
+            delete.assert_not_called()
+        finally:
+            pool.release_guard(got)
+
+    def test_unanswered_stopped_confirmation_spends_the_archived_retry(self):
+        self.box('cold', 'stopped', member=True)
+        new = {'box_id': 'new', 'state': 'running', 'size': 'large', 'source': 'fresh'}
+
+        def resume(box_id, ttl, size=None):
+            self.resume(box_id, ttl, size)
+            if len(self.resumes) == 1:
+                raise api.NetworkError('read timed out')
+            return {}
+
+        with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS': '4'}), \
+                patch.object(api, 'resume', side_effect=resume), \
+                patch.object(api, 'get', side_effect=lambda bid, **kw: self.state(bid, 'archived')), \
+                patch.object(lease, 'acquire_private', return_value=new):
+            got = pool.acquire(self.me)
+        try:
+            self.assertEqual(got['box_id'], 'new')
+            self.assertEqual(len(self.resumes), 2)
+            self.assertEqual(len(self.events('cold', 'resume_stuck')), 1)
+        finally:
+            pool.release_guard(got)
+
+    def test_unanswered_archived_retry_still_stopped_never_sends_third(self):
+        self.box('cold', 'stopped', member=True)
+
+        def resume(box_id, ttl, size=None):
+            self.resume(box_id, ttl, size)
+            if len(self.resumes) == 2:
+                raise api.NetworkError('read timed out')
+            return {}
+
+        with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS': '4'}), \
+                patch.object(api, 'resume', side_effect=resume), \
+                patch.object(api, 'get', side_effect=lambda bid, **kw: self.state(bid, 'archived')), \
+                patch.object(lease, 'acquire_private') as create:
+            with self.assertRaises(lease.ResumeUnresolved):
+                pool.acquire(self.me)
+        self.assertEqual(len(self.resumes), 2)
+        self.assertIsNotNone(self.con.execute("SELECT v FROM kv WHERE k='resume_unanswered:cold'").fetchone())
+        create.assert_not_called()
+
+    def test_busy_queue_does_not_retry_archived_box_again_in_same_invocation(self):
+        self.box('cold', 'stopped', member=True)
+        self.box('busy', 'running', member=True)
+        self.busy('busy')
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '190'}), \
+                patch.object(pool, 'time', self.clock), patch.object(pool, '_refresh_background'), \
+                patch.object(api, 'get', side_effect=lambda bid: self.state(bid, 'archived')), \
+                patch.object(lease, 'acquire_private') as create:
+            with self.assertRaises(pool.PoolBusyError):
+                pool.acquire(self.me)
+        self.assertEqual(len(self.resumes), 2)
+        self.assertGreaterEqual(self.clock.t - self.resumes[0][3], 190)
+        create.assert_not_called()
 
     def test_stuck_pool_box_is_skipped_and_next_stopped_box_used(self):
         self.box('stuck', 'stopped', used=200, member=True)

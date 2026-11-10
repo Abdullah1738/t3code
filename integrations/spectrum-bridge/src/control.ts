@@ -44,6 +44,7 @@ export interface RunSummary {
   runId: string;
   ordinal: number;
   status: string;
+  model?: ThreadSummary["model"];
   requestedAt?: string | null;
   startedAt?: string | null;
   completedAt?: string | null;

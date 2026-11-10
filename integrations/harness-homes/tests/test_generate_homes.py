@@ -608,7 +608,8 @@ class GenerateTests(HarnessTestCase):
                 self.assertIn("/codex.py", group["hooks"][0]["command"])
         for groups in (claude_hooks["PreToolUse"], codex_hooks["PreToolUse"]):
             patterns = [re.compile(group["matcher"]) for group in groups]
-            for tool in ("Bash", "bash", "shell", "exec_command", "shell_command", "mcp__betterstack__monitor", "mcp__example__exec_command",
+            for tool in ("Bash", "bash", "shell", "exec_command", "shell_command",
+                         "mcp__betterstack__monitor", "mcp__example__exec_command",
                          "mcp__example__shell_command", "mcp__example__shell", "mcp__example__bash"):
                 self.assertTrue(any(pattern.fullmatch(tool) for pattern in patterns), tool)
             self.assertFalse(any(pattern.fullmatch("mcp__example__apply_patch") for pattern in patterns))

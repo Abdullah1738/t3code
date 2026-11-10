@@ -75,6 +75,10 @@ offbox local --reason "xcode UI test needs the local simulator stack" --ttl 1h
 offbox local --list ; offbox local --clear
 ```
 
+A Claude Code subagent (in-process child) shares its parent's session id, so its exemption and its `--clear`
+cover its own Robob thread only, never the parent's or a sibling's. An inherited `OFFBOX_THREAD` only counts for such
+a child when it names the child itself.
+
 The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.*) that carry an agent's session id from the shell that opened them; reopen apps with a clean env anyway.
 
 ## Your box (lease)
@@ -88,9 +92,11 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 - A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
   Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–8) and
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
-- Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if the box ran Docker in the last 2 h
-  or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
-  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). A resume takes ~6-10 s. The next run resumes it with everything
+- Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if a run on the box started a container in
+  the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
+  counts) or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
+  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). When a run's client dies,
+  the reaper brings the box back to its idle window instead of the 30-min run ttl. A resume takes ~6-10 s. The next run resumes it with everything
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
@@ -108,14 +114,18 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 - Type-check runs (tsc, tsc-rs, `vp run typecheck`) in JS/TS repos get xlarge by default; large boxes run out of memory on the Robob server typecheck.
 - Other automatic xlarge (no `--size` given; offbox says why): compose/LocalStack/testcontainers in the command,
   any run in a `*harness*` repo, a whole suite (`./...`, `make test`, bare `pytest`) in a repo whose manifests use
-  testcontainers, and any run in a repo that had an exit 137 on a smaller box in the last 14 days. Everything else
+  testcontainers. An exit 137 bumps later runs of the same kind (pytest, vitest, tsc, `make test`...) in that repo one
+  size up from the box it was killed on, for 3 days; other commands in the repo keep their size. Everything else
   runs at the template/base size (large; generic default). Real per-job peak is ~12 GB, which large (16 GB) holds.
 - Sizes: `small` 2 vCPU/4 GB, `default` 4/8, `large` 8/16, `xlarge` 16/32. Growing an idle pooled box requires
   a start allowance (stop + resume). Use xlarge only for big Docker stacks. Don't pass `--size` for ordinary runs:
-  the template/base size is right. A pooled box grown for one xlarge run goes back to its natural size (template
+  the template/base size is right. `--size xlarge` is kept for Docker commands, type-checks, the harness repo and whole
+  test suites in a testcontainers/compose repo; anything else (incl. one named test or file) with no same-kind OOM
+  behind it runs on large and says so (5 Nov: 1,054 hand-picked xlarge runs, mostly uv sync + pytest and narrow go tests);
+  `OFFBOX_ALLOW_XLARGE=1` forces it. A pooled box grown for one xlarge run goes back to its natural size (template
   or base size, at least large; generic stays default) the next time it resumes. While starts are plentiful an
-  oversized running box is skipped for a stopped one so it can stop on its short timer, except the box you used
-  last. A live box is never stopped just to shrink it, and a shrink boat refuses resumes at the old size.
+  oversized running box is skipped for a stopped one so it can stop on its short timer; a grown xlarge box is
+  skipped even when it is the one you used last (5,448 ordinary runs rode grown xlarge boxes, 13 Oct - 5 Nov). A live box is never stopped just to shrink it, and a shrink boat refuses resumes at the old size.
   A stopped box whose disk has outgrown its size (boat 409 "needs N GiB of disk") is skipped and marked too big: it
   stays stopped with its disk, stops counting toward the pool, and the run moves on to another pool box or a fresh
   lease. `offbox list` shows it; `offbox release <id> --delete` removes it.
@@ -163,6 +173,23 @@ then sends HEAD alone as a one-commit shallow `.git` and says so in one line. If
 UIs/dashboards on the box: `offbox ports 3000` opens `http://127.0.0.1:3000` on the Mac via an SSH tunnel
 (`--local 13000` to pick the local port). `offbox ports 1055 --local 8080 --reverse` goes the other way: the Mac's
 `127.0.0.1:8080` shows up on the box at `127.0.0.1:1055` (e.g. a Mac-side proxy). Interactive shell or one-off command: `offbox ssh` / `offbox ssh -- 'docker ps'`.
+
+## Repo toolchains
+
+The `usdtwallet-android` repo recipe installs JDK 17, Android command-line tools, SDK platforms 37.1 and 36,
+build-tools 36.0.0, platform-tools, NDK 26.3.11579264, and gomobile/gobind pinned to `core/go.mod`.
+Offbox sets `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME` and `PATH` for you: no export
+prefix is needed. Setup is locked per box and skipped after success; recipe or x/mobile version changes rerun it.
+Boxes the pool grows into (including through `OFFBOX_POOL_SIZE`) or resumes start with whatever they had and
+get the toolchain on their first run.
+
+`android/app/libs/` AARs aren't synced, so every Android run starts with `./scripts/build-core.sh` before Gradle.
+Run Gradle online (no `--offline`): every box has its own Gradle cache, and an offline run can miss dependencies.
+JDK 25 for the wallet's unit tests is resolved by Gradle's existing toolchain resolver.
+
+To add another repo, add `templates/repos/<repo_key>.sh`. The recipe gets `OFFBOX_REPO_ROOT` pointing to the
+synced root and must write `~/.offbox/repo-env/<repo_key>.sh`. A failed setup stops before your command and
+returns infra exit 90 (internal exit 98); its log is `~/.offbox/repo-setup-<repo_key>.log` on the box.
 
 ## Save state for later (do this!)
 
@@ -236,6 +263,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   fall back locally don't wait. A run that already started keeps reattaching for up to 30 min of outage and keeps its
   box's auto-stop extended, so it survives an outage of about 25 minutes. `offbox status` answers within ~25 s and
   shows `boat.dev: DOWN since ...` during one.
+- A resume with no answer is checked on the box; 503 out_of_capacity and 409 resume_failed / deploy_failed at capacity are waited out like a boat.dev outage.
 - No fallback after a remote command may have started, including a lost start response. No local `--bg` fallback.
   A start boat rejects outright (HTTP 4xx) counts as not started: you get 90 at once instead of a run stuck "lost"
   for an hour. `E2BIG` (huge inline command, e.g. `"$(cat big.sh)"`) returns 2: put it in a script file in the

@@ -132,9 +132,10 @@ def candidates(con, key, size, source, me=None):
             continue
         out.append(r)
     # Running boxes first: the caller's own box (its checkout is already synced there), then the smallest that
-    # fits. A running box bigger than this run needs (grown by an earlier --size run) goes after a stopped box
-    # while starts are plentiful: the stopped one resumes at the right size and the big one stops on its short
-    # idle timer.
+    # fits. A running xlarge box this run doesn't need (grown for an earlier run) goes after a stopped box while
+    # starts are plentiful, even when it is the caller's own: the stopped one resumes at the right size and the big
+    # one stops on its short idle timer. 13 Oct - 5 Nov, 5,448 ordinary runs went to the caller's own grown xlarge
+    # box. Only xlarge: a large box over a generic (default) box's size costs less than the resume.
     from . import lease
     rank = {n: i for i, n in enumerate(SIZES)}
     want = rank.get(size or "", 0)
@@ -151,7 +152,8 @@ def candidates(con, key, size, source, me=None):
         own = 0 if r["box_id"] in mine else 1
         if have < want:
             return (0, 2, have)  # needs a grow
-        if plentiful and own and have > max(want, rank.get(lease.natural_size(con, r), 1)):
+        oversized = have > max(want, rank.get(lease.natural_size(con, r), 1))
+        if plentiful and oversized and (own or r["size"] == "xlarge"):
             return (2, 0, have)
         return (0, own, have)
     out.sort(key=fit)
@@ -159,40 +161,95 @@ def candidates(con, key, size, source, me=None):
 
 
 def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None):
+    from . import allocation
     con = db()
     try:
-        return _acquire(con, me, size, template, base, fresh, run_id)
+        with allocation.scope(me['repo_key']):
+            return _acquire(con, me, size, template, base, fresh, run_id)
     finally:
         con.close()
 
 
 def _acquire(con, me, size, template, base, fresh, run_id):
-    from . import api, lease
+    from . import allocation, api, lease, outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
     lease.cap_check()
     capacity.schema(con)
     key = me["repo_key"]
+    allocation.recover_resumes(con, key)
     source = ("fresh" if fresh else f"base:{base if ':' in base else key+':'+base}" if base else
               f"template:{template}" if template else None)
     wait = wait_seconds()
+    allocation_left = outage.allocation_left()
+    if allocation_left is not None:
+        wait = min(wait, allocation_left)
     started = time.monotonic()
     deadline = started + wait
     said, last_error = False, None
     next_refresh = 0
     next_progress = 0
+    create_first = False
+    resume_stall = None
+    resume_stuck = set()
+    pending_retries = set()
     while True:
         lease.cap_check()
+        pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+                              "WHERE l.repo_key=? AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+        if create_first:
+            pending = None
+        if pending:
+            bid = pending["box_id"]
+            guard = file_lock("box-" + bid, timeout=0)
+            guard.__enter__()
+            try:
+                pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+                                      "WHERE l.box_id=? AND l.state IN ('running','stopped')", (bid,)).fetchone()
+                if not pending:
+                    guard.__exit__(None, None, None)
+                    continue
+                if lease.active_runs(con, bid):
+                    raise lease.ResumeUnresolved(f"{bid} has an active run and an unanswered resume; nothing ran")
+                try:
+                    got = lease._reuse(con, pending, size, skip_archiving=True)
+                except lease.ResumeStopped as e:
+                    pending_retries.add(bid)
+                    guard.__exit__(None, None, None)
+                    say(str(e))
+                    continue
+                except lease.ResumeProvisionStalled as e:
+                    con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
+                    con.commit()
+                    resume_stall, create_first = e, True
+                    guard.__exit__(None, None, None)
+                    say(str(e))
+                    continue
+                if got is None:
+                    guard.__exit__(None, None, None)
+                    continue
+                if source and (pending["source"] or "").replace("recipe:", "template:", 1) != source:
+                    raise lease.ResumeUnresolved(f"{bid} had an unanswered resume; it was checked, "
+                                                 "retry the requested source")
+                _claim(con, me, got, run_id)
+                # Transfer guard ownership to the caller.
+                got["_guard"] = guard
+                return got
+            except BaseException:
+                guard.__exit__(None, None, None)
+                raise
         # Only the latest pass decides whether a timeout was a start limit (90) or plain busy (92).
         last_error = None
         if time.monotonic() >= next_refresh:
             # Outside the pool lock: it asks boat about every detached run.
             _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
-        tried = set()
+        tried = set(resume_stuck)
         stopped_tries = 0
         stopped_error = None
+        capacity_outage = None
+        start_limit = None
         stopped_failed = False  # the last stopped box tried could not be used (error or gone)
         while True:
             # The pool lock covers only the choice: a box (its box lock taken without waiting) or a create slot.
@@ -201,6 +258,26 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             row = guard = token = None
             with _pool_lock(key, deadline, wait):
                 rows, can_create = candidates(con, key, size, source, me)
+                if create_first:
+                    # Retain unanswered markers on excluded boxes, without letting them block a replacement.
+                    siblings, _ = candidates(con, key, None, None, me)
+                    for sibling in siblings:
+                        pending_sibling = con.execute("SELECT 1 FROM kv WHERE k=?",
+                                                     (f"resume_unanswered:{sibling['box_id']}",)).fetchone()
+                        if sibling['state'] == 'stopped' or pending_sibling:
+                            con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
+                                        ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
+                    con.commit()
+                    rows, can_create = [], True
+                pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
+                                      "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
+                                      "AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+                if pending:
+                    raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
+                                                 "retry once it has been checked; nothing ran")
+                if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
+                    # Replaying the retained key resolves the old allocation; it is not a new pool slot.
+                    rows, can_create = [], True
                 if source and not rows and not can_create and not _source_member(con, key, source):
                     busy, cap, _ = queue_state(con, key, run_id)
                     raise OffboxError(
@@ -212,9 +289,8 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     if r["box_id"] in tried:
                         continue
                     if r['state'] != 'running':
-                        # One resume per pass, a second only after the first stopped box failed to come up;
-                        # later running rows may still be free either way.
-                        if stopped_tries >= 2 or (stopped_tries == 1 and not stopped_failed):
+                        # After a failed resume, try every eligible stopped box before creating a new one.
+                        if stopped_tries == 1 and not stopped_failed:
                             continue
                         # boat has no machines of the size this box would resume at: not a try, nothing to wait on.
                         fit_size = lease.resume_size(con, r, size)
@@ -225,6 +301,9 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         try:
                             capacity.check(con)
                         except capacity.CapacityError as e:
+                            if capacity_outage is not None:
+                                raise
+                            start_limit = e
                             last_error = e
                             continue
                     g = file_lock("box-"+r["box_id"], timeout=0)
@@ -240,6 +319,10 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (r["box_id"], key))
                     con.commit()
                     break
+                if outage.allocation_left() == 0:
+                    if guard is not None:
+                        guard.__exit__(None, None, None)
+                    raise PoolBusyError("allocation wait expired; nothing ran")
                 if row is None and can_create:
                     try:
                         capacity.check(con)
@@ -248,6 +331,9 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                                     (token, key, os.getpid(), now(), source))
                         con.commit()
                     except capacity.CapacityError as e:
+                        if capacity_outage is not None:
+                            raise
+                        start_limit = e
                         last_error = e
             if row is not None:
                 tried.add(row["box_id"])
@@ -261,7 +347,24 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                             capacity.check(con)
                         if row['state'] != 'running':
                             stopped_tries += 1
-                        got = lease._reuse(con, row, size, skip_archiving=True)
+                        options = {'retrying': True} if row['box_id'] in pending_retries else {}
+                        got = lease._reuse(con, row, size, skip_archiving=True, **options)
+                    except lease.ResumeProvisionStalled as e:
+                        con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
+                                    (str(e), row['box_id']))
+                        con.commit()
+                        resume_stall = e
+                        create_first = True
+                        say(str(e))
+                        continue
+                    except (lease.ResumeUnresolved, allocation.Unresolved):
+                        # Do not create another machine while this resume may still have been accepted.
+                        raise
+                    except api.BoatAtCapacity as e:
+                        # Try every other eligible stopped box, but keep this one in the pool for the next round.
+                        capacity_outage = e
+                        stopped_failed = True
+                        continue
                     except api.SupplyOut as e:
                         # This box's size is out: the next member gets its turn in this pass.
                         if row['state'] != 'running':
@@ -272,10 +375,11 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         last_error = e
                         say(f"skipping {row['box_id']}: {e}. Trying other pool boxes")
                         continue
-                    except capacity.CapacityError as e:
-                        last_error = e
-                        continue
+                    except capacity.CapacityError:
+                        raise
                     except lease.ArchivingSkip as e:
+                        if isinstance(e, lease.ResumeStuck):
+                            resume_stuck.add(row['box_id'])
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':
@@ -317,8 +421,16 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     try:
                         got = creator(shared, size, template, base, fresh)
                     except capacity.CapacityError as e:
+                        if resume_stall is not None:
+                            e.args = (f"{e} Earlier cause: {resume_stall}",)
+                        if not isinstance(e, (api.SupplyOut, api.BoatAtCapacity)):
+                            raise
                         last_error = e
                         break
+                    except OffboxError as e:
+                        if resume_stall is not None:
+                            raise OffboxError(f"{resume_stall}. Replacement allocation failed: {e}; nothing ran") from e
+                        raise
                     # acquire_private hands over the box lock it took before the row existed.
                     guard = got.pop("_guard", None)
                     if guard is None:
@@ -342,17 +454,25 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         # Failed create: removing the slot only lowers the count, so no lock is needed.
                         con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
                         con.commit()
+            if capacity_outage is not None:
+                raise capacity_outage
+            if start_limit is not None:
+                raise start_limit
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
         t = time.monotonic()
+        if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
+            raise last_error
         if t >= deadline:
             if last_error:
-                raise capacity.CapacityError(str(last_error))
+                raise last_error
             busy, cap, waiting = queue_state(con, key, run_id)
             raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} boxes stayed busy for "
                                 f"{int(t-started)}s; remote queue timed out. Nothing ran (exit {EXIT_BUSY}, not an "
                                 f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})")
+        if isinstance(last_error, api.BoatAtCapacity):
+            raise last_error
         if t >= next_progress:
             busy, cap, waiting = queue_state(con, key, run_id)
             if not said:
@@ -391,6 +511,10 @@ def _refresh_background(con, key):
             with file_lock('box-'+row['box_id'], timeout=0):
                 st = api.cmd_status(row['box_id'], row['process_id'])
                 if st and not st.get('running') and st.get('status') == 'exited':
+                    if (st.get('exitCode') == runs.EXIT_REPO_SETUP
+                            and runs.REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
+                        runs.finish(row['run_id'], EXIT_INFRA, 'infra')
+                        continue
                     import json
                     pulls = json.loads(row['pulls'] or '[]')
                     if pulls:

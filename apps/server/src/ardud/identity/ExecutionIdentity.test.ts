@@ -1,9 +1,27 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import {
+  EventId,
+  ThreadId,
+  ProjectId,
+  ProviderInstanceId,
+  ProviderDriverKind,
+  ProviderThreadId,
+  ProviderSessionId,
+} from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ExecutionIdentity from "./ExecutionIdentity.ts";
 
@@ -458,6 +476,324 @@ const runStaleOnly = <A, E>(body: Effect.Effect<A, E, ExecutionIdentity.Executio
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("ExecutionIdentity", () => {
+  it.live.each(["resumed", "fresh", "adopted"] as const)(
+    "resolves a %s Codex thread while a shell snapshot holds the reader",
+    (scenario) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-identity-reader-" });
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const identity = yield* ExecutionIdentity.ExecutionIdentity;
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const threadId = "thread:reader-test";
+          const providerId = "provider-thread:reader-test";
+          const oldNative = "11111111-2222-7333-8444-555555555555";
+          const nativeId = "22222222-2222-7333-8444-555555555555";
+          const unknownId = "33333333-2222-7333-8444-555555555555";
+          yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
+            thread(threadId, providerId, { parentThreadId: null, rootThreadId: threadId }),
+          )}`;
+          const initial = provider(
+            providerId,
+            threadId,
+            "codex",
+            scenario === "resumed" ? oldNative : null,
+            now,
+          );
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(initial)}`;
+          if (scenario === "adopted") {
+            yield* sql`INSERT INTO ardud_opencode_import ${sql.insert({
+              native_session_id: "ses_reader_import",
+              thread_id: threadId,
+              imported_at: now,
+            })}`;
+            yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+              provider("provider-thread:source", threadId, "opencode", "ses_reader_import", now),
+            )}`;
+          }
+
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const snapshot = yield* Effect.forkChild(
+            sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`SELECT payload_json FROM orchestration_v2_projection_provider_threads`;
+                  yield* Deferred.succeed(held, undefined);
+                  yield* Deferred.await(release);
+                }),
+              )
+              .pipe(NodeSqliteClient.readOnly),
+          );
+          yield* Deferred.await(held);
+          yield* Effect.gen(function* () {
+            if (scenario !== "resumed") {
+              const pending = yield* identity.resolve({ nativeId, driver: "codex" });
+              assert.strictEqual(pending.resolution, "pending");
+              assert.strictEqual(pending.robobThreadId, null);
+            }
+            // Commit the startup/native replacement while the other reader still
+            // pins its old view. Identity must see this commit before tools run.
+            const mapped = provider(providerId, threadId, "codex", nativeId, now);
+            yield* sql`UPDATE orchestration_v2_projection_provider_threads
+              SET payload_json = ${mapped.payload_json} WHERE provider_thread_id = ${providerId}`;
+            const resolved = yield* identity.resolve({ nativeId, driver: "codex" });
+            assert.strictEqual(resolved.resolution, "resolved");
+            assert.strictEqual(resolved.robobThreadId, threadId);
+            assert.strictEqual(resolved.executionKind, "top-level");
+            const unknown = yield* identity.resolve({ nativeId: unknownId, driver: "codex" });
+            assert.strictEqual(unknown.resolution, "unavailable");
+            assert.strictEqual(unknown.robobThreadId, null);
+            if (scenario === "adopted") {
+              const imported = yield* identity.resolve({
+                nativeId: "ses_reader_import",
+                driver: "opencode",
+              });
+              assert.strictEqual(imported.robobThreadId, threadId);
+            }
+          }).pipe(
+            Effect.timeout("2 seconds"),
+            Effect.ensuring(Deferred.succeed(release, undefined)),
+          );
+          yield* Fiber.join(snapshot);
+        }).pipe(
+          Effect.provide(
+            ExecutionIdentity.layer.pipe(
+              Layer.provideMerge(Sqlite.layerFromPath(path.join(directory, "state.sqlite"))),
+            ),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("resolves a started app-managed Codex child while the SQLite writer is held", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-identity-startup-" });
+      yield* Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const identity = yield* ExecutionIdentity.ExecutionIdentity;
+        const now = yield* DateTime.now;
+        const parentId = ThreadId.make("thread:parent-startup");
+        const childId = ThreadId.make("thread:delegated-task:startup");
+        const instance = ProviderInstanceId.make("codex");
+        const driver = ProviderDriverKind.make("codex");
+        const providerId = ProviderThreadId.make("provider-thread:startup");
+        const nativeId = "11111111-2222-7333-8444-555555555555";
+        // delegate_task creates a child and a provider placeholder. Its app-owned
+        // roster entry has no providerThreadId until completion; resolution must
+        // already work through the child's own startup mapping.
+        yield* store.apply({
+          id: EventId.make("event:child-created"),
+          type: "thread.created",
+          threadId: childId,
+          occurredAt: now,
+          payload: {
+            id: childId,
+            createdBy: "agent",
+            creationSource: "mcp",
+            projectId: ProjectId.make("project"),
+            title: "Delegated startup",
+            providerInstanceId: instance,
+            modelSelection: { instanceId: instance, model: "gpt-6.1-sol" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId: parentId,
+              rootThreadId: parentId,
+              relationshipToParent: "subagent",
+            },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        });
+        const placeholder = {
+          id: providerId,
+          driver,
+          providerInstanceId: instance,
+          providerSessionId: ProviderSessionId.make("provider-session:startup"),
+          appThreadId: childId,
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          status: "not_loaded" as const,
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        yield* store.apply({
+          id: EventId.make("event:placeholder"),
+          type: "provider-thread.updated",
+          threadId: childId,
+          occurredAt: now,
+          payload: placeholder,
+        });
+        assert.strictEqual((yield* identity.resolve({ nativeId, driver })).resolution, "pending");
+        // ProviderTurnStartService writes this before session.startTurn, in the
+        // same transaction as run.updated and run-attempt.updated. No model
+        // output or terminal/completion event is needed to publish the native id.
+        yield* store.apply({
+          id: EventId.make("event:startup-mapping"),
+          type: "provider-thread.updated",
+          threadId: childId,
+          driver,
+          providerInstanceId: instance,
+          occurredAt: now,
+          payload: {
+            ...placeholder,
+            status: "active",
+            nativeThreadRef: { driver, nativeId, strength: "strong" },
+          },
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const writerHeld = yield* Deferred.make<void>();
+        const releaseWriter = yield* Deferred.make<void>();
+        const writer = yield* Effect.forkChild(
+          sql.withTransaction(
+            Deferred.succeed(writerHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseWriter)),
+            ),
+          ),
+        );
+        yield* Deferred.await(writerHeld);
+        const result = yield* identity
+          .resolve({ nativeId, driver })
+          .pipe(
+            Effect.timeout("2 seconds"),
+            Effect.ensuring(Deferred.succeed(releaseWriter, undefined)),
+          );
+        yield* Fiber.join(writer);
+        assert.strictEqual(result.resolution, "resolved");
+        assert.strictEqual(result.robobThreadId, childId);
+        assert.strictEqual(result.executionKind, "app-managed-child");
+        assert.strictEqual(result.parentThreadId, parentId);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(ExecutionIdentity.layer, ProjectionStore.layer).pipe(
+            Layer.provideMerge(Sqlite.layerFromPath(path.join(directory, "state.sqlite"))),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "indexes native-id and pending-provider queries on an existing database idempotently",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(
+            thread("t-index", "pt-index", { parentThreadId: null, rootThreadId: "t-index" }),
+          )}`;
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert(
+            provider("pt-index", "t-index", "codex", "native-index", CLOCK_NOW),
+          )}`;
+
+          const nativePlan = sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN
+          SELECT pt.provider_thread_id, pt.thread_id,
+            COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) AS driver,
+            COALESCE(pt.provider_instance_id, json_extract(pt.payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+            pt.updated_at,
+            CASE WHEN t.active_provider_thread_id = pt.provider_thread_id THEN 1 ELSE 0 END AS active
+          FROM orchestration_v2_projection_provider_threads pt
+          LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = pt.thread_id
+          WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${"native-index"}
+        `;
+          const pendingPlan = sql<{ readonly detail: string }>`
+          EXPLAIN QUERY PLAN
+          SELECT COALESCE(driver, json_extract(payload_json, '$.driver')) AS driver,
+            COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS provider_instance_id,
+            json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
+          FROM orchestration_v2_projection_provider_threads
+          WHERE json_extract(payload_json, '$.createdAt') >= ${CLOCK_NOW}
+        `;
+
+          assert.include(
+            (yield* nativePlan).map((row) => row.detail),
+            "SCAN pt",
+          );
+          assert.include(
+            (yield* pendingPlan).map((row) => row.detail),
+            "SCAN orchestration_v2_projection_provider_threads",
+          );
+
+          yield* Layer.build(Layer.fresh(ExecutionIdentity.layer));
+          yield* Layer.build(Layer.fresh(ExecutionIdentity.layer));
+
+          const nativeDetails = (yield* nativePlan).map((row) => row.detail).join("\n");
+          const pendingDetails = (yield* pendingPlan).map((row) => row.detail).join("\n");
+          assert.include(nativeDetails, "USING INDEX ardud_idx_provider_threads_native_id");
+          assert.notMatch(
+            nativeDetails,
+            /SCAN (?:pt|orchestration_v2_projection_provider_threads)\b/,
+          );
+          assert.include(pendingDetails, "USING INDEX ardud_idx_provider_threads_created_at");
+          assert.notMatch(pendingDetails, /SCAN orchestration_v2_projection_provider_threads\b/);
+        }),
+      ).pipe(Effect.provide(Sqlite.layerMemory)),
+  );
+
+  it.effect.each(["ardud_idx_provider_threads_native_id", "ardud_idx_provider_threads_created_at"])(
+    "warns and keeps resolving when creating %s fails",
+    (index) => {
+      const warnings: Array<unknown> = [];
+      const logger = Logger.make(({ logLevel, message }) => {
+        if (logLevel === "Warn") warnings.push(message);
+      });
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          // A conflicting schema name makes CREATE INDEX fail without breaking identity reads.
+          yield* sql`CREATE TABLE ${sql(index)} (id TEXT)`;
+          yield* Effect.gen(function* () {
+            yield* seed;
+            const identity = yield* ExecutionIdentity.ExecutionIdentity;
+            assert.strictEqual(
+              (yield* identity.resolve({ nativeId: "ses_top" })).resolution,
+              "resolved",
+            );
+          }).pipe(Effect.provide(ExecutionIdentity.layer));
+          assert.lengthOf(warnings, 1);
+          const indexes = yield* sql<{ readonly name: string }>`
+            SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN (
+              'ardud_idx_provider_threads_native_id', 'ardud_idx_provider_threads_created_at'
+            )
+          `;
+          assert.lengthOf(indexes, 1);
+          assert.notStrictEqual(indexes[0]?.name, index);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.merge(Sqlite.layerMemory, Logger.layer([logger], { mergeWithExisting: false })),
+        ),
+      );
+    },
+  );
+
+  it.effect("builds without the projection table", () =>
+    Effect.scoped(Layer.build(ExecutionIdentity.layer)).pipe(
+      Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })),
+    ),
+  );
+
   it.effect("resolves a top-level OpenCode session to its thread", () =>
     run(
       Effect.gen(function* () {

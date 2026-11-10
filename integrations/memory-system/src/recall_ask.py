@@ -151,6 +151,7 @@ def gather(
     return res
 
 
+@rc.bounded(0.8)
 def build_sources(sessions: list[dict], *, budget: int, per_hit: tuple[int, int, int]) -> tuple[str, list[dict]]:
     blocks, sources, used = [], [], 0
     for s in sessions:
@@ -226,7 +227,10 @@ def _parallel_plan_and_search(
             kw["since"] = rc.parse_when(p["since"])
         except ValueError:
             pass
-    planned = gather(p["queries"], deadline=deadline, **kw) if p.get("queries") else {"sessions": [], "queries": []}
+    # Planning can outlive the first search. Give the planned query its own
+    # short SQL budget rather than an already-expired network-time deadline.
+    planned_budget = rc.Deadline(0.8) if deadline.seconds <= 0.8 else deadline
+    planned = gather(p["queries"], deadline=planned_budget, **kw) if p.get("queries") else {"sessions": [], "queries": []}
     return p, raw, planned
 
 
@@ -266,7 +270,8 @@ def ask(
     recheck_exclusions: Callable[[], set[str]] | None = None,
 ) -> dict:
     t0 = time.monotonic()
-    deadline = rc.Deadline(max(5.0, timeout - 8))
+    timeout = max(5.0, min(timeout, 30.0))
+    deadline = rc.Deadline(min(0.8, max(0.1, timeout - 3)))
     kw = dict(
         exclude=set(exclude or []),
         cwd=cwd,
@@ -276,7 +281,8 @@ def ask(
         limit_sessions=max_sources,
         cwd_only=cwd_only,
     )
-    p, raw, planned = _parallel_plan_and_search(question, inject_mode=False, context="", search_kw=kw, plan_timeout=8, deadline=deadline)
+    p, raw, planned = _parallel_plan_and_search(question, inject_mode=False, context="", search_kw=kw,
+                                               plan_timeout=min(4, timeout / 3), deadline=deadline)
     # Filter before applying the final limit so excluded late arrivals cannot
     # crowd out an otherwise valid candidate.
     sessions = merge(planned["sessions"], raw["sessions"], len(planned["sessions"]) + len(raw["sessions"]))
@@ -292,7 +298,12 @@ def ask(
             "queries": p.get("queries") or [],
             "timings": timings,
         }
-    evidence, sources = build_sources(sessions, budget=26000, per_hit=(500, 1400, 1200))
+    try:
+        evidence, sources = build_sources(sessions, budget=26000, per_hit=(500, 1400, 1200))
+    except rc.Timeout:
+        return {"answer": "Transcript excerpt budget exceeded; use recall_read with an event reference.",
+                "sources": [], "queries": p.get("queries") or [], "timings": timings}
+    rc.close_readers()
     left = timeout - (time.monotonic() - t0)
     try:
         answer = llm(

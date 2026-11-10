@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import sqlite3
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -17,6 +19,12 @@ mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
 
 TZ = mc.TZ
+
+
+def replica_meta(db):
+    db.execute('CREATE TABLE ardud_readonly_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db.executemany('INSERT INTO ardud_readonly_meta VALUES (?,?)',
+                   [('ready', '1'), ('updated_at', dt.datetime.now(dt.timezone.utc).isoformat()), ('schema_version', '1')])
 
 
 def at(text):
@@ -53,7 +61,7 @@ class Base(unittest.TestCase):
         path = self.wd / 'state.json'
         state = json.loads(path.read_text()) if path.exists() else {'fires': 0}
         state['fires'] = int(state.get('fires', 0)) + 1
-        state['last_fire_at'] = at(when).isoformat(timespec='seconds')
+        state['last_fire_at'] = at(when).astimezone(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
         path.write_text(json.dumps(state))
 
     def watcher(self, watcher_id, status, fires=1):
@@ -63,6 +71,23 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+class Moments(unittest.TestCase):
+    def test_iso_timestamps_are_normalised_to_dubai(self):
+        expected = at('2026-11-05T20:58:51.632')
+        for text in ('2026-11-05T16:58:51.632Z', '2026-11-05T16:58:51.632z',
+                     '2026-11-05T16:58:51.632+00:00', '2026-11-05T20:58:51.632+04:00',
+                     '2026-11-05T20:58:51.632'):
+            with self.subTest(text=text):
+                result = mc.moment(text)
+                self.assertEqual(result, expected)
+                self.assertEqual(result.tzinfo, TZ)
+
+    def test_invalid_timestamps_are_none(self):
+        for text in ('garbage', None, 123, '2026-11-05T16:Z58:51.632'):
+            with self.subTest(text=text):
+                self.assertIsNone(mc.moment(text))
 
 
 class Book(Base):
@@ -105,6 +130,18 @@ class Book(Base):
 
 
 class Pings(Base):
+    def test_runner_z_delivery_is_recorded_and_not_repeated_on_later_ticks(self):
+        self.case(deadline='2026-11-06')
+        self.assertIn('acme', self.check('2026-11-05T20:58:51.632', 'r1'))
+        state = json.loads((self.wd / 'state.json').read_text())
+        self.assertEqual(state['last_fire_at'], '2026-11-05T16:58:51.632Z')
+        for now, run in (('2026-11-05T21:13:51.632', 'r2'), ('2026-11-05T21:28:51.632', 'r3')):
+            with self.subTest(now=now):
+                self.assertEqual(self.check(now, run), '')
+                self.assertEqual(self.sent()['acme|r0|soon'], '2026-11-05T20:58:51+04:00')
+                self.assertNotIn('outbox', json.loads((self.wd / 'pings.json').read_text()))
+        self.assertEqual(json.loads((self.wd / 'state.json').read_text())['fires'], 1)
+
     def test_ping_once_inside_a_day_then_daily_when_overdue(self):
         self.case(deadline='2026-10-25T18:00:00+04:00')
         self.assertEqual(self.check('2026-10-24T17:00'), '')
@@ -381,8 +418,80 @@ class Pings(Base):
         with (self.wd / 'check.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             r = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
-                               env=env, capture_output=True, text=True, timeout=20)
+                               env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
         self.assertEqual((r.returncode, r.stdout), (75, ''))
+
+
+class CheckEntry(Base):
+    def test_watchdog_is_armed_and_cancelled_on_every_return(self):
+        for failure in (None, mc.CaseError('test failure')):
+            with self.subTest(failure=failure), tempfile.TemporaryFile(mode='w+') as stderr:
+                with patch.dict(os.environ, {'WATCH_DIR': str(self.wd)}), \
+                        patch.object(mc, 'LIVE', self.wd), patch.object(mc, 'DATA', self.data), \
+                        patch.object(mc, 'run_check', return_value='', side_effect=failure), \
+                        redirect_stderr(stderr), patch.object(mc.faulthandler, 'enable') as enable, \
+                        patch.object(mc.faulthandler, 'dump_traceback_later') as arm, \
+                        patch.object(mc.faulthandler, 'cancel_dump_traceback_later') as cancel:
+                    self.assertEqual(mc.main(['check']), 2 if failure else 0)
+                    self.assertTrue(stderr.line_buffering)
+                    enable.assert_called_once_with(file=stderr)
+                    arm.assert_called_once_with(mc.CHECK_BUDGET + 8, exit=True)
+                    cancel.assert_called_once_with()
+
+    def test_watchdog_dumps_and_exits_during_a_c_level_hang(self):
+        script = Path(__file__).with_name('cases.py')
+        code = ('import ctypes, runpy; '
+                f'ns = runpy.run_path({str(script)!r}); '
+                'ns["main"].__globals__["run_check"] = lambda *a: ctypes.CDLL(None).sleep(3); '
+                'raise SystemExit(ns["main"](["check"]))')
+        env = {'HOME': str(self.tmp), 'PATH': '/usr/bin:/bin', 'LANG': 'en_US.UTF-8',
+               'WATCH_DIR': str(self.wd), 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_HARD_STOP': '0.15'}
+        started = time.monotonic()
+        done = subprocess.run(['/usr/bin/python3', '-B', '-c', code], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, start_new_session=True, timeout=2)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('Timeout', done.stderr)
+        self.assertIn('<lambda>', done.stderr)
+
+    def test_check_runs_in_runner_environment_with_fake_msgs_and_temp_state(self):
+        home = self.tmp / 'home'
+        home.mkdir()
+        trace = self.tmp / 'msgs-calls'
+        now = mc.now_dubai()
+        book = {'version': 1, 'questions': []}
+        mc.new_question(book, mc.charges.parse(ALERT, BANK), ALERT, now, now)
+        mc.write_json(self.data / 'questions.json', book)
+        replica = self.tmp / 'owner.sqlite'
+        with sqlite3.connect(replica) as db:
+            replica_meta(db)
+            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
+            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
+        fake = self.tmp / 'msgs'
+        fake.write_text('#!/usr/bin/python3\nimport json, sys\n'
+                        'assert sys.stdin.read() == ""\n'
+                        f'with open({str(trace)!r}, "a") as out: out.write(sys.argv[1] + "\\n")\n'
+                        f'row = {{"id": 1, "ts": {now.timestamp()}, "sender": "Acme", "subject": "Acme receipt"}}\n'
+                        'print(json.dumps(row) if sys.argv[1] == "search" else "Acme receipt EUR 12.34")\n')
+        fake.chmod(0o700)
+        runner_path = ':'.join([str(home / '.local/share/robob-watch/helpers'), str(home / '.local/bin'),
+                                str(home / '.bun/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin',
+                                '/bin', '/usr/sbin', '/sbin'])
+        env = {'HOME': str(home), 'PATH': runner_path, 'LANG': 'en_US.UTF-8', 'WATCH_DIR': str(self.wd),
+               'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_STATE_DB': str(replica),
+               'MONEY_CASES_MSGS': str(fake)}
+        started = time.monotonic()
+        done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
+                              env=env, stdin=subprocess.DEVNULL, start_new_session=True,
+                              capture_output=True, text=True, timeout=5)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertLess(time.monotonic() - started, 5)
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(state['timing']['owner_queries'], 1)
+        self.assertEqual(state['timing']['msgs_calls'], 2)
+        self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
+        questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
+        self.assertEqual(questions[0]['status'], 'closed')
 
 
 class Rules(Base):
@@ -625,7 +734,7 @@ RECEIPT = {'id': 2, 'ts': at('2026-10-24T10:47').timestamp(), 'sender': 'Acme <n
            'subject': 'Your Acme order', 'body': 'Thanks for ordering. Total €12.34', 'source': 'email', 'from_me': 0}
 
 
-def read(row, deadline=None):
+def read(row, deadline=None, **_):
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
 
 
@@ -810,7 +919,7 @@ class Questions(Base):
         def find(query, since, until=None, source=None, n=20, deadline=None):
             return sorted([receipt] + notices, key=lambda r: -r['ts'])[:n]
 
-        def read(row, deadline=None):
+        def read(row, deadline=None, **_):
             reads.append(row['id'])
             return shown[row['id']]
         r = mc.charges.receipt(mc.charges.parse(aed, BANK), at('2026-10-24T00:37'), at('2026-10-24T00:45'),
@@ -875,6 +984,378 @@ class Questions(Base):
         code, msg = self.ask('2026-10-24T09:00', finder())
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('settled (his order)', msg)
+
+
+class CheckBudget(Base):
+    def questions(self):
+        return mc.load_questions(self.data)["questions"]
+
+    def seed(self, times):
+        book = {'version': 1, 'questions': []}
+        charge = mc.charges.parse(ALERT, BANK)
+        for n, when in enumerate(times):
+            q = mc.new_question(book, charge, ALERT, when, when, 'sms')
+            q['id'] = f'q-budget{n}'
+        mc.write_json(self.data / 'questions.json', book)
+        return book
+
+    def test_slow_lookups_leave_time_for_due_case_event(self):
+        self.case()
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=n) for n in range(10)])
+
+        def slow(*args, **kw):
+            time.sleep(3)
+            return []
+
+        started = time.monotonic()
+        with patch.object(mc, 'CHECK_BUDGET', 6):
+            event = mc.run_check(self.wd, 'r', self.data, self.root, now, slow, slow)
+        self.assertLess(time.monotonic() - started, 8)
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('OVERDUE', event)
+        self.assertIn('out of time', str(state['question_errors']))
+        self.assertIn('timing', state)
+
+    def test_slow_receipt_cannot_swallow_question_deadline(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now])
+        def slow(*args, **kw):
+            time.sleep(3)
+            return []
+        started = time.monotonic()
+        with patch.object(mc, 'FOLLOW_EACH', 0.15):
+            errors = mc.follow(self.data, now, self.root, time.time() + 5, slow, nobody)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertIn('out of time', str(errors))
+
+    def test_receipt_timeout_still_uses_cached_owner_evidence(self):
+        now = at('2026-10-25T12:00')
+        when = now - dt.timedelta(days=1)
+        book = self.seed([when])
+        book['questions'][0]['asks'] = [{'at': mc.stamp(when)}, {'at': mc.stamp(when + dt.timedelta(hours=1))}]
+        mc.write_json(self.data / 'questions.json', book)
+        def owner(*args, **kw):
+            return [(mc.charges.iso(when), 'I paid Acme', 'app')]
+        def slow(*args, **kw):
+            time.sleep(3)
+            return []
+        with patch.object(mc, 'FOLLOW_EACH', 0.05):
+            mc.follow(self.data, now, self.root, time.time() + 5, slow, owner)
+        q = self.questions()[0]
+        self.assertEqual(q['status'], 'closed')
+        self.assertIn('I paid Acme', q['outcome'])
+        self.assertEqual(mc.load(self.data)['cases'], [])
+
+    def test_interrupted_case_and_question_pair_recovers_on_retry(self):
+        for action in ('promote', 'close'):
+            with self.subTest(action=action):
+                self.data = self.tmp / action
+                now = at('2026-10-25T12:00')
+                when = now - dt.timedelta(days=8)
+                self.seed([when])
+                def owner(*args, **kw):
+                    return [(mc.charges.iso(when), 'I paid Acme', 'app')]
+                if action == 'close':
+                    mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                replace = mc.os.replace
+                def interrupted_replace(src, dst):
+                    replace(src, dst)
+                    if Path(dst).name == 'cases.json':
+                        with mc.within(time.time() + 0.05, mc.CheckTimeout('out of time')):
+                            mc.signal.raise_signal(mc.signal.SIGALRM)
+                with patch.object(mc.os, 'replace', interrupted_replace):
+                    with self.assertRaises(mc.CheckTimeout):
+                        mc.follow(self.data, now, self.root, time.time() + 5, finder(),
+                                  owner if action == 'close' else nobody)
+                self.assertEqual(self.questions()[0]['status'], 'case' if action == 'close' else 'open')
+                self.assertEqual(len(mc.load(self.data)['cases']), 1)
+                mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                q = self.questions()[0]
+                self.assertEqual(q['status'], 'closed')
+                self.assertTrue(q['case_closed'])
+                self.assertEqual(q['was_case'], mc.load(self.data)['cases'][0]['id'])
+                self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'closed')
+
+    def test_every_settlement_path_recovers_an_interrupted_promotion(self):
+        # Entry point       Result                              Case handling
+        # answered          closed, was_case                    answer noted, stays open
+        # ask               case, DONT_ASK                      follows existing case
+        # screen / readonly case verdict                       follows existing case
+        # triaged           case, never closed as an unraised q follows existing case
+        for entry in ('answered', 'ask', 'screen', 'readonly', 'triaged'):
+            with self.subTest(entry=entry):
+                self.data = self.tmp / entry
+                now = at('2026-10-25T12:00')
+                when = now - dt.timedelta(days=8)
+                qid = self.seed([when])['questions'][0]['id']
+                replace = mc.os.replace
+                def interrupted_replace(src, dst):
+                    replace(src, dst)
+                    if Path(dst).name == 'cases.json':
+                        with mc.within(time.time() + 0.05, mc.CheckTimeout('out of time')):
+                            mc.signal.raise_signal(mc.signal.SIGALRM)
+                with patch.object(mc.os, 'replace', interrupted_replace):
+                    with self.assertRaises(mc.CheckTimeout):
+                        mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                cid = mc.load(self.data)['cases'][0]['id']
+                self.assertEqual(self.questions()[0]['status'], 'open')
+                if entry == 'answered':
+                    mc.answered(self.data, qid, 'not mine', now)
+                    q = self.questions()[0]
+                    self.assertEqual((q['status'], q['was_case']), ('closed', cid))
+                    self.assertIn('not mine', mc.load(self.data)['cases'][0]['history'][-1]['text'])
+                elif entry == 'ask':
+                    code, message = mc.ask(self.data, 'Is this yours?', qid=qid, now=now, find=finder(), said=nobody)
+                    self.assertEqual(code, mc.DONT_ASK)
+                    self.assertIn(cid, message)
+                elif entry in ('screen', 'readonly'):
+                    result = mc.screen(ALERT, BANK, when, now, data=self.data, find=finder(), said=nobody,
+                                       record=entry == 'screen')
+                    self.assertEqual(result['verdict'], 'case')
+                    self.assertIn(cid, result['why'])
+                else:
+                    mc.triaged(self.data, [(qid, 'imsg:test', False)], now)
+                q = self.questions()[0]
+                if entry not in ('answered', 'readonly'):
+                    self.assertEqual((q['status'], q['case']), ('case', cid))
+                self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
+                mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                self.assertEqual(len(mc.load(self.data)['cases']), 1)
+
+    def test_slow_run_logs_phase_times_and_counts(self):
+        self.case()
+        clock = [1000.0]
+        attention = mc.attention
+        def slow(*args, **kw):
+            clock[0] += 22
+            return attention(*args, **kw)
+        stderr = io.StringIO()
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'attention', slow), \
+                redirect_stderr(stderr):
+            mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
+        timing = json.loads((self.wd / 'pings.json').read_text())['timing']
+        self.assertEqual(timing['total_s'], 22)
+        self.assertEqual(timing['attention_s'], 22)
+        self.assertEqual(timing['slowest'], 'attention')
+        self.assertIn('money-cases timing:', stderr.getvalue())
+        self.assertEqual((timing['owner_queries'], timing['msgs_calls']), (0, 0))
+
+    def test_work_timeout_keeps_runner_owned_outbox(self):
+        self.case()
+        now = at('2026-10-25T12:00')
+        event = mc.run_check(self.wd, 'original', self.data, self.root, now, finder(), nobody)
+        before = json.loads((self.wd / 'pings.json').read_text())
+        mc.write_json(self.wd / 'state.json', {'fires': 0, 'pending': {'event': event}})
+        def slow(*args, **kw):
+            time.sleep(3)
+            return []
+        with patch.object(mc, 'CHECK_BUDGET', 1.2), patch.object(mc, 'follow', slow):
+            self.assertEqual(mc.run_check(self.wd, 'r', self.data, self.root, now), '')
+        after = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(after['outbox'], before['outbox'])
+        self.assertEqual(after['sent'], before['sent'])
+
+    def test_slow_write_preparation_keeps_prior_file(self):
+        for step in ('dumps', 'write', 'fsync'):
+            with self.subTest(step=step):
+                path = self.tmp / 'atomic.json'
+                mc.write_json(path, {'prior': True})
+                before = path.stat()
+                target = mc.json if step == 'dumps' else mc.os
+                original = getattr(target, step)
+                def slow(*args, **kw):
+                    time.sleep(3)
+                    return original(*args, **kw)
+                started = time.monotonic()
+                with patch.object(target, step, slow):
+                    with self.assertRaises(mc.CheckTimeout):
+                        with mc.within(time.time() + 0.1, mc.CheckTimeout('out of time')):
+                            mc.write_json(path, {'complete': True})
+                self.assertLess(time.monotonic() - started, 0.6)
+                self.assertEqual(json.loads(path.read_text()), {'prior': True})
+                self.assertEqual(path.stat().st_ino, before.st_ino)
+                self.assertEqual(list(self.tmp.glob('.atomic.json.*')), [])
+
+    def test_timeout_never_retries_a_slow_buffer_flush_on_close(self):
+        self.case()
+        pings = self.wd / 'pings.json'
+        mc.write_json(pings, {'sent': {}, 'marker': 'prior'})
+        before = pings.read_bytes()
+        calls = []
+        class SlowRaw(io.FileIO):
+            def write(self, data):
+                calls.append('write')
+                time.sleep(3)
+                return super().write(data)
+        def buffered(fd, *_args, **_kw):
+            return io.TextIOWrapper(io.BufferedWriter(SlowRaw(fd, 'w')))
+        write = mc.os.write
+        def slow_raw(fd, data):
+            calls.append('write')
+            time.sleep(3)
+            return write(fd, data)
+        started = time.monotonic()
+        with patch.object(mc, 'CHECK_BUDGET', 0.3), patch.object(mc.os, 'fdopen', buffered), \
+                patch.object(mc.os, 'write', slow_raw), redirect_stderr(io.StringIO()):
+            event = mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
+        self.assertLess(time.monotonic() - started, 0.8)
+        self.assertEqual(event, '')
+        self.assertEqual(calls, ['write'])
+        self.assertEqual(pings.read_bytes(), before)
+        self.assertEqual(list(self.wd.glob('.pings.json.*')), [])
+
+    def test_raw_writes_handle_short_writes_and_unicode(self):
+        path = self.tmp / 'raw.json'
+        write = mc.os.write
+        def short(fd, data):
+            return write(fd, data[:7])
+        with patch.object(mc.os, 'write', short):
+            mc.write_json(path, {'text': 'received € — 東京'}, timing=lambda: {'total_s': 1})
+        self.assertEqual(json.loads(path.read_text()), {'text': 'received € — 東京', 'timing': {'total_s': 1}})
+
+    def test_final_pings_write_is_bounded_and_keeps_outbox_on_timeout(self):
+        for sync in (1, 2):
+            with self.subTest(sync=sync):
+                self.case() if not (self.data / 'cases.json').exists() else None
+                now = at('2026-10-25T12:00')
+                event = mc.run_check(self.wd, 'old', self.data, self.root, now, finder(), nobody)
+                pings = self.wd / 'pings.json'
+                before = pings.read_bytes()
+                inode = pings.stat().st_ino
+                mc.write_json(self.wd / 'state.json', {'fires': 0, 'pending': {'event': event}})
+                calls = []
+                fsync = mc.os.fsync
+                def slow(fd):
+                    calls.append(fd)
+                    if len(calls) == sync:
+                        time.sleep(3)
+                    return fsync(fd)
+                stderr = io.StringIO()
+                started = time.monotonic()
+                with patch.object(mc, 'CHECK_BUDGET', 0.3), patch.object(mc.os, 'fsync', slow), redirect_stderr(stderr):
+                    result = mc.run_check(self.wd, 'new', self.data, self.root, now, finder(), nobody)
+                self.assertLess(time.monotonic() - started, 0.8)
+                self.assertEqual(result, '')
+                self.assertEqual(pings.read_bytes(), before)
+                self.assertEqual(pings.stat().st_ino, inode)
+                self.assertEqual(list(self.wd.glob('.pings.json.*')), [])
+                timing = json.loads(stderr.getvalue().split('money-cases timing: ')[1])
+                self.assertFalse(timing['pings_saved'])
+                self.assertGreaterEqual(timing['total_s'], 0.29)
+                self.assertEqual(timing['slowest'], 'build_write')
+
+    def test_successful_pings_timing_includes_data_fsync(self):
+        self.case()
+        fsync = mc.os.fsync
+        def slow(fd):
+            time.sleep(0.1)
+            return fsync(fd)
+        with patch.object(mc.os, 'fsync', slow):
+            mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
+        timing = json.loads((self.wd / 'pings.json').read_text())['timing']
+        self.assertGreaterEqual(timing['total_s'], 0.1)
+        self.assertGreaterEqual(timing['build_write_s'], 0.1)
+        self.assertEqual(timing['slowest'], 'build_write')
+
+    def test_slow_attention_stops_and_saves_without_new_outbox(self):
+        self.case()
+        def slow(*args, **kw):
+            time.sleep(3)
+            return []
+        started = time.monotonic()
+        with patch.object(mc, 'CHECK_BUDGET', 1.5), patch.object(mc, 'attention', slow):
+            event = mc.run_check(self.wd, 'r', self.data, self.root, at('2026-10-25T12:00'), finder(), nobody)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(event, '')
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertNotIn('outbox', state)
+        self.assertEqual(state['timing']['slowest'], 'attention')
+
+    def test_held_case_lock_exits_cleanly_and_keeps_pings(self):
+        self.case()
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=8)])
+        mc.write_json(self.wd / 'pings.json', {'sent': {'kept': mc.stamp(now)}})
+        script = ('import fcntl, sys; f = open(sys.argv[1], "a"); '
+                  'fcntl.flock(f, fcntl.LOCK_EX); print("locked", flush=True); sys.stdin.read()')
+        holder = subprocess.Popen(['/usr/bin/python3', '-B', '-c', script, str(self.data / 'cases.lock')],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), 'locked')
+            started = time.monotonic()
+            with patch.object(mc, 'CHECK_BUDGET', 11):
+                event = mc.run_check(self.wd, 'r', self.data, self.root, now, finder(), nobody)
+            self.assertLess(time.monotonic() - started, 11)
+            self.assertEqual(event, '')
+            state = json.loads((self.wd / 'pings.json').read_text())
+            self.assertIn('kept', state['sent'])
+            self.assertIn('cases.lock', str(state['question_errors']))
+            self.assertNotIn('outbox', state)
+            self.assertEqual(mc.load_questions(self.data)['questions'][0]['status'], 'open')
+        finally:
+            holder.communicate(timeout=2)
+
+    def test_one_owner_query_filters_each_questions_window(self):
+        now = at('2026-10-25T12:00')
+        times = [now - dt.timedelta(hours=2*n) for n in range(5)]
+        self.seed(times)
+        path = self.tmp / 'owner.sqlite'
+        with sqlite3.connect(path) as db:
+            replica_meta(db)
+            db.execute('CREATE TABLE orchestration_v2_projection_threads (thread_id, title, updated_at)')
+            db.execute('CREATE TABLE orchestration_v2_projection_messages (thread_id, role, created_at, payload_json)')
+            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)',
+                       ('t', 'app', mc.charges.iso(now)))
+            for n, when in enumerate(times):
+                payload = {'createdBy': 'user', 'creationSource': 'web', 'text': f'I paid Acme, item {n}'}
+                db.execute('INSERT INTO orchestration_v2_projection_messages VALUES (?, ?, ?, ?)',
+                           ('t', 'user', mc.charges.iso(when), json.dumps(payload)))
+        with patch.object(mc.charges, 'STATE_DB', path), \
+                patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
+            mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
+        self.assertEqual(query.call_count, 1)
+        for n, q in enumerate(self.questions()):
+            self.assertEqual(q['status'], 'closed')
+            self.assertIn(f'item {n}', q['outcome'])
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(state['timing']['owner_queries'], 1)
+
+    def test_union_lookup_failure_is_recorded_once(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=n) for n in range(5)])
+        with patch.object(mc.charges, 'owner_texts', side_effect=mc.charges.Lookup('test source failed')) as query:
+            mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
+        self.assertEqual(query.call_count, 1)
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(str(state['question_errors']).count('test source failed'), 1)
+        self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
+
+    def test_long_union_falls_back_to_each_question(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now, now - dt.timedelta(days=3)])
+        with patch.object(mc.charges, 'owner_texts', return_value=[]) as query:
+            mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
+        self.assertEqual(query.call_count, 2)
+        self.assertTrue(all(call.args[1] - call.args[0] <= dt.timedelta(hours=1)
+                            for call in query.call_args_list))
+
+    def test_msgs_cache_is_shared_by_questions_and_reset_each_run(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now, now])
+        row = {'id': 1, 'ts': now.timestamp(), 'sender': 'Acme', 'subject': 'Acme receipt'}
+        calls = []
+        def msgs(argv, **kw):
+            calls.append(tuple(argv))
+            body = json.dumps(row) if argv[1] == 'search' else 'Acme receipt EUR 12.34'
+            return subprocess.CompletedProcess(argv, 0, body, '')
+        with patch.object(mc.charges.subprocess, 'run', msgs):
+            mc.run_check(self.wd, 'r', self.data, self.root, now, said=nobody)
+            self.assertEqual([a[1] for a in calls], ['search', 'show'])
+            self.seed([now, now])
+            mc.run_check(self.wd, 'r2', self.data, self.root, now, said=nobody)
+        self.assertEqual([a[1] for a in calls], ['search', 'show', 'search', 'show'])
+        self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
 
 
 class CardSwap(Base):
@@ -1077,7 +1558,9 @@ class Cli(Base):
     def run_cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
         with patch.object(mc, 'DATA', self.data), patch.object(mc, 'WATCH_ROOT', self.root), \
-                redirect_stdout(out), redirect_stderr(err):
+                redirect_stdout(out), redirect_stderr(err), patch.object(mc.faulthandler, 'enable'), \
+                patch.object(mc.faulthandler, 'dump_traceback_later'), \
+                patch.object(mc.faulthandler, 'cancel_dump_traceback_later'):
             code = mc.main(list(args))
         return code, out.getvalue(), err.getvalue()
 

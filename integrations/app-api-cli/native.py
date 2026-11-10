@@ -224,6 +224,30 @@ def food_menu_raw(code, headers, timeout):
         for i in c.get('items') or []:
             cats.setdefault(i, clean_name(c.get('name')))
     items = []
+    option_items = {i.get('itemCode'): i for i in menu.get('items') or []}
+    modifiers = {g.get('modifierCode'): g for g in menu.get('modifiers') or []}
+
+    def choices(codes, ancestors=()):
+        groups = []
+        for code in codes or []:
+            if not isinstance(code, str) or code in ancestors or code not in modifiers:
+                raise NativeError('SCHEMA_CHANGED', 'Invalid Food modifier reference.')
+            group = modifiers[code]
+            options = []
+            for option in group.get('options') or []:
+                item = option_items.get(option.get('itemCode'))
+                if not item:
+                    raise NativeError('SCHEMA_CHANGED', 'Missing Food option item.')
+                options.append({'id': item['itemCode'], 'name': clean_name(item.get('name')),
+                                'price': money(option.get('price')),
+                                'available': not item.get('isOos'),
+                                'default_quantity': option.get('defaultValue'),
+                                'groups': choices(item.get('modifiers'), (*ancestors, code))})
+            groups.append({'id': code, 'name': clean_name(group.get('name')),
+                           'min': group.get('minTotalOptions'), 'max': group.get('maxTotalOptions'),
+                           'max_per_option': group.get('maxSingleOption'),
+                           'available': not group.get('isOos'), 'options': options})
+        return groups
     for i in menu.get('items') or []:
         if i.get('itemType') not in (None, 'main'):
             continue
@@ -232,9 +256,12 @@ def food_menu_raw(code, headers, timeout):
                        'image_url': image(i, 'https://f.nooncdn.com/food_production/'),
                       'category': cats.get(i.get('itemCode')) or None, 'price': money(i.get('price')),
                       'discount_price': money(i.get('discountPrice')) if i.get('discountPrice') not in (None, i.get('price')) else None,
-                      'available': not i.get('isOos'), 'currency': 'AED'})
+                      'available': not i.get('isOos'), 'currency': 'AED',
+                      'note_type': i.get('noteType'), 'max_quantity': i.get('maxQty'),
+                      'choice_groups': choices(i.get('modifiers'))})
     status = data.get('operatingStatusCode')
     info = {'id': code, 'name': clean_name(data.get('name')), 'address': data.get('address'),
+            'menu_code': menu.get('menuCode'), 'menu_version': menu.get('version'),
             'status': 'open' if status == 'open' and data.get('isAcceptingOrders') else ('not_accepting_orders' if status == 'open' else (status or 'unknown')),
             'status_message': strip_html(data.get('formattedOperatingStatusMsg')) or data.get('closeMsg') or None,
             'eta': (data.get('minutesToDeliver') + ' mins') if data.get('minutesToDeliver') else None,

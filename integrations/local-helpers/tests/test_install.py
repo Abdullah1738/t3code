@@ -126,12 +126,17 @@ exit 0
         self.assertEqual(rc, 0, err)
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
-                    ".local/bin/qcard", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
-                    "Library/LaunchAgents/local.ardud.otp-idle.plist"):
+                    ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
+                    "Library/LaunchAgents/local.ardud.otp-idle.plist",
+                    ".local/bin/robob-read-watchdog",
+                    "Library/LaunchAgents/com.ardud.robob-read-watchdog.plist"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 11, self.calls_log())
+        self.assertEqual(len(loads), 12, self.calls_log())
+        self.assertTrue(os.access(self.live(".local/bin/robob-read-watchdog"), os.X_OK))
+        self.assertTrue(os.path.isdir(self.live(".local/state/robob-read-watchdog")))
         for rel in (".local/share/juno-proxy/juno_proxy.py", ".local/bin/power-unplug-telegram.sh",
                     ".local/bin/battery-low-telegram.sh", ".local/share/lydia-ticks/server.ts",
                     ".local/share/lydia-ticks/tunnel.sh"):
@@ -351,7 +356,7 @@ exit 0
                          ["com.abdullah.juno-proxy", "com.ardud.battery-low-telegram", "com.ardud.cards-health",
                           "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
                           "com.ardud.lydia-ticks-tunnel", "com.ardud.opencode-web",
-                          "com.ardud.power-unplug-telegram",
+                          "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog",
                           "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
     def test_modes_are_checked_and_repaired_on_their_own(self):

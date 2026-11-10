@@ -62,6 +62,15 @@ delivered orders above, with account/Home verification.
 
 ### Food
 
+For a delivered Food order placed on the automatic saved-card path (explicit
+null client secret, no completion sent), `commerce close-food-captured FLOW
+--bank-msg-id ID` validates the retained placement, the exact delivered order
+and its automatic payment detail, and an EmiratesNBD purchase SMS on 2342 for
+the exact amount within 30 minutes after placement. Review the dry run, then
+add `--confirm` to close locally as COMPLETE, retaining the reservation and all
+consumed operations. It never places, pays, or retries; live Food placement
+and completion remain disabled. A changed evidence record cannot close again.
+
 New verified routes on `api-app-fd.noon.com`:
 
 - `POST /_svc/mp-food-api-mpnoon/order/orders`, body `{}`: native default list.

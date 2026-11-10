@@ -8,6 +8,7 @@
  * is `ambiguous`, never resolved to the newest.
  */
 import type { ModelSelection } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -161,6 +162,25 @@ const make = Effect.gen(function* () {
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import"))),
   );
+
+  // Sqlite setup runs migrations first; index failures must not prevent startup.
+  for (const ensureIndex of [
+    sql`
+      CREATE INDEX IF NOT EXISTS ardud_idx_provider_threads_native_id
+      ON orchestration_v2_projection_provider_threads (json_extract(payload_json, '$.nativeThreadRef.nativeId'))
+    `,
+    sql`
+      CREATE INDEX IF NOT EXISTS ardud_idx_provider_threads_created_at
+      ON orchestration_v2_projection_provider_threads (json_extract(payload_json, '$.createdAt'))
+    `,
+  ]) {
+    yield* ensureIndex.pipe(
+      Effect.mapError(fail("ensure-identity-indexes")),
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to ensure execution identity indexes", error),
+      ),
+    );
+  }
 
   // Driver and instance columns are newer than some rows; fall back to payload.
   const providerRowsFor = (nativeId: string) =>
@@ -333,7 +353,9 @@ const make = Effect.gen(function* () {
   );
 
   const resolve: ExecutionIdentityShape["resolve"] = Effect.fn("ExecutionIdentity.resolve")(
-    function* (input) {
+    function* (
+      input: ResolveInput,
+    ): Effect.fn.Return<ExecutionIdentityResult, ExecutionIdentityError> {
       const providers = (yield* providerRowsFor(input.nativeId)).filter(
         (row) =>
           row.thread_id !== null &&
@@ -449,6 +471,8 @@ const make = Effect.gen(function* () {
         candidates: [],
       };
     },
+    // Both writes and large shell snapshots can outlast offbox's lookup timeout.
+    NodeSqliteClient.identityReadOnly,
   );
 
   const currentNative: ExecutionIdentityShape["currentNative"] = (threadIds) =>

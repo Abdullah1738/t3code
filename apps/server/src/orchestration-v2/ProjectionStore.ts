@@ -4253,12 +4253,33 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           },
         ];
         const pageSize = 500;
+        // Turn items are paged through each history store on its own key. The
+        // history view's synthetic rowid has no index in the base archive, so
+        // paging the view re-scanned the whole base for every page.
+        const turnItemSources = [
+          { from: "main.orchestration_v2_projection_turn_items AS src", key: "src.rowid", hidden: "" },
+          {
+            from: "ardud_archive.ardud_turn_items AS src",
+            key: "src.ardud_rowid",
+            hidden: `AND NOT EXISTS (SELECT 1 FROM main.orchestration_v2_projection_turn_items AS hot
+                WHERE hot.turn_item_id = src.turn_item_id)`,
+          },
+          {
+            from: "ardud_base.orchestration_v2_projection_turn_items AS src",
+            key: "src.rowid",
+            hidden: `AND NOT EXISTS (SELECT 1 FROM main.orchestration_v2_projection_turn_items AS hot
+                WHERE hot.turn_item_id = src.turn_item_id)
+              AND NOT EXISTS (SELECT 1 FROM ardud_archive.ardud_turn_items AS delta
+                WHERE delta.turn_item_id = src.turn_item_id)`,
+          },
+        ];
+        const sourcesOf = (name: string) =>
+          name === "turn_items"
+            ? turnItemSources
+            : [{ from: `orchestration_v2_projection_${name} AS src`, key: "src.rowid", hidden: "" }];
         for (const table of tables) {
-          const tableName =
-            table.name === "turn_items"
-              ? "ardud_history_turn_items"
-              : `orchestration_v2_projection_${table.name}`;
-          let afterRowId = table.name === "turn_items" ? Number.MIN_SAFE_INTEGER : 0;
+         for (const source of sourcesOf(table.name)) {
+          let afterRowId = Number.MIN_SAFE_INTEGER;
           while (true) {
             const rows = yield* sql<{
               readonly row_id: number;
@@ -4267,13 +4288,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               readonly target_thread_id: string | null;
               readonly payload_json: string;
             }>`
-              SELECT rowid AS row_id, ${sql(table.id)} AS entity_id,
-                ${sql(table.name === "context_transfers" ? "source_thread_id" : "thread_id")} AS thread_id,
-                ${table.name === "context_transfers" ? sql`target_thread_id` : sql`NULL`} AS target_thread_id,
-                payload_json
-              FROM ${sql(tableName)}
-              WHERE rowid > ${afterRowId}
-              ORDER BY rowid ASC LIMIT ${pageSize}
+              SELECT ${sql.literal(source.key)} AS row_id, src.${sql(table.id)} AS entity_id,
+                src.${sql(table.name === "context_transfers" ? "source_thread_id" : "thread_id")} AS thread_id,
+                ${table.name === "context_transfers" ? sql`src.target_thread_id` : sql`NULL`} AS target_thread_id,
+                src.payload_json
+              FROM ${sql.literal(source.from)}
+              WHERE ${sql.literal(source.key)} > ${afterRowId} ${sql.literal(source.hidden)}
+              ORDER BY ${sql.literal(source.key)} ASC LIMIT ${pageSize}
             `;
             for (const row of rows) {
               if (table.name === "threads") actualThreadIds.add(ThreadId.make(row.entity_id));
@@ -4310,6 +4331,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             afterRowId = rows[rows.length - 1]!.row_id;
             yield* Effect.yieldNow;
           }
+         }
         }
         const pending = [
           ...unreadable,

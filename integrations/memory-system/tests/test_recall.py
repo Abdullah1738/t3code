@@ -1820,6 +1820,24 @@ class RecallTest(unittest.TestCase):
         self.assertIn(">> hit", out)
 
 
+class CliEntryTest(unittest.TestCase):
+    def test_cli_parser_builds_and_remember_writes_rules_db(self):
+        # `recall <anything>` builds the full parser first; a NameError there
+        # broke every CLI command, which no format-only test noticed.
+        import io
+        from contextlib import redirect_stdout
+        import recall_cli as cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "recall_rules.db"
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"RECALL_RULES_DB": str(db)}), redirect_stdout(buf):
+                rc_ = cli.main(["remember", "Crpko deploys use main-dev, never main", "--scope", "crpko"])
+            self.assertEqual(rc_, 0)
+            self.assertIn("main-dev", buf.getvalue())
+            self.assertTrue(db.exists())
+
+
 class GateTest(unittest.TestCase):
     def test_should_skip(self):
         self.assertEqual(ra.should_skip("ok"), "ack")

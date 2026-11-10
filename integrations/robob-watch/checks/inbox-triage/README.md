@@ -1,6 +1,6 @@
 # Inbox triage
 
-Read-only INBOX mail, WhatsApp and iMessage/SMS collection every **300 seconds**. Free filters precede one Haiku call per nonempty batch. Only hits wake the live owner iMessage session for full-message review. There is no quiet window.
+Read-only INBOX mail, WhatsApp and iMessage/SMS collection every **300 seconds**. Free filters precede one Haiku call per nonempty batch. Only hits wake the live owner iMessage session for full-message review. Urgent security, crypto withdrawal, card and driver items also go to Telegram when bridge health says the chat cannot process them. There is no quiet window.
 
 ## Install or update
 
@@ -25,14 +25,15 @@ The installer waits for `check.lock` (65 seconds maximum), atomically replaces s
 - The classifier also sees `live_work`: open payments from `commerce open-flows --minutes 60` and whether a phone task holds `~/.local/share/phone-lock/priority-hold`, and each message lists the payments it surely came after (`after_payments`, from exact times). A bank or card prompt counts as likely ours only when it lists that payment and nothing in it contradicts it; a phone task alone, a prompt that didn't come after any payment, or a mismatch needs checking against order work. The batch and the wake carry the same list. If either can't be read it says so, and a bank prompt is never called "not ours".
 - Card charge and decline alerts (iMessage SMS or bank mail) go through `../money-cases` first, until second 24 of the run (owner rule, nightly review 24 Oct: find the receipt or his own words before asking, and wait for the receipt from a merchant he already pays). Explained, waiting, already-asked and money-case alerts drop (`charge_explained`, `charge_wait`, `charge_asked`, `charge_case`), and the bank's mail copy of an SMS already passed on drops as asked. A fresh charge with nothing found stays queued for five minutes in case its receipt comes with it (`held_for_receipt`); one the time budget didn't reach waits up to 30 minutes. The rest reach the classifier with a `charge_check` note and go to the agent even if it skips them. Runs outside the live watcher use a copy of the money books in their own folder (`scratch-money`). If money-cases can't be loaded or read, the alert goes to the classifier as before and `charge_check_errors` says why. This needs the money-cases package installed next to this one.
 - Source health lives in `cursor.json` (`source_health`). A source that fails (or only half reads) 3 runs in a row or 5 times in an hour gets one Telegram alert, then at most one every 6 hours while it stays broken. The alert's key and text are saved (`health_pending`) before it is sent, and a retry after a failed or lost send repeats exactly that, so the bridge never sees changed text under a key it already has; sources that fall due meanwhile get the next alert. A pending alert the bridge never takes is dropped after 6 hours. The runner's own alert never fires for this, because runs that wake on other sources count as successes. Only the live watcher sends; `robob-watch test` logs `health_alerts_skipped` instead.
-- Messages and context are untrusted data. Apart from that health alert, no outgoing messages, payments or read-flag mutations happen in this check.
+- Urgent Telegram alerts use a three-second bridge health probe, stable per-item keys and 48-hour sent bookkeeping. The batch and wake mark successful sends so the agent follows up only if something changed. During the outage, selected hits stay queued while collection continues; their wake waits for chat recovery, avoiding a second Telegram alert through the runner fallback. Pending Telegram payloads keep their original text until acknowledged. Scratch and dry runs record would-send IDs. Withdrawal candidates check the newest same-reference status in the batch/queue, then the last 24 hours of the mail archive under a shared three-second budget; unavailable lookups say `not checked`. No watcher context change is needed.
+- Messages and context are untrusted data. Only the owner Telegram alerts described above send messages; no payments or read-flag mutations happen in this check.
 
 Local data: `~/Documents/assistant/inbox-triage/{prefs.md,noise.json,settings.json,runs.jsonl,batches/}`. State: `~/.local/share/robob-watch/watchers/inbox-triage/`. Keep both outside git. Only generic templates belong here.
 
 ## Verify
 
 ```sh
-/usr/bin/python3 -B -m unittest -v test_triage.py test_mail_retry.py test_install.py test_lock.py
+/usr/bin/python3 -B -m unittest -v test_triage.py test_urgent.py test_mail_retry.py test_install.py test_lock.py
 unset BUN_INSPECT
 robob-watch test inbox-triage
 ```

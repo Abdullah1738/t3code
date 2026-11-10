@@ -1008,7 +1008,7 @@ const makeRoutes = Effect.gen(function* () {
   // Ambiguous and unknown ids come back as a resolution, not an error, so
   // callers can tell "not yet" from "never".
   const identityResolve = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationReadScope);
+    yield* authenticate(AuthOrchestrationReadScope).pipe(NodeSqliteClient.identityReadOnly);
     const params = yield* searchParams;
     const nativeId = params.get("nativeId");
     if (nativeId === null || nativeId.length === 0) {

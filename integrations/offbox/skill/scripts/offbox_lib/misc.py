@@ -43,10 +43,18 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
             return
         ses = me.get("session")
         if do_clear:
-            keep = [e for e in cur if not (e.get("session_id") == ses or (me.get("thread") and
-                                                                           e.get("thread_id") == me.get("thread")))]
+            thread = me.get("thread")
+            if me.get("driver") == "claudeAgent":
+                # A Claude parent and its in-process children share one session id, so the session names none of
+                # them. Clear only the caller's own thread's entries, never a parent's or a sibling's.
+                def mine(e):
+                    return bool(thread) and e.get("thread_id") == thread
+            else:
+                def mine(e):
+                    return e.get("session_id") == ses or bool(thread and e.get("thread_id") == thread)
+            keep = [e for e in cur if not mine(e)]
             atomic_write_json(EXEMPTIONS, keep)
-            event(db(), None, "exemption_clear", f"session={ses} removed={len(cur) - len(keep)}")
+            event(db(), None, "exemption_clear", f"session={ses} thread={thread} removed={len(cur) - len(keep)}")
             print(f"cleared {len(cur) - len(keep)} exemption(s)")
             return
         if not reason or len(reason.strip()) < 8:
@@ -55,8 +63,10 @@ def local_exempt(me: dict, reason: str | None, ttl: str, do_list: bool, do_clear
             say("note: no OPENCODE_SESSION_ID; the exemption is recorded but the gate can't match it to a session")
         secs = parse_ttl(ttl)
         # The driver goes with the session id: the monitor matches a native UUID only under the driver it was written
-        # for, and an entry without one is read as OpenCode.
+        # for, and an entry without one is read as OpenCode. The execution kind tells the monitor that a Claude
+        # in-process child's entry covers that child's thread only, not the session it shares with its parent.
         e = {"session_id": ses, "driver": me.get("driver") or "opencode", "thread_id": me.get("thread"),
+             "execution_kind": me.get("executionKind"),
              "reason": reason.strip()[:500], "created_at": now(), "expires_at": now() + secs,
              "repo_root": me.get("repo_root"), "pid": os.getppid()}
         cur.append(e)
@@ -70,11 +80,11 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     con = db()
     capacity.schema(con)
     if show_all:
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') ORDER BY last_used_at DESC").fetchall()
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') ORDER BY last_used_at DESC").fetchall()
     else:
         # The caller's own leases are selected by owner. An unproven caller's owner string is shared, so it sees none.
         require_proven(me, "list")
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?)) ORDER BY last_used_at DESC",
                            (me['owner'], me['owner'])).fetchall()
     out = []
@@ -100,9 +110,9 @@ def release(me: dict, box_id: str | None, mine: bool, delete: bool) -> None:
     con = db()
     capacity.schema(con)
     if box_id:
-        rows = con.execute("SELECT * FROM leases WHERE box_id=? AND state IN ('running','stopped')", (box_id,)).fetchall()
+        rows = con.execute("SELECT * FROM leases WHERE box_id=? AND state IN ('running','stopped','resume_stalled')", (box_id,)).fetchall()
     elif mine:
-        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') AND (owner=? OR box_id IN "
+        rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped','resume_stalled') AND (owner=? OR box_id IN "
                            "(SELECT box_id FROM pool_callers WHERE owner=?))", (me['owner'],me['owner'])).fetchall()
     else:
         row = lease.find_lease(con, me['owner'], me['repo_root'])
@@ -143,8 +153,11 @@ def _release_one(con, r, delete):
             lease.delete_box(con, r["box_id"], "release --delete")
             print(f"deleted {r['box_id']}")
         else:
-            if r["state"] == "running":
+            if r["state"] in ("running", "resume_stalled"):
                 lease.stop_box(con, r["box_id"], "release")
+            if r['state'] == 'resume_stalled':
+                print(f"stop requested for {r['box_id']} (disk kept; remains set aside)")
+                return
             print(f"stopped {r['box_id']} (free; disk kept; next offbox run resumes it)")
 
 
@@ -352,6 +365,10 @@ def wait(run_id: str, timeout: float | None) -> int:
 
 
 def _settled(r) -> int:
+    from .runs import repo_setup_failed
+    if repo_setup_failed(r['exit_code'], LOGS_DIR / f"{r['run_id']}.log"):
+        say('repo toolchain setup failed (exit 98), not your command')
+        return EXIT_INFRA
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
@@ -649,7 +666,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 def _finalize(r, code, log_path) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
-    from .runs import do_pulls, finish, go_std_glitch
+    from .runs import do_pulls, finish, go_std_glitch, repo_setup_failed
+    if repo_setup_failed(code, log_path):
+        finish(r['run_id'], EXIT_INFRA, 'infra')
+        say('repo toolchain setup failed (exit 98), not your command')
+        return EXIT_INFRA
     pulls = json.loads(r["pulls"] or "[]")
     if pulls:
         con = db()

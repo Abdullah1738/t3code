@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import api, capacity, ssh_sync
 from .common import (SIZES, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, month_key, new_id, now, read_json, say)
+                     file_lock, iso, log, month_key, new_id, now, read_json, say)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -48,7 +48,7 @@ def natural_size(con, row) -> str:
     return size if _rank(size) >= _rank("large") else "large"
 
 
-DOCKER_CMD = re.compile(r"docker|compose|testcontainers|localstack")
+DOCKER_CMD = re.compile(r"docker|podman|compose|testcontainers|localstack", re.I)
 DOCKER_MANIFEST = re.compile(r"testcontainers|dockertest")
 
 
@@ -85,32 +85,165 @@ def typecheck_size(cmd: str, repo_root: str, size: str | None) -> str | None:
 # narrow tests fit large (16 GB; measured per-job peak ~12 GB, 13-31 Oct).
 BIG_STACK_CMD = re.compile(r"\bcompose\b|docker-compose|localstack|testcontainers")
 WHOLE_SUITE_CMD = re.compile(r"\./\.\.\.|\bmake\s+test|\bpytest(?![^;&|]*::)")
-OOM_WINDOW_S = 14 * 86400
+# An exit 137 bumps the next runs of the same kind of command for a few days. It used to put the whole repo on
+# xlarge for 14 days: 2 OOMs in backoffice-core sent 1,391 ordinary runs to xlarge (13 Oct - 5 Nov).
+OOM_WINDOW_S = 3 * 86400
+# command_kinds() reads the job out of each ;/&&/||/| part of a command: shell setup statements are dropped, then
+# env assignments, wrappers (timeout, nice, uv run, npx, go, ...) and their options are skipped.
+_SETUP = {"set", "export", "cd", "source", ".", "trap", "unset", "local", "shopt", "ulimit", "umask", "alias",
+          "pushd", "popd", "declare", "readonly"}
+# Wrapper word -> its options that take a value (skipped with the value). A wrapper's first other word that is a
+# number is its own argument too (timeout 1800, nice 10).
+_WRAPPERS = {
+    "env": {"-u", "--unset", "-C", "--chdir", "-S"}, "time": {"-f", "-o"}, "command": set(), "sudo": {"-u", "-g"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"}, "nice": {"-n", "--adjustment"},
+    "taskpolicy": {"-c", "-t", "-l", "-p"}, "stdbuf": {"-i", "-o", "-e"}, "xvfb-run": {"-s", "-n", "-e", "-f"},
+    "bash": set(), "sh": set(), "zsh": set(),
+    "uv": {"--with", "--python", "-p", "--project", "--directory", "--group", "--extra", "--package", "--env-file",
+           "--with-requirements", "--index", "--index-url", "--from"},
+    "run": {"--with", "--python", "-p", "--project", "--directory", "--group", "--extra", "--package", "--env-file",
+            "--with-requirements", "--from"},
+    "npx": {"-p", "--package"}, "pnpm": {"-C", "--dir", "--filter", "-F"},
+    "yarn": {"--cwd"}, "npm": {"--prefix", "-w", "--workspace"}, "bunx": {"-p", "--package"},
+    "exec": set(), "dlx": set(), "poetry": {"-C", "--directory"}, "pipenv": set(), "python": set(),
+    "python3": set(), "-m": set(), "go": {"-C"}, "vp": set(), "corepack": set(),
+}
+_KIND_WORD = re.compile(r"[A-Za-z][\w.+-]*")
+_DURATION = re.compile(r"\d+(\.\d+)?[smhd]?")  # timeout 1800 / 30m, nice 10
+# Plumbing and output filters say nothing about how much memory the job needs.
+_KIND_NOISE = {"echo", "printf", "exit", "true", "false", "[", "[[", "grep", "rg", "head", "tail", "sed", "awk",
+               "sort", "uniq", "wc", "tee", "cat", "ls", "mkdir", "rm", "cp", "mv", "do", "done", "then", "fi",
+               "if", "for", "while", "until", "wait", "sleep", "date", "pwd", "cut", "tr", "xargs", "git", "return",
+               "case", "esac", "else", "elif", "nvm", "which", "type", "chmod", "touch", "ln", "find", "jq"}
+_KIND_ALIAS = {"i": "install", "ci": "install", "add": "install", "sync": "install"}
 
 
-def oom_recent(con, repo_key: str, within: int = OOM_WINDOW_S) -> bool:
-    """A box in this repo killed a run for memory (exit 137) on a smaller size lately."""
-    return con.execute("SELECT 1 FROM runs r JOIN leases l USING(box_id) WHERE l.repo_key=? AND r.exit_code=137 "
-                       "AND COALESCE(r.size,'') != 'xlarge' AND r.start_at>? LIMIT 1",
-                       (repo_key, now() - within)).fetchone() is not None
+def _part_kind(words: list[str]) -> str | None:
+    i = 0
+    while i < len(words):
+        if words[i].rsplit("/", 1)[-1] in _SETUP:  # a setup statement, even behind `bash -c`
+            return None
+        w = words[i]
+        base = w.rsplit("/", 1)[-1]
+        if not base.startswith("@"):
+            base = base.split("@", 1)[0]  # npx vitest@3 / pnpm@11 -> vitest / pnpm
+        if "=" in w.split("/")[0] and not w.startswith("-"):  # VAR=value
+            i += 1
+            continue
+        if base in _WRAPPERS:
+            opts = _WRAPPERS[base]
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or _DURATION.fullmatch(words[i])) \
+                    and words[i] not in ("-c", "--call", "-lc"):
+                opt = words[i].split("=", 1)[0]
+                i += 2 if (opt in opts and "=" not in words[i]) else 1
+            continue
+        if base.startswith("-") or base.startswith("@"):  # incl. `-c`: what follows is the command
+            i += 1
+            continue
+        m = _KIND_WORD.match(base)
+        if not m or m.group(0).lower() in _KIND_NOISE:
+            return None
+        kind = _KIND_ALIAS.get(m.group(0).lower(), m.group(0).lower())
+        if kind == "make":  # make's target is the job: `make test` and `make type` are different kinds
+            target, j = "", i + 1
+            while j < len(words):
+                x = words[j]
+                if x in ("-C", "-f", "-I", "-j", "-l", "-o", "-W", "--directory", "--file", "--include-dir"):
+                    j += 2 if not (x == "-j" and (j + 1 >= len(words) or not words[j + 1].isdigit())) else 1
+                    continue
+                if x.startswith("-") or "=" in x:
+                    j += 1
+                    continue
+                target = x
+                break
+            kind = f"make {target}".strip()
+        return kind
+    return None
+
+
+def command_kinds(cmd: str) -> set[str]:
+    """Job kinds in a command: pytest, test (go/vp/npm test), vitest, tsc, typecheck, make <target>, install..."""
+    kinds = set()
+    for part in re.split(r"&&|\|\||;|\n|\|", cmd or ""):
+        kind = _part_kind(part.replace("'", " ").replace('"', " ").replace("(", " ").replace(")", " ").split())
+        if kind:
+            kinds.add(kind)
+    # A dependency install comes before nearly every job, so it names the job only when it is all there is.
+    return (kinds - {"install"}) or kinds
+
+
+def oom_recent(con, repo_key: str, cmd: str = "", within: int = OOM_WINDOW_S) -> str | None:
+    """Size to bump this run to: one above the size whose run of the same kind was killed for memory (exit 137)
+    in this repo lately. None when nothing of this kind was."""
+    kinds = command_kinds(cmd)
+    if not kinds:
+        return None
+    best = None
+    for size, oom_cmd in con.execute(
+            "SELECT COALESCE(r.size,'large'), r.cmd FROM runs r JOIN leases l USING(box_id) WHERE l.repo_key=? "
+            "AND r.exit_code=137 AND COALESCE(r.size,'') != 'xlarge' AND r.start_at>?",
+            (repo_key, now() - within)).fetchall():
+        if kinds & command_kinds(oom_cmd or ""):
+            up = SIZES[min(SIZES.index(size if size in SIZES else "large") + 1, len(SIZES) - 1)]
+            if _rank(up) < _rank("large"):
+                up = "large"
+            if best is None or _rank(up) > _rank(best):
+                best = up
+    return best
+
+
+# Test runners whose suite may start containers in a testcontainers/compose repo (explicit xlarge kept for them).
+SUITE_RUNNER_CMD = re.compile(r"\bmake\s+(-\S+\s+(\S+\s+)?)*\S*(test|integration|e2e)|"
+                              r"\b(vitest|jest|mocha|ava|playwright)\b|"
+                              r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?test|\bvp\s+(run\s+)?test|\bnode\s+--test|"
+                              r"\bgo\s+test\b|\bpytest\b|\bcargo\s+test|\bgradlew?\b.*\b(test|check|integration)")
+# One named test or test file.
+NARROW_TEST_CMD = re.compile(r"\s-run[\s=]|::|--tests\s|--test-name-pattern|\s-t\s|\.(test|spec)\.[jt]sx?\b|"
+                             r"\btest_\w+\.py\b|\w+_test\.py\b")
+COMPOSE_FILES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+
+
+def xlarge_needed(cmd: str, repo_root: str, repo_key: str) -> bool:
+    """An explicit --size xlarge is kept for: anything that runs Docker, a type-check, the harness repo, or a whole
+    suite in a repo with testcontainers or a compose file (`make test-integration` brings up its stack)."""
+    if typecheck_size(cmd, repo_root, None) or DOCKER_CMD.search(cmd or "") or "harness" in repo_key:
+        return True
+    if not WHOLE_SUITE_CMD.search(cmd or "") and not SUITE_RUNNER_CMD.search(cmd or ""):
+        return False
+    if NARROW_TEST_CMD.search(cmd or "") and not re.search(r"\./\.\.\.|\bmake\s+test", cmd or ""):
+        # One test or file (WHOLE_SUITE_CMD reads any bare pytest as a suite, so it can't veto this): the OOM bump or
+        # OFFBOX_ALLOW_XLARGE covers the rare big one.
+        return False
+    return uses_docker("", repo_root) or any(os.path.isfile(os.path.join(repo_root, n)) for n in COMPOSE_FILES)
 
 
 def auto_size(con, cmd: str, me: dict, size: str | None) -> tuple[str | None, str]:
-    """Size for a run that didn't pass --size (an explicit size always wins) -> (size or None, reason).
+    """Size for a run -> (size or None, reason). None means the template/base size (large for Go/Node/harness,
+    default for generic).
 
-    None means the template/base size (large for Go/Node/harness, default for generic)."""
+    An explicit size wins, except --size xlarge on a command no xlarge rule covers and no same-kind OOM backs: that
+    runs on large. 1,054 hand-picked xlarge runs (13 Oct - 5 Nov) were mostly uv sync + pytest and narrow go tests.
+    OFFBOX_ALLOW_XLARGE=1 keeps an explicit xlarge."""
+    rk = me.get("repo_key") or ""
+    root = me.get("repo_root") or ""
+    if size == "xlarge" and os.environ.get("OFFBOX_ALLOW_XLARGE") != "1" and not xlarge_needed(cmd, root, rk) \
+            and oom_recent(con, rk, cmd) != "xlarge":
+        return "large", ("--size xlarge isn't needed for this command (no container stack, type-check or recent "
+                         "out-of-memory kill of this kind): running it on large. If it is killed for memory (exit "
+                         "137), the next run of this kind goes to xlarge by itself; OFFBOX_ALLOW_XLARGE=1 forces xlarge")
     if size:
         return size, ""
-    tc = typecheck_size(cmd, me.get("repo_root") or "", None)
+    tc = typecheck_size(cmd, root, None)
     if tc:
         return tc, "typecheck run: using an xlarge box (tsc ran out of memory on large); pass --size to override"
-    rk = me.get("repo_key") or ""
     if BIG_STACK_CMD.search(cmd or "") or "harness" in rk:
         return "xlarge", "container stack run: using an xlarge box; pass --size to override"
-    if WHOLE_SUITE_CMD.search(cmd or "") and uses_docker("", me.get("repo_root") or ""):
+    if WHOLE_SUITE_CMD.search(cmd or "") and uses_docker("", root):
         return "xlarge", "whole suite in a testcontainers repo: using an xlarge box; pass --size to override"
-    if oom_recent(con, rk):
-        return "xlarge", "a run in this repo was killed for memory in the last 14 days: using an xlarge box"
+    bump = oom_recent(con, rk, cmd)
+    if bump:
+        return bump, f"a run like this one was killed for memory here in the last 3 days: using a {bump} box"
     return None, ""
 
 
@@ -118,15 +251,19 @@ def docker_recent(con, box_id: str | None = None, within: int = 7200, repo_root:
                   thread: str | None = None) -> bool:
     """Docker ran lately on this box (its stop archives images and its next boot reloads them, so stop it less),
     or for this repo/thread (local-first then leaves the next check on the box). Recency counts from the run's
-    start or end; a run still going counts."""
+    start or end; a run still going counts.
+
+    runs.docker starts from the command and manifest (uses_docker) and is cleared at the end of a run that started
+    no container (runs.finish), so only a run still going counts on its command text alone. 13 Oct - 5 Nov, 1,826
+    runs got the 20-minute Docker idle window from a testcontainers manifest alone (ruff, make type, uv sync)."""
     if box_id:
         where, args = "box_id=?", [box_id]
     else:
         where, args = "(repo_root=? OR thread_id=?)", [repo_root or "-", thread or "-"]
     t = now() - within
     sql = (f"SELECT 1 FROM runs WHERE {where} AND mode!='local' AND (start_at>? OR end_at>? OR "
-           "(end_at IS NULL AND status IN ('starting','running'))) AND (docker=1 OR cmd LIKE '%docker%' "
-           "OR cmd LIKE '%compose%' OR cmd LIKE '%testcontainers%') LIMIT 1")
+           "(end_at IS NULL AND status IN ('starting','running'))) AND (docker=1 OR (end_at IS NULL AND "
+           "(cmd LIKE '%docker%' OR cmd LIKE '%compose%' OR cmd LIKE '%testcontainers%'))) LIMIT 1")
     return con.execute(sql, (*args, t, t)).fetchone() is not None
 
 
@@ -432,21 +569,25 @@ _FOLLOW_STOP_S = 160
 
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
+    from . import outage
     options = {"on_state": on_state} if on_state is not None else {}
-    s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
-    ssh_sync.setup(box_id)
-    ssh_sync.wait_ssh(box_id)
-    if recipe:
-        run_recipe(box_id, recipe, box_held=box_held)
-    elif fresh:
-        bootstrap_fresh(box_id)
+    with outage.accepted_machine():
+        s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
+        ssh_sync.setup(box_id)
+        ssh_sync.wait_ssh(box_id)
+        if recipe:
+            run_recipe(box_id, recipe, box_held=box_held)
+        elif fresh:
+            bootstrap_fresh(box_id)
     return s
 
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+        raise ResumeUnresolved(f"{box_id} has an unanswered resume; refresh deferred")
     capacity.check(con)
-    api.resume(box_id, 600)
+    _resume_confirmed(con, box_id, 600, None)
     api.wait_state(box_id, api.LIVE_STATES, timeout=60)
     api.stop(box_id)
     event(con, box_id, "refresh", "resume + stop restarts boat's 14-day data limit")
@@ -564,6 +705,14 @@ class ArchivingSkip(OffboxError):
     """A box that cannot be resumed yet is skipped by pool callers like a busy box."""
 
 
+class ResumeStuck(ArchivingSkip):
+    """The archived retry was spent; this caller must not resume the box again."""
+
+
+class ResumeStopped(ArchivingSkip):
+    """A pending attempt is confirmed stopped; reconcile its siblings before choosing its one retry."""
+
+
 class _ResumeExpired(Exception):
     """The stopped box's data expired while a resume was being requested."""
 
@@ -572,7 +721,8 @@ def _forget_expired(con, box_id: str, why: str) -> None:
     """boat deleted this stopped box's data (14 days after its stop): nothing to resume, a new box replaces it."""
     say(f"lease {box_id} expired ({why}); starting a new box")
     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    con.commit()
+    from . import allocation
+    allocation.clear_resume(con, box_id)
     event(con, box_id, "lease_expired", why)
 
 
@@ -625,8 +775,237 @@ def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
     con.commit()
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False):
+class ResumeUnresolved(OffboxError):
+    """A resume may have been accepted, but its box could not be confirmed."""
+
+    def __init__(self, message, cause=None):
+        super().__init__(message, started=bool(cause and cause.started), outage=bool(cause and cause.outage))
+        self.status = getattr(cause, 'status', None)
+
+
+class ResumeProvisionStalled(OffboxError):
+    """An unanswered resume was accepted, but never became usable within its provisioning cap."""
+
+
+def _wait_unanswered_resume(con, box_id):
+    from . import outage
+    seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
+    key = f'resume_provision:{box_id}'
+    saved = con.execute('SELECT v FROM kv WHERE k=?', (key,)).fetchone()
+    end = float(saved[0]) if saved else time.time() + seconds
+    if not saved:
+        con.execute('INSERT INTO kv VALUES (?,?,?)', (key, str(end), time.time()))
+        con.commit()
+    with outage.accepted_machine():
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
+                con.commit()
+                raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
+                                             "nothing ran; set aside and trying a new box")
+            try:
+                state = api.get(box_id, deadline=time.time() + left)
+            except OffboxError:
+                state = None
+            else:
+                if state is None or state.get('dataExpiredAt'):
+                    _forget_expired(con, box_id, 'confirmed missing or expired during resume provisioning')
+                    raise _ResumeExpired
+            if state and state.get("state") in api.LIVE_STATES:
+                from . import allocation
+                allocation.clear_resume(con, box_id)
+                return
+            time.sleep(min(2, max(0, end - time.time())))
+
+
+def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
+                      confirm_only: bool = False):
+    from . import allocation
+    with allocation.guard(box_id, reconcile=pending):
+        return _resume_under_guard(con, box_id, ttl, size, pending, retry, confirm_only)
+
+
+def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
+                        confirm_only: bool = False):
+    key = f"resume_unanswered:{box_id}"
+
+    def mark_pending():
+        con.execute("INSERT OR REPLACE INTO kv(k,v,ts) VALUES (?, ?, ?)", (key, size or "", now()))
+        con.commit()
+
+    def clear_pending():
+        con.execute("DELETE FROM kv WHERE k=?", (key,))
+        con.commit()
+
+    def confirm(unanswered):
+        log(f"resume_unanswered {box_id}")
+        # A read timeout is not a refusal. Only resend if boat confirms the box stayed stopped for the full window.
+        seconds = capacity.setting("OFFBOX_RESUME_CONFIRM_SECONDS", 120, minimum=0, maximum=120)
+        end = time.monotonic() + seconds
+        last = None
+        observed = False
+        unreadable = False
+        observations = 0
+        previous_read = time.monotonic()
+        while True:
+            left = end - time.monotonic()
+            from . import outage
+            remaining = outage.allocation_left()
+            if remaining is not None:
+                left = min(left, remaining)
+            if left <= 0:
+                break
+            try:
+                last = api.get(box_id, deadline=time.time() + left)
+            except OffboxError:
+                last = None
+                observed = False
+                unreadable = True
+            else:
+                if last is None or last.get('dataExpiredAt'):
+                    _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
+                    raise _ResumeExpired
+            if last is None:
+                unreadable = True
+            read_at = time.monotonic()
+            if read_at > end or read_at - previous_read > 3:
+                unreadable = True
+            previous_read = read_at
+            if last and last.get("state") in api.STARTING_STATES + api.LIVE_STATES:
+                if last.get('state') in api.LIVE_STATES:
+                    from . import allocation
+                    allocation.clear_resume(con, box_id)
+                return last
+            if last and last.get("state") not in api.STOPPED_STATES:
+                raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                       "nothing ran. Retry later") from unanswered
+            if last:
+                observed = True
+                observations += 1
+            left = end - time.monotonic()
+            remaining = outage.allocation_left()
+            if remaining is not None:
+                left = min(left, remaining)
+            if remaining is not None and remaining <= 0:
+                raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                       "nothing ran. Retry later") from unanswered
+            if left <= 0:
+                break
+            # Leave time for a final observation near the boundary, not a second after it.
+            time.sleep(min(2, max(0, left - 0.05)))
+            if left <= 0.05:
+                break
+        if not last or not observed or unreadable or observations < 2:
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
+                                   "nothing ran. Retry later") from unanswered
+        return False
+
+    def send():
+        # The persistent marker is written before sending: a killed client cannot forget an ambiguous resume.
+        from . import outage
+        from . import allocation
+        other = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+                            "WHERE l.repo_key=(SELECT repo_key FROM leases WHERE box_id=?) "
+                            "AND l.box_id<>? AND l.state IN ('running','stopped') LIMIT 1", (box_id, box_id)).fetchone()
+        if other:
+            raise allocation.Unresolved(f"{other[0]} has an unanswered resume; reconcile before sending another")
+        if outage.allocation_left() == 0:
+            from .pool import PoolBusyError
+            raise PoolBusyError("allocation wait expired before resume; nothing ran")
+        mark_pending()
+        try:
+            api.resume(box_id, ttl, size)
+        except OffboxError as e:
+            if isinstance(e, api.NetworkError) or (isinstance(e, api.ApiError) and e.status in (502, 504, 520, 524)):
+                return e
+            clear_pending()
+            raise
+        clear_pending()
+        return None
+
+    unanswered = None if pending else send()
+    if pending or unanswered is not None:
+        confirmed = confirm(unanswered)
+        if confirmed:
+            return confirmed, False
+        if confirm_only:
+            from . import allocation
+            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+            allocation.clear_resume(con, box_id)
+            raise ResumeStopped(f"{box_id} stayed archived after its unanswered resume; attempt settled")
+        if not retry:
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered after its archived retry; "
+                                   "nothing ran. Retry later") from unanswered
+        unanswered = send()
+        if unanswered is not None:
+            confirmed = confirm(unanswered)
+            if confirmed:
+                return confirmed, True
+            raise ResumeUnresolved(f"resume of {box_id} was unanswered twice; nothing ran. Retry later") from unanswered
+        return None, True
+    return None, False
+
+
+def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
+                      skip_archiving=False):
+    left_stopped = bool(confirmed)
+    if confirmed and confirmed.get('state') in api.STARTING_STATES:
+        _wait_unanswered_resume(con, box_id)
+    sent_at = now()
+
+    def check_resume(state):
+        nonlocal sent_at, retried, left_stopped
+        if state.get('state') not in api.STOPPED_STATES:
+            left_stopped = True
+        if left_stopped or now() - sent_at < RESUME_STUCK_S:
+            return
+        if not retried and request_resume is not None:
+            retried = True
+            observed, _ = request_resume(retry=False)
+            if observed:
+                left_stopped = True
+                if observed.get('state') in api.STARTING_STATES:
+                    _wait_unanswered_resume(con, box_id)
+            sent_at = now()
+            event(con, box_id, 'resume_resent', f'still archived after {RESUME_STUCK_S}s')
+            return
+        con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+        con.commit()
+        event(con, box_id, 'resume_stuck', f'still archived after two resumes, {RESUME_STUCK_S}s each')
+        message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
+        if skip_archiving:
+            raise ResumeStuck(message, code=EXIT_BUSY)
+        raise OffboxError(message)
+
+    try:
+        return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+        raise
+    except OffboxError as e:
+        raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
+
+
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
     box_id = row["box_id"]
+    from . import allocation
+    allocation.recover_resumes(con, row['repo_key'])
+    pending = con.execute("SELECT v FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone()
+    if pending:
+        pending_size = pending[0] if pending[0] in SIZES else None
+        try:
+            confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, pending_size, pending=True,
+                                                  confirm_only=skip_archiving)
+            up = _bring_up_resumed(con, box_id, confirmed, retried, skip_archiving=skip_archiving)
+        except _ResumeExpired:
+            return None
+        want = up.get("type") if isinstance(up, dict) else None
+        want = want if want in SIZES else row["size"]
+        con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=? WHERE box_id=?", (want, now(), box_id))
+        con.commit()
+        if _bigger(size, want):
+            raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
+        return dict(con.execute("SELECT * FROM leases WHERE box_id=?", (box_id,)).fetchone())
     # Fast path: lease marked running and the ssh master answers -> no API calls at all.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
         p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-O", "check", box_id], capture_output=True, timeout=10)
@@ -636,7 +1015,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
     s = api.get(box_id)
     if s is None or s.get("state") in ("error", "cancelled"):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-        con.commit()
+        allocation.clear_resume(con, box_id)
         event(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
     if s.get("dataExpiredAt"):
@@ -714,10 +1093,11 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 f"(pass --size {want} to wait for {want})")
             want = fit
         say(f"resuming stopped lease {box_id} ({want})")
-        def request_resume():
+        def request_resume(retry=True):
             nonlocal want
             try:
-                api.resume(box_id, RUN_TTL_S, want if want != s.get("type") else None)
+                confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S,
+                                                       want if want != s.get("type") else None, retry=retry)
             except api.ApiError as e:
                 if e.api_code in api.DATA_GONE:
                     _forget_expired(con, box_id, str(e))
@@ -734,47 +1114,28 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False):
                 say(f"could not shrink {box_id} to {want} ({e}); resuming as {s.get('type')}")
                 want = s.get("type")
                 try:
-                    api.resume(box_id, RUN_TTL_S, None)
+                    confirmed, retried = _resume_confirmed(con, box_id, RUN_TTL_S, None, retry=retry)
                 except api.ApiError as e2:
                     tb = _too_big(con, box_id, e2)
                     if tb:
                         raise tb from e2
                     raise
+            return confirmed, retried
 
         try:
-            request_resume()
-            sent_at = now()
-            resent = False
-            left_stopped = False
-
-            def check_resume(state):
-                nonlocal sent_at, resent, left_stopped
-                if state.get("state") not in api.STOPPED_STATES:
-                    left_stopped = True
-                if left_stopped or now() - sent_at < RESUME_STUCK_S:
-                    return
-                if not resent:
-                    request_resume()
-                    sent_at = now()
-                    resent = True
-                    event(con, box_id, "resume_resent", f"still archived after {RESUME_STUCK_S}s")
-                    return
-                con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-                con.commit()
-                event(con, box_id, "resume_stuck", f"still archived after two resumes, {RESUME_STUCK_S}s each")
-                message = f"boat didn't start {box_id} after two resumes; nothing ran, retry"
-                if skip_archiving:
-                    raise ArchivingSkip(message, code=EXIT_BUSY)
-                raise OffboxError(message)
-
-            up = _bring_up(box_id, since=t, stale_error=s.get("error"), on_state=check_resume)
+            confirmed, retried = request_resume(retry=not retrying)
+            up = _bring_up_resumed(con, box_id, confirmed, retrying or retried, request_resume,
+                                  since=t, stale_error=s.get('error'), skip_archiving=skip_archiving)
         except _ResumeExpired:
             return None
         if isinstance(up, dict) and up.get("type") in SIZES:
             want = up["type"]
         event(con, box_id, "lease_resume", f"{round(now() - t, 1)}s size={want}")
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
-        _bring_up(box_id)
+        try:
+            _bring_up(box_id)
+        except OffboxError as e:
+            raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)
     else:
         raise OffboxError(f"lease {box_id} in unexpected state {st}")
@@ -854,6 +1215,8 @@ def release_if_confirmed(con, box_id: str, run_id: str | None = None) -> bool:
     the hold, since a run may be allocating the box right now."""
     try:
         with file_lock('box-' + box_id, timeout=0):
+            if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                return False
             return _release_locked(con, box_id, run_id)
     except OffboxError:
         return False
@@ -871,6 +1234,8 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             api.wait_state(box_id, api.STOPPED_STATES, timeout=900)
     except api.ApiError as e:
         if e.status == 404:
+            from . import allocation
+            allocation.clear_resume(con, box_id)
             # Release first, then retire the lease only if no hold remains. A failed confirmation keeps the lease
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
@@ -895,7 +1260,8 @@ def delete_box(con, box_id: str, reason: str) -> bool:
     d = api.delete(box_id)
     op = (d.get("operation") or {}).get("id")
     con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
-    con.commit()
+    from . import allocation
+    allocation.clear_resume(con, box_id)
     clear_prune_hold(con, box_id)  # deleted: no remote process survives
     event(con, box_id, "delete", f"{reason} op={op}")
     return True

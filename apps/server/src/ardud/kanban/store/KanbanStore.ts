@@ -92,6 +92,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     page?: { readonly after: number; readonly limit: number },
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly cardPage: (
+    boardId: KanbanBoardId,
+    page: { readonly after: number; readonly limit: number; readonly open: boolean },
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   /** Only the fields the board list's badges read, for every card on the board, in number order. */
   readonly summaryCards: (
     boardId: KanbanBoardId,
@@ -356,6 +360,19 @@ const make = Effect.gen(function* () {
           FROM ardud_kanban_cards
           WHERE board_id = ${boardId} AND number > ${page?.after ?? 0}
           ORDER BY number LIMIT ${page?.limit ?? -1}
+        `,
+        (rows) => decodeAll(rows, Card.decode),
+      ),
+    );
+  const cardPage: KanbanStoreShape["cardPage"] = (boardId, page) =>
+    runRead(
+      "read card page",
+      Effect.flatMap(
+        sql<JsonRow>`
+          SELECT number, json FROM ardud_kanban_cards
+          WHERE board_id = ${boardId} AND number > ${page.after}
+            ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+          ORDER BY number LIMIT ${page.limit}
         `,
         (rows) => decodeAll(rows, Card.decode),
       ),
@@ -909,6 +926,7 @@ const make = Effect.gen(function* () {
     cards,
     summaryCards,
     feedCards,
+    cardPage,
     feedGoals: (boardId) =>
       runRead(
         "read feed goals",

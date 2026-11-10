@@ -588,6 +588,37 @@ class IdentityTest(unittest.TestCase):
         self.assertGreater(ti.sync(self.mem, special), 0)
         self.assertTrue(any(row[0] == "T" for row in self.aliases()))
 
+    def test_gather_does_not_hold_memory_writer_lock_and_refresh_is_serialized(self):
+        ti.sync(self.mem, self.state)
+        original = ti.gather
+        observed = []
+        def gather(state, budget=None):
+            with closing(sqlite3.connect(self.mem, timeout=0)) as writer, writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("INSERT INTO harness_schema_meta VALUES('other-writer','ok')")
+            # A second refresh must not gather a newer snapshot before this one publishes.
+            observed.append(ti.sync(self.mem, self.state))
+            return original(state, budget)
+        with mock.patch.object(ti, "gather", side_effect=gather):
+            self.assertGreater(ti.sync(self.mem, self.state), 0)
+        self.assertEqual(observed, [0])
+
+    def test_expired_gather_never_publishes_partial_aliases(self):
+        from capture_budget import Budget, Exhausted
+        ti.sync(self.mem, self.state)
+        before = self.aliases()
+        clock = [0]
+        budget = Budget(1, clock=lambda: clock[0])
+        original = ti.gather
+        def gather(state, actual_budget):
+            rows = original(state, actual_budget)
+            clock[0] = 2
+            return rows
+        with mock.patch.object(ti, "Budget", return_value=budget), mock.patch.object(ti, "gather", side_effect=gather):
+            with self.assertRaises(Exhausted):
+                ti.sync(self.mem, self.state)
+        self.assertEqual(self.aliases(), before)
+
 
 class NativeIdentityTest(unittest.TestCase):
     def setUp(self):

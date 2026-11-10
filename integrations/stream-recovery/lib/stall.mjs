@@ -3,6 +3,7 @@
 
 import { createHash } from "node:crypto";
 import { hhmm, isNestedThreadId, toMs, truncate } from "./detect.mjs";
+import { neverSettles } from "./codemode-never-settles.mjs";
 import { openCodeSession } from './harness.mjs';
 
 // Opus (our slowest silent thinker) may sit silent up to its 15 min
@@ -10,12 +11,14 @@ import { openCodeSession } from './harness.mjs';
 // without a chunkTimeout get the same bound.
 export const LLM_QUIET_MS = 30 * 60_000;
 // A running tool's output never reaches the message, so the only bound is the
-// tool's own: a shell past its timeout plus this margin is hung. Other tools
-// get TOOL_QUIET_MS, and a shell with its timeout turned off gets
-// NO_TIMEOUT_MS.
+// tool's own: a shell past its timeout plus this margin is hung. Code Mode has
+// no timeout, so execute gets a shorter bound; other tools get TOOL_QUIET_MS.
+// A shell with its timeout turned off gets NO_TIMEOUT_MS.
 export const SHELL_MARGIN_MS = 30 * 60_000;
 export const SHELL_DEFAULT_TIMEOUT_MS = 120_000;
 export const TOOL_QUIET_MS = 2 * 3_600_000;
+export const EXECUTE_QUIET_MS = 20 * 60_000;
+export const EXECUTE_NEVER_SETTLES_MS = 3 * 60_000;
 export const NO_TIMEOUT_MS = 8 * 3_600_000;
 // After a Robob interrupt, wait this long before interrupting OpenCode directly.
 export const FALLBACK_MS = 2 * 60_000;
@@ -37,6 +40,7 @@ export const fingerprint = (messages) =>
 
 // How long a running tool may stay quiet before it counts as hung.
 export function toolLimit(part) {
+  if (part?.name === "execute") return neverSettles(part.state?.input?.code) ? EXECUTE_NEVER_SETTLES_MS : EXECUTE_QUIET_MS;
   if (part?.name !== "shell") return TOOL_QUIET_MS;
   const timeout = part.state?.input?.timeout;
   if (timeout === 0) return NO_TIMEOUT_MS;
@@ -72,7 +76,9 @@ export function tailActivity(messages) {
     return { lastMs, kind: "subagent", label: "waiting on a subagent", limitMs: TOOL_QUIET_MS };
   }
   if (running.length) {
-    return { lastMs, kind: "tool", label: `running ${names(running)}`, limitMs: Math.max(...running.map(toolLimit)) };
+    const label = running.map(p => p.name === "execute" && neverSettles(p.state?.input?.code)
+      ? "execute (code awaits a promise that never resolves)" : p.name || "tool");
+    return { lastMs, kind: "tool", label: `running ${[...new Set(label)].join(", ")}`, limitMs: Math.max(...running.map(toolLimit)) };
   }
   const streaming = tools.filter((p) => p.state?.status === "streaming" || p.state?.status === "pending");
   if (streaming.length) {

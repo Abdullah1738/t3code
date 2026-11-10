@@ -19,7 +19,9 @@ def main():
         bins = Path(temp) / "bin"
         bins.mkdir()
         taskpolicy = bins / "taskpolicy"
-        taskpolicy.write_text('#!/bin/bash\n[ "$1" = -b ] && shift\nexec "$@"\n')
+        # Accept the flag forms the scripts use (-b, -d <policy>) and drop them.
+        taskpolicy.write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do case "$1" in -b) shift ;; '
+                              '-c|-d|-g|-t|-l) shift 2 ;; *) break ;; esac; done\nexec "$@"\n')
         taskpolicy.chmod(0o755)
         date = bins / "date"
         date.write_text('#!/bin/bash\nif [ "$1" = -r ]; then shift; timestamp="$1"; shift; '

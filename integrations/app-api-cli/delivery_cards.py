@@ -30,11 +30,12 @@ BRIDGE = str(Path.home() / '.local/share/spectrum-bridge/src/cli.ts')
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 THEMES = {'noon': ('#feee00', '#16160f'), 'talabat': ('#ff5a00', '#201006'),
           'careem': ('#00df72', '#062c1b'), 'amazon': ('#ffb347', '#202326')}
-LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food'),
+LANES = {'noon': ('minutes', 'nownow', 'supermall', 'main', 'food', 'marketplace'),
          'talabat': ('restaurants', 'mart', 'shops'), 'careem': ('food', 'quik', 'shops', 'box'),
          'amazon': ('same-day',)}
 NAMES = {'noon': 'noon', 'talabat': 'Talabat', 'careem': 'Careem', 'amazon': 'Amazon'}
 LABELS = {'minutes': 'Minutes', 'nownow': 'NowNow', 'supermall': 'Supermall', 'main': 'Main',
+          'marketplace': 'Marketplace',
           'restaurants': 'Food', 'mart': 'Mart', 'shops': 'Shops', 'food': 'Food',
           'quik': 'Quik', 'box': 'Box', 'same-day': 'Same-day'}
 
@@ -97,7 +98,7 @@ def image_url(value):
     return None
 
 
-def items(rows):
+def items(rows, *, private_notes=False):
     out = []
     for row in (rows or [])[:150]:
         if not isinstance(row, dict):
@@ -112,12 +113,13 @@ def items(rows):
         if price is None and row.get('price_minor') is not None:
             price = number(row['price_minor'])
             price = price / 100 if price is not None else None
-        # Choices are the server's own label (size, sauce, sides). Notes and
-        # special requests are the customer's free text and never reach a card.
+        # Free-text notes are opt-in for the owner's private card only.
         # Talabat allows 600 characters; keep them all so two long labels that differ only
         # at the end stay different. The bubble trims at display time.
         detail = next((text(row[k], 600) for k in ('detail', 'choices_text', 'choicesString', 'choices')
                        if isinstance(row.get(k), str) and row[k].strip()), None)
+        if private_notes and isinstance(row.get('notes'),str) and row['notes'].strip():
+            detail=(detail+'; ' if detail else '')+'Note: '+text(row['notes'],500)
         out.append({'name': name or (f'Item {ident}' if ident else 'Item details pending'),
                     'unresolved': bool(row.get('unresolved') or not name), 'detail': detail,
                     'qty': int(qty), 'price': price, 'line_total': amount(row.get('line_total')),
@@ -317,7 +319,7 @@ def lane(cfg, meta):
             return v
     if app == 'noon':
         order = cfg['order'].upper()
-        return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'main' if order.startswith('N') else 'minutes'
+        return 'nownow' if order.startswith('NN') else 'food' if order.startswith('F') else 'marketplace' if order.startswith('N') else 'minutes'
     # Unknown Careem/Talabat vertical must not invent a food/grocery stage.
     return 'same-day' if app == 'amazon' else ''
 
@@ -332,13 +334,18 @@ def stage(data, food=False):
         current = 'unknown'
     if current == 'unknown':
         previous = data.get('last_confirmed_status', 'unknown')
-        if previous not in ('delivered', 'cancelled') or data.get('whole_order_complete') is not False:
+        if previous not in ('delivered', 'cancelled'):
             current = previous
     mapping = {'placed': 0, 'confirmed': 0, 'preparing': 1, 'packed': 1,
                'picked up': 2, 'out for delivery': 3 if food else 2,
                'nearby': 3 if food else 2, 'delivered': len(steps)-1}
     idx = mapping.get(current, -1)
     label = 'Cancelled' if current == 'cancelled' else 'Awaiting confirmation' if current == 'pending confirmation' else steps[idx] if idx >= 0 else 'Tracking pending'
+    if idx < 0 and current=='unknown':
+        if data.get('raw_status')=='processing':
+            label='Processing'
+        elif data.get('status_text') and not re.search(r'cancel|deliver|complet',data['status_text'],re.I):
+            label=text(data['status_text'],120)
     if current == 'preparing' and not food:
         # Preparing is not proof that packing has finished.
         steps[1] = label = 'Packing'
@@ -349,13 +356,17 @@ def stage(data, food=False):
 
 
 def eta(data, cfg):
-    checked = instant(data.get('checked_at'))
+    checked = instant(data.get('eta_observed_at') or data.get('checked_at'))
     # Resolve relative estimates against the observation, not render time.
     raw = text(data.get('eta_text'), 80)
     minutes = data.get('eta_relative_minutes')
+    marketplace=cfg.get('app')=='noon' and lane(cfg,{}) in ('main','supermall','marketplace')
+    if marketplace:
+        from noon_http_orders import marketplace_eta_minutes
+        minutes=marketplace_eta_minutes(raw)
     if type(minutes) not in (int, float) or not math.isfinite(minutes):
         minutes = None
-    if minutes is None and raw:
+    if minutes is None and raw and not marketplace:
         hours = re.search(r'(\d+)\s*(?:hr|hour)', raw, re.I)
         mins = re.search(r'(\d+)(?:\s*[-–]\s*(\d+))?\s*min', raw, re.I)
         if hours or mins:
@@ -382,14 +393,25 @@ def view(cfg, data, meta):
     store = text(meta.get('store') or cfg.get('store') or data.get('vendor_name'))
     if not store and ':' in cfg.get('label', ''):
         store = text(cfg['label'].split(':', 1)[0])
-    rows = items(meta.get('items'))
-    observed = items(data.get('manifest_items') or data.get('items'))
+    private_notes=cfg.get('for','owner')=='owner' and cfg.get('chat','owner')=='owner' and not meta.get('public')
+    rows = items(meta.get('items'),private_notes=private_notes)
+    observed = items(data.get('items') if data.get('items_complete') else data.get('manifest_items') or data.get('items'),private_notes=private_notes)
     if not rows or (observed and any(not i['unresolved'] for i in observed) and all(i['unresolved'] for i in rows)):
         rows = observed or rows
     else:
         rows = fill_details(rows, observed)
+    if private_notes and data.get('items_complete') and observed:
+        for row in rows:
+            matches=[i for i in observed if not i['unresolved'] and i['name']==row['name'] and i['qty']==row['qty']]
+            peers=[i for i in rows if i['name']==row['name'] and i['qty']==row['qty']]
+            if len(matches)==len(peers)==1:
+                detail=matches[0].get('detail') or ''
+                if '; Note: ' in detail and row.get('detail')==detail.split('; Note: ',1)[0]:
+                    row['detail']=detail
     rows = picks(rows)
     total = amount(meta.get('total') if meta.get('total') is not None else cfg.get('total'))
+    if total is None:
+        total = amount(data.get('total'))
     partial = bool(data.get('whole_order_complete') is False and (
         any(p.get('stage') == 'delivered' for p in data.get('partial_evidence', [])) or
         any(p.get('status') == 'delivered' for p in data.get('shipments', []))))
@@ -521,7 +543,7 @@ def build(cfg, data, meta=None, outdir=None, url=None, *, public=False):
     folder = Path(outdir) if outdir else APPS / slug(cfg['app'], cfg['order'])
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {**({} if public else read(folder / 'items.json')), **cfg.get('card_meta', {}), **(meta or {})}
-    v = view(cfg, data, metadata)
+    v = view(cfg, data, {**metadata, 'public':public})
     # JSON refresh and static fallback use the same projection.
     atomic(folder / 'status.json', v)
     fingerprint = hashlib.sha256(json.dumps({k: v[k] for k in ('brand', 'store', 'big', 'sub', 'stage', 'count', 'total', 'sample', 'summary')}, sort_keys=True).encode()).hexdigest()
@@ -787,7 +809,7 @@ def prune_completed_shares():
 
 
 def share_days(cfg):
-    days = 7 if cfg.get('app') == 'amazon' or cfg.get('vertical') in ('main', 'supermall') else 2
+    days = 7 if cfg.get('app') == 'amazon' or cfg.get('vertical') in ('main', 'supermall', 'marketplace') else 2
     promised = instant(cfg.get('eta'))
     if promised:
         days = max(days, math.ceil((promised.timestamp()-time.time())/86400)+2)

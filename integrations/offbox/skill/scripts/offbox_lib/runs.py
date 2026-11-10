@@ -30,6 +30,184 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
 
+# Recipes travel with this runner so an uninstalled checkout can prove the exact change.
+REPO_RECIPES_DIR = Path(__file__).resolve().parents[2] / "templates" / "repos"
+REPO_SETUP_FAILED_MARKER = "offbox-repo-setup-failed"
+EXIT_REPO_SETUP = 98
+
+REPO_SETUP = r'''# offbox-repo-setup
+(
+  set -euo pipefail
+  mkdir -p "$HOME/.offbox/repo-env"
+  exec 9>"$HOME/.offbox/repo-setup-@KEY@.lock"
+  flock -x -w 1800 9
+  export OFFBOX_REPO_ROOT="$HOME"/@ROOT@
+  _offbox_base="$HOME/.offbox/repo-setup-@KEY@"
+  _offbox_stamp=$(python3 - "$OFFBOX_REPO_ROOT" <<'OFFBOX_REPO_STAMP'
+import base64, hashlib, re, sys
+from pathlib import Path
+recipe = base64.b64decode('@RECIPE@')
+mod = Path(sys.argv[1]) / 'core/go.mod'
+match = re.search(r'^\s*(?:require\s+)?golang\.org/x/mobile\s+(v[^\s]+)', mod.read_text(), re.M) if mod.exists() else None
+version = match[1] if match else ''
+print(hashlib.sha256(recipe + b'\0' + version.encode()).hexdigest())
+OFFBOX_REPO_STAMP
+  )
+  if [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
+     [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
+    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    rm -f "$_offbox_base.stamp"
+    _offbox_t0=$SECONDS
+    python3 - "$_offbox_base.sh" <<'OFFBOX_REPO_RECIPE'
+import base64, sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
+OFFBOX_REPO_RECIPE
+    bash "$_offbox_base.sh"
+    # A successful recipe must publish the environment before we trust its stamp.
+    test -f "$HOME/.offbox/repo-env/@KEY@.sh"
+    printf '%s\n' "$_offbox_stamp" > "$_offbox_base.stamp.tmp"
+    mv -f "$_offbox_base.stamp.tmp" "$_offbox_base.stamp"
+    echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3
+  fi
+) 3>&2 >>"$HOME/.offbox/repo-setup-@KEY@.log" 2>&1
+_offbox_repo_rc=$?
+if [ "$_offbox_repo_rc" -ne 0 ]; then
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+fi
+. "$HOME/.offbox/repo-env/@KEY@.sh" || {
+  tail -n 20 "$HOME/.offbox/repo-setup-@KEY@.log" >&2
+  echo 'offbox: @KEY@ toolchain setup failed on this box; nothing ran' >&2
+  echo offbox-repo-setup-failed >&2
+  exit 98
+}
+'''
+
+
+def repo_setup_block(repo_key: str, rdir: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", repo_key):
+        return ""
+    recipe = REPO_RECIPES_DIR / f"{repo_key}.sh"
+    if not recipe.is_file():
+        return ""
+    # The log redirection opens before the subshell can create its directories.
+    return ('mkdir -p "$HOME/.offbox" || { '
+            f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
+            'echo offbox-repo-setup-failed >&2; exit 98; }\n'
+            + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
+            .replace('@RECIPE@', base64.b64encode(recipe.read_bytes()).decode()))
+
+# The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
+# itself so even boxes made before the fix use the bound. The supervisor never waits for a wedged root child.
+IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
+(
+  _offbox_seconds=${OFFBOX_IMAGE_WAIT_SECONDS:-180}
+  [[ $_offbox_seconds =~ ^[1-9][0-9]{0,3}$ ]] || _offbox_seconds=180
+  echo 'offbox: waiting for kept docker images' >&2
+  python3 - "$_offbox_seconds" <<'OFFBOX_IMAGE_WAIT'
+import os, selectors, signal, subprocess, sys, time
+seconds = int(sys.argv[1])
+script = r"""
+set -u -o pipefail
+archive=/home/user/.offbox/images/saved.tar.zst
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
+exec 9>/run/offbox-image-restore.lock || exit 1
+flock -w "$1" 9 || exit 124
+[ -e /run/offbox-images-ready ] && exit 0
+[ -s "$archive" ] || exit 0
+until docker info >/dev/null 2>&1; do sleep 1; done
+missing=0
+if [ -s "$archive.tags" ]; then
+  while read -r tag; do
+    [ -n "$tag" ] || continue
+    docker image inspect "$tag" >/dev/null 2>&1 || { missing=1; break; }
+  done < "$archive.tags"
+else
+  missing=1
+fi
+if [ "$missing" = 1 ]; then
+  size=$(du -h "$archive" 2>/dev/null | cut -f1)
+  echo "offbox: loading kept docker images (${size:-unknown size})..." >&2
+  zstd -dc "$archive" | docker load > /var/tmp/offbox-image-restore.log 2>&1 || exit 1
+fi
+touch /run/offbox-images-ready
+"""
+# Root timeout can signal Docker; the unprivileged supervisor still returns if sudo/timeout is stuck in D state.
+# Capture and relay output so an abandoned child cannot keep the run's SSH output descriptors open.
+try:
+    child = subprocess.Popen(['sudo', '-n', 'timeout', '-k', '2s', f'{seconds}s', 'bash', '-c', script,
+                              'offbox-image-restore', str(seconds)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+except OSError:
+    sys.exit(1)
+selector = selectors.DefaultSelector()
+selector.register(child.stdout, selectors.EVENT_READ)
+deadline = time.monotonic() + seconds
+while True:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        # No wait/communicate here: SIGKILL cannot reap a process blocked in uninterruptible kernel I/O.
+        child.stdout.close()
+        selector.close()
+        sys.exit(124)
+    for key, _ in selector.select(min(left, 0.1)):
+        data = os.read(key.fd, 65536)
+        if data:
+            os.write(2, data)
+        else:
+            selector.unregister(key.fileobj)
+    rc = child.poll()
+    if rc is not None and not selector.get_map():
+        child.stdout.close()
+        selector.close()
+        sys.exit(rc if rc >= 0 else 128 - rc)
+OFFBOX_IMAGE_WAIT
+  _offbox_rc=$?
+  case $_offbox_rc in
+    0) ;;
+    124|137) echo "offbox: kept docker images still loading after ${_offbox_seconds}s; continuing without waiting" >&2 ;;
+    *) echo 'offbox: could not restore kept docker images; continuing without waiting' >&2 ;;
+  esac
+  exit 0
+)'''
+
+
+def needs_image_wait(cmd: str, repo_root: str) -> bool:
+    """Skip only simple read-only commands which cannot start a container themselves.
+
+    Scripts, make targets, tests and unknown commands can invoke Docker without naming it in argv.
+    """
+    if re.search(r"[;&|<>$`\n(){}*?\[\]\\]", cmd) or re.search(r"(^|\s)#", cmd):
+        return True
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return True
+    if not words:
+        return True
+    if words[0] in ("true", "false", ":", "pwd"):
+        return len(words) != 1
+    if lease.uses_docker(cmd, repo_root):
+        return True
+    # Go commands can execute a GOFLAGS -toolexec/-exec from the box's persistent Go env. Version is safe.
+    if words == ["go", "version"]:
+        return False
+    return True
+
+
+def image_wait_seconds() -> int:
+    """The client sets the remote bound; it is not implicitly forwarded as command environment."""
+    value = os.environ.get("OFFBOX_IMAGE_WAIT_SECONDS") or "180"
+    return int(value) if re.fullmatch(r"[1-9][0-9]{0,3}", value) else 180
+
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
 (
@@ -383,6 +561,11 @@ def setup_failed(log_path: Path | None) -> bool:
     return bool(log_path) and Path(log_path).exists() and SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace")
 
 
+def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
+    return (code == EXIT_REPO_SETUP and bool(log_path) and Path(log_path).exists()
+            and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
+
+
 def scope_failed(log_path: Path | None) -> bool:
     """True when the run's only output is boat's scope error: nothing of ours ran."""
     if not log_path or not Path(log_path).exists():
@@ -395,12 +578,26 @@ def exit_recording_command(script: str, run_id: str) -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
+    dk = f'"$HOME/.offbox/exit/{run_id}.dk"'
     outer = "\n".join([
         'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
-        'find "$HOME/.offbox/exit" -name "*.rc" -mtime +2 -delete 2>/dev/null',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" \\) -mtime +2 -delete 2>/dev/null',
+        '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
         f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        # Whether a container started during the run (events, since testcontainers removes its own): only then
+        # does the box get the longer Docker idle window. <run>.dk holds "1" (a container started) or "0" (the query
+        # answered, or dockerd is plainly inactive: none did). No file = unknown (failed/odd dockerd state, timeout,
+        # error): offbox keeps the Docker window.
+        # dockerd is only asked while it runs: the docker CLI would socket-activate it on every run otherwise.
+        'if systemctl is-active --quiet docker 2>/dev/null; then',
+        '  __offbox_ev=$(timeout 5 docker events --since "$__offbox_t0" --until "$(( $(date +%s) + 1 ))" '
+        '--filter type=container --filter event=start --format x 2>/dev/null) && '
+        f'{{ [ -n "$__offbox_ev" ] && echo 1 || echo 0; }} > {dk} 2>/dev/null',
+        'elif [ "$(systemctl is-active docker 2>/dev/null)" = inactive ]; then',
+        f'  echo 0 > {dk} 2>/dev/null',
+        'fi',
         'exit "$__offbox_rc"',
     ])
     return "bash -c " + shlex.quote(outer) + " " + shlex.quote(script)
@@ -428,6 +625,24 @@ def steps_exit(log_path: Path | None, planned: int) -> int | None:
     if not all(n in res for n in range(1, planned + 1)):
         return None
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
+
+
+def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
+    """False only when the run's wrapper got an answer from dockerd and no container started during the run."""
+    try:
+        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.dk" 2>/dev/null || echo unknown', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return True
+    return not (p.returncode == 0 and p.stdout.decode(errors="replace").strip() == "0")
+
+
+def settle_docker(con, run, status: str) -> None:
+    """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
+    box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    if run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(run["box_id"],
+                                                                                                 run["run_id"]):
+        con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
+        con.commit()
 
 
 def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
@@ -479,7 +694,8 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
-                  steps: list[str] | None = None, node: str = "") -> str:
+                  steps: list[str] | None = None, node: str = "", wait_images: bool = False,
+                  image_wait: int = 180, repo_key: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -487,8 +703,10 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
              f'export OFFBOX_RUN_ID={run_id}',
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
-              '[ -x /usr/local/bin/offbox-wait-images ] && /usr/local/bin/offbox-wait-images',
+              (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
+               if wait_images else ':'),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
+              repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
               cmd]
@@ -523,9 +741,10 @@ class Runner:
         con = db()
         steps = getattr(a, "steps", None) or []
         if steps:
-            cmd_text = " ; ".join(steps)[:4000]
+            cmd_text = " ; ".join(steps)
         else:
             cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        wait_images = needs_image_wait(cmd_text, me["repo_root"])
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
                        log_path, pulls, rel_cwd, local_cwd, client_pid) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?)""",
@@ -567,7 +786,8 @@ class Runner:
         except Exception:
             node_block = ""
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
-                               node=node_block)
+                               node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
+                               repo_key=me["repo_key"])
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
@@ -986,6 +1206,7 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
+        settle_docker(con, r, st)
         # Extend auto-stop as well as the reaper threshold when the start budget is tight.
         lease.touch(r["box_id"])
         lease.idle_ttl(r['box_id'])
@@ -1068,6 +1289,11 @@ def _run_remote(a, rn) -> int:
             after = f"offbox could not stop it ({e}); run: offbox release {rn.box}"
         raise OffboxError(f"{rn.box} could not start the command (systemd: transient scope failed); "
                           f"nothing ran. {after}. Retry.", code=EXIT_INFRA)
+    if repo_setup_failed(code, rn.log_path):
+        rn.started = False
+        rn.record(error="repo toolchain setup failed (exit 98)")
+        finish(rn.run_id, None, "infra")
+        raise OffboxError("repo toolchain setup failed (exit 98), not your command", code=EXIT_INFRA)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

@@ -1,0 +1,11 @@
+python3 - <<'PY'
+from pathlib import Path
+p=Path('tmp/reviews/card-2390/REVIEW.md')
+s=p.read_text()
+s=s.replace('Status: static review complete, fresh offbox check and base/head regression proof in progress. Do not treat this draft as a final verdict.','Verdict: Good to merge at the pinned head. Worker review complete; the card\'s independent Sol review (s3) remains required.')
+s=s.replace('Fail-before-fix proof prepared in checkout tmp/review-2390/base-proof.py. It swaps only app/data/vip_state.py to current origin/main-dev b3ab066aabebb2cfebf4e0f20f22c5aee0999c37 (byte-identical to PR parent for this file), runs the three changed tests with RUN_SPEC=1, restores in finally, and runs them again. No authored test/code changes.','Fail-before-fix proof: `offbox run --include tmp/review-2390 -- uv run python tmp/review-2390/base-proof.py`, run-1108-202208-1cb6 on bx_4twa2k2m, overall exit 0. Swapped only app/data/vip_state.py to origin/main-dev b3ab066aabebb2cfebf4e0f20f22c5aee0999c37 (byte-identical to PR parent for this file). All 3 tests FAILED for their intended assertions (10.16s, pytest exit 1): the full ClickHouse page incorrectly selected the later status row; the inactive account retained tier 1 and old computation time; the multi-shard pass repeated IDs and missed other accounts. Restored the pinned module in finally (SHA256 456805549a69b752da0842740e42a1fa1576dde77267262f9bc487694c9a6818). All 3 PASSED afterward (11.14s, pytest exit 0) with RUN_SPEC=1. The PostgreSQL/ClickHouse test also proves one downgrade outbox event and unchanged active tiers. The script is preserved beside this report as base-proof.py; raw output is offbox-base-proof.log. No authored test/code changes.')
+s += '\nFinal freshness check, 8 Nov 2026 ~16:26 UTC: PR still OPEN at fc2cbb98beb5cd9634778426e0446dcc511ceb68; check and image-smoke SUCCESS. GitHub reports BEHIND; branch integration/freshness belongs to the evaluator before merging. No implementation dependency or author feedback. Thread PR registration confirmed. Both the source repo and isolated review checkout have no tracked changes; the offbox lease was released.\n'
+p.write_text(s)
+PY
+ git -C /Users/ardud/rewards status --short
+ git -C /Users/ardud/checkouts/rewards-pr275-review status --short

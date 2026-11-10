@@ -1,0 +1,105 @@
+#!/bin/zsh -f
+# rclaude: interactive Claude Code launched the way Robob launches its claudeAgent threads.
+# Same pinned binary, CLAUDE_CONFIG_DIR (settings, hooks, MCP servers, skills, CLAUDE.md overlay),
+# 9router base URL and key, default model/effort and launch flags. Everything is read from
+# ~/.robob/userdata/settings.json when it runs, so it follows Robob's provider config.
+#
+#   rclaude [claude args...]        interactive session in $PWD; your flags go last, so a repeated
+#                                   single-value flag (--model, --effort, --permission-mode) wins.
+#                                   A --settings of your own replaces Robob's JSON, it doesn't merge.
+#   rclaude -p "prompt"             one-shot, same as claude -p
+#   rclaude mcp list                subcommands run against the Robob home with no session flags
+#   rclaude --rclaude-print         show the resolved command and env names, then exit
+#   RCLAUDE_MODEL / RCLAUDE_EFFORT  override the default model / effort
+#
+# Not the same as a Robob thread: no t3-code MCP (its token is per thread) and no runtime_info append.
+settings=${ROBOB_SETTINGS:-$HOME/.robob/userdata/settings.json}
+instance=${RCLAUDE_INSTANCE:-claudeAgent}
+jq=/usr/bin/jq
+[[ -x $jq ]] || jq=jq
+[[ -r $settings ]] || { print -u2 "rclaude: can't read $settings"; exit 1 }
+
+q() { $jq -r --arg i "$instance" "$1" "$settings" }
+bin=$(q '.providerInstances[$i].config.binaryPath // empty')
+home=$(q '.providerInstances[$i].config.homePath // empty')
+[[ -n $bin ]] || bin="$HOME/.robob/harness-cli/claude/current/bin/claude"
+[[ -n $home ]] || home="$HOME/.robob/harness-homes/claude"
+bin=${bin/#\~/$HOME} home=${home/#\~/$HOME}
+[[ -x $bin ]] || { print -u2 "rclaude: $bin is missing (Robob's pinned Claude CLI)"; exit 127 }
+
+# The instance's environment list (9router key, recall URL), applied like mergeProviderInstanceEnvironment.
+# NUL-separated so values with tabs, backslashes or newlines come through intact.
+redacted=$(q '[.providerInstances[$i].environment // [] | .[] | select(.valueRedacted == true) | .name] | join(" ")')
+[[ -z $redacted ]] || { print -u2 "rclaude: $redacted are kept in Robob's secret store, which this can't read"; exit 1 }
+names=()
+while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+  [[ -n $name ]] || continue
+  [[ $name == CLAUDE_CONFIG_DIR || $name == CODEX_HOME ]] && value=${value/#\~/$HOME}
+  export "$name=$value"
+  names+=$name
+done < <($jq -j --arg i "$instance" '.providerInstances[$i].environment // [] | .[] | .name, "\u0000", (.value // ""), "\u0000"' "$settings")
+export CLAUDE_CONFIG_DIR=$home
+export T3CODE_CLI_PATH="$HOME/.robob/bin/t3"
+# The OpenCode server's inspector port leaks into children; bun can't bind it twice.
+unset BUN_INSPECT
+
+case ${1:-} in
+  # Robob pins and upgrades this binary itself.
+  install|update|upgrade)
+    print -u2 "rclaude: $bin is Robob's pinned CLI; it's upgraded with Robob's harness CLIs, not from here"
+    exit 2 ;;
+  # Other subcommands get the Robob home but none of the session flags.
+  agents|attach|auth|auto-mode|doctor|gateway|import|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview)
+    exec "$bin" "$@" ;;
+esac
+
+# Interactive Claude asks once whether to trust a custom ANTHROPIC_API_KEY and remembers "No" in
+# .claude.json, then says "Not logged in" (the SDK path Robob uses never asks). An apiKeyHelper is
+# never asked about, so the 9router key goes through one instead.
+key_helper=''
+if [[ -n ${ANTHROPIC_API_KEY:-} ]]; then
+  export RCLAUDE_API_KEY=$ANTHROPIC_API_KEY
+  unset ANTHROPIC_API_KEY
+  key_helper='printenv RCLAUDE_API_KEY'
+fi
+# Robob's default selection when it's this instance (model, effort, fastMode), like compileClaudeModelSelection.
+sel='if .defaultModelSelection.instanceId == $i then .defaultModelSelection else {} end'
+opt() { q "($sel) | (.options // []) | map(select(.id == \"$1\"))[0].value // empty" }
+model=${RCLAUDE_MODEL:-$(q "($sel) | .model // empty")}
+model=${model:-claude-opus-5-5}
+effort=${RCLAUDE_EFFORT:-$(opt effort)}
+fast=$(opt fastMode)
+[[ $fast == true ]] || fast=false
+ultracode=false
+case $effort in
+  ultracode) effort=xhigh ultracode=true ;;
+  ultrathink) effort='' ;;  # Robob puts this in the prompt, not --effort
+esac
+compact=$(q '.providerInstances[$i].config.autoCompactWindow // empty')
+[[ -z $compact || $compact == <-> ]] || { print -u2 "rclaude: ignoring autoCompactWindow '$compact' (not a number)"; compact='' }
+sdk_settings=$($jq -cn --arg c "$compact" --argjson f $fast --argjson u $ultracode --arg k "$key_helper" \
+  '{fastMode: $f} + (if $u then {ultracode: true} else {} end) + (if $c == "" then {} else {autoCompactWindow: ($c | tonumber)} end) + {showThinkingSummaries: true} + (if $k == "" then {} else {apiKeyHelper: $k} end)')
+
+# Same flags as a running thread (ps of a Robob claude process), minus the SDK stream/stdio plumbing.
+# --add-dir takes several values, so it uses the = form: a prompt after it isn't read as a directory.
+args=(--model "$model")
+[[ -n $effort ]] && args+=(--effort "$effort")
+args+=(
+  --thinking adaptive --thinking-display summarized
+  --permission-mode bypassPermissions --allow-dangerously-skip-permissions
+  "--add-dir=$PWD"
+)
+attachments="$HOME/.robob/userdata/attachments"
+[[ -d $attachments ]] && args+=("--add-dir=$attachments")
+# launchArgs from the instance config (unset today), unquoted the way Robob's tokenizer does.
+launch=$(q '.providerInstances[$i].config.launchArgs // empty')
+[[ -n $launch ]] && args+=(${(Q)${(z)launch}})
+args+=(--settings "$sdk_settings")
+
+if [[ ${1:-} == --rclaude-print ]]; then
+  print -r -- "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+  print -r -- "env from settings: ${(j:, :)names}"
+  print -r -- "${(q-)bin} ${(q-)args[@]}"
+  exit 0
+fi
+exec "$bin" "${args[@]}" "$@"

@@ -32,7 +32,7 @@ type Turn = Route & {
   phase: "submitting" | "running" | "unknown" | "failed";
   background?: boolean;
   /**
-   * `"request"`: opened by the idle watch only to relay a subagent's request.
+   * `"request"`: follows requests after a reply or when the idle watch finds one.
    * Nothing guarantees the root resumes afterwards (the child may be aborted,
    * fail, or have its request answered elsewhere), so poll() closes it once
    * nothing is asked and the route has stayed quiet for a short grace.
@@ -52,10 +52,15 @@ type Turn = Route & {
   steered?: string[];
   /** When the last steer was sent, bounding how long a steer that never shows up holds the reply. */
   steeredAt?: number;
+  /** The first reply already queued while this turn was still running, including a matching /send. */
+  earlySent?: string;
+  earlyText?: string;
+  /** Physical outbox row, whether the router or /send queued it first. */
+  earlyOutbox?: string;
 };
 /** What an owner-text turn POSTed, kept while its delivery is uncertain so it can be sent again. */
 type ResendBody = {
-  inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string };
+  inboundId: string; text: string; system: string; parts: FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string };
   owner?: OwnerWords;
 };
 type Pending = {
@@ -81,6 +86,9 @@ type Pending = {
   unsupported?: boolean;
 };
 type Watermark = { sessionId: string; id: string };
+const firstFailureText = (modelError?: boolean) => modelError
+  ? "The chat's model isn't available, so I couldn't process that message. Resending it won't fix this."
+  : "I couldn't process that message because this chat hit a system error. Please don't resend it yet.";
 /** An answer-like text that turned out not to answer anything stays queued as conversation. */
 type Detachable = NormalizedInbound & { detached?: boolean };
 type Options = {
@@ -228,6 +236,8 @@ const REQUEST_TURN_GRACE = 15_000;
 const SENDBLUE_QUIET_MS = 2_000;
 /** Sendblue mode: how often our typing bubble is renewed while a turn runs; each start lasts 60 s. */
 const SENDBLUE_TYPING_REFRESH_MS = 20_000;
+// A final normally reaches idle within seconds; 20 seconds without idle means work is continuing.
+const EARLY_REPLY_MS = 20_000;
 /** Sendblue mode: a typing sender holds the batch back, but never past this from its oldest member. */
 const SENDBLUE_TYPING_CAP_MS = 90_000;
 /** After a refused steer the run is ending; give it this long to settle before steering again. */
@@ -2708,14 +2718,9 @@ export class Router {
     // Work has no deadline: a turn runs for as long as the agent needs.
     const elapsed = Date.now() - turn.startedAt;
     try {
-      const statuses = await this.statusesFor(turn);
-      const [messages, requests] = await Promise.all([
-        bounded(this.backend.messages(turn.id, turn.directory, turn.background
-          ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 })),
-        this.requests(turn, statuses),
-      ]);
+      const messages = await bounded(this.backend.messages(turn.id, turn.directory, turn.background
+        ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 }));
       if (!this.current(turn)) return;
-      if (!messages || !statuses) throw new Error();
       if (turn.phase === "submitting" || turn.phase === "unknown") {
         const absent = await this.reconcile(turn, messages);
         const reconciled = this.store.get<Turn | null>("activeTurn");
@@ -2731,6 +2736,25 @@ export class Router {
           }
         }
       }
+      // OpenCode 2 records carry no parent link. A turn is every record after
+      // its user prompt (or, for background work, after the last delivered
+      // record) up to the next idle marker, which OpenCode appends once the
+      // execution settles (succeeded, failed or interrupted).
+      const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
+      const after = start < 0 ? [] : messages.slice(start + 1);
+      // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
+      let steered = -1;
+      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
+      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
+        && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
+      const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
+      const end = missing || found < 0 ? -1 : steered + 1 + found;
+      const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
+      // A run's idle marker settles its reply independently of other runs and children.
+      // Child discovery can fail or block, so only await requests while this run is open.
+      const statuses = idle ? {} : await this.statusesFor(turn);
+      const requests = idle ? [] : await this.requests(turn, statuses);
+      if (!this.current(turn)) return;
       const entries = this.pending();
       const live = new Set<string>();
       for (const { request, directory } of requests) {
@@ -2748,62 +2772,90 @@ export class Router {
           this.store.set("pendingApprovals", entries);
         }).immediate();
       }
-      for (const entry of entries) {
-        if (!live.has(entry.operationId)) {
-          if (entry.state === "pending") entry.state = "expired";
-          // An answer handed over for a request that is no longer open either
-          // landed or no longer matters. Once the resubmit window has passed,
-          // nothing can come of it; while inside it, a restart could still
-          // show the request open again and ask anew.
-          else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-            entry.state = "expired";
-          }
-        } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
-          // The request is still open long after an answer was handed over (for
-          // example across a restart), so that answer never landed: ask again.
-          const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
-          if (body && this.signature(body) === entry.signature) {
-            entry.state = "pending";
-            entry.prompt = undefined;
+      if (!idle) {
+        for (const entry of entries) {
+          if (!live.has(entry.operationId)) {
+            if (entry.state === "pending") entry.state = "expired";
+            // An answer handed over for a request that is no longer open either
+            // landed or no longer matters. Once the resubmit window has passed,
+            // nothing can come of it; while inside it, a restart could still
+            // show the request open again and ask anew.
+            else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+              entry.state = "expired";
+            }
+          } else if ((entry.state === "submitting" || entry.state === "unknown") && Date.now() - (entry.submittedAt ?? 0) > 30_000) {
+            // The request is still open long after an answer was handed over (for
+            // example across a restart), so that answer never landed: ask again.
+            const body = this.store.get<PermissionRequest | QuestionRequest>(`request-body:${entry.operationId}`);
+            if (body && this.signature(body) === entry.signature) {
+              entry.state = "pending";
+              entry.prompt = undefined;
+            }
           }
         }
+        this.store.set("pendingApprovals", entries);
+        this.advance(turn);
       }
-      this.store.set("pendingApprovals", entries);
-      this.advance(turn);
-      // OpenCode 2 records carry no parent link. A turn is every record after
-      // its user prompt (or, for background work, after the last delivered
-      // record) up to the next idle marker, which OpenCode appends once the
-      // execution settles (succeeded, failed or interrupted).
-      const start = messages.findIndex(m => m.id === turn!.messageId && (turn!.background || m.type === "user"));
-      const after = start < 0 ? [] : messages.slice(start + 1);
-      // A steered text that landed after the run ended starts a run of its own; the turn waits for that one too.
-      let steered = -1;
-      after.forEach((m, index) => { if (m.type === "user" && turn!.steered?.includes(m.id)) steered = index; });
-      const missing = (turn.steered ?? []).some(id => !after.some(m => m.id === id))
-        && Date.now() - (turn.steeredAt ?? 0) < STEER_SETTLE_MS;
-      const found = after.slice(steered + 1).findIndex(m => m.type === "idle");
-      const end = missing || found < 0 ? -1 : steered + 1 + found;
-      const idle = end < 0 ? undefined : after[end] as Extract<MessageRecord, { type: "idle" }>;
       const replies = (end < 0 ? after : after.slice(0, end))
         .filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = replies.at(-1);
       // The last word of each earlier run still goes out, ahead of the final
       // one, and so does a step the model stopped on before a steered text
-      // came in (`answer`, see opencode-steps.ts). Narration never does.
+      // came in (`answer`, see opencode-steps.ts). Other narration stays quiet.
       // One message written as several text blocks is judged whole: a NO_REPLY
       // at its end keeps every block of it out of the chat.
-      const scope = end < 0 ? [] : after.slice(0, end);
+      const scope = end < 0 ? after : after.slice(0, end);
       const quiet = quietMessages(scope);
+      const failedReplies = new Set<string>();
+      let priorFailure: Extract<MessageRecord, { type: "idle" }> | undefined;
+      let runReplies: string[] = [];
+      for (const record of scope) {
+        if (record.type === "assistant") runReplies.push(record.id);
+        if (record.type === "idle") {
+          if (record.outcome !== "succeeded" || record.modelError) for (const id of runReplies) failedReplies.add(id);
+          if (record.firstTurnFailure || record.modelError) priorFailure ??= record;
+          runReplies = [];
+        }
+      }
       const earlier: Extract<MessageRecord, { type: "assistant" }>[] = [];
       let last: MessageRecord | undefined;
       for (const m of scope) {
         // A run's last word goes out ahead of the final one unless it is proven narration (answer false),
-        // which never goes to the chat. An unknown last word is forwarded, as the final one is.
+        // which only the early-reply path may forward. An unknown last word is forwarded, as the final one is.
         if (m.type === "idle" && last?.type === "assistant" && last.answer !== false && last.id !== final?.id && !earlier.includes(last)) earlier.push(last);
         if (m.type === "assistant" && m.answer === true && m.id !== final?.id) earlier.push(m);
         if (m.type === "assistant" || m.type === "idle") last = m;
       }
-      for (let i = earlier.length - 1; i >= 0; i--) if (quiet.has(earlier[i]!.id)) earlier.splice(i, 1);
+      for (let i = earlier.length - 1; i >= 0; i--) if (earlier[i]!.id === turn.earlySent || quiet.has(earlier[i]!.id) || failedReplies.has(earlier[i]!.id)) earlier.splice(i, 1);
+      if (turn.phase === "running" && !turn.background && turn.inboundId && !synthetic(turn.inboundId)
+        && !this.isGroup() && !turn.earlySent && found < 0
+        // A later run must not overtake an earlier answer still waiting for the steered turn to settle.
+        && !earlier.some(reply => after.indexOf(reply) <= steered && !!replyText(assistantText(reply)))
+        && !after.some(m => m.type === "idle" && (m.outcome !== "succeeded" || m.modelError))) {
+        const candidate = after.slice(steered + 1).find((record): record is Extract<MessageRecord, { type: "assistant" }> =>
+          record.type === "assistant" && record.time.completed !== undefined && !record.error
+          && !providerRefusal(record) && !quiet.has(record.id) && !!replyText(assistantText(record))
+          && (record.continued || record.finish === "tool-calls" || after.indexOf(record) < after.length - 1
+            || Date.now() - record.time.completed >= EARLY_REPLY_MS));
+        if (candidate) {
+          const text = replyText(assistantText(candidate));
+          const enqueued = this.store.db.transaction(() => {
+            if (!this.current(turn!)) return false;
+            const sent = this.store.queuedSends(turn!.id, turn!.generation, turn!.startedAt)
+              .find(op => replyText(op.text).trim() === text.trim());
+            const id = sent?.id ?? `reply:${turn!.generation}:${candidate.id}`;
+            // TODO(#728): run the final-reply check here too
+            const created = !sent && this.store.enqueue({
+              id, kind: "conversation", text,
+              sessionId: turn!.id, generation: turn!.generation, ...this.replyTarget(turn!.inboundId),
+            });
+            turn = { ...turn!, earlySent: candidate.id, earlyText: text, earlyOutbox: id };
+            this.store.set("activeTurn", turn);
+            return created;
+          }).immediate();
+          if (enqueued) this.stage("early-reply-enqueued", turn.inboundId!);
+        }
+      }
       if (idle && idle.id !== this.seenIdle) {
         this.seenIdle = idle.id;
         this.stage("run-completed-seen", turn.inboundId ?? turn.messageId);
@@ -2811,6 +2863,10 @@ export class Router {
       if (idle) await this.noteRefusal(turn, replies, idle.outcome !== "succeeded" || final?.error !== undefined);
       if (!this.current(turn)) return;
       if (idle && (idle.outcome !== "succeeded" || final?.error)) {
+        if (idle.firstTurnFailure || idle.modelError || priorFailure) {
+          this.fail(turn, firstFailureText(idle.modelError || priorFailure?.modelError), idle.id, "failed", true);
+          return;
+        }
         // A tool-only turn has no assistant records to show its tool calls, so the backend's run evidence decides.
         // A backend without run evidence (none declared) leaves the reply list as the only proof.
         const ran = turnRanTools(replies) || (this.backend.runToolEvidence
@@ -2850,23 +2906,34 @@ export class Router {
         }).immediate();
         return;
       }
+      // Busy activity may belong to an older run whose records precede this watermark.
+      // Once it stops, there is no later idle marker for this empty background turn.
+      if (turn.background && start >= 0 && !after.length && statuses[turn.id] === undefined && !live.size) {
+        this.store.db.transaction(() => {
+          this.store.set("activeTurn", null);
+          this.store.set("pendingApprovals", null);
+        }).immediate();
+        return;
+      }
       const tools = replies.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p?.type === "tool") : []);
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
-      // An active session is still working even after an idle marker.
-      if (turn.phase !== "running" || live.size || statuses[turn.id] !== undefined) return;
+      if (turn.phase !== "running") return;
       if (runningTools || !idle) return;
-      // A final that has not completed, or that stopped to call tools, keeps the turn open. Narration
+      // An unsent final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
-      if (final && (final.time.completed === undefined || final.finish === "tool-calls")) return;
-      // Narration (text before a tool call, `answer` false) never goes to the chat. A final whose phase
+      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) return;
+      // Unsent narration (text before a tool call, `answer` false) stays quiet. A final whose phase
       // is unknown still does, as before: the owner chose to keep forwarding unknown finals.
-      const text = final && final.answer !== false ? replyText(assistantText(final)) : "";
+      const early = replies.find(reply => reply.id === turn!.earlySent);
+      if (early && replyText(assistantText(early)) !== turn.earlyText) this.stage("early-reply-text-changed", turn.inboundId!);
+      const text = final && final.id !== turn.earlySent && final.answer !== false ? replyText(assistantText(final)) : "";
       // Missing status is NOT idle evidence. A settled turn forwards its final
       // text; one that ends without text (after a reaction, poll or file, say)
       // or with NO_REPLY simply closes.
       const usage = [...replies].reverse().map(m => (m as { tokens?: { input?: number; cache?: { read?: number; write?: number } } }).tokens)
         .find(tokens => typeof tokens?.input === "number");
       this.store.db.transaction(() => {
+        if (priorFailure) this.notice(turn!, "failed", firstFailureText(priorFailure.modelError));
         for (const reply of earlier) {
           const words = replyText(assistantText(reply));
           if (words) this.store.enqueue({
@@ -2878,7 +2945,7 @@ export class Router {
           id: `reply:${turn!.generation}:${final!.id}`, kind: "conversation", text, sessionId: turn!.id, generation: turn!.generation,
           ...this.replyTarget(turn!.inboundId),
         });
-        const said = [...earlier.map(reply => replyText(assistantText(reply))), text].filter(Boolean);
+        const said = [turn!.earlyText, ...earlier.map(reply => replyText(assistantText(reply))), text].filter((words): words is string => !!words);
         if (said.length) this.noteGroupReply(turn!.inboundId, said);
         if (turn!.inboundId) this.store.updateInbound(turn!.inboundId, "done");
         for (const id of this.syntheticBatch(turn!.inboundId) ?? []) this.store.set(this.retryKey(id), null);
@@ -2894,8 +2961,13 @@ export class Router {
         }
         if (usage) this.store.set("routeContext", { sessionId: turn!.id, tokens: usage.input! + (usage.cache?.read ?? 0) + (usage.cache?.write ?? 0) });
         this.store.set("watermark", { sessionId: turn!.id, id: idle.id } satisfies Watermark);
-        this.store.set("activeTurn", null);
-        this.store.set("pendingApprovals", null);
+        const waiting = entries.filter(entry => ["pending", "submitting", "unknown"].includes(entry.state));
+        // Keep already-asked requests answerable without rediscovering their run or child.
+        this.store.set("activeTurn", waiting.length ? {
+          id: turn!.id, directory: turn!.directory, generation: turn!.generation,
+          messageId: idle.id, startedAt: Date.now(), phase: "running", background: true, origin: "request", activeAt: Date.now(),
+        } satisfies Turn : null);
+        this.store.set("pendingApprovals", waiting.length ? waiting : null);
         this.store.set("settledAt", Date.now());
       }).immediate();
       if (text || earlier.length) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
@@ -2986,10 +3058,15 @@ export class Router {
     }
   }
 
-  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed"): void {
+  private fail(turn: Turn, text: string, watermark?: string, reason: DropReason = "failed", immediate = false): void {
     this.store.db.transaction(() => {
+      if (immediate) {
+        // A broken new chat or model needs repair, not automatic replay of a watcher wake.
+        for (const id of this.syntheticBatch(turn.inboundId) ?? (turn.inboundId ? [turn.inboundId] : [])) this.store.updateInbound(id, "failed");
+        this.notice(turn, "failed", text);
+      }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
-      if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
+      else if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);

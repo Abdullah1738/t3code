@@ -17,10 +17,12 @@ class RunLimitedTest(unittest.TestCase):
         entry = f"import runpy; runpy.run_path({str(RUNNER)!r}, run_name='__main__')"
         if sys.platform != "darwin":
             # taskpolicy is macOS-only; assert its arguments before emulating it.
+            # --background keeps default I/O and only lowers CPU priority.
+            prefix = ["/usr/sbin/taskpolicy", "-d", "default", "/usr/bin/nice", "-n", "10"]
             entry = (
                 f"import sys; sys.path.insert(0, {str(SRC)!r}); import run_limited as r; "
-                "original=r.run; "
-                "def_background=lambda cmd, secs: original(cmd[2:], secs) if cmd[:2]==['/usr/sbin/taskpolicy','-b'] else 99; "
+                f"original=r.run; prefix={prefix!r}; "
+                "def_background=lambda cmd, secs: original(cmd[len(prefix):], secs) if cmd[:len(prefix)]==prefix else 99; "
                 "r.run=def_background; sys.exit(r.main())"
             )
         result = subprocess.run(

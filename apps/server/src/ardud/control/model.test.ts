@@ -75,6 +75,34 @@ describe("state mapping", () => {
 });
 
 describe("model selection", () => {
+  it.each([
+    undefined,
+    {},
+    { ardudHarnessMigration: { selections: "off" as const } },
+    { ardudHarnessMigration: { selections: "dryrun" as const } },
+  ])("infers OpenCode only for an explicit provider/model without an instance (%j)", (settings) => {
+    const base = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "max" }],
+    } satisfies ModelSelection;
+    for (const [model, instanceId, expected] of [
+      ["opus/claude-opus-5-5", undefined, "opencode"],
+      ["opus/cx/gpt-6.1-sol", undefined, "opencode"],
+      ["opus/claude-opus-5-5", "claudeAgent", "claudeAgent"],
+      ["claude-sonnet-5-5", undefined, "claudeAgent"],
+    ] as const) {
+      expect(
+        selectionOf(modelSelectionFrom({ base, model, instanceId, variant: "high", settings })),
+      ).toEqual({
+        instanceId: expected,
+        model,
+        options: [{ id: "variant", value: "high" }],
+      });
+    }
+    expect(selectionOf(modelSelectionFrom({ base, settings }))).toEqual(base);
+  });
+
   it("parses provider/model with a variant", () => {
     expect(
       selectionOf(

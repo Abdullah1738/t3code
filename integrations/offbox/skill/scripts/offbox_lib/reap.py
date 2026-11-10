@@ -5,7 +5,7 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+from .common import (ARCHIVED_DELETE_S, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, now, say)
 from .identity import thread_get
 
@@ -118,6 +118,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if not dry:
             try:
                 with file_lock('box-'+box_id, timeout=0):
+                    if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{box_id}",)).fetchone():
+                        actions[-1] += ' (unanswered resume; skipped)'
+                        return
                     if lease.active_runs(con, box_id):
                         actions[-1] += ' (busy; skipped)'
                         return
@@ -134,6 +137,9 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
+        if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{bid}",)).fetchone():
+            actions.append(f"defer {bid}: unanswered resume needs reconciliation")
+            continue
         if bid in protected:
             continue
         if b is None:
@@ -270,6 +276,7 @@ def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) 
 
 def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
+    from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
         status, code = None, None
         if run['status'] == 'starting' and not run['process_id'] and now()-(run['start_at'] or 0) < 3600:
@@ -289,6 +296,10 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 code = st.get("exitCode")
                 status = "lost" if st.get("status") == "lost" else ("done" if code == 0 else "failed")
+                # Detached runs may have no local log yet; cmd_status includes the remote stderr tail.
+                if (st.get('status') == 'exited' and code == EXIT_REPO_SETUP
+                        and REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
+                    status, code = 'infra', EXIT_INFRA
         elif run['error']:
             # Ambiguous cmd_start: quarantine until the box stops, never free it for another sync.
             continue
@@ -305,6 +316,11 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
                             (status, code, now(), run["run_id"]))
                 con.commit()
                 event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
+                if state in api.LIVE_STATES:
+                    from .runs import settle_docker
+                    settle_docker(con, run, status)
+                    # The run's client died: the box still has its 30-min run ttl. Bring it to the idle window.
+                    lease.idle_ttl(bid)
 
 
 def print_actions(actions: list[str]) -> None:

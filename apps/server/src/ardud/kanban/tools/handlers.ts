@@ -465,7 +465,17 @@ const handlers = {
           caller.actor,
           { note: input.note ?? null, question: input.question ?? null },
         );
-        return { card: moved };
+        return {
+          card: moved,
+          ...(moved.stage === card.stage
+            ? {
+                message:
+                  input.to === moved.stage
+                    ? `already in ${moved.stage}; nothing changed`
+                    : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
+              }
+            : {}),
+        };
       }),
     ),
   ),

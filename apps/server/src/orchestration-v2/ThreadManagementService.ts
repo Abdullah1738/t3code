@@ -972,28 +972,50 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    const target = yield* getProjectThreadRecords(
+      input,
+      input.mode === "restart"
+        ? ["runs", "providerTurns", "providerThreads", "providerSessions"]
+        : ["runs", "providerTurns"],
+    );
     const steerableRun = latestSteerableRun(target);
-    // ardud: an accepted send can be retried after its run finishes or the thread archives.
-    // Only the orchestrator replays the receipt; never turn a missing receipt into a new send.
+    // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
         ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
         : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
           ? new ThreadManagementNoSteerableRunError({ threadId: input.threadId, mode: input.mode })
           : undefined;
+    const readReceipt = (commandId: CommandId) =>
+      receipts.getByCommandId(commandId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new Orchestrator.OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "message.dispatch",
+              cause,
+            }),
+        ),
+      );
     const receipt =
-      preflightError === undefined
-        ? Option.none()
-        : yield* receipts
-            .getByCommandId(input.commandId)
-            .pipe(Effect.orElseSucceed(() => Option.none()));
-    const replay =
-      Option.isSome(receipt) &&
-      receipt.value.status === "accepted" &&
-      receipt.value.commandType === "message.dispatch" &&
-      receipt.value.threadId === input.threadId;
-    if (preflightError !== undefined && !replay) {
+      input.mode === "restart" || preflightError !== undefined
+        ? yield* readReceipt(input.commandId)
+        : Option.none();
+    // The original command owns replay and conflict checks, before any interrupt side effect.
+    const replay = Option.isSome(receipt);
+    const interruptCommandId = CommandId.make(`${input.commandId}:restart-interrupt`);
+    const interruptReceipt =
+      !replay && input.mode === "restart" ? yield* readReceipt(interruptCommandId) : Option.none();
+    const interruptedForRestart =
+      Option.isSome(interruptReceipt) &&
+      interruptReceipt.value.status === "accepted" &&
+      interruptReceipt.value.commandType === "run.interrupt" &&
+      interruptReceipt.value.threadId === input.threadId;
+    if (
+      preflightError !== undefined &&
+      !replay &&
+      !(interruptedForRestart && target.thread.archivedAt === null)
+    ) {
       return yield* preflightError;
     }
     let dispatchMode: Extract<
@@ -1002,6 +1024,9 @@ const make = Effect.gen(function* () {
     >["dispatchMode"];
     if (replay) {
       dispatchMode = { type: "start_immediately" };
+    } else if (interruptedForRestart) {
+      // A retry can arrive after interrupt committed but before the message did.
+      dispatchMode = { type: "queue_after_active" };
     } else if (input.mode === "steer" || input.mode === "restart") {
       if (steerableRun === undefined) {
         return yield* new ThreadManagementNoSteerableRunError({
@@ -1009,10 +1034,41 @@ const make = Effect.gen(function* () {
           mode: input.mode,
         });
       }
-      dispatchMode = {
-        type: input.mode === "steer" ? "steer_active" : "restart_active",
-        targetRunId: steerableRun.id,
-      };
+      const providerThread =
+        input.mode === "restart"
+          ? target.providerThreads.find(
+              (candidate) => candidate.id === steerableRun.providerThreadId,
+            )
+          : undefined;
+      const capabilities =
+        input.mode === "restart"
+          ? target.providerSessions.find(
+              (candidate) => candidate.id === providerThread?.providerSessionId,
+            )?.capabilities.turns
+          : undefined;
+      if (
+        input.mode === "restart" &&
+        capabilities?.supportsSteeringByInterruptRestart === false &&
+        capabilities.supportsInterrupt &&
+        capabilities.supportsQueuedMessages
+      ) {
+        yield* orchestrator.dispatch({
+          type: "run.interrupt",
+          commandId: interruptCommandId,
+          threadId: input.threadId,
+          runId: steerableRun.id,
+          fenced: true,
+          ...(steerableRun.activeAttemptId === null
+            ? {}
+            : { expectedAttemptId: steerableRun.activeAttemptId }),
+        });
+        dispatchMode = { type: "queue_after_active" };
+      } else {
+        dispatchMode = {
+          type: input.mode === "steer" ? "steer_active" : "restart_active",
+          targetRunId: steerableRun.id,
+        };
+      }
     } else if (input.mode === "auto" && steerableRun !== undefined) {
       dispatchMode = { type: "steer_active", targetRunId: steerableRun.id };
     } else {
@@ -1065,12 +1121,12 @@ const make = Effect.gen(function* () {
       });
     }
     const delivery: ThreadManagementSendResult["delivery"] =
-      turnItem === null || turnItem.inputIntent === "queued_turn"
-        ? "queued"
-        : turnItem.inputIntent === "turn_start"
-          ? "started"
-          : input.mode === "restart"
-            ? "restarted"
+      input.mode === "restart"
+        ? "restarted"
+        : turnItem === null || turnItem.inputIntent === "queued_turn"
+          ? "queued"
+          : turnItem.inputIntent === "turn_start"
+            ? "started"
             : "steered";
     return { dispatch: dispatched, projection, message, run, turnItem, delivery };
   });

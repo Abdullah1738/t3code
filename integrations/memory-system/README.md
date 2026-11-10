@@ -50,8 +50,73 @@ runtime data.
   plists. `src/export_opencode.py` is the sole native live-DB reader: it produces
   `~/.robob/userdata/readonly/opencode.sqlite` for all other native consumers.
 
-The OpenCode plugin that calls `/api/inject` lives outside the fork at
-`~/.config/opencode/plugin/recall.ts` (config `~/.config/opencode/recall.json`).
+The tracked OpenCode plugin is `plugin/recall.ts`; `plugin/install.zsh` installs
+it and the remember skill, with backups and dry-run support. The memory-system
+deploy calls this installer. Runtime config remains `~/.config/opencode/recall.json`.
+
+## Trigger checks and standing rules
+
+All three harnesses call `POST /api/check` for first prompt, completed compaction
+and tool actions. No periodic surveying runs. `recall_classifier.py` skips obvious
+local work, forwards known outward actions and uses pinned Jev `typesafe/jev-1.13`
+for ambiguous calls. Rules matching an action or recipient override classifier
+skips. The separate check executor has no pending queue and a 2.8 second response
+budget. A clear cited branch conflict returns `decision: deny`; otherwise rules
+are context. Denial is enforced before execution by each harness adapter.
+
+`recall_rules.py` indexes existing skills/AGENTS files and owner corrections in
+transcripts. `recall_remember` / `recall remember` explicitly save new owner rules.
+`scripts/index_rules.py` performs bounded corpus imports outside HTTP requests;
+the capture tick refreshes it. `logs/recall-decisions.jsonl` records routing, cost,
+latency, notes and cited denials without tool argument payloads or credentials.
+
+Bootstrap existing rules before enabling the hooks:
+
+```sh
+python3 scripts/index_rules.py --skills ~/.config/opencode/skills \
+  --agents ~/.config/opencode/AGENTS.md --agents ~/trading-core/AGENTS.md \
+  --transcripts /offline-or-approved/memory.db --max-rows 5000 --seconds 2 --repo-agents
+```
+
+Repeat bounded transcript imports until caught up. Missing rules are unhealthy,
+not proof that no rule applies. Hooks deliberately fail open on unavailable checks,
+so they are a guardrail, not a security boundary. See the lane report for harness
+compaction compatibility and deployment prerequisites.
+
+## Hot/cold storage and offline migration
+
+After offline migration/index bootstrap, recall uses `data/recall_hot.db` when
+present. `RECALL_HOT_DB` overrides that path. An explicit `RECALL_MEM_DB` keeps
+the legacy single-store path unless `RECALL_HOT_DB` is also supplied.
+`MEMORY_DB` / `RECALL_MEM_DB` still select the canonical cold transcript store;
+search uses contentless FTS and bounded previews in `recall_hot.db`. Event IDs
+and transcript references are retained. The server builds bounded index pages
+and refreshes the catalog off the request path. Health exposes index/capture lag.
+
+`src/recall_migrate.py --source PATH --target-dir NEWDIR` defaults to a sampled,
+read-only dry run. Execute needs `--execute --offline-confirmed`; repeated
+`--max-rows 100000 --seconds 30 --batch-rows 250` invocations resume. It refuses
+nonempty source WAL/journal files, changed source identity, source aliases or an
+unrecognized destination. It never checkpoints, replaces or deletes the old file.
+The new cold copy omits legacy FTS/duplicate `content_fts` values and adds an
+event-change journal. `opencode_raw.db` stays: backup/reaper verification uses it.
+For a still-running source, the coordinator can first run the bounded read-only
+`python3 scripts/recall_stats.py --source PATH`; unlike offline migration planning
+it tolerates a nonempty WAL and does not checkpoint it. No production-size estimate
+is claimed until those coordinator-run measurements exist.
+
+Safe post-deploy push acceptance is prepared with
+`python3 scripts/acceptance_push.py prepare`. It creates a separate trading-core
+checkout and bare push target per harness, replaces both origin URLs with the
+local path, and prints fresh-session prompts. After the three sessions,
+`python3 scripts/acceptance_push.py verify --root PRINTED_ROOT` requires cited
+main-dev denials in the decision log and no `main` refs in any bare target.
+
+Corpus-derived denial currently recognizes explicit branch constraints and literal
+git push destinations. Other standing rules are supplied as context; ambiguous
+shell/dynamic destinations do not produce an unsupported deny. The supplied
+Jev eval is `python3 src/eval_recall_classifier.py [--live]`; live mode makes paid
+classification requests with synthetic tool arguments, reading the key at runtime.
 
 ## Runtime data lives elsewhere
 

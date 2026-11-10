@@ -131,7 +131,9 @@ model stream that died mid tool call and left the session "running" for hours.
   dry run against a scratch state dir never finds a stall.
 - Limits: 30 min when waiting on the model (twice the opus `chunkTimeout`). A
   running shell gets its own `timeout` (default 2 min) plus 30 min, or 8h when
-  its timeout is off. Other running tools and subagents get 2h, since a running
+  its timeout is off. A running `execute` gets 20 min, or 3 min when its code
+  contains a known never-settling promise; its stall label names that cause.
+  Other running tools and subagents get 2h, since a running
   tool's output never shows up in the message. Sessions waiting on a question,
   form or permission are never touched, and neither is a parent whose subagent
   session is still active.

@@ -28,6 +28,8 @@ ORDER_CARD_LAST4=order_card.LAST4
 # Owner pause on all ordering: while this file exists, money commands refuse (exit 4).
 PAUSE_FILE=Path(os.environ.get('ORDERING_PAUSE_FILE') or Path.home()/'.local/state/ordering-paused')
 PAUSED_COMMANDS=frozenset({'order','test-talabat-shops','await-payment','marketplace-cart','cart','recover-payment'})
+# close-food-captured is excluded: it reads bank/order evidence and closes local
+# ownership only; it has no place, completion, payment or other remote send.
 EXIT_PAUSED=4
 # Only outcomes that clearly mean the card itself was refused.
 CARD_DECLINE_REASONS=frozenset({'PAYMENT_DECLINED_INSUFFICIENT_FUNDS_NO_RETRY',
@@ -155,6 +157,11 @@ def purchase_talabat(args):
     return result
 
 
+def talabat_retired_note():
+    import talabat_retired
+    return talabat_retired.MESSAGE
+
+
 def talabat_discovery(args):
     """Authenticated menu/choice reads, without opening or modifying a cart."""
     from dataclasses import asdict
@@ -231,7 +238,8 @@ def capabilities():
             'nested_subchoices_cart_live_verified':True,
             'nested_subchoices_purchase_live_verified':False,'multi_item_baskets':True,
             'multi_item_cart_live_verified':True,'multi_item_purchase_live_verified':True}},
-        'talabat_order_scope':'arbitrary_catalog_items_and_multiple_lines',
+        'talabat_order_scope':'retired_by_owner_2026_11_07',
+        'talabat_retired':talabat_retired_note(),
         'spending_policy':'caller_managed_no_cli_order_or_campaign_cap',
         'basket_input':'items_file_json_array_or_items_object_with_legacy_single_item_flags',
         'noon_session_recovery':'bounded_same_account_revalidation_and_peer_cookie_adoption',
@@ -659,6 +667,12 @@ def track_exact(app, vertical, order):
     if vertical=='nownow':
         from commerce_nownow import reader
         return reader().track(order)
+    if vertical=='food':
+        from noon_vertical_reads import track
+        return track(order, 'food')
+    if vertical=='marketplace':
+        from native_orders import noon_marketplace_track
+        return noon_marketplace_track(order,15)
     journal.fail('INVALID_COMMERCE_VERTICAL')
 
 
@@ -693,6 +707,14 @@ def checkout_check(vertical):
 
 def review_contract(vertical):
     """Machine-readable native contract gaps, not synthetic financial approval."""
+    if vertical=='food':
+        from noon_food_financial import contract
+        return {'ok':True,'vertical':'food','review_engine':'commerce_food.FoodFlow.review',
+            'prepare_only':True,'purchase_enabled':False,'financial_send':False,
+            'binding':['account','Banyantree Hillside Flat 2104','address version','outlet','item quantities','modifier quantities','item notes','2342'],
+            'quiet':['leavedoor','dontring','avoidcalling','driverNotes'],
+            'journal':'consume before each mutation; no resend of consumed operations; retained exact session readback',
+            'financial_contract':contract()}
     if vertical in ('main','supermall'):
         from noon_marketplace_native_shape import NATIVE_SHAPE,UNRESOLVED
         from noon_marketplace_invoice import NATIVE_ROLE_CONTRACT
@@ -822,6 +844,9 @@ def recover_talabat(flow_id, *, max_reads=90, recipient='owner'):
 
 def recover_payment(flow_id, *, max_reads=90, recipient='owner'):
     binding=journal.binding(flow_id)
+    if binding['app']=='noon' and binding['vertical']=='food':
+        from commerce_food import recover
+        return recover(flow_id)
     if binding['app']=='talabat':return recover_talabat(flow_id,max_reads=max_reads,recipient=recipient)
     if binding['vertical']=='nownow' and journal.preorder_status(flow_id)['operations']:
         from commerce_preorder import recover
@@ -960,9 +985,16 @@ def main(argv=None):
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
     recipient_argument(recover)
+    captured=commands.add_parser('close-food-captured', help='Close a delivered automatic Food capture from bank SMS evidence; never sends money')
+    captured.add_argument('flow_id')
+    captured.add_argument('--bank-msg-id', type=int, required=True)
+    captured.add_argument('--attested-by', choices=('owner',))
+    captured.add_argument('--confirm', action='store_true', help='Commit the evidenced close; omitted means validated dry run')
     track=commands.add_parser('track');track.add_argument('flow_id')
     exact=commands.add_parser('track-exact');exact.add_argument('app',choices=('noon','talabat'))
     exact.add_argument('vertical');exact.add_argument('order')
+    detail=commands.add_parser('order-details',help='Read exact noon merchandise, choices, notes and totals')
+    detail.add_argument('app',choices=('noon',));detail.add_argument('vertical');detail.add_argument('order')
     status=commands.add_parser('order-status');status.add_argument('flow_id')
     disposition=commands.add_parser('reconcile-order');disposition.add_argument('flow_id')
     disposition.add_argument('--close-duplicate',action='store_true',
@@ -984,7 +1016,7 @@ def main(argv=None):
     disposition.add_argument('--attested-by',choices=('owner',))
     cart=commands.add_parser('marketplace-cart');cart.add_argument('service',choices=('main','supermall'))
     preflight=commands.add_parser('checkout-check');preflight.add_argument('vertical',choices=('main','supermall','nownow','minutes'))
-    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow'))
+    contract=commands.add_parser('review-contract');contract.add_argument('vertical',choices=('main','supermall','nownow','food'))
     auth=commands.add_parser('auth');auth.add_argument('app',choices=('noon','talabat'))
     auth.add_argument('vertical');maintenance=auth.add_mutually_exclusive_group()
     maintenance.add_argument('--recover',action='store_true');maintenance.add_argument('--reconcile',action='store_true')
@@ -993,6 +1025,11 @@ def main(argv=None):
     talabat_arguments(buy)
     order=commands.add_parser('order')
     order_commands=order.add_subparsers(dest='order_command',required=True)
+    food_order=order_commands.add_parser('food', help='Journalled Food prepare-only; paid transport is disabled pending proof')
+    food_order.add_argument('--outlet-code',required=True)
+    food_order.add_argument('--items-file',required=True)
+    food_order.add_argument('--prepare-only',action='store_true')
+    food_order.add_argument('--resume-flow')
     talabat_order=order_commands.add_parser('talabat',
         help='Caller-authorized Talabat basket with per-item notes and menu choices')
     talabat_arguments(talabat_order)
@@ -1046,6 +1083,9 @@ def main(argv=None):
         help='Local close of eligible preparation with all sends observed, no financial ops and zero reserved')
     abandon.add_argument('flow_id')
     args=parser.parse_args(argv)
+    # Talabat retired by the owner (2026-11-07): refuse before pause, auth or network.
+    import talabat_retired
+    if talabat_retired.requested(args):return talabat_retired.refuse()
     # Owner pause first: nothing below (chat lookup, auth, network) runs while it holds.
     if args.command in PAUSED_COMMANDS and PAUSE_FILE.exists():
         print(json.dumps({'ok':False,'error':'ORDERING_PAUSED',
@@ -1104,6 +1144,9 @@ def main(argv=None):
         elif args.command=='test-talabat-shops':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='talabat':result=purchase_talabat(args)
         elif args.command=='order' and args.order_command=='minutes':result=order_minutes(args)
+        elif args.command=='order' and args.order_command=='food':
+            from commerce_food import prepare
+            result=prepare(args)
         elif args.command=='order' and args.order_command=='nownow':result=order_nownow(args)
         elif args.command=='order' and args.order_command=='main':result=order_main(args)
         elif args.command=='order' and args.order_command=='supermall':result=order_supermall(args)
@@ -1127,6 +1170,9 @@ def main(argv=None):
                 # No decline row (receipt parked before it was journaled): treat it as now.
                 noted=note_card_decline(result,app='talabat',not_before=started,occurred_at=occurred)
                 if noted:result={**result,'card_status':noted}
+        elif args.command=='close-food-captured':
+            from commerce_food_capture import close
+            result=close(args, track_exact)
         elif args.command=='order-status':
             from commerce_order_status import status
             result=status(args.flow_id)
@@ -1165,6 +1211,9 @@ def main(argv=None):
         elif args.command=='checkout-check':result=checkout_check(args.vertical)
         elif args.command=='review-contract':result=review_contract(args.vertical)
         elif args.command=='track-exact':result=track_exact(args.app,args.vertical,args.order)
+        elif args.command=='order-details':
+            from noon_order_details import details
+            result=details(args.order,args.vertical)
         elif args.command=='auth':
             manager=CommerceAuth()
             if args.diagnose_readonly:

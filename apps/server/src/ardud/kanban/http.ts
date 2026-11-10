@@ -254,6 +254,25 @@ export const kanbanRouteLayer = HttpRouter.addAll(
 
     const listBoards = read(service.boards);
 
+    const listCards = read(
+      Effect.gen(function* () {
+        const board = yield* boardOf(yield* param("board"));
+        const after = yield* query("after");
+        const limit = yield* query("limit");
+        const open = yield* query("open");
+        const fields = yield* query("fields");
+        if (open !== null && open !== "0" && open !== "1")
+          return yield* fail("invalid", "open must be 0 or 1.");
+        return yield* service.cardPage({
+          board: board.id,
+          after: after === null ? 0 : Number(after),
+          limit: limit === null ? 200 : Number(limit),
+          open: open === "1",
+          ...(fields === null ? {} : { fields: fields.split(",").map((field) => field.trim()) }),
+        });
+      }),
+    );
+
     const createBoard = write(
       Effect.gen(function* () {
         const input = yield* body(CreateBoardBody);
@@ -554,6 +573,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("PATCH", `${p}/boards/:board`, handle(updateBoard)),
       HttpRouter.route("POST", `${p}/boards/:board/pools`, handle(setPool)),
       HttpRouter.route("POST", `${p}/boards/:board/cards`, handle(createCard)),
+      HttpRouter.route("GET", `${p}/boards/:board/cards`, handle(listCards)),
       HttpRouter.route("GET", `${p}/boards/:board/discussions`, handle(listDiscussions)),
       HttpRouter.route("POST", `${p}/boards/:board/discussions`, handle(createDiscussion)),
       HttpRouter.route("POST", `${p}/boards/:board/evaluators`, handle(startEvaluator)),

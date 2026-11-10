@@ -172,7 +172,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     } finally { clearTimeout(timer); }
   };
   const shares = new Shares({ store: ownerStore, appsRoot: config.appsRoot, startTunnel: cloudflaredTunnel(), log,
-    origin: config.shareOrigin });
+    origin: config.shareOrigin,
+    secrets: token => registry?.all().find(chat => getSecretRequest(chat.store, token))?.secretDeps });
   process.once("exit", () => shares.killAll());
   void shares.restore().catch(() => log("share-sweep-failed"));
   const post = socketPost(telegramBridgeSocket);
@@ -188,6 +189,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
+    if (chatBackend instanceof RobobBackend) chatBackend.trackFirstTurns(chat.store);
     const liveCards = (config.liveCardChats ?? ["owner"]).includes(chat.info.slug);
     const transport = sbTransport(observed, chat.info.key, chat.store, undefined,
       liveCards ? {} : { static: true, previewImage: cardPreviewImage() });
@@ -211,7 +213,8 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       store: chat.store,
       photon: { react: (_chat, target, reaction) => line.react(target, reaction) } satisfies Pick<Photon, "react">,
       router: () => router, chatGuid: () => chat.info.key,
-      ...(apps ? { secrets: { stateRoot: chat.stateRoot, publishApps } } : {}),
+      ...(apps ? { secrets: { stateRoot: chat.stateRoot, publicForm: !isOwner,
+        publishApps: isOwner ? publishApps : async () => shares.secretBase() } } : {}),
       enabled: ready, health: () => ({}),
       replyCheck: text => checkReply(chat.info, text, readReplyRules(join(stateRoot, "reply-rules.json"))),
       log,
