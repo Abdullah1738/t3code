@@ -97,7 +97,8 @@ const JournalRecord = Schema.Struct({
   version: Schema.Literal(JOURNAL_VERSION),
   key: Schema.String,
   loadId: Schema.String,
-  pages: Schema.Int.check(Schema.isGreaterThan(0)),
+  /** 0 while the load's first page is being written. */
+  pages: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   nextAfter: Schema.String,
   updatedAt: Schema.Number,
 });
@@ -145,6 +146,7 @@ export function makeKeyValueShellLoadJournal<E>(
             "read",
             Effect.gen(function* () {
               for (const record of yield* records(environmentId)) {
+                if (record.pages === 0) continue;
                 const bodies: string[] = [];
                 for (let index = 0; index < record.pages; index++) {
                   const body = yield* store.get(
@@ -173,23 +175,24 @@ export function makeKeyValueShellLoadJournal<E>(
         : quietly(
             "append",
             Effect.gen(function* () {
+              const recordKey = shellLoadRecordKey(environmentId, entry.loadId);
+              const record = (pages: number): JournalRecord => ({
+                version: JOURNAL_VERSION,
+                key: entry.key,
+                loadId: entry.loadId,
+                pages,
+                nextAfter: entry.nextAfter,
+                updatedAt: entry.updatedAt,
+              });
+              // A record before the first page, so the sweep finds the load even when the
+              // client dies between the two writes.
+              if (entry.index === 0) yield* store.put(recordKey, yield* encodeRecord(record(0)));
               yield* store.put(
                 shellLoadPageKey(environmentId, entry.loadId, entry.index),
                 entry.body,
               );
               // The record names a page only after that page is written.
-              const record: JournalRecord = {
-                version: JOURNAL_VERSION,
-                key: entry.key,
-                loadId: entry.loadId,
-                pages: entry.index + 1,
-                nextAfter: entry.nextAfter,
-                updatedAt: entry.updatedAt,
-              };
-              yield* store.put(
-                shellLoadRecordKey(environmentId, entry.loadId),
-                yield* encodeRecord(record),
-              );
+              yield* store.put(recordKey, yield* encodeRecord(record(entry.index + 1)));
             }),
             undefined,
           ),

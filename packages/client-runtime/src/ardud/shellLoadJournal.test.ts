@@ -99,6 +99,19 @@ describe("shell load journal", () => {
       fail = true;
       yield* journal.append(ENVIRONMENT, { ...entry(1, "live"), updatedAt: 9_001 });
       expect(JSON.parse(values.get(shellLoadRecordKey(ENVIRONMENT, "live"))!).pages).toBe(1);
+      // A load that died between its first record and first page is skipped, then swept.
+      values.set(
+        shellLoadRecordKey(ENVIRONMENT, "torn"),
+        JSON.stringify({
+          ...JSON.parse(values.get(shellLoadRecordKey(ENVIRONMENT, "live"))!),
+          loadId: "torn",
+          pages: 0,
+          updatedAt: 9_500,
+        }),
+      );
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("live");
+      yield* journal.sweep(ENVIRONMENT, 9_600);
+      expect([...values.keys()].filter((key) => key.includes("torn"))).toEqual([]);
       // Unreadable records are ignored.
       values.set(shellLoadRecordKey(ENVIRONMENT, "live"), "not json");
       expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);

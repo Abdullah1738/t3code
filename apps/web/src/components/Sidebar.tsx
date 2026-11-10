@@ -577,9 +577,11 @@ function useSidebarThreads(input: {
   const visibleWorkingThreads = workingShelfExpanded
     ? workingThreads
     : routeThreadOnly(workingThreads, routeRowThreadKey);
+  // Navigation, selection and drag writes see the whole Active shelf; only drawing is bounded
+  // (sidebarListItems uses renderedActiveThreads).
   const orderedThreads = [
     ...pinnedThreads,
-    ...renderedActiveThreads,
+    ...activeThreads,
     ...visibleWorkingThreads,
     ...visibleSnoozedThreads,
     ...renderedSettledThreads,
