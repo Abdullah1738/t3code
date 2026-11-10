@@ -3,6 +3,7 @@ export * from "./client.ts";
 export * from "./columns.ts";
 export * from "./filters.ts";
 export * from "./links.ts";
+export * from "./needsYou.ts";
 export * from "./scripts.ts";
 export * from "./transport.ts";
 export * from "./viewModel.ts";

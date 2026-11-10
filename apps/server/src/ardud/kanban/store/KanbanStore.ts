@@ -383,7 +383,16 @@ const make = Effect.gen(function* () {
             'settledAt', json_extract(json, '$.settledAt'),
             'activeThreadId', active_thread_id,
             'asks', json(COALESCE((
-              SELECT json_group_array(json_object('closedAt', json_extract(ask.value, '$.closedAt')))
+              SELECT json_group_array(json_patch(
+                json_object('closedAt', json_extract(ask.value, '$.closedAt')),
+                json_object(
+                  'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
+                  'handedAt', json_extract(ask.value, '$.handedAt'),
+                  'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                  'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
+                    THEN json_object('ack', json('true')) END
+                )
+              ))
               FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
             ), '[]'))
           ) AS json

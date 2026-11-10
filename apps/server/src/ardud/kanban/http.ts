@@ -24,6 +24,7 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -35,7 +36,9 @@ import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
+import * as Asks from "./engine/asks.ts";
 import { textProblem } from "./engine/text.ts";
+import { stubMessage } from "./engine/messagePages.ts";
 import * as BoardReplies from "./engine/boardReplies.ts";
 import { jsonReply } from "../http/jsonReply.ts";
 
@@ -134,6 +137,44 @@ const AnswerBody = Schema.Struct({
   choice: Schema.Array(Schema.String),
   text: Schema.optional(Schema.NullOr(Schema.String)),
 });
+
+// Which verdicts an ask takes depends on its response parts: the engine checks.
+const AskVerdict = Schema.String;
+const AskAnswerFields = {
+  verdict: AskVerdict,
+  optionIds: Schema.optional(Schema.Array(Schema.String)),
+  text: Text,
+  /** For the agent that acts on the answer. Never saved as a rule. */
+  note: Text,
+};
+const AskAnswerBody = Schema.Struct({
+  ...AskAnswerFields,
+  /** A draft ask: the text to post, as the owner left it. */
+  finalDraft: Text,
+  /** Field id to value, for an ask with fields. A file field takes the uploads' attachments. */
+  values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+  /** The revision the client showed; a newer one answers with 409. */
+  revision: Schema.optional(Schema.Int),
+});
+const AskBatchBody = Schema.Struct({
+  ...AskAnswerFields,
+  items: Schema.Array(
+    Schema.Struct({
+      card: Schema.String,
+      askId: Schema.String,
+      revision: Schema.optional(Schema.Int),
+    }),
+  ),
+});
+const AskHandBody = Schema.Struct({
+  action: Schema.optional(Schema.Literals(["hand", "take_back"])),
+  /** With hand: also ask an evaluator to take asks like this one from now on. */
+  always: Schema.optional(Schema.Boolean),
+  /** With always: what the owner said, passed to that evaluator word for word. */
+  text: Text,
+});
+/** At most this many asks in one batch answer. */
+const ASK_BATCH_MAX = 50;
 
 const BoardBody = Schema.Struct({
   name: Text,
@@ -489,6 +530,172 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    /** `closed`: an ISO time, or a window back from now such as `24h` or `7d`. */
+    const closedSince = Effect.fn("KanbanHttp.closedSince")(function* (value: string | null) {
+      if (value === null || value.trim() === "") return undefined;
+      const window = /^(\d{1,4})([hd])$/.exec(value.trim());
+      if (window) {
+        const hours = Number(window[1]) * (window[2] === "d" ? 24 : 1);
+        return DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { hours }));
+      }
+      const time = DateTime.make(value.trim());
+      if (Option.isNone(time)) {
+        return yield* fail("invalid", "closed must be an ISO time or a window like 24h or 7d.");
+      }
+      return DateTime.formatIso(time.value);
+    });
+
+    const askOf = (card: KanbanCard, askId: string) => {
+      const ask = card.asks.find((entry) => entry.id === askId);
+      return {
+        card: { id: card.id, number: card.number, stage: card.stage },
+        ask: ask ?? null,
+      };
+    };
+
+    const listAsks = read(
+      Effect.gen(function* () {
+        const ref = yield* query("board");
+        const board = ref ? yield* boardOf(ref) : null;
+        return yield* service.askFeed({
+          boardId: board?.id,
+          closedSince: yield* closedSince(yield* query("closed")),
+        });
+      }),
+    );
+
+    const getAsk = read(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        return yield* service.askDetail(card.id, yield* param("ask"));
+      }),
+    );
+
+    const answerAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(AskAnswerBody);
+        const result = yield* service.answerAsk(card.id, askId, input, OWNER);
+        return askOf(result.card, askId);
+      }),
+    );
+
+    // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
+    const answerAsks = write(
+      Effect.gen(function* () {
+        const { items, ...answer } = yield* body(AskBatchBody);
+        if (items.length === 0) return yield* fail("invalid", "items is empty.");
+        if (items.length > ASK_BATCH_MAX) {
+          return yield* fail("invalid", `At most ${ASK_BATCH_MAX} asks in one batch.`);
+        }
+        // One answer fits several asks only when they take the same thing back.
+        let shape: string | null = null;
+        const results = yield* Effect.forEach(items, (item) =>
+          Effect.gen(function* () {
+            const card = yield* cardOf(item.card);
+            const open = Asks.findOpenAsk(card, item.askId);
+            if (open) {
+              const own = Asks.batchShape(open);
+              if (own === null) {
+                return yield* fail(
+                  "invalid",
+                  `${item.askId} on card #${card.number} takes more than one answer can give several asks: answer it on its own.`,
+                );
+              }
+              shape ??= own;
+              if (own !== shape) {
+                return yield* fail(
+                  "invalid",
+                  `${item.askId} on card #${card.number} doesn't take the same answer as the first ask in the batch: answer it on its own.`,
+                );
+              }
+            }
+            const result = yield* service.answerAsk(
+              card.id,
+              item.askId,
+              { ...answer, revision: item.revision },
+              OWNER,
+            );
+            return { card: item.card, askId: item.askId, ok: true as const, stage: result.card.stage };
+          }).pipe(
+            Effect.catchTags({
+              KanbanError: (error) =>
+                Effect.succeed({
+                  card: item.card,
+                  askId: item.askId,
+                  ok: false as const,
+                  error: { code: error.code, message: error.detail },
+                }),
+            }),
+          ),
+        );
+        return { answered: results.filter((result) => result.ok).length, results };
+      }),
+    );
+
+    const replyOnAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(PostBody);
+        const problem = textProblem([["message", input.text]]);
+        if (problem) return yield* fail("invalid", problem);
+        const blocks = [
+          ...(input.text?.trim() ? [{ _tag: "md" as const, text: input.text }] : []),
+          ...(input.blocks ?? []),
+        ];
+        if (blocks.length === 0) return yield* fail("invalid", "Nothing to post.");
+        return stubMessage(yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner"));
+      }),
+    );
+
+    const handAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(AskHandBody);
+        const action = input.action ?? "hand";
+        const always = action === "hand" && input.always === true;
+        if (!always) return askOf(yield* service.handAsk(card.id, askId, action, OWNER), askId);
+        const words = input.text?.trim() ?? "";
+        const problem =
+          textProblem([["text", words]]) ??
+          (words.length > Asks.ASK_LIMITS.note
+            ? `text is at most ${Asks.ASK_LIMITS.note} characters.`
+            : null);
+        if (problem) return yield* fail("invalid", problem);
+        const board = yield* boardOf(card.boardId);
+        const handed = yield* service.handAsk(card.id, askId, "hand", OWNER, true);
+        const ask = handed.asks.find((entry) => entry.id === askId);
+        if (!ask) return askOf(handed, askId);
+        // The hand-over stands whether or not the evaluator starts: it is a second step,
+        // outside the hand-over's board write.
+        const started = yield* service
+          .startEvaluator(board.id, {
+            kind: "request",
+            text: Asks.alwaysText(handed, `${board.slug}:${handed.number}`, ask, words),
+          })
+          .pipe(
+            Effect.map((threadId) => ({ threadId, error: null })),
+            Effect.catchTags({
+              KanbanError: (error) => Effect.succeed({ threadId: null, error: error.detail }),
+            }),
+          );
+        if (started.threadId === null) {
+          return {
+            ...askOf(handed, askId),
+            evaluator: { started: false, threadId: null, error: started.error },
+          };
+        }
+        const noted = yield* service.noteHandEvaluator(card.id, askId, started.threadId);
+        return {
+          ...askOf(noted, askId),
+          evaluator: { started: true, threadId: started.threadId, error: null },
+        };
+      }),
+    );
+
     const startEvaluator = write(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
@@ -566,6 +773,12 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),
+      HttpRouter.route("GET", `${p}/asks`, handle(listAsks)),
+      HttpRouter.route("POST", `${p}/asks/answer`, handle(answerAsks)),
+      HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
       HttpRouter.route("PATCH", `${p}/discussions/:discussion`, handle(updateDiscussion)),
       HttpRouter.route("GET", `${p}/discussions/:discussion/messages`, handle(listMessages)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/messages`, handle(postMessage)),

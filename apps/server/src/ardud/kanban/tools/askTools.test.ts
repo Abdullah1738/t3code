@@ -1,0 +1,406 @@
+/** The ask tools as an agent calls them over MCP: card_ask, card_ask_change, card_ask_answer, discussion_post with ask. */
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { assert, it } from "@effect/vitest";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  kanbanAskChanges,
+  kanbanAskWaitsOn,
+  type KanbanActor,
+} from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { McpSchema, McpServer } from "effect/ai";
+
+import * as ServerConfig from "../../../config.ts";
+import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
+import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
+import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as Sqlite from "../../../persistence/Sqlite.ts";
+import * as ProjectService from "../../../project/ProjectService.ts";
+import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
+import * as KanbanService from "../engine/KanbanService.ts";
+import * as KanbanModels from "../engine/models.ts";
+import { opencodeTestProvider } from "../engine/testProviders.ts";
+import { KanbanThreads } from "../engine/threads.ts";
+import * as KanbanStore from "../store/KanbanStore.ts";
+import * as KanbanHandlers from "./handlers.ts";
+import { KanbanToolkit } from "./tools.ts";
+
+const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
+  environmentId: EnvironmentId.make("environment"),
+  requestNamespace: `provider:${threadId}`,
+  thread: {
+    threadId,
+    providerSessionId: `provider:${threadId}`,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+  },
+  client: undefined,
+  capabilities: new Set(["orchestration"]),
+  issuedAt: 0,
+});
+
+const mcpClient = McpSchema.McpServerClient.of({
+  clientId: 1,
+  protocolVersion: "2025-06-18",
+  clientCapabilities: {},
+  clientInfo: { name: "mcp-test", version: "1" },
+  initializePayload: {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "mcp-test", version: "1" },
+  },
+  getClient: Effect.die("unused"),
+});
+
+const call = (threadId: ThreadId, name: string, args: Record<string, unknown>) =>
+  McpServer.McpServer.pipe(
+    Effect.flatMap((server) => server.callTool({ name, arguments: args })),
+    Effect.map((result) => ({
+      isError: result.isError === true,
+      text: result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+      structured: (result.structuredContent ?? {}) as Record<string, any>,
+    })),
+    Effect.provideService(McpInvocationContext.McpInvocationContext, threadCaller(threadId)),
+    Effect.provideService(McpSchema.McpServerClient, mcpClient),
+  );
+
+const testLayer = () => {
+  let launched = 0;
+  const threads = Layer.succeed(
+    KanbanThreads,
+    KanbanThreads.of({
+      view: (threadId) =>
+        Effect.succeed({
+          threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "thread",
+          state: "idle",
+          updatedAt: "2026-11-10T08:00:00.000Z",
+          quietSince: "2026-11-10T08:00:00.000Z",
+          runStartedAt: null,
+          backgroundWork: 0,
+          prs: [],
+          archived: false,
+        }),
+      find: () => Effect.succeed(null),
+      lastFailure: () => Effect.succeed(null),
+      findLastFailure: () => Effect.succeed(null),
+      latestRun: () => Effect.succeed(null),
+      compactRun: () => Effect.succeed(null),
+      launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
+      send: () => Effect.void,
+      model: () => Effect.succeed(null),
+      setModel: () => Effect.void,
+      interrupt: () => Effect.void,
+    }),
+  );
+  return McpHttpServer.toolkitRegistration(KanbanToolkit, KanbanHandlers.layer).pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+      }),
+    ),
+    Layer.provideMerge(KanbanService.layer),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(threads),
+    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-kanban-ask-tools-" }).pipe(
+        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(ServerSettings.layerTest()),
+      ),
+    ),
+  );
+};
+
+const owner: KanbanActor = { _tag: "owner" };
+// A thread the board did not start acts as an evaluator.
+const evaluator = ThreadId.make("thread-evaluator");
+
+const setup = Effect.gen(function* () {
+  const kanban = yield* KanbanService.KanbanService;
+  const board = yield* kanban.ensureBoard({
+    slug: "asks",
+    name: "Asks",
+    defaultProjectId: ProjectId.make("project-1"),
+  });
+  yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+  const card = yield* kanban.createCard(
+    board.id,
+    { prompt: "Long prompt text", title: "A" },
+    owner,
+  );
+  return { kanban, board, card };
+});
+
+it.effect("card_ask takes a template with blocks and answers with a small summary", () =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Replace the tool description?",
+      title: "card_get description",
+      context: "The old one never says it returns history.",
+      change: {
+        label: "card_get description",
+        before: "One card.",
+        after: "One card with its history.",
+      },
+      batchKey: "tool-texts",
+      blocks: [
+        { _tag: "md", text: "Before and after, side by side" },
+        {
+          _tag: "html",
+          html: "<table><tr><td>old</td><td>new</td></tr></table>",
+          title: "Diff",
+          height: 200,
+        },
+        { _tag: "image", url: "https://example.com/diff.png", alt: "The diff as a picture" },
+      ],
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.deepStrictEqual(asked.structured, {
+      card: {
+        card: 1,
+        stage: "todo",
+        ask: { id: "q1", kind: "change", revision: 0, blocking: false, open: true, blocks: 3 },
+      },
+    });
+    assert.notInclude(asked.text, "Long prompt text");
+    const ask = (yield* kanban.card(card.id)).card.asks[0]!;
+    assert.deepStrictEqual(kanbanAskChanges(ask), [
+      {
+        label: "card_get description",
+        before: "One card.",
+        after: "One card with its history.",
+        format: "markdown",
+      },
+    ]);
+    assert.strictEqual(ask.batchKey, "tool-texts");
+    assert.strictEqual(ask.blocks?.length, 3);
+
+    // The old call shape still works: plain option labels make a pick.
+    const plain = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Ship tonight?",
+      options: ["Yes", { label: "No", detail: "Ships Monday", recommended: true }],
+    });
+    assert.isFalse(plain.isError, plain.text);
+    assert.strictEqual(plain.structured.card.ask.kind, "decision");
+
+    const mixed = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Both?",
+      draft: { text: "Hi" },
+      action: { summary: "Send" },
+    });
+    assert.isTrue(mixed.isError);
+    assert.include(mixed.text, "one thing per ask");
+    const pick = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Pick?",
+      blocks: [
+        { _tag: "choice", id: "c", style: "pick", question: "?", options: [], multi: false },
+      ],
+    });
+    assert.isTrue(pick.isError);
+    assert.include(pick.text, "put the answers in options");
+    assert.strictEqual((yield* kanban.card(card.id)).card.asks.length, 2);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "card_ask_change edits an open ask, and its action is an operation or an action body",
+  () =>
+    Effect.gen(function* () {
+      const { kanban, card } = yield* setup;
+      yield* call(evaluator, "card_ask", {
+        card: card.id,
+        question: "Deploy?",
+        action: { summary: "Deploy build 41", command: "make deploy" },
+      });
+      const edited = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        action: { summary: "Deploy build 42", command: "make deploy", undo: "make rollback" },
+        basis: "build 42",
+        revisionNote: "Newer build",
+      });
+      assert.isFalse(edited.isError, edited.text);
+      assert.deepStrictEqual(edited.structured.card.ask, {
+        id: "q1",
+        kind: "action",
+        revision: 1,
+        blocking: false,
+        open: true,
+        blocks: 0,
+      });
+      const ask = (yield* kanban.card(card.id)).card.asks[0]!;
+      assert.strictEqual(ask.action?.summary, "Deploy build 42");
+      assert.strictEqual(ask.revisionNote, "Newer build");
+
+      const nothing = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1" });
+      assert.isTrue(nothing.isError);
+      assert.include(nothing.text, "Pass the fields to change, or an action.");
+      const async = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        blocking: false,
+      });
+      assert.isTrue(async.isError);
+      assert.include(async.text, "can't be made async");
+
+      // Edit and block in one call, then the old operations.
+      const blocked = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        title: "Deploy go",
+        blocking: true,
+      });
+      assert.isFalse(blocked.isError, blocked.text);
+      assert.deepStrictEqual(
+        [
+          blocked.structured.card.stage,
+          blocked.structured.card.ask.blocking,
+          blocked.structured.card.ask.revision,
+        ],
+        ["needs_owner", true, 2],
+      );
+      const dropped = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        action: "drop",
+      });
+      assert.isFalse(dropped.isError, dropped.text);
+      assert.isFalse(dropped.structured.card.ask.open);
+      assert.strictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.verdict, "dropped");
+
+      yield* call(evaluator, "card_ask", { card: card.id, question: "Later?" });
+      const operation = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q2",
+        action: "block",
+      });
+      assert.isFalse(operation.isError, operation.text);
+      assert.isTrue(operation.structured.card.ask.blocking);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("discussion_post with ask replies on the ask without closing it", () =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    yield* call(evaluator, "card_ask", { card: card.id, question: "Which fee?", blocking: true });
+    yield* kanban.replyOnAsk(card.id, "q1", owner, [{ _tag: "md", text: "Fee on what?" }], "owner");
+    assert.strictEqual(kanbanAskWaitsOn((yield* kanban.card(card.id)).card.asks[0]!), "agent");
+
+    const posted = yield* call(evaluator, "discussion_post", {
+      card: card.id,
+      ask: "q1",
+      text: "On withdrawals.",
+      blocks: [{ _tag: "html", html: "<p>fee table</p>", title: "Fees", height: null }],
+    });
+    assert.isFalse(posted.isError, posted.text);
+    assert.strictEqual(posted.structured.message.askId, "q1");
+    assert.deepStrictEqual(
+      posted.structured.message.blocks.map((block: { _tag: string }) => block._tag),
+      ["md", "html"],
+    );
+    const after = (yield* kanban.card(card.id)).card;
+    assert.isNull(after.asks[0]!.closedAt);
+    assert.strictEqual(kanbanAskWaitsOn(after.asks[0]!), "owner");
+    assert.strictEqual(after.stage, "needs_owner");
+
+    const missing = yield* call(evaluator, "discussion_post", {
+      card: card.id,
+      ask: "q7",
+      text: "Hi",
+    });
+    assert.isTrue(missing.isError);
+    assert.include(missing.text, "open ask q7");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask_answer is for evaluators and for asks the owner handed over", () =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+    const asked = yield* call(worker, "card_ask", {
+      question: "Post it?",
+      draft: { text: "Hello.", target: "PR #9" },
+    });
+    assert.isFalse(asked.isError, asked.text);
+
+    const fromWorker = yield* call(worker, "card_ask_answer", { ask: "q1", verdict: "approved" });
+    assert.isTrue(fromWorker.isError);
+    assert.include(fromWorker.text, "Only evaluators use this tool");
+    const notHanded = yield* call(evaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
+    assert.isTrue(notHanded.isError);
+    assert.include(notHanded.text, "was not handed to the evaluator");
+
+    yield* kanban.handAsk(card.id, "q1", "hand", owner);
+    const returned = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: "return",
+    });
+    assert.isFalse(returned.isError, returned.text);
+    assert.isUndefined(returned.structured.card.ask.handed);
+    const workerReturn = yield* call(worker, "card_ask_change", { ask: "q1", action: "return" });
+    assert.isTrue(workerReturn.isError);
+
+    yield* kanban.handAsk(card.id, "q1", "hand", owner);
+    const decided = yield* call(evaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+      finalDraft: "Hello, and thanks.",
+      note: "Friendlier.",
+    });
+    assert.isFalse(decided.isError, decided.text);
+    assert.isFalse(decided.structured.card.ask.open);
+    const answer = (yield* kanban.card(card.id)).card.asks[0]!.answer!;
+    assert.deepStrictEqual(
+      [answer.verdict, answer.decision, answer.finalDraft, answer.draftEdited, answer.note],
+      ["handed", "approved", "Hello, and thanks.", true, "Friendlier."],
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it("the card_ask description says what he can give back, and stays short", () => {
+  const description = KanbanToolkit.tools.card_ask.description ?? "";
+  for (const word of [
+    "approve or reject",
+    "a pick",
+    "values he fills in",
+    "a file",
+    "an edit of your draft",
+    "a step he does himself",
+    "seen",
+    "Shortcuts",
+    "One thing per ask",
+    "notice",
+    "respond",
+    "blocks",
+    "html",
+    "alt text",
+  ]) {
+    assert.include(description, word);
+  }
+  assert.isBelow(description.length, 1_800);
+});

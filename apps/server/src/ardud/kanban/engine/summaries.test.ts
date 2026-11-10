@@ -7,6 +7,7 @@ import {
   type KanbanBoard,
   type KanbanCard,
   type KanbanDiscussion,
+  type KanbanOwnerAsk,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -104,6 +105,18 @@ const discussion = (id: string, lastSeq: number, ownerRead: number): KanbanDiscu
 });
 
 const thread = ThreadId.make("t1");
+const NOW = Date.parse("2026-10-26T12:00:00Z");
+
+const ask = (id: string, patch: Partial<KanbanOwnerAsk> = {}): KanbanOwnerAsk => ({
+  id,
+  text: id,
+  blocking: false,
+  by: { _tag: "evaluator", threadId: thread },
+  at,
+  seq: null,
+  closedAt: null,
+  ...patch,
+});
 
 describe("board summaries", () => {
   it("counts cards waiting on the owner, running cards and unread messages", () => {
@@ -122,12 +135,12 @@ describe("board summaries", () => {
       },
       { board: board("b2"), cards: [], discussions: [], threadIds: [] },
     ]);
-    expect(summaries(tallies).map(({ board, ...counts }) => ({ id: board.id, ...counts }))).toEqual(
-      [
-        { id: "b1", needsOwner: 2, running: 1, unread: 3, threadIds: [thread] },
-        { id: "b2", needsOwner: 0, running: 0, unread: 0, threadIds: [] },
-      ],
-    );
+    expect(
+      summaries(tallies, NOW).map(({ board, ...counts }) => ({ id: board.id, ...counts })),
+    ).toEqual([
+      { id: "b1", needsOwner: 2, running: 1, unread: 3, threadIds: [thread] },
+      { id: "b2", needsOwner: 0, running: 0, unread: 0, threadIds: [] },
+    ]);
   });
 
   it("follows changes and reports only those that move a count", () => {
@@ -135,7 +148,7 @@ describe("board summaries", () => {
       { board: board("b1"), cards: [], discussions: [], threadIds: [] },
     ]);
     const counts = () => {
-      const [summary] = summaries(tallies);
+      const [summary] = summaries(tallies, NOW);
       return summary && [summary.needsOwner, summary.running, summary.unread];
     };
 
@@ -185,7 +198,7 @@ describe("board summaries", () => {
     };
     expect(applyChange(tallies, "b1", started)).toBe(true);
     expect(applyChange(tallies, "b1", started)).toBe(false);
-    expect(summaries(tallies)[0]?.threadIds).toEqual([thread]);
+    expect(summaries(tallies, NOW)[0]?.threadIds).toEqual([thread]);
   });
 
   it("sends the whole list first, then only changed boards and new threads", () => {
@@ -194,7 +207,7 @@ describe("board summaries", () => {
       { board: board("b2"), cards: [], discussions: [], threadIds: [] },
     ]);
     const shape = (first: boolean) =>
-      listUpdate(tallies, first).map((entry) => [
+      listUpdate(tallies, first, NOW).map((entry) => [
         entry.boardId,
         entry.board?.name ?? null,
         entry.threadIds,
@@ -231,7 +244,7 @@ describe("board summaries", () => {
     ]);
     expect(applyChange(tallies, "b1", { _tag: "board", board: board("b1", "Renamed") })).toBe(true);
     expect(applyChange(tallies, "b2", { _tag: "board", board: board("b2") })).toBe(true);
-    expect(summaries(tallies).map((summary) => summary.board.name)).toEqual(["Renamed", "b2"]);
+    expect(summaries(tallies, NOW).map((summary) => summary.board.name)).toEqual(["Renamed", "b2"]);
   });
 
   it.effect("streams the list first, then only changes that move a count", () =>
@@ -267,6 +280,71 @@ describe("board summaries", () => {
       const changes = Stream.fromArrays([owner("c1"), owner("c2"), owner("c3")], [owner("c4")]);
       const lists = yield* Stream.runCollect(follow(tallies, changes));
       expect(Array.from(lists, (list) => list[0]?.needsOwner)).toEqual([0, 3, 4]);
+    }),
+  );
+
+  it("counts for the owner only cards with an ask he can answer now", () => {
+    const later = "2026-10-26T13:00:00Z";
+    const tallies = tallyBoards([
+      {
+        board: board("b1"),
+        cards: [
+          card("his", { asks: [ask("q1")] }),
+          card("held-no-ask", { stage: "needs_owner" }),
+          card("handed", { stage: "needs_owner", asks: [ask("q1", { handedAt: at })] }),
+          card("clarify", { asks: [ask("q1", { clarifyAskedAt: at })] }),
+          card("clarify-running", {
+            stage: "working",
+            activeThreadId: thread,
+            asks: [ask("q1", { clarifyAskedAt: at })],
+          }),
+          card("expired", { asks: [ask("q1", { expiresAt: at })] }),
+          card("expires-later", { asks: [ask("q1", { expiresAt: later })] }),
+          card("one-of-two", { asks: [ask("q1", { handedAt: at }), ask("q2")] }),
+          card("closed", { asks: [ask("q1", { closedAt: at })] }),
+        ],
+        discussions: [],
+        threadIds: [],
+      },
+    ]);
+    const counts = (nowMs: number) => {
+      const [summary] = summaries(tallies, nowMs);
+      return [summary?.needsOwner, summary?.running];
+    };
+    // his, held-no-ask, expires-later, one-of-two.
+    expect(counts(NOW)).toEqual([4, 1]);
+    // An hour on, the last ask with an expiry has passed it.
+    expect(counts(Date.parse(later))).toEqual([3, 1]);
+
+    // Handing an ask over and taking it back moves the count; so does his clarifying reply.
+    const set = (asks: ReadonlyArray<KanbanOwnerAsk>) =>
+      applyChange(tallies, "b1", { _tag: "card", card: card("his", { asks }) });
+    expect(set([ask("q1", { handedAt: at })])).toBe(true);
+    expect(counts(NOW)).toEqual([3, 1]);
+    expect(set([ask("q1")])).toBe(true);
+    expect(set([ask("q1", { clarifyAskedAt: at })])).toBe(true);
+    expect(counts(NOW)).toEqual([3, 1]);
+  });
+
+  it.effect("drops an expired ask from the list at the next change", () =>
+    Effect.gen(function* () {
+      const expiresAt = "2026-10-26T12:30:00Z";
+      const tallies = tallyBoards([
+        {
+          board: board("b1"),
+          cards: [card("c1", { asks: [ask("q1", { expiresAt })] })],
+          discussions: [],
+          threadIds: [],
+        },
+      ]);
+      let nowMs = NOW;
+      // A change that moves no count by itself, arriving after the ask expired.
+      const changes = Stream.make({
+        boardId: "b1",
+        change: { _tag: "card" as const, card: card("c2") },
+      }).pipe(Stream.tap(() => Effect.sync(() => (nowMs = Date.parse(expiresAt) + 1))));
+      const lists = yield* Stream.runCollect(follow(tallies, changes, () => nowMs));
+      expect(Array.from(lists).map((list) => list[0]?.needsOwner)).toEqual([1, 0]);
     }),
   );
 });

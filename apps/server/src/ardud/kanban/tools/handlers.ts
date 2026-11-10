@@ -5,6 +5,7 @@ import {
   KanbanDiscussionId,
   KanbanGoalId,
   OrchestratorMcpFailure,
+  kanbanAskIsNotice,
   ProjectId,
   type KanbanActor,
   type KanbanBlock,
@@ -22,6 +23,7 @@ import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import type { EvaluatorPurpose } from "../engine/briefs.ts";
 import { modelSelectionResult } from "../engine/defaults.ts";
+import * as Asks from "../engine/asks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { textProblem } from "../engine/text.ts";
 import {
@@ -75,6 +77,25 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
   },
   Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) }),
 );
+
+/** The ask fields of a tool input, without the tool's own parameters. */
+const askFieldsOf = (input: Asks.AskFieldsInput): Asks.AskFieldsInput => ({
+  kind: input.kind,
+  title: input.title,
+  context: input.context,
+  options: input.options,
+  multi: input.multi,
+  draft: input.draft,
+  action: input.action,
+  change: input.change,
+  changes: input.changes,
+  respond: input.respond,
+  to: input.to,
+  basis: input.basis,
+  expiresAt: input.expiresAt,
+  batchKey: input.batchKey,
+  blocks: input.blocks,
+});
 
 /** Evaluator tools: board evaluators, or orchestrating threads outside any board. */
 const asEvaluator = <A, R>(
@@ -475,16 +496,12 @@ const handlers = {
         }
         const asked = yield* service.askOwner(
           card.id,
-          {
-            question: input.question,
-            blocking: input.blocking ?? false,
-            options: input.options,
-            multi: input.multi,
-          },
+          { ...askFieldsOf(input), question: input.question, blocking: input.blocking ?? false },
           caller.actor,
           isCardThread(caller) ? "cardThread" : "evaluator",
         );
-        return { card: asked };
+        // The newest ask is the one just added.
+        return { card: Asks.askSummary(asked, asked.asks.at(-1)?.id ?? "") };
       }),
     ),
   ),
@@ -497,14 +514,86 @@ const handlers = {
         if (caller.link?.role === "review") {
           return yield* refuse("Review threads put questions in their findings.");
         }
-        const changed = yield* service.changeAsk(
-          card.id,
-          input.ask.trim(),
-          input.action,
-          caller.actor,
-          isCardThread(caller) ? "cardThread" : "evaluator",
+        const askId = input.ask.trim();
+        const role = isCardThread(caller) ? "cardThread" : "evaluator";
+        // `action` is an operation when it is a word, else the new body of an action ask.
+        const action = typeof input.action === "string" ? input.action : undefined;
+        const blocking = input.blocking;
+        const edit: Asks.AskEdit = {
+          ...askFieldsOf({
+            ...input,
+            action: typeof input.action === "string" ? undefined : input.action,
+          }),
+          question: input.question,
+          revisionNote: input.revisionNote,
+        };
+        const edits = Object.entries(edit).some(
+          ([key, value]) => key !== "revisionNote" && value !== undefined,
         );
-        return { card: changed };
+        if (action === "return") {
+          if (isCardThread(caller)) {
+            return yield* refuse("Only an evaluator returns an ask the owner handed over.");
+          }
+          const returned = yield* service.handAsk(card.id, askId, "return", caller.actor);
+          return { card: Asks.askSummary(returned, askId) };
+        }
+        if (action === "drop") {
+          const dropped = yield* service.changeAsk(card.id, askId, "drop", caller.actor, role);
+          return { card: Asks.askSummary(dropped, askId) };
+        }
+        if (blocking === false) {
+          return yield* invalid(
+            "A blocking ask can't be made async: drop it, or leave it for the owner to answer.",
+          );
+        }
+        if (!edits && action === undefined && blocking === undefined) {
+          return yield* invalid("Pass the fields to change, or an action.");
+        }
+        let changed = card;
+        if (edits) changed = yield* service.editAsk(card.id, askId, edit, caller.actor, role);
+        const open = changed.asks.find((entry) => entry.id === askId && entry.closedAt === null);
+        // Asking for blocking on an ask that already blocks is fine when it came with an edit.
+        if ((action === "block" || blocking === true) && !(edits && open?.blocking === true)) {
+          if (open && kanbanAskIsNotice(open)) {
+            return yield* invalid(
+              "A notice can't block: there is nothing for the card to wait for. Ask a real question instead.",
+            );
+          }
+          changed = yield* service.changeAsk(card.id, askId, "block", caller.actor, role);
+        }
+        return { card: Asks.askSummary(changed, askId) };
+      }),
+    ),
+  ),
+
+  card_ask_answer: McpToolAccess.actsAsCaller((input) =>
+    asEvaluator((service, caller) =>
+      Effect.gen(function* () {
+        const card = yield* cardFor(service, caller, input.card);
+        const askId = input.ask.trim();
+        const result = yield* service.answerAsk(
+          card.id,
+          askId,
+          {
+            verdict: input.verdict,
+            optionIds: input.optionIds,
+            text: input.text,
+            values: input.values,
+            note: input.note,
+            finalDraft: input.finalDraft,
+          },
+          caller.actor,
+        );
+        return {
+          card: {
+            ...Asks.askSummary(result.card, askId),
+            ...(result.heard
+              ? {}
+              : {
+                  note: "Nobody else was told: the thread that asked has moved on. Act on the decision yourself or pass it on (card_edit, card_thread).",
+                }),
+          },
+        };
       }),
     ),
   ),
@@ -558,6 +647,21 @@ const handlers = {
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
+        const askId = input.ask?.trim();
+        if (askId) {
+          // A reply on one ask goes to its card's discussion and never closes the ask.
+          const card = yield* cardFor(service, caller, input.card);
+          yield* ownCard(caller, card);
+          return {
+            message: yield* service.replyOnAsk(
+              card.id,
+              askId,
+              caller.actor,
+              blocks,
+              isCardThread(caller) ? "cardThread" : "evaluator",
+            ),
+          };
+        }
         const target = yield* postTargetFor(service, caller, input.discussionId, input.card);
         return {
           message: yield* target.kind === "card"
