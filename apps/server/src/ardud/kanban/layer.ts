@@ -12,6 +12,8 @@ import { TERMINAL_RUN_STATUSES } from "../control/model.ts";
 import {
   KanbanService,
   OwnerRouteMode,
+  ReplayReads,
+  DeferWriteEffects,
   layer as KanbanServiceLayer,
 } from "./engine/KanbanService.ts";
 import { layer as KanbanModelsLayer } from "./engine/models.ts";
@@ -37,6 +39,19 @@ export const boardEventRoute = (
 };
 
 /**
+ * Streamed output (nodes, turn items) fires per paragraph and does not change
+ * what the board reads about a thread; everything else naming a thread does.
+ */
+const STREAMING_EVENTS = new Set<string>(["node.updated", "turn-item.updated"]);
+
+/** The thread an event changed, for the board's read fences. Exported so it is tested itself. */
+export const threadEventOf = (event: OrchestrationV2DomainEvent): string | null => {
+  if (STREAMING_EVENTS.has(event.type)) return null;
+  const threadId = (event as { readonly threadId?: unknown }).threadId;
+  return typeof threadId === "string" ? threadId : null;
+};
+
+/**
  * Owner answers and posts reply once they and their routing are committed;
  * delivery follows in the background. `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`
  * restores delivery inside the reply.
@@ -49,6 +64,30 @@ const ownerRouteModeLayer = Layer.effect(
     );
     return inline ? "inline" : "deferred";
   }).pipe(Effect.orElseSucceed((): OwnerRouteMode => "deferred")),
+);
+
+/**
+ * A stale rerun of a board operation reuses the thread reads its earlier
+ * attempt made (see `outsideRead`). `ROBOB_KANBAN_REPLAY_READS=0` reads again.
+ */
+const replayReadsLayer = Layer.effect(
+  ReplayReads,
+  Config.Boolean("ROBOB_KANBAN_REPLAY_READS").pipe(
+    Config.withDefault(true),
+    Effect.orElseSucceed(() => true),
+  ),
+);
+
+/**
+ * Card and discussion writes reply on commit; their thread follow-ons run from
+ * route rows. `ROBOB_KANBAN_DEFER_WRITE_EFFECTS=0` runs them inside the reply.
+ */
+const deferWriteEffectsLayer = Layer.effect(
+  DeferWriteEffects,
+  Config.Boolean("ROBOB_KANBAN_DEFER_WRITE_EFFECTS").pipe(
+    Config.withDefault(true),
+    Effect.orElseSucceed(() => true),
+  ),
 );
 
 /** Typing heartbeat, review completion and the dispatcher's safety net. */
@@ -90,6 +129,16 @@ export const ArdudKanbanLive = Layer.effectDiscard(
         Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
       ),
     );
+    // Its own subscriber: a fence moves as soon as its event arrives, never
+    // queued behind the slow thread-change reads above.
+    yield* forkParked(
+      Stream.runForEach(engine.streamDomainEvents, (event) => {
+        const changed = threadEventOf(event);
+        return changed === null ? Effect.void : service.threadEvent(changed);
+      }).pipe(
+        Effect.catchCause(warnUnlessInterrupted("missions board stopped following thread events")),
+      ),
+    );
     yield* forkParked(
       service.tick.pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board tick failed")),
@@ -111,7 +160,13 @@ export const ArdudKanbanLive = Layer.effectDiscard(
   }),
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
-  Layer.provideMerge(KanbanServiceLayer.pipe(Layer.provide(ownerRouteModeLayer))),
+  Layer.provideMerge(
+    KanbanServiceLayer.pipe(
+      Layer.provide(ownerRouteModeLayer),
+      Layer.provide(replayReadsLayer),
+      Layer.provide(deferWriteEffectsLayer),
+    ),
+  ),
   Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),
