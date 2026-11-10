@@ -13,6 +13,7 @@ import {
   KanbanService,
   OwnerRouteMode,
   ReplayReads,
+  DeferWriteEffects,
   layer as KanbanServiceLayer,
 } from "./engine/KanbanService.ts";
 import { layer as KanbanModelsLayer } from "./engine/models.ts";
@@ -59,6 +60,18 @@ const ownerRouteModeLayer = Layer.effect(
 const replayReadsLayer = Layer.effect(
   ReplayReads,
   Config.Boolean("ROBOB_KANBAN_REPLAY_READS").pipe(
+    Config.withDefault(true),
+    Effect.orElseSucceed(() => true),
+  ),
+);
+
+/**
+ * Card and discussion writes reply on commit; their thread follow-ons run from
+ * route rows. `ROBOB_KANBAN_DEFER_WRITE_EFFECTS=0` runs them inside the reply.
+ */
+const deferWriteEffectsLayer = Layer.effect(
+  DeferWriteEffects,
+  Config.Boolean("ROBOB_KANBAN_DEFER_WRITE_EFFECTS").pipe(
     Config.withDefault(true),
     Effect.orElseSucceed(() => true),
   ),
@@ -127,6 +140,7 @@ export const ArdudKanbanLive = Layer.effectDiscard(
   Layer.provideMerge(KanbanServiceLayer.pipe(
       Layer.provide(ownerRouteModeLayer),
       Layer.provide(replayReadsLayer),
+      Layer.provide(deferWriteEffectsLayer),
     )),
   Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),

@@ -16,6 +16,7 @@
  */
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -24,6 +25,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
 import * as NodeFs from "node:fs";
 
@@ -151,6 +153,9 @@ const benchLayer = (threads: Layer.Layer<KanbanThreads>) =>
     Layer.provide(
       Layer.succeed(KanbanService.ReplayReads, process.env.KANBAN_LOCK_BENCH_REPLAY !== "0"),
     ),
+    Layer.provide(
+      Layer.succeed(KanbanService.DeferWriteEffects, process.env.KANBAN_LOCK_BENCH_DEFER !== "0"),
+    ),
     Layer.provideMerge(threads),
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(KanbanStore.layer),
@@ -198,6 +203,21 @@ it.live(
             spans.push(span);
           return span;
         },
+      });
+      // Warnings the service logs (failed deliveries and the like), kept for the report.
+      const logged: Array<string> = [];
+      const warnings = Logger.make(({ message, logLevel, cause }) => {
+        if (logLevel !== "Warn" && logLevel !== "Error") return;
+        if (logged.length >= 200) return;
+        const parts = (Array.isArray(message) ? message : [message]).map((part) => {
+          if (typeof part !== "object" || part === null) return String(part);
+          return Object.entries(part)
+            .map(([key, value]) =>
+              `${key}=${Cause.isCause(value) ? Cause.pretty(value) : String(value)}`,
+            )
+            .join(" ");
+        });
+        logged.push(`${parts.join(" ").slice(0, 900)} ${Cause.isCause(cause) && cause.reasons.length > 0 ? Cause.pretty(cause).slice(0, 300) : ""}`);
       });
       const timings = new Map<string, Array<number>>();
       const failures = new Map<string, number>();
@@ -270,7 +290,7 @@ it.live(
         const ownerWrites = until(
           Effect.gen(function* () {
             ownerStep += 1;
-            switch (ownerStep % 4) {
+            switch (ownerStep % 6) {
               case 0: {
                 const exit = yield* timed(
                   "owner.createCard",
@@ -300,6 +320,31 @@ it.live(
                 );
                 return;
               }
+              case 4: {
+                // The owner drops an agent's question: the asker hears it.
+                const cards = yield* kanban.cards(board.id).pipe(Effect.orDie);
+                const asked = cards.flatMap((card) =>
+                  card.asks
+                    .filter((ask) => ask.closedAt === null)
+                    .map((ask) => ({ card, ask })),
+                );
+                if (asked.length === 0) return;
+                const { card, ask } = asked[random(asked.length)]!;
+                yield* timed(
+                  "owner.dropAsk",
+                  kanban.changeAsk(card.id, ask.id, "drop", owner, "owner"),
+                );
+                return;
+              }
+              case 5: {
+                // The owner pulls a working card back: its thread is let go.
+                const cards = yield* kanban.cards(board.id).pipe(Effect.orDie);
+                const live = cards.filter((card) => card.stage === "working");
+                if (live.length === 0) return;
+                const card = live[random(live.length)]!;
+                yield* timed("owner.moveWorking", kanban.moveCard(card.id, "todo", "owner", owner));
+                return;
+              }
               default: {
                 const card = working[random(working.length)]!;
                 yield* timed(
@@ -320,6 +365,18 @@ it.live(
             if (live.length === 0) return;
             const card = live[random(live.length)]!;
             const actor: KanbanActor = { _tag: "thread", threadId: card.workThreadId! };
+            if (agentStep % 4 === 0 && card.activeThreadId === card.workThreadId) {
+              yield* timed(
+                "agent.askOwner",
+                kanban.askOwner(
+                  card.id,
+                  { question: `Which API for card ${card.number}?`, blocking: false },
+                  actor,
+                  "cardThread",
+                ),
+              );
+              return;
+            }
             const text =
               agentStep % 3 === 0
                 ? `Should I split card ${card.number} into two PRs?`
@@ -336,12 +393,28 @@ it.live(
           [other, turnEnds, ticks, ownerWrites, agentWrites].map((loop) => Effect.forkChild(loop)),
         );
         yield* Effect.forEach(fibers, Fiber.join, { discard: true });
-        // Let in-flight background turn ends settle, bounded.
-        yield* Effect.sleep(Math.min(20_000, SECONDS * 300));
-        return { boardId: board.id };
+        // Let in-flight turn ends and route drains settle, bounded: every saved
+        // follow-on must reach an outcome.
+        const sql = yield* SqlClient.SqlClient;
+        const pending = () =>
+          sql<{ n: number }>`SELECT count(*) AS n FROM ardud_kanban_owner_routes WHERE done_at IS NULL`.pipe(
+            Effect.map((rows) => rows[0]?.n ?? 0),
+            Effect.orDie,
+          );
+        const settleBy = (yield* Clock.currentTimeMillis) + Math.max(20_000, SECONDS * 500);
+        yield* Effect.sleep(2_000);
+        while ((yield* pending()) > 0 && (yield* Clock.currentTimeMillis) < settleBy)
+          yield* Effect.sleep(500);
+        const routes = yield* sql<{ kind: string; outcome: string | null; n: number }>`
+          SELECT coalesce(json_extract(json, '$.effect.kind'), json_extract(json, '$.kind')) AS kind,
+                 CASE WHEN done_at IS NULL THEN 'pending' ELSE json_extract(json, '$.outcome') END AS outcome,
+                 count(*) AS n
+          FROM ardud_kanban_owner_routes GROUP BY 1, 2 ORDER BY 1, 2
+        `.pipe(Effect.orDie);
+        return { boardId: board.id, routes };
       }).pipe(
         Effect.provide(benchLayer(fake.layer)),
-        Effect.provide(Logger.layer([])),
+        Effect.provide(Logger.layer([warnings])),
         Effect.withTracer(tracer),
       );
 
@@ -379,6 +452,7 @@ it.live(
         config: {
           variant: process.env.KANBAN_LOCK_BENCH_VARIANT ?? null,
           replayReads: process.env.KANBAN_LOCK_BENCH_REPLAY !== "0",
+          deferWrites: process.env.KANBAN_LOCK_BENCH_DEFER !== "0",
           seconds: SECONDS,
           workers: WORKERS,
           readMs: READ_MS,
@@ -390,6 +464,7 @@ it.live(
           agentEveryMs: AGENT_EVERY_MS,
         },
         boardId: result.boardId,
+        routes: result.routes,
         writes: Object.fromEntries(
           [...timings].map(([name, values]) => [
             name,
@@ -404,6 +479,7 @@ it.live(
             .map(([name, v]) => [name, summary(v)]),
         ),
         firstFailure: Object.fromEntries(firstFailure),
+        warnings: logged.slice(0, 40),
         turnEnd: { attempts: turnEndAttempts, failedAttempts: turnEndFailedAttempts },
         threadIo: fake.counts,
       };
