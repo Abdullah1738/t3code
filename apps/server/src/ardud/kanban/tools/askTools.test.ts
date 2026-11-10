@@ -357,7 +357,26 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.include(notHanded.text, "was not handed to the evaluator");
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
-    const returned = yield* call(evaluator, "card_ask_change", {
+    // Handed, it is with this board's evaluators. A thread the board did not start is not
+    // one, whoever started it: it can neither decide the ask nor give it back.
+    const outsider = yield* call(evaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
+    assert.isTrue(outsider.isError);
+    assert.include(outsider.text, "is with the evaluators of its own board");
+    const outsiderReturn = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: "return",
+    });
+    assert.isTrue(outsiderReturn.isError);
+    assert.include(outsiderReturn.text, "is with the evaluators of its own board");
+    assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+
+    const boardEvaluator = (yield* kanban.cardDiscussion(card.id)).evaluatorThreadId!;
+    const returned = yield* call(boardEvaluator, "card_ask_change", {
       card: card.id,
       ask: "q1",
       action: "return",
@@ -368,7 +387,7 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.isTrue(workerReturn.isError);
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
-    const decided = yield* call(evaluator, "card_ask_answer", {
+    const decided = yield* call(boardEvaluator, "card_ask_answer", {
       card: card.id,
       ask: "q1",
       verdict: "approved",
