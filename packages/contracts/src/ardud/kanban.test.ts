@@ -331,6 +331,40 @@ describe("kanbanSchedule", () => {
     expect(schedule.get("one")).toMatchObject({ rank: 1 });
   });
 
+  it("gives a card parked on a wait no age while it is parked, and its full age once the wait is gone", () => {
+    const wait = Schema.decodeUnknownSync(KanbanCard)(
+      JSON.parse(
+        JSON.stringify({
+          ...card("x"),
+          wait: {
+            on: "time",
+            until: at(20 * day),
+            note: "after the audit",
+            by: { _tag: "owner" },
+            at: at(1 * day),
+          },
+        }),
+      ),
+    ).wait!;
+    const parked = card("parked", { priority: 4, movedAt: at(0), wait });
+    const nowMs = Date.parse(at(9 * day));
+    expect(kanbanSchedule([parked], { nowMs }).get("parked")).toMatchObject({
+      rank: 4,
+      agingSteps: 0,
+      waitingSince: null,
+    });
+    // The wait ended and the card kept its movedAt: the time it was parked counts.
+    const { wait: _wait, ...woken } = parked;
+    expect(kanbanSchedule([woken], { nowMs }).get("parked")).toMatchObject({
+      rank: 2,
+      agingSteps: 2,
+      waitingSince: at(0),
+    });
+    // A wait left behind by a move holds nothing.
+    const moved = { ...parked, movedAt: at(2 * day) };
+    expect(kanbanSchedule([moved], { nowMs }).get("parked")?.waitingSince).toBe(at(2 * day));
+  });
+
   it("ages a startable To-Do card one step per 3 days, at most two, never above P2", () => {
     const cards = [
       card("fresh", { priority: 4, movedAt: at(8 * day) }),
@@ -410,6 +444,52 @@ describe("kanbanCardFlow", () => {
     expect(flow("b").heldUpBy?.id).toBe("a");
     expect(flow("flagged").ready).toBe(false);
     expect(flow("shipped")).toMatchObject({ unblocks: 0, ready: false, waitsOn: [] });
+  });
+
+  it("is not ready while parked on a wait, or (given a clock) inside a failed run's backoff", () => {
+    const failedAt = "2026-11-10T10:00:00.000Z";
+    const wait = Schema.decodeUnknownSync(KanbanCard)(
+      JSON.parse(
+        JSON.stringify({
+          ...card("x"),
+          wait: {
+            on: "time",
+            until: "2026-12-01T00:00:00.000Z",
+            note: "after the audit",
+            by: { _tag: "owner" },
+            at: failedAt,
+          },
+        }),
+      ),
+    ).wait!;
+    const cards = [
+      card("parked", { wait, movedAt: "2026-11-09T10:00:00.000Z" }),
+      card("holds", { blockedBy: ["parked"] }),
+      card("retrying", {
+        retries: [
+          {
+            kind: "run_failed",
+            role: "work",
+            runId: "run-1",
+            reason: "upstream closed the stream",
+            at: failedAt,
+            state: "waiting",
+          },
+        ],
+      }),
+    ];
+    const byId = new Map(cards.map((c) => [c.id as string, c]));
+    const schedule = kanbanSchedule(cards);
+    const due = Date.parse(failedAt) + KANBAN_RETRY_BACKOFF_MS;
+    // Parked: not ready, and still what the card behind it waits on.
+    expect(kanbanCardFlow(byId.get("parked")!, byId, schedule)).toMatchObject({
+      ready: false,
+      unblocks: 1,
+    });
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule, due - 1).ready).toBe(false);
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule, due).ready).toBe(true);
+    // With no clock only the card's own state counts.
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule).ready).toBe(true);
   });
 });
 

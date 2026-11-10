@@ -1351,7 +1351,10 @@ export function kanbanSchedule(
   const result = new Map<string, KanbanSchedule>();
   graph.open.forEach((card, v) => {
     const blocking = graph.of(v);
-    let waitingSince: string | null = card.stage === "todo" ? card.movedAt : null;
+    // A card parked on a wait is not startable: it gathers no age while parked. When
+    // the wait ends it keeps its `movedAt`, so the time it was parked counts from then on.
+    let waitingSince: string | null =
+      card.stage === "todo" && !kanbanWaiting(card) ? card.movedAt : null;
     if (waitingSince !== null) {
       for (const id of card.blockedBy) {
         const blocker = byId.get(id);
@@ -1408,7 +1411,11 @@ export interface KanbanCardFlow {
   readonly unblocks: number;
   /** The priority it is picked at; see kanbanSchedule. Its own priority for a done card. */
   readonly rank: number;
-  /** A To-Do card nothing on the card itself keeps from starting (the board's pause and pools aside). */
+  /**
+   * A To-Do card nothing on the card itself keeps from starting (the board's pause
+   * and pools aside). False while it is parked on a wait, and, when the caller
+   * passes a clock, while it waits out a failed run's backoff.
+   */
   readonly ready: boolean;
   /** The unfinished cards it lists as blockers, including one its own work thread does first. */
   readonly waitsOn: ReadonlyArray<KanbanCard>;
@@ -1418,12 +1425,14 @@ export interface KanbanCardFlow {
 
 /**
  * What a board shows about one card's place in the queue. `schedule` is
- * kanbanSchedule of the same cards, built once per board.
+ * kanbanSchedule of the same cards, built once per board. `nowMs` lets `ready`
+ * see a failed run's backoff; without it only the card's own state counts.
  */
 export function kanbanCardFlow(
   card: KanbanCard,
   byId: ReadonlyMap<string, KanbanCard>,
   schedule: ReadonlyMap<string, KanbanSchedule>,
+  nowMs?: number,
 ): KanbanCardFlow {
   const entry = schedule.get(card.id);
   const open = isOpenCard(card);
@@ -1447,6 +1456,8 @@ export function kanbanCardFlow(
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
       !kanbanWaitsOnEvaluator(card) &&
+      !kanbanWaiting(card) &&
+      (nowMs === undefined || (kanbanRetryNotBefore(card) ?? 0) <= nowMs) &&
       heldUpBy === undefined,
     waitsOn,
     heldUpBy,
