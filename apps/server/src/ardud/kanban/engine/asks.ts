@@ -1,6 +1,7 @@
 /** A card's questions for the owner: blocking ones hold it in Needs Owner, async ones don't. */
 import {
   KANBAN_ASK_ANSWER_FIELD,
+  KANBAN_ASK_SECRET_PROVIDED,
   KANBAN_ASK_FIELD_TYPES,
   kanbanAskChanges,
   kanbanAskExpired,
@@ -70,6 +71,8 @@ export const closeAsks = (
           const {
             clarifyAskedAt: _clarify,
             handedAt: _handed,
+            snoozedUntil: _snoozed,
+            backFromSnoozeAt: _back,
             handedAlways: always,
             handedThreadId: evaluatorThreadId,
             ...rest
@@ -473,8 +476,9 @@ const NEEDS: Record<string, string> = {
   rank: "a rank ask needs at least two options to put in order",
 };
 
-const SECRET_REFUSED =
-  "a secret can't be collected through an ask yet: ask for it with request_secret, which lets him enter it privately and gives you a one-use secretRef. Use an ask for everything around it";
+/** Why a secret field's value is refused anywhere but the app's private channel. Never repeats a value. */
+const SECRET_PRIVATE =
+  "is a secret: he enters it in the app's private field and you get a one-use secretRef. It is never sent or stored as a value";
 
 /** The parts a kind brings by its name alone. Any other kind brings what its contents imply. */
 const presetRespond = (kind: string, input: AskFieldsInput): AskRespondInput => {
@@ -574,7 +578,9 @@ const fieldOf = (
   if (!isType(type)) {
     return invalid(`${name}: type "${type}" is not one of ${KANBAN_ASK_FIELD_TYPES.join(", ")}`);
   }
-  if (type === "secret") return invalid(`${name}: ${SECRET_REFUSED}`);
+  if (type === "secret" && raw.default !== undefined && raw.default !== null) {
+    return invalid(`${name}: a secret field takes no default`);
+  }
   const hint = line(`${name} hint`, raw.hint, ASK_LIMITS.fieldHint);
   if (isProblem(hint)) return hint;
   const base = { id: id as KanbanAskField["id"], label, type };
@@ -763,7 +769,7 @@ export const fieldValue = (
       return { value: files };
     }
     case "secret":
-      return invalid(SECRET_REFUSED);
+      return invalid(SECRET_PRIVATE);
     case "custom": {
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       const json = JSON.stringify(value);
@@ -1079,6 +1085,9 @@ export const askFields = (
 
   const respond = respondOf(kind, input, options, blockTags, rules.blocking);
   if (isProblem(respond)) return respond;
+  if (to === "evaluator" && respond?.fields?.some((field) => field.type === "secret")) {
+    return invalid("a secret field is for the owner: only he can give a secret");
+  }
 
   return compact<AskFields>({
     kind,
@@ -1199,8 +1208,10 @@ export const reviseAsk = (
     revisionNote: _note,
     clarifyAskedAt: _clarify,
     blocks: stored,
-    ...kept
+    ...rest
   } = ask;
+  // An edit brings a snoozed ask back: there is something new to read.
+  const kept = endSnooze(rest, at);
   return {
     ...kept,
     ...(edit.blocks === undefined && stored !== undefined ? { blocks: stored } : {}),
@@ -1217,9 +1228,86 @@ export const replaceAsk = (card: KanbanCard, next: KanbanOwnerAsk): KanbanCard =
   asks: card.asks.map((ask) => (ask.id === next.id ? next : ask)),
 });
 
+/** The longest the owner can put an ask away for. */
+export const SNOOZE_MAX_MS = 366 * 24 * 60 * 60 * 1000;
+
+/** Without its snooze marks: the owner acted on it, or took the snooze off. */
+const withoutSnooze = <A extends Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt">>(
+  ask: A,
+): Omit<A, "snoozedUntil" | "backFromSnoozeAt"> => {
+  const { snoozedUntil: _until, backFromSnoozeAt: _back, ...rest } = ask;
+  return rest;
+};
+
+/**
+ * Its asker edited it or replied: a snooze still running ends now, and the ask
+ * is marked as back since then. One that already ran out is back since it did.
+ */
+const endSnooze = <A extends Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt">>(
+  ask: A,
+  at: string,
+): A => {
+  if (ask.snoozedUntil === undefined || Date.parse(ask.snoozedUntil) <= Date.parse(at)) return ask;
+  const { snoozedUntil: _until, ...rest } = ask;
+  return {
+    ...rest,
+    backFromSnoozeAt: at as NonNullable<KanbanOwnerAsk["backFromSnoozeAt"]>,
+  } as unknown as A;
+};
+
+/** The agent replied on a snoozed ask: it comes back. Same card when it wasn't snoozed. */
+export const wakeFromSnooze = (card: KanbanCard, askId: string, at: string): KanbanCard => {
+  const ask = card.asks.find((entry) => entry.id === askId);
+  if (!ask || ask.closedAt !== null) return card;
+  const woken = endSnooze(ask, at);
+  return woken === ask ? card : replaceAsk(card, woken);
+};
+
+/**
+ * The owner puts an open ask of his away until `until`, or (null) takes the
+ * snooze off. It stays open and keeps holding its card; nobody is told.
+ */
+export const snoozeAsk = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  until: string | null,
+  at: string,
+): KanbanCard | AskProblem => {
+  const ref = `${ask.id} on card #${card.number}`;
+  if (ask.closedAt !== null) return { code: "conflict", detail: `${ref} is already closed` };
+  if (until === null) return replaceAsk(card, withoutSnooze(ask));
+  if (ask.handedAt !== undefined) {
+    return invalid(`${ref} is with the evaluator: take it back to snooze it`);
+  }
+  if (ask.clarifyAskedAt !== undefined) {
+    return invalid(`${ref} waits on its asker, not on you: there is nothing to snooze`);
+  }
+  const time = DateTime.make(until);
+  if (Option.isNone(time)) return invalid("until is not a time (use ISO 8601)");
+  const ms = DateTime.toEpochMillis(time.value);
+  const now = Date.parse(at);
+  if (ms <= now) return invalid("until is in the past: snooze to a later time");
+  if (ms - now > SNOOZE_MAX_MS) return invalid("until is more than a year away");
+  return replaceAsk(card, {
+    ...withoutSnooze(ask),
+    snoozedUntil: DateTime.formatIso(time.value) as NonNullable<KanbanOwnerAsk["snoozedUntil"]>,
+  });
+};
+
 /** The owner asked about the ask instead of answering it: it waits on its asker. */
 export const markClarify = (card: KanbanCard, askId: string, at: string): KanbanCard =>
-  updateAsk(card, askId, { clarifyAskedAt: at as NonNullable<KanbanOwnerAsk["clarifyAskedAt"]> });
+  updateAsk(actedOn(card, askId), askId, {
+    clarifyAskedAt: at as NonNullable<KanbanOwnerAsk["clarifyAskedAt"]>,
+  });
+
+/** The owner acted on an ask (replied, handed it over): any snooze mark on it is done with. */
+const actedOn = (card: KanbanCard, askId: string): KanbanCard =>
+  card.asks.some(
+    (ask) =>
+      ask.id === askId && (ask.snoozedUntil !== undefined || ask.backFromSnoozeAt !== undefined),
+  )
+    ? { ...card, asks: card.asks.map((ask) => (ask.id === askId ? withoutSnooze(ask) : ask)) }
+    : card;
 
 const without = (
   card: KanbanCard,
@@ -1247,7 +1335,7 @@ export const markHanded = (
   at: string,
   always = false,
 ): KanbanCard =>
-  updateAsk(without(card, askId, "clarifyAskedAt"), askId, {
+  updateAsk(actedOn(without(card, askId, "clarifyAskedAt"), askId), askId, {
     handedAt: at as NonNullable<KanbanOwnerAsk["handedAt"]>,
     ...(always ? { handedAlways: true } : {}),
   });
@@ -1486,6 +1574,48 @@ export const answerTextFields = (
   ),
 ];
 
+const NO_SECRETS: ReadonlySet<string> = new Set();
+
+/** A secret field's one-use ref, as the answer's wake text names it. */
+export interface AskSecretRef {
+  readonly ref: string;
+  readonly expiresAt: string;
+  /** Who can use it: the thread that asked, or whichever thread is working the card. */
+  readonly redeemer: "asker" | "worker";
+}
+export type AskSecretRefs = Readonly<Record<string, AskSecretRef>>;
+
+/** What the reader of a secretRef needs to know to use it, and what a failure means. */
+const secretRefNote = (secret: AskSecretRef) =>
+  `A secretRef stands for a value he typed privately; you never see the value. Pass the ref where a tool takes a secretRef (schedule_task signature.secretRef). It works once, until ${secret.expiresAt}, and only from ${secret.redeemer === "asker" ? "the thread that asked" : "the thread working this card"}. It is kept in memory only: if the tool says the ref is unavailable or expired, Robob restarted or the time ran out, and you ask him for it again with a new ask.`;
+
+/**
+ * Who may use the refs for an open ask's secret fields, or why the ask can't
+ * take them. An ask a card's own thread raised is that thread's. One an
+ * evaluator raised is for whoever works the card: the evaluator's thread ends
+ * with its turn and the work thread often does not exist yet.
+ */
+export const secretPlan = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  fieldIds: ReadonlyArray<string>,
+):
+  | { readonly redeemer: AskSecretRef["redeemer"]; readonly threadId: string | null }
+  | AskProblem => {
+  const ref = `${ask.id} on card #${card.number}`;
+  if (ask.closedAt !== null) return conflict(`${ref} is already closed`);
+  const fields = kanbanAskResponse(ask).fields;
+  const unknown = fieldIds.filter(
+    (id) => !fields.some((field) => field.id === id && field.type === "secret"),
+  );
+  if (unknown.length > 0) {
+    return invalid(`${ref} has no secret field ${unknown.map((id) => `"${id}"`).join(", ")}`);
+  }
+  if (ask.by._tag === "thread") return { redeemer: "asker", threadId: ask.by.threadId };
+  if (ask.by._tag === "evaluator") return { redeemer: "worker", threadId: null };
+  return invalid(`${ref} was not raised by an agent, so nobody could use a secret given on it`);
+};
+
 /**
  * The stored answer for an owner's (or, for an ask with the evaluator, an
  * evaluator's) answer to an open ask, checked against the ask's response
@@ -1499,6 +1629,8 @@ export const answerFor = (
   input: AskAnswerInput,
   by: KanbanActor,
   at: string,
+  /** Ids of the secret fields he filled in over the app's private channel. */
+  secrets: ReadonlySet<string> = NO_SECRETS,
 ): KanbanAskAnswer | AskProblem => {
   const ref = `${ask.id} on card #${card.number}`;
   if (ask.closedAt !== null) return conflict(`${ref} is already closed`);
@@ -1565,9 +1697,29 @@ export const answerFor = (
       `${ref} has no field ${stray.map((id) => `"${id}"`).join(", ")}${response.fields.length > 0 ? ` (it has ${response.fields.map((field) => field.id).join(", ")})` : ""}`,
     );
   }
+  const strays = [...secrets].filter(
+    (id) => !response.fields.some((field) => field.id === id && field.type === "secret"),
+  );
+  if (strays.length > 0) {
+    return invalid(`${ref} has no secret field ${strays.map((id) => `"${id}"`).join(", ")}`);
+  }
   const values: Record<string, unknown> = {};
   for (const field of response.fields) {
     const raw = given[field.id];
+    if (field.type === "secret") {
+      // The value itself never comes this way: only that he gave it does.
+      if (raw !== undefined && raw !== null) {
+        return invalid(`${ref}: field "${field.id}" (${field.label}) ${SECRET_PRIVATE}`);
+      }
+      if (secrets.has(field.id)) {
+        values[field.id] = KANBAN_ASK_SECRET_PROVIDED;
+      } else if (field.required === true && !(verdict === "rejected" || verdict === "cant")) {
+        return invalid(
+          `${ref}: field "${field.id}" (${field.label}) is a secret only the owner can give, in the app's private field${by._tag === "owner" ? "" : ". Return the ask to him"}`,
+        );
+      }
+      continue;
+    }
     const empty = raw === undefined || raw === null || raw === "";
     // A plain question's one field is the answer in his own words.
     if (field.id === KANBAN_ASK_ANSWER_FIELD && ask.respond === undefined) {
@@ -1690,7 +1842,7 @@ const valueText = (
         .map((file) => `${file.name} (${pathOf(file) ?? "unavailable"})`)
         .join("; ");
     case "secret":
-      return "provided";
+      return "he entered it privately";
     case "custom":
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       return JSON.stringify(value);
@@ -1711,6 +1863,8 @@ export const answerText = (
   ask: KanbanOwnerAsk,
   answer: KanbanAskAnswer,
   pathOf: (attachment: AskFile) => string | null = () => null,
+  /** The one-use ref for each secret field he filled in. Only this text carries them. */
+  secrets: AskSecretRefs = {},
 ) => {
   const handed = answer.verdict === "handed";
   const verdict = (handed ? answer.decision : answer.verdict) ?? "answered";
@@ -1733,11 +1887,18 @@ export const answerText = (
     return option ? [option.label] : [];
   });
   if (picked.length > 0) parts.push(`Picked: ${picked.join("; ")}`);
+  const refs: Array<AskSecretRef> = [];
   const filled = response.fields.flatMap((field) => {
     const value = answer.values?.[field.id];
-    return value === undefined ? [] : [`${field.label}: ${valueText(field, value, pathOf)}`];
+    if (value === undefined) return [];
+    const secret = field.type === "secret" ? secrets[field.id] : undefined;
+    if (secret !== undefined) refs.push(secret);
+    return [
+      `${field.label}: ${valueText(field, value, pathOf)}${secret ? `. secretRef: ${secret.ref}` : ""}`,
+    ];
   });
   if (filled.length > 0) parts.push(filled.join("\n"));
+  if (refs.length > 0) parts.push(secretRefNote(refs[0]!));
   if (ask.draft !== undefined && verdict !== "rejected" && answer.finalDraft !== undefined) {
     parts.push(
       answer.draftEdited === true

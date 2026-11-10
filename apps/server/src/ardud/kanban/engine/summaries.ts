@@ -20,19 +20,20 @@ import * as Stream from "effect/Stream";
 import type { SummaryCard } from "../store/summaryCard.ts";
 
 /**
- * What a card adds to the counts. `ownerUntil` is the time (ms) until which it
- * counts for the owner: forever for an ask with no expiry or a hand-set hold,
- * the latest `expiresAt` among his answerable asks otherwise, 0 for none.
+ * What a card adds to the counts. `owner` holds, for each ask the owner can
+ * answer, the time span (ms, from inclusive, until exclusive) in which it
+ * counts: from the end of a snooze, until its expiry. A hand-set hold counts
+ * for all time. The card counts for him while any span holds the clock.
  */
 interface CardCount {
-  readonly ownerUntil: number;
+  readonly owner: ReadonlyArray<readonly [from: number, until: number]>;
   readonly running: boolean;
 }
 
 interface BoardTally {
   board: KanbanBoard;
   readonly cards: Map<string, CardCount>;
-  /** The counts the last list carried, to notice an ask expiring between changes. */
+  /** The counts the last list carried, to notice an ask expiring or a snooze running out between changes. */
   sent: Counts | null;
   readonly unread: Map<string, number>;
   readonly threads: Set<ThreadId>;
@@ -48,24 +49,32 @@ export type BoardTallies = Map<string, BoardTally>;
 // The time-free half of `kanbanCardNeedsOwner`: the clock is applied when a list is built.
 const cardCount = (card: SummaryCard): CardCount | null => {
   if (card.settledAt !== null) return null;
-  let ownerUntil = 0;
+  const owner: Array<readonly [number, number]> = [];
   let open = 0;
   for (const ask of card.asks) {
     if (ask.closedAt !== null || kanbanAskIsNotice(ask)) continue;
     open += 1;
     if (kanbanAskWaitsOn(ask) !== "owner") continue;
-    ownerUntil = Math.max(
-      ownerUntil,
+    owner.push([
+      ask.snoozedUntil === undefined ? 0 : Date.parse(ask.snoozedUntil),
       ask.expiresAt === undefined ? Number.POSITIVE_INFINITY : Date.parse(ask.expiresAt),
-    );
+    ]);
   }
-  if (open === 0 && card.stage === "needs_owner") ownerUntil = Number.POSITIVE_INFINITY;
+  if (open === 0 && card.stage === "needs_owner") owner.push([0, Number.POSITIVE_INFINITY]);
   const running = card.activeThreadId !== null;
-  return ownerUntil === 0 && !running ? null : { ownerUntil, running };
+  return owner.length === 0 && !running ? null : { owner, running };
 };
 
 const sameCount = (a: CardCount | null, b: CardCount | null) =>
-  a === b || (a !== null && b !== null && a.ownerUntil === b.ownerUntil && a.running === b.running);
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.running === b.running &&
+    a.owner.length === b.owner.length &&
+    a.owner.every(([from, until], index) => {
+      const other = b.owner[index]!;
+      return from === other[0] && until === other[1];
+    }));
 
 // Same rule as the board snapshot's unread entries.
 const unreadOf = (discussion: KanbanDiscussion) => {
@@ -173,14 +182,14 @@ const countsOf = (tally: BoardTally, nowMs: number): Counts => {
   let running = 0;
   let unread = 0;
   for (const count of tally.cards.values()) {
-    if (count.ownerUntil > nowMs) needsOwner += 1;
+    if (count.owner.some(([from, until]) => from <= nowMs && nowMs < until)) needsOwner += 1;
     else if (count.running) running += 1;
   }
   for (const count of tally.unread.values()) unread += count;
   return { needsOwner, running, unread };
 };
 
-/** True when a count moved with no change behind it: an ask passed its `expiresAt`. */
+/** True when a count moved with no change behind it: an ask expired, or a snooze ran out. */
 const countsMoved = (tallies: BoardTallies, nowMs: number) => {
   for (const tally of tallies.values()) {
     if (tally.sent === null) continue;
@@ -224,8 +233,8 @@ export function listUpdate(
  * count, so a burst sends one list. Changes set whole records: one queued before the
  * starting read can briefly undo a newer copy it holds, and the change that
  * made that copy follows it and sets it back. An ask passing its `expiresAt`
- * is no change, so each batch also recounts: the badge drops it at the next
- * change on any board.
+ * or the end of its snooze is no change, so each batch also recounts: the
+ * badge follows at the next change on any board.
  */
 export const follow = <E, R>(
   tallies: BoardTallies,

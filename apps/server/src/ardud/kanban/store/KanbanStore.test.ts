@@ -694,6 +694,10 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
         packet(7, "needs_owner", { asks: [{ ...openAsk, blocking: true, handedAt: at }] }),
         packet(8, "todo", { activeThreadId: null, asks: [{ ...openAsk, clarifyAskedAt: at }] }),
         packet(9, "todo", { activeThreadId: null, asks: [{ ...openAsk, expiresAt: at }] }),
+        packet(10, "todo", {
+          activeThreadId: null,
+          asks: [{ ...openAsk, snoozedUntil: "2999-01-01T00:00:00.000Z" }],
+        }),
       ];
       for (const entry of cards) yield* store.putCard(entry);
 
@@ -707,11 +711,12 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
           settledAt,
           activeThreadId,
           // Whose turn it is travels with each ask; the keys stay absent when unset.
-          asks: asks.map(({ closedAt, clarifyAskedAt, handedAt, expiresAt }) => ({
+          asks: asks.map(({ closedAt, clarifyAskedAt, handedAt, expiresAt, snoozedUntil }) => ({
             closedAt,
             ...(clarifyAskedAt === undefined ? {} : { clarifyAskedAt }),
             ...(handedAt === undefined ? {} : { handedAt }),
             ...(expiresAt === undefined ? {} : { expiresAt }),
+            ...(snoozedUntil === undefined ? {} : { snoozedUntil }),
           })),
         })),
       );
@@ -728,7 +733,7 @@ it.layer(TestLayer)("kanban store: summary cards", (it) => {
         nowMs,
       );
       assert.deepStrictEqual(fromSummary, fromFull);
-      // Cards 3 and 4; the handed, waiting-on-asker and expired asks (7, 8, 9) don't count.
+      // Cards 3 and 4; the handed, waiting-on-asker, expired and snoozed asks (7 to 10) don't count.
       assert.equal(fromSummary[0]?.needsOwner, 2);
       assert.equal(fromSummary[0]?.running, 2);
 

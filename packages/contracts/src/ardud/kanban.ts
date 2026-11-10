@@ -406,7 +406,7 @@ export const KanbanAskAnswer = Schema.Struct({
   draftEdited: Schema.optional(Schema.Boolean),
   /**
    * Field id to the value given. A file field holds the attachments the board
-   * kept; a secret field holds `{ "secret": true }`, never the value.
+   * kept; a secret field holds `KANBAN_ASK_SECRET_PROVIDED`, never the value.
    */
   values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   /** He handed it over with "every time": an evaluator was asked to take asks like it from now on. */
@@ -476,6 +476,14 @@ export const KanbanOwnerAsk = Schema.Struct({
   clarifyAskedAt: Schema.optional(IsoDateTime),
   /** It is with the evaluator: the owner handed it over, or it was asked `to` the evaluator. */
   handedAt: Schema.optional(IsoDateTime),
+  /**
+   * The owner put it away until this time. It stays open and keeps holding its
+   * card, but leaves his count and list until the time passes, or until its
+   * asker edits it or replies on it. Only the owner sets and clears it.
+   */
+  snoozedUntil: Schema.optional(IsoDateTime),
+  /** Its asker ended a snooze early by editing or replying: it is back since then. */
+  backFromSnoozeAt: Schema.optional(IsoDateTime),
   /** He handed it over with "every time"; copied to the answer when it closes. */
   handedAlways: Schema.optional(Schema.Boolean),
   /** The evaluator thread "every time" started; copied to the answer when it closes. */
@@ -500,6 +508,41 @@ export const kanbanAskChanges = (
 
 /** The id of the one field a plain question takes; its value is stored as the answer's `text`. */
 export const KANBAN_ASK_ANSWER_FIELD = "answer";
+
+/** What a secret field holds in a stored answer: that he gave it, never the value. */
+export const KANBAN_ASK_SECRET_PROVIDED = { secret: true } as const;
+
+/**
+ * The owner's answer to an ask with secret fields, sent over the app's
+ * private channel (WS `secrets.answerAsk`), never the board's HTTP routes.
+ * `answer` is what the answer route takes, without the secret fields.
+ * `secrets` maps a secret field's id to the value he typed: it goes to the
+ * server's secret store, in memory, and the asking agent gets a one-use
+ * secretRef for it. The card stores only `KANBAN_ASK_SECRET_PROVIDED`.
+ */
+export const KanbanAskSecretAnswerInput = Schema.Struct({
+  cardId: KanbanCardId,
+  askId: Schema.String,
+  answer: Schema.Struct({
+    verdict: Schema.String,
+    optionIds: Schema.optional(Schema.Array(Schema.String)),
+    text: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+    finalDraft: Schema.optional(Schema.String),
+    values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+    /** The revision the client showed; a newer one refuses the answer. */
+    revision: Schema.optional(Schema.Int),
+  }),
+  secrets: Schema.Record(Schema.String, Schema.String),
+});
+export type KanbanAskSecretAnswerInput = typeof KanbanAskSecretAnswerInput.Type;
+
+/** The same reply as the answer route: where the card is now, and the ask as stored. */
+export const KanbanAskSecretAnswerResult = Schema.Struct({
+  card: Schema.Struct({ id: KanbanCardId, number: Schema.Number, stage: KanbanStage }),
+  ask: Schema.NullOr(KanbanOwnerAsk),
+});
+export type KanbanAskSecretAnswerResult = typeof KanbanAskSecretAnswerResult.Type;
 
 /** What the owner gives back on an ask, with every default filled in. */
 export interface KanbanAskResponse {
@@ -607,6 +650,27 @@ export const kanbanAskWaitsOn = (
 /** Past its `expiresAt`: its asker must renew it before it can be answered. */
 export const kanbanAskExpired = (ask: Pick<KanbanOwnerAsk, "expiresAt">, nowMs: number): boolean =>
   ask.expiresAt !== undefined && Date.parse(ask.expiresAt) <= nowMs;
+/** Put away by the owner and not back yet. It is still his turn (`kanbanAskWaitsOn` says "owner"). */
+export const kanbanAskSnoozed = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "closedAt">,
+  nowMs: number,
+): boolean =>
+  ask.closedAt === null && ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) > nowMs;
+/**
+ * When an open ask came back from a snooze: the time it was snoozed until, or
+ * the earlier time its asker edited it or replied. Null when it was never
+ * snoozed, is still snoozed, or the owner has acted on it since.
+ */
+export const kanbanAskBackFromSnooze = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt" | "closedAt">,
+  nowMs: number,
+): string | null =>
+  ask.closedAt !== null
+    ? null
+    : (ask.backFromSnoozeAt ??
+      (ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) <= nowMs
+        ? ask.snoozedUntil
+        : null));
 
 /**
  * One automatic retry on a card's current attempt. A failed run, or a reviewer that
@@ -743,15 +807,18 @@ export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "sett
 
 type AskTurnFields = Pick<
   KanbanOwnerAsk,
-  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt"
+  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt" | "snoozedUntil"
 > & { readonly respond?: { readonly ack?: boolean | undefined } | undefined };
 
 /**
  * An open ask that needs the owner now: his turn, not past its `expiresAt`,
- * and something to decide (a notice only wants to be seen).
+ * not snoozed, and something to decide (a notice only wants to be seen).
  */
 export const kanbanAskNeedsOwner = (ask: AskTurnFields, nowMs: number): boolean =>
-  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs) && !kanbanAskIsNotice(ask);
+  kanbanAskWaitsOn(ask) === "owner" &&
+  !kanbanAskExpired(ask, nowMs) &&
+  !kanbanAskSnoozed(ask, nowMs) &&
+  !kanbanAskIsNotice(ask);
 
 export interface KanbanAskTurns {
   /** His turn, and answerable. */
@@ -762,6 +829,8 @@ export interface KanbanAskTurns {
   readonly evaluator: number;
   /** His turn, but past `expiresAt`: their asker must renew them. */
   readonly expired: number;
+  /** His turn, but he put them away until later. */
+  readonly snoozed: number;
   /** His to see, nothing to decide. */
   readonly notices: number;
 }
@@ -771,13 +840,14 @@ export const kanbanAskTurns = (
   card: { readonly settledAt: string | null; readonly asks: ReadonlyArray<AskTurnFields> },
   nowMs: number,
 ): KanbanAskTurns => {
-  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, notices: 0 };
+  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, snoozed: 0, notices: 0 };
   if (card.settledAt !== null) return turns;
   for (const ask of card.asks) {
     const turn = kanbanAskWaitsOn(ask);
     if (turn === null) continue;
     if (turn !== "owner") turns[turn] += 1;
     else if (kanbanAskExpired(ask, nowMs)) turns.expired += 1;
+    else if (kanbanAskSnoozed(ask, nowMs)) turns.snoozed += 1;
     else if (kanbanAskIsNotice(ask)) turns.notices += 1;
     else turns.owner += 1;
   }
@@ -787,8 +857,8 @@ export const kanbanAskTurns = (
 /**
  * Whether a card counts in the "needs you" numbers: it has an ask the owner can
  * answer now, or it sits in Needs Owner with no open ask to decide (a hold set by hand).
- * A card whose open asks are all handed over, waiting on their asker or expired
- * does not count, though a blocking one still holds it in Needs Owner.
+ * A card whose open asks are all handed over, waiting on their asker, expired or
+ * snoozed does not count, though a blocking one still holds it in Needs Owner.
  */
 export const kanbanCardNeedsOwner = (
   card: {
@@ -1526,6 +1596,10 @@ export const KanbanAskFeedItem = Schema.Struct({
   /** Whose turn it is on an open ask; null once closed. */
   waitsOn: Schema.NullOr(Schema.Literals(["owner", "agent", "evaluator"])),
   expired: Schema.Boolean,
+  /** True while the owner has it put away (`ask.snoozedUntil` is still ahead). */
+  snoozed: Schema.optional(Schema.Boolean),
+  /** Set on an open ask that came back from a snooze and he has not acted on since: when it came back. */
+  backFromSnoozeAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   /** The message that asked it and every message posted on the ask, oldest first. Big blocks are stubs. */
   messages: Schema.Array(KanbanMessage),
 });

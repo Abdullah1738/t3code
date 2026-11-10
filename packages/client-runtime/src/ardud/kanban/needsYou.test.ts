@@ -97,7 +97,14 @@ describe("needsYouItems", () => {
     expect(list.count).toBe(1);
     expect(list.blocking).toBe(0);
     // Each group has its own count; the badge number is `owner`.
-    expect(list.counts).toEqual({ owner: 1, agent: 1, evaluator: 1, expired: 1, notices: 0 });
+    expect(list.counts).toEqual({
+      owner: 1,
+      agent: 1,
+      evaluator: 1,
+      expired: 1,
+      snoozed: 0,
+      notices: 0,
+    });
   });
 
   it("gives each item its response parts, and keeps notices apart, uncounted and never blocking", () => {
@@ -134,7 +141,14 @@ describe("needsYouItems", () => {
     expect(keys(list.items)).toEqual(["card-1:q1", "card-2:q1", "card-3:q2"]);
     expect(keys(list.notices)).toEqual(["card-3:q1"]);
     expect([list.count, list.blocking]).toEqual([3, 0]);
-    expect(list.counts).toEqual({ owner: 3, agent: 0, evaluator: 0, expired: 0, notices: 1 });
+    expect(list.counts).toEqual({
+      owner: 3,
+      agent: 0,
+      evaluator: 0,
+      expired: 0,
+      snoozed: 0,
+      notices: 1,
+    });
     expect(list.notices[0]).toMatchObject({ notice: true, blocking: false });
     expect(list.notices[0]!.response.ack).toBe(true);
 
@@ -148,6 +162,58 @@ describe("needsYouItems", () => {
     expect(custom!.response.verdict).toEqual({ approve: "Deploy", reject: "Hold" });
     expect(custom!.response.fields.map((field) => field.id)).toEqual(["when"]);
     expect(pick!.response.choose).toMatchObject({ multi: false, min: 1, max: 1 });
+  });
+
+  it("keeps snoozed asks apart until they are back, and marks the ones that came back", () => {
+    const inAnHour = iso(NOW + 3_600_000);
+    const tomorrow = iso(NOW + 86_400_000);
+    const list = needsYouItems(
+      state([
+        card(1, {
+          stage: "needs_owner",
+          asks: [ask("q1", { blocking: true, snoozedUntil: tomorrow as never })],
+        }),
+        card(2, { asks: [ask("q1", { snoozedUntil: inAnHour as never })] }),
+        // Its time passed: back in the list, marked as back since then.
+        card(3, { asks: [ask("q1", { snoozedUntil: hoursAgo(2) as never })] }),
+        // Its asker edited it while it was snoozed.
+        card(4, { asks: [ask("q1", { backFromSnoozeAt: hoursAgo(1) as never })] }),
+        card(5, { asks: [ask("q1")] }),
+      ]),
+      NOW,
+    );
+    expect(keys(list.snoozed)).toEqual(["card-2:q1", "card-1:q1"]);
+    expect(keys(list.items).sort()).toEqual(["card-3:q1", "card-4:q1", "card-5:q1"]);
+    // A snoozed blocking ask still holds its card, but is not in his numbers.
+    expect([list.count, list.blocking]).toEqual([3, 0]);
+    expect(list.counts).toEqual({
+      owner: 3,
+      agent: 0,
+      evaluator: 0,
+      expired: 0,
+      snoozed: 2,
+      notices: 0,
+    });
+    expect(list.snoozed[1]).toMatchObject({
+      snoozed: true,
+      blocking: true,
+      backFromSnoozeAt: null,
+    });
+    const back = Object.fromEntries(list.items.map((item) => [item.key, item.backFromSnoozeAt]));
+    expect(back).toEqual({
+      "card-3:q1": hoursAgo(2),
+      "card-4:q1": hoursAgo(1),
+      "card-5:q1": null,
+    });
+    // The same asks an hour and a bit later: #2 is back.
+    const later = needsYouItems(
+      state([card(2, { asks: [ask("q1", { snoozedUntil: inAnHour as never })] })]),
+      NOW + 3_600_001,
+    );
+    expect([keys(later.items), later.items[0]!.backFromSnoozeAt]).toEqual([
+      ["card-2:q1"],
+      inAnHour,
+    ]);
   });
 
   it("folds asks with the same batch key on a board into one entry at its best item's place", () => {

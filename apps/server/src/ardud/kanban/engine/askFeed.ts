@@ -6,9 +6,11 @@
  * page shows plus their matching asks.
  */
 import {
+  kanbanAskBackFromSnooze,
   kanbanAskExpired,
   kanbanAskKind,
   kanbanAskRevision,
+  kanbanAskSnoozed,
   kanbanAskWaitsOn,
   KanbanCard,
   KanbanMessage,
@@ -205,6 +207,11 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
         revision: kanbanAskRevision(ask),
         waitsOn: kanbanAskWaitsOn(ask),
         expired: ask.closedAt === null && kanbanAskExpired(ask, nowMs),
+        snoozed: kanbanAskSnoozed(ask, nowMs),
+        backFromSnoozeAt: kanbanAskBackFromSnooze(
+          ask,
+          nowMs,
+        ) as KanbanAskFeedItem["backFromSnoozeAt"],
         messages:
           own.length > ASK_MESSAGES_MAX + 1 ? [own[0]!, ...own.slice(-ASK_MESSAGES_MAX)] : own,
       };
