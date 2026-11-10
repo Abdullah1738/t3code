@@ -7723,7 +7723,16 @@ const make = Effect.gen(function* () {
         yield* boardOf(boardId);
         const discussion = yield* newDiscussion(boardId, title, null, actor);
         if (!blocks?.length) return discussion;
-        yield* postUnlocked(discussion.id, actor, blocks, actor._tag !== "owner");
+        // Opening owner blocks commit with their route, like any owner post: the
+        // after-commit drain only delivers what has a route row.
+        yield* postUnlocked(
+          discussion.id,
+          actor,
+          blocks,
+          actor._tag !== "owner",
+          false,
+          durableOwnerRoutes,
+        );
         return yield* discussionOf(discussion.id);
       }),
     ).pipe(

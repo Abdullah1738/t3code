@@ -13221,6 +13221,33 @@ it.live("a deferred owner post replies once committed; delivery follows from its
   }),
 );
 
+it.live("an owner discussion opened with blocks routes them through the durable drain", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sql = yield* SqlClient.SqlClient;
+      const channel = yield* kanban.createDiscussion(board.id, "Opened with words", owner, [
+        { _tag: "md", text: "Opening words" },
+      ]);
+      assert.strictEqual(channel.lastSeq, 1);
+      const routes = yield* eventually(
+        sql<{ done_at: string | null }>`SELECT done_at FROM ardud_kanban_owner_routes`,
+        (rows) => rows.length === 1 && rows[0]!.done_at !== null,
+      );
+      assert.lengthOf(routes, 1);
+      const told = [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+        thread.messages.some((text) => text.includes("Opening words")),
+      );
+      assert.lengthOf(told, 1);
+      assert.strictEqual(
+        told[0]!.messages.filter((text) => text.includes("Opening words")).length,
+        1,
+      );
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(fake.layer), "deferred")));
+  }),
+);
+
 it.live("an owner route cut mid-launch replays after a restart without a second evaluator", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
