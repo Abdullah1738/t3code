@@ -71,6 +71,12 @@ const wait = (patch: Partial<KanbanWait> = {}): KanbanWait =>
     at: "2026-11-10T10:00:00.000Z",
     wakeRole: null,
     expiredAt: null,
+    script: null,
+    args: null,
+    status: null,
+    lastCheckedAt: null,
+    failures: 0,
+    problem: null,
     ...patch,
   }) as KanbanWait;
 
@@ -255,7 +261,14 @@ describe("cardTruth: review", () => {
     expect(label({})).toEqual({
       state: "waiting",
       label: "Waiting on the author (PR #512)",
-      wait: { on: "push", note: "Pavan to push F1-F3", age: "2h", expired: false },
+      wait: {
+        on: "push",
+        note: "Pavan to push F1-F3",
+        age: "2h",
+        expired: false,
+        status: null,
+        checkFailing: false,
+      },
       derived: false,
       stuckReason: null,
     });
@@ -272,6 +285,45 @@ describe("cardTruth: review", () => {
     );
     expect(label({ on: "time", pr: null, until: "2026-11-14T09:00:00.000Z" as never }).label).toBe(
       "Held until Sat 14 Nov 09:00",
+    );
+  });
+
+  it("shows a script wait by its script's name, with the check's latest status", () => {
+    const script = (patch: Partial<KanbanWait> = {}) =>
+      truth(
+        card(1, {
+          wait: wait({
+            on: "script",
+            pr: null,
+            sinceHead: null,
+            script: "linear-state" as never,
+            args: { issue: "ENG-123" },
+            note: "ENG-123 to reach Done",
+            ...patch,
+          }),
+        }),
+      );
+    expect(script({ status: "In Review" })).toEqual({
+      state: "waiting",
+      label: "Waiting: linear-state",
+      wait: {
+        on: "script",
+        note: "ENG-123 to reach Done",
+        age: "2h",
+        expired: false,
+        status: "In Review",
+        checkFailing: false,
+      },
+      derived: false,
+      stuckReason: null,
+    });
+    // Two failures are a blip; the third says nothing is watching for the wake.
+    expect(script({ failures: 2, problem: "Linear said 401" }).stuckReason).toBeNull();
+    const failing = script({ failures: 3, problem: "Linear said 401" });
+    expect(failing.label).toBe("Waiting: linear-state (check failing)");
+    expect(failing.wait).toMatchObject({ checkFailing: true });
+    expect(failing.stuckReason).toBe(
+      "Waiting: linear-state: its check failed 3 times in a row (Linear said 401)",
     );
   });
 
@@ -363,6 +415,8 @@ describe("cardTruth: the guess for cards with no wait", () => {
         note: "Waiting on jashwanth9845 for a new head on backoffice-frontend#248.",
         age: "3h",
         expired: false,
+        status: null,
+        checkFailing: false,
       },
       derived: true,
       stuckReason: null,

@@ -6,8 +6,10 @@
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  ForwardCompatibleOptional,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -162,8 +164,19 @@ export const KanbanOwnerAsk = Schema.Struct({
 });
 export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
 
-/** What a parked card can wait on. */
-export const KANBAN_WAIT_KINDS = ["push", "merge", "ci", "owner_go", "card", "time"] as const;
+/**
+ * What a parked card can wait on: the board's own checks, or `script`, a
+ * check one of the board's scripts answers. The built-in names are reserved.
+ */
+export const KANBAN_WAIT_KINDS = [
+  "push",
+  "merge",
+  "ci",
+  "owner_go",
+  "card",
+  "time",
+  "script",
+] as const;
 export const KanbanWaitKind = Schema.Literals(KANBAN_WAIT_KINDS);
 export type KanbanWaitKind = typeof KanbanWaitKind.Type;
 
@@ -176,9 +189,18 @@ export const KanbanWait = Schema.Struct({
   /**
    * `push`: new commits on `pr`. `merge`: `pr` merged. `ci`: checks on `pr`
    * finished. `owner_go`: the owner answered open ask `ask`. `card`: card
-   * `card` is done. `time`: `until` has passed.
+   * `card` is done. `time`: `until` has passed. `script`: the board script
+   * named `script` says so.
    */
   on: KanbanWaitKind,
+  /** script: the board script that checks it, by name. */
+  script: Schema.NullOr(TrimmedNonEmptyString).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** script: what the check is told, as the agent wrote it (a small JSON object). */
+  args: Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   /** push, merge, ci: the pull request's URL, as on the card's links. */
   pr: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** card: the card it waits on. */
@@ -201,8 +223,23 @@ export const KanbanWait = Schema.Struct({
   ),
   /** Set once when it ran past its limit: the card shows as stuck, and still wakes if the wait ends. */
   expiredAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The check's latest one-line progress note ("CI 3 of 5 passed"), or null. */
+  status: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** When the check last answered. */
+  lastCheckedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** Checks in a row that failed or gave no readable answer; 0 after one that answered. */
+  failures: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  /** Why the last check failed, while `failures` is above 0. */
+  problem: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
 });
 export type KanbanWait = typeof KanbanWait.Type;
+
+/** Failed checks in a row before a wait shows as "check failing". */
+export const KANBAN_WAIT_CHECK_FAILURES = 3;
+
+/** A wait whose check keeps failing: it still holds, but nothing can end it until the check works. */
+export const kanbanWaitCheckFailing = (wait: Pick<KanbanWait, "failures">): boolean =>
+  wait.failures >= KANBAN_WAIT_CHECK_FAILURES;
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -251,8 +288,12 @@ export const KanbanCard = Schema.Struct({
   discussionId: Schema.NullOr(KanbanDiscussionId),
   /** Sent to the card's thread the next time the dispatcher starts or wakes it (findings, owner answer). */
   wakeNote: Schema.NullOr(Schema.String),
-  /** What the card waits on while no thread runs it. Absent on cards that wait on nothing. */
-  wait: Schema.optional(KanbanWait),
+  /**
+   * What the card waits on while no thread runs it. Absent on cards that wait
+   * on nothing. A wait this build can't read (a kind a newer server added)
+   * decodes as absent, so the board still loads.
+   */
+  wait: ForwardCompatibleOptional(KanbanWait),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
   settledAt: Schema.NullOr(IsoDateTime),
@@ -317,6 +358,7 @@ export const KANBAN_WAIT_LIMIT_MS: Readonly<Record<KanbanWaitKind, number | null
   owner_go: 2 * WAIT_DAY_MS,
   card: 7 * WAIT_DAY_MS,
   time: null,
+  script: 7 * WAIT_DAY_MS,
 };
 
 /** When a wait counts as stuck: its own `until` (not for `time`), else its kind's limit after it was set. Null: never. */
@@ -525,26 +567,51 @@ export function kanbanPickOrder(cards: ReadonlyArray<KanbanCard>) {
   };
 }
 
+export const KANBAN_CARD_EVENT_KINDS = [
+  "created",
+  "moved",
+  "edited",
+  "linked",
+  "flagged",
+  "comment",
+  "thread",
+  "review",
+  "subtask",
+  /** A wait was set, ended (the body says why), was cleared by hand, or ran past its limit. */
+  "wait_set",
+  "wait_cleared",
+  "wait_expired",
+  /** A kind this build doesn't know, written by a newer server. Never written. */
+  "other",
+] as const;
+const KnownCardEventKind = Schema.Literals(KANBAN_CARD_EVENT_KINDS);
+type KnownCardEventKind = typeof KnownCardEventKind.Type;
+const isCardEventKind = Schema.is(KnownCardEventKind);
+
+/**
+ * A card event's kind. A kind this build doesn't know decodes as "other"
+ * instead of failing: a client older than its server still loads a card's
+ * history when the server adds a kind. A build from before this (its list was
+ * closed) fails the whole card read on an unknown kind, so a new kind is only
+ * written once those builds are gone.
+ */
+export const KanbanCardEventKind = Schema.String.pipe(
+  Schema.decodeTo(
+    KnownCardEventKind,
+    SchemaTransformation.transform<KnownCardEventKind, string>({
+      decode: (raw) => (isCardEventKind(raw) ? raw : "other"),
+      encode: (kind) => kind,
+    }),
+  ),
+);
+export type KanbanCardEventKind = typeof KanbanCardEventKind.Type;
+
 export const KanbanCardEvent = Schema.Struct({
   id: NonNegativeInt,
   cardId: KanbanCardId,
   at: IsoDateTime,
   actor: KanbanActor,
-  kind: Schema.Literals([
-    "created",
-    "moved",
-    "edited",
-    "linked",
-    "flagged",
-    "comment",
-    "thread",
-    "review",
-    "subtask",
-    /** A wait was set, ended (the body says why), was cleared by hand, or ran past its limit. */
-    "wait_set",
-    "wait_cleared",
-    "wait_expired",
-  ]),
+  kind: KanbanCardEventKind,
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),

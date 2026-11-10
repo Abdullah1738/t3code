@@ -1109,3 +1109,430 @@ it.effect(
       assert.strictEqual((yield* scripts.runs(watcher.id, 10)).length, 0);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
+
+// Wait checks. The engine keeps them inert until waits are live; these tests
+// run the script side as it will run then, with answers applied for real.
+const liveWaits = Layer.effect(
+  KanbanService.KanbanService,
+  Effect.gen(function* () {
+    const real = yield* KanbanService.KanbanService;
+    return KanbanService.KanbanService.of({
+      ...real,
+      answerWait: (cardId, answer, from, actor) =>
+        real.answerWait(cardId, answer, from, actor, true),
+    });
+  }),
+);
+
+const waitTestLayer = ScriptService.layer.pipe(
+  Layer.provide(liveWaits),
+  Layer.provideMerge(KanbanService.layer),
+  Layer.provideMerge(KanbanModels.layerTest(null)),
+  Layer.provideMerge(threads),
+  Layer.provideMerge(KanbanStore.layer),
+  Layer.provideMerge(Sqlite.layerMemory),
+  Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+  Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+  Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+  Layer.provideMerge(boardFilesLayer()),
+);
+
+/** A card as a review leaves it (in review, no thread), parked on `script`. */
+const parkedOn = (
+  board: KanbanBoard,
+  script: string,
+  title: string,
+  args: Record<string, unknown>,
+) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const created = yield* kanban.createCard(
+      board.id,
+      { prompt: title, title, description: "Explicit" },
+      owner,
+    );
+    yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+    return yield* kanban.waitCard(
+      created.id,
+      { on: "script", script, args, note: `${title}: waiting on the check` },
+      owner,
+    );
+  });
+
+const waitOf = (cardId: KanbanCard["id"]) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    return (yield* kanban.card(cardId)).card;
+  });
+
+// Answers each card by what its args ask for, and keeps what it was given.
+const answering = (dump: string) =>
+  [
+    "import json, sys",
+    "batch = json.load(sys.stdin)",
+    `open(${JSON.stringify(dump)}, "a").write(json.dumps(batch) + "\\n")`,
+    "for item in batch:",
+    "    card = item['card']['number']",
+    "    say = item['args'].get('say')",
+    "    if say == 'wake':",
+    "        print(json.dumps({'kanban': {'wait': {'card': f'#{card}', 'result': 'wake', 'to': 'work', 'note': 'ENG-1 is Done'}}}))",
+    "    elif say == 'status':",
+    "        print(json.dumps({'kanban': {'wait': {'card': card, 'result': 'hold', 'status': 'In Review'}}}))",
+    "    elif say == 'garbage':",
+    "        print(json.dumps({'kanban': {'wait': {'card': card, 'result': 'maybe'}}}))",
+    "print(f'checked {len(batch)} cards')",
+    "",
+  ].join("\n");
+
+it.effect(
+  "checks every card waiting on a script in one run: the batch on stdin, a line per card it changes",
+  () =>
+    Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      const dump = NodePath.join(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-wait-check-")),
+        "stdin.jsonl",
+      );
+      const script = yield* register(
+        board,
+        scriptFile(answering(dump), "check.py"),
+        manual,
+        "linear-state",
+      );
+      const woken = yield* parkedOn(board, "linear-state", "Woken", {
+        say: "wake",
+        issue: "ENG-1",
+      });
+      const noted = yield* parkedOn(board, "linear-state", "Noted", { say: "status" });
+      const quiet = yield* parkedOn(board, "linear-state", "Quiet", {});
+      const garbled = yield* parkedOn(board, "linear-state", "Garbled", { say: "garbage" });
+      // Not this script's: a built-in wait and a card with no wait are not in the batch.
+      const other = yield* kanban.createCard(
+        board.id,
+        { prompt: "Other", title: "Other", description: "Explicit" },
+        owner,
+      );
+
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+
+      const runs = yield* scripts.runs(script.id, 10);
+      assert.strictEqual(runs.length, 1);
+      assert.strictEqual(runs[0]?.trigger, ScriptService.WAIT_CHECK_TRIGGER);
+      assert.strictEqual(runs[0]?.exitCode, 0);
+      assert.include(
+        runs[0]?.output,
+        `Ended the wait on card #${woken.number} and woke its worker.`,
+      );
+      assert.include(runs[0]?.output, `card #${noted.number} still waits.`);
+      assert.include(runs[0]?.output, "checked 4 cards");
+
+      // What the script read: one array, one input per waiting card, in the contract's shape.
+      const batch = JSON.parse(NodeFS.readFileSync(dump, "utf8").trim()) as Array<{
+        wait: { on: string; script: string; note: string };
+        card: { id: string; number: number; title: string; stage: string; next: string };
+        facts: { now: string; prs: Array<unknown>; cards: Array<unknown>; asks: Array<unknown> };
+        args: Record<string, unknown>;
+      }>;
+      assert.deepStrictEqual(
+        batch.map((item) => item.card.number).toSorted(),
+        [woken.number, noted.number, quiet.number, garbled.number].toSorted(),
+      );
+      const first = batch.find((item) => item.card.id === woken.id)!;
+      assert.deepStrictEqual(first.args, { say: "wake", issue: "ENG-1" });
+      assert.deepInclude(first.wait, { on: "script", script: "linear-state" });
+      assert.deepInclude(first.card, { title: "Woken", stage: "in_review", next: "evaluator" });
+      assert.deepStrictEqual(Object.keys(first.facts).toSorted(), ["asks", "cards", "now", "prs"]);
+
+      const after = yield* waitOf(woken.id);
+      assert.isUndefined(after.wait);
+      assert.strictEqual(after.stage, "todo");
+      assert.include(
+        after.wakeNote ?? "",
+        "ENG-1 is Done. It was waiting on the linear-state script's check",
+      );
+      assert.deepInclude((yield* waitOf(noted.id)).wait, { status: "In Review", failures: 0 });
+      // No line is a hold: still waiting, checked, nothing wrong.
+      const held = (yield* waitOf(quiet.id)).wait;
+      assert.deepInclude(held, { status: null, failures: 0, problem: null });
+      assert.isNotNull(held?.lastCheckedAt);
+      // An answer nobody can read holds too, and shows as a problem.
+      assert.deepInclude((yield* waitOf(garbled.id)).wait, {
+        failures: 1,
+        problem: "The check's answer could not be read",
+      });
+      assert.strictEqual((yield* waitOf(garbled.id)).stage, "in_review");
+      assert.isUndefined((yield* waitOf(other.id)).wait);
+
+      // Inside its rest the script is not run again, however often the pass comes round.
+      yield* TestClock.adjust(30_000);
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 1);
+      // After it, one more run, with only the cards still waiting.
+      yield* TestClock.adjust(5 * 60_000);
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 2);
+      const second = JSON.parse(NodeFS.readFileSync(dump, "utf8").trim().split("\n")[1]!) as Array<{
+        card: { number: number };
+      }>;
+      assert.deepStrictEqual(
+        second.map((item) => item.card.number).toSorted(),
+        [noted.number, quiet.number, garbled.number].toSorted(),
+      );
+      assert.strictEqual((yield* waitOf(garbled.id)).wait?.failures, 2);
+    }).pipe(Effect.provide(waitTestLayer)),
+);
+
+it.effect(
+  "a check run that fails holds its waits, and the third failure in a row shows as check failing",
+  () =>
+    Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      const script = yield* register(
+        board,
+        scriptFile(["echo 'Linear said 401' >&2", "exit 3", ""].join("\n")),
+        manual,
+        "linear-state",
+      );
+      const card = yield* parkedOn(board, "linear-state", "Held", { everyMs: 60_000 });
+      const pass = Effect.gen(function* () {
+        yield* scripts.checkWaits;
+        yield* scripts.idle;
+        yield* TestClock.adjust(60_000);
+      });
+
+      yield* pass;
+      const once = yield* waitOf(card.id);
+      assert.deepInclude(once.wait, {
+        failures: 1,
+        problem: "The linear-state script exited with code 3",
+      });
+      assert.strictEqual(once.stage, "in_review");
+      yield* pass;
+      yield* pass;
+      const failing = yield* kanban.card(card.id);
+      assert.strictEqual(failing.card.wait?.failures, 3);
+      assert.strictEqual(
+        failing.events.at(-1)?.body,
+        "The check for the linear-state script's check failed 3 times in a row: The linear-state script exited with code 3",
+      );
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 3);
+
+      // A script that is turned off, or gone, fails its waits the same way, without a run.
+      yield* scripts.setEnabled(script.id, false);
+      yield* pass;
+      assert.deepInclude((yield* waitOf(card.id)).wait, {
+        failures: 4,
+        problem: "The linear-state script is turned off",
+      });
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 3);
+    }).pipe(Effect.provide(waitTestLayer)),
+);
+
+it.effect(
+  "a script's own run can push a wake or park a card, with the same guards as card_wait",
+  () =>
+    Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      yield* register(board, scriptFile("exit 0\n", "noop.sh"), manual, "linear-state");
+      const waiting = yield* parkedOn(board, "linear-state", "Waiting", {});
+      const plain = yield* kanban.createCard(
+        board.id,
+        { prompt: "Plain", title: "Plain", description: "Explicit" },
+        owner,
+      );
+      yield* store.putCard({ ...plain, stage: "in_review", reviewStep: 1 });
+      const busy = yield* parkedOn(board, "linear-state", "Busy", {});
+      // A thread picked this one up after its wait was set.
+      yield* store.putCard({
+        ...busy,
+        activeThreadId: ThreadId.make("thread-busy"),
+        activeRole: "work",
+      });
+      const todo = yield* kanban.createCard(
+        board.id,
+        { prompt: "Todo", title: "Todo", description: "Explicit" },
+        owner,
+      );
+
+      const line = (value: unknown) => `echo '${JSON.stringify({ kanban: value })}'`;
+      const hook = yield* register(
+        board,
+        scriptFile(
+          [
+            line({
+              wake: { card: `#${waiting.number}`, to: "review", note: "v2.4.1 is live in prod" },
+            }),
+            line({ wake: { card: `#${plain.number}`, note: "v2.4.1 is live in prod" } }),
+            line({ wake: { card: `#${busy.number}`, note: "v2.4.1 is live in prod" } }),
+            line({ wake: { card: "#999", note: "nobody home" } }),
+            // Only the check a card waits on can answer for it; this script is not it.
+            line({ wait: { card: `#${busy.number}`, result: "hold", status: "not mine" } }),
+            line({
+              wait: {
+                card: `#${plain.number}`,
+                on: "time",
+                until: "1970-01-02T00:00:00.000Z",
+                note: "recheck after the release",
+              },
+            }),
+            line({
+              wait: {
+                card: `#${todo.number}`,
+                on: "time",
+                until: "1970-01-02T00:00:00.000Z",
+                note: "later",
+              },
+            }),
+            line({
+              wait: { card: `#${plain.number}`, on: "script", script: "no-such-check", note: "x" },
+            }),
+            "",
+          ].join("\n"),
+          "deploy-hook.sh",
+        ),
+        { _tag: "webhook" },
+        "deploy-hook",
+      );
+      yield* scripts.run(hook.id, "webhook");
+      yield* scripts.idle;
+
+      const [run] = yield* scripts.runs(hook.id, 1);
+      const output = run?.output ?? "";
+      assert.include(output, `Ended the wait on card #${waiting.number} and woke its reviewer.`);
+      assert.include(
+        output,
+        `Refused for card #${plain.number}: card #${plain.number} is not waiting`,
+      );
+      assert.include(
+        output,
+        `Refused for card #${busy.number}: card #${busy.number} has a running thread`,
+      );
+      assert.include(output, "Refused for card #999: No card #999 on this board.");
+      assert.include(output, `Card #${plain.number} now waits (time).`);
+      assert.include(output, `Couldn't park card #${todo.number}: card #${todo.number} is in todo`);
+      assert.include(
+        output,
+        `Couldn't park card #${plain.number}: this board has no script named no-such-check`,
+      );
+
+      const woken = yield* waitOf(waiting.id);
+      assert.isUndefined(woken.wait);
+      assert.strictEqual(woken.stage, "needs_review");
+      assert.include(woken.wakeNote ?? "", "v2.4.1 is live in prod");
+      const parked = yield* waitOf(plain.id);
+      assert.deepInclude(parked.wait, { on: "time", until: "1970-01-02T00:00:00.000Z" });
+      assert.deepStrictEqual(parked.wait?.by, { _tag: "script", scriptId: hook.id });
+      // Refused means untouched.
+      assert.deepInclude((yield* waitOf(busy.id)).wait, {
+        on: "script",
+        status: null,
+        failures: 0,
+      });
+      assert.isUndefined((yield* waitOf(todo.id)).wait);
+    }).pipe(Effect.provide(waitTestLayer)),
+);
+
+it.effect(
+  "stays inert until waits are live: the scheduler runs no checks and a pushed wake changes nothing",
+  () =>
+    Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      const script = yield* register(
+        board,
+        scriptFile("exit 0\n", "noop.sh"),
+        manual,
+        "linear-state",
+      );
+      const card = yield* parkedOn(board, "linear-state", "Parked", {});
+      yield* scripts.tick;
+      yield* scripts.idle;
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 0);
+
+      const hook = yield* register(
+        board,
+        scriptFile(
+          `echo '${JSON.stringify({ kanban: { wake: { card: `#${card.number}`, note: "deployed" } } })}'\n`,
+          "hook.sh",
+        ),
+        manual,
+        "deploy-hook",
+      );
+      yield* scripts.run(hook.id, "manual");
+      yield* scripts.idle;
+      const [run] = yield* scripts.runs(hook.id, 1);
+      assert.include(run?.output, "waits are not live on this board yet: nothing changed");
+      assert.deepInclude((yield* waitOf(card.id)).wait, { on: "script", failures: 0 });
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "the reference check for a PR leaving draft holds on a draft and wakes the reviewer when it is ready",
+  () =>
+    Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      const example = NodePath.resolve(
+        import.meta.dirname,
+        "../../../../../../docs/user/board-wait-checks/pr-ready.py",
+      );
+      yield* register(board, example, manual, "pr-ready");
+      const pr = "https://github.com/acme/app/pull/12";
+      const created = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Review PR 12",
+          title: "Review PR 12",
+          description: "Explicit",
+          links: [{ url: pr }],
+        },
+        owner,
+      );
+      const link = (state: "draft" | "open") =>
+        created.links.map((entry) => ({
+          ...entry,
+          state,
+          checkedAt: "1970-01-01T00:00:00.000Z" as never,
+        }));
+      yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1, links: link("draft") });
+      yield* kanban.waitCard(
+        created.id,
+        {
+          on: "script",
+          script: "pr-ready",
+          args: { everyMs: 60_000 },
+          note: "author to mark it ready",
+        },
+        owner,
+      );
+
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+      const held = yield* waitOf(created.id);
+      assert.deepInclude(held.wait, { status: "PR #12 is still a draft", failures: 0 });
+
+      // The author marks it ready; the board's PR sync updates the link.
+      yield* store.putCard({ ...held, links: link("open") });
+      yield* TestClock.adjust(60_000);
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+      const woken = yield* waitOf(created.id);
+      assert.isUndefined(woken.wait);
+      assert.strictEqual(woken.stage, "needs_review");
+      assert.strictEqual(woken.reviewStep, 0);
+      assert.include(woken.wakeNote ?? "", "PR #12 was marked ready for review");
+    }).pipe(Effect.provide(waitTestLayer)),
+);

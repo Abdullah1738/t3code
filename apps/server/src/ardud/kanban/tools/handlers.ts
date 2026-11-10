@@ -533,7 +533,14 @@ const handlers = {
         if (input.clear) {
           return { card: yield* service.waitCard(card.id, null, caller.actor) };
         }
-        if (input.on === undefined) return yield* invalid("Pass on (what the card waits on) or clear.");
+        // Naming a script is enough to say what kind of wait it is.
+        const on = input.on ?? (input.script === undefined ? undefined : "script");
+        if (on === undefined) return yield* invalid("Pass on (what the card waits on) or clear.");
+        if (input.script !== undefined && on !== "script") {
+          return yield* invalid(
+            `script goes with on: script. ${on} is one of the board's own checks, and a script can't stand in for it.`,
+          );
+        }
         if (!input.note?.trim()) {
           return yield* invalid("A wait needs a one-line note: what exactly is awaited.");
         }
@@ -541,13 +548,13 @@ const handlers = {
         const prs = card.links.filter((link) => link.kind === "pr");
         const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
         const waitsOn =
-          input.on === "card" && input.waitsOn?.trim()
+          on === "card" && input.waitsOn?.trim()
             ? yield* cardFor(service, caller, input.waitsOn, card.boardId)
             : null;
         const waiting = yield* service.waitCard(
           card.id,
           {
-            on: input.on,
+            on,
             note: input.note,
             pr,
             card: waitsOn?.id ?? null,
@@ -555,6 +562,8 @@ const handlers = {
             until: input.until,
             head: input.head,
             wakeRole: input.wakeRole,
+            script: input.script,
+            args: input.args,
           },
           caller.actor,
         );

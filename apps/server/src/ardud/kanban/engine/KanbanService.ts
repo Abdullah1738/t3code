@@ -11,6 +11,7 @@ import {
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
+  kanbanWaiting,
   kanbanWithoutWait,
   KanbanBoardId,
   KanbanCardId,
@@ -235,6 +236,10 @@ export interface CardWaitInput {
   /** For `push`: the reviewed commit. Left out, the card's latest review event's head. */
   readonly head?: string | null | undefined;
   readonly wakeRole?: Waits.WaitRole | null | undefined;
+  /** For `script`: the board script that checks it, by name. */
+  readonly script?: string | null | undefined;
+  /** For `script`: what the check is told. */
+  readonly args?: Readonly<Record<string, unknown>> | null | undefined;
 }
 
 export interface KanbanServiceShape {
@@ -333,6 +338,20 @@ export interface KanbanServiceShape {
     input: CardWaitInput | null,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * Applies a wait check's answer to a waiting card: hold (with a status
+   * line), wake or fail. `script` is the board script that answered, which
+   * must be the one the card waits on; null is a wake pushed from outside the
+   * check, which ends any wait. Refused, with the reason, when the card has no
+   * wait or a thread is running it. Returns what happened in one line.
+   */
+  readonly answerWait: (
+    cardId: KanbanCard["id"],
+    answer: Waits.WaitAnswer,
+    from: { readonly script: string | null },
+    actor: KanbanActor,
+    wired?: boolean,
+  ) => Effect.Effect<string, KanbanError>;
   /** Reattaches an existing thread without starting a turn or lifting the board pause. */
   readonly restoreCutoverCard: (input: RestoreCutoverCardInput) => Effect.Effect<void, KanbanError>;
   readonly settleCard: (cardId: KanbanCard["id"]) => Effect.Effect<KanbanCard, KanbanError>;
@@ -7736,7 +7755,7 @@ const make = Effect.gen(function* () {
             return yield* failWith("invalid", `card #${card.number} has no wait to clear`);
           }
           const next: KanbanCard = { ...kanbanWithoutWait(card), updatedAt: at };
-          yield* logEvent(next, actor, "wait_cleared", {
+          yield* logEvent(next, actor, Waits.waitEventKind("wait_cleared"), {
             body: `Cleared by hand: was waiting on ${Waits.waitTarget(card.wait)}`,
           });
           yield* saveCard(next);
@@ -7772,19 +7791,113 @@ const make = Effect.gen(function* () {
           until: input.until?.trim() || null,
           sinceHead: input.head?.trim() || reviewed,
           wakeRole: input.wakeRole ?? null,
+          script:
+            input.on === "script"
+              ? {
+                  name: input.script?.trim() ?? "",
+                  found: (yield* store.scripts(card.boardId)).filter(
+                    (script) => script.name === input.script?.trim(),
+                  ),
+                }
+              : null,
+          args: input.args ?? null,
         };
         const check = Waits.checkWait(card, request, actor, yield* nowMillis);
         if (!check.ok) return yield* failWith(check.code, check.reason);
         const wait = Waits.newWait(request, actor, at);
         const next: KanbanCard = { ...card, wait, stalled: null, updatedAt: at };
         const known = target === null ? undefined : new Map([[target.id as string, target]]);
-        yield* logEvent(next, actor, "wait_set", {
+        yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
           body:
             Waits.waitSetBody(wait, known) +
             (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
         });
         yield* saveCard(next);
         return next;
+      }),
+    );
+
+  /**
+   * Carries out what a check's answer means for a card: save it, log the
+   * event, wake whoever is next. The tick's wait pass and answerWait share it.
+   */
+  const applyWaitStep = Effect.fn("KanbanService.applyWaitStep")(function* (
+    step: Waits.WaitStep,
+    actor: KanbanActor,
+  ) {
+    if (step._tag === "none") return;
+    if (step._tag === "hold") {
+      if (step.save !== null) yield* saveCard(step.save);
+      return;
+    }
+    yield* logEvent(step.card, actor, step.event.kind, {
+      body: step.event.body,
+      fromStage: step.event.fromStage,
+      toStage: step.event.toStage,
+    });
+    yield* saveCard(step.card);
+    if (step.wake.to === "evaluator") yield* noteDiscussion(step.card, step.wake.text);
+    // Back in To-Do or Needs Review with its wake note: the dispatcher takes it from here.
+    else if (step.wake.to !== "none") yield* kick;
+  });
+
+  const answerWait: KanbanServiceShape["answerWait"] = (
+    cardId,
+    answer,
+    from,
+    actor,
+    wired = Waits.WAITS_ENGINE_WIRED,
+  ) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const n = `card #${card.number}`;
+        if (!wired) {
+          return yield* failWith("conflict", "waits are not live on this board yet: nothing changed");
+        }
+        if (card.wait === undefined) return yield* failWith("conflict", `${n} is not waiting`);
+        if (card.activeThreadId !== null) {
+          return yield* failWith("conflict", `${n} has a running thread, so it isn't waiting`);
+        }
+        if (!kanbanWaiting(card)) {
+          return yield* failWith("conflict", `${n} was moved since its wait was set`);
+        }
+        if (from.script === null) {
+          if (answer.result !== "wake") {
+            return yield* failWith("invalid", "only a wake can be pushed to a waiting card");
+          }
+        } else if (card.wait.on !== "script" || card.wait.script !== from.script) {
+          return yield* failWith(
+            "denied",
+            `${n} does not wait on the ${from.script} script: only the check a card waits on can answer for it (a wake line ends any wait)`,
+          );
+        }
+        yield* checkText([["note", answer.result === "wake" ? answer.note : null]]);
+        const board = yield* boardOf(card.boardId);
+        const cards = new Map(
+          (yield* store.cards(card.boardId)).map((entry) => [entry.id as string, entry]),
+        );
+        const step = Waits.applyAnswer(
+          card,
+          answer,
+          { nowMs: yield* nowMillis, cards },
+          { chainLength: Rules.chainFor(board, card)?.steps.length ?? 1 },
+          yield* nowIso,
+          { stamp: true },
+        );
+        yield* applyWaitStep(step, actor);
+        switch (step._tag) {
+          case "end":
+            return step.wake.to === "none"
+              ? `Ended the wait on ${n}.`
+              : `Ended the wait on ${n} and woke ${step.wake.to === "work" ? "its worker" : step.wake.to === "review" ? "its reviewer" : "the evaluator"}.`;
+          case "failing":
+            return `${n} still waits; its check has failed ${card.wait.failures + 1} times in a row and the evaluator was told.`;
+          case "expire":
+            return `${n} still waits, past its limit; the evaluator was told.`;
+          default:
+            return `${n} still waits.`;
+        }
       }),
     );
 
@@ -9006,6 +9119,7 @@ const make = Effect.gen(function* () {
     restoreCutoverCard,
     flagCard,
     waitCard,
+    answerWait,
     settleCard,
     markSubtask,
     handBack,

@@ -3,6 +3,7 @@ import {
   KANBAN_DONE_STAGES,
   KANBAN_WAIT_LIMIT_MS,
   kanbanAwaitsMerge,
+  kanbanWaitCheckFailing,
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
   kanbanScriptStep,
@@ -55,6 +56,10 @@ export interface CardTruthWait {
   /** How long it has waited: "3d 2h". */
   readonly age: string;
   readonly expired: boolean;
+  /** The check's latest progress line ("CI 3 of 5 passed"), or null. */
+  readonly status: string | null;
+  /** Its check failed several times in a row: nothing can end the wait until it works. */
+  readonly checkFailing: boolean;
 }
 
 export interface CardTruth {
@@ -108,6 +113,7 @@ function waitLabel(
     readonly cardNumber: number | null;
     readonly until: string | null;
     readonly ask: string | null;
+    readonly script?: string | null;
   },
   nowMs: number,
   timeZone?: string,
@@ -131,6 +137,8 @@ function waitLabel(
       return detail.until === null
         ? "Held for a recheck"
         : `Held until ${untilLabel(detail.until, nowMs, timeZone)}`;
+    case "script":
+      return detail.script ? `Waiting: ${detail.script}` : "Waiting on a script";
   }
 }
 
@@ -155,20 +163,30 @@ function fromWait(
   const target = wait.card === null ? undefined : state.cards.get(wait.card);
   const label = waitLabel(
     wait.on,
-    { pr: wait.pr, cardNumber: target?.number ?? null, until: wait.until, ask: wait.ask },
+    {
+      pr: wait.pr,
+      cardNumber: target?.number ?? null,
+      until: wait.until,
+      ask: wait.ask,
+      script: wait.script,
+    },
     nowMs,
     timeZone,
   );
   const expired = kanbanWaitExpired(wait, nowMs);
+  const checkFailing = kanbanWaitCheckFailing(wait);
   const since = age(wait.at, nowMs);
   return {
     state: "waiting",
-    label,
-    wait: { on: wait.on, note: wait.note, age: since, expired },
+    // The label says so itself: a failing check means nothing is watching for the wake.
+    label: checkFailing ? `${label} (check failing)` : label,
+    wait: { on: wait.on, note: wait.note, age: since, expired, status: wait.status, checkFailing },
     derived: false,
-    stuckReason: expired
-      ? `${label} for ${since}, past its limit${wait.note.trim() ? `: ${wait.note.trim()}` : ""}`
-      : null,
+    stuckReason: checkFailing
+      ? `${label}: its check failed ${wait.failures} times in a row${wait.problem ? ` (${wait.problem})` : ""}`
+      : expired
+        ? `${label} for ${since}, past its limit${wait.note.trim() ? `: ${wait.note.trim()}` : ""}`
+        : null,
   };
 }
 
@@ -191,7 +209,14 @@ function fromGuess(
   return {
     state: "waiting",
     label,
-    wait: { on: guess.on, note: guess.from, age: since, expired },
+    wait: {
+      on: guess.on,
+      note: guess.from,
+      age: since,
+      expired,
+      status: null,
+      checkFailing: false,
+    },
     derived: true,
     stuckReason: expired ? `${label} for ${since} (a guess from "${guess.from}")` : null,
   };
@@ -391,6 +416,8 @@ export function cardTruth(
         note: "Review passed; the card completes when its PRs land",
         age: since,
         expired: false,
+        status: null,
+        checkFailing: false,
       },
       derived: false,
       stuckReason:

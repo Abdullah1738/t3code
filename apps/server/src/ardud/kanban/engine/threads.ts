@@ -46,6 +46,8 @@ export interface KanbanThreadPr {
   readonly head?: string | null;
   /** Checks on the head as last synced; null when none were reported. */
   readonly checks?: "passing" | "failing" | "pending" | null;
+  /** When its state and checks were last synced from the host; null when never. */
+  readonly at?: string | null;
 }
 
 export interface KanbanThreadView {
@@ -209,6 +211,7 @@ const make = Effect.gen(function* () {
                 // Only a live watch: an ended one's head may be commits behind.
                 head: pr.watch?.headSha ?? null,
                 checks: pr.snapshot?.checksState ?? null,
+                at: pr.snapshot?.syncedAt ?? null,
               })),
             },
       ),
