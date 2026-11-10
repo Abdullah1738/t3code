@@ -8,6 +8,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RunId,
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -123,40 +124,86 @@ describe("backgroundWorkOf", () => {
   });
 });
 
-it.effect("find distinguishes a failed shell read from a missing thread while view hides failures", () =>
-  Effect.gen(function* () {
-    const failedId = ThreadId.make("thread-shell-read-failed");
-    const missingId = ThreadId.make("thread-shell-missing");
-    const readError = new Orchestrator.OrchestratorProjectionError({
-      threadId: failedId,
-      cause: "injected shell read failure",
-    });
-    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
-      getThreadShell: (threadId) =>
-        threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
-    });
-    yield* Effect.gen(function* () {
-      const threads = yield* KanbanThreads;
-      const result = yield* Effect.result(threads.find(failedId));
-      expect(Result.isFailure(result)).toBe(true);
-      if (Result.isFailure(result)) {
-        expect(result.failure).toBeInstanceOf(KanbanThreadError);
-        expect(result.failure.operation).toBe("view");
-        expect(result.failure.detail).toBe(readError.message);
-      }
-      expect(yield* threads.view(failedId)).toBeNull();
-      expect(yield* threads.find(missingId)).toBeNull();
-      expect(yield* threads.view(missingId)).toBeNull();
-    }).pipe(
-      Effect.provide(
-        layer.pipe(
-          Layer.provide(management),
-          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
-          Layer.provide(Sqlite.layerMemory),
+it.effect(
+  "find distinguishes a failed shell read from a missing thread while view hides failures",
+  () =>
+    Effect.gen(function* () {
+      const failedId = ThreadId.make("thread-shell-read-failed");
+      const missingId = ThreadId.make("thread-shell-missing");
+      const readError = new Orchestrator.OrchestratorProjectionError({
+        threadId: failedId,
+        cause: "injected shell read failure",
+      });
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (threadId) =>
+          threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        const result = yield* Effect.result(threads.find(failedId));
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) {
+          expect(result.failure).toBeInstanceOf(KanbanThreadError);
+          expect(result.failure.operation).toBe("view");
+          expect(result.failure.detail).toBe(readError.message);
+        }
+        expect(yield* threads.view(failedId)).toBeNull();
+        expect(yield* threads.find(missingId)).toBeNull();
+        expect(yield* threads.view(missingId)).toBeNull();
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
         ),
-      ),
-    );
-  }),
+      );
+    }),
+);
+
+it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
+  "active model reads the recorded run instead of a next-turn selection (%s)",
+  (active) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-active-model");
+      const first = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+      const second = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6-astra" };
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({
+            deletedAt: null,
+            modelSelection: second,
+            activeRunId: active === "none" ? null : RunId.make("run-active"),
+          } as never),
+        getThreadRecords: () =>
+          Effect.succeed({
+            runs: [
+              {
+                id: RunId.make(active === "missing" ? "run-other" : "run-active"),
+                status: active === "completed" ? "completed" : "running",
+                modelSelection: active === "second" ? second : first,
+              },
+              { id: RunId.make("run-next"), status: "queued", modelSelection: second },
+            ],
+          } as never),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        expect(yield* threads.model(threadId)).toEqual(second);
+        expect(yield* threads.model(threadId, true)).toEqual(
+          active === "first" ? first : active === "second" ? second : null,
+        );
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect("a keyed send passes stable command and message ids to thread management", () =>

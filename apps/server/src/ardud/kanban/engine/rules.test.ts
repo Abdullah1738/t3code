@@ -17,6 +17,7 @@ import {
   applyReviewResult,
   checkClaim,
   checkMove,
+  confirmDispatch,
   discussionSettleDue,
   isBlocked,
   isContextFull,
@@ -246,6 +247,40 @@ describe("applyReviewResult", () => {
 });
 
 describe("planDispatch", () => {
+  it("skips attempted candidates without losing their blockers or occupied slots", () => {
+    const failed = card({ priority: 1 });
+    const blocked = card({ blockedBy: [failed.id] });
+    const next = card({ priority: 3 });
+    const attempted = new Set<string>([failed.id]);
+    expect(
+      planDispatch(
+        board,
+        [failed, blocked, next],
+        pools([[opus, 1]]),
+        new Map(),
+        () => 0,
+        attempted,
+      ),
+    ).toMatchObject([{ cardId: next.id }]);
+    const running = card({
+      stage: "working",
+      activeRole: "work",
+      activeThreadId: ThreadId.make("busy"),
+      activePool: poolKey(opus),
+    });
+    attempted.add(running.id);
+    expect(
+      planDispatch(
+        board,
+        [failed, running, next],
+        pools([[opus, 1]]),
+        new Map(),
+        () => 0,
+        attempted,
+      ),
+    ).toEqual([]);
+  });
+
   it("starts no card work or review while the board's setup runs", () => {
     const setupRunning: KanbanBoard = {
       ...board,
@@ -441,6 +476,93 @@ describe("planDispatch", () => {
     );
     expect(plan.map((d) => d.pool)).toEqual([poolKey(sol), poolKey(astra)]);
     expect(planDispatch(board, [critical], pools([[astra, 1]]))).toEqual([]);
+  });
+});
+
+describe("confirmDispatch", () => {
+  const plan = (cards: ReadonlyArray<KanbanCard>, slots = 2) =>
+    planDispatch(board, cards, pools([[opus, slots]]));
+
+  it("confirms a start whose card, board and pool are unchanged", () => {
+    const waiting = card();
+    const [start] = plan([waiting]);
+    expect(confirmDispatch(board, waiting, [waiting], pools([[opus, 2]]), new Map(), start!)).toBe(
+      true,
+    );
+  });
+
+  it("refuses when the card's row changed after planning", () => {
+    const waiting = card();
+    const [start] = plan([waiting]);
+    const edited = { ...waiting, description: "edited", updatedAt: "2026-10-25T01:00:00Z" };
+    const taken = { ...waiting, activeThreadId: ThreadId.make("t9"), activePool: poolKey(opus) };
+    for (const fresh of [edited, taken]) {
+      expect(confirmDispatch(board, waiting, [fresh], pools([[opus, 2]]), new Map(), start!)).toBe(
+        false,
+      );
+    }
+  });
+
+  it("refuses when the pool filled, the board paused or a blocker reopened meanwhile", () => {
+    const blocker = card({ stage: "completed" });
+    const waiting = card({ blockedBy: [blocker.id] });
+    const [start] = plan([blocker, waiting], 1);
+    const running = card({
+      stage: "working",
+      activeThreadId: ThreadId.make("t1"),
+      activePool: poolKey(opus),
+    });
+    const ok = (b: KanbanBoard, cards: ReadonlyArray<KanbanCard>, slots = 1) =>
+      confirmDispatch(b, waiting, cards, pools([[opus, slots]]), new Map(), start!);
+    expect(ok(board, [blocker, waiting])).toBe(true);
+    expect(ok(board, [blocker, waiting, running])).toBe(false);
+    expect(ok(board, [blocker, waiting], 0)).toBe(false);
+    const paused: KanbanBoard = {
+      ...board,
+      pause: { reason: "r", keep: [], at: "2026-10-25T00:00:00Z", by: "owner" },
+    };
+    expect(ok(paused, [blocker, waiting])).toBe(false);
+    expect(ok(board, [{ ...blocker, stage: "working" as const }, waiting])).toBe(false);
+  });
+
+  it("refuses a review whose chain or step model changed after planning", () => {
+    const review = card({ stage: "needs_review" });
+    const all = pools([
+      [opus, 2],
+      [sol, 2],
+    ]);
+    const [start] = planDispatch(board, [review], all);
+    expect(start?.model).toEqual(opus);
+    const ok = (b: KanbanBoard) => confirmDispatch(b, review, [review], all, new Map(), start!);
+    expect(ok(board)).toBe(true);
+    // Key order alone is not a change.
+    expect(
+      ok({
+        ...board,
+        reviewChains: [
+          { steps: [sol, astra], name: "Critical" },
+          { name: "Default", steps: [{ model: opus.model, instanceId: opus.instanceId }] },
+        ],
+      }),
+    ).toBe(true);
+    expect(ok({ ...board, defaultReviewChain: "Critical" })).toBe(false);
+    expect(
+      ok({
+        ...board,
+        reviewChains: [
+          { name: "Critical", steps: [sol, astra] },
+          { name: "Default", steps: [sol] },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("refuses when the planned pool is gone", () => {
+    const waiting = card();
+    const [start] = plan([waiting]);
+    expect(confirmDispatch(board, waiting, [waiting], pools([[sol, 2]]), new Map(), start!)).toBe(
+      false,
+    );
   });
 });
 

@@ -94,6 +94,7 @@ const fakeThreads = (
     mode: "encode" | "slow" | "budget" | "conflict" | "pre-save";
     saved: Deferred.Deferred<void>;
   },
+  delivery?: { readonly findExisting: boolean; readonly send: KanbanThreads["Service"]["send"] },
 ) => {
   const running = new Set<string>();
   const rejectSends = new Set<string>();
@@ -101,26 +102,27 @@ const fakeThreads = (
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
+  const view: KanbanThreads["Service"]["view"] = (threadId) =>
+    Effect.sync(() => {
+      views.push(threadId);
+      return {
+        threadId,
+        projectId: ProjectId.make("project-1"),
+        title: "thread",
+        state: running.has(threadId) ? "running" : "idle",
+        updatedAt: "2026-10-26T08:00:00.000Z",
+        quietSince: "2026-10-26T08:00:00.000Z",
+        runStartedAt: null,
+        backgroundWork: 0,
+        prs: [],
+        archived: false,
+      };
+    });
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
-      view: (threadId) =>
-        Effect.sync(() => {
-          views.push(threadId);
-          return {
-            threadId,
-            projectId: ProjectId.make("project-1"),
-            title: "thread",
-            state: running.has(threadId) ? "running" : "idle",
-            updatedAt: "2026-10-26T08:00:00.000Z",
-            quietSince: "2026-10-26T08:00:00.000Z",
-            runStartedAt: null,
-            backgroundWork: 0,
-            prs: [],
-            archived: false,
-          };
-        }),
-      find: () => Effect.succeed(null),
+      view,
+      find: delivery?.findExisting ? view : () => Effect.succeed(null),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
@@ -137,10 +139,12 @@ const fakeThreads = (
             )
           : launch;
       },
-      send: (input) =>
-        rejectSends.has(input.threadId)
-          ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "send failed" }))
-          : Effect.void,
+      send:
+        delivery?.send ??
+        ((input) =>
+          rejectSends.has(input.threadId)
+            ? Effect.fail(new KanbanThreadError({ operation: "send", detail: "send failed" }))
+            : Effect.void),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
       interrupt: () => Effect.void,
@@ -888,12 +892,15 @@ it.effect("compound board tools progress while a dispatch launch waits", () =>
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(dispatch);
       assert.lengthOf(launches, 1);
+      // A discussion and another board changed nothing this card's start depends on,
+      // so the launch is kept rather than abandoned.
       const after = yield* kanban.card(card.id);
-      assert.deepStrictEqual(after.card, before.card);
-      assert.deepStrictEqual(after.events, before.events);
+      assert.strictEqual(before.card.stage, "todo");
+      assert.strictEqual(after.card.stage, "working");
+      assert.strictEqual(after.card.activeThreadId, ThreadId.make("thread-1"));
       assert.lengthOf(after.threads, 1);
       assert.strictEqual(after.threads[0]!.threadId, ThreadId.make("thread-1"));
-      assert.isNotNull(after.threads[0]!.endedAt);
+      assert.isNull(after.threads[0]!.endedAt);
       assert.deepStrictEqual(yield* kanban.discussions(board.id), discussions);
       assert.deepStrictEqual(yield* kanban.messages(discussion.id), messages);
       assert.deepStrictEqual(yield* kanban.boards, boards);
@@ -1387,6 +1394,105 @@ it.effect("discussion_read keeps blocks whole, caps a reply near 1 MB and reads 
     assert.isUndefined(one.structured.earlierBefore);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each(["id", "number", "implicit", "board", "edit", "noop", "comment", "links"] as const)(
+  "agent read %s consumes a claim used outside the board send wrapper",
+  (form) => {
+    let send: KanbanThreads["Service"]["send"] = () => Effect.void;
+    const { layer } = fakeThreads(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        findExisting: true,
+        send: (input) => Effect.suspend(() => send(input)),
+      },
+    );
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const server = yield* McpServer.McpServer;
+      const board = yield* kanban.ensureBoard({
+        slug: "consume",
+        name: "Consume",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(
+        board.id,
+        { title: "Consume", prompt: "Consume" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const current = (yield* kanban.card(card.id)).card;
+      const thread = current.workThreadId!;
+      yield* store.putCard({
+        ...current,
+        stage: "todo",
+        activeThreadId: null,
+        activeRole: null,
+        activePool: null,
+      });
+      send = () => {
+        send = () => Effect.void;
+        const request =
+          form === "board"
+            ? call(thread, "board_get", { boardId: board.id })
+            : form === "edit" || form === "noop" || form === "comment" || form === "links"
+              ? call(thread, "card_update", {
+                  card: card.id,
+                  ...(form === "edit" ? { description: "Changed while delivery waits" } : {}),
+                  ...(form === "comment" ? { comment: "I am working on this" } : {}),
+                  ...(form === "links" ? { links: [{ url: "https://example.com/change" }] } : {}),
+                })
+              : call(
+                  thread,
+                  "card_get",
+                  form === "id"
+                    ? { card: card.id }
+                    : form === "number"
+                      ? { card: `#${card.number}` }
+                      : {},
+                );
+        return Effect.forkChild(
+          request.pipe(Effect.provideService(McpServer.McpServer, server)),
+        ).pipe(
+          Effect.flatMap(Fiber.join),
+          Effect.tap((reply) =>
+            Effect.sync(() => {
+              assert.isFalse(reply.isError, reply.text);
+              const read =
+                form === "board"
+                  ? (reply.structured.board as { cards: Array<{ activeThreadId: string }> })
+                      .cards[0]!
+                  : (reply.structured.card as { activeThreadId: string });
+              assert.strictEqual(read.activeThreadId, thread);
+            }),
+          ),
+          Effect.orDie,
+          Effect.andThen(
+            Effect.fail(
+              new KanbanThreadError({
+                operation: "send",
+                detail: "Final rejection",
+                rejected: true,
+              }),
+            ),
+          ),
+        );
+      };
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, thread);
+      yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId: thread,
+      });
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect.each([
   { tool: "card_update", mode: "encode" },
   { tool: "card_update", mode: "slow" },
