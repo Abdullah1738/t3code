@@ -419,7 +419,6 @@ it.effect(
       const tool = (name: string, args: Record<string, unknown>) =>
         call(evaluator, name, args).pipe(
           Effect.tap((result) =>
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             Effect.sync(() => replies.push(`${result.text} ${JSON.stringify(result.structured)}`)),
           ),
         );

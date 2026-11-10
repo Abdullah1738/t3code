@@ -2574,7 +2574,6 @@ it.effect(
     Effect.gen(function* () {
       const SECRET = "whsec_W5-rpc-V4lue+71c2e5d09a";
       const dump = (value: unknown) =>
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify(value, (_key, entry: unknown) =>
           typeof entry === "bigint" ? entry.toString() : entry,
         ) ?? "";
