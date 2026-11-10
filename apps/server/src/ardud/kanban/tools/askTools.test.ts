@@ -324,6 +324,23 @@ it.effect("discussion_post with ask replies on the ask without closing it", () =
     assert.strictEqual(kanbanAskWaitsOn(after.asks[0]!), "owner");
     assert.strictEqual(after.stage, "needs_owner");
 
+    // A reply on an ask is held to the ask's sizes: a page over 256 KB, or too many blocks.
+    const page = yield* call(evaluator, "discussion_post", {
+      card: card.id,
+      ask: "q1",
+      blocks: [{ _tag: "html", html: "x".repeat(256 * 1024 + 1), title: "Big", height: null }],
+    });
+    assert.isTrue(page.isError);
+    assert.include(page.text, "an html block on a reply on an ask is at most 256 KB");
+    const many = yield* call(evaluator, "discussion_post", {
+      card: card.id,
+      ask: "q1",
+      blocks: Array.from({ length: 13 }, (_, index) => ({ _tag: "md", text: `Line ${index}` })),
+    });
+    assert.isTrue(many.isError);
+    assert.include(many.text, "a reply on an ask takes at most 12 blocks (got 13)");
+    assert.strictEqual(kanbanAskWaitsOn((yield* kanban.card(card.id)).card.asks[0]!), "owner");
+
     const missing = yield* call(evaluator, "discussion_post", {
       card: card.id,
       ask: "q7",

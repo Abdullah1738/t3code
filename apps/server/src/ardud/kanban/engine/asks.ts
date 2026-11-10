@@ -379,37 +379,17 @@ const utf8Bytes = (text: string) => Buffer.byteLength(text, "utf8");
  * its own text checks and adopts the files.
  */
 export const askBlocksProblem = (blocks: ReadonlyArray<KanbanBlock>): AskProblem | undefined => {
-  if (blocks.length > ASK_LIMITS.blocks) {
-    return invalid(`an ask takes at most ${ASK_LIMITS.blocks} blocks (got ${blocks.length})`);
-  }
-  const files = blocks.filter((block) => block._tag === "attachment" || block._tag === "image");
-  if (files.length > ASK_LIMITS.attachments) {
-    return invalid(
-      `an ask takes at most ${ASK_LIMITS.attachments} images and files (got ${files.length}): keep the ones he needs to decide`,
-    );
-  }
+  const size = blockLimitsProblem(blocks, "an ask", ": keep the ones he needs to decide");
+  if (size) return size;
   for (const block of blocks) {
     switch (block._tag) {
       case "choice":
         return invalid(
           "an ask's blocks can't hold a poll or pick: put the answers in options, they are the ask's own field",
         );
-      case "md":
-      case "collapse": {
-        const long = tooLong(`a ${block._tag} block`, block.text, ASK_LIMITS.blockText);
-        if (long) return long;
-        break;
-      }
-      case "html": {
-        const bytes = utf8Bytes(block.html);
-        if (bytes > ASK_LIMITS.htmlBytes) {
-          return invalid(
-            `an html block on an ask is at most ${ASK_LIMITS.htmlBytes / 1024} KB (got ${Math.ceil(bytes / 1024)} KB): trim the page, or attach it as a file`,
-          );
-        }
+      case "html":
         if (block.html.trim() === "") return invalid("an html block needs its html");
         break;
-      }
       case "image":
         if (!block.alt?.trim()) {
           return invalid("an image on an ask needs alt text saying what it shows");
@@ -417,6 +397,45 @@ export const askBlocksProblem = (blocks: ReadonlyArray<KanbanBlock>): AskProblem
         break;
       default:
         break;
+    }
+  }
+  return undefined;
+};
+
+/**
+ * A reply on an ask is read on the same page as the ask, so it is held to the
+ * same sizes: how many blocks, how many of them images and files, and how big
+ * one body is. It applies to the owner's replies and to an agent's.
+ */
+export const replyBlocksProblem = (blocks: ReadonlyArray<KanbanBlock>): AskProblem | undefined =>
+  blockLimitsProblem(blocks, "a reply on an ask", "");
+
+/** How much one ask, or one reply on it, may hold. */
+const blockLimitsProblem = (
+  blocks: ReadonlyArray<KanbanBlock>,
+  what: string,
+  keep: string,
+): AskProblem | undefined => {
+  if (blocks.length > ASK_LIMITS.blocks) {
+    return invalid(`${what} takes at most ${ASK_LIMITS.blocks} blocks (got ${blocks.length})`);
+  }
+  const files = blocks.filter((block) => block._tag === "attachment" || block._tag === "image");
+  if (files.length > ASK_LIMITS.attachments) {
+    return invalid(
+      `${what} takes at most ${ASK_LIMITS.attachments} images and files (got ${files.length})${keep}`,
+    );
+  }
+  for (const block of blocks) {
+    if (block._tag === "md" || block._tag === "collapse") {
+      const long = tooLong(`a ${block._tag} block`, block.text, ASK_LIMITS.blockText);
+      if (long) return long;
+    } else if (block._tag === "html") {
+      const bytes = utf8Bytes(block.html);
+      if (bytes > ASK_LIMITS.htmlBytes) {
+        return invalid(
+          `an html block on ${what} is at most ${ASK_LIMITS.htmlBytes / 1024} KB (got ${Math.ceil(bytes / 1024)} KB): trim the page, or attach it as a file`,
+        );
+      }
     }
   }
   return undefined;
