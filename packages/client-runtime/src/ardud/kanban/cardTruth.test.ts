@@ -2,6 +2,7 @@ import type {
   KanbanBoardSnapshot,
   KanbanCard,
   KanbanCardEvent,
+  KanbanCardRetry,
   KanbanThreadState,
   KanbanWait,
 } from "@t3tools/contracts";
@@ -99,6 +100,16 @@ const state = (cards: KanbanCard[], threads: KanbanThreadState[] = [], board: ob
     unread: [],
   } as unknown as KanbanBoardSnapshot);
 
+const retry = (patch: Partial<KanbanCardRetry> = {}): KanbanCardRetry => ({
+  kind: "run_failed",
+  role: "work",
+  runId: "run-1",
+  reason: "upstream closed the stream",
+  at: "2026-11-10T11:00:00.000Z" as never,
+  state: "waiting",
+  ...patch,
+});
+
 const thread = (patch: Partial<KanbanThreadState> = {}): KanbanThreadState =>
   ({
     threadId: "thread-1",
@@ -182,14 +193,80 @@ describe("cardTruth: working", () => {
     expect(truth(working(), [], [])).toMatchObject({ state: "running", stuckReason: null });
   });
 
-  it("is retrying when the board says so, and ignores a missing counter", () => {
-    expect(truth(working(), [], [thread()], { retries: 2 })).toMatchObject({
+  it("is retrying while the turn its retry started runs, read from the card's own record", () => {
+    expect(truth(working({ retries: [retry()] }), [], [thread()])).toMatchObject({
       state: "retrying",
-      label: "Retrying (attempt 3)",
+      label: "Retrying after a failed run",
+      stuckReason: null,
     });
-    expect(truth({ ...working(), retries: 1 } as never, [], [thread()]).state).toBe("retrying");
-    expect(truth(working(), [], [thread()], { retries: null }).state).toBe("running");
-    expect(truth(working(), [], [thread()], { retries: 0 }).state).toBe("running");
+    // No record, or a reviewer's record on a card its worker runs: plain running.
+    expect(truth(working(), [], [thread()]).state).toBe("running");
+    expect(truth(working({ retries: [] }), [], [thread()]).state).toBe("running");
+    expect(truth(working({ retries: [retry({ role: "review" })] }), [], [thread()]).state).toBe(
+      "running",
+    );
+    const reviewing = { stage: "in_review", activeRole: "review" } as const;
+    expect(
+      truth(working({ ...reviewing, retries: [retry({ role: "review" })] }), [], [thread()]),
+    ).toMatchObject({ state: "retrying", label: "Reviewing again after a failed run" });
+    expect(
+      truth(
+        working({
+          ...reviewing,
+          retries: [retry({ role: "review", kind: "no_verdict", runId: null, state: "restarted" })],
+        }),
+        [],
+        [thread()],
+      ),
+    ).toMatchObject({ state: "retrying", label: "Reviewing again after no verdict" });
+  });
+
+  it("is retrying, not ready or stuck, while a failed run's card waits in its queue", () => {
+    // The run failed 30 seconds ago: inside the 60-second backoff.
+    const failedAt = "2026-11-10T11:59:30.000Z" as never;
+    const held = card(1, {
+      stage: "todo",
+      workThreadId: "thread-1" as never,
+      retries: [retry({ at: failedAt })],
+    });
+    expect(truth(held)).toEqual({
+      state: "retrying",
+      label: "Run failed, retrying shortly",
+      wait: null,
+      derived: false,
+      stuckReason: null,
+    });
+    expect(stuckCards(state([held]), NOW)).toEqual([]);
+    // The backoff is over and no slot is free yet: still its retry, now queued.
+    expect(
+      truth({ ...held, retries: [retry({ at: "2026-11-10T11:50:00.000Z" as never })] }),
+    ).toMatchObject({
+      state: "retrying",
+      label: "Run failed, retry is queued",
+      stuckReason: null,
+    });
+    // A reviewer's failed run waits in Needs review the same way.
+    expect(
+      truth(card(2, { stage: "needs_review", retries: [retry({ role: "review", at: failedAt })] })),
+    ).toMatchObject({ state: "retrying", label: "Run failed, retrying shortly" });
+    expect(
+      truth(
+        card(3, {
+          stage: "needs_review",
+          retries: [retry({ role: "review", kind: "no_verdict", runId: null, state: "restarted" })],
+        }),
+      ),
+    ).toMatchObject({ state: "retrying", label: "No verdict, review is queued again" });
+  });
+
+  it("shows the wait when a card is both parked on a wait and held for a retry", () => {
+    const both = card(1, {
+      stage: "todo",
+      retries: [retry({ at: "2026-11-10T11:59:30.000Z" as never })],
+      wait: wait(),
+    });
+    expect(truth(both)).toMatchObject({ state: "waiting" });
+    expect(truth(both).wait).not.toBeNull();
   });
 
   it("is failed when its run failed and the card is flagged", () => {
@@ -206,10 +283,8 @@ describe("cardTruth: working", () => {
       label: "Failed",
       stuckReason: "Failed 1h: Run failed: Provider turn failed.",
     });
-    expect(truth(failed, [], [], { retries: 1 })).toMatchObject({
-      state: "retrying",
-      stuckReason: null,
-    });
+    // A flagged card is past its retry, whatever a caller believes about attempts.
+    expect(truth(failed, [], [], { retries: 1 }).state).toBe("failed");
   });
 
   it("is stuck when its thread went quiet or waits on its own question", () => {

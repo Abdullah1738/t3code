@@ -6,6 +6,8 @@ import {
   kanbanWaitCheckFailing,
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
+  kanbanRetryNotBefore,
+  kanbanRetrying,
   kanbanScriptStep,
   kanbanStepSubtasks,
   kanbanWaitExpired,
@@ -32,7 +34,10 @@ export type CardTruthState =
   | "blocked"
   /** A work thread is on it. */
   | "running"
-  /** Its run failed and the board is trying again. */
+  /**
+   * Its run failed, or its reviewer gave no verdict, and the board is on the one
+   * automatic retry: waiting out the backoff, queued for a slot, or running again.
+   */
   | "retrying"
   /** Its run failed, or it was flagged stalled, and nothing is retrying it. */
   | "failed"
@@ -78,8 +83,6 @@ export interface CardTruthHints {
   readonly events?: ReadonlyArray<KanbanCardEvent> | undefined;
   /** The card's full wake note, when loaded; the feed only says one is pending. */
   readonly wakeNote?: string | null | undefined;
-  /** How many times the board has retried the card's failed run; absent or 0 means none. */
-  readonly retries?: number | null | undefined;
   readonly timeZone?: string | undefined;
 }
 
@@ -240,9 +243,6 @@ const reviewPassed = (card: KanbanCard, state: KanbanBoardState): boolean => {
   return card.reviewStep >= Math.max(chain?.steps.length ?? 1, 1);
 };
 
-const numeric = (value: unknown): number =>
-  typeof value === "number" && Number.isFinite(value) ? value : 0;
-
 /**
  * The texts a wait can be guessed from, most direct first: the stalled
  * reason, the newest comment, flag or move note (when history is loaded), the
@@ -282,8 +282,18 @@ function threadTruth(
   const thread = card.activeThreadId === null ? undefined : state.threads.get(card.activeThreadId);
   // Its state hasn't arrived yet (or couldn't be read): it has a thread, so it counts as moving.
   if (thread === undefined || thread.running) {
-    const retries = numeric(hints.retries ?? (card as { readonly retries?: unknown }).retries);
-    if (!reviewing && retries > 0) return base("retrying", `Retrying (attempt ${retries + 1})`);
+    // The card's own record says so (kanbanRetrying): the retried turn is the one running.
+    const retry = kanbanRetrying(card);
+    if (retry !== undefined && retry.role === (reviewing ? "review" : "work")) {
+      return base(
+        "retrying",
+        retry.kind === "no_verdict"
+          ? "Reviewing again after no verdict"
+          : reviewing
+            ? "Reviewing again after a failed run"
+            : "Retrying after a failed run",
+      );
+    }
     return reviewing ? base("reviewing", "Reviewing") : base("running", "Running");
   }
   const who = reviewing ? "Reviewer" : "Worker";
@@ -337,13 +347,25 @@ export function cardTruth(
     // Agents parked cards with a stalled flag before waits existed: read it as one when it says so.
     const guess = guessWaitFrom([card.stalled.reason]);
     if (guess !== null) return fromGuess(guess, card.stalled.at, nowMs, hints.timeZone);
-    const retries = numeric(hints.retries ?? (card as { readonly retries?: unknown }).retries);
-    if (retries > 0 && card.stalled.by._tag === "system") {
-      return base("retrying", `Retrying (attempt ${retries + 1})`);
-    }
+    // A flagged card is past its retry: the board keeps no retry record on it.
     const failed = card.stalled.by._tag === "system";
     const label = failed ? "Failed" : "Stalled";
     return base("failed", label, `${label} ${age(card.stalled.at, nowMs)}: ${card.stalled.reason}`);
+  }
+
+  // Back in its queue for the one automatic retry. Not "ready": the dispatcher holds
+  // it until the backoff is over, and after that it waits for a slot like any card.
+  const retry = kanbanRetrying(card);
+  if (retry !== undefined && (card.stage === "todo" || card.stage === "needs_review")) {
+    const notBefore = kanbanRetryNotBefore(card);
+    return base(
+      "retrying",
+      retry.kind === "no_verdict"
+        ? "No verdict, review is queued again"
+        : notBefore !== null && nowMs < notBefore
+          ? "Run failed, retrying shortly"
+          : "Run failed, retry is queued",
+    );
   }
 
   if (card.stage === "working") {
