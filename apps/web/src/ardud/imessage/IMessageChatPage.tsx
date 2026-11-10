@@ -488,7 +488,8 @@ function EventLine(props: { source: string; title: string; detail: string | null
           onClick={() => setOpen((value) => !value)}
           className="rounded-sm text-center text-xs leading-snug wrap-anywhere text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
         >
-          {line}
+          {/* Long watcher prompts read as one short line until opened. */}
+          <span className={open ? undefined : "line-clamp-2"}>{line}</span>
         </button>
       )}
       {open && props.detail !== null ? (
