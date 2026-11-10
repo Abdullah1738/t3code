@@ -93,6 +93,8 @@ module stops {
   // A row given up is closed and holds no send.
   val givenUp = s.undeliverable.forall(id => not(s.rows.contains(id)) and not(s.pending.contains(id)))
   val safe = invariant and owed and givenUp
+  // The same property, named apart for the expected `stepVolatile` counterexample.
+  val volatileSafe = safe
   run heldStopTest = init.then(request(0)).then(runEnds).then(dispatchCommit).then(consume(true, true)).then(accept)
     .then(all { assert(not(s.cutLater) and s.rows == Set() and s.running and s.runAssign == 1), s' = s })
   run requestBetweenConsumeAndAcceptTest = init.then(runEnds).then(dispatchCommit).then(consume(true, true))
