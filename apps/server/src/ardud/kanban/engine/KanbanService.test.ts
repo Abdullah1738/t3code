@@ -14381,38 +14381,42 @@ it.live("a pause note that can't go out refuses the thread's take until it has g
   }),
 );
 
-it.live("a stop on a thread doesn't wait for a drop note that can't go out; the note closes unsent", () =>
-  Effect.gen(function* () {
-    const fake = yield* makeFake;
-    const layer = gatedNotes(fake, () =>
-      Effect.fail(new KanbanThreadError({ operation: "send", detail: "provider disabled" })),
-    );
-    yield* Effect.gen(function* () {
-      const { kanban, card: a, threadId } = yield* workingCard;
-      const b = (yield* kanban.createForThread(threadId, { prompt: "B", title: "B" })).card;
-      // A goes back to todo while the thread keeps B: a drop note, which can't be sent.
-      yield* kanban.moveCard(a.id, "todo", "owner", owner);
-      yield* eventually(effectRows, (all) => all.some((row) => row.kind === "release"));
-      // Then B goes too: the thread has nothing left, so it is stopped now, not after the
-      // note gives up, and the obsolete "carry on with #B" note is never sent.
-      yield* kanban.moveCard(b.id, "todo", "owner", owner);
-      yield* eventually(
-        Effect.sync(() => fake.interrupted.filter((id) => id === threadId).length),
-        (count) => count > 0,
-      ).pipe(Effect.timeout("5 seconds"));
-      const rows = yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
-      assert.deepStrictEqual(
-        rows.map((row) => [row.kind, row.outcome]),
-        [
-          ["release", "superseded"],
-          ["interrupt", "delivered"],
-        ],
+it.live(
+  "a stop on a thread doesn't wait for a drop note that can't go out; the note closes unsent",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const layer = gatedNotes(fake, () =>
+        Effect.fail(new KanbanThreadError({ operation: "send", detail: "provider disabled" })),
       );
-      yield* Effect.sleep("100 millis");
-      assert.lengthOf(yield* notesTo(fake, threadId, a.number), 0);
-      assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
-    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
-  }),
+      yield* Effect.gen(function* () {
+        const { kanban, card: a, threadId } = yield* workingCard;
+        const b = (yield* kanban.createForThread(threadId, { prompt: "B", title: "B" })).card;
+        // A goes back to todo while the thread keeps B: a drop note, which can't be sent.
+        yield* kanban.moveCard(a.id, "todo", "owner", owner);
+        yield* eventually(effectRows, (all) => all.some((row) => row.kind === "release"));
+        // Then B goes too: the thread has nothing left, so it is stopped now, not after the
+        // note gives up, and the obsolete "carry on with #B" note is never sent.
+        yield* kanban.moveCard(b.id, "todo", "owner", owner);
+        yield* eventually(
+          Effect.sync(() => fake.interrupted.filter((id) => id === threadId).length),
+          (count) => count > 0,
+        ).pipe(Effect.timeout("5 seconds"));
+        const rows = yield* eventually(effectRows, (all) =>
+          all.every((row) => row.done_at !== null),
+        );
+        assert.deepStrictEqual(
+          rows.map((row) => [row.kind, row.outcome]),
+          [
+            ["release", "superseded"],
+            ["interrupt", "delivered"],
+          ],
+        );
+        yield* Effect.sleep("100 millis");
+        assert.lengthOf(yield* notesTo(fake, threadId, a.number), 0);
+        assert.strictEqual(fake.interrupted.filter((id) => id === threadId).length, 1);
+      }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+    }),
 );
 
 it.live("a note saved while a take sends earlier notes reruns the take instead of failing it", () =>

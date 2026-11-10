@@ -7073,21 +7073,19 @@ const make = Effect.gen(function* () {
         return Effect.void;
       }
       // A note that fails to go out stays pending; the take is then refused below.
-      return locks
-        .access(boardId, Effect.void, false, stopResource(threadId))
-        .pipe(
-          Effect.andThen(
-            // Safe to rerun when stale (a note saved meanwhile): sends are keyed and
-            // closes durable, so a rerun sends only what is still pending.
-            locks.outside(
-              runPendingStops(threadId).pipe(
-                Effect.catchTags({ KanbanThreadError: () => Effect.void }),
-              ),
-              undefined,
-              true,
+      return locks.access(boardId, Effect.void, false, stopResource(threadId)).pipe(
+        Effect.andThen(
+          // Safe to rerun when stale (a note saved meanwhile): sends are keyed and
+          // closes durable, so a rerun sends only what is still pending.
+          locks.outside(
+            runPendingStops(threadId).pipe(
+              Effect.catchTags({ KanbanThreadError: () => Effect.void }),
             ),
+            undefined,
+            true,
           ),
-        );
+        ),
+      );
     });
   const checkTake = Effect.fn("KanbanService.checkTake")(function* (
     thread: {
