@@ -609,6 +609,10 @@ describe("helpers", () => {
     });
     const other = newWait({ on: "card", note: "after it", card: card(2), pr: PR }, owner, AT);
     expect(other).toMatchObject({ on: "card", card: "card-2", pr: null, sinceHead: null });
+    // A time written with a zone offset is stored in UTC like every other timestamp.
+    expect(
+      newWait({ on: "time", note: "recheck", until: "2026-11-14T09:00:00+04:00" }, owner, AT).until,
+    ).toBe("2026-11-14T05:00:00.000Z");
   });
 
   it("names PRs, compares short and full commits, and words the target", () => {

@@ -25,6 +25,7 @@ import {
   type KanbanWait,
   type KanbanWaitKind,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 
 /** How long each kind may hold before the card shows as stuck (shared with the clients). */
 export const WAIT_LIMIT_MS = KANBAN_WAIT_LIMIT_MS;
@@ -645,6 +646,12 @@ export function checkWait(
   }
 }
 
+/** A time as the board stores every timestamp (UTC), whatever zone it was written in. */
+const utcIso = (time: string | null | undefined): KanbanWait["until"] => {
+  const ms = time == null ? Number.NaN : Date.parse(time);
+  return Number.isFinite(ms) ? DateTime.formatIso(DateTime.makeUnsafe(ms)) : null;
+};
+
 /** The wait to store for a checked request. */
 export function newWait(request: WaitRequest, by: KanbanActor, at: string): KanbanWait {
   const onPr = request.on === "push" || request.on === "merge" || request.on === "ci";
@@ -653,7 +660,7 @@ export function newWait(request: WaitRequest, by: KanbanActor, at: string): Kanb
     pr: onPr ? ((request.pr ?? null) as KanbanWait["pr"]) : null,
     card: request.on === "card" ? (request.card?.id ?? null) : null,
     ask: request.on === "owner_go" ? ((request.ask ?? null) as KanbanWait["ask"]) : null,
-    until: (request.until ?? null) as KanbanWait["until"],
+    until: utcIso(request.until),
     sinceHead: request.on === "push" ? (request.sinceHead?.trim() ?? null) : null,
     note: request.note.trim(),
     by,
