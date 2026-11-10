@@ -10,6 +10,7 @@ import {
   KanbanCardEvent,
   kanbanAwaitsMerge,
   kanbanBlocking,
+  kanbanBoardClock,
   kanbanBoardIcon,
   kanbanCardFlow,
   kanbanEvaluatorStep,
@@ -132,6 +133,17 @@ describe("KanbanCard retries", () => {
       }),
     ).toBeNull();
     expect(kanbanRetryNotBefore({ retries: [{ ...waiting, at: "not a time" }] })).toBeNull();
+  });
+
+  it("gives a caller with no clock the board's newest card stamp", () => {
+    expect(kanbanBoardClock([])).toBe(0);
+    expect(
+      kanbanBoardClock([
+        { updatedAt: "2026-11-10T10:00:00.000Z" },
+        { updatedAt: "2026-11-10T12:00:00.000Z" },
+        { updatedAt: "2026-11-09T23:00:00.000Z" },
+      ]),
+    ).toBe(Date.parse("2026-11-10T12:00:00.000Z"));
   });
 });
 

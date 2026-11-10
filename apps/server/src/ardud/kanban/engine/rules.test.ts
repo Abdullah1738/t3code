@@ -33,7 +33,6 @@ import {
   modelOnPool,
   nextProbeDelay,
   planDispatch,
-  heldSlots,
   aliasPool,
   poolFor,
   poolKey,
@@ -551,17 +550,25 @@ describe("planDispatch", () => {
       expect(planAt(cards, pools([[opus, 0]]), due + 24 * 60 * 60_000)).toEqual([]);
     });
 
-    it("takes the dispatcher's clock from its held slots", () => {
-      const waiting = failed();
-      const one = pools([[opus, 1]]);
-      expect(planDispatch(board, [waiting], one, heldSlots([], due - 1))).toEqual([]);
-      expect(planDispatch(board, [waiting], one, heldSlots([], due)).map((e) => e.cardId)).toEqual([
-        waiting.id,
-      ]);
-      // An explicit clock wins, and the held slots are still slots.
-      expect(planDispatch(board, [waiting], one, heldSlots([], due), () => 0, due - 1)).toEqual([]);
+    it("measures the backoff and the aging of waiting cards against the one clock it is given", () => {
+      const waiting = failed({ priority: 4 });
+      // Startable for six days by the clock passed in: two aging steps, P4 to P2.
+      const old = card({ priority: 4, movedAt: iso(due - 6 * 24 * 60 * 60_000) });
+      const fresh = card({ priority: 3, movedAt: iso(due - 60_000) });
+      const cards = [fresh, old, waiting];
+      const three = pools([[opus, 3]]);
+      expect(planAt(cards, three, due - 1)).toEqual([old.id, fresh.id]);
+      expect(planAt(cards, three, due)).toEqual([old.id, fresh.id, waiting.id]);
+      // Held slots are only slots: they carry no clock.
       expect(
-        planDispatch(board, [waiting], one, heldSlots([["t-held", poolKey(opus)]], due)),
+        planDispatch(
+          board,
+          [waiting],
+          pools([[opus, 1]]),
+          new Map([["t-held", poolKey(opus)]]),
+          () => 0,
+          due,
+        ),
       ).toEqual([]);
     });
 

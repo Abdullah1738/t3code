@@ -1521,24 +1521,19 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
     );
-  /**
-   * One board's held slots, thread id to pool, as the rules take them, stamped with
-   * the time of the read: the planner measures a waiting retry's backoff against it
-   * (see Rules.HeldSlots). `except`: a start's own key.
-   */
+  /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
   const boardHolds = (boardId: string, except?: string) =>
-    Effect.zipWith(Ref.get(holds), nowMillis, (all, now) =>
-      Rules.heldSlots(
-        [
+    Effect.map(
+      Ref.get(holds),
+      (all) =>
+        new Map([
           ...[...all].flatMap(([threadId, held]) =>
             held.boardId === boardId ? [[threadId as string, held.pool] as const] : [],
           ),
           ...[...starting]
             .filter(([key]) => key.startsWith(`${boardId}:`) && key !== except)
             .map(([key, value]) => [value.threadId ?? key, value.pool] as const),
-        ],
-        now,
-      ),
+        ]),
     );
   // Threads confirmed missing at the previous tick; a failed read is not a miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
@@ -4752,6 +4747,9 @@ const make = Effect.gen(function* () {
                     Rules.maskDownPools(yield* store.pools(board.id), downKeys),
                     yield* boardHolds(board.id),
                     pick,
+                    // The real time: a waiting retry's backoff and the aging of
+                    // waiting cards are measured against it.
+                    yield* nowMillis,
                   );
                   return { boardId: board.id, cards, plan };
                 }),

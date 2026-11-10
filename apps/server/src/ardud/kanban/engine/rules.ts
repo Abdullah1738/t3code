@@ -9,6 +9,7 @@ import {
   kanbanCardFlow,
   kanbanCardModels,
   kanbanHeldUpBy,
+  kanbanBoardClock,
   kanbanPickOrder,
   kanbanRetryNotBefore,
   kanbanSchedule,
@@ -473,26 +474,6 @@ export function poolThreads(
   return byPool;
 }
 
-/** The newest stamp on any card: the clock of a caller that passes none. */
-const newestStamp = (cards: ReadonlyArray<KanbanCard>): number => {
-  let newest = Number.NEGATIVE_INFINITY;
-  for (const card of cards) {
-    const at = Date.parse(card.updatedAt);
-    if (at > newest) newest = at;
-  }
-  return newest;
-};
-
-/**
- * A board's held slots (thread id to pool) as the dispatcher reads them, with the
- * time of the read. The dispatcher's plan call hands planDispatch its holds and
- * no clock, so `asOf` is the time a waiting retry is measured against there. A
- * plain Map is a HeldSlots with no time.
- */
-export type HeldSlots = ReadonlyMap<string, string> & { readonly asOf?: number };
-export const heldSlots = (entries: Iterable<readonly [string, string]>, asOf: number): HeldSlots =>
-  Object.assign(new Map(entries), { asOf });
-
 /**
  * Fill free pool slots: reviews first (oldest first), then todo in pick
  * order (see `schedule`), skipping blocked, settled and backlog cards. Lowering a pool below what is
@@ -500,20 +481,22 @@ export const heldSlots = (entries: Iterable<readonly [string, string]>, asOf: nu
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
  * A card with no work thread yet starts on its highest-weight model with a
- * free slot; `pick(n)` returns an index below n to break a tie. `nowMs` is the
- * clock waiting cards age against; left out, it is the board's newest card stamp.
+ * free slot; `pick(n)` returns an index below n to break a tie.
  *
  * Not before: a card whose run failed waits in its queue for its one retry and
  * is not started until its backoff is over (kanbanRetryNotBefore). It holds no
  * slot meanwhile, and once due it is a card like any other: same rank, same
- * age, same wait for a free slot. The clock for this is `nowMs`, else the
- * holds' `asOf`, else the board's newest card stamp.
+ * age, same wait for a free slot.
+ *
+ * `nowMs` is the one clock both the retry backoff and the aging of waiting cards
+ * are measured against. The dispatcher passes the real time. Left out (tests, a
+ * caller with no clock) it is the board's newest card stamp (kanbanBoardClock).
  */
 export function planDispatch(
   board: KanbanBoard,
   cards: ReadonlyArray<KanbanCard>,
   pools: ReadonlyArray<KanbanPool>,
-  holds: HeldSlots = new Map(),
+  holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
   nowMs?: number,
 ): ReadonlyArray<Dispatch> {
@@ -531,12 +514,10 @@ export function planDispatch(
   const free = new Map<string, number>();
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
-  const clock = nowMs ?? holds.asOf;
-  let newest: number | undefined;
+  const clock = nowMs ?? kanbanBoardClock(cards);
   const retryHeld = (card: KanbanCard) => {
     const notBefore = kanbanRetryNotBefore(card);
-    if (notBefore === null) return false;
-    return notBefore > (clock ?? (newest ??= newestStamp(cards)));
+    return notBefore !== null && notBefore > clock;
   };
   const waiting = cards.filter(
     (card) =>
@@ -555,7 +536,7 @@ export function planDispatch(
     .toSorted((a, b) => a.movedAt.localeCompare(b.movedAt));
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .toSorted(kanbanPickOrder(cards, { nowMs }));
+    .toSorted(kanbanPickOrder(cards, { nowMs: clock }));
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 

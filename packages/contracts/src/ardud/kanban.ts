@@ -1175,6 +1175,18 @@ export function kanbanBlocking(cards: ReadonlyArray<KanbanCard>): Map<string, Ka
 }
 
 /**
+ * The clock of a caller that has none: the newest stamp on any of the board's
+ * cards. It never runs ahead of the real time, so nothing ages or comes due early;
+ * on a board nothing has touched for a while it runs behind. The dispatcher passes
+ * the real time instead.
+ */
+export function kanbanBoardClock(cards: ReadonlyArray<Pick<KanbanCard, "updatedAt">>): number {
+  let newest = "";
+  for (const card of cards) if (card.updatedAt > newest) newest = card.updatedAt;
+  return newest === "" ? 0 : Date.parse(newest);
+}
+
+/**
  * How every open card on a board is ranked for pick-up, from one pass over the
  * blocking graph. A card's rank starts at its urgency (its own priority, or that of
  * the most urgent card it holds up) and is lifted, never above KANBAN_BOOST_FLOOR:
@@ -1187,12 +1199,7 @@ export function kanbanSchedule(
 ): Map<string, KanbanSchedule> {
   const graph = blockingGraph(cards, options.maxWords ?? SCHEDULE_MAX_WORDS);
   const byId = new Map(cards.map((card) => [card.id as string, card]));
-  let nowMs = options.nowMs;
-  if (nowMs === undefined) {
-    let newest = "";
-    for (const card of cards) if (card.updatedAt > newest) newest = card.updatedAt;
-    nowMs = newest === "" ? 0 : Date.parse(newest);
-  }
+  const nowMs = options.nowMs ?? kanbanBoardClock(cards);
   const result = new Map<string, KanbanSchedule>();
   graph.open.forEach((card, v) => {
     const blocking = graph.of(v);
