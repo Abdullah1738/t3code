@@ -9328,6 +9328,7 @@ interface HeldModel {
   readonly started: Queue.Queue<string>;
   readonly release: Deferred.Deferred<void>;
   fail: boolean;
+  goalsReply?: (prompt: string) => unknown;
 }
 const makeHeldModel = (held: boolean) =>
   Effect.gen(function* () {
@@ -9358,7 +9359,7 @@ const heldScribeLayer = (fake: Layer.Layer<KanbanThreads>, model: HeldModel) =>
             if (model.fail) return yield* Effect.fail(new ModelDown());
             if (input.prompt.startsWith("You suggest goals")) return { proposals: [] };
             if (input.prompt.startsWith("You keep a work board's goals"))
-              return { assign: [], goals: [] };
+              return model.goalsReply?.(input.prompt) ?? { assign: [], goals: [] };
             if (input.prompt.startsWith(WRITER_PREFIX))
               return { title: "Written title", description: "Written description" };
             return {
@@ -9525,6 +9526,61 @@ it.effect("one title writer per card: an edit made meanwhile is written after it
       // Nothing is left in flight: a later edit starts a writer at once.
       yield* kanban.editCard(card.id, { prompt: "Fourth task" }, owner);
       yield* heldEventually(Effect.sync(() => asksOf(model, WRITER_PREFIX).length === 3));
+    }).pipe(Effect.scoped, Effect.provide(heldScribeLayer(fake.layer, model)));
+  }),
+);
+
+it.effect("a queued title write keeps a title the owner typed while it waited", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const model = yield* makeHeldModel(true);
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "First task" }, owner);
+      yield* heldEventually(Effect.sync(() => asksOf(model, WRITER_PREFIX).length === 1));
+      yield* kanban.editCard(card.id, { prompt: "Second task" }, owner);
+      yield* kanban.editCard(card.id, { title: "Owner title" }, owner);
+      yield* Deferred.succeed(model.release, undefined);
+      yield* heldEventually(Effect.sync(() => asksOf(model, WRITER_PREFIX).length === 2));
+      yield* heldEventually(
+        kanban
+          .card(card.id)
+          .pipe(Effect.map(({ card }) => card.description === "Written description")),
+      );
+      assert.strictEqual((yield* kanban.card(card.id)).card.title, "Owner title");
+    }).pipe(Effect.scoped, Effect.provide(heldScribeLayer(fake.layer, model)));
+  }),
+);
+
+it.effect("a goal Now written during a long scribe call is kept, however old it is", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const model = yield* makeHeldModel(true);
+    model.goalsReply = (prompt) => {
+      const id = /Goal (\S+):/.exec(prompt)?.[1] ?? "";
+      return { assign: [], goals: [{ id, now: "Scribe's Now.", story: null }] };
+    };
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const login = yield* kanban.setGoal(board.id, { name: "Login" });
+      yield* kanban.createCard(
+        board.id,
+        { prompt: "A", title: "Login form", description: "Sign-in", goalId: login.id },
+        owner,
+      );
+      yield* kanban.tick;
+      yield* heldEventually(
+        Effect.sync(() => asksOf(model, "You keep a work board's goals").length === 1),
+      );
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.setGoal(board.id, { id: login.id, now: "Owner's Now." });
+      // Past the 5-minute fresh-Now window before the answer lands.
+      yield* TestClock.adjust("8 minutes");
+      yield* Deferred.succeed(model.release, undefined);
+      yield* settleLive;
+      yield* settleLive;
+      const goal = (yield* kanban.snapshot(board.id)).goals.find((entry) => entry.id === login.id);
+      assert.strictEqual(goal?.now?.text, "Owner's Now.");
     }).pipe(Effect.scoped, Effect.provide(heldScribeLayer(fake.layer, model)));
   }),
 );

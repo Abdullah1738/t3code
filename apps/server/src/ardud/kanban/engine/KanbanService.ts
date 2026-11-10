@@ -1209,10 +1209,14 @@ const make = Effect.gen(function* () {
   // SCRIBE_EVERY_MS cooldown, and the next tick must not start a second one beside it.
   const groupsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
   const goalsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
-  // Cards with a title writer running, each with the fields of a write asked for meanwhile
-  // (null when none). One writer per card; the asked-for write runs after it, on the latest card.
+  // Cards with a title writer running, each with the write asked for meanwhile (null when
+  // none): its fields and the card's title and description at the time. One writer per card; the asked-for write runs after it, on the latest card.
   type WriterFields = { readonly title: boolean; readonly description: boolean };
-  type WritersRunning = ReadonlyMap<KanbanCardId, WriterFields | null>;
+  type WriterAsk = {
+    readonly fields: WriterFields;
+    readonly asked: Pick<KanbanCard, "title" | "description">;
+  };
+  type WritersRunning = ReadonlyMap<KanbanCardId, WriterAsk | null>;
   const titlesRunning = yield* Ref.make<WritersRunning>(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
@@ -1686,6 +1690,8 @@ const make = Effect.gen(function* () {
   const writeTitle = Effect.fn("KanbanService.writeTitle")(function* (
     cardId: KanbanCard["id"],
     fields: { readonly title: boolean; readonly description: boolean },
+    // The card's title and description when the write was asked for; an edit after that wins.
+    asked?: Pick<KanbanCard, "title" | "description">,
   ) {
     const generateJson = textGeneration.generateJson;
     if (!generateJson) return;
@@ -1707,16 +1713,22 @@ const make = Effect.gen(function* () {
         const current = yield* cardOf(cardId);
         const title = written.title.trim().slice(0, 80);
         const description = written.description.trim();
+        const basis = asked ?? card;
         yield* saveCard({
           ...current,
           title:
-            fields.title && title && current.title === card.title && current.prompt === card.prompt
+            fields.title &&
+            title &&
+            current.title === card.title &&
+            current.title === basis.title &&
+            current.prompt === card.prompt
               ? title
               : current.title,
           description:
             fields.description &&
             description &&
             current.description === card.description &&
+            current.description === basis.description &&
             current.prompt === card.prompt
               ? description
               : current.description,
@@ -1728,13 +1740,17 @@ const make = Effect.gen(function* () {
   });
 
   // Runs the writer, then any write asked for while it ran, until none is left.
-  const writerRuns = (cardId: KanbanCard["id"], fields: WriterFields): Effect.Effect<void> =>
-    writeTitle(cardId, fields).pipe(
+  const writerRuns = (
+    cardId: KanbanCard["id"],
+    fields: WriterFields,
+    asked?: WriterAsk["asked"],
+  ): Effect.Effect<void> =>
+    writeTitle(cardId, fields, asked).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban title writer failed", { cardId, cause }),
       ),
       Effect.andThen(
-        Ref.modify(titlesRunning, (all): [WriterFields | null, WritersRunning] => {
+        Ref.modify(titlesRunning, (all): [WriterAsk | null, WritersRunning] => {
           const next = all.get(cardId) ?? null;
           if (next !== null) return [next, new Map(all).set(cardId, null)];
           const rest = new Map(all);
@@ -1742,34 +1758,48 @@ const make = Effect.gen(function* () {
           return [null, rest];
         }),
       ),
-      Effect.flatMap((next) => (next === null ? Effect.void : writerRuns(cardId, next))),
+      Effect.flatMap((next) =>
+        next === null ? Effect.void : writerRuns(cardId, next.fields, next.asked),
+      ),
     );
   // At most one writer per card. A later ask (an edited prompt) waits for it, and the newest
   // ask's fields win: each reflects what the owner had written by then.
   // The claim and the fork are one step, so an interrupt cannot leave a claim with no writer;
   // the writer itself stays interruptible, so closing the scope still kills its CLI child.
   const forkWriter = (cardId: KanbanCard["id"], fields: WriterFields) =>
-    Effect.uninterruptibleMask((restore) =>
-      Ref.modify(titlesRunning, (all): [boolean, WritersRunning] => [
-        !all.has(cardId),
-        new Map(all).set(cardId, all.has(cardId) ? fields : null),
-      ]).pipe(
-        Effect.flatMap((start) =>
-          start
-            ? restore(writerRuns(cardId, fields)).pipe(
-                Effect.onInterrupt(() =>
-                  Ref.update(titlesRunning, (all) => {
-                    const rest = new Map(all);
-                    rest.delete(cardId);
-                    return rest;
-                  }),
-                ),
-                Effect.forkIn(scope),
-              )
-            : Effect.void,
-        ),
+    cardOf(cardId).pipe(
+      Effect.flatMap((card) => {
+        const ask: WriterAsk = {
+          fields,
+          asked: { title: card.title, description: card.description },
+        };
+        return Effect.uninterruptibleMask((restore) =>
+          Ref.modify(titlesRunning, (all): [boolean, WritersRunning] => [
+            !all.has(cardId),
+            new Map(all).set(cardId, all.has(cardId) ? ask : null),
+          ]).pipe(
+            Effect.flatMap((start) =>
+              start
+                ? restore(writerRuns(cardId, fields, ask.asked)).pipe(
+                    Effect.onInterrupt(() =>
+                      Ref.update(titlesRunning, (all) => {
+                        const rest = new Map(all);
+                        rest.delete(cardId);
+                        return rest;
+                      }),
+                    ),
+                    Effect.forkIn(scope),
+                  )
+                : Effect.void,
+            ),
+          ),
+        );
+      }),
+      Effect.catch((error) =>
+        Effect.logWarning("kanban title writer failed", { cardId, cause: error }),
       ),
-    ).pipe(Effect.asVoid);
+      Effect.asVoid,
+    );
 
   // The scribe regroups a board's open cards with the board's cheap model. Groups are
   // view-only, but card_next offers same-group cards, so they batch similar work.
@@ -1832,9 +1862,10 @@ const make = Effect.gen(function* () {
     // Cards that finish during the call wait for the next pass: the Story cutoff is the
     // time this snapshot was read, not the time the write lands.
     const snapshotMs = yield* nowMillis;
+    const snapshotGoals = yield* store.goals(boardId);
     const output = yield* generateJson({
       cwd: project.value.workspaceRoot,
-      prompt: Scribe.goalsPrompt(yield* store.cards(boardId), yield* store.goals(boardId)),
+      prompt: Scribe.goalsPrompt(yield* store.cards(boardId), snapshotGoals),
       outputSchema: Scribe.ScribeGoalsOutput,
       modelSelection: board.managerModel,
       timeoutMs: Scribe.BOARD_TEXT_HANG_GUARD_MS,
@@ -1860,8 +1891,12 @@ const make = Effect.gen(function* () {
         for (const update of updates.goals) {
           const goal = goals.find((entry) => entry.id === update.id);
           if (!goal) continue;
+          // A Now written while the call ran is newer than the answer, however long it took.
+          const was = snapshotGoals.find((entry) => entry.id === goal.id)?.now ?? null;
           const keepNow =
             update.now === "" ||
+            was?.at !== goal.now?.at ||
+            was?.text !== goal.now?.text ||
             (goal.now !== null && nowMs - Date.parse(goal.now.at) < SCRIBE_KEEPS_NOW_MS);
           if (keepNow && update.now !== "") held = true;
           if (keepNow && update.story === null) continue;
