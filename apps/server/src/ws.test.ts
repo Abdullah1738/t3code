@@ -106,6 +106,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { readSpeedups, ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
@@ -684,6 +685,65 @@ it.live.each([false, true])(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.live("background sweep scans stay off a held writer unless switched back", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-sweep-reader-" });
+    yield* Effect.gen(function* () {
+      const fixture = yield* fileReplayFixture;
+      const sweeps = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return {
+          pullRequests: yield* store.getThreadsWithPullRequests(),
+          limits: yield* store.getLimitRecoveryCandidates({
+            now: fixture.now,
+            autoResume: true,
+            snooze: false,
+          }),
+        };
+      });
+      // A store built with ROBOB_SWEEP_READS_ON_WRITER=1, on the same database.
+      const onWriter = sweeps.pipe(
+        Effect.provide(
+          // Fresh: the fixture already built this layer with the default switches.
+          Layer.fresh(ProjectionStore.layer).pipe(
+            Layer.provide(
+              Layer.succeed(Switches, {
+                ...readSpeedups({}),
+                sweepReadsOffWriter: false,
+              }),
+            ),
+          ),
+        ),
+      );
+      const baseline = yield* sweeps;
+      assert.deepEqual(yield* onWriter, baseline);
+
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* fixture.sql
+        .withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(held);
+      const offWriter = yield* sweeps.pipe(
+        Effect.timeout("10 seconds"),
+        Effect.onError(() => Deferred.succeed(release, undefined)),
+      );
+      assert.deepEqual(offWriter, baseline);
+      // The old placement queues behind the writer's transaction.
+      const blocked = yield* onWriter.pipe(Effect.forkScoped);
+      yield* Effect.sleep("300 millis");
+      assert.isUndefined(blocked.pollUnsafe());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writer);
+      assert.deepEqual(yield* Fiber.join(blocked), baseline);
+    }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live(
   "replays shell changes and reads initial, archive and enrichment while a writer is held",
   () =>
@@ -751,6 +811,7 @@ it.live(
                 ),
               ),
         });
+        const legacyLimits = { replayMaxGap: 1_000, changesMaxGap: 1_000, maxThreads: 2_000 };
         const [firstOverBudget] = yield* subscribeOrchestrationV2Shell({
           ...input,
           omitIdleSubagents: true,
@@ -758,8 +819,54 @@ it.live(
           Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
           Effect.scoped,
           Effect.provide(Layer.mergeAll(fixture.services, overBudgetAtCursor)),
+          Effect.provideService(ShellResumeLimits, legacyLimits),
         );
         assert.equal(firstOverBudget?.kind, "snapshot");
+        // ardud: a range replay refuses (too many events, or bodies over budget) catches up
+        // from the list of changed threads and project events: the same rows, no bodies read.
+        const resume = (
+          resumeInput: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+          limits: typeof legacyLimits,
+          store?: Layer.Layer<OrchestrationEventStore.OrchestrationEventStore>,
+        ) =>
+          subscribeOrchestrationV2Shell(resumeInput).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(
+              store === undefined ? fixture.services : Layer.mergeAll(fixture.services, store),
+            ),
+            Effect.provideService(ShellResumeLimits, limits),
+          );
+        const noBodies = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          readApplicationEvents: () => Stream.die("a changes resume must not read event bodies"),
+        });
+        const changeLimits = { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, changeLimits, noBodies), baseline);
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, noBodies),
+          optedIn,
+        );
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, overBudgetAtCursor),
+          optedIn,
+        );
+        // Past the changes gap, over the thread cap, or with the switch at the legacy limit,
+        // the client still gets the whole list.
+        for (const limits of [
+          { replayMaxGap: 0, changesMaxGap: 1, maxThreads: 2_000 },
+          { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 0 },
+          { replayMaxGap: 0, changesMaxGap: 0, maxThreads: 2_000 },
+        ]) {
+          const [first] = yield* resume(input, limits);
+          assert.equal(first?.kind, "snapshot");
+        }
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const writer = yield* fixture.sql

@@ -146,6 +146,7 @@ import {
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   skipUnchangedThreadShells,
+  shellChangeEvents,
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
@@ -171,6 +172,7 @@ import {
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
+import { ShellResumeLimits } from "./ardud/perf/speedups.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
@@ -558,9 +560,10 @@ const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
 const ServerWsCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
 // ardud: missions board
 const ServerWsKanbanRpcGroup = WsKanbanRpcGroup.middleware(RpcInstrumentation);
-// Replaying each intervening event costs a shell refetch; past this gap a
-// single O(active-threads) snapshot is cheaper and bounded.
-const SHELL_RESUME_MAX_GAP = 1_000;
+// Replaying each intervening event reads and decodes its body; past
+// ShellResumeLimits.replayMaxGap the resume reads only which threads changed
+// (getShellChanges), and past changesMaxGap a single O(active-threads) snapshot
+// is cheaper.
 // Row count alone does not bound replay memory: a few events with large tool
 // payloads can decode to gigabytes. Before replaying, sum the serialized
 // payload bytes of the range in SQL and reset with a snapshot past this budget.
@@ -1192,28 +1195,57 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         input.omitIdleSubagents === true && input.afterSequence > 0
           ? input.afterSequence - 1
           : input.afterSequence;
-      if (
-        input.afterSequence > highWater ||
-        !(yield* canReplayPersistedRange(
-          replayAfter,
-          highWater,
-          SHELL_RESUME_MAX_GAP + (input.afterSequence - replayAfter),
-        ))
-      ) {
+      if (input.afterSequence > highWater) {
         return yield* snapshotThenLive();
+      }
+      const cursorRepeat = input.afterSequence - replayAfter;
+      const limits = yield* ShellResumeLimits;
+      let replayEvents: Stream.Stream<
+        ShellApplicationEvent,
+        OrchestrationEventStore.OrchestrationEventStoreError
+      >;
+      if (
+        yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat)
+      ) {
+        replayEvents = applicationEvents
+          .readApplicationEvents({
+            afterSequence: replayAfter,
+            throughSequence: highWater,
+            // A row a newer build wrote (e.g. after a downgrade) must not fail
+            // every shell resubscribe. The live tail below resumes from
+            // highWater, so a dropped row never hides later events.
+            skipUnknownEventTypes: true,
+          })
+          .pipe(Stream.map(toShellApplicationEvent));
+      } else {
+        // ardud: a busy server passes the replay gap in under a minute (about 18 event
+        // batches a second on 10 Nov 2026), so a client that had just spent minutes
+        // loading every shell page was sent every page again. The shell stream refetches
+        // each changed aggregate anyway; it only needs to know which ones changed.
+        // At the legacy limit the switch is off: every range replay refuses gets a snapshot.
+        const changes =
+          limits.changesMaxGap > limits.replayMaxGap &&
+          highWater - replayAfter <= limits.changesMaxGap + cursorRepeat
+            ? yield* applicationEvents.getShellChanges({
+                afterSequence: replayAfter,
+                throughSequence: highWater,
+                maxThreads: limits.maxThreads,
+              })
+            : undefined;
+        if (changes === undefined || !changes.complete) {
+          return yield* snapshotThenLive();
+        }
+        yield* Effect.annotateCurrentSpan({
+          "shell.resume": "changes",
+          "shell.resume.gap": highWater - replayAfter,
+          "shell.resume.threads": changes.threads.length,
+          "shell.resume.projects": changes.projects.length,
+        });
+        replayEvents = Stream.fromIterable(shellChangeEvents(changes));
       }
 
       const loaded = yield* loadProjectMetadataSnapshot(highWater);
-      const replay = toShellStream(
-        applicationEvents.readApplicationEvents({
-          afterSequence: replayAfter,
-          throughSequence: highWater,
-          // A row a newer build wrote (e.g. after a downgrade) must not fail
-          // every shell resubscribe. The live tail below resumes from
-          // highWater, so a dropped row never hides later events.
-          skipUnknownEventTypes: true,
-        }),
-      );
+      const replay = toShellStream(replayEvents);
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
         tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),
