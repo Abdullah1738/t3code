@@ -498,6 +498,7 @@ const fileReplayFixture = Effect.gen(function* () {
       ensureLegacyTranscript: (id) => importer.ensureTranscript(id).pipe(Effect.asVoid),
       streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
       getThreadShell: orchestrator.getThreadShell,
+      getShellSnapshot: orchestrator.getShellSnapshot,
       getThreadSnapshot: orchestrator.getThreadSnapshot,
       getThreadSnapshotWindow: orchestrator.getThreadSnapshotWindow,
       readShellSnapshot: orchestrator.readShellSnapshot,
@@ -540,6 +541,108 @@ const fileReplayFixture = Effect.gen(function* () {
     now,
   };
 });
+
+it.live(
+  "a shell resume reads its changed threads in one batch, with the items one read per thread gives",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-shell-batch-" });
+      yield* Effect.gen(function* () {
+        const fixture = yield* fileReplayFixture;
+        // After the cursor: the reader thread changed (fixture), a new thread appears and
+        // the archived thread changes too (the stream reports it as removed from the list).
+        const addedId = ThreadId.make("thread:ws-reader-added");
+        yield* fixture.orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${addedId}`),
+          threadId: addedId,
+          projectId: fixture.projectId,
+          title: "Added thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.1-codex" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const archivedThread = (yield* fixture.orchestrator.getThreadRecords(
+          fixture.archivedId,
+          [],
+        )).thread;
+        yield* fixture.sink.write({
+          events: [
+            {
+              id: EventId.make("ws-reader:archive-again"),
+              type: "thread.archived",
+              threadId: fixture.archivedId,
+              occurredAt: fixture.now,
+              payload: { ...archivedThread, archivedAt: fixture.now },
+            },
+          ],
+        });
+        const reads = { perThread: 0, batches: [] as Array<number> };
+        const counted = Layer.mock(ThreadManagement.ThreadManagementService)({
+          streamStoredEventsFrom: fixture.orchestrator.streamStoredEventsFrom,
+          readShellSnapshot: fixture.orchestrator.readShellSnapshot,
+          getThreadShell: (threadId) =>
+            Effect.suspend(() => {
+              reads.perThread++;
+              return fixture.orchestrator.getThreadShell(threadId);
+            }),
+          getShellSnapshot: (options) =>
+            Effect.suspend(() => {
+              reads.batches.push(options?.threadIds?.length ?? -1);
+              return fixture.orchestrator.getShellSnapshot(options);
+            }),
+        });
+        const resume = (batched: boolean) =>
+          subscribeOrchestrationV2Shell({
+            afterSequence: fixture.cursor,
+            requestCompletionMarker: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(Layer.mergeAll(fixture.services, counted)),
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellBatchedStreamReads: batched,
+            }),
+          );
+        const batched = yield* resume(true);
+        assert.deepEqual(reads, { perThread: 0, batches: [3] });
+        assert.deepEqual(
+          batched.map((item) => [
+            item.kind,
+            item.kind === "thread.updated"
+              ? item.thread.id
+              : item.kind === "thread.removed"
+                ? item.threadId
+                : null,
+          ]),
+          [
+            ["thread.updated", fixture.threadId],
+            ["project.updated", null],
+            ["thread.updated", addedId],
+            ["thread.removed", fixture.archivedId],
+            ["synchronized", null],
+          ],
+        );
+        reads.batches = [];
+        // ROBOB_SHELL_STREAM_BATCH_READS=0: one reader transaction per thread, same items.
+        assert.deepEqual(yield* resume(false), batched);
+        assert.deepEqual(reads, { perThread: 3, batches: [] });
+      }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.live("streams a synthetic large shell as bounded pages before synchronizing", () =>
   Effect.gen(function* () {

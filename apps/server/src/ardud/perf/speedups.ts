@@ -26,6 +26,8 @@
  *   as the first page of a paged thread list gets pages by thread id from the start.
  * - `ROBOB_SHELL_PAGE_REPLY_LANE=0`: pages of the paged thread list queue on the shared
  *   snapshot reply lane again, behind board snapshots and whole-list reads.
+ * - `ROBOB_SHELL_STREAM_BATCH_READS=0`: the thread-list stream reads each changed thread's
+ *   row in its own reader transaction again, instead of one read per batch of changes.
  * - `ROBOB_SHELL_KEEP_RESUMABLE=0`: clients are no longer told they may keep a complete
  *   thread list resumable across sessions and resubscribes; a session that ends before its
  *   "synchronized" marker makes the next one load every page again (the old client rule).
@@ -69,6 +71,7 @@ export interface Speedups {
   readonly ingestDedupeForeground: boolean;
   readonly shellResumeAcrossSessions: boolean;
   readonly shellPageReplyLane: boolean;
+  readonly shellBatchedStreamReads: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -88,6 +91,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   ingestDedupeForeground: text(env, "ROBOB_INGEST_DEDUPE_LANE")?.toLowerCase() !== "background",
   shellResumeAcrossSessions: !isOff(env, "ROBOB_SHELL_KEEP_RESUMABLE"),
   shellPageReplyLane: !isOff(env, "ROBOB_SHELL_PAGE_REPLY_LANE"),
+  shellBatchedStreamReads: !isOff(env, "ROBOB_SHELL_STREAM_BATCH_READS"),
 });
 
 /** Process-wide switches, read once at start. */

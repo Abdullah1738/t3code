@@ -89,6 +89,7 @@ import {
   PersistChatAttachmentsError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  type OrchestrationV2ThreadShell,
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -697,6 +698,11 @@ function readClientAnalyticsProps(request: HttpServerRequest.HttpServerRequest) 
   };
 }
 
+// ardud: a shell stream batch with at least this many changed threads reads their shells
+// together; a single thread keeps its one-row read. Chunked like the control live lists.
+const SHELL_STREAM_BATCH_READ_MIN_THREADS = 2;
+const SHELL_STREAM_BATCH_READ_CHUNK = 400;
+
 const canReplayPersistedRange = Effect.fnUntraced(function* (
   afterSequence: number,
   headSequence: number,
@@ -1072,17 +1078,48 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       });
     });
 
+    /** Shells of these threads, archived ones included, from one read per chunk of ids. */
+    const readThreadShells = Effect.fn("ws.orchestrationV2.readThreadShells")(function* (
+      threadIds: ReadonlyArray<ThreadId>,
+    ) {
+      const shells = new Map<ThreadId, OrchestrationV2ThreadShell>();
+      for (let start = 0; start < threadIds.length; start += SHELL_STREAM_BATCH_READ_CHUNK) {
+        const snapshot = yield* threadManagement.getShellSnapshot({
+          threadIds: threadIds.slice(start, start + SHELL_STREAM_BATCH_READ_CHUNK),
+        });
+        for (const shell of snapshot.threads) shells.set(shell.id, shell);
+        for (const shell of snapshot.archivedThreads) shells.set(shell.id, shell);
+      }
+      return shells;
+    });
+
     const projectShellItems = Effect.fn("ws.orchestrationV2.projectShellItems")(function* (
       events: ReadonlyArray<ShellApplicationEvent>,
     ) {
+      const coalesced = coalesceShellApplicationEvents(events);
+      // ardud: one read for the batch's changed threads instead of a reader transaction
+      // per thread. A resume replays hundreds of threads; on a busy server each
+      // transaction queued for a reader slot (a 125-thread catch-up took 16.7 s and a
+      // 450-event foreground resume 12-28 s under a loaded reader pool, 10 Nov 2026).
+      const changedThreadIds = coalesced.flatMap((stored) =>
+        "aggregateKind" in stored ? [] : [stored.event.threadId],
+      );
+      const batchedShells =
+        (yield* Switches).shellBatchedStreamReads &&
+        changedThreadIds.length >= SHELL_STREAM_BATCH_READ_MIN_THREADS
+          ? yield* readThreadShells(changedThreadIds)
+          : undefined;
       const items = yield* Effect.forEach(
-        coalesceShellApplicationEvents(events),
+        coalesced,
         (stored) =>
           Effect.gen(function* () {
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const shell = yield* threadManagement.getThreadShell(stored.event.threadId);
+            const shell =
+              batchedShells === undefined
+                ? yield* threadManagement.getThreadShell(stored.event.threadId)
+                : (batchedShells.get(stored.event.threadId) ?? null);
             return shellStreamItemFromThreadShell({ stored, shell });
           }),
         { concurrency: 8 },
@@ -1864,7 +1901,9 @@ export const layerWsRpc = (
           settings,
           shellResumeCompletionMarker: true,
           shellSnapshotPagination: true,
-          ...((yield* Switches).shellResumeAcrossSessions ? { shellResumeAcrossSessions: true } : {}),
+          ...((yield* Switches).shellResumeAcrossSessions
+            ? { shellResumeAcrossSessions: true }
+            : {}),
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
           threadFind: true,
