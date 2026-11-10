@@ -1045,7 +1045,10 @@ const make = Effect.gen(function* () {
     },
     Effect.mapError(
       (error) =>
-        new KanbanThreadError({ operation: "interrupt", detail: `stop not saved: ${error.message}` }),
+        new KanbanThreadError({
+          operation: "interrupt",
+          detail: `stop not saved: ${error.message}`,
+        }),
     ),
   );
   /**
@@ -2828,55 +2831,57 @@ const make = Effect.gen(function* () {
         )
       : Effect.void;
   /** Fails when its note or launch fails; a saved follow-on retries on that. */
-  const evaluatorTurnStrict = Effect.fn("KanbanService.evaluatorTurn")(
-    function* (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) {
-      const turn = stepTurn;
-      const now = turn(after);
-      if (now === null) return;
-      if (before !== null && now === turn(before)) return;
-      if (actor._tag === "evaluator") {
-        // An evaluator's change never starts an evaluator: one is already on the card.
-        if (before === null || after.discussionId === null) return;
-        // Part of a step its evaluator already heard about got done: nothing new.
-        const told =
-          turn(before) === null
-            ? null
-            : new Set(kanbanStepSubtasks(before, "evaluator").map((subtask) => subtask.id));
-        if (
-          told !== null &&
-          kanbanStepSubtasks(after, "evaluator").every((subtask) => told.has(subtask.id))
-        ) {
-          return;
-        }
-        const discussion = yield* store.discussion(after.discussionId);
-        const own = discussion?.evaluatorThreadId ?? null;
-        if (discussion === null || own === null || own === actor.threadId) return;
-        if (!(yield* liveEvaluator(own))) return;
-        yield* toEvaluator(
-          discussion,
-          Briefs.evaluatorStepFromOtherText(after, actor.threadId),
-          true,
-        );
+  const evaluatorTurnStrict = Effect.fn("KanbanService.evaluatorTurn")(function* (
+    before: KanbanCard | null,
+    after: KanbanCard,
+    actor: KanbanActor,
+  ) {
+    const turn = stepTurn;
+    const now = turn(after);
+    if (now === null) return;
+    if (before !== null && now === turn(before)) return;
+    if (actor._tag === "evaluator") {
+      // An evaluator's change never starts an evaluator: one is already on the card.
+      if (before === null || after.discussionId === null) return;
+      // Part of a step its evaluator already heard about got done: nothing new.
+      const told =
+        turn(before) === null
+          ? null
+          : new Set(kanbanStepSubtasks(before, "evaluator").map((subtask) => subtask.id));
+      if (
+        told !== null &&
+        kanbanStepSubtasks(after, "evaluator").every((subtask) => told.has(subtask.id))
+      ) {
         return;
       }
-      const text = Briefs.evaluatorStepText(after);
-      if (before === null) {
-        // New cards share one packets evaluator, so a script making twenty
-        // cards starts one thread, not twenty.
-        const open = yield* store.threadLinks({ boardId: after.boardId, open: true });
-        for (const link of open.toReversed()) {
-          if (link.role !== "evaluator" || link.purpose !== "packets") continue;
-          if (!(yield* liveEvaluator(link.threadId))) continue;
-          yield* threads.send({ threadId: link.threadId, text });
-          return;
-        }
-        yield* startEvaluatorUnlocked(yield* boardOf(after.boardId), { kind: "packets" }, { text });
+      const discussion = yield* store.discussion(after.discussionId);
+      const own = discussion?.evaluatorThreadId ?? null;
+      if (discussion === null || own === null || own === actor.threadId) return;
+      if (!(yield* liveEvaluator(own))) return;
+      yield* toEvaluator(
+        discussion,
+        Briefs.evaluatorStepFromOtherText(after, actor.threadId),
+        true,
+      );
+      return;
+    }
+    const text = Briefs.evaluatorStepText(after);
+    if (before === null) {
+      // New cards share one packets evaluator, so a script making twenty
+      // cards starts one thread, not twenty.
+      const open = yield* store.threadLinks({ boardId: after.boardId, open: true });
+      for (const link of open.toReversed()) {
+        if (link.role !== "evaluator" || link.purpose !== "packets") continue;
+        if (!(yield* liveEvaluator(link.threadId))) continue;
+        yield* threads.send({ threadId: link.threadId, text });
         return;
       }
-      const discussion = yield* cardDiscussionUnlocked(after.id);
-      yield* toEvaluator(discussion, text, true);
-    },
-  );
+      yield* startEvaluatorUnlocked(yield* boardOf(after.boardId), { kind: "packets" }, { text });
+      return;
+    }
+    const discussion = yield* cardDiscussionUnlocked(after.id);
+    yield* toEvaluator(discussion, text, true);
+  });
   const evaluatorTurn = (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) =>
     evaluatorTurnStrict(before, after, actor).pipe(
       Effect.catchCause((cause) =>
@@ -7278,16 +7283,14 @@ const make = Effect.gen(function* () {
             saved.boardId,
             cardLane(saved),
             { kind: "setModel", threadId: saved.activeThreadId, model: saved.model },
-            threads
-              .setModel(saved.activeThreadId, saved.model)
-              .pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("kanban thread model switch failed", {
-                    cardId: saved.id,
-                    cause,
-                  }),
-                ),
+            threads.setModel(saved.activeThreadId, saved.model).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("kanban thread model switch failed", {
+                  cardId: saved.id,
+                  cause,
+                }),
               ),
+            ),
           );
         }
         yield* kick;
