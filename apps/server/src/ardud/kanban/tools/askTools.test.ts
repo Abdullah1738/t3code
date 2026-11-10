@@ -422,6 +422,20 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.isTrue(stale.isError);
     assert.include(stale.text, "revision 0, you answered revision 3");
     assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+    // Words alone decide nothing on an approval, from an evaluator as from the owner.
+    const inWords = yield* call(boardEvaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "answered",
+      text: "Looks fine to me.",
+      revision: 0,
+    });
+    assert.isTrue(inWords.isError);
+    assert.include(
+      inWords.text,
+      "q1 on card #1 can't be answered in words alone: it takes approved or rejected.",
+    );
+    assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
     const decided = yield* call(boardEvaluator, "card_ask_answer", {
       card: card.id,
       ask: "q1",

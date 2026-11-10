@@ -2,7 +2,9 @@
 import {
   KANBAN_ASK_ANSWER_FIELD,
   KANBAN_ASK_SECRET_PROVIDED,
+  KANBAN_ASK_WORDS_REFUSED,
   kanbanAskIsFreeText,
+  kanbanResponseTakesWords,
   KANBAN_ASK_FIELD_TYPES,
   kanbanAskChanges,
   kanbanAskExpired,
@@ -1570,7 +1572,8 @@ export const verdictsFor = (response: KanbanAskResponse): ReadonlyArray<OwnerVer
   ...(response.verdict ? (["approved", "rejected"] as const) : []),
   ...(response.choose ? (["picked"] as const) : []),
   ...(response.task ? (["done", "cant"] as const) : []),
-  ...(response.ack ? (["acknowledged"] as const) : (["answered"] as const)),
+  ...(response.ack ? (["acknowledged"] as const) : []),
+  ...(kanbanResponseTakesWords(response) ? (["answered"] as const) : []),
 ];
 
 /**
@@ -1698,6 +1701,12 @@ export const answerFor = (
     }
   }
   const takes = verdictsFor(response);
+  // Words are not a verdict or a pick: said on the ask, they keep it open instead.
+  if (verdict === "answered" && !response.ack && !kanbanResponseTakesWords(response)) {
+    return invalid(
+      `${ref} ${KANBAN_ASK_WORDS_REFUSED}: it takes ${takes.join(" or ")}. To say something about it without deciding, reply on the ask instead: it stays open.`,
+    );
+  }
   if (!(takes as ReadonlyArray<string>).includes(verdict)) {
     return invalid(`${ref} takes ${takes.join(", ")} (got "${verdict}")`);
   }
@@ -1723,9 +1732,7 @@ export const answerFor = (
     if (ids.length > max) {
       return invalid(max === 1 ? `${ref} takes one option` : `${ref} takes at most ${max} options`);
     }
-    // His own words instead of a pick stay possible, as in the card discussion.
-    const inWords = verdict === "answered" && ids.length === 0;
-    if (!refusal && !inWords && ids.length < min) {
+    if (!refusal && ids.length < min) {
       return invalid(`${ref} takes at least ${min} option${min === 1 ? "" : "s"}`);
     }
   }
@@ -2047,6 +2054,16 @@ const askInFull = (ask: KanbanOwnerAsk) => {
     .join("\n\n");
 };
 
+/** What his words on an ask are not, when it needs more than words. */
+const notAnAnswer = (ask: KanbanOwnerAsk) => {
+  const response = kanbanAskResponse(ask);
+  return response.verdict !== null
+    ? " It is not an approval or a rejection."
+    : response.choose !== null && response.choose.min >= 1
+      ? " It is not a pick."
+      : "";
+};
+
 /**
  * The owner replied on an ask without answering it. `passedOn` is for the
  * evaluator that gets it when the asker can't hear it (a parked or ended
@@ -2064,7 +2081,7 @@ export const clarifyText = (
       ? "The thread that asked it can't hear this (it is parked or has moved on), so it is yours to handle."
       : null,
     `His message:\n${ownerText}`,
-    `Reply to him with discussion_post (card #${card.number}, ask "${ask.id}"): that keeps the ask open and gives him the turn back. If the question, context or options were unclear or wrong, fix the ask itself with card_ask_change (ask "${ask.id}", the fields to change, revisionNote saying what changed) instead of only explaining. Don't treat his message as the answer.`,
+    `Reply to him with discussion_post (card #${card.number}, ask "${ask.id}"): that keeps the ask open and gives him the turn back. If the question, context or options were unclear or wrong, fix the ask itself with card_ask_change (ask "${ask.id}", the fields to change, revisionNote saying what changed) instead of only explaining. Don't treat his message as the answer.${notAnAnswer(ask)}`,
     passedOn ? askInFull(ask) : null,
   ]
     .filter((entry) => entry !== null)

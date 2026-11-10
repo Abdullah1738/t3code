@@ -11,6 +11,7 @@ import {
   kanbanAskExpired,
   kanbanAskIsFreeText,
   kanbanAskRevision,
+  kanbanAskTakesWords,
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
@@ -8535,7 +8536,13 @@ const make = Effect.gen(function* () {
     );
 
   const replyOnAsk: KanbanServiceShape["replyOnAsk"] = (cardId, askId, actor, blocks, role) =>
-    guardDeferred(
+    guardDeferred(replyOnAskUnlocked(cardId, askId, actor, blocks, role));
+  /** A reply on an ask: from its route or tool, or his words typed on its pick block. */
+  const replyOnAskUnlocked = (
+    ...[cardId, askId, actor, blocks, role]: Parameters<KanbanServiceShape["replyOnAsk"]>
+  ) =>
+    // Suspended only to keep the body where it was: it is `replyOnAsk` as before.
+    Effect.suspend(() =>
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
@@ -9979,19 +9986,35 @@ const make = Effect.gen(function* () {
             if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {
               return answerChoice(discussionId, seq, blockId, choice, by, text);
             }
+            const words = (text ?? "").trim();
+            const message = store
+              .message(discussionId, seq)
+              .pipe(
+                Effect.flatMap((found) =>
+                  found ? Effect.succeed(found) : failWith("not-found", `message ${seq}`),
+                ),
+              );
+            // Words with no pick, on an ask that needs a verdict or a pick: they are a reply
+            // on the ask. It stays open and its asker is told they decided nothing.
+            if (choice.length === 0 && words !== "" && !kanbanAskTakesWords(pick.ask)) {
+              return guardDeferred(
+                replyOnAskUnlocked(
+                  pick.card.id,
+                  pick.ask.id,
+                  by,
+                  [{ _tag: "md", text: words }],
+                  "owner",
+                ).pipe(Effect.andThen(message)),
+              );
+            }
             // Anything else is answered as the ask's own answer route would, checks included.
             return guardDeferred(
               answerAskUnlocked(
                 pick.card.id,
                 pick.ask.id,
-                Asks.pickAnswer(pick.ask, choice, (text ?? "").trim()),
+                Asks.pickAnswer(pick.ask, choice, words),
                 by,
-              ).pipe(
-                Effect.andThen(store.message(discussionId, seq)),
-                Effect.flatMap((message) =>
-                  message ? Effect.succeed(message) : failWith("not-found", `message ${seq}`),
-                ),
-              ),
+              ).pipe(Effect.andThen(message)),
             );
           }),
         );

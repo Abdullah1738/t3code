@@ -5786,7 +5786,7 @@ it.effect("a multi ask posts a tick-several pick and wakes the card with every p
   }),
 );
 
-it.effect("a blocked ask answered in his own words wakes the card with them", () =>
+it.effect("his own words on a blocked pick keep it open, and a pick then wakes the card", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -5803,8 +5803,9 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
       );
       yield* kanban.changeAsk(card.id, "q1", "block", owner, "owner");
 
+      // Words are not a pick: they are a reply on the ask, which still holds the card.
       const talk = yield* kanban.cardDiscussion(card.id);
-      const answered = yield* kanban.answer(
+      const shown = yield* kanban.answer(
         talk.id,
         asked.asks[0]!.seq!,
         "q1",
@@ -5812,9 +5813,13 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
         owner,
         "Wait for Monday",
       );
-      const ownAnswer = answered.answers.find((entry) => entry.by._tag === "owner");
-      assert.deepStrictEqual(ownAnswer?.choice, []);
-      assert.strictEqual(ownAnswer?.text, "Wait for Monday");
+      assert.deepStrictEqual(shown.answers, []);
+      const held = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(held.stage, "needs_owner");
+      assert.isNull(held.asks[0]!.closedAt);
+      assert.isDefined(held.asks[0]!.clarifyAskedAt);
+
+      yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", ["o2"], owner, "Wait for Monday");
       const woken = (yield* kanban.card(card.id)).card;
       assert.strictEqual(woken.stage, "todo");
       assert.include(woken.wakeNote ?? "", "Wait for Monday");
@@ -5823,7 +5828,7 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
   }),
 );
 
-it.effect("an async ask answered in his own words reaches the working thread", () =>
+it.effect("his own words on an async pick reach the working thread as a reply", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -5839,13 +5844,18 @@ it.effect("an async ask answered in his own words reaches the working thread", (
         "cardThread",
       );
 
+      // The thread that asked is working, so it hears his words itself, once, as a reply
+      // that decided nothing.
       const talk = yield* kanban.cardDiscussion(card.id);
       yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", [], owner, "Use 2%");
       const after = (yield* kanban.card(card.id)).card;
       assert.strictEqual(after.stage, "working");
-      assert.isNotNull(after.asks[0]!.closedAt);
+      assert.isNull(after.asks[0]!.closedAt);
       const sent = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
-      assert.strictEqual(sent.filter((message) => message.includes("Use 2%")).length, 1);
+      const heard = sent.filter((message) => message.includes("Use 2%"));
+      assert.strictEqual(heard.length, 1);
+      assert.include(heard[0]!, "without answering it");
+      assert.include(heard[0]!, "It is not a pick.");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
