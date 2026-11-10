@@ -815,6 +815,80 @@ class FactScopeTests(unittest.TestCase):
                 for trigger in ('first_prompt', 'compaction'):
                     self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
 
+    def test_temporal_main_clauses_require_positive_directive_intent(self):
+        from recall_fact_scope import comparison_text, standing_instruction
+        changed = 'Approve deployment and rollout, retry failed checks for PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        reports = ('deployment succeeded', 'deployment succeeds', 'deployment has succeeded',
+                   'deployment is green', 'rollout completed', 'rollout completes',
+                   'rollout has completed', 'rollout is complete', 'deployment for PR1145 succeeded',
+                   'no runs passed', 'no CI checks passed', 'no deployment succeeded',
+                   'no deployment succeeds', 'no deployment has succeeded', 'no rollout completed',
+                   'no rollout completes', 'no rollout is complete')
+        commands = ('deploy PR1145', 'verify results', 'deploy changes', 'approve deployment',
+                    'retry failed checks', 'hold the merge', 'stop', 'please approve PR1145',
+                    'must approve PR1145', 'should retry PR1145', 'never bypass verification',
+                    'always verify CI', "don't merge PR1145", 'only claim verified results',
+                    'need to verify CI', 'have to verify CI', 'make sure CI passed',
+                    'remember to check CI', 'no approval for PR1145',
+                    'please no approval for PR1145')
+        for prefix in ('After', 'When', 'Once', 'If', 'Until', 'Unless'):
+            for anchor in ('', ' for PR1145 head 66cfd86f'):
+                for clause in reports + commands:
+                    fact = f'{prefix} CI passed{anchor}, {clause}.'
+                    instruction = clause in commands
+                    with self.subTest(prefix=prefix, anchor=anchor, clause=clause):
+                        self.assertEqual(instruction, standing_instruction(fact))
+                        self.assertEqual(fact if instruction else '', comparison_text(fact, changed))
+                        self.assertEqual(fact if anchor or instruction else '', comparison_text(fact, matching))
+        for i, clause in enumerate(('deployment succeeded', 'rollout completed', 'deployment succeeds',
+                                   'deployment for PR1145 succeeded', 'approve deployment', 'retry failed checks',
+                                   'no approval for PR1145', 'please no approval for PR1145',
+                                   'no deployment succeeded', 'no rollout completed')):
+            for anchored in (False, True):
+                anchor = ' for PR1145 head 66cfd86f' if anchored else ''
+                fact = f'After CI passed{anchor}, {clause}.'
+                instruction = clause in commands
+                index = RuleIndex(self.root / f'main-clause-{i}-{anchored}.db')
+                index.remember(fact, scope=CWD)
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    rules, result = preflight('t3_thread_send', {'message': changed}, CWD, index.path)
+                    self.assertEqual([fact] if instruction else [], [r['text'] for r in rules])
+                    self.assertEqual('deny' if instruction else None, result['decision'] if result else None)
+                    self.assertEqual(instruction, model.called)
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([fact] if instruction else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0]])
+
+    def test_linked_ci_labels_keep_original_identities(self):
+        from recall_fact_scope import comparison_text, ci_ids
+        changed = 'PR1145 head 72a10c19 CI checks pending.'
+        matching = 'PR1145 head 66cfd86f CI checks failed.'
+        labels = ('PR1145', 'PR #1145', 'pull request #1145', '**PR1145**', '`PR1145`')
+        for i, label in enumerate(labels):
+            fact = f'[{label}](https://github.com/org/repo/pull/1145) head 66cfd86f is green.'
+            with self.subTest(label=label):
+                self.assertEqual('', comparison_text(fact, changed))
+                self.assertEqual(fact, comparison_text(fact, matching))
+                index = RuleIndex(self.root / f'linked-label-{i}.db')
+                index.remember(fact, scope=CWD)
+                with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                    self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+                    model.assert_not_called()
+                    self.assertEqual('deny', preflight('t3_thread_send', {'message': matching}, CWD, index.path)[1]['decision'])
+                engine = CheckEngine(rules_path=index.path)
+                for trigger in ('first_prompt', 'compaction'):
+                    self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+                    self.assertEqual([fact], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
+        for target, extra in (('https://github.com/org/repo/pull/289', ' PR289'),
+                              ('https://github.com/org/repo/commit/72a10c19', ' head 72a10c19'),
+                              ('https://github.com/org/repo/actions/runs/42819961468', ' run 42819961468')):
+            fact = f'[PR1145]({target}) head 66cfd86f is green.'
+            with self.subTest(target=target):
+                self.assertEqual('', comparison_text(fact, matching))
+                self.assertEqual(fact, comparison_text(fact, matching + extra))
+                self.assertEqual(ci_ids(f'PR1145 {target} head 66cfd86f'), ci_ids(fact))
+
     def test_markdown_ci_outcomes_keep_strict_identity_matching(self):
         from recall_fact_scope import comparison_text
         wrappers = (('', ''), ('`', '`'), ('``', '``'), ('**', '**'), ('__', '__'),

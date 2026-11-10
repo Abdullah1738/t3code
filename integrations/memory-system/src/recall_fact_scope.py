@@ -2,6 +2,8 @@
 import re
 import hashlib
 import json
+from functools import lru_cache
+from pathlib import Path
 
 
 _AUTOMATION = (
@@ -62,7 +64,9 @@ def durable(text):
 
 
 def ci_ids(text):
-    text = presentation_text(text)
+    # Link destinations can carry additional PR/head/run identities. Only strip
+    # inline formatting here; outcome recognition uses the displayed label.
+    text = inline_text(text)
     return (
         set(re.findall(r"(?:\b(?:PR|pull request)\s*[:=#-]?\s*|/pull/)(\d+)", text, re.I)),
         {s.lower() for s in re.findall(r"\b[0-9a-f]{7,40}\b", text, re.I) if not s.isdigit()},
@@ -75,9 +79,7 @@ _CI_STATES = (r"success(?:ful(?:ly)?)?|succeed(?:ed|s)?|pass(?:ed|ing)?|fail(?:e
               r"neutral|completed|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
 
 
-def presentation_text(text):
-    # Strip paired inline code/emphasis before recognition and identifier
-    # extraction; keep the original fact text and compare every extracted ID.
+def inline_text(text):
     for _ in range(4):
         plain = re.sub(r"(`+)([^`\n]+)\1", r"\2", text)
         plain = re.sub(r"(?<!\w)(\*\*|__|\*|_)(?=\S)(.+?)(?<=\S)\1(?!\w)", r"\2", plain)
@@ -85,6 +87,10 @@ def presentation_text(text):
             break
         text = plain
     return text
+
+
+def presentation_text(text):
+    return inline_text(re.sub(r"\[([^\]\n]+)\]\([^\n)]+\)", r"\1", text))
 
 
 def describes_result(text):
@@ -107,15 +113,62 @@ def describes_result(text):
         r"yesterday|previously|already|has|had|have|was|were|is|are|did)\b)", text, re.I))
 
 
-_MODAL = r"(?:always|never|don't|do not|only|must not|should not|cannot|can't)"
+_MODAL = (r"(?:always|never|don't|do not|only|must(?: not)?|should(?: not)?|cannot|can't|"
+          r"need to|have to|make sure|remember to)")
+
+
+@lru_cache(maxsize=1)
+def base_verbs():
+    return frozenset(w for w in Path(__file__).with_name('english_verbs.txt').read_text().splitlines()
+                     if w and not w.startswith('#'))
+
+
+def base_verb(word):
+    word = word.casefold()
+    return word in base_verbs() or word.startswith('re') and word[2:] in base_verbs()
+
+
+def nominal_instruction(text):
+    if not text or describes_result(text):
+        return False
+    words = re.findall(r"[a-z]+", text.casefold())
+    # A prohibition's nominal object has no finite predicate. Recognize
+    # inflections through the same lexicon instead of enumerating noun subjects.
+    for word in words[1:]:
+        if word in {'for', 'unless', 'until', 'before', 'after', 'without', 'while'}:
+            break
+        if word in {'is', 'are', 'was', 'were', 'has', 'have', 'had', 'does', 'did'}:
+            return False
+        if word.endswith(('s', 'ed')):
+            stems = [word[:-1], word[:-2], word[:-3] + 'y', word[:-1] + 'e']
+            if any(stem in base_verbs() for stem in stems):
+                return False
+    return True
 
 
 def directive_clause(text):
+    prefix = re.sub(r"^\s*(?:\[Abdullah\]\s*|(?:please|actually)[,:]?\s+)", "",
+                    directive_prefix(text), flags=re.I).strip()
+    if re.match(r"No\s+", prefix, re.I):
+        nominal = re.sub(r"^No\s+", "", prefix, flags=re.I)
+        return nominal_instruction(nominal)
     text = directive_body(text).strip()
-    text = re.sub(r"^" + _MODAL + r"\s+", "", text, flags=re.I)
+    modal = re.match(_MODAL + r"\s+", text, re.I)
+    if modal:
+        text = text[modal.end():]
     if re.match(r"a revision\b[^\n]*new essay", text, re.I):
         return True
-    return bool(text) and not describes_result(text)
+    if modal and modal[0].strip().lower() == 'make sure':
+        return bool(text)
+    if not text or describes_result(text):
+        return False
+    head = re.match(r"[a-z]+\b", text, re.I)
+    if modal:
+        return bool(head and (modal[0].strip().lower() != 'only' or base_verb(head[0])))
+    # Use a fixed English lexicon for unmarked imperatives, not a growing
+    # list of command objects or report subjects. Explicit modals do not
+    # depend on vocabulary coverage; unknown non-CI facts still stay kept.
+    return bool(head and base_verb(head[0]))
 
 
 def conditional_instruction(text):
@@ -139,7 +192,10 @@ def standing_instruction(text):
         return True
     if re.search(r"\b(?:must|should|needs? to|required to)\s+(?:pass|succeed|be|run|finish|complete|remain|stay)\b", policy, re.I):
         return True
-    if negative or re.match(_MODAL + r"\s+", policy, re.I):
+    if negative:
+        nominal = re.sub(r"^No\s+", "", directive_body(policy), flags=re.I)
+        return nominal_instruction(nominal)
+    if re.match(_MODAL + r"\s+", policy, re.I):
         remainder = re.sub(r"^" + _MODAL + r"\s+", "", policy, flags=re.I)
         return conditional_instruction(remainder) or directive_clause(policy)
     return standing_formulation(presentation_text(text)) and directive_clause(policy)
