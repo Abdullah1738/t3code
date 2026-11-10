@@ -195,7 +195,9 @@ export const layerFromPaths = (dbPath: string, legacyPath: string) =>
             // Foreground (board/discussion views) and background (tick, dispatch,
             // sweeps) readers; each boards cache is capped, statev2 keeps its budget.
             ...readerLaneOptions(BOARDS_READER_LANES),
-            readerInitializationSql: [`PRAGMA cache_size = -${BOARDS_READER_LANES.foregroundCacheKiB}`],
+            readerInitializationSql: [
+              `PRAGMA cache_size = -${BOARDS_READER_LANES.foregroundCacheKiB}`,
+            ],
             checkpointWorker: true,
             beforeAcquire: Effect.flatMap(bypassReady, (bypass) =>
               bypass ? Effect.void : Deferred.await(ready),

@@ -16,9 +16,9 @@
  * - idle foreground: median idle-p95 ratio at most 1.25 per probe;
  * - no probe failures and no holder failures on either side.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import {
   BACKGROUND_PROBES,
   FOREGROUND_PROBES,
@@ -43,18 +43,28 @@ function bootstrapMedian(values: ReadonlyArray<number>, resamples = 10_000, seed
   };
   const medians: Array<number> = [];
   for (let r = 0; r < resamples; r++) {
-    const draw = Array.from({ length: values.length }, () => values[Math.floor(next() * values.length)]!);
+    const draw = Array.from(
+      { length: values.length },
+      () => values[Math.floor(next() * values.length)]!,
+    );
     medians.push(median(draw));
   }
   medians.sort((a, b) => a - b);
-  return { lo: medians[Math.floor(0.025 * resamples)]!, hi: medians[Math.floor(0.975 * resamples)]! };
+  return {
+    lo: medians[Math.floor(0.025 * resamples)]!,
+    hi: medians[Math.floor(0.975 * resamples)]!,
+  };
 }
 
-const p95 = (run: ReadsGateRun, phase: string, probe: string) => run.summary[phase]?.[probe]?.p95 ?? Number.NaN;
+const p95 = (run: ReadsGateRun, phase: string, probe: string) =>
+  run.summary[phase]?.[probe]?.p95 ?? Number.NaN;
 
 const resourceAt = (run: ReadsGateRun, at: string) => run.resources.find((r) => r.at === at);
 
-export function compare(pairs: ReadonlyArray<{ base: ReadsGateRun; candidate: ReadsGateRun }>, off: ReadonlyArray<ReadsGateRun>) {
+export function compare(
+  pairs: ReadonlyArray<{ base: ReadsGateRun; candidate: ReadsGateRun }>,
+  off: ReadonlyArray<ReadsGateRun>,
+) {
   const probes = [...FOREGROUND_PROBES, ...RESERVED_PROBES, ...BACKGROUND_PROBES];
   const table: Record<string, unknown> = {};
   const verdicts: Array<{ check: string; pass: boolean; detail: string }> = [];
@@ -89,13 +99,23 @@ export function compare(pairs: ReadonlyArray<{ base: ReadsGateRun; candidate: Re
         detail: `not applicable: base loaded p95 ${Math.round(loaded.baseMedianP95)} ms < 200 ms`,
       });
     const idle = row(`idle.${probe}`);
-    verdicts.push({ check: `idle.${probe}`, pass: idle.medianRatio <= 1.25, detail: `ratio ${idle.medianRatio.toFixed(3)}` });
+    verdicts.push({
+      check: `idle.${probe}`,
+      pass: idle.medianRatio <= 1.25,
+      detail: `ratio ${idle.medianRatio.toFixed(3)}`,
+    });
   }
   for (const probe of RESERVED_PROBES) {
     const loaded = row(`loaded.${probe}`);
-    verdicts.push({ check: `reserved.${probe}`, pass: loaded.medianRatio <= 1.25, detail: `ratio ${loaded.medianRatio.toFixed(3)}` });
+    verdicts.push({
+      check: `reserved.${probe}`,
+      pass: loaded.medianRatio <= 1.25,
+      detail: `ratio ${loaded.medianRatio.toFixed(3)}`,
+    });
   }
-  const holderRatios = pairs.map((p) => median(p.candidate.holders.loadedMs) / Math.max(median(p.base.holders.loadedMs), 1));
+  const holderRatios = pairs.map(
+    (p) => median(p.candidate.holders.loadedMs) / Math.max(median(p.base.holders.loadedMs), 1),
+  );
   table.holders = {
     baseMedianMs: median(pairs.map((p) => median(p.base.holders.loadedMs))),
     candidateMedianMs: median(pairs.map((p) => median(p.candidate.holders.loadedMs))),
@@ -105,18 +125,33 @@ export function compare(pairs: ReadonlyArray<{ base: ReadsGateRun; candidate: Re
     medianRatio: median(holderRatios),
     ci95: bootstrapMedian(holderRatios),
   };
-  verdicts.push({ check: "background.holder", pass: median(holderRatios) <= 1.25, detail: `ratio ${median(holderRatios).toFixed(3)}` });
-  const failures = pairs.flatMap((p) => [p.base, p.candidate]).reduce(
-    (n, r) => n + Object.values(r.failures).reduce((m, f) => m + f.length, 0) + r.holders.failures,
-    0,
-  );
-  verdicts.push({ check: "failures", pass: failures === 0, detail: `${failures} probe/holder failures` });
+  verdicts.push({
+    check: "background.holder",
+    pass: median(holderRatios) <= 1.25,
+    detail: `ratio ${median(holderRatios).toFixed(3)}`,
+  });
+  const failures = pairs
+    .flatMap((p) => [p.base, p.candidate])
+    .reduce(
+      (n, r) =>
+        n + Object.values(r.failures).reduce((m, f) => m + f.length, 0) + r.holders.failures,
+      0,
+    );
+  verdicts.push({
+    check: "failures",
+    pass: failures === 0,
+    detail: `${failures} probe/holder failures`,
+  });
   const resources = (side: "base" | "candidate") => {
     const pick = (at: string, key: "rssBytes" | "hwmBytes" | "threads") =>
       median(pairs.map((p) => resourceAt(p[side], at)?.[key] ?? Number.NaN));
     const io = (key: "readBytes" | "writeBytes") =>
       median(
-        pairs.map((p) => (resourceAt(p[side], "loaded-end")?.[key] ?? Number.NaN) - (resourceAt(p[side], "idle-end")?.[key] ?? Number.NaN)),
+        pairs.map(
+          (p) =>
+            (resourceAt(p[side], "loaded-end")?.[key] ?? Number.NaN) -
+            (resourceAt(p[side], "idle-end")?.[key] ?? Number.NaN),
+        ),
       );
     return {
       idleRssBytes: pick("idle-end", "rssBytes"),
@@ -128,27 +163,39 @@ export function compare(pairs: ReadonlyArray<{ base: ReadsGateRun; candidate: Re
     };
   };
   table.resources = { base: resources("base"), candidate: resources("candidate") };
-  return { table, verdicts, pass: verdicts.every((v) => v.pass), pairs: pairs.length, offRuns: off.length };
+  return {
+    table,
+    verdicts,
+    pass: verdicts.every((v) => v.pass),
+    pairs: pairs.length,
+    offRuns: off.length,
+  };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (import.meta.url === NodeURL.pathToFileURL(process.argv[1] ?? "").href) {
   const [fixture, baseEntry, candidateEntry, outDir, pairsArg, offArg] = process.argv.slice(2);
   if (!fixture || !baseEntry || !candidateEntry || !outDir || !pairsArg) {
-    console.error("usage: readsGatePairs.ts FIXTURE BASE_ENTRY CANDIDATE_ENTRY OUTDIR PAIRS [OFF_RUNS]");
+    console.error(
+      "usage: readsGatePairs.ts FIXTURE BASE_ENTRY CANDIDATE_ENTRY OUTDIR PAIRS [OFF_RUNS]",
+    );
     process.exit(2);
   }
-  const out = resolve(outDir);
-  if (existsSync(resolve(out, "comparison.json"))) throw new Error("Use a fresh output directory");
-  mkdirSync(resolve(out, "runs"), { recursive: true });
-  const attempt = (entry: unknown) => appendFileSync(resolve(out, "attempts.jsonl"), JSON.stringify(entry) + "\n");
+  const out = NodePath.resolve(outDir);
+  if (NodeFS.existsSync(NodePath.resolve(out, "comparison.json")))
+    throw new Error("Use a fresh output directory");
+  NodeFS.mkdirSync(NodePath.resolve(out, "runs"), { recursive: true });
+  const attempt = (entry: unknown) =>
+    NodeFS.appendFileSync(NodePath.resolve(out, "attempts.jsonl"), JSON.stringify(entry) + "\n");
   const runOne = async (side: string, entry: string, index: number, lanes: "default" | "off") => {
     const label = `${side}-${index}`;
     attempt({ label, status: "started", at: new Date().toISOString() });
     try {
       const run = await readsGate(fixture, label, entry, lanes);
-      writeFileSync(resolve(out, "runs", `${label}.json`), JSON.stringify(run));
+      NodeFS.writeFileSync(NodePath.resolve(out, "runs", `${label}.json`), JSON.stringify(run));
       attempt({ label, status: "completed", at: new Date().toISOString() });
-      console.log(`[${label}] loaded shell p95=${Math.round(run.summary.loaded?.shell?.p95 ?? -1)} holder=${Math.round(run.holders.idleMs)}`);
+      console.log(
+        `[${label}] loaded shell p95=${Math.round(run.summary.loaded?.shell?.p95 ?? -1)} holder=${Math.round(run.holders.idleMs)}`,
+      );
       return run;
     } catch (error) {
       attempt({ label, status: "failed", error: String(error), at: new Date().toISOString() });
@@ -168,10 +215,12 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     }
   }
   const off: Array<ReadsGateRun> = [];
-  for (let i = 0; i < Number(offArg ?? 0); i++) off.push(await runOne("candidate-off", candidateEntry, i, "off"));
+  for (let i = 0; i < Number(offArg ?? 0); i++)
+    off.push(await runOne("candidate-off", candidateEntry, i, "off"));
   const result = compare(pairs, off);
-  writeFileSync(resolve(out, "comparison.json"), JSON.stringify(result, null, 1));
-  for (const v of result.verdicts) console.log(`${v.pass ? "PASS" : "FAIL"} ${v.check}: ${v.detail}`);
+  NodeFS.writeFileSync(NodePath.resolve(out, "comparison.json"), JSON.stringify(result, null, 1));
+  for (const v of result.verdicts)
+    console.log(`${v.pass ? "PASS" : "FAIL"} ${v.check}: ${v.detail}`);
   console.log(result.pass ? "READS GATE PASS" : "READS GATE FAIL");
-  void readFileSync;
+  void NodeFS.readFileSync;
 }

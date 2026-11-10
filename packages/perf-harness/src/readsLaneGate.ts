@@ -24,9 +24,9 @@
  * The same file runs unchanged in the base tree (copy it there); it only uses
  * APIs both trees have and feature-detects `foregroundReads`.
  */
-import { constants, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { cpus, tmpdir, totalmem } from "node:os";
-import { resolve } from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 const [fixtureDir, label, out, lanesArg] = process.argv.slice(2);
 if (!fixtureDir || !label || !out) {
@@ -56,7 +56,10 @@ const Fiber = await import("effect/Fiber");
 const Layer = await import("effect/Layer");
 const SqlClient = await import("effect/sql/SqlClient");
 const NodeServices = await import("@effect/platform-node/NodeServices");
-const NodeSqliteClient = (await import("@t3tools/shared/nodeSqliteClient")) as Record<string, unknown> &
+const NodeSqliteClient = (await import("@t3tools/shared/nodeSqliteClient")) as Record<
+  string,
+  unknown
+> &
   typeof import("@t3tools/shared/nodeSqliteClient");
 const Sqlite = await import("../../../apps/server/src/persistence/Sqlite.ts");
 const Projection = await import("../../../apps/server/src/orchestration-v2/ProjectionStore.ts");
@@ -70,17 +73,19 @@ const foreground: <A>(effect: Eff<A>) => Eff<A> =
     : (effect) => effect;
 const hasLanes = typeof NodeSqliteClient.foregroundReads === "function";
 
-const fixture = JSON.parse(readFileSync(resolve(fixtureDir, "fixture.json"), "utf8"));
+const fixture = JSON.parse(
+  NodeFS.readFileSync(NodePath.resolve(fixtureDir, "fixture.json"), "utf8"),
+);
 if (fixture.synthetic !== true) throw new Error("Synthetic fixture marker required");
-const home = mkdtempSync(resolve(tmpdir(), "robob-reads-lane-gate-"));
-cpSync(resolve(fixtureDir, "userdata"), resolve(home, "userdata"), {
+const home = NodeFS.mkdtempSync(NodePath.resolve(NodeOS.tmpdir(), "robob-reads-lane-gate-"));
+NodeFS.cpSync(NodePath.resolve(fixtureDir, "userdata"), NodePath.resolve(home, "userdata"), {
   recursive: true,
-  mode: constants.COPYFILE_FICLONE,
+  mode: NodeFS.constants.COPYFILE_FICLONE,
 });
 
 const readIo = () => {
   try {
-    const io = readFileSync("/proc/self/io", "utf8");
+    const io = NodeFS.readFileSync("/proc/self/io", "utf8");
     return {
       readBytes: Number(io.match(/^read_bytes:\s+(\d+)/m)?.[1] ?? 0),
       writeBytes: Number(io.match(/^write_bytes:\s+(\d+)/m)?.[1] ?? 0),
@@ -91,7 +96,9 @@ const readIo = () => {
 };
 const threads = () => {
   try {
-    return Number(readFileSync("/proc/self/status", "utf8").match(/^Threads:\s+(\d+)/m)?.[1] ?? 0);
+    return Number(
+      NodeFS.readFileSync("/proc/self/status", "utf8").match(/^Threads:\s+(\d+)/m)?.[1] ?? 0,
+    );
   } catch {
     return 0;
   }
@@ -104,13 +111,14 @@ const sample = (at: string) => {
 
 const probes: Record<string, Record<string, Array<number>>> = {};
 const failures: Record<string, Array<string>> = {};
-const record = (phase: string, probe: string, ms: number) => ((probes[phase] ??= {})[probe] ??= []).push(ms);
+const record = (phase: string, probe: string, ms: number) =>
+  ((probes[phase] ??= {})[probe] ??= []).push(ms);
 const holders = { loadedMs: [] as Array<number>, failures: 0 };
 const writer = { commitMs: [] as Array<number>, failures: 0 };
 const aborted = { issued: 0, completedBeforeAbort: 0 };
 
 const layer = Projection.layer.pipe(
-  Layer.provideMerge(Sqlite.layerFromPath(resolve(home, "userdata/statev2.sqlite"))),
+  Layer.provideMerge(Sqlite.layerFromPath(NodePath.resolve(home, "userdata/statev2.sqlite"))),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -142,12 +150,18 @@ const program = Effect.gen(function* () {
       (probe) =>
         time(run[probe]!()).pipe(
           Effect.tap((ms) => Effect.sync(() => record(phase, probe, ms))),
-          Effect.catchCause((cause) => Effect.sync(() => (failures[probe] ??= []).push(String(cause).slice(0, 300)))),
+          Effect.catchCause((cause) =>
+            Effect.sync(() => (failures[probe] ??= []).push(String(cause).slice(0, 300))),
+          ),
         ),
       { discard: true },
     );
   // Warm every lane and slot (prepared statements, page cache).
-  for (let i = 0; i < 3; i++) yield* Effect.all(Object.values(run).map((f) => f()), { concurrency: "unbounded" });
+  for (let i = 0; i < 3; i++)
+    yield* Effect.all(
+      Object.values(run).map((f) => f()),
+      { concurrency: "unbounded" },
+    );
   yield* Effect.sync(() => console.error(`[${label}] warmed t=${Math.round(performance.now())}ms`));
   yield* sql`CREATE TABLE IF NOT EXISTS gate_scratch (id INTEGER PRIMARY KEY, body TEXT NOT NULL)`;
   const holderTransaction = sql
@@ -163,11 +177,11 @@ const program = Effect.gen(function* () {
   sample("idle-start");
   for (let i = 0; i < readsLaneWorkload.idleCycles; i++) yield* cycle("idle");
   sample("idle-end");
-  let stop = false;
+  const load = { stop: false };
   const holderLoops = yield* Effect.forEach(Array.from({ length: readsLaneWorkload.holders }), () =>
     Effect.forkChild(
       Effect.gen(function* () {
-        while (!stop) {
+        while (!load.stop) {
           const exit = yield* Effect.exit(time(holderTransaction));
           if (exit._tag === "Success") holders.loadedMs.push(exit.value);
           else holders.failures++;
@@ -178,8 +192,10 @@ const program = Effect.gen(function* () {
   const writerLoop = yield* Effect.forkChild(
     Effect.gen(function* () {
       let id = 0;
-      while (!stop) {
-        const exit = yield* Effect.exit(time(sql`INSERT INTO gate_scratch (body) VALUES (${`w${id++}`})`));
+      while (!load.stop) {
+        const exit = yield* Effect.exit(
+          time(sql`INSERT INTO gate_scratch (body) VALUES (${`w${id++}`})`),
+        );
         if (exit._tag === "Success") writer.commitMs.push(exit.value);
         else writer.failures++;
         yield* Effect.sleep(readsLaneWorkload.writerEveryMs);
@@ -198,17 +214,25 @@ const program = Effect.gen(function* () {
         aborted.issued++;
         return run.shellPage!().pipe(
           Effect.timeoutOption(readsLaneWorkload.abortAfterMs),
-          Effect.tap((result) => Effect.sync(() => (result._tag === "Some" ? aborted.completedBeforeAbort++ : undefined))),
+          Effect.tap((result) =>
+            Effect.sync(() =>
+              result._tag === "Some" ? aborted.completedBeforeAbort++ : undefined,
+            ),
+          ),
           Effect.ignore,
         );
       }),
     { concurrency: "unbounded", discard: true },
   );
   for (let i = 0; i < readsLaneWorkload.afterAbortCycles; i++) yield* cycle("afterAbort");
-  stop = true;
+  load.stop = true;
   yield* Effect.forEach(holderLoops, Fiber.join, { discard: true });
   yield* Fiber.join(writerLoop);
-  const checkpoint = yield* sql<{ busy: number; log: number; checkpointed: number }>`PRAGMA wal_checkpoint(PASSIVE)`;
+  const checkpoint = yield* sql<{
+    busy: number;
+    log: number;
+    checkpointed: number;
+  }>`PRAGMA wal_checkpoint(PASSIVE)`;
   sample("end");
   return { holderIdleMs, checkpoint: checkpoint[0] ?? null };
 });
@@ -228,15 +252,22 @@ try {
   )) as { holderIdleMs: number; checkpoint: unknown };
 } finally {
   clearInterval(keepAlive);
-  rmSync(home, { recursive: true, force: true });
+  NodeFS.rmSync(home, { recursive: true, force: true });
 }
 const dist = (values: ReadonlyArray<number>) => {
   const d = percentiles(values);
-  return { n: values.length, p50: d?.p50 ?? 0, p95: d?.p95 ?? 0, p99: d?.p99 ?? 0, max: d?.max ?? 0 };
+  return {
+    n: values.length,
+    p50: d?.p50 ?? 0,
+    p95: d?.p95 ?? 0,
+    p99: d?.p99 ?? 0,
+    max: d?.max ?? 0,
+  };
 };
 const summary: Record<string, Record<string, ReturnType<typeof dist>>> = {};
 for (const [phase, byProbe] of Object.entries(probes))
-  for (const [probe, values] of Object.entries(byProbe)) (summary[phase] ??= {})[probe] = dist(values);
+  for (const [probe, values] of Object.entries(byProbe))
+    (summary[phase] ??= {})[probe] = dist(values);
 summary.load = { holder: dist(holders.loadedMs), writerCommit: dist(writer.commitMs) };
 const report = {
   tier: "B",
@@ -246,7 +277,7 @@ const report = {
   workload: readsLaneWorkload,
   fixtureHash: String(fixture.fixtureHash ?? ""),
   startedAt: started,
-  host: { cpus: cpus().length, memBytes: totalmem(), node: process.version },
+  host: { cpus: NodeOS.cpus().length, memBytes: NodeOS.totalmem(), node: process.version },
   holderIdleMs: result.holderIdleMs,
   checkpoint: result.checkpoint,
   probes,
@@ -257,7 +288,7 @@ const report = {
   resources,
   summary,
 };
-writeFileSync(out, JSON.stringify(report));
+NodeFS.writeFileSync(out, JSON.stringify(report));
 const line = (phase: string) =>
   Object.entries(summary[phase] ?? {})
     .map(([probe, s]) => `${probe} ${Math.round(s.p50)}/${Math.round(s.p95)}`)

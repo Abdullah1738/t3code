@@ -19,23 +19,13 @@
  *   `off` boots with ROBOB_STATEV2_FOREGROUND_READERS=0 and ROBOB_BOARDS_FOREGROUND_READERS=0.
  * No production database is read: the fixture must carry the synthetic marker.
  */
-import { spawn } from "node:child_process";
-import { createServer } from "node:net";
-import {
-  constants,
-  cpSync,
-  createWriteStream,
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { cpus, tmpdir, totalmem } from "node:os";
-import { resolve } from "node:path";
-import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeNet from "node:net";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeCrypto from "node:crypto";
+import * as NodeURL from "node:url";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -49,6 +39,7 @@ import {
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION_TEXT,
 } from "@t3tools/contracts";
+// oxlint-disable-next-line t3code/no-rpc-permission-bypass -- The perf harness drives the raw WS protocol exactly as the web client does.
 import { makeWsRpcProtocolClient } from "../../../packages/client-runtime/src/rpc/protocol.ts";
 import { artifactHash, percentiles } from "./metrics.ts";
 import { observeExit } from "./process.ts";
@@ -56,7 +47,13 @@ import { observeExit } from "./process.ts";
 const token = "synthetic-performance-credential-only";
 const dist = (values: ReadonlyArray<number>) => {
   const d = percentiles(values);
-  return { n: values.length, p50: d?.p50 ?? 0, p95: d?.p95 ?? 0, p99: d?.p99 ?? 0, max: d?.max ?? 0 };
+  return {
+    n: values.length,
+    p50: d?.p50 ?? 0,
+    p95: d?.p95 ?? 0,
+    p99: d?.p99 ?? 0,
+    max: d?.max ?? 0,
+  };
 };
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -92,12 +89,13 @@ interface ResourceSample {
 
 // Linux only: the server pid plus every descendant (reader workers are threads; auth readers may be processes).
 function sampleTree(root: number, at: string): ResourceSample | null {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone harness script, no Effect runtime here.
   if (process.platform !== "linux") return null;
   const parents = new Map<number, number>();
-  for (const name of readdirSync("/proc")) {
+  for (const name of NodeFS.readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      const stat = NodeFS.readFileSync(`/proc/${name}/stat`, "utf8");
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
       parents.set(Number(name), Number(fields[1]));
     } catch {
@@ -121,11 +119,11 @@ function sampleTree(root: number, at: string): ResourceSample | null {
     writeBytes = 0;
   for (const pid of tree) {
     try {
-      const status = readFileSync(`/proc/${pid}/status`, "utf8");
+      const status = NodeFS.readFileSync(`/proc/${pid}/status`, "utf8");
       rss += Number(status.match(/^VmRSS:\s+(\d+)/m)?.[1] ?? 0) * 1024;
       hwm += Number(status.match(/^VmHWM:\s+(\d+)/m)?.[1] ?? 0) * 1024;
       threads += Number(status.match(/^Threads:\s+(\d+)/m)?.[1] ?? 0);
-      const io = readFileSync(`/proc/${pid}/io`, "utf8");
+      const io = NodeFS.readFileSync(`/proc/${pid}/io`, "utf8");
       readBytes += Number(io.match(/^read_bytes:\s+(\d+)/m)?.[1] ?? 0);
       writeBytes += Number(io.match(/^write_bytes:\s+(\d+)/m)?.[1] ?? 0);
     } catch {
@@ -145,10 +143,17 @@ export interface ReadsGateRun {
   readonly host: { readonly cpus: number; readonly memBytes: number; readonly node: string };
   readonly probes: Record<string, Record<string, Array<number>>>;
   readonly failures: Record<string, Array<string>>;
-  readonly holders: { readonly idleMs: number; readonly loadedMs: Array<number>; readonly failures: number };
+  readonly holders: {
+    readonly idleMs: number;
+    readonly loadedMs: Array<number>;
+    readonly failures: number;
+  };
   readonly aborted: { readonly issued: number; readonly completedBeforeAbort: number };
   readonly resources: Array<ResourceSample>;
-  readonly summary: Record<string, Record<string, { n: number; p50: number; p95: number; p99: number; max: number }>>;
+  readonly summary: Record<
+    string,
+    Record<string, { n: number; p50: number; p95: number; p99: number; max: number }>
+  >;
 }
 
 export async function readsGate(
@@ -157,18 +162,20 @@ export async function readsGate(
   serverEntry: string,
   lanes: "default" | "off" = "default",
 ): Promise<ReadsGateRun> {
-  const pristine = resolve(fixtureDir);
-  const fixture = JSON.parse(readFileSync(resolve(pristine, "fixture.json"), "utf8"));
+  const pristine = NodePath.resolve(fixtureDir);
+  const fixture = JSON.parse(
+    NodeFS.readFileSync(NodePath.resolve(pristine, "fixture.json"), "utf8"),
+  );
   if (fixture.synthetic !== true) throw new Error("Synthetic fixture marker required");
-  const home = mkdtempSync(resolve(tmpdir(), "robob-reads-gate-"));
+  const home = NodeFS.mkdtempSync(NodePath.resolve(NodeOS.tmpdir(), "robob-reads-gate-"));
   try {
-    cpSync(pristine, home, {
+    NodeFS.cpSync(pristine, home, {
       recursive: true,
-      mode: constants.COPYFILE_FICLONE,
-      filter: (path) => path !== resolve(pristine, "perf"),
+      mode: NodeFS.constants.COPYFILE_FICLONE,
+      filter: (path) => path !== NodePath.resolve(pristine, "perf"),
     });
     const port = await new Promise<number>((ok, fail) => {
-      const s = createServer();
+      const s = NodeNet.createServer();
       s.once("error", fail);
       s.listen(0, "127.0.0.1", () => {
         const p = s.address();
@@ -176,13 +183,13 @@ export async function readsGate(
       });
     });
     const origin = `http://127.0.0.1:${port}`;
-    const logPath = resolve(home, `server-${label}.log`);
-    const log = createWriteStream(logPath);
-    const child = spawn(
+    const logPath = NodePath.resolve(home, `server-${label}.log`);
+    const log = NodeFS.createWriteStream(logPath);
+    const child = NodeChildProcess.spawn(
       process.execPath,
       [
         "--max-old-space-size=8192",
-        resolve(serverEntry),
+        NodePath.resolve(serverEntry),
         "--base-dir",
         home,
         "--port",
@@ -201,7 +208,7 @@ export async function readsGate(
           HOME: home,
           T3CODE_DEV_AUTH_TOKEN: token,
           T3CODE_TELEMETRY_ENABLED: "false",
-          T3CODE_TRACE_FILE: resolve(home, "trace.ndjson"),
+          T3CODE_TRACE_FILE: NodePath.resolve(home, "trace.ndjson"),
           ...(lanes === "off"
             ? { ROBOB_STATEV2_FOREGROUND_READERS: "0", ROBOB_BOARDS_FOREGROUND_READERS: "0" }
             : {}),
@@ -217,7 +224,9 @@ export async function readsGate(
     const record = (phase: string, probe: string, ms: number) =>
       ((probes[phase] ??= {})[probe] ??= []).push(ms);
     const fail = (probe: string, error: unknown) =>
-      (failures[probe] ??= []).push(String(error instanceof Error ? error.message : error).slice(0, 300));
+      (failures[probe] ??= []).push(
+        String(error instanceof Error ? error.message : error).slice(0, 300),
+      );
     const resources: Array<ResourceSample> = [];
     const sample = (at: string) => {
       const s = child.pid === undefined ? null : sampleTree(child.pid, at);
@@ -228,14 +237,16 @@ export async function readsGate(
       const response = await fetch(origin + path, {
         headers: {
           authorization: `Bearer ${token}`,
-          "x-robob-action-id": randomUUID(),
+          "x-robob-action-id": NodeCrypto.randomUUID(),
           [ORCHESTRATION_PROTOCOL_HEADER]: ORCHESTRATION_PROTOCOL_VERSION_TEXT,
         },
         signal: signal ?? AbortSignal.timeout(120_000),
       });
       const body = await response.arrayBuffer();
       if (!response.ok)
-        throw new Error(`${path}: HTTP ${response.status} ${new TextDecoder().decode(body).slice(0, 200)}`);
+        throw new Error(
+          `${path}: HTTP ${response.status} ${new TextDecoder().decode(body).slice(0, 200)}`,
+        );
       return performance.now() - start;
     };
     const post = async (path: string, body: unknown) => {
@@ -262,7 +273,9 @@ export async function readsGate(
       if (!ticket) throw new Error("server readiness timed out");
       const socket = Socket.layerWebSocket(
         `${origin.replace("http:", "ws:")}/ws?${ORCHESTRATION_PROTOCOL_QUERY_PARAM}=${ORCHESTRATION_PROTOCOL_VERSION_TEXT}&wsTicket=${encodeURIComponent(ticket)}`,
-      ).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, (url) => new WebSocket(url))));
+      ).pipe(
+        Layer.provide(Layer.succeed(Socket.WebSocketConstructor, (url) => new WebSocket(url))),
+      );
       const protocol = RpcClient.layerProtocolSocket().pipe(
         Layer.provide(Layer.mergeAll(socket, RpcSerialization.layerJson)),
       );
@@ -290,7 +303,9 @@ export async function readsGate(
               Effect.runPromise(timed(client["kanban.messages"]({ discussionId, limit: 50 }))),
             auth: () => request("/api/auth/session"),
             identity: () =>
-              request("/api/ardud/control/identity/resolve?nativeId=synthetic-native-unknown"),
+              request(
+                "/api/ardud/control/identity/NodePath.resolve?nativeId=synthetic-native-unknown",
+              ),
             backgroundSmall: () =>
               request(
                 `/api/ardud/control/threads?limit=5&updatedSince=${encodeURIComponent("2025-12-31T00:00:00.000Z")}`,
@@ -317,9 +332,9 @@ export async function readsGate(
               await delay(readsGateWorkload.roundGapMs);
             }
             sample("idle-end");
-            let stop = false;
+            const load = { stop: false };
             const loops = Array.from({ length: readsGateWorkload.holders }, async () => {
-              while (!stop) {
+              while (!load.stop) {
                 try {
                   holders.loadedMs.push(await request("/api/ardud/control/threads"));
                 } catch {
@@ -354,7 +369,7 @@ export async function readsGate(
               await round("afterAbort");
               await delay(readsGateWorkload.roundGapMs);
             }
-            stop = true;
+            load.stop = true;
             await Promise.all(loops);
             sample("end");
           });
@@ -370,9 +385,9 @@ export async function readsGate(
         lanes,
         workload: readsGateWorkload,
         fixtureHash: String(fixture.fixtureHash ?? ""),
-        artifactHash: await artifactHash(resolve(serverEntry)),
+        artifactHash: await artifactHash(NodePath.resolve(serverEntry)),
         startedAt: new Date().toISOString(),
-        host: { cpus: cpus().length, memBytes: totalmem(), node: process.version },
+        host: { cpus: NodeOS.cpus().length, memBytes: NodeOS.totalmem(), node: process.version },
         probes,
         failures,
         holders,
@@ -386,24 +401,26 @@ export async function readsGate(
       if (!lifetime.exited) child.kill("SIGKILL");
     }
   } finally {
-    rmSync(home, { recursive: true, force: true });
+    NodeFS.rmSync(home, { recursive: true, force: true });
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (import.meta.url === NodeURL.pathToFileURL(process.argv[1] ?? "").href) {
   const [fixtureDir, label, entry, out, lanes] = process.argv.slice(2);
   if (!fixtureDir || !label || !entry || !out) {
     console.error("usage: readsGate.ts FIXTURE LABEL SERVER_ENTRY OUT.json [default|off]");
     process.exit(2);
   }
-  if (!existsSync(entry)) throw new Error(`missing server entry ${entry}`);
+  if (!NodeFS.existsSync(entry)) throw new Error(`missing server entry ${entry}`);
   const result = await readsGate(fixtureDir, label, entry, lanes === "off" ? "off" : "default");
-  writeFileSync(out, JSON.stringify(result, null, 1));
+  NodeFS.writeFileSync(out, JSON.stringify(result, null, 1));
   const line = (phase: string) =>
     Object.entries(result.summary[phase] ?? {})
       .map(([probe, s]) => `${probe} p50=${Math.round(s.p50)} p95=${Math.round(s.p95)}`)
       .join(" | ");
   console.log(`[${label}] idle: ${line("idle")}`);
   console.log(`[${label}] loaded: ${line("loaded")}`);
-  console.log(`[${label}] holders idle=${Math.round(result.holders.idleMs)}ms loaded n=${result.holders.loadedMs.length}`);
+  console.log(
+    `[${label}] holders idle=${Math.round(result.holders.idleMs)}ms loaded n=${result.holders.loadedMs.length}`,
+  );
 }

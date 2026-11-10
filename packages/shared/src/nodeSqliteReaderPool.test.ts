@@ -26,7 +26,10 @@ const slowRead = (sql: SqlClient.SqlClient, rows: number) =>
   );
 
 const countEntries = (sql: SqlClient.SqlClient) =>
-  Effect.map(sql<{ count: number }>`SELECT COUNT(*) AS count FROM entries`, (rows) => rows[0]?.count);
+  Effect.map(
+    sql<{ count: number }>`SELECT COUNT(*) AS count FROM entries`,
+    (rows) => rows[0]?.count,
+  );
 
 const now = () => performance.now();
 
@@ -297,7 +300,8 @@ it.effect(
   () =>
     withLanes({ foregroundReaderSlots: 1, readerMaxResultBytes: { foreground: 4096 } }, (sql) =>
       Effect.gen(function* () {
-        for (let index = 0; index < 100; index++) yield* sql`INSERT INTO entries VALUES ('padding-padding')`;
+        for (let index = 0; index < 100; index++)
+          yield* sql`INSERT INTO entries VALUES ('padding-padding')`;
         const error = yield* foreground(sql`SELECT name FROM entries`).pipe(Effect.flip);
         assert.include(String(error.reason.cause), "Reader result exceeds 4096 bytes");
         // The background lane has no budget here and the slot still serves small reads.
@@ -315,7 +319,9 @@ it.effect(
       Effect.gen(function* () {
         yield* foreground(countEntries(sql));
         // Started on the slot's worker, then past the limit: the worker is retired.
-        const overrunning = yield* Effect.forkChild(foreground(slowRead(sql, 400_000_000)).pipe(Effect.flip));
+        const overrunning = yield* Effect.forkChild(
+          foreground(slowRead(sql, 400_000_000)).pipe(Effect.flip),
+        );
         yield* realPause(100);
         // Never started: moves once to the replacement worker.
         const waiting = yield* Effect.forkChild(foreground(countEntries(sql)));
@@ -323,7 +329,10 @@ it.effect(
         const started = now();
         assert.equal(yield* background(countEntries(sql)), 1);
         assert.isBelow(now() - started, 500);
-        assert.include(String((yield* Fiber.join(overrunning)).reason.cause), "Database reader retired");
+        assert.include(
+          String((yield* Fiber.join(overrunning)).reason.cause),
+          "Database reader retired",
+        );
         assert.equal(yield* Fiber.join(waiting), 1);
       }),
     ),
@@ -381,26 +390,32 @@ it.effect("pool picks the least loaded slot and bounds in-flight reads", () =>
   }),
 );
 
-it.effect("concurrent reads awaiting their worker spread across slots and respect the lane bound", () =>
-  Effect.gen(function* () {
-    const connection = {} as never;
-    const ready = yield* Deferred.make<void>();
-    // Each acquisition waits for the worker, as a real reader's startup promise does.
-    const slot = Effect.as(Deferred.await(ready), connection);
-    const pool = yield* makeReaderPool({ lane: "foreground", slots: [slot, slot], queueLimit: 2 });
-    const first = yield* Effect.forkChild(pool.acquire);
-    const second = yield* Effect.forkChild(pool.acquire);
-    yield* Effect.yieldNow;
-    assert.equal(pool.inFlight(), 2);
-    // A third read while two are still acquiring is refused, not queued without bound.
-    const refused = yield* pool.acquire.pipe(Effect.flip);
-    assert.include(String(refused.reason.message), "Reader lane admission queue full");
-    yield* Deferred.succeed(ready, undefined);
-    const a = yield* Fiber.join(first);
-    const b = yield* Fiber.join(second);
-    assert.notEqual(a!.slot, b!.slot);
-    assert.equal(pool.inFlight(), 0);
-  }),
+it.effect(
+  "concurrent reads awaiting their worker spread across slots and respect the lane bound",
+  () =>
+    Effect.gen(function* () {
+      const connection = {} as never;
+      const ready = yield* Deferred.make<void>();
+      // Each acquisition waits for the worker, as a real reader's startup promise does.
+      const slot = Effect.as(Deferred.await(ready), connection);
+      const pool = yield* makeReaderPool({
+        lane: "foreground",
+        slots: [slot, slot],
+        queueLimit: 2,
+      });
+      const first = yield* Effect.forkChild(pool.acquire);
+      const second = yield* Effect.forkChild(pool.acquire);
+      yield* Effect.yieldNow;
+      assert.equal(pool.inFlight(), 2);
+      // A third read while two are still acquiring is refused, not queued without bound.
+      const refused = yield* pool.acquire.pipe(Effect.flip);
+      assert.include(String(refused.reason.message), "Reader lane admission queue full");
+      yield* Deferred.succeed(ready, undefined);
+      const a = yield* Fiber.join(first);
+      const b = yield* Fiber.join(second);
+      assert.notEqual(a!.slot, b!.slot);
+      assert.equal(pool.inFlight(), 0);
+    }),
 );
 
 it.effect("an interrupted acquisition releases its reservation", () =>
@@ -445,7 +460,8 @@ it.effect(
             yield* Fiber.join(deferred!);
           }).pipe(Effect.orDie),
         );
-        for (const span of spans) if (span["db.connection"] === "reader") lanes.push(span["db.reader.lane"]);
+        for (const span of spans)
+          if (span["db.connection"] === "reader") lanes.push(span["db.reader.lane"]);
         assert.deepStrictEqual(lanes, ["foreground", "background"]);
       }),
     ),

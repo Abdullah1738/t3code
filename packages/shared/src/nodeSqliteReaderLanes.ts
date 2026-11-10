@@ -51,10 +51,13 @@ export const isReservedLane = (lane: ReaderLaneName): lane is "auth" | "identity
 
 const laneOverloaded = (lane: string, limit: number) =>
   new SqlError({
-    reason: classifySqliteError(new Error(`Reader lane admission queue full (${lane}, ${limit} in flight)`), {
-      operation: "readerAdmission",
-      message: `Reader lane admission queue full (${lane})`,
-    }),
+    reason: classifySqliteError(
+      new Error(`Reader lane admission queue full (${lane}, ${limit} in flight)`),
+      {
+        operation: "readerAdmission",
+        message: `Reader lane admission queue full (${lane})`,
+      },
+    ),
   });
 
 export interface ReaderSlotLock {
@@ -101,11 +104,18 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
   // starting worker cannot collect an unbounded queue.
   let acquiring = 0;
   const entries = yield* Effect.forEach(options.slots, (acquire, slot) =>
-    Effect.map(Semaphore.make(1), (semaphore) => ({ slot, acquire, semaphore, load: 0, acquiring: 0 })),
+    Effect.map(Semaphore.make(1), (semaphore) => ({
+      slot,
+      acquire,
+      semaphore,
+      load: 0,
+      acquiring: 0,
+    })),
   );
   type Entry = (typeof entries)[number];
   const admit = (entry: Entry): SqlError | undefined => {
-    if (inFlight + acquiring >= options.queueLimit) return laneOverloaded(options.lane, options.queueLimit);
+    if (inFlight + acquiring >= options.queueLimit)
+      return laneOverloaded(options.lane, options.queueLimit);
     inFlight++;
     entry.load++;
     return undefined;
@@ -121,7 +131,11 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
         if (refused !== undefined) return Effect.fail(refused);
         return entry.semaphore
           .take(permits)
-          .pipe(Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Effect.sync(() => leave(entry)))));
+          .pipe(
+            Effect.onExit((exit) =>
+              Exit.isSuccess(exit) ? Effect.void : Effect.sync(() => leave(entry)),
+            ),
+          );
       }),
     release: (permits) =>
       entry.semaphore.release(permits).pipe(Effect.ensuring(Effect.sync(() => leave(entry)))),
@@ -176,7 +190,11 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
       ),
     );
   });
-  return { acquire, inFlight: () => inFlight + acquiring, slots: entries.length } satisfies ReaderPool;
+  return {
+    acquire,
+    inFlight: () => inFlight + acquiring,
+    slots: entries.length,
+  } satisfies ReaderPool;
 });
 
 /** Bounded admission for one reserved connection; opened after migrations. */
