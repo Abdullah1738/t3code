@@ -424,8 +424,7 @@ it.live(
         `.pipe(Effect.orDie);
         return { boardId: board.id, routes };
       }).pipe(
-        Effect.provide(benchLayer(fake.layer)),
-        Effect.provide(Logger.layer([warnings])),
+        Effect.provide(Layer.mergeAll(benchLayer(fake.layer), Logger.layer([warnings]))),
         Effect.withTracer(tracer),
       );
 
