@@ -13508,3 +13508,209 @@ it.effect("ask-drop does not report saved success from a preliminary discussion 
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
+
+it.effect.each(["post", "postToCard"] as const)(
+  "%s returns its saved message after a post-commit stale-continuation conflict",
+  (method) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            send: (input) =>
+              input.text.includes("Saved race post")
+                ? Deferred.succeed(held, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(real.send(input)),
+                  )
+                : real.send(input),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
+        yield* kanban.dispatchNow;
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const author: KanbanActor = {
+          _tag: "evaluator",
+          threadId: ThreadId.make("posting-evaluator"),
+        };
+        const blocks = [{ _tag: "md", text: "Saved race post" }] as const;
+        const posting = yield* (
+          method === "post"
+            ? kanban.post(discussion.id, author, blocks)
+            : kanban.postToCard(card.id, author, blocks)
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(held);
+        yield* kanban.editCard(card.id, { description: "Concurrent edit" }, owner);
+        yield* Deferred.succeed(release, undefined);
+        const message = yield* Fiber.join(posting);
+        assert.strictEqual(message.seq, 1);
+        assert.deepStrictEqual(message, yield* kanban.message(discussion.id, 1));
+        assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+        assert.strictEqual((yield* kanban.card(card.id)).card.description, "Concurrent edit");
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(testLayer(gated)),
+      );
+    }),
+);
+
+it.effect.each(["post", "postToCard"] as const)(
+  "%s returns its saved owner message when routeOwnerPost fails",
+  (method) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let failRead = false;
+      let failures = 0;
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putMessage: (message) =>
+              real.putMessage(message).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    failRead = true;
+                  }),
+                ),
+              ),
+            discussion: (id) =>
+              Effect.suspend(() => {
+                if (!failRead) return real.discussion(id);
+                failRead = false;
+                failures++;
+                return Effect.die("owner routing read failed");
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const blocks = [{ _tag: "md", text: "Saved owner post" }] as const;
+        const message = yield* method === "post"
+          ? kanban.post(discussion.id, owner, blocks)
+          : kanban.postToCard(card.id, owner, blocks);
+        assert.strictEqual(failures, 1);
+        assert.deepStrictEqual(message, yield* kanban.message(discussion.id, 1));
+        assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+    }),
+);
+
+it.effect("cancellation during message persistence retains the acknowledged sequence", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const written = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let armed = false;
+    let receipt: number | undefined;
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          putMessage: (message) =>
+            real
+              .putMessage(message)
+              .pipe(
+                Effect.andThen(
+                  Effect.suspend(() =>
+                    armed
+                      ? Deferred.succeed(written, undefined).pipe(
+                          Effect.andThen(Deferred.await(release)),
+                        )
+                      : Effect.void,
+                  ),
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const discussion = yield* kanban.createDiscussion(board.id, "Commit", owner);
+      const author: KanbanActor = { _tag: "thread", threadId: ThreadId.make("poster") };
+      armed = true;
+      const posting = yield* kanban
+        .post(discussion.id, author, [{ _tag: "md", text: "First" }])
+        .pipe(
+          Effect.provideService(SavedWrite.observer, (saved) => {
+            if (saved.kind === "message") receipt = saved.message.seq;
+          }),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(written);
+      assert.isUndefined(receipt);
+      const cancelling = yield* Fiber.interrupt(posting).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cancelling);
+      assert.strictEqual(receipt, 1);
+      assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, 1);
+      armed = false;
+      const second = yield* kanban.post(discussion.id, author, [{ _tag: "md", text: "Second" }]);
+      assert.strictEqual(second.seq, 2);
+      assert.deepStrictEqual(
+        (yield* kanban.messages(discussion.id)).map((message) => ({
+          seq: message.seq,
+          blocks: message.blocks,
+        })),
+        [
+          { seq: 1, blocks: [{ _tag: "md", text: "First" }] },
+          { seq: 2, blocks: [{ _tag: "md", text: "Second" }] },
+        ],
+      );
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+      Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)),
+    );
+  }),
+);
+
+it.effect("a failed discussion sequence write rolls back the message without a receipt", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let armed = false;
+    let receipt = false;
+    const storeLayer = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          putDiscussion: (discussion) =>
+            armed && discussion.lastSeq > 0
+              ? Effect.die("discussion write failed")
+              : real.putDiscussion(discussion),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const discussion = yield* kanban.createDiscussion(board.id, "Rollback", owner);
+      armed = true;
+      const result = yield* kanban
+        .post(discussion.id, { _tag: "thread", threadId: ThreadId.make("poster") }, [
+          { _tag: "md", text: "Not saved" },
+        ])
+        .pipe(
+          Effect.provideService(SavedWrite.observer, (saved) => {
+            if (saved.kind === "message") receipt = true;
+          }),
+          Effect.exit,
+        );
+      assert.isTrue(Exit.isFailure(result));
+      assert.isFalse(receipt);
+      assert.strictEqual((yield* kanban.discussion(discussion.id)).lastSeq, 0);
+      assert.lengthOf(yield* kanban.messages(discussion.id), 0);
+    }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, storeLayer)));
+  }),
+);
