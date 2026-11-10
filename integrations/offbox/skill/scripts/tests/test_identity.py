@@ -1,7 +1,7 @@
 """Caller identity through Robob's identity map (C1), against a stub control API on a real HTTP socket.
 
 Covers: Claude and Codex env resolve by driver, an inherited OFFBOX_THREAD of an unrelated thread is ignored,
-a pending answer resolves on retry within 60 s, and an unresolved caller never claims the shared local owner.
+a pending answer resolves within the same call, and an unresolved caller never claims the shared local owner.
 """
 import json
 import os
@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from offbox_lib import bases, capacity, common, identity, lease, misc, pool  # noqa: E402
 from offbox_lib.common import OffboxError  # noqa: E402
+
+REAL_REPO_ROOT = identity.repo_root
 
 PARENT = "thread-parent"
 CHILD = "thread-child"
@@ -39,6 +41,9 @@ class StubControl:
             OTHER: {"threadId": OTHER, "parentThreadId": None, "relationshipToParent": None},
         }
         self.calls = []
+        self.stream_identity_status = None
+        self.truncated_identity_status = None
+        self.stream_closed = threading.Event()
         # Every POST /threads/<id>/send, as (thread id, body): the monitor's warning, recorded for assertions.
         self.sends = []
         stub = self
@@ -74,6 +79,22 @@ class StubControl:
                 if self.headers.get("Authorization") != "Bearer test-token":
                     return self._send(401, {"ok": False})
                 if url.path == "/api/ardud/control/identity/resolve":
+                    if stub.truncated_identity_status is not None:
+                        self.send_response(stub.truncated_identity_status)
+                        self.send_header("Content-Length", "1000")
+                        self.end_headers()
+                        self.wfile.write(b"{")
+                        return
+                    if stub.stream_identity_status is not None:
+                        self.send_response(stub.stream_identity_status)
+                        self.end_headers()
+                        try:
+                            while True:
+                                self.wfile.write(b" ")
+                                self.wfile.flush()
+                        except OSError:
+                            stub.stream_closed.set()
+                        return
                     q = parse_qs(url.query)
                     key = (q.get("nativeId", [""])[0], q.get("driver", [""])[0])
                     if key in stub.identities:
@@ -106,6 +127,7 @@ def resolved(thread, parent=None, kind="top-level", accepts=True, driver="claude
 
 class IdentityTests(unittest.TestCase):
     def setUp(self):
+        self.elapsed = 0.0
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.stub = StubControl()
@@ -124,7 +146,8 @@ class IdentityTests(unittest.TestCase):
             patch.object(identity, "CTL_CFGS", (cfg, root / "none.json")),
             patch.object(identity, "repo_root", return_value=root),
             patch.object(identity, "repo_key", return_value="repo"),
-            patch.object(identity.time, "sleep"),
+            patch.object(identity, "sleep", side_effect=self.advance),
+            patch.object(identity, "monotonic", side_effect=lambda: self.elapsed),
         ]
         for p in self.stack:
             p.start()
@@ -139,6 +162,9 @@ class IdentityTests(unittest.TestCase):
     def who(self, **shell):
         with patch.dict(os.environ, shell):
             return identity.whoami(str(Path(self.tmp.name)))
+
+    def advance(self, seconds):
+        self.elapsed += seconds
 
     def test_claude_shell_asks_c1_by_driver_but_takes_no_resolved_owner(self):
         # C1 is queried with driver=claudeAgent, but a bare Claude id can't prove top-level, so the caller keeps
@@ -186,33 +212,183 @@ class IdentityTests(unittest.TestCase):
         con.execute("UPDATE kv SET ts = ts - ? WHERE k = ?", (seconds, f"identity:codex:{native}"))
         con.commit()
 
-    def test_pending_resolves_on_retry_within_sixty_seconds(self):
+    def test_pending_waits_for_mapping_and_proceeds_in_the_same_call(self):
         pending = {"resolution": "pending", "robobThreadId": None, "parentThreadId": None,
                    "executionKind": None, "acceptsMessages": False, "candidates": []}
         self.stub.identities[(PENDING_UUID, "codex")] = pending
-        first = self.who(CODEX_THREAD_ID=PENDING_UUID)
-        self.assertEqual(first["resolution"], "pending")
-        self.assertEqual(first["owner"], f"unresolved:codex:{PENDING_UUID}")
-        # The mapping lands. The next attempt is a few seconds later (past the short burst cache, well
-        # inside the 60 s ceiling), so it asks C1 again and resolves.
-        self.stub.identities[(PENDING_UUID, "codex")] = resolved(OTHER, driver="codex")
-        self.age_identity_row(PENDING_UUID, 10)
-        second = self.who(CODEX_THREAD_ID=PENDING_UUID)
-        self.assertEqual(second["resolution"], "resolved")
-        self.assertEqual(second["thread"], OTHER)
+        def mapping_lands(seconds):
+            self.assertGreaterEqual(seconds, 2)
+            self.assertLessEqual(seconds, 3)
+            self.advance(seconds)
+            if self.elapsed >= 5:
+                self.stub.identities[(PENDING_UUID, "codex")] = resolved(OTHER, driver="codex")
 
-    def test_pending_answer_is_not_cached_past_sixty_seconds(self):
+        with patch.object(identity, "sleep", side_effect=mapping_lands):
+            me = self.who(CODEX_THREAD_ID=PENDING_UUID)
+        self.assertEqual(me["resolution"], "resolved")
+        self.assertEqual(me["thread"], OTHER)
+        self.assertEqual(me["owner"], OTHER)
+        identity.require_proven(me, "run")
+        self.assertGreaterEqual(self.elapsed, 5)
+        self.assertLessEqual(self.elapsed, 60)
+
+    def test_recent_pending_cache_does_not_skip_waiting_for_mapping(self):
         pending = {"resolution": "pending", "robobThreadId": None, "parentThreadId": None,
                    "executionKind": None, "acceptsMessages": False, "candidates": []}
-        self.stub.identities[(PENDING_UUID, "codex")] = pending
-        self.who(CODEX_THREAD_ID=PENDING_UUID)
-        before = len(self.stub.calls)
-        # Age the cached row past 60 s, then the next lookup must go back to the control API.
-        con = common.db()
-        con.execute("UPDATE kv SET ts = ts - 61 WHERE k = ?", (f"identity:codex:{PENDING_UUID}",))
-        con.commit()
-        self.who(CODEX_THREAD_ID=PENDING_UUID)
-        self.assertGreater(len(self.stub.calls), before)
+        common.kv_set(common.db(), f"identity:codex:{PENDING_UUID}", pending)
+        self.stub.identities[(PENDING_UUID, "codex")] = resolved(OTHER, driver="codex")
+        me = self.who(CODEX_THREAD_ID=PENDING_UUID)
+        self.assertEqual(me["resolution"], "resolved")
+        self.assertEqual(me["thread"], OTHER)
+
+    def test_pending_expires_at_sixty_seconds_without_proving_an_owner(self):
+        self.stub.identities[(PENDING_UUID, "codex")] = {"resolution": "pending"}
+        me = self.who(CODEX_THREAD_ID=PENDING_UUID)
+        self.assertEqual(self.elapsed, 60)
+        self.assertEqual(me["resolution"], "pending")
+        self.assertEqual(me["owner"], f"unresolved:codex:{PENDING_UUID}")
+        with self.assertRaises(OffboxError) as refused:
+            identity.require_proven(me, "run")
+        self.assertEqual(refused.exception.code, 2)
+
+    def test_unknown_and_ambiguous_answers_refuse_without_waiting(self):
+        for index, resolution in enumerate(("unavailable", "ambiguous")):
+            with self.subTest(resolution=resolution), patch.object(identity, "ctl", return_value=(
+                200, {"identity": {"resolution": resolution, "robobThreadId": None}}
+            )) as ctl:
+                me = self.who(CODEX_THREAD_ID=f"99999999-2222-3333-4444-{index:012d}")
+            ctl.assert_called_once()
+            self.assertEqual(self.elapsed, 0)
+            self.assertEqual(me["resolution"], resolution)
+            with self.assertRaises(OffboxError):
+                identity.require_proven(me, "run")
+
+    def test_cwd_outside_every_project_cannot_change_native_proof(self):
+        self.stub.identities[(CODEX_UUID, "codex")] = resolved(OTHER, driver="codex")
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as outside, patch.object(
+            identity, "repo_root", REAL_REPO_ROOT
+        ):
+            for native, expected in ((CODEX_UUID, "resolved"), (PENDING_UUID, "unavailable")):
+                with self.subTest(native=native), patch.dict(os.environ, {"CODEX_THREAD_ID": native}):
+                    me = identity.whoami(outside)
+                    self.assertEqual(me["repo_root"], str(Path(outside).resolve()))
+                    self.assertEqual(me["resolution"], expected)
+                    self.assertEqual(me["thread"], OTHER if expected == "resolved" else None)
+                    if expected == "resolved":
+                        identity.require_proven(me, "run")
+                    else:
+                        with self.assertRaises(OffboxError):
+                            identity.require_proven(me, "run")
+
+    def test_control_worker_ignores_cwd_and_pythonpath_modules(self):
+        original_cwd = os.getcwd()
+        forged = json.dumps([200, {"identity": resolved(PARENT, driver="codex")}])
+        index = 0
+        for channel in ("cwd", "PYTHONPATH"):
+            for module in ("json.py", "urllib/__init__.py", "sitecustomize.py"):
+                index += 1
+                with self.subTest(channel=channel, module=module), tempfile.TemporaryDirectory() as attack:
+                    marker = Path(attack) / "executed"
+                    target = Path(attack) / module
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                                      f"print({forged!r}, flush=True)\nraise SystemExit(0)\n")
+                    try:
+                        os.chdir(attack if channel == "cwd" else original_cwd)
+                        env = {"CODEX_THREAD_ID": f"88888888-1111-2222-3333-{index:012d}"}
+                        if channel == "PYTHONPATH":
+                            env["PYTHONPATH"] = attack
+                        with patch.dict(os.environ, env):
+                            me = self.who()
+                        self.assertFalse(marker.exists(), "caller modules must not execute with the control token")
+                        self.assertEqual(me["resolution"], "unavailable")
+                        with self.assertRaises(OffboxError):
+                            identity.require_proven(me, "run")
+                    finally:
+                        os.chdir(original_cwd)
+
+    def test_transport_retry_policy_remains_one_retry(self):
+        for status in (0, 500, 503):
+            start = self.elapsed
+            with self.subTest(status=status), patch.object(identity, "ctl", return_value=(status, {})) as ctl:
+                result = identity.identity_for(f"outage-{status}", "codex")
+                self.assertEqual(ctl.call_count, 2)
+                self.assertEqual(self.elapsed - start, 1.5)
+                self.assertEqual(result["resolution"], "unavailable")
+
+    def test_slow_requests_share_the_sixty_second_budget(self):
+        timeouts = []
+
+        def request_times_out(*args, **kwargs):
+            timeout = kwargs.get("timeout", 10)
+            self.assertLessEqual(timeout, 60 - self.elapsed)
+            timeouts.append(timeout)
+            self.advance(min(8, timeout))
+            return 200, {"identity": {"resolution": "pending"}}
+
+        with patch.object(identity, "ctl", side_effect=request_times_out):
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertEqual(self.elapsed, 60)
+        self.assertLess(timeouts[-1], timeouts[0])
+        self.assertEqual(me["resolution"], "pending")
+        with self.assertRaises(OffboxError):
+            identity.require_proven(me, "run")
+
+    def test_pending_then_outage_never_restores_an_older_resolved_identity(self):
+        con, key, _ = self.seed_resolved_identity(3700)
+        pending = {"resolution": "pending", "robobThreadId": None}
+        with patch.object(identity, "ctl", side_effect=lambda *args, **kwargs: (
+            (200, {"identity": pending}) if self.elapsed == 0 else (500, {})
+        )):
+            me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+        self.assertGreater(self.elapsed, 0)
+        self.assertLessEqual(self.elapsed, 60)
+        self.assertEqual(me["resolution"], "pending")
+        self.assertEqual(common.kv_get(con, key)["resolution"], "pending")
+        with self.assertRaises(OffboxError):
+            identity.require_proven(me, "run")
+
+    def test_pending_then_client_error_invalidates_old_proof_across_calls(self):
+        for status in range(400, 500):
+            with self.subTest(status=status):
+                con, key, _ = self.seed_resolved_identity(3700)
+                pending = {"resolution": "pending", "robobThreadId": None}
+                with patch.object(identity, "ctl", side_effect=[(200, {"identity": pending}), (status, {})]):
+                    first = self.who(CODEX_THREAD_ID=CODEX_UUID)
+                self.assertEqual(first["resolution"], "unavailable")
+                self.assertNotEqual(common.kv_get(con, key)["resolution"], "resolved")
+                self.age_identity_row(CODEX_UUID, 10)
+                with patch.object(identity, "ctl", return_value=(500, {})):
+                    later = self.who(CODEX_THREAD_ID=CODEX_UUID)
+                self.assertIsNone(later["thread"])
+                with self.assertRaises(OffboxError):
+                    identity.require_proven(later, "run")
+
+    def test_complete_response_deadline_closes_continuously_arriving_bodies(self):
+        for status in (200, 500):
+            with self.subTest(status=status):
+                self.stub.stream_identity_status = status
+                self.stub.stream_closed.clear()
+                self.stub.calls.clear()
+                code, body = identity.ctl("GET", "/identity/resolve", timeout=0.2, whole_response=True)
+                self.assertIn(code, (0, status if status >= 400 else 0))
+                self.assertNotIn("identity", body)
+                if self.stub.calls:
+                    self.assertTrue(self.stub.stream_closed.wait(1), "timed-out HTTP reader must close")
+
+    def test_incomplete_client_error_bodies_never_trigger_stale_owner_fallback(self):
+        for form in ("streaming", "truncated"):
+            for status in range(400, 500):
+                with self.subTest(form=form, status=status):
+                    self.seed_resolved_identity(3700)
+                    self.stub.stream_identity_status = status if form == "streaming" else None
+                    self.stub.truncated_identity_status = status if form == "truncated" else None
+                    me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+                    self.assertEqual(me["resolution"], "unavailable")
+                    self.assertIn(f"status={status}", me["lookupError"])
+                    self.assertIsNone(me["thread"])
+                    with self.assertRaises(OffboxError):
+                        identity.require_proven(me, "ssh")
 
     def test_resolved_answer_is_cached_for_an_hour(self):
         self.stub.identities[(CLAUDE_UUID, "claudeAgent")] = resolved(OTHER)
@@ -221,7 +397,7 @@ class IdentityTests(unittest.TestCase):
         self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID)
         self.assertEqual(len(self.stub.calls), before)
 
-    def test_identity_lookup_retries_transport_and_server_errors_once(self):
+    def test_identity_lookup_retries_transport_and_server_errors(self):
         for status in (0, 500, 503):
             with self.subTest(status=status), patch.object(identity, "ctl", side_effect=[
                 (status, {"error": "timed out"}), (200, {"identity": resolved(OTHER, driver="codex")})
@@ -231,14 +407,16 @@ class IdentityTests(unittest.TestCase):
                 self.assertEqual(ident["resolution"], "resolved")
                 self.assertNotIn("lookupError", ident)
                 self.assertEqual(ctl.call_count, 2)
-                self.assertEqual(ctl.call_args.kwargs, {"timeout": 20})
+                self.assertEqual(ctl.call_args.kwargs, {"timeout": 20, "whole_response": True})
                 self.assertEqual(ctl.call_args_list[0].args, ctl.call_args_list[1].args)
 
     def test_failed_lookup_carries_detail_to_whoami_logs_and_refusal(self):
         with patch.object(identity, "ctl", return_value=(0, {"error": "timed out"})) as ctl:
             me = self.who(CODEX_THREAD_ID=CODEX_UUID)
+            before = ctl.call_count
             cached = self.who(CODEX_THREAD_ID=CODEX_UUID)
-        self.assertEqual(ctl.call_count, 2, "the unavailable answer still has a short cache")
+        self.assertGreater(before, 1)
+        self.assertEqual(ctl.call_count, before, "the unavailable answer still has a short cache")
         self.assertEqual(me["resolution"], "unavailable")
         self.assertEqual(me["lookupError"], "status=0 timed out")
         self.assertEqual(cached["lookupError"], me["lookupError"])
@@ -252,7 +430,7 @@ class IdentityTests(unittest.TestCase):
         self.assertIn(f"caller codex {CODEX_UUID[:8]} unresolved: unavailable (status=0 timed out)", logs)
 
     def test_client_errors_are_not_retried(self):
-        for status in (401, 404):
+        for status in range(400, 500):
             with self.subTest(status=status), patch.object(identity, "ctl", return_value=(status, {})) as ctl:
                 ident = identity.identity_for(f"client-{status}", "codex")
             ctl.assert_called_once()
@@ -275,7 +453,7 @@ class IdentityTests(unittest.TestCase):
                 before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
                 with patch.object(identity, "ctl", return_value=(status, {"error": "timed out"})) as ctl:
                     ident = identity.identity_for(CODEX_UUID, "codex")
-                self.assertEqual(ctl.call_count, 2)
+                self.assertGreater(ctl.call_count, 1)
                 self.assertEqual(ident, old)
                 self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
                 with patch.object(identity, "ctl", return_value=(200, {"identity": resolved(OTHER, driver="codex")})) as ctl:
@@ -316,7 +494,10 @@ class IdentityTests(unittest.TestCase):
                 answer = {"resolution": resolution, "robobThreadId": None}
                 with patch.object(identity, "ctl", return_value=(200, {"identity": answer})) as ctl:
                     me = self.who(CODEX_THREAD_ID=CODEX_UUID)
-                ctl.assert_called_once()
+                if resolution == "pending":
+                    self.assertGreater(ctl.call_count, 1)
+                else:
+                    ctl.assert_called_once()
                 self.assertEqual(me["resolution"], resolution)
                 self.assertIsNone(me["lookupError"])
                 self.assertEqual(common.kv_get(con, key)["resolution"], resolution)
@@ -347,14 +528,14 @@ class IdentityTests(unittest.TestCase):
                 before = tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone())
                 with patch.object(identity, "ctl", return_value=(500, body)) as ctl:
                     self.assertEqual(identity.identity_for(CODEX_UUID, "codex"), old)
-                self.assertEqual(ctl.call_count, 2)
+                self.assertGreater(ctl.call_count, 1)
                 self.assertEqual(tuple(con.execute("SELECT v, ts FROM kv WHERE k=?", (key,)).fetchone()), before)
 
     def test_server_error_body_shapes_without_cached_identity_refuse_with_detail(self):
         for shape, body in ERROR_BODY_SHAPES.items():
             with self.subTest(shape=shape), patch.object(identity, "ctl", return_value=(500, body)) as ctl:
                 ident = identity.identity_for(f"error-body-{shape}", "codex")
-            self.assertEqual(ctl.call_count, 2)
+            self.assertGreater(ctl.call_count, 1)
             self.assertEqual(ident["resolution"], "unavailable")
             self.assertEqual(ident["lookupError"], "status=500 no error detail")
             with self.assertRaises(OffboxError) as refused:
