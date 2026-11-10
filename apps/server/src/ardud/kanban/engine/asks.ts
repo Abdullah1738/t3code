@@ -2,6 +2,7 @@
 import {
   KANBAN_ASK_ANSWER_FIELD,
   KANBAN_ASK_SECRET_PROVIDED,
+  kanbanAskIsFreeText,
   KANBAN_ASK_FIELD_TYPES,
   kanbanAskChanges,
   kanbanAskExpired,
@@ -1938,6 +1939,45 @@ export const blockAnswer = (
   const words = [answer.text, answer.note].filter((entry) => entry !== undefined).join("\n\n");
   return { choice, text: words === "" ? (choice.length > 0 ? null : (verdict ?? null)) : words };
 };
+
+/**
+ * A reply in words answers this ask: it takes words alone and has not expired.
+ * Anything with a verdict, a pick, fields, a draft to edit or a task is
+ * answered through the ask itself, where the answer is checked.
+ */
+export const takesReply = (ask: KanbanOwnerAsk, nowMs: number): boolean =>
+  ask.closedAt === null && kanbanAskIsFreeText(ask) && !kanbanAskExpired(ask, nowMs);
+
+/**
+ * For whoever hears an owner reply which left asks open: his words are not an
+ * answer to them. `asks` are the open asks the reply did not close.
+ */
+export const wordsOnlyNote = (
+  card: KanbanCard,
+  asks: ReadonlyArray<KanbanOwnerAsk>,
+  nowMs: number,
+): string =>
+  asks
+    .map((ask) => {
+      const name = `${ask.id} on card #${card.number} ("${ask.title ?? ask.text}")`;
+      return kanbanAskExpired(ask, nowMs)
+        ? `${name} has expired, so this reply did not answer it. It is still open: ${askerName(ask.by)} asked it and renews it with card_ask_change, or drops it.`
+        : `He wrote this in the card's discussion without using the answer on ${name}. It is not an approval, a pick or a decision on that ask: nobody may act as if it were. The ask is still open and now waits on its asker, ${askerName(ask.by)} (the evaluator when that thread cannot hear this): reply to him on it (discussion_post with ask "${ask.id}"), change the ask or ask again (card_ask_change), or drop it.`;
+    })
+    .join("\n");
+
+/** A pick, or his own words, on an ask's pick block as the structured answer it stands for. */
+export const pickAnswer = (
+  ask: KanbanOwnerAsk,
+  choice: ReadonlyArray<string>,
+  words: string,
+): AskAnswerInput => ({
+  verdict: choice.length > 0 ? "picked" : "answered",
+  ...(choice.length > 0 ? { optionIds: choice } : {}),
+  ...(words === "" ? {} : { text: words }),
+  // The pick was made on the ask's current message: that is the revision it read.
+  revision: kanbanAskRevision(ask),
+});
 
 /**
  * How an ask closed when it went through the old paths (a reply or pick in the
