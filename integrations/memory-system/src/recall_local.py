@@ -9,7 +9,21 @@ from recall_rules import RuleIndex, evaluate_conflict
 from recall_classifier import deterministic
 
 
+def rule_preflight_enabled():
+    """The pattern-matched rule index is off unless RECALL_RULE_PREFLIGHT=1.
+
+    Owner, 2026-11-10: recall informs; it doesn't block tool calls or add rule
+    notes from regex-extracted skill/transcript rules (the Crpko main-dev rule
+    blocked pushes on the Robob fork). The code and recall_rules.db stay so the
+    flag can restore it: set it for the recall server LaunchAgent and the hook
+    environment.
+    """
+    return os.environ.get('RECALL_RULE_PREFLIGHT', '').strip() == '1'
+
+
 def preflight(tool, arguments, cwd, path=None):
+    if not rule_preflight_enabled():
+        return [], None
     path = Path(path or os.environ.get('RECALL_RULES_DB', str(Path.home() / '.local/share/memory-system/data/recall_rules.db')))
     if isinstance(arguments, str):
         if tool.lower().split('__')[-1] in {'apply_patch', 'patch'}:

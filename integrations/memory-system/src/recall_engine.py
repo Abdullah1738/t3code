@@ -25,6 +25,9 @@ class CheckEngine:
         self.verdicts = OrderedDict()
 
     def _rules(self, cwd, tool, arguments, *, explicit_only=False):
+        from recall_local import rule_preflight_enabled
+        if not rule_preflight_enabled():
+            return [], None
         if not self.rules_path.exists():
             return [], "rules index missing"
         from recall_rules import RuleIndex

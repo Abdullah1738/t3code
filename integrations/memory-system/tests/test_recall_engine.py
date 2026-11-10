@@ -14,14 +14,63 @@ from recall_engine import CheckEngine
 from test_recall_rules import RulesFixture
 
 
+class RulePreflightOffTest(unittest.TestCase):
+    """Default: recall informs, it never blocks or adds rule notes from the rule index."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.fixture = RulesFixture(self.root)
+        self.index = self.fixture.index()
+        self.index.remember("When messaging Moni, never say 'as requested'.", actions=["message"],
+                            recipient="Moni", source_session="owner")
+        self.env = patch.dict(os.environ, RECALL_DECISION_LOG=str(self.root / "decisions.jsonl"))
+        self.env.start()
+        os.environ.pop("RECALL_RULE_PREFLIGHT", None)
+        self.engine = CheckEngine(self.index.path)
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_no_rule_deny_or_note_from_any_trigger(self):
+        from test_recall_project import make_repo, ROBOB, T3CODE
+        fork = make_repo(self.root / "t3code-fork", [("upstream", T3CODE), ("origin", ROBOB)])
+        checkout = make_repo(self.root / "checkouts/offbox-cap-900", [("origin", ROBOB)], git_dir=self.root / "ovnfs/offbox")
+        calls = [
+            ("shell", {"command": "git push origin HEAD:main"}, str(fork)),
+            ("shell", {"command": f"cd {checkout} && git push --dry-run origin HEAD:refs/heads/main"}, str(self.root)),
+            # Before: both of these were hard denies from the rule index.
+            ("shell", {"command": "git push origin HEAD:main"}, self.fixture.cwd),
+            ("whatsapp.send", {"recipient": "Moni", "text": "Done as requested"}, str(self.root)),
+        ]
+        with patch("recall_classifier.classify", side_effect=AssertionError("no rule candidates, no Jev call")):
+            for tool, arguments, cwd in calls:
+                with self.subTest(tool=tool, arguments=arguments):
+                    body = dict(trigger="tool", tool=tool, arguments=arguments, cwd=cwd)
+                    self.assertIsNone(self.engine.preflight(body)[2])
+                    result = self.engine.check(body)
+                    self.assertEqual("allow", result["decision"])
+                    self.assertIsNone(result["note"])
+                    self.assertEqual([], result["sources"])
+        with patch("recall_admission.cheap_note", return_value={"note": None, "sources": []}):
+            prompt = self.engine.check(dict(trigger="first_prompt", prompt="deploy main-dev never main crpko services", cwd=str(fork)))
+        self.assertIsNone(prompt["note"])
+
+    def test_flag_restores_the_rule_index(self):
+        with patch.dict(os.environ, RECALL_RULE_PREFLIGHT="1"):
+            body = dict(trigger="tool", tool="shell", arguments={"command": "git push origin HEAD:main"}, cwd=self.fixture.cwd)
+            self.assertEqual("deny", self.engine.preflight(body)[2]["decision"])
+
+
 class EngineTest(unittest.TestCase):
+    """The rule index path, which is dormant unless RECALL_RULE_PREFLIGHT=1."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.fixture = RulesFixture(self.root)
         self.index = self.fixture.index()
         self.engine = CheckEngine(self.index.path)
-        self.log = patch.dict(os.environ, RECALL_DECISION_LOG=str(self.root / "decisions.jsonl"))
+        self.log = patch.dict(os.environ, RECALL_DECISION_LOG=str(self.root / "decisions.jsonl"), RECALL_RULE_PREFLIGHT="1")
         self.log.start()
 
     def tearDown(self):
@@ -91,6 +140,7 @@ class EngineTest(unittest.TestCase):
 
 
 class PreflightAdmissionTest(unittest.IsolatedAsyncioTestCase):
+    @patch.dict(os.environ, RECALL_RULE_PREFLIGHT="1")  # the dormant rule path
     async def test_http_denies_before_saturated_optional_admission(self):
         try:
             import recall_server as server
