@@ -1021,6 +1021,15 @@ const make = Effect.gen(function* () {
     if (!stops) pendingStops.set(threadId, (stops = new Map()));
     stops.set(routeKey, reason);
   };
+  const closeStopRows = (keys: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const at = yield* nowIso;
+      yield* boardSql`
+        UPDATE ardud_kanban_owner_routes
+        SET done_at = ${at}, json = json_set(json, '$.outcome', 'delivered')
+        WHERE route_key IN ${boardSql.in(keys)} AND done_at IS NULL
+      `;
+    });
   /**
    * Runs the thread's pending stops, if any; callers hold no board gate. A
    * drain passes its own route: skipped when a send already ran it.
@@ -1041,6 +1050,10 @@ const make = Effect.gen(function* () {
               if (keys.length === 0) return Effect.void;
               const reason = route?.reason ?? stops!.values().next().value!;
               return touching(threadId, threadIo.interrupt(ThreadId.make(threadId), reason)).pipe(
+                // Closed durably before the lock is released: a restart must not
+                // reload a stop that already ran and cut the run a send starts
+                // next (packages/protocol-models/stops.qnt, `stepVolatile`).
+                Effect.andThen(closeStopRows(keys)),
                 Effect.tap(() =>
                   Effect.sync(() => {
                     for (const key of keys) {

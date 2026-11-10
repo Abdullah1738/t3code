@@ -32,6 +32,7 @@ reports an invariant violation, never when parsing or the backend fails.
 | commands | two IDs, two crashes, three lease generations, one active claim | I1 ACK has durable outcome; I2 retry/receipt-expiry dedup; I4 durable delivery obligation |
 | boards | two cards, two independent fields, three revisions/tokens, one pool slot | I3 field preservation and explicit conflicts; I6 capacity and fenced attachment |
 | sync | two keys, four writes, two epochs, one principal/scope, two snapshot pages | I5 prefix equality/convergence/tombstones; I9 immediate authorization |
+| stops | two deferred board stops, three runs, two crashes (board sends only) | a let-go interrupt never cuts a run started after it was asked for; `stepVolatile` is the expected counterexample (stop closed in memory only) |
 
 The runner explores all executions through 10 transitions using Apalache and
 samples 10,000 runs of 10 transitions with seed 20261108. Deterministic `run`
