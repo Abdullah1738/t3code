@@ -356,7 +356,33 @@ describe("askBlocks", () => {
   });
 });
 
+/** The validator as called by someone who read the ask as it is now, unless a test says otherwise. */
+const answerFor: typeof Asks.answerFor = (onCard, on, input, ...rest) =>
+  Asks.answerFor(onCard, on, { revision: kanbanAskRevision(on), ...input }, ...rest);
+
 describe("answerFor and answerText", () => {
+  it("an answer with no revision is refused unless the ask takes words alone", () => {
+    const approval = ask({ action: { summary: "Deploy" } });
+    const blind = Asks.answerFor(card([approval]), approval, { verdict: "approved" }, owner, AT);
+    assert.isTrue(Asks.isAskProblem(blind));
+    if (Asks.isAskProblem(blind)) {
+      assert.strictEqual(blind.code, "invalid");
+      assert.include(blind.detail, "needs the revision you are answering");
+      assert.include(blind.detail, "It is at revision 0");
+    }
+    const revised = Asks.reviseAsk(approval, { context: "More detail." }, LATER);
+    if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
+    const later = Asks.answerFor(card([revised]), revised, { verdict: "rejected" }, owner, LATER);
+    assert.isTrue(Asks.isAskProblem(later) && later.detail.includes("It is at revision 1"));
+    // A plain question, and an ask as the previous build stored it, need none.
+    const plain = ask({}, "Which tier?");
+    assert.isFalse(
+      Asks.isAskProblem(
+        Asks.answerFor(card([plain]), plain, { verdict: "answered", text: "Tier 2." }, owner, AT),
+      ),
+    );
+  });
+
   const draftAsk = ask(
     {
       title: "PR comment",
@@ -366,7 +392,7 @@ describe("answerFor and answerText", () => {
   );
 
   it("a note and an edited draft give the exact wake text, in order", () => {
-    const answer = Asks.answerFor(
+    const answer = answerFor(
       card([draftAsk]),
       draftAsk,
       {
@@ -398,7 +424,7 @@ describe("answerFor and answerText", () => {
 
   it("an untouched draft says so, and trailing whitespace is not an edit", () => {
     for (const finalDraft of [undefined, "Thanks, fixed in abc123.\n"]) {
-      const answer = Asks.answerFor(
+      const answer = answerFor(
         card([draftAsk]),
         draftAsk,
         { verdict: "approved", finalDraft },
@@ -415,7 +441,7 @@ describe("answerFor and answerText", () => {
   });
 
   it("a rejection says not to go ahead and never carries a text to post", () => {
-    const answer = Asks.answerFor(
+    const answer = answerFor(
       card([draftAsk]),
       draftAsk,
       { verdict: "rejected", note: "Too curt." },
@@ -441,7 +467,7 @@ describe("answerFor and answerText", () => {
       },
       "When?",
     );
-    const answer = Asks.answerFor(
+    const answer = answerFor(
       card([pickAsk]),
       pickAsk,
       {
@@ -468,7 +494,7 @@ describe("answerFor and answerText", () => {
   it("checks the verdict against the ask", () => {
     const pickAsk = ask({ options: ["A", "B"] });
     const detail = (input: Asks.AskAnswerInput, on = pickAsk) =>
-      problem(Asks.answerFor(card([on]), on, input, owner, LATER)).detail;
+      problem(answerFor(card([on]), on, input, owner, LATER)).detail;
     assert.include(detail({ verdict: "picked" }), "needs optionIds");
     assert.include(
       detail({ verdict: "picked", optionIds: ["zz"] }),
@@ -496,7 +522,7 @@ describe("answerFor and answerText", () => {
     const revised = Asks.reviseAsk(pickable(), { context: "More detail." }, LATER);
     if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
     const stale = problem(
-      Asks.answerFor(
+      answerFor(
         card([revised]),
         revised,
         { verdict: "picked", optionIds: ["o1"], revision: 0 },
@@ -511,7 +537,7 @@ describe("answerFor and answerText", () => {
     );
     assert.isFalse(
       Asks.isAskProblem(
-        Asks.answerFor(
+        answerFor(
           card([revised]),
           revised,
           { verdict: "picked", optionIds: ["o1"], revision: 1 },
@@ -522,10 +548,10 @@ describe("answerFor and answerText", () => {
     );
 
     const expiring = ask({ action: { summary: "Deploy" }, basis: "head abc123", expiresAt: LATER });
-    const before = Asks.answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, AT);
+    const before = answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, AT);
     assert.isFalse(Asks.isAskProblem(before));
     const expired = problem(
-      Asks.answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, LATER),
+      answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, LATER),
     );
     assert.strictEqual(expired.code, "conflict");
     assert.include(expired.detail, "expired at 2026-11-10T11:00:00.000Z");
@@ -533,14 +559,14 @@ describe("answerFor and answerText", () => {
 
     const closed = { ...expiring, closedAt: AT as never };
     assert.strictEqual(
-      problem(Asks.answerFor(card([closed]), closed, { verdict: "approved" }, owner, AT)).code,
+      problem(answerFor(card([closed]), closed, { verdict: "approved" }, owner, AT)).code,
       "conflict",
     );
   });
 
   it("an evaluator's decision on a handed ask is recorded as handed, with what it decided", () => {
     const handed = { ...pickable(), handedAt: AT as never };
-    const answer = Asks.answerFor(
+    const answer = answerFor(
       card([handed]),
       handed,
       { verdict: "picked", optionIds: ["o2"], note: "Cheaper." },
@@ -563,7 +589,7 @@ describe("answerFor and answerText", () => {
   });
 
   it("shows the answer on the pick block for clients that only read the discussion", () => {
-    const approve = Asks.answerFor(
+    const approve = answerFor(
       card([draftAsk]),
       draftAsk,
       { verdict: "approved", note: "ok" },
@@ -576,7 +602,7 @@ describe("answerFor and answerText", () => {
       text: "ok",
     });
     const plain = ask();
-    const words = Asks.answerFor(
+    const words = answerFor(
       card([plain]),
       plain,
       { verdict: "answered", text: "Friday" },

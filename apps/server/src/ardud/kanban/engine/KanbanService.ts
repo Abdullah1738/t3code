@@ -8540,6 +8540,9 @@ const make = Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
         const ask = yield* openAskOf(card, askId);
+        // Read beside the ask, so held to the ask's sizes, whoever writes it.
+        const tooBig = Asks.replyBlocksProblem(blocks);
+        if (tooBig) return yield* failWith(tooBig.code, tooBig.detail);
         const discussion = yield* cardDiscussionUnlocked(card.id);
         // Never routed as an owner reply: that would answer every open ask on the card.
         const message = yield* postUnlocked(

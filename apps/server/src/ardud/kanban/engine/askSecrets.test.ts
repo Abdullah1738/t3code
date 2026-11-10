@@ -2,6 +2,7 @@
  * A secret field on an ask: the owner types the value in the app's private
  * field, it is held in memory, and the agent that asked gets a one-use ref.
  */
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   KANBAN_ASK_SECRET_PROVIDED,
@@ -13,7 +14,7 @@ import {
   kanbanAskResponse,
   type KanbanActor,
 } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
+import { makeLocalFileTracer, type TraceRecord } from "@t3tools/shared/observability";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -26,6 +27,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
+import * as ServerConfig from "../../../config.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import { featureUsage } from "../../../telemetry/FeatureUsage.ts";
@@ -122,33 +124,69 @@ const dumpDatabase = Effect.gen(function* () {
   return rows.join("\n");
 });
 
-/** Every file under the server's state directory, as text. */
+/**
+ * Every file under the test server's base directory, as text: its state
+ * directory (the secret store, attachments, logs, settings) and its caches.
+ * The database is in memory and is read by `dumpDatabase`.
+ */
 const dumpFiles = Effect.gen(function* () {
+  const config = yield* ServerConfig.ServerConfig;
   const store = yield* ServerSecretStore.ServerSecretStore;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  if (store.directory === undefined) return { names: [] as Array<string>, text: "" };
-  const names = yield* fs.readDirectory(store.directory, { recursive: true });
+  const names = yield* fs.readDirectory(config.baseDir, { recursive: true });
   const texts = yield* Effect.forEach(names, (name) =>
-    fs.readFile(path.join(store.directory!, name)).pipe(
+    fs.readFile(path.join(config.baseDir, name)).pipe(
       Effect.map((bytes) => Buffer.from(bytes).toString("utf8")),
+      // A directory has no bytes of its own.
       Effect.orElseSucceed(() => ""),
     ),
   );
-  return { names, text: texts.join("\n") };
+  // The secret store is one of the directories this walked.
+  const inside =
+    store.directory !== undefined &&
+    !path.relative(config.baseDir, store.directory).startsWith("..");
+  return { names, text: texts.join("\n"), coversSecretStore: inside };
 });
 
-const text = (value: unknown) => JSON.stringify(value) ?? "";
+/** JSON for anything a log or trace holds, bigints included. */
+const text = (value: unknown) =>
+  JSON.stringify(value, (_key, entry: unknown) =>
+    typeof entry === "bigint" ? entry.toString() : entry,
+  ) ?? "";
 
+/**
+ * What this test reads for the value: the answer handler's reply and refusals
+ * (the function `secrets.answerAsk` runs, called directly), the board's reads
+ * and HTTP routes, the discussion, every thread message, every database row,
+ * every file under the test server's base directory, every log record (message,
+ * cause, annotations and log spans) and every span the server's own tracer
+ * records. It does not go through the RPC layer: decoding, the authorization
+ * and instrumentation middleware and the reply's serialization are covered by
+ * the `secrets.answerAsk` case in `ws.test.ts`.
+ */
 it.effect(
-  "a secret typed into an ask reaches the asker as a one-use ref, and the value shows up nowhere",
+  "a secret typed into an ask reaches the asker as a one-use ref; the value is in no handler reply, board read, stored row, file, log record or trace span",
   () =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
+      // The whole record a logger gets: message, cause, annotations and log spans.
       const logs: Array<string> = [];
-      const logger = Logger.make<unknown, void>((entry) => {
-        logs.push(`${text(entry.message)} ${Cause.pretty(entry.cause)}`);
-      });
+      const logger = Logger.map(Logger.formatStructured, (record) => void logs.push(text(record)));
+      // The server's own tracer, writing to memory what it would write to the trace file.
+      const traced: Array<TraceRecord> = [];
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1_000_000,
+        maxFiles: 1,
+        batchWindowMs: 0,
+        sink: {
+          filePath: "unused",
+          push: (record) => void traced.push(record),
+          flush: Effect.void,
+          close: () => Effect.void,
+        },
+      }).pipe(Effect.provide(NodeServices.layer));
       yield* Effect.scoped(
         Effect.gen(function* () {
           const { card, worker, threadId } = yield* workingCard("Fees");
@@ -203,7 +241,7 @@ it.effect(
 
           const before = (yield* fake.heard(threadId)).length;
           const reply = yield* answer(input(card.id), ownerApp);
-          seen.push(["rpc reply", text(reply)]);
+          seen.push(["answer handler reply", text(reply)]);
 
           // The stored answer says only that he gave it.
           const stored = (yield* kanban.card(card.id)).card;
@@ -246,8 +284,14 @@ it.effect(
           seen.push(["thread messages", text(everyThread)]);
           seen.push(["database", yield* dumpDatabase]);
           const files = yield* dumpFiles;
-          seen.push(["files on disk", files.text]);
-          seen.push(["logs", logs.join("\n")]);
+          seen.push(["files under the base directory", files.text]);
+          // A record logged here, to show the capture holds annotations and log spans.
+          yield* Effect.logInfo("leak-probe").pipe(
+            Effect.annotateLogs({ probe: "probe-annotation" }),
+            Effect.withLogSpan("probe-log-span"),
+          );
+          seen.push(["log records", logs.join("\n")]);
+          seen.push(["trace spans", text(traced)]);
 
           // Memory only: no saved-request file was written for it.
           assert.deepStrictEqual(
@@ -261,17 +305,29 @@ it.effect(
               `part of the value shows in: ${where}`,
             );
           }
-          // The outputs were real: they do hold the rest of the answer.
-          assert.include(seen.find(([where]) => where === "database")![1], "staging");
-          assert.include(seen.find(([where]) => where === "card detail")![1], '"secret":true');
+          // The outputs were real: they do hold the rest of the answer, and what was looked
+          // for in logs, spans and files was there to look through.
+          const read = (name: string) => seen.find(([where]) => where === name)![1];
+          assert.include(read("database"), "staging");
+          assert.include(read("card detail"), '"secret":true');
+          assert.include(read("log records"), "probe-annotation");
+          assert.include(read("log records"), "probe-log-span");
+          assert.isAbove(traced.length, 0);
+          assert.isTrue(traced.some((span) => span.name.startsWith("KanbanService.")));
+          assert.isTrue(files.coversSecretStore);
+          assert.isAbove(files.names.length, 0);
 
           // The one place the value comes out: the asking thread's tool call, once.
           assert.strictEqual(yield* redeem(secrets, ref, threadId), SECRET);
           const again = yield* redeem(secrets, ref, threadId).pipe(Effect.flip);
           assert.strictEqual(again.reason, "ref_unavailable");
           assert.include(again.message, "Ask the user again");
+          // Using the ref leaves the value in no log record or span either.
+          assert.isFalse(text(traced).includes(SECRET), "the value shows in a span after use");
+          assert.isFalse(logs.join("\n").includes(SECRET), "the value shows in a log after use");
         }),
       ).pipe(
+        Effect.withTracer(tracer),
         Effect.provide(
           Layer.merge(layer(fake.layer), Logger.layer([logger], { mergeWithExisting: false })),
         ),
