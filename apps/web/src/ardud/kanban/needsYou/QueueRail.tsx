@@ -161,7 +161,7 @@ export function QueueRail(props: QueueRailProps) {
               </button>
             </div>
           ) : (
-            <p className="px-2.5 pt-4 text-sm text-(--m-muted)">Nothing waits on you.</p>
+            <p className="px-2.5 pt-4 text-sm text-(--m-muted)">No asks</p>
           )
         ) : (
           sections.map((section) => (
