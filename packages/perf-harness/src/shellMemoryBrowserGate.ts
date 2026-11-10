@@ -510,7 +510,9 @@ for (const result of results) {
   if (result.crashed) failures.push(`${result.name}: renderer crashed`);
   if (result.completeMs === null) failures.push(`${result.name}: list never completed`);
   else if (result.cachedRows !== serverRows)
-    failures.push(`${result.name}: client saved ${result.cachedRows} rows, server has ${serverRows}`);
+    failures.push(
+      `${result.name}: client saved ${result.cachedRows} rows, server has ${serverRows}`,
+    );
   if (result.peakUsedMb > maxPeakMb)
     failures.push(`${result.name}: peak ${result.peakUsedMb.toFixed(0)} MB > ${maxPeakMb}`);
   if (result.retainedMb !== null && result.retainedMb > maxRetainedMb)

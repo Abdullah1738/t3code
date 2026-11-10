@@ -3728,9 +3728,9 @@ export default function Sidebar() {
     if (source === undefined) return createSidebarCollisionDetection(() => false);
     return createSidebarCollisionDetection(
       (id) => {
-        const drop = resolveSidebarDropTarget(sidebarListItems, draggedThreadKey, id);
-        if (drop === null) return false;
-        const target = withWholeActiveOrder(drop, activeKeys, draggedThreadKey);
+        const dropTarget = resolveSidebarDropTarget(sidebarListItems, draggedThreadKey, id);
+        if (dropTarget === null) return false;
+        const target = withWholeActiveOrder(dropTarget, activeKeys, draggedThreadKey);
         return (
           planSidebarThreadDrop({
             activeKey: draggedThreadKey,
@@ -3760,11 +3760,12 @@ export default function Sidebar() {
   const handleThreadDragEnd = (event: DragEndEvent) => {
     const activeKey = String(event.active.id);
     const activeSection = sectionByThreadKey.get(activeKey);
-    const drop =
+    const dropTarget =
       event.over === null
         ? null
         : resolveSidebarDropTarget(sidebarListItems, activeKey, String(event.over.id));
-    const target = drop === null ? null : withWholeActiveOrder(drop, activeKeys, activeKey);
+    const target =
+      dropTarget === null ? null : withWholeActiveOrder(dropTarget, activeKeys, activeKey);
     const activeThread = threadByKey.get(activeKey);
     if (activeSection === undefined || target === null || activeThread === undefined) return;
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
