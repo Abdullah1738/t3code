@@ -56,7 +56,7 @@ const background = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(SqliteClient.readOnly, SqliteClient.backgroundReads);
 
 // Records the lane/slot each read used, from its span attributes.
-const spanAttributes = (effect: Effect.Effect<unknown, unknown, never>) =>
+const spanAttributes = <A, E>(effect: Effect.Effect<A, E>) =>
   Effect.gen(function* () {
     const spans: Array<Record<string, unknown>> = [];
     const tracer = Tracer.make({
