@@ -1926,8 +1926,13 @@ it.effect("a reviewer's verdict after it lost its slot counts until the card mov
         return { card, reviewThread };
       });
 
-      // The dispatcher flags a reviewer that ended twice without a verdict.
+      // A reviewer that ends twice without a verdict has its review started again
+      // once; the dispatcher flags it when that ends twice without one too.
       const quiet = yield* toReview("A");
+      yield* kanban.turnEnded(quiet.reviewThread);
+      yield* kanban.turnEnded(quiet.reviewThread);
+      assert.isNull((yield* kanban.card(quiet.card.id)).card.stalled);
+      yield* kanban.dispatchNow;
       yield* kanban.turnEnded(quiet.reviewThread);
       yield* kanban.turnEnded(quiet.reviewThread);
       let card = (yield* kanban.card(quiet.card.id)).card;
@@ -1998,6 +2003,10 @@ const chainStepOneLostSlot = (flag: "dispatcher" | "self") =>
     const reviewThread = (yield* kanban.card(created.id)).card.activeThreadId!;
 
     if (flag === "dispatcher") {
+      // Reminder, one restart of the review, reminder, flag.
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.turnEnded(reviewThread);
+      yield* kanban.dispatchNow;
       yield* kanban.turnEnded(reviewThread);
       yield* kanban.turnEnded(reviewThread);
       assert.strictEqual(
@@ -12438,6 +12447,14 @@ it.effect(
         card = (yield* kanban.card(cardId)).card;
         assert.isNotNull(card.nudgedAt);
         assert.strictEqual(yield* verdictNudges(fake, reviewThread), 1);
+        // Still no verdict: the review is started again once, reminded once more, then flagged.
+        yield* kanban.turnEnded(reviewThread);
+        card = (yield* kanban.card(cardId)).card;
+        assert.strictEqual(card.stage, "needs_review");
+        assert.isNull(card.stalled);
+        yield* kanban.dispatchNow;
+        yield* kanban.turnEnded(reviewThread);
+        assert.strictEqual(yield* verdictNudges(fake, reviewThread), 2);
         yield* kanban.turnEnded(reviewThread);
         card = (yield* kanban.card(cardId)).card;
         assert.strictEqual(card.stage, "needs_review");
@@ -12477,6 +12494,18 @@ it.effect("the tick catches a reviewer whose turn end was skipped", () =>
       assert.strictEqual(yield* verdictNudges(fake, reviewThread), 1);
       yield* kanban.tick;
       assert.strictEqual(yield* verdictNudges(fake, reviewThread), 1);
+      // Half an hour on with no verdict, the tick starts the review again once.
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      yield* kanban.dispatchNow;
+      const restarted = (yield* kanban.card(cardId)).card;
+      assert.strictEqual(restarted.stage, "in_review");
+      assert.strictEqual(restarted.activeThreadId, reviewThread);
+      assert.isNull(restarted.stalled);
+      // The restarted review gets its own reminder, then the flag.
+      yield* TestClock.adjust("31 minutes");
+      yield* kanban.tick;
+      assert.strictEqual(yield* verdictNudges(fake, reviewThread), 2);
       yield* TestClock.adjust("31 minutes");
       yield* kanban.tick;
       const card = (yield* kanban.card(cardId)).card;

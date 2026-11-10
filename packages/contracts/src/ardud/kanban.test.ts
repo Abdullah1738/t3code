@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -5,19 +6,26 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanCard,
   KanbanCardEvent,
   kanbanAwaitsMerge,
   kanbanBlocking,
   kanbanBoardIcon,
+  kanbanCardFlow,
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
+  kanbanPickOrder,
+  kanbanRetryNotBefore,
+  kanbanRetrying,
+  kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
+  KANBAN_AGING_STEP_MS,
+  KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
   KanbanSubtask,
   KanbanThreadLink,
-  type KanbanCard,
 } from "./kanban.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
@@ -65,6 +73,68 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
   };
 }
 
+const decodeCard = Schema.decodeUnknownSync(KanbanCard);
+const encodeCard = Schema.encodeSync(KanbanCard);
+
+describe("KanbanCard retries", () => {
+  const stored = JSON.parse(JSON.stringify(card("a")));
+
+  it("loads a card stored before retries existed unchanged, with no retry record", () => {
+    expect("retries" in stored).toBe(false);
+    const decoded = decodeCard(stored);
+    expect(decoded.retries).toBeUndefined();
+    expect(kanbanRetrying(decoded)).toBeUndefined();
+    expect(encodeCard(decoded)).toEqual(stored);
+  });
+
+  it("keeps a retry record through storage, and shows it until the card is flagged", () => {
+    const retry = {
+      kind: "run_failed",
+      role: "work",
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at: "2026-11-10T10:00:00.000Z",
+      state: "waiting",
+    };
+    const decoded = decodeCard(JSON.parse(JSON.stringify({ ...stored, retries: [retry] })));
+    expect(decoded.retries).toEqual([retry]);
+    expect(encodeCard(decoded).retries).toEqual([retry]);
+    expect(kanbanRetrying(decoded)).toEqual(retry);
+    expect(
+      kanbanRetrying({
+        ...decoded,
+        stalled: { reason: "Run failed: x", by: { _tag: "owner" }, at: decoded.createdAt },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("says when a failed run's card may start again, and nothing for other cards", () => {
+    const at = "2026-11-10T10:00:00.000Z";
+    const waiting = {
+      kind: "run_failed",
+      role: "work",
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at,
+      state: "waiting",
+    } as const;
+    expect(kanbanRetryNotBefore({ retries: undefined })).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [] })).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [waiting] })).toBe(
+      Date.parse(at) + KANBAN_RETRY_BACKOFF_MS,
+    );
+    // A review started again at once waits for nothing; a stamp that doesn't parse holds nothing back.
+    expect(
+      kanbanRetryNotBefore({
+        retries: [
+          { ...waiting, kind: "no_verdict", role: "review", runId: null, state: "restarted" },
+        ],
+      }),
+    ).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [{ ...waiting, at: "not a time" }] })).toBeNull();
+  });
+});
+
 describe("KanbanCardEvent", () => {
   it("decodes an event stored before head existed as head null", () => {
     const event = Schema.decodeUnknownSync(KanbanCardEvent)({
@@ -106,6 +176,216 @@ describe("kanbanBlocking", () => {
     ]);
     expect(blocking.get("a")).toEqual({ holds: 0, urgency: 3 });
     expect(blocking.get("c")).toEqual({ holds: 1, urgency: KANBAN_BACKLOG });
+  });
+});
+
+/** The walk kanbanBlocking used before the single-pass graph: one breadth-first search per open card. */
+function blockingByWalk(cards: ReadonlyArray<KanbanCard>) {
+  const isOpen = (c: KanbanCard) =>
+    !["completed", "deployed", "verified"].includes(c.stage) && c.settledAt === null;
+  const byId = new Map(cards.map((c) => [c.id as string, c]));
+  const waiters = new Map<string, Array<string>>();
+  for (const c of cards) {
+    if (!isOpen(c) || c.priority === KANBAN_BACKLOG) continue;
+    for (const id of c.blockedBy) waiters.set(id, [...(waiters.get(id) ?? []), c.id]);
+  }
+  const result = new Map<string, { holds: number; urgency: number }>();
+  for (const c of cards) {
+    if (!isOpen(c)) continue;
+    const seen = new Set<string>([c.id]);
+    const queue: Array<string> = [c.id];
+    let urgency: number = c.priority;
+    for (let i = 0; i < queue.length; i += 1) {
+      for (const id of waiters.get(queue[i] ?? "") ?? []) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        queue.push(id);
+        urgency = Math.min(urgency, byId.get(id)?.priority ?? urgency);
+      }
+    }
+    result.set(c.id, {
+      holds: seen.size - 1,
+      urgency: c.priority === KANBAN_BACKLOG ? KANBAN_BACKLOG : urgency,
+    });
+  }
+  return result;
+}
+
+/** A small seeded generator, so a failing board can be rebuilt. */
+const seeded = (seed: number) => () => {
+  seed = (seed * 1664525 + 1013904223) >>> 0;
+  return seed / 2 ** 32;
+};
+
+describe("kanbanBlocking on one pass", () => {
+  it("matches a walk per card on random boards with loops, done, settled and backlog cards", () => {
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const random = seeded(seed);
+      const size = 5 + Math.floor(random() * 70);
+      const ids = Array.from({ length: size }, (_, i) => `c${i}`);
+      const cards = ids.map((id) => {
+        const blockedBy = Array.from({ length: Math.floor(random() * 4) }, () =>
+          // Any card, itself and later ones included: loops and self-blocks are part of the test.
+          random() < 0.05 ? "missing" : ids[Math.floor(random() * size)]!,
+        );
+        const roll = random();
+        return card(id, {
+          blockedBy,
+          priority: 1 + Math.floor(random() * 5),
+          stage: roll < 0.15 ? "completed" : roll < 0.3 ? "working" : "todo",
+          settledAt: random() < 0.05 ? "2026-10-26T10:00:00.000Z" : null,
+        });
+      });
+      expect([...kanbanBlocking(cards)], `seed ${seed}`).toEqual([...blockingByWalk(cards)]);
+    }
+  });
+
+  it("counts every member of a loop for the others, and the cards behind the loop", () => {
+    const blocking = kanbanBlocking([
+      card("a", { blockedBy: ["c"] }),
+      card("b", { blockedBy: ["a"] }),
+      card("c", { blockedBy: ["b"], priority: 2 }),
+      card("tail", { blockedBy: ["b"], priority: 1 }),
+    ]);
+    expect(blocking.get("a")).toEqual({ holds: 3, urgency: 1 });
+    expect(blocking.get("b")).toEqual({ holds: 3, urgency: 1 });
+    expect(blocking.get("tail")).toEqual({ holds: 0, urgency: 1 });
+  });
+
+  it("walks a chain thousands of cards long without recursing", () => {
+    const cards = Array.from({ length: 20_000 }, (_, i) =>
+      card(`c${i}`, { blockedBy: i === 0 ? [] : [`c${i - 1}`] }),
+    );
+    const blocking = kanbanBlocking(cards);
+    expect(blocking.get("c0")?.holds).toBe(19_999);
+    expect(blocking.get("c19999")?.holds).toBe(0);
+  });
+
+  it("past its memory limit gives upper bounds instead of failing", () => {
+    // A diamond: d is reached from a along two paths.
+    const cards = [
+      card("a"),
+      card("b", { blockedBy: ["a"] }),
+      card("c", { blockedBy: ["a"], priority: 1 }),
+      card("d", { blockedBy: ["b", "c"] }),
+    ];
+    const exact = kanbanSchedule(cards);
+    expect(exact.get("a")?.holds).toBe(3);
+    const bounded = kanbanSchedule(cards, { maxWords: 0 });
+    expect(bounded.get("b")?.holds).toBe(1);
+    // d counted once through b and once through c, capped at the other open cards.
+    expect(bounded.get("a")?.holds).toBe(3);
+    expect(bounded.get("a")?.urgency).toBe(1);
+    const wide = [...cards, card("e", { blockedBy: ["d"] })];
+    expect(kanbanSchedule(wide, { maxWords: 0 }).get("a")?.holds).toBe(4);
+  });
+});
+
+describe("kanbanSchedule", () => {
+  const day = 24 * 60 * 60 * 1000;
+  const at = (ms: number) =>
+    DateTime.formatIso(DateTime.makeUnsafe(Date.parse("2026-10-25T10:00:00.000Z") + ms));
+
+  it("lifts a card one step at 10 held-up cards and two at 100, never above P2", () => {
+    const fan = (id: string, count: number, priority: number) => [
+      card(id, { priority }),
+      ...Array.from({ length: count }, (_, i) =>
+        card(`${id}-w${i}`, { blockedBy: [id], priority: 4 }),
+      ),
+    ];
+    const schedule = kanbanSchedule([
+      ...fan("nine", 9, 4),
+      ...fan("ten", 10, 4),
+      ...fan("hundred", 100, 4),
+      ...fan("three", 100, 3),
+      ...fan("one", 100, 1),
+    ]);
+    expect(schedule.get("nine")).toMatchObject({ holds: 9, rank: 4, fanoutSteps: 0 });
+    expect(schedule.get("ten")).toMatchObject({ holds: 10, rank: 3, fanoutSteps: 1 });
+    expect(schedule.get("hundred")).toMatchObject({ holds: 100, rank: 2, fanoutSteps: 2 });
+    expect(schedule.get("three")).toMatchObject({ rank: 2, fanoutSteps: 2 });
+    expect(schedule.get("one")).toMatchObject({ rank: 1 });
+  });
+
+  it("ages a startable To-Do card one step per 3 days, at most two, never above P2", () => {
+    const cards = [
+      card("fresh", { priority: 4, movedAt: at(8 * day) }),
+      card("three", { priority: 4, movedAt: at(6 * day) }),
+      card("week", { priority: 4, movedAt: at(0) }),
+      card("p3", { priority: 3, movedAt: at(0) }),
+      card("p2", { priority: 2, movedAt: at(0) }),
+      card("backlog", { priority: KANBAN_BACKLOG, movedAt: at(0) }),
+      card("working", { priority: 4, stage: "working", movedAt: at(0) }),
+    ];
+    const schedule = kanbanSchedule(cards, { nowMs: Date.parse(at(9 * day)) });
+    expect(schedule.get("fresh")).toMatchObject({ rank: 4, agingSteps: 0 });
+    expect(schedule.get("three")).toMatchObject({ rank: 3, agingSteps: 1 });
+    expect(schedule.get("week")).toMatchObject({ rank: 2, agingSteps: 2 });
+    expect(schedule.get("p3")).toMatchObject({ rank: 2, agingSteps: 2 });
+    expect(schedule.get("p2")).toMatchObject({ rank: 2 });
+    expect(schedule.get("backlog")).toMatchObject({ rank: KANBAN_BACKLOG });
+    expect(schedule.get("working")).toMatchObject({ rank: 4, agingSteps: 0, waitingSince: null });
+  });
+
+  it("counts waiting from when the last blocker finished, and not at all while one is open", () => {
+    const cards = [
+      card("done", { stage: "deployed", movedAt: at(8 * day) }),
+      card("open", { stage: "working", movedAt: at(0) }),
+      card("unblocked", { priority: 4, blockedBy: ["done", "gone"], movedAt: at(0) }),
+      card("blocked", { priority: 4, blockedBy: ["open"], movedAt: at(0) }),
+    ];
+    const schedule = kanbanSchedule(cards, { nowMs: Date.parse(at(9 * day)) });
+    expect(schedule.get("unblocked")).toMatchObject({ agingSteps: 0, waitingSince: at(8 * day) });
+    expect(schedule.get("blocked")).toMatchObject({ agingSteps: 0, waitingSince: null });
+    const later = kanbanSchedule(cards, { nowMs: Date.parse(at(11 * day)) });
+    expect(later.get("unblocked")).toMatchObject({ agingSteps: 1, rank: 3 });
+  });
+
+  it("with no clock given measures against the board's newest card stamp", () => {
+    const old = card("old", { priority: 4, movedAt: at(0), updatedAt: at(0) });
+    const touched = card("touched", { updatedAt: at(KANBAN_AGING_STEP_MS) });
+    expect(kanbanSchedule([old]).get("old")?.agingSteps).toBe(0);
+    expect(kanbanSchedule([old, touched]).get("old")?.agingSteps).toBe(1);
+    expect(kanbanSchedule([]).size).toBe(0);
+  });
+
+  it("orders by rank, then held-up cards, then the longest wait, then number", () => {
+    const cards = [
+      card("young", { movedAt: at(2), number: 1 }),
+      card("old", { movedAt: at(1), number: 2 }),
+      card("twin", { movedAt: at(1), number: 3 }),
+      card("holder", { movedAt: at(3), number: 4 }),
+      card("waiter", { blockedBy: ["holder"], movedAt: at(0), priority: 4, number: 5 }),
+      card("urgent", { priority: 1, movedAt: at(4), number: 6 }),
+    ];
+    const order = cards
+      .filter((c) => c.blockedBy.length === 0)
+      .toSorted(kanbanPickOrder(cards))
+      .map((c) => c.id);
+    expect(order).toEqual(["urgent", "holder", "old", "twin", "young"]);
+  });
+});
+
+describe("kanbanCardFlow", () => {
+  it("says what a card unblocks, whether it is ready and which unfinished cards it waits on", () => {
+    const cards = [
+      card("a"),
+      card("b", { blockedBy: ["a", "shipped"] }),
+      card("c", { blockedBy: ["b"] }),
+      card("shipped", { stage: "deployed" }),
+      card("flagged", {
+        stalled: { reason: "x", by: { _tag: "owner" }, at: "2026-10-25T10:00:00.000Z" },
+      }),
+    ];
+    const byId = new Map(cards.map((c) => [c.id as string, c]));
+    const schedule = kanbanSchedule(cards);
+    const flow = (id: string) => kanbanCardFlow(byId.get(id)!, byId, schedule);
+    expect(flow("a")).toMatchObject({ unblocks: 2, ready: true, waitsOn: [], rank: 3 });
+    expect(flow("b")).toMatchObject({ unblocks: 1, ready: false });
+    expect(flow("b").waitsOn.map((c) => c.id)).toEqual(["a"]);
+    expect(flow("b").heldUpBy?.id).toBe("a");
+    expect(flow("flagged").ready).toBe(false);
+    expect(flow("shipped")).toMatchObject({ unblocks: 0, ready: false, waitsOn: [] });
   });
 });
 
