@@ -14,10 +14,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .common import OffboxError, EXIT_INFRA, db, iso_ts, log
+from .common import OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log
 from . import capacity
 
-API = os.environ.get("OFFBOX_BOAT_API", "https://boat.dev/api/v1")
+BACKEND = backend()
+
+
+def _server_url() -> str:
+    try:
+        return json.loads(SERVER_CFG.read_text())["url"].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        return "http://offbox-server:8443/api/v1"
+
+
+# Our own server (boatd) answers the same REST calls as boat.dev did; see integrations/offbox/server/boatd.py.
+API = os.environ.get("OFFBOX_BOAT_API") or (_server_url() if BACKEND == "server" else "https://boat.dev/api/v1")
+KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
@@ -28,11 +40,11 @@ REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 def _key() -> str:
     global _KEY
     if _KEY is None:
-        p = subprocess.run(["security", "find-generic-password", "-s", "boat-api", "-a", "ardud", "-w"],
+        p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", "ardud", "-w"],
                            capture_output=True, text=True)
         k = p.stdout.strip()
         if p.returncode != 0 or not k:
-            raise OffboxError("boat API key missing from Keychain (boat-api/ardud)")
+            raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/ardud)")
         _KEY = k
     return _KEY
 
@@ -628,10 +640,13 @@ def cmd_sync(box_id: str, command: str, timeout: int = 60, cwd: str | None = Non
     return call("POST", f"/sandboxes/{box_id}/commands", body, timeout=timeout + 30, retries=0)
 
 
-def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
+def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | None = None) -> dict:
+    """meta (repo, kind, run_id) lets the server group per-run resource numbers; boat ignored unknown fields."""
     body = {"command": command, "detached": True}
     if cwd:
         body["cwd"] = cwd
+    if meta and BACKEND == "server":
+        body["meta"] = meta
     return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
 
 

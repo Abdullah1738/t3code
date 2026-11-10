@@ -1,0 +1,15 @@
+[Unit]
+Description=boatd: offbox server API (boat.dev-compatible) over Incus
+After=network-online.target tailscaled.service incus.service
+Wants=network-online.target
+Requires=incus.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/boatd/boatd.py serve
+Restart=always
+RestartSec=5
+# Commands run in their own transient units (systemd-run), so restarting boatd never kills a run.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

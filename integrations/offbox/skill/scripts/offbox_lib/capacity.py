@@ -10,7 +10,11 @@ import sqlite3
 
 from .common import IDLE_STOP_S, OffboxError, db, event, iso, now
 
-WINDOWS = ((60, "MINUTE", 25), (3600, "HOUR", 180), (86400, "DAY", 760))
+from .common import backend
+
+# boat.dev start limits. Our own server has none (starts are free), so the local windows are effectively off there.
+WINDOWS = ((60, "MINUTE", 25), (3600, "HOUR", 180), (86400, "DAY", 760)) if backend() == "boat" else \
+    ((60, "MINUTE", 100000), (3600, "HOUR", 1000000), (86400, "DAY", 10000000))
 
 
 class CapacityError(OffboxError):

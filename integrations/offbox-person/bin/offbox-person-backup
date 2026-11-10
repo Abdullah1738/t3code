@@ -2,7 +2,8 @@
 # offbox-person-backup <person>|--all [--force] [--after-stop]
 #
 # Backs up a person's box home to Dropbox so a lost lease never loses her data:
-#   1. pick her lease (or her saved base once no lease is left) and its latest boat snapshot
+#   1. pick her lease (or her saved base once no lease is left) and its latest snapshot (a ZFS snapshot on our
+#      offbox server, read through a read-only mount over root ssh; boat.dev's snapshot API on the boat backend)
 #   2. skip when that snapshot id is the one the last successful backup used (--force overrides)
 #   3. pull her home from the snapshot, minus runtimes and caches that box/setup.sh reinstalls, onto a
 #      throwaway encrypted disk image whose key exists only in this process
@@ -36,6 +37,12 @@ POLL="${OFFBOX_PERSON_POLL:-10}"
 export RESTIC_PASSWORD_COMMAND="${OFFBOX_PERSON_RESTIC_PASSWORD_COMMAND:-security find-generic-password -s restic-offbox-person -a ardud -w}"
 export RESTIC_CACHE_DIR="$ROOT/.restic-cache"
 BOX_HOME=/home/user
+# Backend: our own offbox server (default) or boat.dev, same switch as offbox (~/.local/share/offbox/backend).
+BACKEND="${OFFBOX_BACKEND:-$(cat "$HOME/.local/share/offbox/backend" 2>/dev/null)}"
+[ "$BACKEND" = boat ] || BACKEND=server
+OFFBOX_LIB="${OFFBOX_PERSON_OFFBOX_LIB:-$HOME/.config/opencode/skills/remote-compute/scripts}"
+# Root on the server, for read-only mounts of her box's ZFS snapshots (key ~/.ssh/offbox_server).
+SERVER_SSH="${OFFBOX_PERSON_SERVER_SSH:-ssh -F $HOME/.local/share/offbox/server-admin.sshconfig offbox-server-root}"
 # Reinstalled by box/setup.sh or plain caches: about 1.3 GB of the home that holds none of her data.
 # person/wiki is a read-only clone of the life wiki, which has its own GitHub and Dropbox copies.
 # person/bin (himalaya, ortie) is not reinstalled by setup.sh, so it is backed up.
@@ -365,7 +372,27 @@ PY
 ) || fail box "no lease or saved base for $P"
 
 # 2. after down/save: wait until boat has stopped the box, which takes its final snapshot first
-if [ "$AFTER_STOP" = 1 ]; then
+api_get() {  # GET an offbox server API path; prints the JSON (key from Keychain via offbox_lib, never printed)
+  "$PY" - "$OFFBOX_LIB" "$1" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from offbox_lib import api
+print(json.dumps(api.call("GET", sys.argv[2], ok404=True) or {}))
+PY
+}
+export -f api_get
+export PY OFFBOX_LIB
+if [ "$AFTER_STOP" = 1 ] && [ "$BACKEND" = server ]; then
+  waited=0
+  while :; do
+    st=
+    call "$CALL_TIMEOUT" "$TMP/info.json" bash -c 'api_get "$1"' _ "/sandboxes/$BOX" \
+      && st=$("$PY" -c 'import json, sys; print((json.load(open(sys.argv[1])).get("sandbox") or {}).get("state"))' "$TMP/info.json")
+    [ "$st" = archived ] && break
+    if [ "$waited" -ge "$STOP_WAIT" ]; then log "box still '$st' after ${waited}s; using its latest snapshot"; break; fi
+    sleep "$POLL"; waited=$((waited + POLL))
+  done
+elif [ "$AFTER_STOP" = 1 ]; then
   waited=0
   while :; do
     st=
@@ -385,7 +412,15 @@ fi
 
 # 3. latest content snapshot and the parts of the home to pull. `snapshot latest` can return a no-op snapshot
 # (new id, no tree) every few minutes; `tree` names the snapshot that holds the files.
+plan_server() {
+  call "$CALL_TIMEOUT" "$TMP/latest.json" bash -c 'api_get "$1"' _ "/sandboxes/$BOX/snapshots/latest" || fail snapshot "no snapshot for $BOX"
+  SNAP=$("$PY" -c 'import json, sys; print((json.load(open(sys.argv[1])).get("snapshot") or {}).get("id") or "")' "$TMP/latest.json")
+  [ -n "$SNAP" ] || fail snapshot "$BOX has no snapshot yet"
+  EXPECT=-2  # counted from the mounted snapshot at pull time
+  plan=$SNAP
+}
 plan_tree() {
+  [ "$BACKEND" = server ] && { plan_server; return; }
   call "$CALL_TIMEOUT" "$TMP/tree.json" "$BOAT" snapshot tree "$BOX" --json || fail snapshot "boat snapshot tree $BOX failed"
   plan=$("$PY" - "$SKIP" "$TMP/tree.json" "$TMP/want" <<'PY'
 import json, sys
@@ -447,10 +482,38 @@ if [ "$FORCE" = 0 ] && [ "$SNAP" = "$(prev_field last_boat_snapshot)" ]; then
   exit 0
 fi
 
+# 5s. server: mount the ZFS snapshot read-only on the server, list it, rsync the home minus SKIP into the stage.
+pull_server() {
+  local mnt
+  mnt=$($SERVER_SSH "python3 /opt/boatd/boatd.py snap-mount $BOX $SNAP" 2>/dev/null | tail -1) || return 1
+  case $mnt in /run/boatd-snap/*) ;; *) return 1 ;; esac
+  local ex=() s
+  for s in $SKIP; do ex+=(--exclude "/$s"); done
+  # The file list the pull must match (same excludes), in code-point order.
+  $SERVER_SSH "cd $mnt$BOX_HOME && find . -type f $(for s in $SKIP; do printf -- "-not -path ./%s -not -path './%s/*' " "$s" "$s"; done)" \
+    2>/dev/null | sed 's|^\./||' | LC_ALL=C sort > "$TMP/want" || { $SERVER_SSH "python3 /opt/boatd/boatd.py snap-umount $BOX" >/dev/null 2>&1; return 1; }
+  mkdir -p "$STAGE/pull/home"
+  rsync -rlt --delete "${ex[@]}" -e "$SERVER_SSH_RSYNC" "offbox-server-root:$mnt$BOX_HOME/" "$STAGE/pull/home/" >/dev/null 2>&1
+  local rc=$?
+  $SERVER_SSH "python3 /opt/boatd/boatd.py snap-umount $BOX" >/dev/null 2>&1
+  [ $rc -eq 0 ] || [ $rc -eq 24 ]  # 24: files vanished during transfer (not possible on a snapshot; tolerated)
+}
+export -f pull_server
+SERVER_SSH_RSYNC="${SERVER_SSH% offbox-server-root}"
+if [ "$BACKEND" = server ]; then
+  mount_stage || fail stage "could not create the encrypted stage image"
+  export BOX SNAP SKIP BOX_HOME TMP STAGE SERVER_SSH SERVER_SSH_RSYNC
+  call "$PULL_TIMEOUT" "$TMP/pull.out" bash -c pull_server || fail pull "pull of $BOX snapshot $SNAP from the server failed"
+  SRC="$STAGE/pull/home"
+  EXPECT=$(wc -l < "$TMP/want" | tr -d ' ')
+  pulled=1
+fi
+
 # 5. pull. A pull can fail for a moment while boat writes the box's next snapshot, so a failed pull
 # re-reads the tree and tries again, up to three times.
-pulled=0
+[ "$BACKEND" = server ] || pulled=0
 for attempt in 1 2 3; do
+  [ "$BACKEND" = server ] && break
   paths=()
   while IFS= read -r top; do
     [ -n "$top" ] || continue
@@ -468,7 +531,7 @@ for attempt in 1 2 3; do
   plan_tree
 done
 [ "$pulled" = 1 ] || fail pull "boat snapshot pull ${SNAP:0:8} failed 3 times or took over ${PULL_TIMEOUT}s"
-SRC=$("$PY" -c 'import json, sys
+[ "$BACKEND" = server ] || SRC=$("$PY" -c 'import json, sys
 print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])["homeDir"])' "$TMP/pull.json")
 case $SRC in
   "$STAGE/pull"/*) [ -d "$SRC" ] || fail pull "pull of ${SNAP:0:8} produced no home dir" ;;
@@ -493,7 +556,7 @@ chmod -R u+rwX "$SRC"
 excludes=()
 for s in $SKIP; do excludes+=(--exclude "$SRC/$s"); done
 call "$LONG_TIMEOUT" "$TMP/backup.out" nice -n 10 "$RESTIC" backup --host offbox-person --tag "person-$P" \
-  --tag "boat-${SNAP:0:8}" --skip-if-unchanged --ignore-inode --ignore-ctime --json --quiet "${excludes[@]}" "$SRC"
+  --tag "$([ "$BACKEND" = server ] && echo "server-${SNAP:0:24}" || echo "boat-${SNAP:0:8}")" --skip-if-unchanged --ignore-inode --ignore-ctime --json --quiet "${excludes[@]}" "$SRC"
 rc=$?
 summary=$(grep '"message_type":"summary"' "$TMP/backup.out" | tail -1)
 [ $rc -eq 0 ] && [ -n "$summary" ] || fail restic "restic backup rc=$rc"

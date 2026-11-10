@@ -30,6 +30,16 @@ SKILL_DIR = HOME / ".config/opencode/skills/remote-compute"
 TEMPLATES_DIR = SKILL_DIR / "templates"
 TZ = ZoneInfo("Asia/Dubai")
 
+# Backend: "server" = our own offbox server (boatd on the Hetzner box, see integrations/offbox/server), "boat" =
+# boat.dev. Chosen by OFFBOX_BACKEND, else ~/.local/share/offbox/backend, else server. server.json holds the URL.
+BACKEND_PATH = STATE / "backend"
+SERVER_CFG = STATE / "server.json"
+
+
+def backend() -> str:
+    b = os.environ.get("OFFBOX_BACKEND") or (BACKEND_PATH.read_text().strip() if BACKEND_PATH.exists() else "")
+    return b if b in ("server", "boat") else "server"
+
 EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry

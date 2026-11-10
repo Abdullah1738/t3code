@@ -791,7 +791,8 @@ class Runner:
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
         try:
-            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id))
+            r = api.cmd_start(self.box, exit_recording_command(script, self.run_id),
+                              meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id})
         except api.ApiError as e:
             # A 4xx answer (400 E2BIG, 409 not ready, 429 rate limit) means boat refused it: nothing ran.
             # Without this the run sat "starting" for an hour and held the box until it stopped.
@@ -956,6 +957,21 @@ _RUNNING = object()
 
 # Matches outage.WAIT_MAX_S: the auto-stop now holds ~25 min, so a run can ride out an outage that long.
 OUTAGE_FOLLOW_S = 1800
+
+
+def run_kind(cmd_text: str) -> str:
+    """A short label grouping runs for right-sizing on the server: the tool and its subcommand, e.g. `go test`,
+    `make test-int`, `pnpm vitest`. Flags, paths and arguments after the second word are dropped."""
+    try:
+        toks = shlex.split(cmd_text or "", posix=True)
+    except ValueError:
+        toks = (cmd_text or "").split()
+    if len(toks) >= 3 and toks[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and toks[1].startswith("-") \
+            and "c" in toks[1]:
+        return run_kind(toks[2])
+    words = [w for w in toks[:6] if not w.startswith("-") and "=" not in w]
+    words = [w.rsplit("/", 1)[-1] for w in words]
+    return " ".join(words[:2])[:60] or "?"
 
 
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
