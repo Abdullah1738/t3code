@@ -321,35 +321,49 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
     const newLoadId = Effect.all([Clock.currentTimeMillis, Random.nextInt]).pipe(
       Effect.map(([now, salt]) => `${now.toString(36)}-${Math.abs(salt).toString(36)}`),
     );
-    // A journal from an earlier client: same key, still fresh, every page readable, and the
-    // last page's cursor is the one recorded. Anything else starts over.
+    // A journal from an earlier client: same key, still fresh, every page readable, and each
+    // page follows the one before it up to the recorded cursor. Anything else starts over.
+    // The pages are copied under this load's own id, so the load that wrote them (perhaps
+    // still running in another window) and this one never write the same keys.
     const resumeFromJournal = Effect.fnUntraced(function* (
       prepared: PreparedConnection,
       key: string,
       serverVersion: string,
       now: number,
+      loadId: string,
     ) {
       if (Option.isNone(journal)) return undefined;
       // Without a known server build, an upgrade could hand back pages it rewrote.
       if (serverVersion === "") return undefined;
-      const stored = yield* journal.value.read(prepared.environmentId);
+      const environmentId = prepared.environmentId;
+      yield* journal.value.sweep(environmentId, now - SHELL_LOAD_RESUME_MAX_AGE_MS);
+      const stored = yield* journal.value.read(environmentId);
       if (Option.isNone(stored)) return undefined;
       const { value } = stored;
       if (value.key !== key || now - value.updatedAt > SHELL_LOAD_RESUME_MAX_AGE_MS) {
-        yield* journal.value.clear(prepared.environmentId, value.loadId);
         return undefined;
       }
       const pages = yield* Effect.forEach(value.bodies, (body) =>
         decodeJsonBody(body).pipe(Effect.flatMap(decodeShellSnapshotDeferringPullRequests)),
       ).pipe(Effect.option);
       if (Option.isNone(pages) || !isPageChain(pages.value, value.nextAfter)) {
-        yield* journal.value.clear(prepared.environmentId, value.loadId);
+        yield* journal.value.clear(environmentId, value.loadId);
         return undefined;
       }
-      return {
-        progress: { pages: pages.value, nextAfter: value.nextAfter, updatedAt: value.updatedAt },
-        loadId: value.loadId,
-      };
+      yield* Effect.forEach(
+        pages.value,
+        (page, index) =>
+          journal.value.append(environmentId, {
+            key,
+            loadId,
+            index,
+            body: value.bodies[index]!,
+            nextAfter: page.page?.nextAfter ?? value.nextAfter,
+            updatedAt: value.updatedAt,
+          }),
+        { discard: true },
+      );
+      return { pages: pages.value, nextAfter: value.nextAfter, updatedAt: value.updatedAt };
     });
     return ShellSnapshotLoader.of({
       load: Effect.fnUntraced(function* (
@@ -369,9 +383,10 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
         // Valid progress stays until the load finishes or newer progress replaces it, so a
         // resumed load that fails before its next page still resumes next time.
         if (saved !== undefined && inMemory === undefined) progressByConnection.delete(key);
-        const resumed = inMemory ?? (yield* resumeFromJournal(prepared, key, serverVersion, now));
-        const resume = resumed?.progress;
-        const loadId = resumed?.loadId ?? (yield* newLoadId);
+        const loadId = inMemory?.loadId ?? (yield* newLoadId);
+        const resume =
+          inMemory?.progress ??
+          (yield* resumeFromJournal(prepared, key, serverVersion, now, loadId));
         return yield* fetchEnvironmentShellSnapshot({
           prepared,
           signer,

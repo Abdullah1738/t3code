@@ -31,6 +31,8 @@ function memoryStore(options: { readonly failPuts?: () => boolean } = {}) {
         : Effect.sync(() => {
             values.set(key, value);
           }),
+    keys: (from, to) =>
+      Effect.sync(() => [...values.keys()].filter((key) => key >= from && key <= to).toSorted()),
     removeRange: (from, to) =>
       Effect.sync(() => {
         for (const key of values.keys()) if (key >= from && key <= to) values.delete(key);
@@ -63,55 +65,58 @@ describe("shell load journal", () => {
     }),
   );
 
-  it.effect("leaves a newer load's journal alone when an older load finishes or goes on", () =>
+  it.effect("keeps each load's pages apart and reads the newest whole one", () =>
     Effect.gen(function* () {
       const { values, store } = memoryStore();
       const journal = makeKeyValueShellLoadJournal(store);
-      // Two windows on one store: "old" started first, "new" started after it.
+      // Two windows on one store: "old" started first, "new" after it.
       yield* journal.append(ENVIRONMENT, entry(0, "old"));
-      yield* journal.append(ENVIRONMENT, entry(0, "new"));
+      yield* journal.append(ENVIRONMENT, { ...entry(0, "new"), updatedAt: 2_000 });
       yield* journal.append(ENVIRONMENT, entry(1, "old"));
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("new");
+      // "old" finishing leaves "new" alone.
       yield* journal.clear(ENVIRONMENT, "old");
-      const stored = Option.getOrThrow(yield* journal.read(ENVIRONMENT));
-      expect(stored.loadId).toBe("new");
-      expect(stored.bodies).toHaveLength(1);
-      expect([...values.keys()].filter((key) => key.includes("old"))).toEqual([]);
-    }),
-  );
-
-  it.effect("drops an older load's pages when a new load starts", () =>
-    Effect.gen(function* () {
-      const { values, store } = memoryStore();
-      const journal = makeKeyValueShellLoadJournal(store);
-      yield* journal.append(ENVIRONMENT, entry(0, "old"));
-      yield* journal.append(ENVIRONMENT, entry(1, "old"));
-      yield* journal.append(ENVIRONMENT, entry(0, "new"));
       expect([...values.keys()].filter((key) => key.includes("old"))).toEqual([]);
       expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).bodies).toHaveLength(1);
+      // A newest load missing a page falls back to an older whole one.
+      yield* journal.append(ENVIRONMENT, { ...entry(0, "older"), updatedAt: 500 });
+      values.delete(shellLoadPageKey(ENVIRONMENT, "new", 0));
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("older");
     }),
   );
 
-  it.effect("starts over when a named page is missing and never fails on store errors", () =>
+  it.effect("sweeps loads last written before a time and never fails on store errors", () =>
     Effect.gen(function* () {
       let fail = false;
       const { values, store } = memoryStore({ failPuts: () => fail });
       const journal = makeKeyValueShellLoadJournal(store);
-      yield* journal.append(ENVIRONMENT, entry(0));
-      values.delete(shellLoadPageKey(ENVIRONMENT, "load-a", 0));
-      expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);
+      yield* journal.append(ENVIRONMENT, entry(0, "stale"));
+      yield* journal.append(ENVIRONMENT, { ...entry(0, "live"), updatedAt: 9_000 });
+      yield* journal.sweep(ENVIRONMENT, 5_000);
+      expect([...values.keys()].filter((key) => key.includes("stale"))).toEqual([]);
+      expect(Option.getOrThrow(yield* journal.read(ENVIRONMENT)).loadId).toBe("live");
       // A failed page write leaves the record where it was.
       fail = true;
-      yield* journal.append(ENVIRONMENT, entry(1));
-      expect(JSON.parse(values.get(shellLoadRecordKey(ENVIRONMENT))!).pages).toBe(1);
+      yield* journal.append(ENVIRONMENT, { ...entry(1, "live"), updatedAt: 9_001 });
+      expect(JSON.parse(values.get(shellLoadRecordKey(ENVIRONMENT, "live"))!).pages).toBe(1);
       // Unreadable records are ignored.
-      values.set(shellLoadRecordKey(ENVIRONMENT), "not json");
+      values.set(shellLoadRecordKey(ENVIRONMENT, "live"), "not json");
       expect(Option.isNone(yield* journal.read(ENVIRONMENT))).toBe(true);
     }),
   );
 
+  it.effect("keeps no journal for an id that could reach into another's keys", () =>
+    Effect.gen(function* () {
+      const { values, store } = memoryStore();
+      const journal = makeKeyValueShellLoadJournal(store);
+      yield* journal.append(EnvironmentId.make("a\u0000shell-load"), entry(0));
+      expect(values.size).toBe(0);
+    }),
+  );
+
   it("keeps journal keys apart from the environment's own shell key", () => {
-    expect(shellLoadRecordKey(ENVIRONMENT)).not.toBe(ENVIRONMENT);
-    expect(shellLoadPageKey(ENVIRONMENT, "a", 2) > shellLoadRecordKey(ENVIRONMENT)).toBe(true);
+    expect(shellLoadRecordKey(ENVIRONMENT, "a").startsWith(`${ENVIRONMENT}\u0000`)).toBe(true);
+    expect(shellLoadPageKey(ENVIRONMENT, "a", 2) > String(ENVIRONMENT)).toBe(true);
     expect(shellLoadPageKey(ENVIRONMENT, "a", 10) > shellLoadPageKey(ENVIRONMENT, "a", 9)).toBe(
       true,
     );
@@ -213,8 +218,31 @@ describe("shell loader with a journal", () => {
       expect(ids(loaded)).toEqual(["c", "a", "b", "d"]);
       expect(loaded.snapshotSequence).toBe(10);
       expect(loaded.page).toEqual({ after: null, nextAfter: null });
-      // A finished load leaves no journal behind.
-      expect([...values.keys()]).toEqual([]);
+      // The finished load leaves none of its own pages; the crashed load's pages wait for
+      // the age sweep, since a window that is still running may own them.
+      const crashedLoad = [...values.keys()].find((key) => key.endsWith("\u0000record"));
+      expect([...values.keys()].every((key) => key.startsWith(crashedLoad!.slice(0, -6)))).toBe(
+        true,
+      );
+    }),
+  );
+
+  it.effect("a resumed load writes its pages under its own id", () =>
+    Effect.gen(function* () {
+      const { values, store } = memoryStore();
+      const journal = makeKeyValueShellLoadJournal(store);
+      yield* (yield* makeLoader(shellServer(new Set([3])).fetchFn, journal)).load(
+        prepared("1.0.0"),
+      );
+      // Two new windows resume the same pages; both fail before their next page lands.
+      for (let window = 0; window < 2; window++) {
+        const server = shellServer(new Set([1]));
+        yield* (yield* makeLoader(server.fetchFn, journal)).load(prepared("1.0.0"));
+        expect(server.afters).toEqual(["walk:1"]);
+      }
+      const records = [...values.keys()].filter((key) => key.endsWith("\u0000record"));
+      expect(records).toHaveLength(3);
+      for (const record of records) expect(JSON.parse(values.get(record)!).pages).toBe(2);
     }),
   );
 

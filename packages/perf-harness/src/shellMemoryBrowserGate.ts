@@ -7,8 +7,8 @@
  * Scenarios:
  * - cold: a fresh profile pairs and loads every shell page;
  * - reload: the same profile reloads (the cached list is on disk), as after ⌘R;
- * - crash: the renderer is crashed mid-load and a new one opens, as after an OOM.
- *   Reports whether the new renderer restarted the walk at page one.
+ * - crash: in a fresh profile, the renderer is crashed mid-load and a new one opens, as after
+ *   an OOM. Reports whether the new renderer restarted the walk at page one.
  *
  * usage: node packages/perf-harness/src/shellMemoryBrowserGate.ts FIXTURE OUT.json
  *   FIXTURE from `node packages/perf-harness/src/fixture.ts DIR shell`.
@@ -146,44 +146,43 @@ for (let i = 0; ; i++) {
   await delay(500);
 }
 
-const pairUrl = await new Promise<string>((ok, fail) => {
-  const child = NodeChildProcess.spawn(
-    process.execPath,
-    [
-      serverEntry,
-      "auth",
-      "pairing",
-      "create",
-      "--base-dir",
-      home,
-      "--ttl",
-      "15m",
-      "--label",
-      "shell-memory-gate",
-      "--base-url",
-      origin,
-      "--json",
-    ],
-    { env: serverEnv, stdio: ["ignore", "pipe", "ignore"] },
-  );
-  let text = "";
-  child.stdout.on("data", (chunk) => (text += chunk));
-  child.on("exit", (code) => {
-    const json = text.slice(text.indexOf("{"));
-    try {
-      ok(JSON.parse(json).pairUrl);
-    } catch {
-      fail(new Error(`pairing create failed (exit ${code})`));
-    }
+const createPairUrl = () =>
+  new Promise<string>((ok, fail) => {
+    const child = NodeChildProcess.spawn(
+      process.execPath,
+      [
+        serverEntry,
+        "auth",
+        "pairing",
+        "create",
+        "--base-dir",
+        home,
+        "--ttl",
+        "15m",
+        "--label",
+        "shell-memory-gate",
+        "--base-url",
+        origin,
+        "--json",
+      ],
+      { env: serverEnv, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let text = "";
+    child.stdout.on("data", (chunk) => (text += chunk));
+    child.on("exit", (code) => {
+      const json = text.slice(text.indexOf("{"));
+      try {
+        ok(JSON.parse(json).pairUrl);
+      } catch {
+        fail(new Error(`pairing create failed (exit ${code})`));
+      }
+    });
   });
-});
+const pairUrl = await createPairUrl();
 
-// Rows a complete client list holds: the server's whole shell, read once.
-const serverRows: number = await fetch(`${origin}/api/orchestration/shell`, {
-  headers: { authorization: `Bearer ${token}` },
-})
-  .then((r) => r.json())
-  .then((snapshot) => snapshot.threads.length);
+// Rows a complete client list holds: every row id the server sent in the first scenario that
+// walked the whole list (a fresh profile, so it fetched every page).
+let serverRows: number | null = null;
 
 // Rows in the client's saved shell list (IndexedDB), as JSON the client wrote after applying
 // them. Journal entries (keys with a NUL) are skipped.
@@ -332,8 +331,11 @@ interface ShellRequest {
   last?: boolean;
 }
 
-const runScenario = async (name: string, navigateTo: string) => {
-  const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+const runScenario = async (name: string, navigateTo: string, browserContextId?: string) => {
+  const { targetId } = await send("Target.createTarget", {
+    url: "about:blank",
+    ...(browserContextId ? { browserContextId } : {}),
+  });
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Runtime.enable", {}, sessionId);
   await send("Network.enable", {}, sessionId);
@@ -353,6 +355,9 @@ const runScenario = async (name: string, navigateTo: string) => {
   const shell: ShellRequest[] = [];
   let crashed = false;
   let completeMs: number | null = null;
+  // Rows the server sent in this scenario's pages, by id.
+  const served = new Set<string>();
+  const bodies: Array<Promise<void>> = [];
   const stops = [
     on("Inspector.targetCrashed", (_p, s) => {
       if (s === sessionId) crashed = true;
@@ -374,15 +379,17 @@ const runScenario = async (name: string, navigateTo: string) => {
       if (!request) return;
       request.bytes = p.encodedDataLength;
       request.finishedMs = at();
-      void send("Network.getResponseBody", { requestId: p.requestId }, sessionId)
+      const read = send("Network.getResponseBody", { requestId: p.requestId }, sessionId)
         .then((body) => {
           const text: string = body.base64Encoded
             ? Buffer.from(body.body, "base64").toString()
             : body.body;
           request.last = /"nextAfter":null/.test(text.slice(-400));
           if (request.last && completeMs === null) completeMs = request.finishedMs!;
+          for (const thread of JSON.parse(text).threads ?? []) served.add(thread.id);
         })
         .catch(() => undefined);
+      bodies.push(read);
     }),
   ];
   const samples: Array<{ ms: number; usedMb: number; totalMb: number }> = [];
@@ -446,16 +453,22 @@ const runScenario = async (name: string, navigateTo: string) => {
     await send("HeapProfiler.collectGarbage", {}, sessionId, 120_000);
     const usage = await send("Runtime.getHeapUsage", {}, sessionId);
     retainedMb = usage.usedSize / MB;
+    const evaluate = (expression: string) =>
+      send(
+        "Runtime.evaluate",
+        { expression, awaitPromise: true, returnByValue: true },
+        sessionId,
+        120_000,
+      ).then(
+        ({ result }) => Number(result.value),
+        () => -1,
+      );
+    await Promise.all(bodies);
+    if (serverRows === null && completeMs !== null) serverRows = served.size;
     // The cache is written in the background; give it up to 30 s to hold the whole list.
     for (let tries = 0; tries < 30 && cachedRows !== serverRows; tries++) {
       if (tries > 0) await delay(1_000);
-      const { result } = await send(
-        "Runtime.evaluate",
-        { expression: CACHED_ROWS, awaitPromise: true, returnByValue: true },
-        sessionId,
-        60_000,
-      ).catch(() => ({ result: { value: -1 } }));
-      cachedRows = Number(result.value);
+      cachedRows = await evaluate(CACHED_ROWS);
     }
   }
   for (const stop of stops) stop();
@@ -473,6 +486,7 @@ const runScenario = async (name: string, navigateTo: string) => {
     peakUsedMb: peak.usedMb,
     peakAtMs: peak.ms,
     retainedMb,
+    servedRows: served.size,
     cachedRows,
     profileFile,
     samples: samples
@@ -493,8 +507,11 @@ try {
   else results.push(await runScenario("pair", pairUrl));
   if (scenarios.includes("reload")) results.push(await runScenario("reload", origin));
   if (scenarios.includes("crash")) {
-    results.push(await runScenario("crash-first", origin));
-    results.push(await runScenario("crash-resume", origin));
+    // A fresh profile, so the crashed load has no complete saved list to fall back on and the
+    // resumed renderer's saved list can only come from the pages it applied.
+    const { browserContextId } = await send("Target.createBrowserContext", {});
+    results.push(await runScenario("crash-first", await createPairUrl(), browserContextId));
+    results.push(await runScenario("crash-resume", origin, browserContextId));
   }
 } finally {
   writing = false;
@@ -509,6 +526,8 @@ for (const result of results) {
   if (result.name === "crash-first") continue;
   if (result.crashed) failures.push(`${result.name}: renderer crashed`);
   if (result.completeMs === null) failures.push(`${result.name}: list never completed`);
+  else if (serverRows === null || serverRows <= 0)
+    failures.push(`${result.name}: could not read the server's shell (${serverRows})`);
   else if (result.cachedRows !== serverRows)
     failures.push(
       `${result.name}: client saved ${result.cachedRows} rows, server has ${serverRows}`,
