@@ -2,6 +2,7 @@ import type { KanbanAskAction } from "@t3tools/contracts";
 import { CheckIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { cn } from "../../../lib/utils";
 import { KanbanMarkdown } from "../links";
 import { Label } from "./ui";
 
@@ -60,9 +61,9 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
         </>
       ) : null}
       <dl className="grid grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-2.5 max-sm:grid-cols-1 max-sm:gap-y-1">
-        {rows.map(([name, value]) => (
+        {rows.map(([name, value], index) => (
           <div key={name} className="contents">
-            <dt className="text-sm text-(--m-muted) max-sm:mt-2 max-sm:first:mt-0">{name}</dt>
+            <dt className={cn("text-sm text-(--m-muted)", index > 0 && "max-sm:mt-2")}>{name}</dt>
             <dd className="min-w-0">{value}</dd>
           </div>
         ))}

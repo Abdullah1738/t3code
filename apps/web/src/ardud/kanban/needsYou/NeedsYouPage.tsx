@@ -30,6 +30,7 @@ import { CardDrawer, noteDrawerOpener } from "../CardDrawer";
 import { useBoardState, useBoards } from "../kanbanStore";
 import { KanbanLinksProvider } from "../links";
 import { useNowMs } from "../useNowMs";
+import { AllClear } from "./AllClear";
 import { AskReader, askTurn, type AskReaderHandle } from "./AskReader";
 import { AskToastView } from "./AskToast";
 import {
@@ -530,9 +531,11 @@ export function NeedsYouPage(props: {
                 }
               />
             ) : (
-              <Empty
-                title="Nothing waits on you."
-                detail="New asks show up here as agents raise them."
+              <AllClear
+                nowMs={nowMs}
+                waiting={waiting}
+                snoozed={needsYou.counts.snoozed}
+                onHistory={() => setView("history")}
               />
             )}
             <AskToastView
