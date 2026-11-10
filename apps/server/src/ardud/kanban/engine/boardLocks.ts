@@ -178,12 +178,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     effect: Effect.Effect<A, E, R>,
     cardId?: string,
     attempt = 0,
-    replay: Map<string, Array<ReplayEntry>> = new Map(),
+    // Only a stale rerun passes this in: every new execution starts with its own empty map.
+    replayOf?: Map<string, Array<ReplayEntry>>,
   ): Effect.Effect<A, E, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const parent = yield* operation;
         if (parent) return yield* restore(effect);
+        const replay = replayOf ?? new Map<string, Array<ReplayEntry>>();
         const op: Operation = {
           fiberId: yield* Effect.fiberId,
           cardId,

@@ -495,5 +495,11 @@ it.effect("reads within one attempt and in separate operations are never replaye
     assert.strictEqual(yield* locks.board("a", read), 3);
     // Outside any operation it is a plain read.
     assert.strictEqual(yield* read, 4);
+    // One constructed operation run twice, and twice at once: each run reads for itself.
+    const op = locks.board("a", read);
+    assert.strictEqual(yield* op, 5);
+    assert.strictEqual(yield* op, 6);
+    const pair = yield* Effect.all([op, op], { concurrency: 2 });
+    assert.deepStrictEqual([...pair].sort(), [7, 8]);
   }),
 );

@@ -528,6 +528,11 @@ export interface KanbanServiceShape {
   readonly probeOutages: Effect.Effect<void, KanbanError>;
   /** Queues a finished turn for the worker. */
   readonly notifyTurnEnded: (threadId: ThreadId) => Effect.Effect<void>;
+  /**
+   * Something changed a thread (a run, a message, a request), from the board or
+   * anywhere else: stale reruns read it again instead of replaying.
+   */
+  readonly threadEvent: (threadId: string) => Effect.Effect<void>;
   /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
   readonly notifyThreadChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Background worker: runs queued dispatch kicks and turn ends; never returns. */
@@ -894,10 +899,12 @@ type BoardEffect =
       readonly kind: "send";
       readonly threadId: string;
       readonly text: string;
-      /** A failed send is dropped, as the inline path did, instead of retried. */
+      /** Inline only, a failed send is dropped as before; a saved one retries like any other. */
       readonly bestEffort?: boolean;
     }
   | { readonly kind: "interrupt"; readonly threadId: string; readonly reason: string }
+  /** A card's new model on its open work thread; a failed switch is retried. */
+  | { readonly kind: "setModel"; readonly threadId: string; readonly model: ModelSelection }
   /** Sent only while the evaluator thread is live, as a dropped ask's note. */
   | { readonly kind: "tellEvaluator"; readonly threadId: string; readonly text: string }
   | {
@@ -917,6 +924,12 @@ type BoardEffect =
 interface OwnerRouteEffect {
   readonly kind: "effect";
   readonly effect: BoardEffect;
+  /**
+   * Downgrade guard: builds before this payload read any non-post row as an
+   * answer at `seq`. No message has seq -1, so they close it as not-saved at
+   * once instead of retrying it at the head of the lane.
+   */
+  readonly seq: -1;
 }
 type OwnerRoutePayload = OwnerRoutePost | OwnerRouteAnswer | OwnerRouteEffect;
 
@@ -996,6 +1009,52 @@ const make = Effect.gen(function* () {
       touch(threadId);
       return effect.pipe(Effect.ensuring(Effect.sync(() => touch(threadId))));
     });
+  // A deferred interrupt (a card let go of its thread) is pending from the
+  // moment its route row is saved until it runs. Nothing this board sends to
+  // that thread goes out before it: the send runs the stop first, so a late
+  // interrupt never cuts a run started after it was asked for. Keyed by route.
+  const pendingStops = new Map<string, Map<string, string>>();
+  const stoppedRoutes = new Set<string>();
+  const stopping = yield* Semaphore.make(1);
+  const addPendingStop = (threadId: string, routeKey: string, reason: string) => {
+    let stops = pendingStops.get(threadId);
+    if (!stops) pendingStops.set(threadId, (stops = new Map()));
+    stops.set(routeKey, reason);
+  };
+  /**
+   * Runs the thread's pending stops, if any; callers hold no board gate. A
+   * drain passes its own route: skipped when a send already ran it.
+   */
+  const runPendingStops = (
+    threadId: string,
+    route?: { readonly key: string; readonly reason: string },
+  ) =>
+    Effect.suspend(() =>
+      route === undefined && !pendingStops.has(threadId)
+        ? Effect.void
+        : stopping.withPermits(1)(
+            Effect.suspend(() => {
+              if (route !== undefined && stoppedRoutes.delete(route.key)) return Effect.void;
+              const stops = pendingStops.get(threadId);
+              const keys = [...(stops?.keys() ?? [])];
+              if (route !== undefined && !keys.includes(route.key)) keys.push(route.key);
+              if (keys.length === 0) return Effect.void;
+              const reason = route?.reason ?? stops!.values().next().value!;
+              return touching(threadId, threadIo.interrupt(ThreadId.make(threadId), reason)).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    for (const key of keys) {
+                      stops?.delete(key);
+                      // The drain of that route skips it; the caller's own route is done here.
+                      if (key !== route?.key) stoppedRoutes.add(key);
+                    }
+                    if (stops?.size === 0) pendingStops.delete(threadId);
+                  }),
+                ),
+              );
+            }),
+          ),
+    );
   const threadRead = <A, E, R>(read: string, threadId: string, effect: Effect.Effect<A, E, R>) =>
     replayReads
       ? locks.outsideRead(`${read}:${threadId}`, () => threadFences.get(threadId) ?? 0, effect)
@@ -1077,7 +1136,9 @@ const make = Effect.gen(function* () {
         const answer = input.key === undefined;
         if (answer && delivered?.has(input.threadId)) return;
         return yield* locks.outside(
-          touching(
+          Effect.andThen(
+            runPendingStops(input.threadId),
+            touching(
             input.threadId,
             threadIo.send({
               ...input,
@@ -1085,6 +1146,7 @@ const make = Effect.gen(function* () {
                 ? {}
                 : { key: `${key}:${input.threadId}:${input.key ?? "answer"}` }),
             }),
+            ),
           ).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
@@ -2703,7 +2765,8 @@ const make = Effect.gen(function* () {
           evaluatorTurn(before, after, actor),
         )
       : Effect.void;
-  const evaluatorTurn = Effect.fn("KanbanService.evaluatorTurn")(
+  /** Fails when its note or launch fails; a saved follow-on retries on that. */
+  const evaluatorTurnStrict = Effect.fn("KanbanService.evaluatorTurn")(
     function* (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) {
       const turn = stepTurn;
       const now = turn(after);
@@ -2751,13 +2814,13 @@ const make = Effect.gen(function* () {
       const discussion = yield* cardDiscussionUnlocked(after.id);
       yield* toEvaluator(discussion, text, true);
     },
-    (effect, _before, after) =>
-      effect.pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban evaluator step note failed", { cardId: after.id, cause }),
-        ),
-      ),
   );
+  const evaluatorTurn = (before: KanbanCard | null, after: KanbanCard, actor: KanbanActor) =>
+    evaluatorTurnStrict(before, after, actor).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("kanban evaluator step note failed", { cardId: after.id, cause }),
+      ),
+    );
 
   /**
    * The owner answers asks on a card (`which` picks them): they close, and
@@ -3279,23 +3342,28 @@ const make = Effect.gen(function* () {
    * since changed, is closed without delivery). Delivery marks it done.
    */
   /** One saved write follow-on, as the write would have run it inline. */
-  const runBoardEffect = (effect: BoardEffect) => {
+  // Failures propagate, so the drain retries and finally closes the row
+  // undeliverable with a notice; only success marks it delivered.
+  const runBoardEffect = (effect: BoardEffect, routeKey: string) => {
     switch (effect.kind) {
-      case "send": {
-        const sent = threads.send({
+      case "send":
+        return threads.send({
           threadId: ThreadId.make(effect.threadId),
           text: effect.text,
           key: "effect",
         });
-        return effect.bestEffort === true ? Effect.ignore(sent) : sent;
-      }
       case "interrupt":
-        return threads.interrupt(ThreadId.make(effect.threadId), effect.reason);
+        // Already run if a send to the thread came first (see `pendingStops`).
+        return locks.outside(
+          runPendingStops(effect.threadId, { key: routeKey, reason: effect.reason }),
+        );
+      case "setModel":
+        return threads.setModel(ThreadId.make(effect.threadId), effect.model);
       case "tellEvaluator":
         return Effect.gen(function* () {
           const threadId = ThreadId.make(effect.threadId);
           if (!(yield* liveEvaluator(threadId))) return;
-          yield* threads.send({ threadId, text: effect.text, key: "effect" }).pipe(Effect.ignore);
+          yield* threads.send({ threadId, text: effect.text, key: "effect" });
         });
       case "toEvaluator":
         return Effect.gen(function* () {
@@ -3303,7 +3371,7 @@ const make = Effect.gen(function* () {
           yield* toEvaluator(discussion, effect.text, effect.note);
         });
       case "evaluatorTurn":
-        return evaluatorTurn(effect.before, effect.after, effect.actor);
+        return evaluatorTurnStrict(effect.before, effect.after, effect.actor);
       case "tellAnswered":
         return Effect.gen(function* () {
           const discussion = yield* discussionOf(KanbanDiscussionId.make(effect.discussionId));
@@ -3330,7 +3398,7 @@ const make = Effect.gen(function* () {
     yield* routeSavedOwner(
       KanbanDiscussionId.make(record.discussion_id),
       record.route_key,
-      runBoardEffect(effect),
+      runBoardEffect(effect, record.route_key),
       row,
     );
     return yield* markOwnerRouteDelivered(record);
@@ -3361,26 +3429,48 @@ const make = Effect.gen(function* () {
    * After a write that collected follow-ons commits: each is saved as its own
    * route row in one transaction, in its lane's order, and its drain started.
    */
-  const saveEffects = Effect.fn("KanbanService.saveEffects")(function* (
+  const saveEffectRows = Effect.fn("KanbanService.saveEffectRows")(function* (
     effects: EffectSink["effects"],
   ) {
     const lanes = new Set<string>();
+    const stops: Array<[string, string, string]> = [];
     yield* boardSql.withTransaction(
       Effect.forEach(
         effects,
         ({ boardId, lane, effect }) => {
           lanes.add(lane);
+          const routeKey = `effect:${uuid()}`;
+          if (effect.kind === "interrupt") stops.push([effect.threadId, routeKey, effect.reason]);
           return saveOwnerRoute(
             KanbanBoardId.make(boardId),
             KanbanDiscussionId.make(lane),
-            `effect:${uuid()}`,
-            { kind: "effect", effect },
+            routeKey,
+            { kind: "effect", effect, seq: -1 },
           );
         },
         { discard: true },
       ),
     );
-    for (const lane of lanes) yield* afterOwnerCommit(lane);
+    for (const [threadId, routeKey, reason] of stops) addPendingStop(threadId, routeKey, reason);
+    return lanes;
+  });
+  /** After a restart, stops saved and not yet run hold their threads' sends again. */
+  const loadPendingStops = Effect.fn("KanbanService.loadPendingStops")(function* () {
+    const rows = yield* boardSql<{ route_key: string; thread_id: string; reason: string }>`
+      SELECT route_key,
+             json_extract(json, '$.effect.threadId') AS thread_id,
+             json_extract(json, '$.effect.reason') AS reason
+      FROM ardud_kanban_owner_routes
+      WHERE done_at IS NULL AND json_extract(json, '$.kind') = 'effect'
+        AND json_extract(json, '$.effect.kind') = 'interrupt'
+      ORDER BY id
+    `;
+    for (const row of rows) addPendingStop(row.thread_id, row.route_key, row.reason);
+  });
+  const saveEffects = Effect.fn("KanbanService.saveEffects")(function* (
+    effects: EffectSink["effects"],
+  ) {
+    for (const lane of yield* saveEffectRows(effects)) yield* afterOwnerCommit(lane);
   });
 
   const runOwnerRoute = Effect.fn("KanbanService.runOwnerRoute")(function* (
@@ -4157,15 +4247,19 @@ const make = Effect.gen(function* () {
       const reused = threadId;
       const key = wakeKey(reused, `${card.id}:${at}`);
       yield* locks.outside(
-        touching(reused, threadIo.send({ threadId: reused, text, model: dispatch.model, key })),
+        Effect.andThen(
+          runPendingStops(reused),
+          touching(reused, threadIo.send({ threadId: reused, text, model: dispatch.model, key })),
+        ),
         () =>
-          threadIo
-            .send({
+          touching(
+            reused,
+            threadIo.send({
               threadId: reused,
               key: `${key}:state-changed`,
               text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
-            })
-            .pipe(Effect.asVoid, Effect.ignore),
+            }),
+          ).pipe(Effect.asVoid, Effect.ignore),
       );
     } else {
       const title =
@@ -6244,10 +6338,11 @@ const make = Effect.gen(function* () {
     Deferred.await(startupReady).pipe(Effect.andThen(guardReady(effect, cardId, boardId)));
   /**
    * A write that replies once its state is committed: thread follow-ons it
-   * makes through `later` are saved as route rows after it (in their lane's
-   * order) and run by the drains, as owner posts and answers are. A follow-on
-   * collected by an attempt that then failed is still saved, as the inline
-   * path would already have run it. `inline` route mode runs them inline.
+   * makes through `later` are saved as route rows as its last step, still
+   * inside its board operation, so rows keep the order of the writes that
+   * made them; the drains start once it returns. A follow-on collected by an
+   * attempt that then failed is still saved (after it, unordered), as the
+   * inline path would already have run it. `inline` route mode runs them inline.
    */
   const guardDeferred = <A, E, R>(
     effect: Effect.Effect<A, E, R>,
@@ -6257,23 +6352,41 @@ const make = Effect.gen(function* () {
     deferWrites
       ? Effect.suspend(() => {
           const sink: EffectSink = { effects: [], closed: false };
+          let lanes = new Set<string>();
           const attempt = Effect.suspend(() => {
             // A stale rerun starts over; it keeps only its own follow-ons.
             sink.effects.length = 0;
             return effect;
-          }).pipe(Effect.provideService(effectSink, sink));
+          }).pipe(
+            Effect.tap(() =>
+              Effect.suspend(() => {
+                sink.closed = true;
+                if (sink.effects.length === 0) return Effect.void;
+                const saving = [...sink.effects];
+                sink.effects.length = 0;
+                return saveEffectRows(saving).pipe(
+                  Effect.tap((saved) => Effect.sync(() => (lanes = saved))),
+                );
+              }),
+            ),
+            Effect.provideService(effectSink, sink),
+          );
           return guard(attempt, cardId, boardId).pipe(
             Effect.onExit((exit) =>
               Effect.suspend(() => {
                 sink.closed = true;
-                if (sink.effects.length === 0) return Effect.void;
+                const started = Effect.forEach(lanes, afterOwnerCommit, { discard: true });
+                if (sink.effects.length === 0) return started;
                 const saving = saveEffects([...sink.effects]);
                 // A failed write's follow-ons are saved too, but never replace its error.
                 return Exit.isSuccess(exit)
-                  ? saving
-                  : saving.pipe(
-                      Effect.catchCause((cause) =>
-                        Effect.logWarning("kanban write follow-ons not saved", { cause }),
+                  ? Effect.andThen(started, saving)
+                  : Effect.andThen(
+                      started,
+                      saving.pipe(
+                        Effect.catchCause((cause) =>
+                          Effect.logWarning("kanban write follow-ons not saved", { cause }),
+                        ),
                       ),
                     );
               }),
@@ -6984,9 +7097,14 @@ const make = Effect.gen(function* () {
         }
         if (plan?.ok && saved.activeThreadId !== null) {
           // The thread on the card works from the plan it was given; tell it the new one.
-          yield* threads
-            .send({ threadId: saved.activeThreadId, text: Briefs.planChangedText(saved) })
-            .pipe(Effect.ignore);
+          const threadId = saved.activeThreadId;
+          const text = Briefs.planChangedText(saved);
+          yield* later(
+            saved.boardId,
+            cardLane(saved),
+            { kind: "send", threadId, text, bestEffort: true },
+            threads.send({ threadId, text }).pipe(Effect.ignore),
+          );
         }
         if (
           saved.activeThreadId !== null &&
@@ -7009,13 +7127,21 @@ const make = Effect.gen(function* () {
             yield* hold(saved.activeThreadId, saved.boardId, newPool);
           }
           // An open work thread runs the card's model; switch it now, not on its next wake.
-          yield* threads
-            .setModel(saved.activeThreadId, saved.model)
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("kanban thread model switch failed", { cardId: saved.id, cause }),
+          yield* later(
+            saved.boardId,
+            cardLane(saved),
+            { kind: "setModel", threadId: saved.activeThreadId, model: saved.model },
+            threads
+              .setModel(saved.activeThreadId, saved.model)
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("kanban thread model switch failed", {
+                    cardId: saved.id,
+                    cause,
+                  }),
+                ),
               ),
-            );
+          );
         }
         yield* kick;
         return saved;
@@ -8439,6 +8565,7 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
+        Effect.andThen(loadPendingStops()),
         Effect.tapError((cause) =>
           Effect.logWarning("Board startup recovery will retry", { cause }),
         ),
@@ -8667,6 +8794,7 @@ const make = Effect.gen(function* () {
     turnEnded: (threadId) => guard(turnEndedUnlocked(threadId)),
     tick: read(tickUnlocked()),
     probeOutages: read(probeOutagesNow()),
+    threadEvent: (threadId) => Effect.sync(() => touch(threadId)),
     notifyTurnEnded: (threadId) =>
       Queue.offer(jobs, { _tag: "turnEnd", threadId }).pipe(Effect.asVoid),
     notifyThreadChanged: (threadId) =>

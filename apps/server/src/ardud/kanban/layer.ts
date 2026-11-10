@@ -39,6 +39,19 @@ export const boardEventRoute = (
 };
 
 /**
+ * Streamed output (nodes, turn items) fires per paragraph and does not change
+ * what the board reads about a thread; everything else naming a thread does.
+ */
+const STREAMING_EVENTS = new Set<string>(["node.updated", "turn-item.updated"]);
+
+/** The thread an event changed, for the board's read fences. Exported so it is tested itself. */
+export const threadEventOf = (event: OrchestrationV2DomainEvent): string | null => {
+  if (STREAMING_EVENTS.has(event.type)) return null;
+  const threadId = (event as { readonly threadId?: unknown }).threadId;
+  return typeof threadId === "string" ? threadId : null;
+};
+
+/**
  * Owner answers and posts reply once they and their routing are committed;
  * delivery follows in the background. `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`
  * restores delivery inside the reply.
@@ -105,13 +118,17 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     );
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) => {
+        const changed = threadEventOf(event);
+        const touched = changed === null ? Effect.void : service.threadEvent(changed);
         const route = boardEventRoute(event);
-        if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
+        if (route === "turnEnd")
+          return touched.pipe(Effect.andThen(service.notifyTurnEnded(event.threadId)));
         if (route === "threadChanged")
-          return service
-            .notifyThreadChanged(event.threadId)
-            .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change")));
-        return Effect.void;
+          return touched.pipe(
+            Effect.andThen(service.notifyThreadChanged(event.threadId)),
+            Effect.catchCause(warnUnlessInterrupted("missions board thread change")),
+          );
+        return touched;
       }).pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
       ),
