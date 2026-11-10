@@ -23,7 +23,8 @@ class CleanupTests(unittest.TestCase):
             (order_card, 'LAST4', '2342'), (order_card, 'NETWORK', 'mastercard')]:
             p = patch.object(mod, key, value); p.start(); self.addCleanup(p.stop)
         self.flow, self.wire = f.make_flow(f.happy_responses())
-        self.flow.prepare_only(); retain(self.flow)
+        self.flow.prepare_only()
+        self.assertEqual(j.inspect(self.flow.flow_id)['reserved_minor'], 0)
         self.row = copy.deepcopy(self.wire.responses['cart_get']['data'])
         self.wire.responses['carts_recent'] = {'data': {'carts': [self.row]}}
         j.abandon(self.flow.flow_id)
@@ -121,6 +122,23 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(commerce_cli.main(['clear-cart', 'nownow', '--flow', self.flow.flow_id]), 0)
             clear.assert_called_once_with(self.flow.flow_id)
 
+    def test_cli_unexpected_error_has_safe_cause(self):
+        import commerce_cli
+        import contextlib
+        import io
+        import json
+        with patch.object(cleanup, 'clear_cart', side_effect=FileNotFoundError('private-secret-path')), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(commerce_cli.main(['clear-cart', 'nownow', '--flow', self.flow.flow_id]), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['cause'], 'FileNotFoundError')
+        self.assertIn('location', result)
+        self.assertNotIn('private-secret-path', output.getvalue())
+
+    def test_preparation_retains_review_without_financial_send(self):
+        from commerce_nownow_capture import load
+        self.assertEqual(load(self.flow.flow_id)['review'], self.flow.review)
+
 class FailedVerificationTests(CleanupTests):
     def setUp(self):
         super().setUp()
@@ -151,5 +169,80 @@ class FailedVerificationTests(CleanupTests):
 
     def test_changed_payment_status_refuses(self):
         self.wire.responses['payment_status']['captured_amount'] = 1
+        with self.assertRaises(Exception): self.clear()
+        self.assertEqual(self.deletes, [])
+
+
+class LegacyCleanupTests(CleanupTests):
+    def setUp(self):
+        super().setUp()
+        (j.ROOT/'nownow'/(self.flow.flow_id+'.json')).unlink()
+        with j._db() as db:
+            db.execute('UPDATE flows SET created_at=created_at-90000 WHERE id=?', (self.flow.flow_id,))
+
+    def test_preparation_retains_review_without_financial_send(self):
+        from commerce_nownow_capture import load
+        with self.assertRaisesRegex(j.JournalError, 'NOWNOW_RETAINED_REVIEW_MISSING'):
+            load(self.flow.flow_id)
+
+    def test_changed_session_cannot_be_adopted(self):
+        self.row['checkoutSessionCode'] = 'different-session'
+        with self.assertRaisesRegex(Exception, 'LEGACY_CART_EVIDENCE_MISMATCH'): self.clear()
+        self.assertEqual(self.deletes, [])
+
+    def test_changed_total_cannot_be_adopted(self):
+        self.row['orderTotal'] = 999
+        with self.assertRaisesRegex(Exception, 'LEGACY_CART_EVIDENCE_MISMATCH'): self.clear()
+        self.assertEqual(self.deletes, [])
+
+    def test_changed_manifest_cannot_be_adopted(self):
+        self.row['products'][0]['qty'] = 2
+        with self.assertRaisesRegex(Exception, 'LEGACY_SCOPE_CHANGED'): self.clear()
+        self.assertEqual(self.deletes, [])
+
+    def test_expired_multi_item_restores_original_input_order(self):
+        self.check_expired_multi_item(None)
+
+    def test_expired_multi_item_with_empty_string_notes(self):
+        self.check_expired_multi_item('')
+
+    def check_expired_multi_item(self, notes):
+        from commerce_nownow_order import NowNowOrderFlow
+        items = [{'product_code': f.PRODUCT, 'quantity': 1, 'notes': notes},
+                 {'product_code': 'P0000000000000000A', 'quantity': 1, 'notes': notes}]
+        responses = f.happy_responses()
+        for name in ('cart_validate', 'payment', 'delivery_preference', 'instructions', 'cart_get'):
+            products = responses[name]['data']['products']
+            products[0]['price'] = 10.25
+            products.append({**products[0], 'productCode': items[1]['product_code']})
+        responses['product_edit'] = copy.deepcopy(responses['cart_validate'])
+        self.wire = f.Harness(responses)
+        self.flow = NowNowOrderFlow(store_code=f.STORE, items=items, auth=f.FakeAuth())
+        self.flow.client._request = self.wire.request
+        self.flow.prepare_only()
+        (j.ROOT/'nownow'/(self.flow.flow_id+'.json')).unlink()
+        with j._db() as db:
+            db.execute('UPDATE flows SET created_at=created_at-90000 WHERE id=?', (self.flow.flow_id,))
+        j.abandon(self.flow.flow_id)
+        self.row = copy.deepcopy(self.wire.responses['cart_get']['data'])
+        self.row['products'].reverse()
+        self.wire.responses['carts_recent'] = {'data': {'carts': [self.row]}}
+        self.client._request = self.wire.request
+        self.assertTrue(self.clear()['cart_empty'])
+        from commerce_nownow_capture import load
+        self.assertEqual([i['product_code'] for i in load(self.flow.flow_id)['items']],
+                         [i['product_code'] for i in items])
+        self.assertEqual([i['notes'] for i in load(self.flow.flow_id)['items']], [notes, notes])
+
+    def test_missing_receipt_cannot_be_adopted(self):
+        with j._db() as db:
+            db.execute("UPDATE observations SET evidence_hash=? WHERE flow_id=? AND operation LIKE 'cart_get_%'",
+                       ('a'*64, self.flow.flow_id))
+        with self.assertRaisesRegex(Exception, 'LEGACY_CART_EVIDENCE_MISMATCH'): self.clear()
+        self.assertEqual(self.deletes, [])
+
+    def test_financial_history_cannot_use_legacy_recovery(self):
+        with j._db() as db:
+            db.execute("UPDATE operations SET kind='prepay' WHERE flow_id=? AND name='payment'", (self.flow.flow_id,))
         with self.assertRaises(Exception): self.clear()
         self.assertEqual(self.deletes, [])

@@ -1279,6 +1279,17 @@ def main(argv=None):
         if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,100}',code):code='COMMERCE_OPERATION_FAILED'
         # A sent payment that didn't confirm: say whether a no-charge is proven, never assume it.
         details=exc.details if isinstance(exc,journal.PaymentError) else {}
+        if code == 'COMMERCE_OPERATION_FAILED':
+            # Exception messages may contain credentials or raw provider responses.
+            cause = exc.__cause__ or exc
+            tb = cause.__traceback__
+            while tb and tb.tb_next:
+                tb = tb.tb_next
+            details = {**details, 'cause': type(cause).__name__}
+            if tb:
+                details['location'] = {'file': Path(tb.tb_frame.f_code.co_filename).name,
+                                       'function': tb.tb_frame.f_code.co_name,
+                                       'line': tb.tb_lineno}
         print(json.dumps({'ok':False,'error':code,**details,'financial_retry':False}))
         return 1
 

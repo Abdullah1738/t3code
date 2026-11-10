@@ -33,7 +33,10 @@ def retain(flow):
 
 def load(flow_id):
     binding = j.binding(flow_id)
-    state = json.loads((j.ROOT / 'nownow' / (flow_id + '.json')).read_text())
+    try:
+        state = json.loads((j.ROOT / 'nownow' / (flow_id + '.json')).read_text())
+    except FileNotFoundError:
+        j.fail('NOWNOW_RETAINED_REVIEW_MISSING')
     require(binding == state['binding'] and binding['vertical'] == 'nownow'
             and j.digest(state['review']['projection']) == state['review']['digest'], 'RETAINED_REVIEW_INVALID')
     return state

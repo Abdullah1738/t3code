@@ -799,6 +799,7 @@ class NowNowOrderFlow:
         self.pre_place_read(timeout=timeout)
         self.guard_validated(timeout=timeout)
         review = self.review_final(timeout=timeout)
+        self.retain_review()
         return {'flow_id': self.flow_id, 'prepared_only': True, 'review': review,
                 'readback': dict(self.current.projection)}
 

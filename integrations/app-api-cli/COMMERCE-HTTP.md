@@ -609,6 +609,11 @@ Never manufacture a completion request for an automatic paid order.
 
 NowNow retained cart cleanup: `commerce clear-cart nownow --flow FLOW_UUID`.
 Requires a released flow and the exact retained session/review/account/Home.
+Prepare-only retains this review before returning. Older nonfinancial preparations
+without a retained review can recover it only when the live session matches the
+last journalled cart-read receipt, original basket/Home/card scope and selected-card
+request. Expiry does not permit purchase resume. Missing financial reviews,
+changed carts or missing receipt evidence still refuse cleanup.
 A failed pre-order card verification additionally requires its terminal release
 and fresh exact failed-intent evidence with zero bank amounts. Active account
 flows, later writers, unknown sends and placement history refuse. The native
