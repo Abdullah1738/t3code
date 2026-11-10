@@ -6844,10 +6844,18 @@ const make = Effect.gen(function* () {
                 const current = yield* store.card(card.id);
                 if (!current || current.deciding === undefined || Waits.decidingHolds(current, now))
                   continue;
-                // Still held but for the clock: the evaluator did not decide in time.
+                // Still held but for the clock: the evaluator did not decide in time, or
+                // was never told (its note could not be delivered). The history says which.
                 yield* endDeciding(
                   current.id,
-                  Waits.decidingHolds(current) ? { body: Waits.DECIDING_RAN_OUT } : {},
+                  Waits.decidingHolds(current)
+                    ? {
+                        body:
+                          current.deciding.toldAt === null
+                            ? Waits.DECIDING_NEVER_TOLD
+                            : Waits.DECIDING_RAN_OUT,
+                      }
+                    : {},
                 );
                 invalidateCards();
               }

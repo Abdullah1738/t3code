@@ -491,19 +491,29 @@ const make = Effect.gen(function* () {
     );
     const askedByNumber = new Map((check?.cards ?? []).map((card) => [card.number, card.id]));
     // Answers not yet sent, each with the card number its note names (null: no note).
-    let pending: Array<{ readonly answer: WaitAnswerFor; readonly line: number | null }> = [];
+    // One refused before it is sent has no answer, only the reason.
+    let pending: Array<
+      | { readonly answer: WaitAnswerFor; readonly line: number | null }
+      | { readonly answer: null; readonly line: number; readonly refused: string }
+    > = [];
     const flush = Effect.gen(function* () {
       if (pending.length === 0) return;
       const sending = pending;
       pending = [];
-      const result = yield* Effect.result(
-        service.answerWaits(
-          script.boardId,
-          sending.map((entry) => entry.answer),
-          actor,
-        ),
-      );
-      for (const [index, entry] of sending.entries()) {
+      const answers = sending.flatMap((entry) => (entry.answer === null ? [] : [entry.answer]));
+      const result =
+        answers.length === 0
+          ? null
+          : yield* Effect.result(service.answerWaits(script.boardId, answers, actor));
+      let sent = 0;
+      for (const entry of sending) {
+        if (entry.answer === null) {
+          notes.push(`Refused for card #${entry.line}: ${entry.refused}`);
+          continue;
+        }
+        const index = sent;
+        sent += 1;
+        if (result === null) continue;
         const outcome = Result.isSuccess(result) ? result.success[index] : undefined;
         // The card may have moved on while the script ran; for a card the script
         // printed nothing about, that refusal is not news.
@@ -545,6 +555,18 @@ const make = Effect.gen(function* () {
         continue;
       }
       const askedId = askedByNumber.get(line.card);
+      // A check answers for the cards it was asked about and no other. A card that
+      // started waiting on this script while the check ran was never in its input, so
+      // whatever the script printed for it (a cached line, say) says nothing about its
+      // wait. A wake line is the way to end a wait from outside its check.
+      if (line._tag === "answer" && check !== null && askedId === undefined) {
+        pending.push({
+          line: line.card,
+          answer: null,
+          refused: `this check was not asked about card #${line.card}, so it cannot answer for it. Its wait, if it has one on this script, is checked on the next run; a wake line ends a wait from outside its check.`,
+        });
+        continue;
+      }
       // Answered, as far as the rest of this run goes, whatever the board makes of it.
       if (line._tag === "answer" && askedId !== undefined) answered.add(askedId);
       pending.push({
