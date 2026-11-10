@@ -8405,6 +8405,8 @@ const make = Effect.gen(function* () {
         if (ask.handedAt !== undefined) {
           return yield* failWith("invalid", `${ref} is already with the evaluator`);
         }
+        const unfit = Asks.handProblem(card, ask);
+        if (unfit) return yield* failWith(unfit.code, unfit.detail);
         const discussion = yield* cardDiscussionUnlocked(card.id);
         const next = {
           ...Asks.markHanded(yield* cardOf(card.id), ask.id, at, always === true),
