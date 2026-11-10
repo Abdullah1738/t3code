@@ -724,6 +724,116 @@ it.effect(
     ),
 );
 
+it.effect(
+  "a reviewed card whose wait ended is not completed before its evaluator has had its turn",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const created = yield* kanban.createCard(
+          board.id,
+          { prompt: "Review PR 12", title: "Review PR 12", links: [{ url: PR }] },
+          owner,
+        );
+        yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+        yield* kanban.waitCard(
+          created.id,
+          { on: "time", until: iso(T0 + HOUR), note: "see if the author replied" },
+          owner,
+        );
+        yield* TestClock.adjust(HOUR + MINUTE);
+        yield* kanban.tick;
+        // The wait is over and the evaluator was asked. The same tick did not complete the card.
+        let card = yield* cardOf(created.id);
+        assert.isUndefined(card.wait);
+        assert.strictEqual(card.stage, "in_review");
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+        const evaluator = [...world.threads].find(([, thread]) =>
+          thread.title.startsWith("Evaluator"),
+        )![0];
+        // Nor do later ticks, while that turn runs.
+        world.threads.get(evaluator)!.running = true;
+        for (let turn = 0; turn < 3; turn += 1) {
+          yield* TestClock.adjust(MINUTE);
+          yield* kanban.tick;
+        }
+        assert.strictEqual((yield* cardOf(created.id)).stage, "in_review");
+
+        // The evaluator's turn ends with the card left as it is: the next tick completes it.
+        world.threads.get(evaluator)!.running = false;
+        yield* kanban.turnEnded(ThreadId.make(evaluator));
+        yield* kanban.tick;
+        card = yield* cardOf(created.id);
+        assert.strictEqual(card.stage, "completed");
+        assert.strictEqual(world.cardThreads(), 0);
+      }),
+    ),
+);
+
+it.effect("an evaluator that parks the card again in its turn keeps it out of Completed", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Review PR 12", title: "Review PR 12", links: [{ url: PR }] },
+        owner,
+      );
+      yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+      yield* kanban.waitCard(
+        created.id,
+        { on: "time", until: iso(T0 + HOUR), note: "see if the author replied" },
+        owner,
+      );
+      yield* TestClock.adjust(HOUR + MINUTE);
+      yield* kanban.tick;
+      const evaluator = ThreadId.make(
+        [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+      );
+      // Its decision: the author asked for two more days.
+      yield* kanban.waitCard(
+        created.id,
+        { on: "time", until: iso(T0 + 49 * HOUR), note: "author asked for two more days" },
+        { _tag: "evaluator", threadId: evaluator },
+      );
+      yield* kanban.turnEnded(evaluator);
+      yield* TestClock.adjust(MINUTE);
+      yield* kanban.tick;
+      const card = yield* cardOf(created.id);
+      assert.strictEqual(card.stage, "in_review");
+      assert.isTrue(kanbanWaiting(card));
+    }),
+  ),
+);
+
+it.effect("an evaluator that never ends its turn cannot keep a reviewed card from completing", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "Review PR 12", title: "Review PR 12", links: [{ url: PR }] },
+        owner,
+      );
+      yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+      yield* kanban.waitCard(
+        created.id,
+        { on: "time", until: iso(T0 + HOUR), note: "see if the author replied" },
+        owner,
+      );
+      yield* TestClock.adjust(HOUR + MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+      yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - 2 * MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(created.id)).stage, "in_review");
+      yield* TestClock.adjust(3 * MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(created.id)).stage, "completed");
+    }),
+  ),
+);
+
 it.effect("a card with a running thread is left alone, whatever its wait says", () =>
   inWorld((world) =>
     Effect.gen(function* () {

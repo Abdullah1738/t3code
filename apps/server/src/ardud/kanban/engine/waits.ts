@@ -77,6 +77,13 @@ export const WAITS_ENGINE_WIRED: boolean = true;
  */
 export const WAIT_EVENT_KINDS_LIVE: boolean = false;
 
+/**
+ * How long a reviewed card whose wait ended may be kept from completing while its
+ * evaluator, asked what to do next, has not finished that turn. Counted from the
+ * card's last change, so an evaluator that never answers cannot hold it for good.
+ */
+export const WAIT_DECIDE_MS = 30 * 60 * 1000;
+
 /** Stages where the engine as it is today leaves a thread-less card alone. */
 const QUIET_STAGES: ReadonlySet<KanbanStage> = new Set([
   "in_review",
