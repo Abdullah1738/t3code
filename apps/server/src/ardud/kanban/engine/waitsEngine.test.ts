@@ -984,6 +984,140 @@ it.effect("an evaluator that never ends its turn cannot keep a reviewed card fro
   ),
 );
 
+it.effect(
+  "a card awaiting review whose wait ended for the evaluator gets no reviewer until that turn is over",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const card = yield* placed(board, "Review PR 12", {
+          stage: "needs_review",
+          links: [tracked(PR)],
+        });
+        yield* kanban.waitCard(
+          card.id,
+          { on: "push", pr: "#12", head: "aaa1111", note: "author to push the fixes" },
+          owner,
+        );
+        // The author closed the PR instead: only the evaluator can say what the card does now.
+        yield* TestClock.adjust(MINUTE);
+        world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+        yield* kanban.tick;
+        const held = yield* cardOf(card.id);
+        assert.isUndefined(held.wait);
+        assert.strictEqual(held.stage, "needs_review");
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+        // Held in the card's own row, from the write that ended the wait, and told.
+        const row = yield* store.card(card.id);
+        assert.strictEqual(row?.deciding?.since, held.updatedAt);
+        assert.isNotNull(row?.deciding?.toldAt);
+        // A free slot, and nobody starts its reviewer while the evaluator decides.
+        const evaluator = ThreadId.make(
+          [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+        );
+        world.threads.get(evaluator)!.running = true;
+        for (let turn = 0; turn < 3; turn += 1) {
+          yield* TestClock.adjust(MINUTE);
+          yield* kanban.dispatchNow;
+          yield* kanban.tick;
+        }
+        assert.strictEqual(world.cardThreads(), 0);
+        assert.isNull((yield* cardOf(card.id)).activeThreadId);
+
+        // The evaluator's turn ends with the card left as it is: the review starts, with the note.
+        world.threads.get(evaluator)!.running = false;
+        yield* kanban.turnEnded(evaluator);
+        assert.isUndefined((yield* cardOf(card.id)).deciding);
+        yield* kanban.tick;
+        const reviewing = yield* cardOf(card.id);
+        assert.strictEqual(reviewing.activeRole, "review");
+        assert.include(briefOf(world, reviewing), "was closed while this waited for a push");
+      }),
+    ),
+);
+
+it.effect("a To-Do card held for its evaluator cannot be claimed, and says why", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const busy = yield* placed(board, "Carries on");
+      yield* kanban.tick;
+      const worker = (yield* cardOf(busy.id)).activeThreadId!;
+      world.threads.get(worker)!.running = true;
+      const card = yield* placed(board, "Lands with PR 12", { links: [tracked(PR)] });
+      yield* kanban.waitCard(card.id, { on: "merge", pr: "#12", note: "until it merges" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+      yield* kanban.tick;
+      const held = yield* cardOf(card.id);
+      assert.isDefined(held.deciding);
+      assert.isNull(held.activeThreadId);
+      const refused = yield* Effect.flip(kanban.claimCard(worker, card.id));
+      assert.include(refused.detail, "is held for its evaluator");
+      assert.include(refused.detail, "was closed without merging");
+    }),
+  ),
+);
+
+it.effect("a card held for its evaluator is still held after a restart", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      // Reviewed, and parked until its PR merges. The PR is closed unmerged instead.
+      const card = yield* placed(board, "Review PR 12", {
+        stage: "in_review",
+        reviewStep: 1,
+        links: [tracked(PR)],
+      });
+      yield* kanban.waitCard(card.id, { on: "merge", pr: "#12", note: "until it merges" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(card.id)).stage, "in_review");
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+      const evaluator = ThreadId.make(
+        [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+      );
+      world.threads.get(evaluator)!.running = true;
+
+      // The server restarts: a new engine over the same store, with nothing in memory.
+      yield* Effect.gen(function* () {
+        const restarted = yield* KanbanService.KanbanService;
+        for (let turn = 0; turn < 3; turn += 1) {
+          yield* TestClock.adjust(MINUTE);
+          yield* restarted.tick;
+        }
+        // A closed PR counts as landed, so only the hold keeps the card out of Completed.
+        assert.strictEqual((yield* store.card(card.id))?.stage, "in_review");
+        world.threads.get(evaluator)!.running = false;
+        yield* restarted.turnEnded(evaluator);
+        yield* restarted.tick;
+        assert.strictEqual((yield* store.card(card.id))?.stage, "completed");
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+    }),
+  ),
+);
+
+it.effect("the history says so when the evaluator did not decide in time", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const created = yield* reviewedAndParked(board);
+      yield* TestClock.adjust(HOUR + MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+      yield* TestClock.adjust(Waits.WAIT_DECIDE_MS + MINUTE);
+      yield* kanban.tick;
+      const card = yield* cardOf(created.id);
+      assert.strictEqual(card.stage, "completed");
+      assert.isUndefined(card.deciding);
+      assert.isTrue(
+        (yield* eventsOf(created.id)).some((event) => event.body === Waits.DECIDING_RAN_OUT),
+      );
+    }),
+  ),
+);
+
 it.effect("a card with a running thread is left alone, whatever its wait says", () =>
   inWorld((world) =>
     Effect.gen(function* () {

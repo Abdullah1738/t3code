@@ -6,6 +6,7 @@
  * `newWait`.
  */
 import {
+  KANBAN_DECIDE_MS,
   KANBAN_DONE_STAGES,
   KANBAN_WAIT_LIMIT_MS,
   kanbanAwaitsMerge,
@@ -18,6 +19,7 @@ import {
   kanbanWaitDeadlineMs,
   kanbanWaitExpired,
   kanbanWaitStale,
+  kanbanDeciding,
   kanbanWaiting,
   kanbanWithoutWait,
   type KanbanActor,
@@ -78,11 +80,11 @@ export const WAITS_ENGINE_WIRED: boolean = true;
 export const WAIT_EVENT_KINDS_LIVE: boolean = false;
 
 /**
- * How long a reviewed card whose wait ended may be kept from completing while its
- * evaluator, asked what to do next, has not finished that turn. Counted from the
- * card's last change, so an evaluator that never answers cannot hold it for good.
+ * How long a card whose wait ended with a wake for its evaluator is held for that
+ * evaluator's decision (the card's `deciding`). Counted from the end of the wait,
+ * so an evaluator that never answers cannot hold the card for good.
  */
-export const WAIT_DECIDE_MS = 30 * 60 * 1000;
+export const WAIT_DECIDE_MS = KANBAN_DECIDE_MS;
 
 /** Stages where the engine as it is today leaves a thread-less card alone. */
 const QUIET_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -477,6 +479,17 @@ export const waitHoldsDispatch = (card: WaitingFields) => kanbanWaiting(card);
 /** No quiet-thread nudge and no evaluator reminder for it. */
 export const waitSkipsNudge = (card: WaitingFields) => kanbanWaiting(card);
 
+/**
+ * Held for its evaluator after a wait ended: like a waiting card, it is not
+ * started, claimed, completed or reminded about until the evaluator's turn ends
+ * or the time to decide runs out.
+ */
+export const decidingHolds = (card: WaitingFields & Pick<KanbanCard, "deciding">, nowMs?: number) =>
+  kanbanDeciding(card, nowMs);
+
+/** The line the history gets when a card held for its evaluator is let go at the limit. */
+export const DECIDING_RAN_OUT = `The evaluator did not decide within ${Math.round(KANBAN_DECIDE_MS / 60_000)} minutes of the wait ending: the card carries on`;
+
 /** Not idle and not stalled in any count or sweep, until the wait runs past its limit or its check keeps failing. */
 export const waitHidesIdle = (card: WaitingFields, nowMs: number) =>
   kanbanWaiting(card) &&
@@ -729,24 +742,34 @@ export function endWait(
       wake: { to: "review", note },
     };
   }
-  // The dispatcher starts a To-Do card as soon as nothing holds it, so its worker hears why too.
-  const startsAnyway = card.stage === "todo" && nextActor(card, ctx) === "work";
+  // What the card does now is the evaluator's call. It is held for that decision from
+  // this write on (`deciding`): nothing starts, claims or completes it until the
+  // evaluator's turn ends, it is moved or parked again, or the time to decide runs out.
+  const held: KanbanCard = {
+    ...cleared,
+    deciding: { since: at as KanbanWait["at"], why: `${reason}. ${was}`, toldAt: null },
+  };
+  // Once the hold is over the dispatcher starts a To-Do card or a review again, so
+  // whoever it starts hears why too.
+  const startsAfter =
+    (card.stage === "todo" && nextActor(card, ctx) === "work") || card.stage === "needs_review";
+  const minutes = Math.round(KANBAN_DECIDE_MS / 60_000);
   return {
-    card: startsAnyway
+    card: startsAfter
       ? {
-          ...cleared,
+          ...held,
           wakeNote: joinNotes(
             card.wakeNote,
             `${reason}. ${was} The evaluator has been told: check the card still makes sense before you carry on.`,
           ),
         }
-      : cleared,
+      : held,
     event: event(card.stage),
     wake: {
       to: "evaluator",
-      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is no longer waiting: ${reason}. ${was} ${
-        startsAnyway
-          ? "The dispatcher will start its worker again; flag or move the card if it should not run."
+      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is no longer waiting: ${reason}. ${was} It is held for you: nothing starts or completes it until your turn ends, or for ${minutes} minutes at most. ${
+        startsAfter
+          ? `After that the dispatcher starts its ${card.stage === "needs_review" ? "reviewer" : "worker"} again; move or flag the card, or set a new wait with card_wait, if it should not run.`
           : "Take its next step, or set a new wait with card_wait if it still has to hold."
       }`,
     },

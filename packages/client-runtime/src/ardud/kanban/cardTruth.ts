@@ -3,6 +3,7 @@ import {
   KANBAN_DONE_STAGES,
   KANBAN_WAIT_LIMIT_MS,
   kanbanAwaitsMerge,
+  kanbanDeciding,
   kanbanWaitCheckFailing,
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
@@ -329,6 +330,8 @@ export function cardTruth(
   if (card.wait !== undefined && kanbanWaiting(card)) {
     return fromWait(card.wait, state, nowMs, hints.timeZone);
   }
+  // Its wait ended in a way only the evaluator can take on: held until that turn is over.
+  if (kanbanDeciding(card, nowMs)) return base("evaluator", "Evaluator deciding");
   if (card.stage === "needs_owner") return base("owner", "Waiting on the owner");
   if (KANBAN_DONE_STAGES.has(card.stage)) {
     if (card.stage !== "verified" && (kanbanEvaluatorStep(card) || kanbanScriptStep(card))) {

@@ -140,6 +140,25 @@ const subtask = (owner: "work" | "evaluator" | "script", text: string) =>
   }) as never;
 
 describe("cardTruth: To-Do", () => {
+  it("shows a card held for its evaluator after a wait ended, until the time to decide is over", () => {
+    const held = card(1, {
+      stage: "needs_review",
+      movedAt: "2026-11-10T11:00:00.000Z" as never,
+      deciding: {
+        since: "2026-11-10T11:50:00.000Z" as never,
+        why: "app#12 was closed while this waited for a push",
+        toldAt: "2026-11-10T11:50:01.000Z" as never,
+      },
+    });
+    expect(truth(held)).toMatchObject({ state: "evaluator", label: "Evaluator deciding" });
+    // Past the limit the board lets it go: it reads as any card awaiting review.
+    const late = {
+      ...held,
+      deciding: { ...held.deciding!, since: "2026-11-10T11:00:00.000Z" as never },
+    };
+    expect(truth(late).label).not.toBe("Evaluator deciding");
+  });
+
   it("is ready with nothing in the way", () => {
     expect(truth(card(1, { stage: "todo" }))).toEqual({
       state: "ready",

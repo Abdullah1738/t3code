@@ -419,8 +419,38 @@ describe("PR readings from the reader and the work thread", () => {
       "trading-core#512 was closed without merging",
     );
     expect(step._tag === "end" && step.wake.to === "evaluator" && step.wake.text).toContain(
-      "The dispatcher will start its worker again",
+      "After that the dispatcher starts its worker again",
     );
+    // Held for the evaluator from the write that ends the wait, not told yet.
+    expect(step._tag === "end" && step.card.deciding).toEqual({
+      since: AT,
+      why: expect.stringContaining("trading-core#512 was closed without merging"),
+      toldAt: null,
+    });
+  });
+
+  it("a wait that ends for the evaluator holds a card awaiting review, with a note for its reviewer", () => {
+    const waiting = card(1, {
+      stage: "needs_review",
+      wait: wait({ on: "push", note: "author to push" }),
+    });
+    const step = resolveWait(waiting, facts({ prs: [{ url: PR, state: "closed" }] }), ctx, AT);
+    expect(step).toMatchObject({
+      _tag: "end",
+      card: { stage: "needs_review", deciding: { since: AT, toldAt: null } },
+      wake: { to: "evaluator" },
+    });
+    expect(step._tag === "end" && step.card.wakeNote).toContain("was closed while this waited");
+    expect(step._tag === "end" && step.wake.to === "evaluator" && step.wake.text).toContain(
+      "After that the dispatcher starts its reviewer again",
+    );
+  });
+
+  it("a wait that ends for its worker or reviewer holds nothing for the evaluator", () => {
+    const waiting = card(1, { stage: "todo", wait: wait({ on: "merge", sinceHead: null }) });
+    const step = resolveWait(waiting, facts({ prs: [{ url: PR, state: "merged" }] }), ctx, AT);
+    expect(step).toMatchObject({ _tag: "end", wake: { to: "work" } });
+    expect(step._tag === "end" && step.card.deciding).toBeUndefined();
   });
 
   it("an unknown reading holds: a PR nobody could read is not done", () => {

@@ -14,6 +14,7 @@ import {
   kanbanRetryNotBefore,
   kanbanSchedule,
   kanbanScriptStep,
+  kanbanDeciding,
   kanbanWaiting,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
@@ -532,7 +533,9 @@ export function planDispatch(
       // Reviews still go: a review never waits on the evaluator's step.
       !kanbanWaitsOnEvaluator(card) &&
       // Parked on a wait: the tick wakes it when the wait ends.
-      !kanbanWaiting(card),
+      !kanbanWaiting(card) &&
+      // Its wait ended and its evaluator decides what it does next.
+      !kanbanDeciding(card, clock),
   );
   const reviews = waiting
     .filter((card) => card.stage === "needs_review")
@@ -666,6 +669,8 @@ export interface ClaimContext {
   readonly slots: number;
   /** The board's pools, to find the pool each of the card's models runs on. */
   readonly pools?: ReadonlyArray<KanbanPool>;
+  /** Now: a card held for its evaluator is let go when the time to decide runs out. */
+  readonly nowMs?: number;
 }
 
 /**
@@ -692,6 +697,11 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
   if (kanbanWaiting(card)) {
     return no(
       `card #${card.number} is waiting (${card.wait?.note.trim() || card.wait?.on}): the board wakes it when that ends; clear the wait with card_wait first to take it now`,
+    );
+  }
+  if (kanbanDeciding(card, ctx.nowMs)) {
+    return no(
+      `card #${card.number} is held for its evaluator, who was told its wait ended (${card.deciding?.why}): it carries on when that evaluator's turn ends`,
     );
   }
   if (kanbanWaitsOnEvaluator(card)) {
