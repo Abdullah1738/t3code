@@ -448,7 +448,10 @@ export const makeAuthReader = Effect.fnUntraced(function* (
         const runningEntry = running === undefined ? undefined : pending.get(running);
         if ((autocommit || (beginsTransaction && !transactionOpen)) && runningEntry?.abandoned)
           return Effect.fail(
-            readerBusy("Reader lane busy: the reader is still finishing an abandoned statement", false),
+            readerBusy(
+              "Reader lane busy: the reader is still finishing an abandoned statement",
+              false,
+            ),
           );
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
