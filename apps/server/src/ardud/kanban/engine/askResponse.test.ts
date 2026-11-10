@@ -8,6 +8,7 @@ import {
   kanbanAskIsNotice,
   kanbanAskKind,
   kanbanAskResponse,
+  kanbanAskRevision,
   type KanbanActor,
   type KanbanAskAnswer,
   type KanbanCard,
@@ -55,13 +56,18 @@ const problem = (value: unknown) => {
 const refused = (input: Asks.AskFieldsInput, blocking = false) =>
   problem(Asks.askFields(input, { blocking }));
 
+/** The answer as sent by someone who read the ask as it is now. */
+const read = (on: KanbanOwnerAsk, input: Asks.AskAnswerInput): Asks.AskAnswerInput => ({
+  revision: kanbanAskRevision(on),
+  ...input,
+});
 const answer = (on: KanbanOwnerAsk, input: Asks.AskAnswerInput) => {
-  const stored = Asks.answerFor(card([on]), on, input, owner, LATER);
+  const stored = Asks.answerFor(card([on]), on, read(on, input), owner, LATER);
   if (Asks.isAskProblem(stored)) throw new Error(stored.detail);
   return stored;
 };
 const rejected = (on: KanbanOwnerAsk, input: Asks.AskAnswerInput) =>
-  problem(Asks.answerFor(card([on]), on, input, owner, LATER));
+  problem(Asks.answerFor(card([on]), on, read(on, input), owner, LATER));
 const wake = (on: KanbanOwnerAsk, stored: KanbanAskAnswer) =>
   Asks.answerText(card([on]), on, stored, (file) => `/files/${file.name}`);
 
