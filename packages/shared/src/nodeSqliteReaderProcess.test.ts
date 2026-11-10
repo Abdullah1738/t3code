@@ -79,6 +79,7 @@ const runGuarded = (data: Record<string, unknown>, ops: ReadonlyArray<Record<str
       }
     });
     runtime.on("exit", () => resolve("killed"));
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a child process, not a window.
     ops.forEach((op, id) => runtime.postMessage({ id, ...op }));
   });
 
