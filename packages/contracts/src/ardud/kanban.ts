@@ -406,7 +406,7 @@ export const KanbanAskAnswer = Schema.Struct({
   draftEdited: Schema.optional(Schema.Boolean),
   /**
    * Field id to the value given. A file field holds the attachments the board
-   * kept; a secret field holds `{ "secret": true }`, never the value.
+   * kept; a secret field holds `KANBAN_ASK_SECRET_PROVIDED`, never the value.
    */
   values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
   /** He handed it over with "every time": an evaluator was asked to take asks like it from now on. */
@@ -508,6 +508,41 @@ export const kanbanAskChanges = (
 
 /** The id of the one field a plain question takes; its value is stored as the answer's `text`. */
 export const KANBAN_ASK_ANSWER_FIELD = "answer";
+
+/** What a secret field holds in a stored answer: that he gave it, never the value. */
+export const KANBAN_ASK_SECRET_PROVIDED = { secret: true } as const;
+
+/**
+ * The owner's answer to an ask with secret fields, sent over the app's
+ * private channel (WS `secrets.answerAsk`), never the board's HTTP routes.
+ * `answer` is what the answer route takes, without the secret fields.
+ * `secrets` maps a secret field's id to the value he typed: it goes to the
+ * server's secret store, in memory, and the asking agent gets a one-use
+ * secretRef for it. The card stores only `KANBAN_ASK_SECRET_PROVIDED`.
+ */
+export const KanbanAskSecretAnswerInput = Schema.Struct({
+  cardId: KanbanCardId,
+  askId: Schema.String,
+  answer: Schema.Struct({
+    verdict: Schema.String,
+    optionIds: Schema.optional(Schema.Array(Schema.String)),
+    text: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+    finalDraft: Schema.optional(Schema.String),
+    values: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+    /** The revision the client showed; a newer one refuses the answer. */
+    revision: Schema.optional(Schema.Int),
+  }),
+  secrets: Schema.Record(Schema.String, Schema.String),
+});
+export type KanbanAskSecretAnswerInput = typeof KanbanAskSecretAnswerInput.Type;
+
+/** The same reply as the answer route: where the card is now, and the ask as stored. */
+export const KanbanAskSecretAnswerResult = Schema.Struct({
+  card: Schema.Struct({ id: KanbanCardId, number: Schema.Number, stage: KanbanStage }),
+  ask: Schema.NullOr(KanbanOwnerAsk),
+});
+export type KanbanAskSecretAnswerResult = typeof KanbanAskSecretAnswerResult.Type;
 
 /** What the owner gives back on an ask, with every default filled in. */
 export interface KanbanAskResponse {
