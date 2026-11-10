@@ -80,6 +80,7 @@ import { makeBoardAttachments } from "./attachments.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Defaults from "./defaults.ts";
+import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
@@ -1900,7 +1901,8 @@ const make = Effect.gen(function* () {
       : card;
     const asked = options.question?.trim() || null;
     let next: KanbanCard = {
-      ...base,
+      // A real move ends the attempt its automatic retry belonged to.
+      ...Retries.withoutRetries(base),
       stage: to,
       movedAt: at,
       updatedAt: at,
@@ -4933,10 +4935,39 @@ const make = Effect.gen(function* () {
       yield* saveCard({ ...card, nudgedAt: at, updatedAt: at });
       return;
     }
-    // A reviewer that still has no verdict after the nudge frees its slot and is flagged.
-    const reason = "Reviewer stopped without a verdict";
+    // A reviewer that still has no verdict after the nudge frees its slot. The first
+    // time the review is started again once (see Retries); the second time it is flagged.
+    const reason = Retries.NO_VERDICT_REASON;
+    const retry = Retries.decideRetry({
+      kind: "no_verdict",
+      role: "review",
+      retries: card.retries,
+      paused: Retries.heldByPause(board, card),
+      nowMs: Date.parse(at),
+      at,
+    });
+    if (retry._tag === "hold" || retry._tag === "wait") return;
+    if (retry._tag === "restart") {
+      const again: KanbanCard = {
+        ...release(card),
+        stage: "needs_review",
+        stalled: null,
+        nudgedAt: null,
+        retries: retry.retries,
+        movedAt: at,
+        updatedAt: at,
+      };
+      yield* logEvent(again, system, "moved", {
+        fromStage: card.stage,
+        toStage: again.stage,
+        body: Retries.NO_VERDICT_RESTARTED_EVENT,
+      });
+      yield* saveCard(again);
+      yield* kick;
+      return;
+    }
     const next: KanbanCard = {
-      ...release(card),
+      ...Retries.withoutRetries(release(card)),
       stage: "needs_review",
       stalled: { reason, by: system, at },
       nudgedAt: null,
@@ -5523,20 +5554,63 @@ const make = Effect.gen(function* () {
             yield* saveCard(fresh);
             continue;
           }
-          const next: KanbanCard = {
-            ...release(entry),
-            stage: "todo",
-            stalled: { reason, by: system, at },
-            nudgedAt: null,
-            movedAt: at,
-            updatedAt: at,
-          };
+          // The first failure a retry can help is run again once (see Retries): the
+          // card waits with its thread for the backoff, then goes back to To-Do
+          // unflagged and the dispatcher wakes the same thread. Anything else is flagged.
+          const retry = Retries.decideRetry({
+            kind: "run_failed",
+            role: "work",
+            failure,
+            retries: entry.retries,
+            paused: Retries.heldByPause(yield* boardOf(entry.boardId), entry),
+            nowMs: Date.parse(at),
+            at,
+          });
+          if (retry._tag === "hold") continue;
+          const next: KanbanCard =
+            retry._tag === "wait"
+              ? { ...entry, retries: retry.retries, updatedAt: at }
+              : retry._tag === "restart"
+                ? {
+                    ...release(entry),
+                    stage: "todo",
+                    stalled: null,
+                    nudgedAt: null,
+                    retries: retry.retries,
+                    wakeNote: Retries.withRetryNote(entry.wakeNote, failure.message),
+                    movedAt: at,
+                    updatedAt: at,
+                  }
+                : {
+                    ...Retries.withoutRetries(release(entry)),
+                    stage: "todo",
+                    stalled: { reason, by: system, at },
+                    nudgedAt: null,
+                    movedAt: at,
+                    updatedAt: at,
+                  };
           if (
             expectedFailedWorkRunId !== undefined &&
             compactSent?._tag !== "Success" &&
             !(yield* failedRunIsCurrent())
           )
             return;
+          if (retry._tag === "wait") {
+            yield* logEvent(next, system, "thread", {
+              body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+            });
+            yield* saveCard(next);
+            continue;
+          }
+          if (retry._tag === "restart") {
+            yield* logEvent(next, system, "moved", {
+              fromStage: entry.stage,
+              toStage: "todo",
+              body: `${Retries.RESTARTED_EVENT}: ${failure.message}`,
+            });
+            yield* saveCard(next);
+            continue;
+          }
           yield* logEvent(next, system, "flagged", {
             fromStage: entry.stage,
             toStage: "todo",
@@ -5558,10 +5632,18 @@ const make = Effect.gen(function* () {
       const view = yield* threads.view(threadId);
       // A repeated run event can arrive while the thread runs again.
       if (view === null || view.state !== "idle") return;
+      // The run ended without failing: a retry it was on is over, and the next
+      // failure on these cards gets its own.
+      const settled = yield* Effect.forEach(carried, (entry) => {
+        const cleared = Retries.withoutRoleRetries(entry, "work");
+        if (cleared === entry) return Effect.succeed(entry);
+        const next: KanbanCard = { ...cleared, updatedAt: at };
+        return saveCard(next).pipe(Effect.as(next));
+      });
       // A worker waiting on its own subagents hasn't stopped.
       if (Rules.waitingOnBackground(view, yield* nowMillis)) return;
       if (discussionAttempted) return;
-      yield* nudgeWorker(threadId, carried);
+      yield* nudgeWorker(threadId, settled);
       return;
     }
     if (!card) return;
@@ -5605,8 +5687,46 @@ const make = Effect.gen(function* () {
         return;
       }
       const reason = `Run failed: ${failure.message}`;
+      // As for a worker: the first failure a retry can help is run again once.
+      const retry = Retries.decideRetry({
+        kind: "run_failed",
+        role: "review",
+        failure,
+        retries: card.retries,
+        paused: Retries.heldByPause(yield* boardOf(card.boardId), card),
+        nowMs: Date.parse(at),
+        at,
+      });
+      if (retry._tag === "hold") return;
+      if (retry._tag === "wait") {
+        const waiting: KanbanCard = { ...card, retries: retry.retries, updatedAt: at };
+        yield* logEvent(waiting, system, "thread", {
+          body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+        });
+        yield* saveCard(waiting);
+        return;
+      }
+      if (retry._tag === "restart") {
+        const again: KanbanCard = {
+          ...release(card),
+          stage: "needs_review",
+          stalled: null,
+          nudgedAt: null,
+          retries: retry.retries,
+          movedAt: at,
+          updatedAt: at,
+        };
+        yield* logEvent(again, system, "moved", {
+          fromStage: card.stage,
+          toStage: again.stage,
+          body: `${Retries.RESTARTED_EVENT}: ${failure.message}`,
+        });
+        yield* saveCard(again);
+        yield* kick;
+        return;
+      }
       const next: KanbanCard = {
-        ...release(card),
+        ...Retries.withoutRetries(release(card)),
         stage: "needs_review",
         stalled: { reason, by: system, at },
         nudgedAt: null,
@@ -7952,7 +8072,8 @@ const make = Effect.gen(function* () {
           : card.subtasks;
         const moreWork = passed && Subtasks.workAfterReview({ subtasks });
         const next: KanbanCard = {
-          ...release(card),
+          // A verdict is a review that ended normally: its retry record goes.
+          ...Retries.withoutRetries(release(card)),
           // The dispatcher's no-verdict flag is answered by the verdict; a
           // reviewer's own flag stays for the evaluator.
           stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,

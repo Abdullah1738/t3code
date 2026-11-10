@@ -162,6 +162,26 @@ export const KanbanOwnerAsk = Schema.Struct({
 });
 export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
 
+/**
+ * One automatic retry on a card's current attempt. A failed run, or a reviewer that
+ * ended without a verdict, is run again once before the card is flagged; this
+ * records which, so the second failure of the same kind flags.
+ */
+export const KanbanCardRetry = Schema.Struct({
+  /** What went wrong: the run failed, or a nudged reviewer still gave no verdict. */
+  kind: Schema.Literals(["run_failed", "no_verdict"]),
+  role: Schema.Literals(["work", "review"]),
+  /** The failed run, so the same failure reported again isn't counted twice; null for no_verdict. */
+  runId: Schema.NullOr(Schema.String),
+  /** Why, in the provider's words or the board's. */
+  reason: Schema.String,
+  /** When the failure was seen (waiting), then when the card was restarted. */
+  at: IsoDateTime,
+  /** waiting: the card keeps its thread until the backoff is over. restarted: the one retry is used. */
+  state: Schema.Literals(["waiting", "restarted"]),
+});
+export type KanbanCardRetry = typeof KanbanCardRetry.Type;
+
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
   boardId: KanbanBoardId,
@@ -211,6 +231,12 @@ export const KanbanCard = Schema.Struct({
   wakeNote: Schema.NullOr(Schema.String),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
+  /**
+   * Automatic retries used on the current attempt, at most one per kind. Absent on
+   * most cards and on every card stored before retries existed. Cleared by a real
+   * move, a turn that ends normally, a review verdict and a flag.
+   */
+  retries: Schema.optional(Schema.Array(KanbanCardRetry)),
   settledAt: Schema.NullOr(IsoDateTime),
   createdBy: KanbanActor,
   createdAt: IsoDateTime,
@@ -218,6 +244,16 @@ export const KanbanCard = Schema.Struct({
   movedAt: IsoDateTime,
 });
 export type KanbanCard = typeof KanbanCard.Type;
+
+/**
+ * The retry a card is in the middle of, for a board to show "Retrying": a failed
+ * run waiting to be restarted, or a restarted run that hasn't ended. A flagged card
+ * is past retrying.
+ */
+export const kanbanRetrying = (
+  card: Pick<KanbanCard, "retries" | "stalled" | "settledAt">,
+): KanbanCardRetry | undefined =>
+  card.stalled !== null || card.settledAt !== null ? undefined : card.retries?.at(-1);
 
 /** The models a card's work may start on, highest weight first. */
 export const kanbanCardModels = (card: KanbanCard): ReadonlyArray<KanbanCardModel> =>

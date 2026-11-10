@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanCard,
   KanbanCardEvent,
   kanbanAwaitsMerge,
   kanbanBlocking,
@@ -14,6 +15,7 @@ import {
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
   kanbanPickOrder,
+  kanbanRetrying,
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
@@ -22,7 +24,6 @@ import {
   KANBAN_BOARD_IMAGE_MAX,
   KanbanSubtask,
   KanbanThreadLink,
-  type KanbanCard,
 } from "./kanban.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
@@ -69,6 +70,42 @@ function card(id: string, patch: CardPatch = {}): KanbanCard {
     ...rest,
   };
 }
+
+const decodeCard = Schema.decodeUnknownSync(KanbanCard);
+const encodeCard = Schema.encodeSync(KanbanCard);
+
+describe("KanbanCard retries", () => {
+  const stored = JSON.parse(JSON.stringify(card("a")));
+
+  it("loads a card stored before retries existed unchanged, with no retry record", () => {
+    expect("retries" in stored).toBe(false);
+    const decoded = decodeCard(stored);
+    expect(decoded.retries).toBeUndefined();
+    expect(kanbanRetrying(decoded)).toBeUndefined();
+    expect(encodeCard(decoded)).toEqual(stored);
+  });
+
+  it("keeps a retry record through storage, and shows it until the card is flagged", () => {
+    const retry = {
+      kind: "run_failed",
+      role: "work",
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at: "2026-11-10T10:00:00.000Z",
+      state: "waiting",
+    };
+    const decoded = decodeCard(JSON.parse(JSON.stringify({ ...stored, retries: [retry] })));
+    expect(decoded.retries).toEqual([retry]);
+    expect(encodeCard(decoded).retries).toEqual([retry]);
+    expect(kanbanRetrying(decoded)).toEqual(retry);
+    expect(
+      kanbanRetrying({
+        ...decoded,
+        stalled: { reason: "Run failed: x", by: { _tag: "owner" }, at: decoded.createdAt },
+      }),
+    ).toBeUndefined();
+  });
+});
 
 describe("KanbanCardEvent", () => {
   it("decodes an event stored before head existed as head null", () => {
