@@ -382,6 +382,16 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     always?: boolean,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * The owner puts one ask away until a time, or (null) takes the snooze off.
+   * The ask stays open and keeps holding its card; no thread is told.
+   */
+  readonly snoozeAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    until: string | null,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
   /** Records the evaluator thread an "every time" hand-over started, while the ask is still handed. */
   readonly noteHandEvaluator: (
     cardId: KanbanCard["id"],
@@ -7173,8 +7183,12 @@ const make = Effect.gen(function* () {
         );
         const fresh = yield* cardOf(card.id);
         if (actor._tag !== "owner") {
-          // The agent replied: it is the owner's turn again.
-          const next = Asks.clearClarify(fresh, ask.id);
+          // The agent replied: it is the owner's turn again, and a snoozed ask comes back.
+          const next = Asks.wakeFromSnooze(
+            Asks.clearClarify(fresh, ask.id),
+            ask.id,
+            message.createdAt,
+          );
           if (next !== fresh) yield* saveCard({ ...next, updatedAt: message.createdAt });
           return message;
         }
@@ -7248,6 +7262,24 @@ const make = Effect.gen(function* () {
         });
         yield* saveCard(next);
         yield* toEvaluator(discussion, Asks.handText(next, ask));
+        return next;
+      }),
+    );
+
+  const snoozeAsk: KanbanServiceShape["snoozeAsk"] = (cardId, askId, until, actor) =>
+    guard(
+      Effect.gen(function* () {
+        if (actor._tag !== "owner") {
+          return yield* failWith("denied", "only the owner snoozes an ask");
+        }
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const at = yield* nowIso;
+        const snoozed = Asks.snoozeAsk(card, ask, until, at);
+        if (Asks.isAskProblem(snoozed)) return yield* failWith(snoozed.code, snoozed.detail);
+        const next = { ...snoozed, updatedAt: at };
+        yield* saveCard(next);
         return next;
       }),
     );
@@ -8569,6 +8601,7 @@ const make = Effect.gen(function* () {
     answerAsk,
     replyOnAsk,
     handAsk,
+    snoozeAsk,
     noteHandEvaluator,
     askDetail,
     askFeed,

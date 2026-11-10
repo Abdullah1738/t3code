@@ -476,6 +476,14 @@ export const KanbanOwnerAsk = Schema.Struct({
   clarifyAskedAt: Schema.optional(IsoDateTime),
   /** It is with the evaluator: the owner handed it over, or it was asked `to` the evaluator. */
   handedAt: Schema.optional(IsoDateTime),
+  /**
+   * The owner put it away until this time. It stays open and keeps holding its
+   * card, but leaves his count and list until the time passes, or until its
+   * asker edits it or replies on it. Only the owner sets and clears it.
+   */
+  snoozedUntil: Schema.optional(IsoDateTime),
+  /** Its asker ended a snooze early by editing or replying: it is back since then. */
+  backFromSnoozeAt: Schema.optional(IsoDateTime),
   /** He handed it over with "every time"; copied to the answer when it closes. */
   handedAlways: Schema.optional(Schema.Boolean),
   /** The evaluator thread "every time" started; copied to the answer when it closes. */
@@ -607,6 +615,27 @@ export const kanbanAskWaitsOn = (
 /** Past its `expiresAt`: its asker must renew it before it can be answered. */
 export const kanbanAskExpired = (ask: Pick<KanbanOwnerAsk, "expiresAt">, nowMs: number): boolean =>
   ask.expiresAt !== undefined && Date.parse(ask.expiresAt) <= nowMs;
+/** Put away by the owner and not back yet. It is still his turn (`kanbanAskWaitsOn` says "owner"). */
+export const kanbanAskSnoozed = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "closedAt">,
+  nowMs: number,
+): boolean =>
+  ask.closedAt === null && ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) > nowMs;
+/**
+ * When an open ask came back from a snooze: the time it was snoozed until, or
+ * the earlier time its asker edited it or replied. Null when it was never
+ * snoozed, is still snoozed, or the owner has acted on it since.
+ */
+export const kanbanAskBackFromSnooze = (
+  ask: Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt" | "closedAt">,
+  nowMs: number,
+): string | null =>
+  ask.closedAt !== null
+    ? null
+    : (ask.backFromSnoozeAt ??
+      (ask.snoozedUntil !== undefined && Date.parse(ask.snoozedUntil) <= nowMs
+        ? ask.snoozedUntil
+        : null));
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -678,15 +707,18 @@ export const kanbanNeedsOwner = (card: Pick<KanbanCard, "asks" | "stage" | "sett
 
 type AskTurnFields = Pick<
   KanbanOwnerAsk,
-  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt"
+  "closedAt" | "clarifyAskedAt" | "handedAt" | "expiresAt" | "snoozedUntil"
 > & { readonly respond?: { readonly ack?: boolean | undefined } | undefined };
 
 /**
  * An open ask that needs the owner now: his turn, not past its `expiresAt`,
- * and something to decide (a notice only wants to be seen).
+ * not snoozed, and something to decide (a notice only wants to be seen).
  */
 export const kanbanAskNeedsOwner = (ask: AskTurnFields, nowMs: number): boolean =>
-  kanbanAskWaitsOn(ask) === "owner" && !kanbanAskExpired(ask, nowMs) && !kanbanAskIsNotice(ask);
+  kanbanAskWaitsOn(ask) === "owner" &&
+  !kanbanAskExpired(ask, nowMs) &&
+  !kanbanAskSnoozed(ask, nowMs) &&
+  !kanbanAskIsNotice(ask);
 
 export interface KanbanAskTurns {
   /** His turn, and answerable. */
@@ -697,6 +729,8 @@ export interface KanbanAskTurns {
   readonly evaluator: number;
   /** His turn, but past `expiresAt`: their asker must renew them. */
   readonly expired: number;
+  /** His turn, but he put them away until later. */
+  readonly snoozed: number;
   /** His to see, nothing to decide. */
   readonly notices: number;
 }
@@ -706,13 +740,14 @@ export const kanbanAskTurns = (
   card: { readonly settledAt: string | null; readonly asks: ReadonlyArray<AskTurnFields> },
   nowMs: number,
 ): KanbanAskTurns => {
-  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, notices: 0 };
+  const turns = { owner: 0, agent: 0, evaluator: 0, expired: 0, snoozed: 0, notices: 0 };
   if (card.settledAt !== null) return turns;
   for (const ask of card.asks) {
     const turn = kanbanAskWaitsOn(ask);
     if (turn === null) continue;
     if (turn !== "owner") turns[turn] += 1;
     else if (kanbanAskExpired(ask, nowMs)) turns.expired += 1;
+    else if (kanbanAskSnoozed(ask, nowMs)) turns.snoozed += 1;
     else if (kanbanAskIsNotice(ask)) turns.notices += 1;
     else turns.owner += 1;
   }
@@ -722,8 +757,8 @@ export const kanbanAskTurns = (
 /**
  * Whether a card counts in the "needs you" numbers: it has an ask the owner can
  * answer now, or it sits in Needs Owner with no open ask to decide (a hold set by hand).
- * A card whose open asks are all handed over, waiting on their asker or expired
- * does not count, though a blocking one still holds it in Needs Owner.
+ * A card whose open asks are all handed over, waiting on their asker, expired or
+ * snoozed does not count, though a blocking one still holds it in Needs Owner.
  */
 export const kanbanCardNeedsOwner = (
   card: {
@@ -1146,6 +1181,10 @@ export const KanbanAskFeedItem = Schema.Struct({
   /** Whose turn it is on an open ask; null once closed. */
   waitsOn: Schema.NullOr(Schema.Literals(["owner", "agent", "evaluator"])),
   expired: Schema.Boolean,
+  /** True while the owner has it put away (`ask.snoozedUntil` is still ahead). */
+  snoozed: Schema.optional(Schema.Boolean),
+  /** Set on an open ask that came back from a snooze and he has not acted on since: when it came back. */
+  backFromSnoozeAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   /** The message that asked it and every message posted on the ask, oldest first. Big blocks are stubs. */
   messages: Schema.Array(KanbanMessage),
 });

@@ -70,6 +70,8 @@ export const closeAsks = (
           const {
             clarifyAskedAt: _clarify,
             handedAt: _handed,
+            snoozedUntil: _snoozed,
+            backFromSnoozeAt: _back,
             handedAlways: always,
             handedThreadId: evaluatorThreadId,
             ...rest
@@ -1199,8 +1201,10 @@ export const reviseAsk = (
     revisionNote: _note,
     clarifyAskedAt: _clarify,
     blocks: stored,
-    ...kept
+    ...rest
   } = ask;
+  // An edit brings a snoozed ask back: there is something new to read.
+  const kept = endSnooze(rest, at);
   return {
     ...kept,
     ...(edit.blocks === undefined && stored !== undefined ? { blocks: stored } : {}),
@@ -1217,9 +1221,86 @@ export const replaceAsk = (card: KanbanCard, next: KanbanOwnerAsk): KanbanCard =
   asks: card.asks.map((ask) => (ask.id === next.id ? next : ask)),
 });
 
+/** The longest the owner can put an ask away for. */
+export const SNOOZE_MAX_MS = 366 * 24 * 60 * 60 * 1000;
+
+/** Without its snooze marks: the owner acted on it, or took the snooze off. */
+const withoutSnooze = <A extends Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt">>(
+  ask: A,
+): Omit<A, "snoozedUntil" | "backFromSnoozeAt"> => {
+  const { snoozedUntil: _until, backFromSnoozeAt: _back, ...rest } = ask;
+  return rest;
+};
+
+/**
+ * Its asker edited it or replied: a snooze still running ends now, and the ask
+ * is marked as back since then. One that already ran out is back since it did.
+ */
+const endSnooze = <A extends Pick<KanbanOwnerAsk, "snoozedUntil" | "backFromSnoozeAt">>(
+  ask: A,
+  at: string,
+): A => {
+  if (ask.snoozedUntil === undefined || Date.parse(ask.snoozedUntil) <= Date.parse(at)) return ask;
+  const { snoozedUntil: _until, ...rest } = ask;
+  return {
+    ...rest,
+    backFromSnoozeAt: at as NonNullable<KanbanOwnerAsk["backFromSnoozeAt"]>,
+  } as unknown as A;
+};
+
+/** The agent replied on a snoozed ask: it comes back. Same card when it wasn't snoozed. */
+export const wakeFromSnooze = (card: KanbanCard, askId: string, at: string): KanbanCard => {
+  const ask = card.asks.find((entry) => entry.id === askId);
+  if (!ask || ask.closedAt !== null) return card;
+  const woken = endSnooze(ask, at);
+  return woken === ask ? card : replaceAsk(card, woken);
+};
+
+/**
+ * The owner puts an open ask of his away until `until`, or (null) takes the
+ * snooze off. It stays open and keeps holding its card; nobody is told.
+ */
+export const snoozeAsk = (
+  card: KanbanCard,
+  ask: KanbanOwnerAsk,
+  until: string | null,
+  at: string,
+): KanbanCard | AskProblem => {
+  const ref = `${ask.id} on card #${card.number}`;
+  if (ask.closedAt !== null) return { code: "conflict", detail: `${ref} is already closed` };
+  if (until === null) return replaceAsk(card, withoutSnooze(ask));
+  if (ask.handedAt !== undefined) {
+    return invalid(`${ref} is with the evaluator: take it back to snooze it`);
+  }
+  if (ask.clarifyAskedAt !== undefined) {
+    return invalid(`${ref} waits on its asker, not on you: there is nothing to snooze`);
+  }
+  const time = DateTime.make(until);
+  if (Option.isNone(time)) return invalid("until is not a time (use ISO 8601)");
+  const ms = DateTime.toEpochMillis(time.value);
+  const now = Date.parse(at);
+  if (ms <= now) return invalid("until is in the past: snooze to a later time");
+  if (ms - now > SNOOZE_MAX_MS) return invalid("until is more than a year away");
+  return replaceAsk(card, {
+    ...withoutSnooze(ask),
+    snoozedUntil: DateTime.formatIso(time.value) as NonNullable<KanbanOwnerAsk["snoozedUntil"]>,
+  });
+};
+
 /** The owner asked about the ask instead of answering it: it waits on its asker. */
 export const markClarify = (card: KanbanCard, askId: string, at: string): KanbanCard =>
-  updateAsk(card, askId, { clarifyAskedAt: at as NonNullable<KanbanOwnerAsk["clarifyAskedAt"]> });
+  updateAsk(actedOn(card, askId), askId, {
+    clarifyAskedAt: at as NonNullable<KanbanOwnerAsk["clarifyAskedAt"]>,
+  });
+
+/** The owner acted on an ask (replied, handed it over): any snooze mark on it is done with. */
+const actedOn = (card: KanbanCard, askId: string): KanbanCard =>
+  card.asks.some(
+    (ask) =>
+      ask.id === askId && (ask.snoozedUntil !== undefined || ask.backFromSnoozeAt !== undefined),
+  )
+    ? { ...card, asks: card.asks.map((ask) => (ask.id === askId ? withoutSnooze(ask) : ask)) }
+    : card;
 
 const without = (
   card: KanbanCard,
@@ -1247,7 +1328,7 @@ export const markHanded = (
   at: string,
   always = false,
 ): KanbanCard =>
-  updateAsk(without(card, askId, "clarifyAskedAt"), askId, {
+  updateAsk(actedOn(without(card, askId, "clarifyAskedAt"), askId), askId, {
     handedAt: at as NonNullable<KanbanOwnerAsk["handedAt"]>,
     ...(always ? { handedAlways: true } : {}),
   });

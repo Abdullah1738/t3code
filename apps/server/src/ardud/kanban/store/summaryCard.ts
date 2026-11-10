@@ -17,6 +17,7 @@ export const SummaryCard = Schema.Struct({
       clarifyAskedAt: Schema.optional(Schema.String),
       handedAt: Schema.optional(Schema.String),
       expiresAt: Schema.optional(Schema.String),
+      snoozedUntil: Schema.optional(Schema.String),
       /** Only `ack` is read: a notice never counts for the owner. */
       respond: Schema.optional(Schema.Struct({ ack: Schema.optional(Schema.Boolean) })),
     }),

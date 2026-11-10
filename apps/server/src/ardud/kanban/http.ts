@@ -173,6 +173,14 @@ const AskHandBody = Schema.Struct({
   /** With always: what the owner said, passed to that evaluator word for word. */
   text: Text,
 });
+const AskSnoozeBody = Schema.Struct({
+  /** ISO time to put the ask away until; null takes the snooze off. */
+  until: Schema.NullOr(Schema.String),
+});
+const AskSnoozeBatchBody = Schema.Struct({
+  until: Schema.NullOr(Schema.String),
+  items: Schema.Array(Schema.Struct({ card: Schema.String, askId: Schema.String })),
+});
 /** At most this many asks in one batch answer. */
 const ASK_BATCH_MAX = 50;
 
@@ -696,6 +704,44 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    const snoozeAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(AskSnoozeBody);
+        return askOf(yield* service.snoozeAsk(card.id, askId, input.until, OWNER), askId);
+      }),
+    );
+
+    // Each ask is snoozed on its own: one that can't be doesn't hold back the rest.
+    const snoozeAsks = write(
+      Effect.gen(function* () {
+        const { items, until } = yield* body(AskSnoozeBatchBody);
+        if (items.length === 0) return yield* fail("invalid", "items is empty.");
+        if (items.length > ASK_BATCH_MAX) {
+          return yield* fail("invalid", `At most ${ASK_BATCH_MAX} asks in one batch.`);
+        }
+        const results = yield* Effect.forEach(items, (item) =>
+          Effect.gen(function* () {
+            const card = yield* cardOf(item.card);
+            yield* service.snoozeAsk(card.id, item.askId, until, OWNER);
+            return { card: item.card, askId: item.askId, ok: true as const };
+          }).pipe(
+            Effect.catchTags({
+              KanbanError: (error) =>
+                Effect.succeed({
+                  card: item.card,
+                  askId: item.askId,
+                  ok: false as const,
+                  error: { code: error.code, message: error.detail },
+                }),
+            }),
+          ),
+        );
+        return { snoozed: results.filter((result) => result.ok).length, results };
+      }),
+    );
+
     const startEvaluator = write(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
@@ -775,10 +821,12 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),
       HttpRouter.route("GET", `${p}/asks`, handle(listAsks)),
       HttpRouter.route("POST", `${p}/asks/answer`, handle(answerAsks)),
+      HttpRouter.route("POST", `${p}/asks/snooze`, handle(snoozeAsks)),
       HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/snooze`, handle(snoozeAsk)),
       HttpRouter.route("PATCH", `${p}/discussions/:discussion`, handle(updateDiscussion)),
       HttpRouter.route("GET", `${p}/discussions/:discussion/messages`, handle(listMessages)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/messages`, handle(postMessage)),
