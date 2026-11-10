@@ -121,6 +121,9 @@ times out or prints too much) counts as `fail` for the cards it did not answer.
 - The run is a normal script run (trigger `wait-check`): same timeout, same
   output cap, same environment, and it shows on the scripts page.
 - Only the script a card waits on can answer that card's check.
+- An answer is for the wait the check was asked about. If the card's wait was
+  replaced while the check ran (even with the same script and other `args`),
+  the answer is dropped and the new wait is checked on the next run.
 - A script that is turned off or removed fails its waits, so the card shows it.
 
 ## Waking and parking from any script
@@ -133,9 +136,14 @@ polling, or park a card:
 {"kanban":{"wait":{"card":"#12","on":"time","until":"2026-11-14T09:00:00+04:00","note":"recheck after the release"}}}
 ```
 
-- `wake` ends the card's wait, whatever it waits on. It is refused, with the
-  reason in the run's output, when the card has no wait or a thread is running
-  it.
+- `wake` ends the card's wait, whatever it waits on: the wait the card has
+  when the line is applied, which may not be the one the script had in mind.
+  It is refused, with the reason in the run's output, when the card has no
+  wait or a thread is running it.
+- To end one particular wait, add `"wait"` with the time that wait was set
+  (`wait.at` in a check's input, or the card's wait as `card_get` shows it):
+  `{"kanban":{"wake":{"card":"#12","wait":"2026-11-10T11:00:00.000Z","note":"v2.4.1 is live"}}}`.
+  The wake is then refused when the card waits on something else by now.
 - `wait` with `on` parks a card. It takes the same fields as `card_wait`
   (`on`, `note`, `pr`, `waitsOn`, `ask`, `until`, `head`, `wakeRole`, `script`,
   `args`) and has the same guards.

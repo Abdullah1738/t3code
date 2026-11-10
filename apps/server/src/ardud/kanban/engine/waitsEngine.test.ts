@@ -21,6 +21,7 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KANBAN_BACKLOG,
   KanbanCard,
   KanbanCardDetail,
   KanbanCardEvent,
@@ -92,12 +93,20 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     } | null;
     fail: boolean;
   } = { hold: null, fail: false };
+  /** Runs while a thread's view is being read, outside the board's gate. */
+  const reading: { during: ((threadId: string) => Effect.Effect<void>) | null; count: number } = {
+    during: null,
+    count: 0,
+  };
   let next = 0;
   const view = (threadId: ThreadId) =>
-    Effect.map(Clock.currentTimeMillis, (nowMs): KanbanThreadView | null => {
+    Effect.gen(function* () {
+      reading.count += 1;
+      if (reading.during !== null) yield* reading.during(threadId);
+      const nowMs = yield* Clock.currentTimeMillis;
       const thread = threads.get(threadId);
       if (!thread) return null;
-      return {
+      const found: KanbanThreadView = {
         threadId,
         projectId: ProjectId.make("project-1"),
         title: thread.title,
@@ -109,6 +118,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         prs: prs.get(threadId) ?? [],
         archived: false,
       };
+      return found;
     });
   const threadsLayer = Layer.succeed(
     KanbanThreads,
@@ -198,6 +208,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     prs,
     host,
     gate,
+    reading,
     layer,
     /** Messages anywhere that include `text`. */
     said,
@@ -240,7 +251,7 @@ const tracked = (url: string, state: KanbanLink["state"] = "open"): KanbanLink =
 const placed = (
   board: KanbanBoard,
   title: string,
-  patch: Partial<Pick<KanbanCard, "stage" | "reviewStep" | "links">> = {},
+  patch: Partial<Pick<KanbanCard, "stage" | "reviewStep" | "links" | "workThreadId">> = {},
 ) =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -973,6 +984,140 @@ it.effect("an evaluator that never ends its turn cannot keep a reviewed card fro
   ),
 );
 
+it.effect(
+  "a card awaiting review whose wait ended for the evaluator gets no reviewer until that turn is over",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const card = yield* placed(board, "Review PR 12", {
+          stage: "needs_review",
+          links: [tracked(PR)],
+        });
+        yield* kanban.waitCard(
+          card.id,
+          { on: "push", pr: "#12", head: "aaa1111", note: "author to push the fixes" },
+          owner,
+        );
+        // The author closed the PR instead: only the evaluator can say what the card does now.
+        yield* TestClock.adjust(MINUTE);
+        world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+        yield* kanban.tick;
+        const held = yield* cardOf(card.id);
+        assert.isUndefined(held.wait);
+        assert.strictEqual(held.stage, "needs_review");
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+        // Held in the card's own row, from the write that ended the wait, and told.
+        const row = yield* store.card(card.id);
+        assert.strictEqual(row?.deciding?.since, held.updatedAt);
+        assert.isNotNull(row?.deciding?.toldAt);
+        // A free slot, and nobody starts its reviewer while the evaluator decides.
+        const evaluator = ThreadId.make(
+          [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+        );
+        world.threads.get(evaluator)!.running = true;
+        for (let turn = 0; turn < 3; turn += 1) {
+          yield* TestClock.adjust(MINUTE);
+          yield* kanban.dispatchNow;
+          yield* kanban.tick;
+        }
+        assert.strictEqual(world.cardThreads(), 0);
+        assert.isNull((yield* cardOf(card.id)).activeThreadId);
+
+        // The evaluator's turn ends with the card left as it is: the review starts, with the note.
+        world.threads.get(evaluator)!.running = false;
+        yield* kanban.turnEnded(evaluator);
+        assert.isUndefined((yield* cardOf(card.id)).deciding);
+        yield* kanban.tick;
+        const reviewing = yield* cardOf(card.id);
+        assert.strictEqual(reviewing.activeRole, "review");
+        assert.include(briefOf(world, reviewing), "was closed while this waited for a push");
+      }),
+    ),
+);
+
+it.effect("a To-Do card held for its evaluator cannot be claimed, and says why", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const busy = yield* placed(board, "Carries on");
+      yield* kanban.tick;
+      const worker = (yield* cardOf(busy.id)).activeThreadId!;
+      world.threads.get(worker)!.running = true;
+      const card = yield* placed(board, "Lands with PR 12", { links: [tracked(PR)] });
+      yield* kanban.waitCard(card.id, { on: "merge", pr: "#12", note: "until it merges" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+      yield* kanban.tick;
+      const held = yield* cardOf(card.id);
+      assert.isDefined(held.deciding);
+      assert.isNull(held.activeThreadId);
+      const refused = yield* Effect.flip(kanban.claimCard(worker, card.id));
+      assert.include(refused.detail, "is held for its evaluator");
+      assert.include(refused.detail, "was closed without merging");
+    }),
+  ),
+);
+
+it.effect("a card held for its evaluator is still held after a restart", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, store, board } = yield* setup;
+      // Reviewed, and parked until its PR merges. The PR is closed unmerged instead.
+      const card = yield* placed(board, "Review PR 12", {
+        stage: "in_review",
+        reviewStep: 1,
+        links: [tracked(PR)],
+      });
+      yield* kanban.waitCard(card.id, { on: "merge", pr: "#12", note: "until it merges" }, owner);
+      yield* TestClock.adjust(MINUTE);
+      world.host.readings = [{ url: PR, state: "closed", at: iso(T0 + MINUTE) }];
+      yield* kanban.tick;
+      assert.strictEqual((yield* cardOf(card.id)).stage, "in_review");
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+      const evaluator = ThreadId.make(
+        [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+      );
+      world.threads.get(evaluator)!.running = true;
+
+      // The server restarts: a new engine over the same store, with nothing in memory.
+      yield* Effect.gen(function* () {
+        const restarted = yield* KanbanService.KanbanService;
+        for (let turn = 0; turn < 3; turn += 1) {
+          yield* TestClock.adjust(MINUTE);
+          yield* restarted.tick;
+        }
+        // A closed PR counts as landed, so only the hold keeps the card out of Completed.
+        assert.strictEqual((yield* store.card(card.id))?.stage, "in_review");
+        world.threads.get(evaluator)!.running = false;
+        yield* restarted.turnEnded(evaluator);
+        yield* restarted.tick;
+        assert.strictEqual((yield* store.card(card.id))?.stage, "completed");
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+    }),
+  ),
+);
+
+it.effect("the history says so when the evaluator did not decide in time", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const created = yield* reviewedAndParked(board);
+      yield* TestClock.adjust(HOUR + MINUTE);
+      yield* kanban.tick;
+      assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+      yield* TestClock.adjust(Waits.WAIT_DECIDE_MS + MINUTE);
+      yield* kanban.tick;
+      const card = yield* cardOf(created.id);
+      assert.strictEqual(card.stage, "completed");
+      assert.isUndefined(card.deciding);
+      assert.isTrue(
+        (yield* eventsOf(created.id)).some((event) => event.body === Waits.DECIDING_RAN_OUT),
+      );
+    }),
+  ),
+);
+
 it.effect("a card with a running thread is left alone, whatever its wait says", () =>
   inWorld((world) =>
     Effect.gen(function* () {
@@ -1237,6 +1382,148 @@ it.effect(
     ),
 );
 
+it.effect("a check that outlives its wait does not answer for the wait that replaced it", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const card = yield* placed(board, "Blocked on Linear", {
+        stage: "in_review",
+        reviewStep: 1,
+      });
+      // The check says "wake" for whatever card it was asked about, once it is let go.
+      const go = NodePath.join(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-waits-go-")),
+        "go",
+      );
+      const wake = `{"kanban":{"wait":{"card":"#${card.number}","result":"wake","to":"work","note":"ENG-1 is Done"}}}`;
+      yield* scripts.register(
+        {
+          boardId: board.id,
+          name: "linear-state",
+          path: scriptFile(
+            `#!/bin/sh\nwhile [ ! -f "${go}" ]; do sleep 0.05; done\necho '${wake}'\n`,
+            "linear-state.sh",
+          ),
+          trigger: { _tag: "manual" },
+        },
+        owner,
+      );
+      yield* kanban.waitCard(
+        card.id,
+        { on: "script", script: "linear-state", args: { issue: "ENG-1" }, note: "ENG-1 Done" },
+        owner,
+      );
+      // The check for ENG-1 starts and is still running...
+      yield* kanban.tick;
+      yield* scripts.tick;
+      // ...when the evaluator replaces the wait: same script, another issue.
+      yield* kanban.waitCard(
+        card.id,
+        { on: "script", script: "linear-state", args: { issue: "ENG-2" }, note: "ENG-2 Done" },
+        owner,
+      );
+      NodeFS.writeFileSync(go, "");
+      yield* scripts.idle;
+      // The old check's wake was for the ENG-1 wait: the card still waits, on ENG-2.
+      const still = yield* cardOf(card.id);
+      assert.deepStrictEqual(still.wait?.args, { issue: "ENG-2" });
+      assert.strictEqual(still.stage, "in_review");
+      assert.strictEqual(still.wait?.failures, 0);
+      assert.strictEqual(world.cardThreads(), 0);
+    }),
+  ),
+);
+
+it.effect("a pushed wake can name the wait it means, and is refused once that wait is gone", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+      const card = yield* placed(board, "Ships with the release");
+      const first = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + 48 * HOUR), note: "after the release" },
+        owner,
+      );
+      yield* TestClock.adjust(MINUTE);
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + 96 * HOUR), note: "after the next release" },
+        owner,
+      );
+      const script: KanbanActor = { _tag: "system", component: "test" };
+      const stale = yield* Effect.flip(
+        kanban.answerWait(
+          card.id,
+          { result: "wake", note: "v1 is live" },
+          { script: null, expect: first.wait!.at },
+          script,
+        ),
+      );
+      assert.strictEqual(stale.code, "conflict");
+      assert.include(stale.detail, "waits on something else now");
+      assert.include((yield* cardOf(card.id)).wait?.note ?? "", "after the next release");
+      // Naming no wait ends whatever wait the card has now, as it always did.
+      yield* kanban.answerWait(
+        card.id,
+        { result: "wake", note: "v2 is live" },
+        { script: null },
+        script,
+      );
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+    }),
+  ),
+);
+
+it.effect(
+  "a batch of answers is one write: each card gets its own outcome and a refusal stops nothing",
+  () =>
+    inWorld(() =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const parkOn = (title: string) =>
+          Effect.gen(function* () {
+            const card = yield* placed(board, title);
+            return yield* kanban.waitCard(
+              card.id,
+              { on: "time", until: iso(T0 + 48 * HOUR), note: `${title}: later` },
+              owner,
+            );
+          });
+        const first = yield* parkOn("First");
+        const second = yield* parkOn("Second");
+        const free = yield* placed(board, "Not waiting");
+        const script: KanbanActor = { _tag: "system", component: "test" };
+        const outcomes = yield* kanban.answerWaits(
+          board.id,
+          [
+            // By number, as a script names its cards; by id, as a check's own batch does.
+            { card: first.number, answer: { result: "wake", note: "go" }, script: null },
+            { card: free.id, answer: { result: "wake", note: "go" }, script: null },
+            { card: 9999, answer: { result: "wake", note: "go" }, script: null },
+            { card: second.id, answer: { result: "hold" }, script: null },
+            {
+              card: second.id,
+              answer: { result: "wake", note: "go" },
+              script: null,
+              expect: "2020-01-01T00:00:00.000Z",
+            },
+          ],
+          script,
+        );
+        assert.deepStrictEqual(
+          outcomes.map((outcome) => (outcome.ok ? "ok" : outcome.code)),
+          ["ok", "conflict", "not-found", "invalid", "conflict"],
+        );
+        assert.isUndefined((yield* cardOf(first.id)).wait);
+        // Refused answers left the second card exactly as it was.
+        assert.deepStrictEqual(yield* cardOf(second.id), second);
+      }),
+    ),
+);
+
 // The event kinds a client built before the tolerant decoder knows: a closed list.
 const OldEventKind = Schema.Literals([
   "created",
@@ -1326,6 +1613,75 @@ it.effect(
           Result.getOrThrow(thisClientReads(onTheWire(live))).events.length,
           live.events.length,
         );
+      }),
+    ),
+);
+
+it.effect(
+  "writes that land while the wait pass reads its threads cost the tick one start-over, not one per parked card",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        // Nothing is started here: the test is about the tick, not the dispatcher.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        // Ten cards, each parked until the PR its own idle work thread watches has merged.
+        const parked: Array<KanbanCard> = [];
+        for (let i = 0; i < 10; i += 1) {
+          const url = `https://github.com/acme/app/pull/${100 + i}`;
+          const threadId = ThreadId.make(`watcher-${i}`);
+          world.threads.set(threadId, {
+            title: `Work ${i}`,
+            model: board.defaultCardModel,
+            messages: [],
+            running: false,
+          });
+          world.prs.set(threadId, [{ url, title: null, state: "open" }]);
+          const card = yield* placed(board, `Lands with PR ${100 + i}`, {
+            links: [tracked(url)],
+            workThreadId: threadId,
+          });
+          yield* kanban.waitCard(card.id, { on: "merge", pr: url, note: "until it merges" }, owner);
+          parked.push(card);
+        }
+        yield* kanban.tick;
+        for (const card of parked) assert.isDefined((yield* cardOf(card.id)).wait);
+
+        // Every PR merges, and the board is busy: while each of those threads is read,
+        // somebody else writes to the board. Any such write makes the tick start over,
+        // and it gives up after eight of those, so a read per parked card would end no
+        // wait here.
+        for (const [threadId, prs] of world.prs) {
+          world.prs.set(
+            threadId,
+            prs.map((pr) => ({ ...pr, state: "merged" as const })),
+          );
+        }
+        let made = 0;
+        world.reading.count = 0;
+        world.reading.during = (threadId) =>
+          threadId.startsWith("watcher-")
+            ? Effect.forkChild(
+                kanban.createCard(
+                  board.id,
+                  {
+                    prompt: "Unrelated",
+                    title: `Unrelated ${(made += 1)}`,
+                    description: "Written while the tick reads",
+                    priority: KANBAN_BACKLOG,
+                  },
+                  owner,
+                ),
+              ).pipe(Effect.flatMap(Fiber.join), Effect.ignore)
+            : Effect.void;
+        yield* kanban.tick;
+        world.reading.during = null;
+        for (const card of parked) {
+          assert.isUndefined((yield* cardOf(card.id)).wait, `card #${card.number} was woken`);
+        }
+        assert.strictEqual(made, 10, "a write landed during every read");
+        // Read together once; the tick that started over reused that read.
+        assert.strictEqual(world.reading.count, 10);
       }),
     ),
 );

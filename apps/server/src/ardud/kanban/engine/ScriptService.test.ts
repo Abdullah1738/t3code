@@ -1233,10 +1233,12 @@ it.effect(
         "ENG-1 is Done. It was waiting for the linear-state script's check",
       );
       assert.deepInclude((yield* waitOf(noted.id)).wait, { status: "In Review", failures: 0 });
-      // No line is a hold: still waiting, checked, nothing wrong.
-      const held = (yield* waitOf(quiet.id)).wait;
-      assert.deepInclude(held, { status: null, failures: 0, problem: null });
-      assert.isNotNull(held?.lastCheckedAt);
+      // No line is a hold: still waiting, nothing wrong, and nothing new to show,
+      // so its row was not written.
+      const held = yield* waitOf(quiet.id);
+      assert.deepInclude(held.wait, { status: null, failures: 0, problem: null });
+      assert.isNull(held.wait?.lastCheckedAt);
+      assert.strictEqual(held.updatedAt, quiet.updatedAt);
       // An answer nobody can read holds too, and shows as a problem.
       assert.deepInclude((yield* waitOf(garbled.id)).wait, {
         failures: 1,
@@ -1439,7 +1441,10 @@ it.effect("the script scheduler runs the wait checks, once per rest", () =>
     const runs = yield* scripts.runs(script.id, 10);
     assert.strictEqual(runs.length, 1);
     assert.strictEqual(runs[0]?.trigger, ScriptService.WAIT_CHECK_TRIGGER);
-    assert.isNotNull((yield* waitOf(card.id)).wait?.lastCheckedAt);
+    // The check ran and held: the card says nothing new, so it was not written.
+    const held = yield* waitOf(card.id);
+    assert.isNull(held.wait?.lastCheckedAt);
+    assert.strictEqual(held.updatedAt, card.updatedAt);
     yield* TestClock.adjust(30_000);
     yield* scripts.tick;
     yield* scripts.idle;

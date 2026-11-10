@@ -6,6 +6,7 @@
  * `newWait`.
  */
 import {
+  KANBAN_DECIDE_MS,
   KANBAN_DONE_STAGES,
   KANBAN_WAIT_LIMIT_MS,
   kanbanAwaitsMerge,
@@ -18,6 +19,7 @@ import {
   kanbanWaitDeadlineMs,
   kanbanWaitExpired,
   kanbanWaitStale,
+  kanbanDeciding,
   kanbanWaiting,
   kanbanWithoutWait,
   type KanbanActor,
@@ -78,11 +80,11 @@ export const WAITS_ENGINE_WIRED: boolean = true;
 export const WAIT_EVENT_KINDS_LIVE: boolean = false;
 
 /**
- * How long a reviewed card whose wait ended may be kept from completing while its
- * evaluator, asked what to do next, has not finished that turn. Counted from the
- * card's last change, so an evaluator that never answers cannot hold it for good.
+ * How long a card whose wait ended with a wake for its evaluator is held for that
+ * evaluator's decision (the card's `deciding`). Counted from the end of the wait,
+ * so an evaluator that never answers cannot hold the card for good.
  */
-export const WAIT_DECIDE_MS = 30 * 60 * 1000;
+export const WAIT_DECIDE_MS = KANBAN_DECIDE_MS;
 
 /** Stages where the engine as it is today leaves a thread-less card alone. */
 const QUIET_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -120,6 +122,11 @@ export interface WaitFacts {
    * One not listed is unknown, not gone.
    */
   readonly prs: ReadonlyArray<WaitPrFacts>;
+  /**
+   * `prs` by `prKey` (`indexPrReadings`). A caller that checks many cards against
+   * the same readings builds it once; without it each card scans `prs`.
+   */
+  readonly prsByKey?: ReadonlyMap<string, WaitPrFacts> | undefined;
   /** The board's cards by id. A card not in the map is gone. */
   readonly cards: ReadonlyMap<
     string,
@@ -191,6 +198,36 @@ export function mergePrReadings(
     );
   }
   return [...byKey.values()];
+}
+
+/**
+ * Which wait this is: two waits differ when they were set at different times or
+ * ask for different things, however alike they look (the same script with other
+ * args). What checks write on a wait as they go (status, failures) is not part
+ * of it. A check's answer carries the identity of the wait it was asked about,
+ * so an answer that comes back after the wait was replaced is not applied to
+ * the new one.
+ */
+export function waitIdentity(wait: KanbanWait): string {
+  return JSON.stringify([
+    wait.at,
+    wait.on,
+    wait.script,
+    wait.args,
+    wait.pr,
+    wait.card,
+    wait.ask,
+    wait.until,
+    wait.sinceHead,
+    wait.by,
+  ]);
+}
+
+/** One reading per pull request, by `prKey`: built once for a pass over many waiting cards. */
+export function indexPrReadings(
+  readings: ReadonlyArray<WaitPrFacts>,
+): ReadonlyMap<string, WaitPrFacts> {
+  return new Map(mergePrReadings(readings).map((reading) => [prKey(reading.url), reading]));
 }
 
 /**
@@ -465,6 +502,17 @@ export const waitHoldsDispatch = (card: WaitingFields) => kanbanWaiting(card);
 /** No quiet-thread nudge and no evaluator reminder for it. */
 export const waitSkipsNudge = (card: WaitingFields) => kanbanWaiting(card);
 
+/**
+ * Held for its evaluator after a wait ended: like a waiting card, it is not
+ * started, claimed, completed or reminded about until the evaluator's turn ends
+ * or the time to decide runs out.
+ */
+export const decidingHolds = (card: WaitingFields & Pick<KanbanCard, "deciding">, nowMs?: number) =>
+  kanbanDeciding(card, nowMs);
+
+/** The line the history gets when a card held for its evaluator is let go at the limit. */
+export const DECIDING_RAN_OUT = `The evaluator did not decide within ${Math.round(KANBAN_DECIDE_MS / 60_000)} minutes of the wait ending: the card carries on`;
+
 /** Not idle and not stalled in any count or sweep, until the wait runs past its limit or its check keeps failing. */
 export const waitHidesIdle = (card: WaitingFields, nowMs: number) =>
   kanbanWaiting(card) &&
@@ -565,10 +613,14 @@ export function nextActor(
  */
 function inputReadings(
   prLinks: ReadonlyArray<KanbanLink>,
-  readings: ReadonlyArray<WaitPrFacts>,
+  facts: Pick<WaitFacts, "prs" | "prsByKey">,
   keys: ReadonlySet<string>,
 ): ReadonlyArray<WaitPrFacts> {
-  const read = mergePrReadings(readings.filter((reading) => keys.has(prKey(reading.url))));
+  const byKey = facts.prsByKey;
+  const read =
+    byKey === undefined
+      ? mergePrReadings(facts.prs.filter((reading) => keys.has(prKey(reading.url))))
+      : [...keys].flatMap((key) => byKey.get(key) ?? []);
   const known = new Set(read.map((reading) => prKey(reading.url)));
   return [
     ...read,
@@ -609,7 +661,7 @@ export function checkInput(
     },
     facts: {
       now: DateTime.formatIso(DateTime.makeUnsafe(facts.nowMs)),
-      prs: inputReadings(prLinks, facts.prs, keys),
+      prs: inputReadings(prLinks, facts, keys),
       cards: named.flatMap((id) => {
         const target = facts.cards.get(id);
         return target === undefined
@@ -713,24 +765,34 @@ export function endWait(
       wake: { to: "review", note },
     };
   }
-  // The dispatcher starts a To-Do card as soon as nothing holds it, so its worker hears why too.
-  const startsAnyway = card.stage === "todo" && nextActor(card, ctx) === "work";
+  // What the card does now is the evaluator's call. It is held for that decision from
+  // this write on (`deciding`): nothing starts, claims or completes it until the
+  // evaluator's turn ends, it is moved or parked again, or the time to decide runs out.
+  const held: KanbanCard = {
+    ...cleared,
+    deciding: { since: at as KanbanWait["at"], why: `${reason}. ${was}`, toldAt: null },
+  };
+  // Once the hold is over the dispatcher starts a To-Do card or a review again, so
+  // whoever it starts hears why too.
+  const startsAfter =
+    (card.stage === "todo" && nextActor(card, ctx) === "work") || card.stage === "needs_review";
+  const minutes = Math.round(KANBAN_DECIDE_MS / 60_000);
   return {
-    card: startsAnyway
+    card: startsAfter
       ? {
-          ...cleared,
+          ...held,
           wakeNote: joinNotes(
             card.wakeNote,
             `${reason}. ${was} The evaluator has been told: check the card still makes sense before you carry on.`,
           ),
         }
-      : cleared,
+      : held,
     event: event(card.stage),
     wake: {
       to: "evaluator",
-      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is no longer waiting: ${reason}. ${was} ${
-        startsAnyway
-          ? "The dispatcher will start its worker again; flag or move the card if it should not run."
+      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is no longer waiting: ${reason}. ${was} It is held for you: nothing starts or completes it until your turn ends, or for ${minutes} minutes at most. ${
+        startsAfter
+          ? `After that the dispatcher starts its ${card.stage === "needs_review" ? "reviewer" : "worker"} again; move or flag the card, or set a new wait with card_wait, if it should not run.`
           : "Take its next step, or set a new wait with card_wait if it still has to hold."
       }`,
     },
@@ -780,9 +842,9 @@ export type WaitStep =
 /**
  * Applies a check's answer to a waiting card, whoever gave it: one of the
  * board's own checks, a board script's check, or a wake a script pushed.
- * Ending wins over expiring. `stamp` also records the time of an answer that
- * changed nothing; a caller that checks every tick leaves it off, so a quiet
- * wait costs no writes.
+ * Ending wins over expiring. An answer that changes nothing the wait shows
+ * (a hold with the same status, no failure to clear) saves nothing, so a quiet
+ * wait costs no writes however often it is checked.
  */
 export function applyAnswer(
   card: KanbanCard,
@@ -790,7 +852,6 @@ export function applyAnswer(
   facts: Pick<WaitFacts, "nowMs" | "cards">,
   ctx: WaitContext,
   at: string,
-  options: { readonly stamp?: boolean } = {},
 ): WaitStep {
   const wait = kanbanWait(card);
   if (wait === null || !kanbanWaiting(card)) return { _tag: "none" };
@@ -826,14 +887,13 @@ export function applyAnswer(
   }
   const status = answer.status == null ? null : oneLine(answer.status, WAIT_STATUS_MAX) || null;
   const changed = status !== wait.status || wait.failures !== 0 || wait.problem !== null;
-  const held: KanbanCard =
-    changed || options.stamp === true
-      ? {
-          ...card,
-          wait: { ...wait, status, failures: 0, problem: null, lastCheckedAt: checkedAt },
-          updatedAt: at,
-        }
-      : card;
+  const held: KanbanCard = changed
+    ? {
+        ...card,
+        wait: { ...wait, status, failures: 0, problem: null, lastCheckedAt: checkedAt },
+        updatedAt: at,
+      }
+    : card;
   const expired = expireWait(held, facts, at);
   if (expired !== null) return { _tag: "expire", ...expired };
   return { _tag: "hold", save: held === card ? null : held };

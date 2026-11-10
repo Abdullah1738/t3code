@@ -31,7 +31,10 @@ import {
   kanbanWaitCheckFailing,
   kanbanWaitDeadlineMs,
   kanbanWaitExpired,
+  kanbanDeciding,
   kanbanWaiting,
+  kanbanWithoutDeciding,
+  KANBAN_DECIDE_MS,
   kanbanWaitStale,
   kanbanWithoutWait,
   type KanbanWait,
@@ -938,6 +941,50 @@ describe("KanbanCard wait", () => {
     const moved = { ...waiting, movedAt: "2026-10-25T11:00:00.000Z" as never };
     expect(kanbanWaitStale(moved)).toBe(true);
     expect(kanbanWaiting(moved)).toBe(false);
+  });
+
+  it("a card held for its evaluator round-trips, and one stored before the key has none", () => {
+    const plain = Schema.decodeUnknownSync(KanbanCard)(stored());
+    expect(plain.deciding).toBeUndefined();
+    expect("deciding" in Schema.encodeSync(KanbanCard)(plain)).toBe(false);
+    const held = Schema.decodeUnknownSync(KanbanCard)(
+      // Written by a build before `toldAt`: it decodes as not told yet.
+      stored({ deciding: { since: "2026-10-25T10:00:00.000Z", why: "PR closed" } }),
+    );
+    expect(held.deciding).toEqual({
+      since: "2026-10-25T10:00:00.000Z",
+      why: "PR closed",
+      toldAt: null,
+    });
+    // A shape this build cannot read is dropped, and the board still loads.
+    expect(
+      Schema.decodeUnknownSync(KanbanCard)(stored({ deciding: { since: 7 } })).deciding,
+    ).toBeUndefined();
+  });
+
+  it("holds a card for its evaluator until it is moved, parked, started or out of time", () => {
+    const since = Date.parse("2026-10-25T10:00:00.000Z");
+    const held = card("d", {
+      stage: "needs_review",
+      movedAt: "2026-10-25T09:00:00.000Z" as never,
+      deciding: { since: "2026-10-25T10:00:00.000Z" as never, why: "PR closed", toldAt: null },
+    });
+    expect(kanbanDeciding(held)).toBe(true);
+    expect(kanbanDeciding(held, since + KANBAN_DECIDE_MS - 1)).toBe(true);
+    expect(kanbanDeciding(held, since + KANBAN_DECIDE_MS)).toBe(false);
+    expect(kanbanDeciding({ ...held, movedAt: "2026-10-25T10:05:00.000Z" as never })).toBe(false);
+    expect(kanbanDeciding({ ...held, activeThreadId: "thread-1" as never })).toBe(false);
+    expect(
+      kanbanDeciding({ ...held, wait: wait({ at: "2026-10-25T10:05:00.000Z" as never }) }),
+    ).toBe(false);
+    expect(kanbanDeciding(kanbanWithoutDeciding(held))).toBe(false);
+    // Not ready, and it gathers no age, while the evaluator decides.
+    const todo = { ...held, stage: "todo" as const };
+    const byId = new Map([[todo.id as string, todo]]);
+    expect(kanbanCardFlow(todo, byId, kanbanSchedule([todo]), since + 1).ready).toBe(false);
+    expect(kanbanCardFlow(todo, byId, kanbanSchedule([todo]), since + KANBAN_DECIDE_MS).ready).toBe(
+      true,
+    );
   });
 
   it("an old-shape client reads a waiting card's detail while wait events are written as edits", () => {

@@ -784,7 +784,11 @@ export const KanbanWait = Schema.Struct({
   expiredAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** The check's latest one-line progress note ("CI 3 of 5 passed"), or null. */
   status: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
-  /** When the check last answered. */
+  /**
+   * When a check last changed what the wait shows (its status, a failure, a failure
+   * cleared). A check that changes nothing does not write the card, so this is not
+   * the time of the latest check: a script's runs record that.
+   */
   lastCheckedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   /** Checks in a row that failed or gave no readable answer; 0 after one that answered. */
   failures: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
@@ -799,6 +803,20 @@ export const KANBAN_WAIT_CHECK_FAILURES = 3;
 /** A wait whose check keeps failing: it still holds, but nothing can end it until the check works. */
 export const kanbanWaitCheckFailing = (wait: Pick<KanbanWait, "failures">): boolean =>
   wait.failures >= KANBAN_WAIT_CHECK_FAILURES;
+
+/** How long an evaluator has to decide what a card does once its wait ended. */
+export const KANBAN_DECIDE_MS = 30 * 60 * 1000;
+
+/** A card held for its evaluator: its wait ended in a way only the evaluator can take on. */
+export const KanbanCardDeciding = Schema.Struct({
+  /** When the wait ended. */
+  since: IsoDateTime,
+  /** What ended and why, in one line. */
+  why: Schema.String,
+  /** When the evaluator was told; null while the note is still on its way. */
+  toldAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+});
+export type KanbanCardDeciding = typeof KanbanCardDeciding.Type;
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -853,6 +871,13 @@ export const KanbanCard = Schema.Struct({
    * decodes as absent, so the board still loads.
    */
   wait: ForwardCompatibleOptional(KanbanWait),
+  /**
+   * Set when a wait ended and what the card does next is its evaluator's call.
+   * Until that evaluator's turn ends (or KANBAN_DECIDE_MS passes) the card is not
+   * started, claimed or completed. Absent on every other card; a build that does
+   * not know the key drops it, and the card then carries on as it did before.
+   */
+  deciding: ForwardCompatibleOptional(KanbanCardDeciding),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
   /**
@@ -996,6 +1021,32 @@ export const kanbanWaiting = (
   card.activeThreadId === null &&
   card.settledAt === null &&
   !kanbanWaitStale(card);
+
+/**
+ * A card held for its evaluator after a wait ended (`deciding`). It is not
+ * started, claimed or completed until the evaluator's turn ends, the card is
+ * moved or parked again, or the time to decide runs out. A thread on the card,
+ * a newer move or a new wait all mean somebody has taken it on. Without a clock
+ * the time limit is not applied: the board's tick removes a hold that ran out.
+ */
+export const kanbanDeciding = (
+  card: Pick<KanbanCard, "deciding" | "wait" | "activeThreadId" | "settledAt" | "movedAt">,
+  nowMs?: number,
+): boolean => {
+  const deciding = card.deciding;
+  if (deciding === undefined || card.wait !== undefined) return false;
+  if (card.activeThreadId !== null || card.settledAt !== null) return false;
+  const since = Date.parse(deciding.since);
+  if (Date.parse(card.movedAt) > since) return false;
+  return nowMs === undefined || nowMs - since < KANBAN_DECIDE_MS;
+};
+
+/** The card without its evaluator hold. */
+export const kanbanWithoutDeciding = <C extends Pick<KanbanCard, "deciding">>(card: C): C => {
+  if (card.deciding === undefined) return card;
+  const { deciding: _deciding, ...rest } = card;
+  return rest as C;
+};
 
 /** The card without its wait. */
 export const kanbanWithoutWait = <C extends Pick<KanbanCard, "wait">>(card: C): C => {
@@ -1453,7 +1504,9 @@ export function kanbanSchedule(
     // A card parked on a wait is not startable: it gathers no age while parked. When
     // the wait ends it keeps its `movedAt`, so the time it was parked counts from then on.
     let waitingSince: string | null =
-      card.stage === "todo" && !kanbanWaiting(card) ? card.movedAt : null;
+      card.stage === "todo" && !kanbanWaiting(card) && !kanbanDeciding(card, nowMs)
+        ? card.movedAt
+        : null;
     if (waitingSince !== null) {
       for (const id of card.blockedBy) {
         const blocker = byId.get(id);
@@ -1556,6 +1609,7 @@ export function kanbanCardFlow(
       card.priority !== KANBAN_BACKLOG &&
       !kanbanWaitsOnEvaluator(card) &&
       !kanbanWaiting(card) &&
+      !kanbanDeciding(card, nowMs) &&
       (nowMs === undefined || (kanbanRetryNotBefore(card) ?? 0) <= nowMs) &&
       heldUpBy === undefined,
     waitsOn,

@@ -92,7 +92,7 @@ describe("board scripts", () => {
         '{"kanban":{"wait":{"card":13,"result":"hold","status":"CI 3 of 5 passed"}}}',
         '{"kanban":{"wait":{"card":"#14","result":"fail","reason":"Linear said 401"}}}',
         '{"kanban":{"wake":{"card":"#15","to":"work","note":"v2.4.1 is live"}}}',
-        '{"kanban":{"wake":{"card":16,"note":"deployed"}}}',
+        '{"kanban":{"wake":{"card":16,"note":"deployed","wait":"2026-11-10T11:00:00.000Z"}}}',
         '{"kanban":{"wait":{"card":"#17","on":"merge","pr":"#544","note":"release PR","wakeRole":"evaluator"}}}',
         '{"kanban":{"wait":{"card":"#18","on":"card","waitsOn":"#12","note":"after the parent"}}}',
         '{"kanban":{"wait":{"card":"#19","on":"script","script":"deploy-landed","args":{"env":"prod"},"note":"prod deploy"}}}',
@@ -111,8 +111,19 @@ describe("board scripts", () => {
       },
       { _tag: "answer", card: 13, answer: { result: "hold", status: "CI 3 of 5 passed" } },
       { _tag: "answer", card: 14, answer: { result: "fail", reason: "Linear said 401" } },
-      { _tag: "wake", card: 15, answer: { result: "wake", to: "work", note: "v2.4.1 is live" } },
-      { _tag: "wake", card: 16, answer: { result: "wake", note: "deployed" } },
+      {
+        _tag: "wake",
+        card: 15,
+        // Names no wait: it ends whatever wait the card has.
+        wait: null,
+        answer: { result: "wake", to: "work", note: "v2.4.1 is live" },
+      },
+      {
+        _tag: "wake",
+        card: 16,
+        wait: "2026-11-10T11:00:00.000Z",
+        answer: { result: "wake", note: "deployed" },
+      },
       {
         _tag: "park",
         card: 17,
