@@ -513,6 +513,9 @@ export const decidingHolds = (card: WaitingFields & Pick<KanbanCard, "deciding">
 /** The line the history gets when a card held for its evaluator is let go at the limit. */
 export const DECIDING_RAN_OUT = `The evaluator did not decide within ${Math.round(KANBAN_DECIDE_MS / 60_000)} minutes of the wait ending: the card carries on`;
 
+/** The same, for a hold whose note never reached the evaluator (a note that could not be delivered). */
+export const DECIDING_NEVER_TOLD = `The evaluator could not be told that the wait ended, for ${Math.round(KANBAN_DECIDE_MS / 60_000)} minutes: the card carries on`;
+
 /** Not idle and not stalled in any count or sweep, until the wait runs past its limit or its check keeps failing. */
 export const waitHidesIdle = (card: WaitingFields, nowMs: number) =>
   kanbanWaiting(card) &&

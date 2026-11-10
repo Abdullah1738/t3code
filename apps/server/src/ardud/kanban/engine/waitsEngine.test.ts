@@ -943,6 +943,10 @@ it.effect(
         yield* kanban.tick;
         assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
         assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
+        // The history says the evaluator was never told, not that it took too long.
+        const lines = (yield* eventsOf(pushed.id)).map((event) => event.body);
+        assert.include(lines, Waits.DECIDING_NEVER_TOLD);
+        assert.notInclude(lines, Waits.DECIDING_RAN_OUT);
         yield* Fiber.interrupt(answering);
 
         // From the tick: the send fails then and there, nobody was told, so nothing holds it.
@@ -1435,10 +1439,6 @@ it.effect("a check that outlives its wait does not answer for the wait that repl
   ),
 );
 
-it.effect("a pushed wake can name the wait it means, and is refused once that wait is gone", () =>
-  inWorld(() =>
-    Effect.gen(function* () {
-      const { kanban, board } = yield* setup;
 it.effect(
   "a check cannot answer for a card it was not asked about, even one that waits on its script by now",
   () =>
@@ -1497,6 +1497,10 @@ it.effect(
     ),
 );
 
+it.effect("a pushed wake can name the wait it means, and is refused once that wait is gone", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
       yield* kanban.setPool(board.id, board.defaultCardModel, 0);
       const card = yield* placed(board, "Ships with the release");
       const first = yield* kanban.waitCard(
