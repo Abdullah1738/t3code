@@ -5061,9 +5061,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         const payloadJson = yield* encodeNodePayload(node);
         // Ingest dedupe runs before its write, outside any transaction; the
         // reader sees every committed node, so it need not queue on the writer.
+        // ardud: on the foreground pool. It is one row by primary key in the path of
+        // streamed agent output; on the background reader it waited behind sweeps and
+        // reports (wait p95 12.4 s, max 67 s on 10 Nov).
         const rows = yield* sql<PayloadRow>`
           SELECT payload_json FROM orchestration_v2_projection_nodes WHERE node_id = ${node.id}
-        `.pipe(NodeSqliteClient.readOnly);
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          speedups.ingestDedupeForeground ? NodeSqliteClient.foregroundReads : (effect) => effect,
+        );
         return rows[0]?.payload_json === payloadJson;
       },
       (effect, node) => effect.pipe(Effect.mapError(controlReadError(node.threadId))),

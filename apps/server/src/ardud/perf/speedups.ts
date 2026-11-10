@@ -17,6 +17,11 @@
  *   lets a resume up to 20,000 events behind catch up from a list of changed threads.
  * - `ROBOB_SHELL_RESUME_MAX_THREADS=<n>`: most changed threads one such catch-up may
  *   refetch before the whole list is sent instead (default 2,000).
+ * - `ROBOB_THREADS_PR_INDEX=0`: drops the partial index over threads that have pull request
+ *   links at the next start; the pull-request sweeps scan every thread row again.
+ * - `ROBOB_INGEST_DEDUPE_LANE=background`: the provider-ingest node dedupe lookup (one row by
+ *   primary key, on every repeated node event) queues on the background reader again,
+ *   behind sweeps and reports, instead of the foreground pool.
  * - `ROBOB_SHELL_RECENT_FIRST=0`: a client asking for the most recently updated threads
  *   as the first page of a paged thread list gets pages by thread id from the start.
  */
@@ -54,6 +59,8 @@ export interface Speedups {
   readonly shellResumeMaxGap: number;
   readonly shellResumeMaxThreads: number;
   readonly shellRecentFirst: boolean;
+  readonly threadsPullRequestIndex: boolean;
+  readonly ingestDedupeForeground: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -69,6 +76,8 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   ),
   shellResumeMaxThreads: count(env, "ROBOB_SHELL_RESUME_MAX_THREADS", 2_000, 1, 20_000),
   shellRecentFirst: !isOff(env, "ROBOB_SHELL_RECENT_FIRST"),
+  threadsPullRequestIndex: !isOff(env, "ROBOB_THREADS_PR_INDEX"),
+  ingestDedupeForeground: text(env, "ROBOB_INGEST_DEDUPE_LANE")?.toLowerCase() !== "background",
 });
 
 /** Process-wide switches, read once at start. */

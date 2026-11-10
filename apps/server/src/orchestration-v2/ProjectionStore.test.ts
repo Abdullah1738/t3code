@@ -7835,6 +7835,32 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       yield* syncPullRequests("unwatched", [link]);
       assert.deepEqual((yield* store.getThreadShell(threadId))?.pendingBackgroundTasks, []);
       assert.equal(yield* phase, "completed");
+
+      // ardud: the sweeps' list comes from the partial index over threads that have links,
+      // in the order the query asks for, and follows the links as they come and go.
+      const sql = yield* SqlClient.SqlClient;
+      const listed = () =>
+        store
+          .getThreadsWithPullRequests()
+          .pipe(Effect.map((threads) => threads.some((candidate) => candidate.id === threadId)));
+      assert.isTrue(yield* listed());
+      const plan = yield* sql<{ readonly detail: string }>`
+        EXPLAIN QUERY PLAN
+        SELECT payload_json
+        FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL
+          AND json_extract(payload_json, '$.archivedAt') IS NULL
+          AND json_array_length(payload_json, '$.pullRequests') > 0
+        ORDER BY updated_at ASC, thread_id ASC
+      `;
+      assert.deepEqual(
+        plan.map((row) => row.detail),
+        ["SCAN orchestration_v2_projection_threads USING INDEX ardud_v2_threads_pull_requests_idx"],
+      );
+      yield* syncPullRequests("unlinked", []);
+      assert.isFalse(yield* listed());
+      yield* syncPullRequests("relinked", [link]);
+      assert.isTrue(yield* listed());
     }),
   );
 

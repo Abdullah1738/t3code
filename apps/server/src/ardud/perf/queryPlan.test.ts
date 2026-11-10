@@ -152,6 +152,11 @@ it.effect(
           run: projection.getShellSnapshot({ location: "active", limit: 501, recentFirst: true }),
         },
         {
+          // The pull-request sweeps' list: the partial index of threads that have links.
+          route: "sweep.threads-with-pull-requests",
+          run: projection.getThreadsWithPullRequests(),
+        },
+        {
           // Turn-start run-control checks: one run row by primary key.
           route: "turn-start.run-control",
           run: projection.getRunControlState(threadId, RunId.make("synthetic-run")),
