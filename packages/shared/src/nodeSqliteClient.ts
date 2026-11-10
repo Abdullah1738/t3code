@@ -29,7 +29,17 @@ import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 
 import { makeAuthReader, ReadOnly, retireAuthReader } from "./nodeSqliteAuthReader.ts";
-import { makeReaderLanes, ReaderLane, bindSemaphore } from "./nodeSqliteReaderLanes.ts";
+import {
+  bindSemaphore,
+  isReservedLane,
+  makeReaderLanes,
+  makeReaderPool,
+  ReaderLane,
+} from "./nodeSqliteReaderLanes.ts";
+
+export { ReaderLane } from "./nodeSqliteReaderLanes.ts";
+export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
+import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
@@ -53,6 +63,24 @@ export interface SqliteClientConfig {
    * Ignored for in-memory databases, which a second connection cannot share.
    */
   readonly readerWorker?: boolean | undefined;
+  /**
+   * Reader workers reserved for `foregroundReads` (interactive views), on top
+   * of the default reader that serves the background lane. 0 (the default)
+   * sends foreground reads to the default reader: the single-reader layout.
+   * Needs `readerWorker`.
+   */
+  readonly foregroundReaderSlots?: number | undefined;
+  /** Extra connection-local SQL for foreground slots, after `readerInitializationSql` (e.g. a smaller cache). */
+  readonly foregroundReaderInitializationSql?: ReadonlyArray<string> | undefined;
+  /** Reads queued or running per lane before new ones fail with "Reader lane admission queue full". */
+  readonly readerQueueLimits?:
+    | { readonly foreground?: number | undefined; readonly background?: number | undefined }
+    | undefined;
+  /** Approximate per-statement result budget for reader workers; 0 or unset = unbounded. */
+  readonly readerMaxResultBytes?:
+    | { readonly foreground?: number | undefined; readonly background?: number | undefined }
+    | number
+    | undefined;
   readonly readerStartupTimeout?: Duration.Input | undefined;
   /** Connection-local attachments/views, repeated when a reader worker is replaced. */
   readonly readerInitializationSql?: ReadonlyArray<string> | undefined;
@@ -90,6 +118,26 @@ export const readOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect
 interface Acquired {
   readonly connection: "writer" | "reader";
   readonly lockWaitMs: number;
+  readonly lane?: ReaderLaneName;
+  readonly slot?: number;
+}
+
+/** A routed connection: the writer, a lane slot, or a reserved auth/identity reader. */
+interface RouteTarget {
+  readonly name: "writer" | "reader";
+  readonly lane?: ReaderLaneName;
+  readonly slot?: number;
+  readonly connection: Connection;
+  readonly lock: {
+    readonly take: (permits: number) => Effect.Effect<unknown, SqlError>;
+    readonly release: (permits: number) => Effect.Effect<unknown>;
+    readonly withPermits: (
+      permits: number,
+    ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | SqlError, R>;
+    readonly withPermitsIfAvailable: (
+      permits: number,
+    ) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E, R>;
+  };
 }
 
 const annotateAcquired = (fiber: Fiber.Fiber<unknown, unknown>, acquired: Acquired | undefined) => {
@@ -97,11 +145,34 @@ const annotateAcquired = (fiber: Fiber.Fiber<unknown, unknown>, acquired: Acquir
   if (span?._tag !== "Span" || acquired === undefined) return;
   span.attribute("db.connection", acquired.connection);
   span.attribute("db.lock_wait_ms", acquired.lockWaitMs);
+  if (acquired.lane !== undefined) span.attribute("db.reader.lane", acquired.lane);
+  if (acquired.slot !== undefined) span.attribute("db.reader.slot", acquired.slot);
 };
 
-const TransactionAcquire = Context.Reference<
-  { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } | undefined
->("@t3tools/shared/nodeSqliteClient/TransactionAcquire", { defaultValue: () => undefined });
+const annotateHold = (fiber: Fiber.Fiber<unknown, unknown>, holdMs: number) => {
+  const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+  if (span?._tag === "Span") span.attribute("db.reader.hold_ms", holdMs);
+};
+
+const readerWait = Metric.timer("t3_sqlite_reader_wait", {
+  description: "Time a read waited for its reader lane slot, by lane and database.",
+});
+const readerHold = Metric.timer("t3_sqlite_reader_hold", {
+  description: "Time a read (or read transaction) held its reader lane slot, by lane and database.",
+});
+
+interface TransactionPending {
+  acquired?: Acquired;
+  restore: typeof Effect.interruptible | undefined;
+  retire?: Effect.Effect<void>;
+  /** The transaction's span, annotated with the reader hold when the permit is released. */
+  span?: Tracer.Span;
+}
+
+const TransactionAcquire = Context.Reference<TransactionPending | undefined>(
+  "@t3tools/shared/nodeSqliteClient/TransactionAcquire",
+  { defaultValue: () => undefined },
+);
 
 export class UnsupportedNodeSqliteVersionError extends Schema.TaggedError<UnsupportedNodeSqliteVersionError>()(
   "UnsupportedNodeSqliteVersionError",
@@ -127,6 +198,19 @@ export class UnsupportedNodeSqliteOperationError extends Schema.TaggedError<Unsu
 /** Fresh committed auth lookup, isolated from the base reader queue. */
 export const authReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   readOnly(Effect.provideService(effect, ReaderLane, "auth"));
+
+/**
+ * Interactive reads: shell pages, thread detail, board/discussion views and
+ * transcript checks on a user action. Applies to every `readOnly` read in the
+ * effect (and fibers it forks); reserved auth/identity lookups inside keep
+ * their own lane. Without a foreground pool they use the default reader.
+ */
+export const foregroundReads = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReaderLane, "foreground");
+
+/** Sweeps, recovery, maintenance and polling. Same as untagged; use it at loop roots so a sweep started from a foreground fiber does not inherit that lane. */
+export const backgroundReads = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.provideService(effect, ReaderLane, "background");
 
 /** Identity lookups have their own bounded process and never queue behind auth or views. */
 export const identityReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
@@ -245,6 +329,28 @@ const prepare = (sql, cached) => {
   return statement;
 };
 const claims = new Int32Array(workerData.claims);
+// Bounded results: past maxResultBytes (approximate decoded size) the statement
+// fails instead of handing the main thread an unbounded structured clone.
+const rowBytes = (row) => {
+  let bytes = 16;
+  for (const key in row) {
+    const value = row[key];
+    bytes += typeof value === "string" ? value.length * 2 : value !== null && typeof value === "object" ? value.byteLength || 8 : 8;
+  }
+  return bytes;
+};
+const collect = (statement, params) => {
+  const limit = workerData.maxResultBytes;
+  if (!(limit > 0)) return statement.all(...params);
+  const rows = [];
+  let bytes = 0;
+  for (const row of statement.iterate(...params)) {
+    bytes += rowBytes(row);
+    if (bytes > limit) throw new Error("Reader result exceeds " + limit + " bytes");
+    rows.push(row);
+  }
+  return rows;
+};
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
   // Claim the request before running it. The parent cancels a request whose
   // caller gave up, so a backlog of timed-out requests cannot keep the reader
@@ -268,7 +374,7 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
     statement.setReadBigInts(safeIntegers);
     if (statement.columns().length > 0) {
       statement.setReturnArrays(values);
-      parentPort.postMessage({ id, rows: statement.all(...params) });
+      parentPort.postMessage({ id, rows: collect(statement, params) });
     } else {
       const result = statement.run(...params);
       parentPort.postMessage({ id, rows: raw ? result : [] });
@@ -287,6 +393,10 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
   }
 });
 `;
+
+// makeReader receives per-lane options with a plain number.
+const resolvedMaxResultBytes = (options: SqliteClientConfig): number =>
+  typeof options.readerMaxResultBytes === "number" ? options.readerMaxResultBytes : 0;
 
 interface ReaderRequest {
   readonly sql: string;
@@ -419,6 +529,7 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
         initializationSql: options.readerInitializationSql ?? [],
         claims: claimsBuffer,
         claimsMask: CLAIM_SLOTS - 1,
+        maxResultBytes: resolvedMaxResultBytes(options),
       },
     });
     let announce: (startup: ReaderStartup) => void = () => {};
@@ -1455,12 +1566,49 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const semaphore = yield* Semaphore.make(1);
   const connection = yield* makeConnection;
-  const acquireReader =
-    options.readerWorker && isFileDatabase ? yield* makeReader(options) : undefined;
-  const readerSemaphore = yield* Semaphore.make(1);
-  const readerLock = bindSemaphore(readerSemaphore);
+  const readers = Boolean(options.readerWorker) && isFileDatabase;
+  // All slots pin their WAL snapshots under one lock, so an archive mover sees one gate.
+  const snapshotLock =
+    options.readerSnapshotLock ??
+    (options.readerSnapshotSql !== undefined ? yield* Semaphore.make(1) : undefined);
+  const laneMaxResultBytes = (lane: "foreground" | "background") =>
+    typeof options.readerMaxResultBytes === "number"
+      ? options.readerMaxResultBytes
+      : (options.readerMaxResultBytes?.[lane] ?? 0);
+  const laneReader = (lane: "foreground" | "background") =>
+    makeReader({
+      ...options,
+      readerSnapshotLock: snapshotLock,
+      readerMaxResultBytes: laneMaxResultBytes(lane),
+      readerInitializationSql:
+        lane === "foreground"
+          ? [
+              ...(options.readerInitializationSql ?? []),
+              ...(options.foregroundReaderInitializationSql ?? []),
+            ]
+          : options.readerInitializationSql,
+    });
+  // The default reader is the background lane (and every lane's fallback).
+  const background = readers
+    ? yield* makeReaderPool({
+        lane: "background",
+        slots: [yield* laneReader("background")],
+        queueLimit: options.readerQueueLimits?.background ?? 1024,
+      })
+    : undefined;
+  const foregroundSlots = readers ? Math.max(0, Math.floor(options.foregroundReaderSlots ?? 0)) : 0;
+  const foreground =
+    foregroundSlots > 0
+      ? yield* makeReaderPool({
+          lane: "foreground",
+          slots: yield* Effect.forEach(Array.from({ length: foregroundSlots }), () =>
+            laneReader("foreground"),
+          ),
+          queueLimit: options.readerQueueLimits?.foreground ?? 128,
+        })
+      : undefined;
   const acquireAuth =
-    options.readerWorker && isFileDatabase && options.authReaderProcess
+    readers && options.authReaderProcess
       ? yield* makeReaderLanes(() =>
           makeAuthReader({
             ...options,
@@ -1470,7 +1618,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       : undefined;
 
   const acquireIdentity =
-    options.readerWorker && isFileDatabase && (options.identityReaderProcess ?? options.authReaderProcess)
+    readers && (options.identityReaderProcess ?? options.authReaderProcess)
       ? yield* makeReaderLanes(() =>
           makeAuthReader({
             ...options,
@@ -1479,42 +1627,67 @@ const make = Effect.fn("makeWithDatabase")(function* (
         )
       : undefined;
 
-  const writer = { name: "writer" as const, lock: bindSemaphore(semaphore), connection };
+  const writer: RouteTarget = { name: "writer", lock: bindSemaphore(semaphore), connection };
   const admission = Effect.withFiber((fiber) => {
     const wait = options.beforeAcquire ?? Effect.void;
     const restore = fiber.getRef(TransactionAcquire)?.restore;
     return restore === undefined ? wait : restore(wait);
   });
-  const reservedReader = (fiber: Fiber.Fiber<any, any>) =>
-    Context.get(fiber.context, ReaderLane) === "identity" ? acquireIdentity : acquireAuth;
+  const reservedReader = (lane: "auth" | "identity") =>
+    lane === "identity" ? acquireIdentity : acquireAuth;
+  const viaPool = (
+    pool: NonNullable<typeof background>,
+    orElse: Effect.Effect<RouteTarget, SqlError>,
+  ): Effect.Effect<RouteTarget, SqlError> =>
+    Effect.flatMap(pool.acquire, (slot) =>
+      slot === undefined
+        ? orElse
+        : Effect.succeed<RouteTarget>({
+            name: "reader",
+            lane: slot.lane,
+            slot: slot.slot,
+            lock: slot.lock,
+            connection: slot.connection,
+          }),
+    );
   const route = Effect.andThen(
     admission,
-    Effect.withFiber<{
-      name: "writer" | "reader";
-      connection: Connection;
-      lock: typeof writer.lock | Effect.Success<NonNullable<typeof acquireAuth>>["lock"];
-    }, SqlError>((fiber) =>
-      acquireReader !== undefined && Context.get(fiber.context, ReadOnly)
-        ? reservedReader(fiber) !== undefined && Context.get(fiber.context, ReaderLane) !== "view"
-          ? Effect.map(reservedReader(fiber)!, (reader) => ({ name: "reader" as const, ...reader }))
-          : Effect.map(acquireReader, (readerConnection) =>
-              readerConnection === undefined
-                ? writer
-                : { name: "reader" as const, lock: readerLock, connection: readerConnection },
-            )
-        : Effect.succeed(writer),
-    ),
+    Effect.withFiber<RouteTarget, SqlError>((fiber) => {
+      if (background === undefined || !Context.get(fiber.context, ReadOnly))
+        return Effect.succeed(writer);
+      const lane = Context.get(fiber.context, ReaderLane);
+      if (isReservedLane(lane)) {
+        const reserved = reservedReader(lane);
+        if (reserved !== undefined)
+          return Effect.map(
+            reserved,
+            (reader): RouteTarget => ({ name: "reader", lane, ...reader }),
+          );
+      }
+      // An unavailable reader falls back to the main connection, as before lanes.
+      const viaBackground = viaPool(background, Effect.succeed(writer));
+      return lane === "foreground" && foreground !== undefined
+        ? viaPool(foreground, viaBackground)
+        : viaBackground;
+    }),
   );
 
-  const acquired = (
-    target: { readonly name: Acquired["connection"] },
-    clock: Clock.Clock,
-    start: bigint,
-  ): Acquired => ({
+  const acquired = (target: RouteTarget, clock: Clock.Clock, start: bigint): Acquired => ({
     connection: target.name,
     lockWaitMs: Number((clock.monotonicTimeNanosUnsafe() - start) / 1000n) / 1000,
+    ...(target.lane === undefined ? {} : { lane: target.lane }),
+    ...(target.slot === undefined ? {} : { slot: target.slot }),
   });
-
+  const dbName = String(options.spanAttributes?.["db.name"] ?? "sqlite");
+  const observeReader = (target: RouteTarget, metric: typeof readerWait, ms: number) =>
+    target.name === "reader"
+      ? Metric.update(
+          Metric.withAttributes(metric, { lane: target.lane ?? "background", db: dbName }),
+          Duration.millis(ms),
+        )
+      : Effect.void;
+  const holdMs = (clock: Clock.Clock, start: bigint) =>
+    Number((clock.monotonicTimeNanosUnsafe() - start) / 1000n) / 1000;
   const writerBorrowBatchSize = 16;
   let writerBorrowsSinceYield = 0;
   const borrower: Borrower = <A, E, R>(use: (connection: Connection) => Effect.Effect<A, E, R>) =>
@@ -1523,13 +1696,25 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const clock = fiber.getRef(Clock.Clock);
         const start = clock.monotonicTimeNanosUnsafe();
         const useConnection = Effect.suspend(() => {
-          if (
+          const grant = acquired(target, clock, start);
+          const traced =
             fiber.getRef(References.TracerEnabled) &&
-            fiber.getRef(Statement.SpanPropagationEnabled)
-          ) {
-            annotateAcquired(fiber, acquired(target, clock, start));
-          }
-          return use(target.connection);
+            fiber.getRef(Statement.SpanPropagationEnabled);
+          if (traced) annotateAcquired(fiber, grant);
+          if (target.name !== "reader") return use(target.connection);
+          const granted = clock.monotonicTimeNanosUnsafe();
+          return Effect.andThen(
+            observeReader(target, readerWait, grant.lockWaitMs),
+            use(target.connection).pipe(
+              Effect.ensuring(
+                Effect.suspend(() => {
+                  const held = holdMs(clock, granted);
+                  if (traced) annotateHold(fiber, held);
+                  return observeReader(target, readerHold, held);
+                }),
+              ),
+            ),
+          );
         });
         if (!options.checkpointWorker || target.name !== "writer") {
           return target.lock.withPermits(1)(useConnection);
@@ -1568,11 +1753,28 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const clock = fiber.getRef(Clock.Clock);
       const start = clock.monotonicTimeNanosUnsafe();
       const pending = fiber.getRef(TransactionAcquire);
-      if (pending !== undefined && reservedReader(fiber) !== undefined && target.name === "reader" && Context.get(fiber.context, ReaderLane) !== "view")
+      if (pending !== undefined && target.name === "reader" && target.lane !== undefined && isReservedLane(target.lane))
         pending.retire = retireAuthReader(target.connection);
       const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
-        if (pending !== undefined) pending.acquired = acquired(target, clock, start);
-        return Scope.addFinalizer(scope, target.lock.release(1));
+        const grant = acquired(target, clock, start);
+        if (pending !== undefined) pending.acquired = grant;
+        const granted = clock.monotonicTimeNanosUnsafe();
+        // The snapshot is pinned to this slot from BEGIN to COMMIT; its permit is the hold.
+        return Effect.andThen(
+          observeReader(target, readerWait, grant.lockWaitMs),
+          Scope.addFinalizer(
+            scope,
+            target.lock.release(1).pipe(
+              Effect.andThen(
+                Effect.suspend(() => {
+                  const held = holdMs(clock, granted);
+                  if (pending?.span !== undefined) pending.span.attribute("db.reader.hold_ms", held);
+                  return observeReader(target, readerHold, held);
+                }),
+              ),
+            ),
+          ),
+        );
       });
       return Effect.as(
         // A scheduler yield after taking the permit must not precede its release finalizer.
@@ -1602,15 +1804,17 @@ const make = Effect.fn("makeWithDatabase")(function* (
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.uninterruptibleMask((restore) => {
         // SqlClient masks setup; acquisition must preserve the caller's interruptibility.
-        const pending: { acquired?: Acquired; restore: typeof Effect.interruptible | undefined; retire?: Effect.Effect<void> } = {
+        const pending: TransactionPending = {
           restore,
         };
         const body = Effect.withFiber<A, E | SqlError, R>((fiber) => {
           annotateAcquired(fiber, pending.acquired);
+          const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
+          if (span?._tag === "Span") pending.span = span;
           pending.restore = undefined;
-          return reservedReader(fiber) !== undefined &&
-            Context.get(fiber.context, ReaderLane) !== "view" &&
-            pending.acquired?.connection === "reader"
+          return pending.acquired?.connection === "reader" &&
+            pending.acquired.lane !== undefined &&
+            isReservedLane(pending.acquired.lane)
             ? Effect.timeoutOrElse(effect, {
                 duration: options.readerStatementLimit ?? "5 seconds",
                 orElse: () =>
