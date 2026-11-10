@@ -3671,27 +3671,31 @@ const make = Effect.gen(function* () {
    * a stop in between posts it again on replay rather than never.
    */
   /**
-   * A stop that could not be delivered is closed under the stop lock, so it
-   * either already ran from a send (and stays delivered) or is dropped from
-   * the pending stops before any send could run it: the barrier ends with the
-   * row, and the notice says so. False when a send had run it.
+   * A stop that could not be delivered: its notice is written first, while the
+   * row is still open (a stop ending between the two replays the give-up, as
+   * other routes do), then the row is closed under the stop lock, so it either
+   * already ran from a send (and stays delivered) or is dropped from the
+   * pending stops before any send could run it. Skipped when a send ran it
+   * before the notice.
    */
-  const giveUpStop = (record: OwnerRouteRecord, threadId: string) =>
+  const stopRowOpen = (record: OwnerRouteRecord) =>
+    boardSql<{ id: number }>`
+      SELECT id FROM ardud_kanban_owner_routes WHERE id = ${record.id} AND done_at IS NULL
+    `.pipe(Effect.map((rows) => rows.length > 0));
+  const closeGivenUpStop = (record: OwnerRouteRecord, threadId: string) =>
     locks.outside(
       stopping.withPermits(1)(
         Effect.gen(function* () {
           const at = yield* nowIso;
-          const closed = yield* boardSql<{ id: number }>`
+          yield* boardSql`
             UPDATE ardud_kanban_owner_routes
             SET done_at = ${at}, json = json_set(json, '$.outcome', 'undeliverable')
             WHERE id = ${record.id} AND done_at IS NULL
-            RETURNING id
           `;
           const stops = pendingStops.get(threadId);
           stops?.delete(record.route_key);
           if (stops?.size === 0) pendingStops.delete(threadId);
           stoppedRoutes.delete(record.route_key);
-          return closed.length > 0;
         }),
       ),
     );
@@ -3701,11 +3705,12 @@ const make = Effect.gen(function* () {
     const discussionId = KanbanDiscussionId.make(record.discussion_id);
     const stop = ownerRoutePayload(record);
     if (stop.kind === "effect" && stop.effect.kind === "interrupt") {
-      if (!(yield* giveUpStop(record, stop.effect.threadId))) return;
-      return yield* routeNotice(
+      if (!(yield* stopRowOpen(record))) return;
+      yield* routeNotice(
         record.discussion_id,
         `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board no longer holds its sends for this stop.`,
       );
+      return yield* closeGivenUpStop(record, stop.effect.threadId);
     }
     yield* routeNotice(
       record.discussion_id,

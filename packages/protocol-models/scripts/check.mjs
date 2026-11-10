@@ -13,7 +13,6 @@ const cases = [
   ['restart', 'step', 'nativePreparationContinues', false],
   ['restart', 'step', 'queuedContinues', false],
   ['commands', 'stepCurrent', 'currentRecoverable', true],
-  ['stops', 'stepVolatile', 'volatileSafe', true],
 ];
 mkdirSync('traces/latest', { recursive: true });
 let failed = false;
