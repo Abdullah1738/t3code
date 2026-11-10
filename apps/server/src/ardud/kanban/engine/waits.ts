@@ -120,6 +120,11 @@ export interface WaitFacts {
    * One not listed is unknown, not gone.
    */
   readonly prs: ReadonlyArray<WaitPrFacts>;
+  /**
+   * `prs` by `prKey` (`indexPrReadings`). A caller that checks many cards against
+   * the same readings builds it once; without it each card scans `prs`.
+   */
+  readonly prsByKey?: ReadonlyMap<string, WaitPrFacts> | undefined;
   /** The board's cards by id. A card not in the map is gone. */
   readonly cards: ReadonlyMap<
     string,
@@ -191,6 +196,13 @@ export function mergePrReadings(
     );
   }
   return [...byKey.values()];
+}
+
+/** One reading per pull request, by `prKey`: built once for a pass over many waiting cards. */
+export function indexPrReadings(
+  readings: ReadonlyArray<WaitPrFacts>,
+): ReadonlyMap<string, WaitPrFacts> {
+  return new Map(mergePrReadings(readings).map((reading) => [prKey(reading.url), reading]));
 }
 
 /**
@@ -565,10 +577,14 @@ export function nextActor(
  */
 function inputReadings(
   prLinks: ReadonlyArray<KanbanLink>,
-  readings: ReadonlyArray<WaitPrFacts>,
+  facts: Pick<WaitFacts, "prs" | "prsByKey">,
   keys: ReadonlySet<string>,
 ): ReadonlyArray<WaitPrFacts> {
-  const read = mergePrReadings(readings.filter((reading) => keys.has(prKey(reading.url))));
+  const byKey = facts.prsByKey;
+  const read =
+    byKey === undefined
+      ? mergePrReadings(facts.prs.filter((reading) => keys.has(prKey(reading.url))))
+      : [...keys].flatMap((key) => byKey.get(key) ?? []);
   const known = new Set(read.map((reading) => prKey(reading.url)));
   return [
     ...read,
@@ -609,7 +625,7 @@ export function checkInput(
     },
     facts: {
       now: DateTime.formatIso(DateTime.makeUnsafe(facts.nowMs)),
-      prs: inputReadings(prLinks, facts.prs, keys),
+      prs: inputReadings(prLinks, facts, keys),
       cards: named.flatMap((id) => {
         const target = facts.cards.get(id);
         return target === undefined

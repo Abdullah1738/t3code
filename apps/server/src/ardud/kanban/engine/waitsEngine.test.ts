@@ -21,6 +21,7 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  KANBAN_BACKLOG,
   KanbanCard,
   KanbanCardDetail,
   KanbanCardEvent,
@@ -92,12 +93,20 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     } | null;
     fail: boolean;
   } = { hold: null, fail: false };
+  /** Runs while a thread's view is being read, outside the board's gate. */
+  const reading: { during: ((threadId: string) => Effect.Effect<void>) | null; count: number } = {
+    during: null,
+    count: 0,
+  };
   let next = 0;
   const view = (threadId: ThreadId) =>
-    Effect.map(Clock.currentTimeMillis, (nowMs): KanbanThreadView | null => {
+    Effect.gen(function* () {
+      reading.count += 1;
+      if (reading.during !== null) yield* reading.during(threadId);
+      const nowMs = yield* Clock.currentTimeMillis;
       const thread = threads.get(threadId);
       if (!thread) return null;
-      return {
+      const found: KanbanThreadView = {
         threadId,
         projectId: ProjectId.make("project-1"),
         title: thread.title,
@@ -109,6 +118,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         prs: prs.get(threadId) ?? [],
         archived: false,
       };
+      return found;
     });
   const threadsLayer = Layer.succeed(
     KanbanThreads,
@@ -198,6 +208,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     prs,
     host,
     gate,
+    reading,
     layer,
     /** Messages anywhere that include `text`. */
     said,
@@ -240,7 +251,7 @@ const tracked = (url: string, state: KanbanLink["state"] = "open"): KanbanLink =
 const placed = (
   board: KanbanBoard,
   title: string,
-  patch: Partial<Pick<KanbanCard, "stage" | "reviewStep" | "links">> = {},
+  patch: Partial<Pick<KanbanCard, "stage" | "reviewStep" | "links" | "workThreadId">> = {},
 ) =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -1326,6 +1337,75 @@ it.effect(
           Result.getOrThrow(thisClientReads(onTheWire(live))).events.length,
           live.events.length,
         );
+      }),
+    ),
+);
+
+it.effect(
+  "writes that land while the wait pass reads its threads cost the tick one start-over, not one per parked card",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        // Nothing is started here: the test is about the tick, not the dispatcher.
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        // Ten cards, each parked until the PR its own idle work thread watches has merged.
+        const parked: Array<KanbanCard> = [];
+        for (let i = 0; i < 10; i += 1) {
+          const url = `https://github.com/acme/app/pull/${100 + i}`;
+          const threadId = ThreadId.make(`watcher-${i}`);
+          world.threads.set(threadId, {
+            title: `Work ${i}`,
+            model: board.defaultCardModel,
+            messages: [],
+            running: false,
+          });
+          world.prs.set(threadId, [{ url, title: null, state: "open" }]);
+          const card = yield* placed(board, `Lands with PR ${100 + i}`, {
+            links: [tracked(url)],
+            workThreadId: threadId,
+          });
+          yield* kanban.waitCard(card.id, { on: "merge", pr: url, note: "until it merges" }, owner);
+          parked.push(card);
+        }
+        yield* kanban.tick;
+        for (const card of parked) assert.isDefined((yield* cardOf(card.id)).wait);
+
+        // Every PR merges, and the board is busy: while each of those threads is read,
+        // somebody else writes to the board. Any such write makes the tick start over,
+        // and it gives up after eight of those, so a read per parked card would end no
+        // wait here.
+        for (const [threadId, prs] of world.prs) {
+          world.prs.set(
+            threadId,
+            prs.map((pr) => ({ ...pr, state: "merged" as const })),
+          );
+        }
+        let made = 0;
+        world.reading.count = 0;
+        world.reading.during = (threadId) =>
+          threadId.startsWith("watcher-")
+            ? Effect.forkChild(
+                kanban.createCard(
+                  board.id,
+                  {
+                    prompt: "Unrelated",
+                    title: `Unrelated ${(made += 1)}`,
+                    description: "Written while the tick reads",
+                    priority: KANBAN_BACKLOG,
+                  },
+                  owner,
+                ),
+              ).pipe(Effect.flatMap(Fiber.join), Effect.ignore)
+            : Effect.void;
+        yield* kanban.tick;
+        world.reading.during = null;
+        for (const card of parked) {
+          assert.isUndefined((yield* cardOf(card.id)).wait, `card #${card.number} was woken`);
+        }
+        assert.strictEqual(made, 10, "a write landed during every read");
+        // Read together once; the tick that started over reused that read.
+        assert.strictEqual(world.reading.count, 10);
       }),
     ),
 );

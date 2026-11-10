@@ -703,6 +703,8 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+/** Thread views the wait pass reads at once, in its one read outside the gate. */
+const WAIT_VIEW_READS = 8;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
@@ -6727,58 +6729,120 @@ const make = Effect.gen(function* () {
                   )
                 : [];
               if (parked.length > 0) {
-                // What the work threads already know about the PRs these waits point at.
-                const live: Array<Waits.WaitPrFacts> = [];
-                for (const card of parked) {
-                  if (card.wait?.pr == null || card.workThreadId === null) continue;
-                  const view = yield* planView(card.workThreadId);
-                  if (view) live.push(...view.prs);
-                }
+                // What the work threads know about the PRs these waits point at, and what
+                // the hosts say about the rest. Any write that lands while a tick is outside
+                // the gate makes the tick start over (see boardLocks `acquire`), so the pass
+                // leaves it once: the views this tick does not have yet are read together,
+                // then the host reader is asked, in one read a rerun replays.
+                const watched = [
+                  ...new Set(
+                    parked.flatMap((card) =>
+                      card.wait?.pr == null || card.workThreadId === null
+                        ? []
+                        : [card.workThreadId],
+                    ),
+                  ),
+                ];
+                const unread = watched.filter((threadId) => !views.has(threadId));
                 // A script's waits are read for by its own pass (ScriptService.checkWaits).
-                const requests = Waits.waitPrRequests(
-                  parked.filter((card) => card.wait?.on !== "script"),
-                  board,
-                  live,
-                );
-                // The host read leaves the board's gate; a stale rerun of this tick replays it.
-                const readings =
-                  requests.length > 0 && Option.isSome(waitPrs)
-                    ? (yield* locks.outsideRead(
-                        `waitPrs:${board.id}`,
-                        () => 0,
-                        waitPrs.value.read(requests),
-                      )).readings
-                    : Waits.mergePrReadings(live);
+                const builtIn = parked.filter((card) => card.wait?.on !== "script");
+                const known = watched.flatMap((threadId) => views.get(threadId)?.prs ?? []);
+                const reader = Option.getOrNull(waitPrs);
+                const read = Effect.gen(function* () {
+                  const found = yield* Effect.forEach(
+                    unread,
+                    (threadId) =>
+                      threadIo.find(threadId).pipe(
+                        Effect.map((view) => [threadId, view] as const),
+                        // A failed read is not an absent thread: nothing is known this tick.
+                        Effect.catch(() => Effect.succeed(null)),
+                      ),
+                    { concurrency: WAIT_VIEW_READS },
+                  );
+                  const live: Array<Waits.WaitPrFacts> = [
+                    ...known,
+                    ...found.flatMap((entry) => entry?.[1]?.prs ?? []),
+                  ];
+                  const requests = Waits.waitPrRequests(builtIn, board, live);
+                  return {
+                    found,
+                    readings:
+                      requests.length > 0 && reader !== null
+                        ? (yield* reader.read(requests)).readings
+                        : Waits.mergePrReadings(live),
+                  };
+                });
+                const nothingOutside =
+                  unread.length === 0 &&
+                  (reader === null || Waits.waitPrRequests(builtIn, board, known).length === 0);
+                const pass = nothingOutside
+                  ? { found: [], readings: Waits.mergePrReadings(known) }
+                  : replayReads
+                    ? yield* locks.outsideRead(
+                        // A rerun that wants other threads read is another read.
+                        `waits:${board.id}:${unread.join(",")}`,
+                        // Fences only grow, so the sum moves when any of these threads was touched.
+                        () =>
+                          unread.reduce(
+                            (sum, threadId) => sum + (threadFences.get(threadId) ?? 0),
+                            0,
+                          ),
+                        read,
+                      )
+                    : yield* locks.outside(read, undefined, true);
+                for (const entry of pass.found) {
+                  if (entry !== null) views.set(entry[0], entry[1]);
+                }
                 const facts: Waits.WaitFacts = {
                   nowMs: now,
-                  prs: readings,
+                  prs: pass.readings,
+                  prsByKey: Waits.indexPrReadings(pass.readings),
                   cards: new Map((yield* cardsForPlan).map((card) => [card.id as string, card])),
                 };
                 const waits: KanbanActor = { _tag: "system", component: "waits" };
+                const at = yield* nowIso;
+                const chainLength = (card: KanbanCard) =>
+                  Rules.chainFor(board, card)?.steps.length ?? 1;
+                // A wait that holds with nothing new costs its check and nothing else: the
+                // card is the one this tick already loaded. Only a card with something to
+                // save has its row read.
+                const steps: Array<Exclude<Waits.WaitStep, { readonly _tag: "none" }>> = [];
                 for (const card of parked) {
+                  const quiet = Waits.resolveWait(
+                    card,
+                    facts,
+                    { chainLength: chainLength(card) },
+                    at,
+                  );
+                  if (quiet._tag === "none" || (quiet._tag === "hold" && quiet.save === null))
+                    continue;
                   const current = yield* store.card(card.id);
                   if (!current || current.wait === undefined) continue;
-                  const at = yield* nowIso;
                   const step = Waits.resolveWait(
                     current,
                     facts,
-                    { chainLength: Rules.chainFor(board, current)?.steps.length ?? 1 },
+                    { chainLength: chainLength(current) },
                     at,
                   );
                   if (step._tag === "none" || (step._tag === "hold" && step.save === null))
                     continue;
-                  // The card is saved before its evaluator is told, one card at a time: a note
-                  // that leaves the gate can only cost the cards after it this tick, not a note.
-                  yield* applyWaitStep(
+                  steps.push(
                     // A PR no thread watches: the card's link takes the merge the host reported.
                     step._tag === "end"
                       ? { ...step, card: Waits.withLandedLinks(step.card, facts.prs, at) }
                       : step,
-                    waits,
                   );
-                  views.clear();
-                  invalidateCards();
                 }
+                // Each card is saved before its evaluator is told. Telling leaves the gate, and
+                // a tick that has written cannot start over, so the cards nobody is told about
+                // are saved first: a note can then only cost the notes after it this tick.
+                const tells = (step: (typeof steps)[number]) =>
+                  step._tag !== "hold" && step.wake.to === "evaluator";
+                for (const step of steps) if (!tells(step)) yield* applyWaitStep(step, waits);
+                for (const step of steps) if (tells(step)) yield* applyWaitStep(step, waits);
+                if (steps.length > 0) invalidateCards();
+                // A note may have started or woken an evaluator's thread.
+                if (steps.some(tells)) views.clear();
               }
               // Reviewed cards wait in review until their PRs land.
               const chains = board.reviewChains;
