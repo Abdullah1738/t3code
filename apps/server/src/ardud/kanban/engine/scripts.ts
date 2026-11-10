@@ -166,10 +166,16 @@ const cardNumberOf = (ref: number | string): number | null => {
 
 const WakeTo = Schema.Literals(["work", "review", "evaluator", "none"]);
 
-/** Ends the card's wait, whatever it waits on, and wakes `to` (left out: whoever acts next). */
+/**
+ * Ends the card's wait, whatever it waits on, and wakes `to` (left out: whoever acts
+ * next). `wait` names the wait it means, by the `at` the wait was set: the wake is
+ * refused when the card waits on another one by now. Left out, it ends whatever wait
+ * the card has when the line is applied.
+ */
 const WakeLine = Schema.Struct({
   card: CardNumber,
   note: Schema.String,
+  wait: Schema.optional(Schema.NullOr(Schema.String)),
   to: Schema.optional(Schema.NullOr(WakeTo)),
   restart: Schema.optional(Schema.Boolean),
 });
@@ -202,6 +208,8 @@ export type WaitLine =
       readonly _tag: "wake";
       readonly card: number;
       readonly answer: Extract<Waits.WaitAnswer, { result: "wake" }>;
+      /** The wait it means (its `at`), or null: whatever wait the card has. */
+      readonly wait: string | null;
     }
   | {
       readonly _tag: "park";
@@ -224,6 +232,7 @@ const waitLineOf = (body: Readonly<Record<string, unknown>>): WaitLine | string 
     return {
       _tag: "wake",
       card,
+      wait: wake.success.wait?.trim() || null,
       answer: {
         result: "wake",
         note,

@@ -200,6 +200,29 @@ export function mergePrReadings(
   return [...byKey.values()];
 }
 
+/**
+ * Which wait this is: two waits differ when they were set at different times or
+ * ask for different things, however alike they look (the same script with other
+ * args). What checks write on a wait as they go (status, failures) is not part
+ * of it. A check's answer carries the identity of the wait it was asked about,
+ * so an answer that comes back after the wait was replaced is not applied to
+ * the new one.
+ */
+export function waitIdentity(wait: KanbanWait): string {
+  return JSON.stringify([
+    wait.at,
+    wait.on,
+    wait.script,
+    wait.args,
+    wait.pr,
+    wait.card,
+    wait.ask,
+    wait.until,
+    wait.sinceHead,
+    wait.by,
+  ]);
+}
+
 /** One reading per pull request, by `prKey`: built once for a pass over many waiting cards. */
 export function indexPrReadings(
   readings: ReadonlyArray<WaitPrFacts>,

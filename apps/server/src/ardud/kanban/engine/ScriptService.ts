@@ -479,6 +479,14 @@ const make = Effect.gen(function* () {
     const actor: KanbanActor = { _tag: "script", scriptId: script.id };
     const cards = yield* io(store.cards(script.boardId));
     const answered = new Set<string>();
+    // The waits this check was asked about, as they were when its input was built.
+    // An answer is for that wait: if the card waits on another one by now (the
+    // same script with other args, say), it is dropped.
+    const asked = new Map(
+      (check?.cards ?? []).flatMap((card) =>
+        card.wait === undefined ? [] : [[card.id as string, Waits.waitIdentity(card.wait)]],
+      ),
+    );
     for (const line of lines) {
       const card = cards.find((entry) => entry.number === line.card);
       if (!card) {
@@ -507,7 +515,9 @@ const make = Effect.gen(function* () {
         service.answerWait(
           card.id,
           line.answer,
-          { script: line._tag === "wake" ? null : script.name },
+          line._tag === "wake"
+            ? { script: null, expect: line.wait }
+            : { script: script.name, expect: asked.get(card.id) ?? null },
           actor,
         ),
       );
@@ -524,7 +534,7 @@ const make = Effect.gen(function* () {
         service.answerWait(
           card.id,
           failed === null ? { result: "hold" } : { result: "fail", reason: failed },
-          { script: script.name },
+          { script: script.name, expect: asked.get(card.id) ?? null },
           actor,
         ),
       );

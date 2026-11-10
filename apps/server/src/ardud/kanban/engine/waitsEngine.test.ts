@@ -1382,6 +1382,100 @@ it.effect(
     ),
 );
 
+it.effect("a check that outlives its wait does not answer for the wait that replaced it", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const card = yield* placed(board, "Blocked on Linear", {
+        stage: "in_review",
+        reviewStep: 1,
+      });
+      // The check says "wake" for whatever card it was asked about, once it is let go.
+      const go = NodePath.join(
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-waits-go-")),
+        "go",
+      );
+      const wake = `{"kanban":{"wait":{"card":"#${card.number}","result":"wake","to":"work","note":"ENG-1 is Done"}}}`;
+      yield* scripts.register(
+        {
+          boardId: board.id,
+          name: "linear-state",
+          path: scriptFile(
+            `#!/bin/sh\nwhile [ ! -f "${go}" ]; do sleep 0.05; done\necho '${wake}'\n`,
+            "linear-state.sh",
+          ),
+          trigger: { _tag: "manual" },
+        },
+        owner,
+      );
+      yield* kanban.waitCard(
+        card.id,
+        { on: "script", script: "linear-state", args: { issue: "ENG-1" }, note: "ENG-1 Done" },
+        owner,
+      );
+      // The check for ENG-1 starts and is still running...
+      yield* kanban.tick;
+      yield* scripts.tick;
+      // ...when the evaluator replaces the wait: same script, another issue.
+      yield* kanban.waitCard(
+        card.id,
+        { on: "script", script: "linear-state", args: { issue: "ENG-2" }, note: "ENG-2 Done" },
+        owner,
+      );
+      NodeFS.writeFileSync(go, "");
+      yield* scripts.idle;
+      // The old check's wake was for the ENG-1 wait: the card still waits, on ENG-2.
+      const still = yield* cardOf(card.id);
+      assert.deepStrictEqual(still.wait?.args, { issue: "ENG-2" });
+      assert.strictEqual(still.stage, "in_review");
+      assert.strictEqual(still.wait?.failures, 0);
+      assert.strictEqual(world.cardThreads(), 0);
+    }),
+  ),
+);
+
+it.effect("a pushed wake can name the wait it means, and is refused once that wait is gone", () =>
+  inWorld(() =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+      const card = yield* placed(board, "Ships with the release");
+      const first = yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + 48 * HOUR), note: "after the release" },
+        owner,
+      );
+      yield* TestClock.adjust(MINUTE);
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(T0 + 96 * HOUR), note: "after the next release" },
+        owner,
+      );
+      const script: KanbanActor = { _tag: "system", component: "test" };
+      const stale = yield* Effect.flip(
+        kanban.answerWait(
+          card.id,
+          { result: "wake", note: "v1 is live" },
+          { script: null, expect: first.wait!.at },
+          script,
+        ),
+      );
+      assert.strictEqual(stale.code, "conflict");
+      assert.include(stale.detail, "waits on something else now");
+      assert.include((yield* cardOf(card.id)).wait?.note ?? "", "after the next release");
+      // Naming no wait ends whatever wait the card has now, as it always did.
+      yield* kanban.answerWait(
+        card.id,
+        { result: "wake", note: "v2 is live" },
+        { script: null },
+        script,
+      );
+      assert.isUndefined((yield* cardOf(card.id)).wait);
+    }),
+  ),
+);
+
 // The event kinds a client built before the tolerant decoder knows: a closed list.
 const OldEventKind = Schema.Literals([
   "created",

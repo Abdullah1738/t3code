@@ -348,13 +348,17 @@ export interface KanbanServiceShape {
    * Applies a wait check's answer to a waiting card: hold (with a status
    * line), wake or fail. `script` is the board script that answered, which
    * must be the one the card waits on; null is a wake pushed from outside the
-   * check, which ends any wait. Refused, with the reason, when the card has no
+   * check, which ends whatever wait the card has now. `expect` ties the answer
+   * to one wait: the identity of the wait the check was asked about
+   * (`Waits.waitIdentity`), or the `at` it was set. An answer for a wait the
+   * card no longer has is refused, so a check that outlives its wait cannot end
+   * the one that replaced it. Refused, with the reason, when the card has no
    * wait or a thread is running it. Returns what happened in one line.
    */
   readonly answerWait: (
     cardId: KanbanCard["id"],
     answer: Waits.WaitAnswer,
-    from: { readonly script: string | null },
+    from: { readonly script: string | null; readonly expect?: string | null },
     actor: KanbanActor,
     wired?: boolean,
   ) => Effect.Effect<string, KanbanError>;
@@ -8849,6 +8853,18 @@ const make = Effect.gen(function* () {
           return yield* failWith(
             "denied",
             `${n} does not wait on the ${from.script} script: only the check a card waits on can answer for it (a wake line ends any wait)`,
+          );
+        }
+        // Checked here, with the card read under this write's lock: the wait may have
+        // been replaced while the check ran.
+        if (
+          from.expect != null &&
+          from.expect !== Waits.waitIdentity(card.wait) &&
+          from.expect !== card.wait.at
+        ) {
+          return yield* failWith(
+            "conflict",
+            `${n} waits on something else now: this answer was for the wait it had before and is dropped`,
           );
         }
         yield* checkText([["note", answer.result === "wake" ? answer.note : null]]);
