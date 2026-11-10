@@ -8,9 +8,15 @@ import {
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
   kanbanEvaluatorStep,
+  kanbanAskExpired,
+  kanbanAskIsFreeText,
+  kanbanAskRevision,
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
+  kanbanWaiting,
+  kanbanWithoutDeciding,
+  kanbanWithoutWait,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
@@ -39,6 +45,7 @@ import {
   type KanbanPool,
   type KanbanStage,
   type KanbanThreadLink,
+  type KanbanWait,
   type KanbanThreadRow,
   type KanbanThreadState,
   type KanbanWikiPage,
@@ -87,6 +94,8 @@ import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
+import { KanbanWaitPrs } from "./waitPrs.ts";
+import * as Waits from "./waits.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
 import * as Pages from "./messagePages.ts";
@@ -225,6 +234,43 @@ export type KanbanWatchEvent =
   | { readonly _tag: "snapshot"; readonly snapshot: KanbanBoardSnapshot }
   | { readonly _tag: "change"; readonly change: KanbanChange };
 
+export interface CardWaitInput {
+  readonly on: KanbanWait["on"];
+  readonly note: string;
+  readonly pr?: string | null | undefined;
+  /** The card to wait on, for `card`. */
+  readonly card?: KanbanCard["id"] | null | undefined;
+  readonly ask?: string | null | undefined;
+  readonly until?: string | null | undefined;
+  /** For `push`: the reviewed commit. Left out, the card's latest review event's head. */
+  readonly head?: string | null | undefined;
+  readonly wakeRole?: Waits.WaitRole | null | undefined;
+  /** For `script`: the board script that checks it, by name. */
+  readonly script?: string | null | undefined;
+  /** For `script`: what the check is told. */
+  readonly args?: Readonly<Record<string, unknown>> | null | undefined;
+}
+
+/** One answer of a batch (`answerWaits`). */
+export interface WaitAnswerFor {
+  /** The card: its id, or its number on the board. */
+  readonly card: KanbanCard["id"] | number;
+  readonly answer: Waits.WaitAnswer;
+  /** The board script that answered; null for a wake pushed from outside the card's check. */
+  readonly script: string | null;
+  /** The wait the answer is for (see `answerWait`); left out: whatever wait the card has. */
+  readonly expect?: string | null;
+}
+
+export type WaitAnswerOutcome =
+  | { readonly ok: true; readonly cardId: KanbanCard["id"]; readonly text: string }
+  | {
+      readonly ok: false;
+      readonly cardId: KanbanCard["id"] | null;
+      readonly code: KanbanError["code"];
+      readonly detail: string;
+    };
+
 export interface KanbanServiceShape {
   readonly ready: Effect.Effect<void>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanError>;
@@ -311,6 +357,48 @@ export interface KanbanServiceShape {
     reason: string | null,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * Sets what a card with no running thread waits on (replacing any wait it
+   * had, and a stalled flag the caller may clear), or clears it with null.
+   * `pr` is the PR's URL, "#544" or "repo#544" from the card's links.
+   */
+  readonly waitCard: (
+    cardId: KanbanCard["id"],
+    input: CardWaitInput | null,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * Applies a wait check's answer to a waiting card: hold (with a status
+   * line), wake or fail. `script` is the board script that answered, which
+   * must be the one the card waits on; null is a wake pushed from outside the
+   * check, which ends whatever wait the card has now. `expect` ties the answer
+   * to one wait: the identity of the wait the check was asked about
+   * (`Waits.waitIdentity`), or the `at` it was set. An answer for a wait the
+   * card no longer has is refused, so a check that outlives its wait cannot end
+   * the one that replaced it. Refused, with the reason, when the card has no
+   * wait or a thread is running it. Returns what happened in one line.
+   */
+  readonly answerWait: (
+    cardId: KanbanCard["id"],
+    answer: Waits.WaitAnswer,
+    from: { readonly script: string | null; readonly expect?: string | null },
+    actor: KanbanActor,
+    wired?: boolean,
+  ) => Effect.Effect<string, KanbanError>;
+  /**
+   * `answerWait` for many cards of one board at once: a script run's answers,
+   * and the hold or fail for every card it did not answer. One write, with the
+   * board's cards read once for all of them. An answer that changes nothing
+   * (a hold with the status the wait already shows) writes nothing. One
+   * outcome per answer, in order: what happened, or why it was refused. A
+   * refused answer does not stop the ones after it.
+   */
+  readonly answerWaits: (
+    boardId: KanbanBoard["id"],
+    answers: ReadonlyArray<WaitAnswerFor>,
+    actor: KanbanActor,
+    wired?: boolean,
+  ) => Effect.Effect<ReadonlyArray<WaitAnswerOutcome>, KanbanError>;
   /** Reattaches an existing thread without starting a turn or lifting the board pause. */
   readonly restoreCutoverCard: (input: RestoreCutoverCardInput) => Effect.Effect<void, KanbanError>;
   readonly settleCard: (cardId: KanbanCard["id"]) => Effect.Effect<KanbanCard, KanbanError>;
@@ -657,6 +745,8 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+/** Thread views the wait pass reads at once, in its one read outside the gate. */
+const WAIT_VIEW_READS = 8;
 // An evaluator turn that has run this long is asked for a one-line status, then again every hour.
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
@@ -670,6 +760,10 @@ const waitingOnEvaluatorStep = (card: KanbanCard) =>
   card.settledAt === null &&
   card.activeThreadId === null &&
   card.stalled?.by._tag !== "evaluator" &&
+  // Parked on a wait: its evaluator is told when that ends, not reminded meanwhile.
+  !Waits.waitSkipsNudge(card) &&
+  // Held for its evaluator, who was just told: no second reminder while it decides.
+  !Waits.decidingHolds(card) &&
   kanbanEvaluatorStep(card);
 // An owner message a running evaluator hasn't answered gets one reminder; its turn
 // end covers an idle evaluator, so the tick doesn't double it.
@@ -1025,6 +1119,8 @@ type BoardEffect =
       readonly discussionId: string;
       readonly text: string;
       readonly note: boolean;
+      /** The card is held for this evaluator's decision (`deciding`): delivery marks it told. */
+      readonly decides?: boolean;
     }
   | {
       readonly kind: "evaluatorTurn";
@@ -1112,6 +1208,9 @@ const make = Effect.gen(function* () {
   const boardSql = yield* BoardsDatabase.client;
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
+  // Host readings for the pull requests waits point at. Provided around the
+  // board layers (server.ts); without it a wait only sees what work threads know.
+  const waitPrs = yield* Effect.serviceOption(KanbanWaitPrs);
   // Bumped before and after anything this process does to a thread, so a stale
   // rerun never replays a read of it taken across that change (see `outsideRead`).
   const threadFences = new Map<string, number>();
@@ -1881,6 +1980,41 @@ const make = Effect.gen(function* () {
       body: extra.body ?? null,
       head: extra.head ?? null,
     });
+  });
+
+  /**
+   * A card held for its evaluator (`deciding`, set by the write that ended its
+   * wait): the note reached that evaluator, so the end of its turn lets the card go.
+   */
+  const decidingTold = Effect.fn("KanbanService.decidingTold")(function* (
+    cardId: KanbanCard["id"] | null,
+  ) {
+    const card = cardId === null ? null : yield* store.card(cardId);
+    if (!card || card.deciding === undefined || card.deciding.toldAt !== null) return;
+    const at = yield* nowIso;
+    yield* saveCard({ ...card, deciding: { ...card.deciding, toldAt: at }, updatedAt: at });
+  });
+  /**
+   * Lets a card held for its evaluator go: the hold comes off and the dispatcher
+   * and the tick treat the card as they would without it. `told`: only a hold
+   * whose note was delivered (the evaluator's turn ending means nothing before
+   * that). `body` goes in the card's history.
+   */
+  const endDeciding = Effect.fn("KanbanService.endDeciding")(function* (
+    cardId: KanbanCard["id"] | null,
+    options: { readonly told?: boolean; readonly body?: string } = {},
+  ) {
+    const card = cardId === null ? null : yield* store.card(cardId);
+    if (!card || card.deciding === undefined) return;
+    if (options.told === true && card.deciding.toldAt === null) return;
+    const next: KanbanCard = { ...kanbanWithoutDeciding(card), updatedAt: yield* nowIso };
+    if (options.body !== undefined) {
+      yield* logEvent(next, { _tag: "system", component: "waits" }, "edited", {
+        body: options.body,
+      });
+    }
+    yield* saveCard(next);
+    yield* kick;
   });
 
   const release = (card: KanbanCard) =>
@@ -3335,6 +3469,8 @@ const make = Effect.gen(function* () {
     text: string,
     from: "owner" | "script" = "owner",
     pick?: (ask: KanbanOwnerAsk) => boolean,
+    /** When the owner wrote it: asks raised later are not what he replied to. */
+    asOf?: string,
   ) {
     let current = discussion;
     if (current.cardId !== null) {
@@ -3342,10 +3478,51 @@ const make = Effect.gen(function* () {
       let told = new Set<string>();
       if (from === "owner" && kanbanNeedsOwner(card)) {
         const frozen = yield* ownerRouteAsks;
+        const nowMs = yield* nowMillis;
+        // Words answer only asks that take words alone. One with a verdict, a pick,
+        // fields, a draft or a task is answered through the ask, where it is checked.
         const which = (ask: KanbanOwnerAsk) =>
-          (pick === undefined || pick(ask)) && (frozen === undefined || frozen.has(ask.id));
+          (pick === undefined || pick(ask)) &&
+          (frozen === undefined || frozen.has(ask.id)) &&
+          Asks.takesReply(ask, nowMs);
+        const left = kanbanOpenAsks(card).filter(
+          (ask) =>
+            (pick === undefined || pick(ask)) &&
+            !Asks.takesReply(ask, nowMs) &&
+            // One asked after he wrote this was never what he replied to.
+            (asOf === undefined || ask.at <= asOf),
+        );
+        // Whoever hears his words is told they did not answer those asks.
+        if (left.length > 0) text = `${text}\n\n${Asks.wordsOnlyNote(card, left, nowMs)}`;
         const result = yield* answerAsks(current, card, text, which);
         ({ told, discussion: current, card } = result);
+        // They stay open and wait on their askers, as after a reply on the ask itself.
+        const at = yield* nowIso;
+        const waiting = left
+          .filter((ask) => !kanbanAskExpired(ask, nowMs))
+          .reduce((next, ask) => Asks.markClarify(next, ask.id, at), card);
+        if (waiting !== card) {
+          card = { ...waiting, updatedAt: at };
+          yield* saveCard(card);
+        }
+        // Each one's asker hears it: itself when live, else the discussion's evaluator.
+        for (const ask of left) {
+          const by = ask.by;
+          const live =
+            by._tag === "thread"
+              ? by.threadId === card.activeThreadId
+              : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
+          if (live && (by._tag === "thread" || by._tag === "evaluator")) {
+            if (told.has(by.threadId)) continue;
+            const name =
+              by._tag === "evaluator" ? "Evaluator" : roleName(card.activeRole ?? "work");
+            current = yield* deliver(current, by, name, by.threadId, text);
+            told.add(by.threadId);
+          } else if (current.evaluatorThreadId === null || !told.has(current.evaluatorThreadId)) {
+            current = yield* toEvaluator(current, text);
+            if (current.evaluatorThreadId !== null) told.add(current.evaluatorThreadId);
+          }
+        }
       }
       if (pick && told.size > 0) return;
       if (card.activeThreadId !== null && card.activeRole !== null) {
@@ -3526,12 +3703,14 @@ const make = Effect.gen(function* () {
       const card = initial?.cardId ? yield* rawStore.card(initial.cardId) : null;
       const specific = card?.asks.find((ask) => ask.id === askId);
       const recorded = row?.askers ?? null;
+      const nowMs = yield* nowMillis;
       const asks = recorded
         ? (card?.asks ?? []).filter((ask) => recorded.ids.includes(ask.id))
         : specific
           ? [specific]
           : card
-            ? kanbanOpenAsks(card)
+            ? // A reply in words answers only the asks that take words alone.
+              kanbanOpenAsks(card).filter((ask) => Asks.takesReply(ask, nowMs))
             : [];
       const needsOwner = recorded ? recorded.needsOwner : card?.stage === "needs_owner";
       if (row !== undefined && recorded === null) {
@@ -3592,7 +3771,13 @@ const make = Effect.gen(function* () {
         key,
         text,
         Effect.gen(function* () {
-          yield* routeToOwnerAgent(yield* discussionOf(message.discussionId), text);
+          yield* routeToOwnerAgent(
+            yield* discussionOf(message.discussionId),
+            text,
+            "owner",
+            undefined,
+            message.createdAt,
+          );
         }),
         undefined,
         row,
@@ -3704,6 +3889,8 @@ const make = Effect.gen(function* () {
         return Effect.gen(function* () {
           const discussion = yield* discussionOf(KanbanDiscussionId.make(effect.discussionId));
           yield* toEvaluator(discussion, effect.text, effect.note);
+          // Delivered: the card it is about is let go when this evaluator's turn ends.
+          if (effect.decides === true) yield* decidingTold(discussion.cardId);
         });
       case "evaluatorTurn":
         return evaluatorTurnStrict(effect.before, effect.after, effect.actor);
@@ -5568,6 +5755,9 @@ const make = Effect.gen(function* () {
             next.delete(discussion.id);
             return next;
           });
+          // A card held for this evaluator's decision after its wait ended: the turn
+          // it was told in is over, so whatever it left the card as stands.
+          yield* endDeciding(discussion.cardId, { told: true });
         }
       }
       // A paused evaluator stays open so it can be woken, and a retry keeps the link
@@ -6646,11 +6836,150 @@ const make = Effect.gen(function* () {
                 if (!current || !Rules.discussionSettleDue(current, currentCard, now)) continue;
                 yield* saveDiscussion({ ...current, settledAt: idleNow, snoozedUntil: null });
               }
+              // Cards held for their evaluator after a wait ended: a hold that ran out, or
+              // that a move or a thread has overtaken, comes off here.
+              for (const card of yield* cardsForPlan) {
+                if (card.deciding === undefined || Waits.decidingHolds(card, now)) continue;
+                const current = yield* store.card(card.id);
+                if (!current || current.deciding === undefined || Waits.decidingHolds(current, now))
+                  continue;
+                // Still held but for the clock: the evaluator did not decide in time.
+                yield* endDeciding(
+                  current.id,
+                  Waits.decidingHolds(current) ? { body: Waits.DECIDING_RAN_OUT } : {},
+                );
+                invalidateCards();
+              }
+              // Waits: each parked card's check is asked once a tick, and a wait that
+              // ended is cleared here, before the PRs-landed step below.
+              const parked = Waits.WAITS_ENGINE_WIRED
+                ? (yield* cardsForPlan).filter(
+                    (card) => card.wait !== undefined && card.activeThreadId === null,
+                  )
+                : [];
+              if (parked.length > 0) {
+                // What the work threads know about the PRs these waits point at, and what
+                // the hosts say about the rest. Any write that lands while a tick is outside
+                // the gate makes the tick start over (see boardLocks `acquire`), so the pass
+                // leaves it once: the views this tick does not have yet are read together,
+                // then the host reader is asked, in one read a rerun replays.
+                const watched = [
+                  ...new Set(
+                    parked.flatMap((card) =>
+                      card.wait?.pr == null || card.workThreadId === null
+                        ? []
+                        : [card.workThreadId],
+                    ),
+                  ),
+                ];
+                const unread = watched.filter((threadId) => !views.has(threadId));
+                // A script's waits are read for by its own pass (ScriptService.checkWaits).
+                const builtIn = parked.filter((card) => card.wait?.on !== "script");
+                const known = watched.flatMap((threadId) => views.get(threadId)?.prs ?? []);
+                const reader = Option.getOrNull(waitPrs);
+                const read = Effect.gen(function* () {
+                  const found = yield* Effect.forEach(
+                    unread,
+                    (threadId) =>
+                      threadIo.find(threadId).pipe(
+                        Effect.map((view) => [threadId, view] as const),
+                        // A failed read is not an absent thread: nothing is known this tick.
+                        Effect.catch(() => Effect.succeed(null)),
+                      ),
+                    { concurrency: WAIT_VIEW_READS },
+                  );
+                  const live: Array<Waits.WaitPrFacts> = [
+                    ...known,
+                    ...found.flatMap((entry) => entry?.[1]?.prs ?? []),
+                  ];
+                  const requests = Waits.waitPrRequests(builtIn, board, live);
+                  return {
+                    found,
+                    readings:
+                      requests.length > 0 && reader !== null
+                        ? (yield* reader.read(requests)).readings
+                        : Waits.mergePrReadings(live),
+                  };
+                });
+                const nothingOutside =
+                  unread.length === 0 &&
+                  (reader === null || Waits.waitPrRequests(builtIn, board, known).length === 0);
+                const pass = nothingOutside
+                  ? { found: [], readings: Waits.mergePrReadings(known) }
+                  : replayReads
+                    ? yield* locks.outsideRead(
+                        // A rerun that wants other threads read is another read.
+                        `waits:${board.id}:${unread.join(",")}`,
+                        // Fences only grow, so the sum moves when any of these threads was touched.
+                        () =>
+                          unread.reduce(
+                            (sum, threadId) => sum + (threadFences.get(threadId) ?? 0),
+                            0,
+                          ),
+                        read,
+                      )
+                    : yield* locks.outside(read, undefined, true);
+                for (const entry of pass.found) {
+                  if (entry !== null) views.set(entry[0], entry[1]);
+                }
+                const facts: Waits.WaitFacts = {
+                  nowMs: now,
+                  prs: pass.readings,
+                  prsByKey: Waits.indexPrReadings(pass.readings),
+                  cards: new Map((yield* cardsForPlan).map((card) => [card.id as string, card])),
+                };
+                const waits: KanbanActor = { _tag: "system", component: "waits" };
+                const at = yield* nowIso;
+                const chainLength = (card: KanbanCard) =>
+                  Rules.chainFor(board, card)?.steps.length ?? 1;
+                // A wait that holds with nothing new costs its check and nothing else: the
+                // card is the one this tick already loaded. Only a card with something to
+                // save has its row read.
+                const steps: Array<Exclude<Waits.WaitStep, { readonly _tag: "none" }>> = [];
+                for (const card of parked) {
+                  const quiet = Waits.resolveWait(
+                    card,
+                    facts,
+                    { chainLength: chainLength(card) },
+                    at,
+                  );
+                  if (quiet._tag === "none" || (quiet._tag === "hold" && quiet.save === null))
+                    continue;
+                  const current = yield* store.card(card.id);
+                  if (!current || current.wait === undefined) continue;
+                  const step = Waits.resolveWait(
+                    current,
+                    facts,
+                    { chainLength: chainLength(current) },
+                    at,
+                  );
+                  if (step._tag === "none" || (step._tag === "hold" && step.save === null))
+                    continue;
+                  steps.push(
+                    // A PR no thread watches: the card's link takes the merge the host reported.
+                    step._tag === "end"
+                      ? { ...step, card: Waits.withLandedLinks(step.card, facts.prs, at) }
+                      : step,
+                  );
+                }
+                // Each card is saved before its evaluator is told. Telling leaves the gate, and
+                // a tick that has written cannot start over, so the cards nobody is told about
+                // are saved first: a note can then only cost the notes after it this tick.
+                const tells = (step: (typeof steps)[number]) =>
+                  step._tag !== "hold" && step.wake.to === "evaluator";
+                for (const step of steps) if (!tells(step)) yield* applyWaitStep(step, waits);
+                for (const step of steps) if (tells(step)) yield* applyWaitStep(step, waits);
+                if (steps.length > 0) invalidateCards();
+                // A note may have started or woken an evaluator's thread.
+                if (steps.some(tells)) views.clear();
+              }
               // Reviewed cards wait in review until their PRs land.
               const chains = board.reviewChains;
               // syncPrs and evaluatorTurn can change cards and send to other threads.
               for (const card of yield* cardsForPlan) {
                 if (card.stage !== "in_review" || card.activeThreadId !== null) continue;
+                // Parked on a wait: it stays in review until the wait pass above ends it.
+                if (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(card)) continue;
                 const chain = Rules.chainFor({ ...board, reviewChains: chains }, card);
                 if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) continue;
                 const current = yield* store.card(card.id);
@@ -6658,12 +6987,15 @@ const make = Effect.gen(function* () {
                   !current ||
                   current.stage !== "in_review" ||
                   current.activeThreadId !== null ||
+                  (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(current)) ||
                   !Rules.reviewFinished(
                     current,
                     Rules.chainFor({ ...board, reviewChains: chains }, current)?.steps.length ?? 1,
                   )
                 )
                   continue;
+                // Its wait just ended and its evaluator was told: that decision comes first.
+                if (Waits.decidingHolds(current, now)) continue;
                 views.clear();
                 invalidateCards();
                 const synced = yield* syncPrs(current);
@@ -7439,6 +7771,7 @@ const make = Effect.gen(function* () {
         [...starting.values()].filter((pending) => pending.threadId === threadId).length,
       slots,
       pools,
+      nowMs: yield* nowMillis,
     });
     if (!check.ok) return yield* failWith("denied", check.reason);
     if (!thread.holdsSlot) {
@@ -8081,8 +8414,34 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * A handed ask is with the evaluators of its card's board: the threads that
+   * board started as evaluators. Another board's evaluator is not one, and
+   * neither is a thread no board started (an outside thread, or a card
+   * thread's subagent, which has no link of its own).
+   */
+  const checkHandedTo = Effect.fn("KanbanService.checkHandedTo")(function* (
+    card: KanbanCard,
+    ask: KanbanOwnerAsk,
+    actor: KanbanActor,
+  ) {
+    const link = actor._tag === "evaluator" ? yield* store.threadLink(actor.threadId) : null;
+    if (link === null || link.role !== "evaluator" || link.boardId !== card.boardId) {
+      return yield* failWith(
+        "denied",
+        `${ask.id} on card #${card.number} is with the evaluators of its own board: this thread is not one of them`,
+      );
+    }
+  });
+
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
-    guardDeferred(
+    guardDeferred(answerAskUnlocked(cardId, askId, input, actor, secrets));
+  /** The one place an ask is answered: by the answer route, a tool, or a pick on its message. */
+  const answerAskUnlocked = (
+    ...[cardId, askId, input, actor, secrets]: Parameters<KanbanServiceShape["answerAsk"]>
+  ) =>
+    // Suspended only to keep the body where it was: it is `answerAsk` as before.
+    Effect.suspend(() =>
       Effect.gen(function* () {
         yield* checkText(Asks.answerTextFields(input));
         const card = yield* cardOf(cardId);
@@ -8095,6 +8454,7 @@ const make = Effect.gen(function* () {
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
           );
         }
+        if (!byOwner) yield* checkHandedTo(card, ask, actor);
         const checked = Asks.answerFor(
           card,
           ask,
@@ -8268,6 +8628,7 @@ const make = Effect.gen(function* () {
           );
         }
         const at = yield* nowIso;
+        if (action === "return") yield* checkHandedTo(card, ask, actor);
         if (action !== "hand") {
           if (ask.handedAt === undefined) {
             return yield* failWith("invalid", `${ref} is not with the evaluator`);
@@ -8285,6 +8646,8 @@ const make = Effect.gen(function* () {
         if (ask.handedAt !== undefined) {
           return yield* failWith("invalid", `${ref} is already with the evaluator`);
         }
+        const unfit = Asks.handProblem(card, ask);
+        if (unfit) return yield* failWith(unfit.code, unfit.detail);
         const discussion = yield* cardDiscussionUnlocked(card.id);
         const next = {
           ...Asks.markHanded(yield* cardOf(card.id), ask.id, at, always === true),
@@ -8413,6 +8776,300 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+
+  const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
+    guard(
+      Effect.gen(function* () {
+        yield* checkText([["note", input?.note]]);
+        const card = yield* cardOf(cardId);
+        const at = yield* nowIso;
+        if (input === null) {
+          if (card.wait === undefined) {
+            // Held for its evaluator after a wait ended: clearing lets it carry on now.
+            if (card.deciding !== undefined) {
+              const next: KanbanCard = { ...kanbanWithoutDeciding(card), updatedAt: at };
+              yield* logEvent(next, actor, Waits.waitEventKind("wait_cleared"), {
+                body: "No longer held for the evaluator: the card carries on",
+              });
+              yield* saveCard(next);
+              yield* kick;
+              return next;
+            }
+            return yield* failWith("invalid", `card #${card.number} has no wait to clear`);
+          }
+          const next: KanbanCard = {
+            ...kanbanWithoutDeciding(kanbanWithoutWait(card)),
+            updatedAt: at,
+          };
+          yield* logEvent(next, actor, Waits.waitEventKind("wait_cleared"), {
+            body: Waits.waitClearedBody(card.wait),
+          });
+          yield* saveCard(next);
+          yield* kick;
+          return next;
+        }
+        const onPr = input.on === "push" || input.on === "merge" || input.on === "ci";
+        const link = onPr && input.pr?.trim() ? Waits.findPrLink(card, input.pr) : null;
+        if (link === "ambiguous") {
+          return yield* failWith(
+            "invalid",
+            `card #${card.number} has several pull requests matching ${input.pr}: pass its URL`,
+          );
+        }
+        const target = input.on === "card" && input.card ? yield* store.card(input.card) : null;
+        if (target !== null && target.boardId !== card.boardId) {
+          return yield* failWith("invalid", `card #${target.number} is on another board`);
+        }
+        // The reviewed commit is on the card already: its latest review event.
+        const reviewed =
+          input.on === "push" && !input.head?.trim()
+            ? ((yield* store.cardEvents(card.id)).findLast(
+                (event) => event.kind === "review" && event.head !== null,
+              )?.head ?? null)
+            : null;
+        const request: Waits.WaitRequest = {
+          on: input.on,
+          note: input.note,
+          // An unknown ref goes through as written, so the refusal names it.
+          pr: onPr ? (link?.url ?? input.pr?.trim() ?? null) : null,
+          card: target,
+          ask: input.ask?.trim() || null,
+          until: input.until?.trim() || null,
+          sinceHead: input.head?.trim() || reviewed,
+          wakeRole: input.wakeRole ?? null,
+          script:
+            input.on === "script"
+              ? {
+                  name: input.script?.trim() ?? "",
+                  found: (yield* store.scripts(card.boardId)).filter(
+                    (script) => script.name === input.script?.trim(),
+                  ),
+                }
+              : null,
+          args: input.args ?? null,
+        };
+        const check = Waits.checkWait(card, request, actor, yield* nowMillis);
+        if (!check.ok) return yield* failWith(check.code, check.reason);
+        const wait = Waits.newWait(request, actor, at);
+        // A new wait is a decision: a hold for the evaluator from the last one ends here.
+        const next: KanbanCard = {
+          ...kanbanWithoutDeciding(card),
+          wait,
+          stalled: null,
+          updatedAt: at,
+        };
+        const known = target === null ? undefined : new Map([[target.id as string, target]]);
+        yield* logEvent(next, actor, Waits.waitEventKind("wait_set"), {
+          body:
+            Waits.waitSetBody(wait, known) +
+            (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+        });
+        yield* saveCard(next);
+        return next;
+      }),
+    );
+
+  /**
+   * Carries out what a check's answer means for a card: save it, log the
+   * event, wake whoever is next. The tick's wait pass and answerWait share it.
+   */
+  const applyWaitStep = Effect.fn("KanbanService.applyWaitStep")(function* (
+    step: Waits.WaitStep,
+    actor: KanbanActor,
+  ) {
+    if (step._tag === "none") return;
+    if (step._tag === "hold") {
+      if (step.save !== null) yield* saveCard(step.save);
+      return;
+    }
+    // The wait ended and the card is held for its evaluator (`deciding`): the hold is
+    // part of this write, so it starts here, whenever the evaluator is told. A deferred
+    // write's note is sent by its lane's drain, which marks the card told once it has
+    // been. From the tick the note is sent below in this same operation, so the card
+    // is saved as told: a tick that cannot write again after sending leaves it right.
+    const decides = step._tag === "end" && step.card.deciding !== undefined;
+    const sink = yield* effectSink;
+    const sentHere = sink === undefined || sink.closed;
+    const card: KanbanCard =
+      decides && sentHere && step.card.deciding !== undefined
+        ? {
+            ...step.card,
+            deciding: { ...step.card.deciding, toldAt: step.card.deciding.since },
+          }
+        : step.card;
+    yield* logEvent(card, actor, step.event.kind, {
+      body: step.event.body,
+      fromStage: step.event.fromStage,
+      toStage: step.event.toStage,
+    });
+    yield* saveCard(card);
+    if (step.wake.to === "evaluator") {
+      // A thread follow-on like any other: saved and sent by its lane's drain
+      // under `guardDeferred`, sent here (outside the gate) from the tick.
+      const text = step.wake.text;
+      const discussion = yield* cardDiscussionUnlocked(step.card.id);
+      // A card left in review with nobody on it is the evaluator's to decide. There the
+      // text is an ask, not a note: the evaluator owes the card's discussion a reply.
+      const note = !(step._tag === "end" && step.card.stage === "in_review");
+      yield* later(
+        step.card.boardId,
+        discussion.id,
+        { kind: "toEvaluator", discussionId: discussion.id, text, note, decides },
+        // A send that fails told nobody, so nothing is left to wait for and the hold
+        // comes off.
+        toEvaluator(discussion, text, note).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban wait note failed", { cardId: step.card.id, cause }).pipe(
+              Effect.andThen(
+                decides
+                  ? endDeciding(step.card.id, {
+                      body: "The evaluator could not be told that the wait ended: the card carries on",
+                    }).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    // Back in To-Do or Needs Review with its wake note: the dispatcher takes it from here.
+    else if (step.wake.to !== "none") yield* kick;
+  });
+
+  const answerWaits: KanbanServiceShape["answerWaits"] = (
+    boardId,
+    answers,
+    actor,
+    wired = Waits.WAITS_ENGINE_WIRED,
+  ) =>
+    // Deferred: the notes to evaluators are saved with the write and sent by their lanes' drains.
+    guardDeferred(
+      Effect.gen(function* () {
+        if (!wired) {
+          return yield* failWith(
+            "conflict",
+            "waits are not live on this board yet: nothing changed",
+          );
+        }
+        if (answers.length === 0) return [];
+        const board = yield* boardOf(boardId);
+        // The board's cards, read once for the whole batch. This write holds the board,
+        // so they stay current; a card this batch changes is replaced in the map.
+        const all = yield* store.cards(boardId);
+        const cards = new Map(all.map((entry) => [entry.id as string, entry]));
+        const byNumber = new Map(all.map((entry) => [entry.number, entry.id as string]));
+        const nowMs = yield* nowMillis;
+        const at = yield* nowIso;
+        const outcomes: Array<WaitAnswerOutcome> = [];
+        // Notes to evaluators go last: where they are sent inline they leave the board's
+        // gate, and a write that has left it cannot start over.
+        const telling: Array<Exclude<Waits.WaitStep, { readonly _tag: "none" | "hold" }>> = [];
+        for (const { card: ref, answer, script, expect } of answers) {
+          const card = cards.get(typeof ref === "number" ? (byNumber.get(ref) ?? "") : ref);
+          const refuse = (code: KanbanError["code"], detail: string) =>
+            void outcomes.push({ ok: false, cardId: card?.id ?? null, code, detail });
+          if (card === undefined) {
+            refuse(
+              "not-found",
+              typeof ref === "number" ? `No card #${ref} on this board.` : "No such card.",
+            );
+            continue;
+          }
+          const n = `card #${card.number}`;
+          if (card.wait === undefined) {
+            refuse("conflict", `${n} is not waiting`);
+            continue;
+          }
+          if (card.activeThreadId !== null) {
+            refuse("conflict", `${n} has a running thread, so it isn't waiting`);
+            continue;
+          }
+          if (!kanbanWaiting(card)) {
+            refuse("conflict", `${n} was moved since its wait was set`);
+            continue;
+          }
+          if (script === null) {
+            if (answer.result !== "wake") {
+              refuse("invalid", "only a wake can be pushed to a waiting card");
+              continue;
+            }
+          } else if (card.wait.on !== "script" || card.wait.script !== script) {
+            refuse(
+              "denied",
+              `${n} does not wait on the ${script} script: only the check a card waits on can answer for it (a wake line ends any wait)`,
+            );
+            continue;
+          }
+          // The wait may have been replaced while the check ran: the card is the one
+          // this write holds.
+          if (
+            expect != null &&
+            expect !== Waits.waitIdentity(card.wait) &&
+            expect !== card.wait.at
+          ) {
+            refuse(
+              "conflict",
+              `${n} waits on something else now: this answer was for the wait it had before and is dropped`,
+            );
+            continue;
+          }
+          const problem = Text.textProblem([
+            ["note", answer.result === "wake" ? answer.note : null],
+          ]);
+          if (problem !== null) {
+            refuse("invalid", problem);
+            continue;
+          }
+          const step = Waits.applyAnswer(
+            card,
+            answer,
+            { nowMs, cards },
+            { chainLength: Rules.chainFor(board, card)?.steps.length ?? 1 },
+            at,
+          );
+          const done = (text: string) => void outcomes.push({ ok: true, cardId: card.id, text });
+          // Still waiting with nothing new to show: nothing is written.
+          if (step._tag === "none" || step._tag === "hold") {
+            if (step._tag === "hold" && step.save !== null) {
+              yield* applyWaitStep(step, actor);
+              cards.set(card.id, step.save);
+            }
+            done(`${n} still waits.`);
+            continue;
+          }
+          cards.set(card.id, step.card);
+          if (step.wake.to === "evaluator") telling.push(step);
+          else yield* applyWaitStep(step, actor);
+          done(
+            step._tag === "end"
+              ? step.wake.to === "none"
+                ? `Ended the wait on ${n}.`
+                : `Ended the wait on ${n} and woke ${step.wake.to === "work" ? "its worker" : step.wake.to === "review" ? "its reviewer" : "the evaluator"}.`
+              : step._tag === "failing"
+                ? `${n} still waits; its check has failed ${card.wait.failures + 1} times in a row and the evaluator was told.`
+                : `${n} still waits, past its limit; the evaluator was told.`,
+          );
+        }
+        for (const step of telling) yield* applyWaitStep(step, actor);
+        return outcomes;
+      }),
+      undefined,
+      boardId,
+    );
+
+  const answerWait: KanbanServiceShape["answerWait"] = (cardId, answer, from, actor, wired) =>
+    Effect.gen(function* () {
+      // Only to find the card's board: the batch reads the card again under its lock.
+      const card = yield* cardOf(cardId).pipe(Effect.mapError(toKanbanError));
+      const [outcome] = yield* answerWaits(
+        card.boardId,
+        [{ card: card.id, answer, script: from.script, expect: from.expect ?? null }],
+        actor,
+        wired,
+      );
+      if (outcome === undefined) return yield* failWith("conflict", "nothing changed");
+      return outcome.ok ? outcome.text : yield* failWith(outcome.code, outcome.detail);
+    });
 
   const settleCard: KanbanServiceShape["settleCard"] = (cardId) =>
     guard(
@@ -8681,7 +9338,10 @@ const make = Effect.gen(function* () {
               ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
               : moreWork
                 ? Subtasks.nextStepNote({ subtasks }, "The review passed. ")
-                : card.wakeNote,
+                : // A review start keeps the card's wake note so the reviewer reads it
+                  // (startCard). The verdict is where it has been read: without this it
+                  // came back in every later review brief.
+                  null,
           nudgedAt: null,
           movedAt: at,
           updatedAt: at,
@@ -9278,7 +9938,68 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * The ask a pick on this message is for, when it is one of an ask's own
+   * messages: its current one, or (`stale`) one from before the ask was edited.
+   */
+  const askPickOf = Effect.fn("KanbanService.askPickOf")(function* (
+    discussionId: KanbanDiscussion["id"],
+    seq: number,
+    blockId: string,
+  ) {
+    const discussion = yield* discussionOf(discussionId);
+    if (discussion.cardId === null) return null;
+    const card = yield* cardOf(discussion.cardId);
+    const ask = card.asks.find((entry) => entry.id === blockId);
+    if (!ask) return null;
+    const message = yield* store.message(discussionId, seq);
+    // An ask's messages carry its id; the first of one asked before that is known by its seq.
+    const own = message?.askId === ask.id || ask.seq === seq || ask.firstSeq === seq;
+    return own ? { card, ask, stale: ask.seq !== seq } : null;
+  });
+
   const answer: KanbanServiceShape["answer"] = (discussionId, seq, blockId, choice, by, text) =>
+    by._tag !== "owner"
+      ? answerChoice(discussionId, seq, blockId, choice, by, text)
+      : readDb(askPickOf(discussionId, seq, blockId)).pipe(
+          Effect.flatMap((pick) => {
+            if (pick === null) return answerChoice(discussionId, seq, blockId, choice, by, text);
+            const ref = `${pick.ask.id} on card #${pick.card.number}`;
+            if (pick.stale) {
+              // An earlier version of the ask: answering it would answer something he no longer sees.
+              return failWith(
+                "conflict",
+                `${ref} was updated since this message (it is at revision ${kanbanAskRevision(pick.ask)} now). Nothing was answered: answer its current version.`,
+              );
+            }
+            // A closed ask's late pick, and an ask that takes words alone, go the way a reply does.
+            if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {
+              return answerChoice(discussionId, seq, blockId, choice, by, text);
+            }
+            // Anything else is answered as the ask's own answer route would, checks included.
+            return guardDeferred(
+              answerAskUnlocked(
+                pick.card.id,
+                pick.ask.id,
+                Asks.pickAnswer(pick.ask, choice, (text ?? "").trim()),
+                by,
+              ).pipe(
+                Effect.andThen(store.message(discussionId, seq)),
+                Effect.flatMap((message) =>
+                  message ? Effect.succeed(message) : failWith("not-found", `message ${seq}`),
+                ),
+              ),
+            );
+          }),
+        );
+  const answerChoice: KanbanServiceShape["answer"] = (
+    discussionId,
+    seq,
+    blockId,
+    choice,
+    by,
+    text,
+  ) =>
     guard(
       Effect.gen(function* () {
         yield* checkText([["answer", text]]);
@@ -9633,6 +10354,9 @@ const make = Effect.gen(function* () {
     moveCard,
     restoreCutoverCard,
     flagCard,
+    waitCard,
+    answerWait,
+    answerWaits,
     settleCard,
     markSubtask,
     handBack,

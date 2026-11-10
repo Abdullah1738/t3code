@@ -2,6 +2,7 @@
 import {
   KANBAN_ASK_ANSWER_FIELD,
   KANBAN_ASK_SECRET_PROVIDED,
+  kanbanAskIsFreeText,
   KANBAN_ASK_FIELD_TYPES,
   kanbanAskChanges,
   kanbanAskExpired,
@@ -771,13 +772,11 @@ export const fieldValue = (
     case "secret":
       return invalid(SECRET_PRIVATE);
     case "custom": {
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       const json = JSON.stringify(value);
       if (json === undefined) return invalid("is not a JSON value");
       if (utf8Bytes(json) > ASK_LIMITS.customBytes) {
         return invalid(`is at most ${ASK_LIMITS.customBytes / 1024} KB of JSON`);
       }
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       return { value: JSON.parse(json) as unknown };
     }
     default: {
@@ -1329,6 +1328,21 @@ const without = (
 export const clearClarify = (card: KanbanCard, askId: string): KanbanCard =>
   without(card, askId, "clarifyAskedAt");
 
+/**
+ * Why an ask can't be handed to the evaluator, or undefined. An evaluator has
+ * no way to give a secret, so an ask that requires one would only come back.
+ */
+export const handProblem = (card: KanbanCard, ask: KanbanOwnerAsk): AskProblem | undefined => {
+  const secret = kanbanAskResponse(ask).fields.find(
+    (field) => field.type === "secret" && field.required === true,
+  );
+  return secret === undefined
+    ? undefined
+    : invalid(
+        `${ask.id} on card #${card.number} needs a secret (${secret.label}) that only you can give, in the app's private field, so the evaluator can't answer it. Answer it yourself, or reject it`,
+      );
+};
+
 export const markHanded = (
   card: KanbanCard,
   askId: string,
@@ -1523,7 +1537,10 @@ export interface AskAnswerInput {
   readonly finalDraft?: string | undefined;
   /** Field id to value, for the ask's fields. */
   readonly values?: Readonly<Record<string, unknown>> | undefined;
-  /** The revision the answerer saw; a newer one refuses the answer. */
+  /**
+   * The revision the answerer saw; a newer one refuses the answer. Required
+   * unless the ask is answered in words alone (`kanbanAskIsFreeText`).
+   */
   readonly revision?: number | undefined;
 }
 
@@ -1635,6 +1652,12 @@ export const answerFor = (
   const ref = `${ask.id} on card #${card.number}`;
   if (ask.closedAt !== null) return conflict(`${ref} is already closed`);
   const revision = kanbanAskRevision(ask);
+  // Only an ask answered in words alone may be answered without saying which version was read.
+  if (input.revision === undefined && !kanbanAskIsFreeText(ask)) {
+    return invalid(
+      `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
+    );
+  }
   if (input.revision !== undefined && input.revision !== revision) {
     return conflict(
       `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
@@ -1844,7 +1867,6 @@ const valueText = (
     case "secret":
       return "he entered it privately";
     case "custom":
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       return JSON.stringify(value);
     default:
       return String(value);
@@ -1928,6 +1950,45 @@ export const blockAnswer = (
 };
 
 /**
+ * A reply in words answers this ask: it takes words alone and has not expired.
+ * Anything with a verdict, a pick, fields, a draft to edit or a task is
+ * answered through the ask itself, where the answer is checked.
+ */
+export const takesReply = (ask: KanbanOwnerAsk, nowMs: number): boolean =>
+  ask.closedAt === null && kanbanAskIsFreeText(ask) && !kanbanAskExpired(ask, nowMs);
+
+/**
+ * For whoever hears an owner reply which left asks open: his words are not an
+ * answer to them. `asks` are the open asks the reply did not close.
+ */
+export const wordsOnlyNote = (
+  card: KanbanCard,
+  asks: ReadonlyArray<KanbanOwnerAsk>,
+  nowMs: number,
+): string =>
+  asks
+    .map((ask) => {
+      const name = `${ask.id} on card #${card.number} ("${ask.title ?? ask.text}")`;
+      return kanbanAskExpired(ask, nowMs)
+        ? `${name} has expired, so this reply did not answer it. It is still open: ${askerName(ask.by)} asked it and renews it with card_ask_change, or drops it.`
+        : `He wrote this in the card's discussion without using the answer on ${name}. It is not an approval, a pick or a decision on that ask: nobody may act as if it were. The ask is still open and now waits on its asker, ${askerName(ask.by)} (the evaluator when that thread cannot hear this): reply to him on it (discussion_post with ask "${ask.id}"), change the ask or ask again (card_ask_change), or drop it.`;
+    })
+    .join("\n");
+
+/** A pick, or his own words, on an ask's pick block as the structured answer it stands for. */
+export const pickAnswer = (
+  ask: KanbanOwnerAsk,
+  choice: ReadonlyArray<string>,
+  words: string,
+): AskAnswerInput => ({
+  verdict: choice.length > 0 ? "picked" : "answered",
+  ...(choice.length > 0 ? { optionIds: choice } : {}),
+  ...(words === "" ? {} : { text: words }),
+  // The pick was made on the ask's current message: that is the revision it read.
+  revision: kanbanAskRevision(ask),
+});
+
+/**
  * How an ask closed when it went through the old paths (a reply or pick in the
  * discussion, a drop, a card moved on). The answer itself stays in the discussion.
  */
@@ -1959,6 +2020,9 @@ const askInFull = (ask: KanbanOwnerAsk) => {
       ? `Options${ask.multi === true ? " (several may be picked)" : ""}: ${options.map((option) => `${option.id} = ${option.label}`).join("; ")}`
       : null,
     `It takes the verdict ${verdictsFor(kanbanAskResponse(ask)).join(" or ")}.`,
+    kanbanAskIsFreeText(ask)
+      ? null
+      : `It is at revision ${kanbanAskRevision(ask)}: an answer to it must say so (revision ${kanbanAskRevision(ask)}).`,
   ]
     .filter((entry) => entry !== null)
     .join("\n\n");

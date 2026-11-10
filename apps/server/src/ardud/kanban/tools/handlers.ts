@@ -26,6 +26,7 @@ import { modelSelectionResult } from "../engine/defaults.ts";
 import * as Asks from "../engine/asks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
 import { textProblem } from "../engine/text.ts";
+import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
 import {
   AGENT_READ_BYTES,
   MESSAGE_PAGE_MAX,
@@ -581,6 +582,7 @@ const handlers = {
             values: input.values,
             note: input.note,
             finalDraft: input.finalDraft,
+            revision: input.revision,
           },
           caller.actor,
         );
@@ -607,6 +609,60 @@ const handlers = {
         yield* ownCard(caller, card);
         const reason = input.stalled ? input.reason?.trim() || "Stalled" : null;
         return { card: yield* service.flagCard(card.id, reason, caller.actor) };
+      }),
+    ),
+  ),
+
+  card_wait: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      Effect.gen(function* () {
+        const problem = textProblem([["note", input.note]]);
+        if (problem) return yield* invalid(problem);
+        const card = yield* cardFor(service, caller, input.card);
+        yield* ownCard(caller, card);
+        if (input.clear) {
+          return { card: yield* service.waitCard(card.id, null, caller.actor) };
+        }
+        // Naming a script is enough to say what kind of wait it is.
+        const on = input.on ?? (input.script === undefined ? undefined : "script");
+        if (on === undefined) return yield* invalid("Pass on (what the card waits on) or clear.");
+        if (input.script !== undefined && on !== "script") {
+          return yield* invalid(
+            `script goes with on: script. ${on} is one of the board's own checks, and a script can't stand in for it.`,
+          );
+        }
+        if (!input.note?.trim()) {
+          return yield* invalid("A wait needs a one-line note: what exactly is awaited.");
+        }
+        // One PR on the card needs no naming.
+        const prs = card.links.filter((link) => link.kind === "pr");
+        const pr = input.pr ?? (prs.length === 1 ? prs[0]?.url : undefined);
+        const waitsOn =
+          on === "card" && input.waitsOn?.trim()
+            ? yield* cardFor(service, caller, input.waitsOn, card.boardId)
+            : null;
+        const waiting = yield* service.waitCard(
+          card.id,
+          {
+            on,
+            note: input.note,
+            pr,
+            card: waitsOn?.id ?? null,
+            ask: input.ask,
+            until: input.until,
+            head: input.head,
+            wakeRole: input.wakeRole,
+            script: input.script,
+            args: input.args,
+          },
+          caller.actor,
+        );
+        return WAITS_ENGINE_WIRED
+          ? { card: waiting }
+          : {
+              card: waiting,
+              note: "Saved and shown on the board. The board does not end waits by itself yet: keep your own check until it does.",
+            };
       }),
     ),
   ),

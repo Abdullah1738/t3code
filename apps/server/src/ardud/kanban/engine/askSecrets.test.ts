@@ -5,26 +5,30 @@
 import { assert, it } from "@effect/vitest";
 import {
   KANBAN_ASK_SECRET_PROVIDED,
+  KanbanAskSecretAnswerInput,
   ProjectId,
   SecretRef,
   ThreadId,
+  WS_METHODS,
   kanbanAskResponse,
   type KanbanActor,
-  type KanbanAskSecretAnswerInput,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../../../secrets/SecretRequests.ts";
+import { featureUsage } from "../../../telemetry/FeatureUsage.ts";
 import { HELD_SECRET_MAX, SecretRedeemer, makeHeldSecrets } from "../../auth/heldSecrets.ts";
 import type { OwnerProvenance } from "../../auth/provenance.ts";
 import { answerAskSecrets } from "../askSecrets.ts";
@@ -77,7 +81,7 @@ const input = (
 ): KanbanAskSecretAnswerInput => ({
   cardId,
   askId: "q1",
-  answer: { verdict: "answered", values: { env: "staging" }, ...answer },
+  answer: { verdict: "answered", values: { env: "staging" }, revision: 0, ...answer },
   secrets,
 });
 
@@ -105,14 +109,15 @@ const dumpDatabase = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const tables = yield* sql<{ name: string }>`SELECT name FROM sqlite_master WHERE type = 'table'`;
   const rows = yield* Effect.forEach(tables, (table) =>
-    sql.unsafe(`SELECT * FROM "${table.name}"`).pipe(
-      Effect.map((found) =>
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        JSON.stringify(found, (_key, value: unknown) =>
-          value instanceof Uint8Array ? Buffer.from(value).toString("utf8") : value,
+    sql
+      .unsafe(`SELECT * FROM "${table.name}"`)
+      .pipe(
+        Effect.map((found) =>
+          JSON.stringify(found, (_key, value: unknown) =>
+            value instanceof Uint8Array ? Buffer.from(value).toString("utf8") : value,
+          ),
         ),
       ),
-    ),
   );
   return rows.join("\n");
 });
@@ -133,7 +138,6 @@ const dumpFiles = Effect.gen(function* () {
   return { names, text: texts.join("\n") };
 });
 
-// @effect-diagnostics-next-line preferSchemaOverJson:off
 const text = (value: unknown) => JSON.stringify(value) ?? "";
 
 it.effect(
@@ -162,6 +166,7 @@ it.effect(
           const overHttp = yield* http.post("/cards/toy:1/asks/q1/answer", {
             verdict: "answered",
             values: { token: SECRET, env: "staging" },
+            revision: 0,
           });
           assert.strictEqual(overHttp.status, 400);
           assert.include(text(overHttp.body), "private field");
@@ -169,6 +174,7 @@ it.effect(
           const without = yield* http.post("/cards/toy:1/asks/q1/answer", {
             verdict: "answered",
             values: { env: "staging" },
+            revision: 0,
           });
           assert.strictEqual(without.status, 400);
           seen.push(["http refusal without it", text(without.body)]);
@@ -178,6 +184,7 @@ it.effect(
             ["an unknown field", input(card.id, { nope: SECRET }), ownerApp],
             ["too long", input(card.id, { token: SECRET.repeat(2000) }), ownerApp],
             ["a stale revision", input(card.id, undefined, { revision: 7 }), ownerApp],
+            ["no revision", input(card.id, undefined, { revision: undefined }), ownerApp],
             [
               "a verdict the ask doesn't take",
               input(card.id, undefined, { verdict: "approved" }),
@@ -187,6 +194,11 @@ it.effect(
             const error = yield* answer(bad, by).pipe(Effect.flip);
             seen.push([`refusal: ${name}`, `${error.message} ${text(error)}`]);
           }
+          // An answer that names no revision is refused with the one to send.
+          assert.include(
+            seen.find(([name]) => name === "refusal: no revision")![1],
+            "It is at revision 0",
+          );
           assert.isNull(askOf((yield* kanban.card(card.id)).card).closedAt);
 
           const before = (yield* fake.heard(threadId)).length;
@@ -315,7 +327,12 @@ it.effect(
 
           // He can still say no without giving it.
           const no = yield* kanban
-            .answerAsk(card.id, "q1", { verdict: "answered", text: "Use the old one." }, owner)
+            .answerAsk(
+              card.id,
+              "q1",
+              { verdict: "answered", text: "Use the old one.", revision: 0 },
+              owner,
+            )
             .pipe(Effect.flip);
           assert.include(no.detail, "is a secret only the owner can give");
         }),
@@ -459,6 +476,62 @@ it.effect("the holder is bounded, and an expired value frees its place", () =>
   }),
 );
 
+it.effect(
+  "an ask that requires a secret can't be handed to the evaluator, once or every time",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const { card, worker } = yield* workingCard();
+          const { kanban } = yield* setup;
+          const http = yield* makeHttp;
+          yield* kanban.askOwner(card.id, tokenAsk, worker, "cardThread");
+          const evaluators = (yield* fake.evaluators).length;
+
+          for (const body of [{}, { always: true, text: "You decide these from now on." }]) {
+            const refused = yield* http.post("/cards/toy:1/asks/q1/hand", body);
+            assert.strictEqual(refused.status, 400);
+            assert.include(
+              refused.body.error.message,
+              "q1 on card #1 needs a secret (Signing secret) that only you can give",
+            );
+            assert.include(refused.body.error.message, "the evaluator can't answer it");
+          }
+          // Not handed, nobody started, nothing recorded on the ask.
+          const ask = askOf((yield* kanban.card(card.id)).card);
+          assert.deepStrictEqual(
+            [ask.handedAt, ask.handedAlways, ask.closedAt],
+            [undefined, undefined, null],
+          );
+          assert.strictEqual((yield* fake.evaluators).length, evaluators);
+          const direct = yield* kanban
+            .handAsk(card.id, "q1", "hand", owner, true)
+            .pipe(Effect.flip);
+          assert.strictEqual(direct.code, "invalid");
+
+          // A secret he may leave out doesn't hold the hand back: the evaluator answers without it.
+          yield* kanban.askOwner(
+            card.id,
+            {
+              question: "Rotate the staging key now?",
+              blocking: false,
+              respond: {
+                verdict: true,
+                fields: [{ id: "key", label: "New key", type: "secret" }],
+              },
+            },
+            { _tag: "evaluator", threadId: ThreadId.make("evaluator-main") },
+            "evaluator",
+          );
+          const handed = yield* http.post("/cards/toy:1/asks/q2/hand", {});
+          assert.strictEqual(handed.status, 200);
+          assert.isString(handed.body.ask.handedAt);
+        }),
+      ).pipe(Effect.provide(layer(fake.layer)));
+    }),
+);
+
 it("a secret field takes no default, is the owner's alone, and never accepts a value in values", () => {
   const fields = (extra: Record<string, unknown>, to?: string) =>
     Asks.askFields({
@@ -477,6 +550,28 @@ it("a secret field takes no default, is the owner's alone, and never accepts a v
   const toEvaluator = fields({}, "evaluator");
   assert.isTrue(Asks.isAskProblem(toEvaluator));
   if (Asks.isAskProblem(toEvaluator)) assert.include(toEvaluator.detail, "for the owner");
+  // An ask edited to require a secret after it was handed: the evaluator is told to give it back.
+  const card = { number: 4 } as never;
+  const handed = {
+    id: "q1",
+    text: "Token?",
+    blocking: false,
+    by: { _tag: "owner" },
+    at: "2026-11-10T10:00:00.000Z",
+    seq: null,
+    closedAt: null,
+    handedAt: "2026-11-10T10:05:00.000Z",
+    respond: { fields: [{ id: "token", label: "Token", type: "secret", required: true }] },
+  } as never;
+  const byEvaluator = Asks.answerFor(
+    card,
+    handed,
+    { verdict: "answered", text: "ok", revision: 0 },
+    { _tag: "evaluator", threadId: ThreadId.make("evaluator-main") },
+    "2026-11-10T10:06:00.000Z",
+  );
+  assert.isTrue(Asks.isAskProblem(byEvaluator));
+  if (Asks.isAskProblem(byEvaluator)) assert.include(byEvaluator.detail, "Return the ask to him");
   // The preset kind is one required secret field.
   const preset = Asks.askFields({ question: "The deploy key?", kind: "secret" } as never);
   assert.isFalse(Asks.isAskProblem(preset));
@@ -485,5 +580,32 @@ it("a secret field takes no default, is the owner's alone, and never accepts a v
       preset.respond?.fields?.map((field) => [field.id, field.type, field.required]),
       [["secret", "secret", true]],
     );
+  }
+});
+
+it("what sees every request records nothing of this one: analytics, and a payload that fails to decode", () => {
+  const payload = {
+    cardId: "card-1",
+    askId: "q1",
+    answer: { verdict: "answered", values: { env: "staging" } },
+    secrets: { token: SECRET },
+  };
+  // The authorization middleware hands every authorized payload to this hook.
+  assert.isUndefined(featureUsage(WS_METHODS.secretsAnswerAsk, payload));
+
+  // A malformed request is refused by the schema with the path, never what was there.
+  const decode = Schema.decodeUnknownExit(KanbanAskSecretAnswerInput);
+  assert.isTrue(Exit.isSuccess(decode(payload)));
+  for (const bad of [
+    { ...payload, answer: {} },
+    { ...payload, cardId: 5 },
+    { ...payload, secrets: SECRET },
+    { ...payload, secrets: { token: { value: SECRET } } },
+    { ...payload, secrets: { token: [SECRET] } },
+    { ...payload, answer: { verdict: 1, values: { token: SECRET } } },
+  ]) {
+    const exit = decode(bad);
+    assert.isTrue(Exit.isFailure(exit));
+    assert.isFalse(`${String(exit)} ${text(exit)}`.includes(SECRET));
   }
 });

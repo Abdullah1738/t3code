@@ -291,7 +291,7 @@ it.effect(
         const result = yield* kanban.answerAsk(
           card.id,
           "q1",
-          { verdict: "picked", optionIds: ["lite"] },
+          { verdict: "picked", optionIds: ["lite"], revision: 0 },
           owner,
         );
         assert.strictEqual(result.card.stage, "todo");
@@ -348,7 +348,7 @@ it.effect("a stale ask refuses the answer: revised since it was read, or expired
         "cardThread",
       );
       const expired = yield* kanban
-        .answerAsk(card.id, "q2", { verdict: "approved" }, owner)
+        .answerAsk(card.id, "q2", { verdict: "approved", revision: 0 }, owner)
         .pipe(Effect.flip);
       assert.strictEqual(expired.code, "conflict");
       assert.include(expired.detail, "expired at 1969-12-31T00:00:00.000Z");
@@ -488,12 +488,16 @@ it.effect(
         );
         assert.strictEqual(item.waitsOn, "owner");
 
-        // An old client's pick on the new version still answers it and wakes the card.
+        // An old client's pick on the new version still answers it and wakes the card: it is
+        // stored as the pick it is, checked like one sent to the ask.
         const talk = yield* kanban.cardDiscussion(card.id);
         yield* kanban.answer(talk.id, revised.seq!, "q1", ["o1"], owner);
         const answered = (yield* kanban.card(card.id)).card;
         assert.isNotNull(askOf(answered).closedAt);
-        assert.strictEqual(askOf(answered).answer?.verdict, "answered");
+        assert.deepStrictEqual(
+          [askOf(answered).answer?.verdict, askOf(answered).answer?.optionIds],
+          ["picked", ["o1"]],
+        );
         assert.strictEqual(answered.stage, "todo");
         assert.include(answered.wakeNote ?? "", "Yes");
       }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -684,7 +688,7 @@ it.effect("the owner hands one ask to the evaluator, which decides it for him", 
       const result = yield* kanban.answerAsk(
         card.id,
         "q1",
-        { verdict: "picked", optionIds: ["o1"], note: "We already run SQS." },
+        { verdict: "picked", optionIds: ["o1"], note: "We already run SQS.", revision: 0 },
         evaluatorActor,
       );
       const closed = askOf(result.card);
@@ -1027,7 +1031,8 @@ it.effect("the HTTP routes: feed shape, single answer, batch answer, reply and h
           404,
         );
         assert.strictEqual(
-          (yield* http.post("/cards/toy:2/asks/q1/answer", { verdict: "maybe" })).status,
+          (yield* http.post("/cards/toy:2/asks/q1/answer", { verdict: "maybe", revision: 0 }))
+            .status,
           400,
         );
 
@@ -1037,7 +1042,7 @@ it.effect("the HTTP routes: feed shape, single answer, batch answer, reply and h
           note: "After 6pm only.",
           items: [
             { card: "toy:1", askId: "q1", revision: 0 },
-            { card: "toy:2", askId: "q1" },
+            { card: "toy:2", askId: "q1", revision: 0 },
             { card: "toy:2", askId: "q2" },
           ],
         });

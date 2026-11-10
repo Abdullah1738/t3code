@@ -357,7 +357,26 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.include(notHanded.text, "was not handed to the evaluator");
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
-    const returned = yield* call(evaluator, "card_ask_change", {
+    // Handed, it is with this board's evaluators. A thread the board did not start is not
+    // one, whoever started it: it can neither decide the ask nor give it back.
+    const outsider = yield* call(evaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
+    assert.isTrue(outsider.isError);
+    assert.include(outsider.text, "is with the evaluators of its own board");
+    const outsiderReturn = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: "return",
+    });
+    assert.isTrue(outsiderReturn.isError);
+    assert.include(outsiderReturn.text, "is with the evaluators of its own board");
+    assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+
+    const boardEvaluator = (yield* kanban.cardDiscussion(card.id)).evaluatorThreadId!;
+    const returned = yield* call(boardEvaluator, "card_ask_change", {
       card: card.id,
       ask: "q1",
       action: "return",
@@ -368,12 +387,31 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     assert.isTrue(workerReturn.isError);
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
-    const decided = yield* call(evaluator, "card_ask_answer", {
+    // An approval is answered for the revision that was read: without one it is refused
+    // with the current revision, and one from before an edit is refused as stale.
+    const blind = yield* call(boardEvaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
+    assert.isTrue(blind.isError);
+    assert.include(blind.text, "It is at revision 0");
+    const stale = yield* call(boardEvaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+      revision: 3,
+    });
+    assert.isTrue(stale.isError);
+    assert.include(stale.text, "revision 0, you answered revision 3");
+    assert.isNull((yield* kanban.card(card.id)).card.asks[0]!.closedAt);
+    const decided = yield* call(boardEvaluator, "card_ask_answer", {
       card: card.id,
       ask: "q1",
       verdict: "approved",
       finalDraft: "Hello, and thanks.",
       note: "Friendlier.",
+      revision: 0,
     });
     assert.isFalse(decided.isError, decided.text);
     assert.isFalse(decided.structured.card.ask.open);
@@ -419,7 +457,6 @@ it.effect(
       const tool = (name: string, args: Record<string, unknown>) =>
         call(evaluator, name, args).pipe(
           Effect.tap((result) =>
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             Effect.sync(() => replies.push(`${result.text} ${JSON.stringify(result.structured)}`)),
           ),
         );
@@ -441,8 +478,9 @@ it.effect(
       });
       assert.isTrue(withDefault.isError);
       assert.include(withDefault.text, "takes no default");
-      // An evaluator can't give it for him, even on an ask he handed over.
-      yield* kanban.handAsk(card.id, "q1", "hand", owner);
+      // An evaluator can't give it for him, and he can't hand it over either.
+      const hand = yield* kanban.handAsk(card.id, "q1", "hand", owner).pipe(Effect.flip);
+      assert.include(hand.detail, "the evaluator can't answer it");
       const forHim = yield* tool("card_ask_answer", {
         card: card.id,
         ask: "q1",
@@ -450,21 +488,13 @@ it.effect(
         values: { token: value },
       });
       assert.isTrue(forHim.isError);
-      assert.include(forHim.text, "private field");
-      const without = yield* tool("card_ask_answer", {
-        card: card.id,
-        ask: "q1",
-        verdict: "answered",
-        text: "ok",
-      });
-      assert.isTrue(without.isError);
-      assert.include(without.text, "Return the ask to him");
+      assert.include(forHim.text, "only the owner answers it");
 
       yield* answerAskSecrets(kanban, secrets)(
         {
           cardId: card.id,
           askId: "q1",
-          answer: { verdict: "answered" },
+          answer: { verdict: "answered", revision: 0 },
           secrets: { token: value },
         },
         { _tag: "owner-app", surface: "desktop", sessionId: "session-1" },
@@ -475,7 +505,7 @@ it.effect(
       yield* tool("discussion_read", {
         discussion: (yield* kanban.card(card.id)).card.discussionId,
       });
-      assert.isAbove(replies.length, 6);
+      assert.isAbove(replies.length, 5);
       for (const reply of replies) assert.notInclude(reply, value);
       assert.deepStrictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.values, {
         token: { secret: true },

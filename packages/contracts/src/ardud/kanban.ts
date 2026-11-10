@@ -6,8 +6,10 @@
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  ForwardCompatibleOptional,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -631,6 +633,25 @@ export const kanbanAskResponse = (ask: AskResponseFields): KanbanAskResponse => 
   };
 };
 
+/**
+ * An ask answered in words alone: a plain question, and every ask the build
+ * before typed asks made. Nothing to approve, pick, fill in, edit or do. Only
+ * these are closed by a plain reply in the card's discussion, and only these
+ * may be answered without saying which revision was read.
+ */
+export const kanbanAskIsFreeText = (ask: AskResponseFields): boolean => {
+  const response = kanbanAskResponse(ask);
+  return (
+    response.verdict === null &&
+    response.choose === null &&
+    response.edit === null &&
+    response.task === null &&
+    !response.ack &&
+    response.fields.length === 1 &&
+    response.fields[0]!.id === KANBAN_ASK_ANSWER_FIELD
+  );
+};
+
 /** A notice: nothing to decide, he only marks it seen. Never blocking, never in the needs-owner count. */
 export const kanbanAskIsNotice = (ask: {
   readonly respond?: { readonly ack?: boolean | undefined } | undefined;
@@ -704,6 +725,99 @@ export type KanbanCardRetry = typeof KanbanCardRetry.Type;
  */
 export const KANBAN_RETRY_BACKOFF_MS = 60_000;
 
+/**
+ * What a parked card can wait on: the board's own checks, or `script`, a
+ * check one of the board's scripts answers. The built-in names are reserved.
+ */
+export const KANBAN_WAIT_KINDS = [
+  "push",
+  "merge",
+  "ci",
+  "owner_go",
+  "card",
+  "time",
+  "script",
+] as const;
+export const KanbanWaitKind = Schema.Literals(KANBAN_WAIT_KINDS);
+export type KanbanWaitKind = typeof KanbanWaitKind.Type;
+
+/**
+ * Why a card with no running thread sits where it is, as data: the board
+ * checks it on every tick, wakes whoever acts next when it is over, and shows
+ * it instead of "idle". A card has at most one. Stored only while it holds.
+ */
+export const KanbanWait = Schema.Struct({
+  /**
+   * `push`: new commits on `pr`. `merge`: `pr` merged. `ci`: checks on `pr`
+   * finished. `owner_go`: the owner answered open ask `ask`. `card`: card
+   * `card` is done. `time`: `until` has passed. `script`: the board script
+   * named `script` says so.
+   */
+  on: KanbanWaitKind,
+  /** script: the board script that checks it, by name. */
+  script: Schema.NullOr(TrimmedNonEmptyString).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** script: what the check is told, as the agent wrote it (a small JSON object). */
+  args: Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** push, merge, ci: the pull request's URL, as on the card's links. */
+  pr: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** card: the card it waits on. */
+  card: Schema.NullOr(KanbanCardId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** owner_go: the open ask (q1, q2...) whose answer ends it. */
+  ask: Schema.NullOr(TrimmedNonEmptyString).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** time: when it ends. Any other kind: when it counts as stuck, instead of the kind's default. */
+  until: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** push: the PR's head commit when the wait was set (the reviewed commit); a different head ends it. */
+  sinceHead: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** One line: what exactly is awaited, for the board and the wake. */
+  note: Schema.String,
+  by: KanbanActor,
+  at: IsoDateTime,
+  /** Who is woken when it ends; null is whoever acts next in the card's stage. */
+  wakeRole: Schema.NullOr(Schema.Literals(["work", "review", "evaluator"])).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** Set once when it ran past its limit: the card shows as stuck, and still wakes if the wait ends. */
+  expiredAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** The check's latest one-line progress note ("CI 3 of 5 passed"), or null. */
+  status: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /**
+   * When a check last changed what the wait shows (its status, a failure, a failure
+   * cleared). A check that changes nothing does not write the card, so this is not
+   * the time of the latest check: a script's runs record that.
+   */
+  lastCheckedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** Checks in a row that failed or gave no readable answer; 0 after one that answered. */
+  failures: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  /** Why the last check failed, while `failures` is above 0. */
+  problem: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+});
+export type KanbanWait = typeof KanbanWait.Type;
+
+/** Failed checks in a row before a wait shows as "check failing". */
+export const KANBAN_WAIT_CHECK_FAILURES = 3;
+
+/** A wait whose check keeps failing: it still holds, but nothing can end it until the check works. */
+export const kanbanWaitCheckFailing = (wait: Pick<KanbanWait, "failures">): boolean =>
+  wait.failures >= KANBAN_WAIT_CHECK_FAILURES;
+
+/** How long an evaluator has to decide what a card does once its wait ended. */
+export const KANBAN_DECIDE_MS = 30 * 60 * 1000;
+
+/** A card held for its evaluator: its wait ended in a way only the evaluator can take on. */
+export const KanbanCardDeciding = Schema.Struct({
+  /** When the wait ended. */
+  since: IsoDateTime,
+  /** What ended and why, in one line. */
+  why: Schema.String,
+  /** When the evaluator was told; null while the note is still on its way. */
+  toldAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+});
+export type KanbanCardDeciding = typeof KanbanCardDeciding.Type;
+
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
   boardId: KanbanBoardId,
@@ -751,6 +865,19 @@ export const KanbanCard = Schema.Struct({
   discussionId: Schema.NullOr(KanbanDiscussionId),
   /** Sent to the card's thread the next time the dispatcher starts or wakes it (findings, owner answer). */
   wakeNote: Schema.NullOr(Schema.String),
+  /**
+   * What the card waits on while no thread runs it. Absent on cards that wait
+   * on nothing. A wait this build can't read (a kind a newer server added)
+   * decodes as absent, so the board still loads.
+   */
+  wait: ForwardCompatibleOptional(KanbanWait),
+  /**
+   * Set when a wait ended and what the card does next is its evaluator's call.
+   * Until that evaluator's turn ends (or KANBAN_DECIDE_MS passes) the card is not
+   * started, claimed or completed. Absent on every other card; a build that does
+   * not know the key drops it, and the card then carries on as it did before.
+   */
+  deciding: ForwardCompatibleOptional(KanbanCardDeciding),
   /** Set when the server nudged the active thread after a turn ended without a card move. */
   nudgedAt: Schema.NullOr(IsoDateTime),
   /**
@@ -872,6 +999,97 @@ export const kanbanCardNeedsOwner = (
   (card.asks.some((ask) => kanbanAskNeedsOwner(ask, nowMs)) ||
     (card.stage === "needs_owner" &&
       card.asks.every((ask) => ask.closedAt !== null || kanbanAskIsNotice(ask))));
+
+/** The card's wait, or null. */
+export const kanbanWait = (card: Pick<KanbanCard, "wait">): KanbanWait | null => card.wait ?? null;
+
+/**
+ * A wait left behind: the card was moved after it was set, so whoever moved
+ * it took the card on. The board drops such a wait without waking anyone.
+ */
+export const kanbanWaitStale = (card: Pick<KanbanCard, "wait" | "movedAt">): boolean =>
+  card.wait !== undefined && Date.parse(card.movedAt) > Date.parse(card.wait.at);
+
+/**
+ * A card parked on a wait. A card with a running thread is never waiting (the
+ * thread is the truth), and neither is one moved since its wait was set.
+ */
+export const kanbanWaiting = (
+  card: Pick<KanbanCard, "wait" | "activeThreadId" | "settledAt" | "movedAt">,
+): boolean =>
+  card.wait !== undefined &&
+  card.activeThreadId === null &&
+  card.settledAt === null &&
+  !kanbanWaitStale(card);
+
+/**
+ * A card held for its evaluator after a wait ended (`deciding`). It is not
+ * started, claimed or completed until the evaluator's turn ends, the card is
+ * moved or parked again, or the time to decide runs out. A thread on the card,
+ * a newer move or a new wait all mean somebody has taken it on. Without a clock
+ * the time limit is not applied: the board's tick removes a hold that ran out.
+ */
+export const kanbanDeciding = (
+  card: Pick<KanbanCard, "deciding" | "wait" | "activeThreadId" | "settledAt" | "movedAt">,
+  nowMs?: number,
+): boolean => {
+  const deciding = card.deciding;
+  if (deciding === undefined || card.wait !== undefined) return false;
+  if (card.activeThreadId !== null || card.settledAt !== null) return false;
+  const since = Date.parse(deciding.since);
+  if (Date.parse(card.movedAt) > since) return false;
+  return nowMs === undefined || nowMs - since < KANBAN_DECIDE_MS;
+};
+
+/** The card without its evaluator hold. */
+export const kanbanWithoutDeciding = <C extends Pick<KanbanCard, "deciding">>(card: C): C => {
+  if (card.deciding === undefined) return card;
+  const { deciding: _deciding, ...rest } = card;
+  return rest as C;
+};
+
+/** The card without its wait. */
+export const kanbanWithoutWait = <C extends Pick<KanbanCard, "wait">>(card: C): C => {
+  if (card.wait === undefined) return card;
+  const { wait: _wait, ...rest } = card;
+  return rest as C;
+};
+
+const WAIT_HOUR_MS = 60 * 60 * 1000;
+const WAIT_DAY_MS = 24 * WAIT_HOUR_MS;
+
+/**
+ * How long a wait may hold with nothing happening before the card shows as
+ * stuck, per kind. A `time` wait has no limit: it ends by itself.
+ */
+export const KANBAN_WAIT_LIMIT_MS: Readonly<Record<KanbanWaitKind, number | null>> = {
+  push: 3 * WAIT_DAY_MS,
+  merge: 2 * WAIT_DAY_MS,
+  ci: 3 * WAIT_HOUR_MS,
+  owner_go: 2 * WAIT_DAY_MS,
+  card: 7 * WAIT_DAY_MS,
+  time: null,
+  script: 7 * WAIT_DAY_MS,
+};
+
+/** When a wait counts as stuck: its own `until` (not for `time`), else its kind's limit after it was set. Null: never. */
+export const kanbanWaitDeadlineMs = (wait: KanbanWait): number | null => {
+  if (wait.on === "time") return null;
+  if (wait.until !== null) {
+    const until = Date.parse(wait.until);
+    if (Number.isFinite(until)) return until;
+  }
+  const limit = KANBAN_WAIT_LIMIT_MS[wait.on];
+  const at = Date.parse(wait.at);
+  return limit === null || !Number.isFinite(at) ? null : at + limit;
+};
+
+/** A wait that ran past its limit, whether or not the board has marked it yet. */
+export const kanbanWaitExpired = (wait: KanbanWait, nowMs: number): boolean => {
+  if (wait.expiredAt !== null) return true;
+  const deadline = kanbanWaitDeadlineMs(wait);
+  return deadline !== null && nowMs >= deadline;
+};
 
 /** The step the card is on: the first with an open subtask, or null when none is open. */
 export const kanbanOpenStep = (card: Pick<KanbanCard, "subtasks">): number | null =>
@@ -1283,7 +1501,12 @@ export function kanbanSchedule(
   const result = new Map<string, KanbanSchedule>();
   graph.open.forEach((card, v) => {
     const blocking = graph.of(v);
-    let waitingSince: string | null = card.stage === "todo" ? card.movedAt : null;
+    // A card parked on a wait is not startable: it gathers no age while parked. When
+    // the wait ends it keeps its `movedAt`, so the time it was parked counts from then on.
+    let waitingSince: string | null =
+      card.stage === "todo" && !kanbanWaiting(card) && !kanbanDeciding(card, nowMs)
+        ? card.movedAt
+        : null;
     if (waitingSince !== null) {
       for (const id of card.blockedBy) {
         const blocker = byId.get(id);
@@ -1340,7 +1563,11 @@ export interface KanbanCardFlow {
   readonly unblocks: number;
   /** The priority it is picked at; see kanbanSchedule. Its own priority for a done card. */
   readonly rank: number;
-  /** A To-Do card nothing on the card itself keeps from starting (the board's pause and pools aside). */
+  /**
+   * A To-Do card nothing on the card itself keeps from starting (the board's pause
+   * and pools aside). False while it is parked on a wait, and, when the caller
+   * passes a clock, while it waits out a failed run's backoff.
+   */
   readonly ready: boolean;
   /** The unfinished cards it lists as blockers, including one its own work thread does first. */
   readonly waitsOn: ReadonlyArray<KanbanCard>;
@@ -1350,12 +1577,14 @@ export interface KanbanCardFlow {
 
 /**
  * What a board shows about one card's place in the queue. `schedule` is
- * kanbanSchedule of the same cards, built once per board.
+ * kanbanSchedule of the same cards, built once per board. `nowMs` lets `ready`
+ * see a failed run's backoff; without it only the card's own state counts.
  */
 export function kanbanCardFlow(
   card: KanbanCard,
   byId: ReadonlyMap<string, KanbanCard>,
   schedule: ReadonlyMap<string, KanbanSchedule>,
+  nowMs?: number,
 ): KanbanCardFlow {
   const entry = schedule.get(card.id);
   const open = isOpenCard(card);
@@ -1379,28 +1608,60 @@ export function kanbanCardFlow(
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
       !kanbanWaitsOnEvaluator(card) &&
+      !kanbanWaiting(card) &&
+      !kanbanDeciding(card, nowMs) &&
+      (nowMs === undefined || (kanbanRetryNotBefore(card) ?? 0) <= nowMs) &&
       heldUpBy === undefined,
     waitsOn,
     heldUpBy,
   };
 }
 
+export const KANBAN_CARD_EVENT_KINDS = [
+  "created",
+  "moved",
+  "edited",
+  "linked",
+  "flagged",
+  "comment",
+  "thread",
+  "review",
+  "subtask",
+  /** A wait was set, ended (the body says why), was cleared by hand, or ran past its limit. */
+  "wait_set",
+  "wait_cleared",
+  "wait_expired",
+  /** A kind this build doesn't know, written by a newer server. Never written. */
+  "other",
+] as const;
+const KnownCardEventKind = Schema.Literals(KANBAN_CARD_EVENT_KINDS);
+type KnownCardEventKind = typeof KnownCardEventKind.Type;
+const isCardEventKind = Schema.is(KnownCardEventKind);
+
+/**
+ * A card event's kind. A kind this build doesn't know decodes as "other"
+ * instead of failing: a client older than its server still loads a card's
+ * history when the server adds a kind. A build from before this (its list was
+ * closed) fails the whole card read on an unknown kind, so a new kind is only
+ * written once those builds are gone.
+ */
+export const KanbanCardEventKind = Schema.String.pipe(
+  Schema.decodeTo(
+    KnownCardEventKind,
+    SchemaTransformation.transform<KnownCardEventKind, string>({
+      decode: (raw) => (isCardEventKind(raw) ? raw : "other"),
+      encode: (kind) => kind,
+    }),
+  ),
+);
+export type KanbanCardEventKind = typeof KanbanCardEventKind.Type;
+
 export const KanbanCardEvent = Schema.Struct({
   id: NonNegativeInt,
   cardId: KanbanCardId,
   at: IsoDateTime,
   actor: KanbanActor,
-  kind: Schema.Literals([
-    "created",
-    "moved",
-    "edited",
-    "linked",
-    "flagged",
-    "comment",
-    "thread",
-    "review",
-    "subtask",
-  ]),
+  kind: KanbanCardEventKind,
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),

@@ -89,7 +89,7 @@ it.effect(
           const decided = yield* kanban.answerAsk(
             card.id,
             "q1",
-            { verdict: "approved" },
+            { revision: 0, verdict: "approved" },
             { _tag: "evaluator", threadId: cardEvaluator.threadId },
           );
           const answer = askOf(decided.card).answer!;
@@ -215,7 +215,7 @@ it.effect(
         const answered = yield* kanban.answerAsk(
           card.id,
           "q1",
-          { verdict: "picked", optionIds: ["o1"] },
+          { revision: 0, verdict: "picked", optionIds: ["o1"] },
           owner,
         );
         assert.strictEqual(askOf(answered.card).answer?.verdict, "picked");
@@ -269,18 +269,27 @@ it.effect("an action with a field and a file over HTTP: checked, kept, and told 
         );
 
         const answerUrl = "/cards/toy:1/asks/q1/answer";
-        const missing = yield* http.post(answerUrl, { verdict: "approved" });
+        const missing = yield* http.post(answerUrl, { revision: 0, verdict: "approved" });
         assert.strictEqual(missing.status, 400);
         assert.include(missing.body.error.message, 'field "when" (When) is required');
         const range = yield* http.post(answerUrl, {
+          revision: 0,
           verdict: "approved",
           values: { when: "o1", max: 9 },
         });
         assert.strictEqual(range.status, 400);
         assert.include(range.body.error.message, 'field "max" (Max error rate) is above 5 %');
-        const option = yield* http.post(answerUrl, { verdict: "approved", values: { when: "o7" } });
+        const option = yield* http.post(answerUrl, {
+          revision: 0,
+          verdict: "approved",
+          values: { when: "o7" },
+        });
         assert.include(option.body.error.message, 'field "when" (When) takes one of o1, o2');
-        const verdict = yield* http.post(answerUrl, { verdict: "done", values: { when: "o1" } });
+        const verdict = yield* http.post(answerUrl, {
+          revision: 0,
+          verdict: "done",
+          values: { when: "o1" },
+        });
         assert.strictEqual(verdict.status, 400);
         assert.include(
           verdict.body.error.message,
@@ -288,6 +297,7 @@ it.effect("an action with a field and a file over HTTP: checked, kept, and told 
         );
         // A file the board can't keep refuses the whole answer and changes nothing.
         const ghost = yield* http.post(answerUrl, {
+          revision: 0,
           verdict: "approved",
           values: {
             when: "o1",
@@ -307,6 +317,7 @@ it.effect("an action with a field and a file over HTTP: checked, kept, and told 
 
         const pending = yield* writePending("runbook.pdf", "application/pdf", "%PDF-1.7 steps");
         const done = yield* http.post(answerUrl, {
+          revision: 0,
           verdict: "approved",
           note: "Watch the dashboards.",
           values: { when: "o2", max: 2.5, runbook: [pending] },
@@ -373,6 +384,7 @@ it.effect("a task and a notice over HTTP, and a notice never counts or blocks", 
         assert.isTrue(kanbanAskIsNotice(askOf(noticed, "q2")));
 
         const cant = yield* http.post("/cards/toy:1/asks/q1/answer", {
+          revision: 0,
           verdict: "cant",
           note: "The build won't install.",
         });
@@ -385,7 +397,10 @@ it.effect("a task and a notice over HTTP, and a notice never counts or blocks", 
         // Only the notice is open now: the card is not the owner's to act on.
         const only = (yield* kanban.card(card.id)).card;
         assert.isFalse(kanbanCardNeedsOwner(only, Date.parse("2030-01-01")));
-        const seen = yield* http.post("/cards/toy:1/asks/q2/answer", { verdict: "acknowledged" });
+        const seen = yield* http.post("/cards/toy:1/asks/q2/answer", {
+          revision: 0,
+          verdict: "acknowledged",
+        });
         assert.strictEqual(seen.status, 200);
         assert.strictEqual(seen.body.ask.answer.verdict, "acknowledged");
         assert.include(
@@ -419,7 +434,11 @@ it.effect("a batch takes only asks that take the same thing back", () =>
         for (const ask of asks) yield* kanban.askOwner(card.id, ask, evaluatorActor, "evaluator");
         const batch = yield* http.post("/asks/answer", {
           verdict: "approved",
-          items: ["q1", "q2", "q3", "q4", "q5", "q9"].map((askId) => ({ card: "toy:1", askId })),
+          items: ["q1", "q2", "q3", "q4", "q5", "q9"].map((askId) => ({
+            card: "toy:1",
+            askId,
+            revision: 0,
+          })),
         });
         assert.strictEqual(batch.status, 200);
         assert.deepStrictEqual(
@@ -469,6 +488,7 @@ it.effect("a secret sent as a plain value is refused, and it is stored nowhere",
         );
         const value = "sk_live_NEVER_STORE_THIS_4242";
         const answered = yield* http.post("/cards/toy:1/asks/q1/answer", {
+          revision: 0,
           verdict: "answered",
           values: { key: value },
         });

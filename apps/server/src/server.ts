@@ -198,6 +198,7 @@ import { ArdudOpenCodeImportLive } from "./ardud/opencode-import/layer.ts";
 import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 // ardud: missions board
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
+import { layer as KanbanWaitPrsLayer } from "./ardud/kanban/engine/waitPrs.ts";
 import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
@@ -630,7 +631,11 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ReplayMarkers.layer,
   ArdudOpenCodeImportLive.pipe(StartupPhaseLog.withStartupLayer("server.opencode-import")),
   // ardud: missions board
-  ArdudKanbanLive.pipe(StartupPhaseLog.withStartupLayer("server.kanban")),
+  ArdudKanbanLive.pipe(
+    // Reads the pull requests board waits point at; the board picks it up when present.
+    Layer.provide(KanbanWaitPrsLayer.pipe(Layer.provide(layerPullRequestService))),
+    StartupPhaseLog.withStartupLayer("server.kanban"),
+  ),
   ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
     StartupPhaseLog.withStartupLayer("server.project-settings-sweep"),

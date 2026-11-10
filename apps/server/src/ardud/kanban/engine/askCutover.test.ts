@@ -359,7 +359,7 @@ it.effect("who may edit an ask: an evaluator any, a worker those on the card it 
   }),
 );
 
-it.effect("an owner on an older client answers a typed ask from the card discussion", () =>
+it.effect("words in the card discussion from an older client do not approve a typed ask", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -395,23 +395,22 @@ it.effect("an owner on an older client answers a typed ask from the card discuss
         ["q1", "Deploy build 42 tonight?", ["Approve", "Reject"]],
       );
 
-      // He replies in words from there: no values, no verdict. It closes and the worker gets his
-      // words the way any owner reply reaches it.
+      // He replies in words from there: no values, no verdict. That is not an approval of
+      // the action: the ask stays open, waits on its asker, and the card stays held.
       const text = "Yes, go at 22:00 Dubai time.";
       yield* kanban.post(discussion.id, owner, [{ _tag: "md", text }]);
       const after = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(after.stage, "todo");
+      assert.strictEqual(after.stage, "needs_owner");
       assert.deepStrictEqual(
-        [
-          askOf(after).closedAt !== null,
-          askOf(after).answer?.verdict,
-          askOf(after).answer?.by._tag,
-        ],
-        [true, "answered", "owner"],
+        [askOf(after).closedAt, askOf(after).answer, kanbanAskWaitsOn(askOf(after))],
+        [null, undefined, "agent"],
       );
-      assert.strictEqual(after.wakeNote, ownerMessageText("#1 Deploy", discussion.id, text));
-      yield* kanban.dispatchNow;
-      assert.include((yield* fake.heard(threadId)).join("\n"), text);
+      // The worker is parked on its ask, so the discussion's evaluator hears his words and
+      // that they were not the ask's answer.
+      const told = (yield* fake.evaluators).flatMap((entry) => entry.messages).join("\n");
+      assert.include(told, ownerMessageText("#1 Deploy", discussion.id, text));
+      assert.include(told, "It is not an approval, a pick or a decision on that ask");
+      assert.notInclude((yield* fake.heard(threadId)).join("\n"), text);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

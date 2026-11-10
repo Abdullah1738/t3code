@@ -24,10 +24,25 @@ import {
   KANBAN_AGING_STEP_MS,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
+  KANBAN_WAIT_LIMIT_MS,
+  KANBAN_CARD_EVENT_KINDS,
+  KANBAN_WAIT_CHECK_FAILURES,
+  kanbanWait,
+  kanbanWaitCheckFailing,
+  kanbanWaitDeadlineMs,
+  kanbanWaitExpired,
+  kanbanDeciding,
+  kanbanWaiting,
+  kanbanWithoutDeciding,
+  KANBAN_DECIDE_MS,
+  kanbanWaitStale,
+  kanbanWithoutWait,
+  type KanbanWait,
   KANBAN_BOARD_IMAGE_MAX,
   KanbanSubtask,
   KanbanThreadLink,
 } from "./kanban.ts";
+import { KanbanCardDetail } from "./kanbanRpc.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
 
@@ -319,6 +334,40 @@ describe("kanbanSchedule", () => {
     expect(schedule.get("one")).toMatchObject({ rank: 1 });
   });
 
+  it("gives a card parked on a wait no age while it is parked, and its full age once the wait is gone", () => {
+    const wait = Schema.decodeUnknownSync(KanbanCard)(
+      JSON.parse(
+        JSON.stringify({
+          ...card("x"),
+          wait: {
+            on: "time",
+            until: at(20 * day),
+            note: "after the audit",
+            by: { _tag: "owner" },
+            at: at(1 * day),
+          },
+        }),
+      ),
+    ).wait!;
+    const parked = card("parked", { priority: 4, movedAt: at(0), wait });
+    const nowMs = Date.parse(at(9 * day));
+    expect(kanbanSchedule([parked], { nowMs }).get("parked")).toMatchObject({
+      rank: 4,
+      agingSteps: 0,
+      waitingSince: null,
+    });
+    // The wait ended and the card kept its movedAt: the time it was parked counts.
+    const { wait: _wait, ...woken } = parked;
+    expect(kanbanSchedule([woken], { nowMs }).get("parked")).toMatchObject({
+      rank: 2,
+      agingSteps: 2,
+      waitingSince: at(0),
+    });
+    // A wait left behind by a move holds nothing.
+    const moved = { ...parked, movedAt: at(2 * day) };
+    expect(kanbanSchedule([moved], { nowMs }).get("parked")?.waitingSince).toBe(at(2 * day));
+  });
+
   it("ages a startable To-Do card one step per 3 days, at most two, never above P2", () => {
     const cards = [
       card("fresh", { priority: 4, movedAt: at(8 * day) }),
@@ -398,6 +447,52 @@ describe("kanbanCardFlow", () => {
     expect(flow("b").heldUpBy?.id).toBe("a");
     expect(flow("flagged").ready).toBe(false);
     expect(flow("shipped")).toMatchObject({ unblocks: 0, ready: false, waitsOn: [] });
+  });
+
+  it("is not ready while parked on a wait, or (given a clock) inside a failed run's backoff", () => {
+    const failedAt = "2026-11-10T10:00:00.000Z";
+    const wait = Schema.decodeUnknownSync(KanbanCard)(
+      JSON.parse(
+        JSON.stringify({
+          ...card("x"),
+          wait: {
+            on: "time",
+            until: "2026-12-01T00:00:00.000Z",
+            note: "after the audit",
+            by: { _tag: "owner" },
+            at: failedAt,
+          },
+        }),
+      ),
+    ).wait!;
+    const cards = [
+      card("parked", { wait, movedAt: "2026-11-09T10:00:00.000Z" }),
+      card("holds", { blockedBy: ["parked"] }),
+      card("retrying", {
+        retries: [
+          {
+            kind: "run_failed",
+            role: "work",
+            runId: "run-1",
+            reason: "upstream closed the stream",
+            at: failedAt,
+            state: "waiting",
+          },
+        ],
+      }),
+    ];
+    const byId = new Map(cards.map((c) => [c.id as string, c]));
+    const schedule = kanbanSchedule(cards);
+    const due = Date.parse(failedAt) + KANBAN_RETRY_BACKOFF_MS;
+    // Parked: not ready, and still what the card behind it waits on.
+    expect(kanbanCardFlow(byId.get("parked")!, byId, schedule)).toMatchObject({
+      ready: false,
+      unblocks: 1,
+    });
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule, due - 1).ready).toBe(false);
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule, due).ready).toBe(true);
+    // With no clock only the card's own state counts.
+    expect(kanbanCardFlow(byId.get("retrying")!, byId, schedule).ready).toBe(true);
   });
 });
 
@@ -657,5 +752,335 @@ describe("board script steps", () => {
       doneAt: null,
     });
     expect(decoded.script).toBeUndefined();
+  });
+});
+
+describe("KanbanCard wait", () => {
+  const stored = (extra: Record<string, unknown> = {}) => ({
+    ...Schema.encodeSync(KanbanCard)(card("stored")),
+    ...extra,
+  });
+  const wait = (patch: Partial<KanbanWait> = {}): KanbanWait => ({
+    on: "push",
+    pr: "https://github.com/acme/app/pull/12" as never,
+    card: null,
+    ask: null,
+    until: null,
+    sinceHead: "a1b2c3d4",
+    note: "author to push the fix",
+    by: { _tag: "owner" },
+    at: "2026-10-25T10:00:00.000Z" as never,
+    wakeRole: null,
+    expiredAt: null,
+    script: null,
+    args: null,
+    status: null,
+    lastCheckedAt: null,
+    failures: 0,
+    problem: null,
+    ...patch,
+  });
+
+  it("decodes a card stored before waits existed, and encodes it back without a wait key", () => {
+    const encoded = stored();
+    expect("wait" in encoded).toBe(false);
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(encoded);
+    expect(decoded.wait).toBeUndefined();
+    expect(kanbanWait(decoded)).toBeNull();
+    expect(kanbanWaiting(decoded)).toBe(false);
+    expect(JSON.parse(JSON.stringify(Schema.encodeSync(KanbanCard)(decoded)))).toEqual(encoded);
+  });
+
+  it("fills the optional parts of a stored wait", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(
+      stored({
+        wait: {
+          on: "merge",
+          pr: "https://github.com/acme/app/pull/12",
+          note: "parent PR",
+          by: { _tag: "owner" },
+          at: "2026-10-25T10:00:00.000Z",
+        },
+      }),
+    );
+    expect(decoded.wait).toEqual({
+      on: "merge",
+      pr: "https://github.com/acme/app/pull/12",
+      card: null,
+      ask: null,
+      until: null,
+      sinceHead: null,
+      note: "parent PR",
+      by: { _tag: "owner" },
+      at: "2026-10-25T10:00:00.000Z",
+      wakeRole: null,
+      expiredAt: null,
+      script: null,
+      args: null,
+      status: null,
+      lastCheckedAt: null,
+      failures: 0,
+      problem: null,
+    });
+  });
+
+  it("decodes a script wait with its args and check state", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(
+      stored({
+        wait: {
+          on: "script",
+          script: "linear-state",
+          args: { issue: "ENG-123", state: "Done", everyMs: 600000 },
+          note: "ENG-123 to reach Done",
+          by: { _tag: "owner" },
+          at: "2026-10-25T10:00:00.000Z",
+          status: "In Review",
+          lastCheckedAt: "2026-10-25T10:05:00.000Z",
+          failures: 3,
+          problem: "Linear said 401",
+        },
+      }),
+    );
+    expect(decoded.wait).toMatchObject({
+      on: "script",
+      script: "linear-state",
+      args: { issue: "ENG-123", state: "Done", everyMs: 600000 },
+      status: "In Review",
+      failures: 3,
+    });
+    expect(kanbanWaitCheckFailing(decoded.wait!)).toBe(true);
+    expect(kanbanWaitCheckFailing({ failures: KANBAN_WAIT_CHECK_FAILURES - 1 })).toBe(false);
+  });
+
+  it("drops a wait of a kind this build doesn't know instead of failing the card", () => {
+    // A newer server may add kinds; an older client must still load the board.
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(
+      stored({
+        wait: {
+          on: "deploy",
+          note: "prod deploy",
+          by: { _tag: "owner" },
+          at: "2026-10-25T10:00:00.000Z",
+        },
+      }),
+    );
+    expect(decoded.wait).toBeUndefined();
+    expect(decoded.id).toBe("stored");
+    // So does a field it never heard of on a wait it does know.
+    const extra = Schema.decodeUnknownSync(KanbanCard)(
+      stored({
+        wait: {
+          on: "time",
+          until: "2026-10-26T10:00:00.000Z",
+          note: "recheck",
+          by: { _tag: "owner" },
+          at: "2026-10-25T10:00:00.000Z",
+          somethingNew: { nested: true },
+        },
+      }),
+    );
+    expect(extra.wait?.on).toBe("time");
+  });
+
+  it("decodes an event kind this build doesn't know as a generic event", () => {
+    const event = (kind: string) =>
+      Schema.decodeUnknownSync(KanbanCardEvent)({
+        id: 1,
+        cardId: "card-1",
+        at: "2026-10-29T10:00:00.000Z",
+        actor: { _tag: "owner" },
+        kind,
+        fromStage: null,
+        toStage: null,
+        body: "Something a newer server logged",
+      });
+    expect(event("wait_failing").kind).toBe("other");
+    expect(event("").kind).toBe("other");
+    expect(event("moved").kind).toBe("moved");
+    expect(event("wait_failing").body).toBe("Something a newer server logged");
+    // A whole card history with one unknown kind in it still loads.
+    const detail = Schema.decodeUnknownSync(Schema.Array(KanbanCardEvent))(
+      ["created", "from_the_future", "comment"].map((kind, index) => ({
+        id: index + 1,
+        cardId: "card-1",
+        at: "2026-10-29T10:00:00.000Z",
+        actor: { _tag: "owner" },
+        kind,
+        fromStage: null,
+        toStage: null,
+        body: null,
+      })),
+    );
+    expect(detail.map((entry) => entry.kind)).toEqual(["created", "other", "comment"]);
+    expect(KANBAN_CARD_EVENT_KINDS).toContain("other");
+  });
+
+  it("decodes the wait event kinds", () => {
+    for (const kind of ["wait_set", "wait_cleared", "wait_expired"]) {
+      const event = Schema.decodeUnknownSync(KanbanCardEvent)({
+        id: 1,
+        cardId: "card-1",
+        at: "2026-10-29T10:00:00.000Z",
+        actor: { _tag: "owner" },
+        kind,
+        fromStage: null,
+        toStage: null,
+        body: "PR merged",
+      });
+      expect(event.kind).toBe(kind);
+    }
+  });
+
+  it("counts a card as waiting only with no thread, unsettled and unmoved since", () => {
+    const waiting = card("w", { stage: "in_review", wait: wait() });
+    expect(kanbanWaiting(waiting)).toBe(true);
+    expect(kanbanWaiting({ ...waiting, activeThreadId: "thread-1" as never })).toBe(false);
+    expect(kanbanWaiting({ ...waiting, settledAt: "2026-10-26T10:00:00.000Z" as never })).toBe(
+      false,
+    );
+    const moved = { ...waiting, movedAt: "2026-10-25T11:00:00.000Z" as never };
+    expect(kanbanWaitStale(moved)).toBe(true);
+    expect(kanbanWaiting(moved)).toBe(false);
+  });
+
+  it("a card held for its evaluator round-trips, and one stored before the key has none", () => {
+    const plain = Schema.decodeUnknownSync(KanbanCard)(stored());
+    expect(plain.deciding).toBeUndefined();
+    expect("deciding" in Schema.encodeSync(KanbanCard)(plain)).toBe(false);
+    const held = Schema.decodeUnknownSync(KanbanCard)(
+      // Written by a build before `toldAt`: it decodes as not told yet.
+      stored({ deciding: { since: "2026-10-25T10:00:00.000Z", why: "PR closed" } }),
+    );
+    expect(held.deciding).toEqual({
+      since: "2026-10-25T10:00:00.000Z",
+      why: "PR closed",
+      toldAt: null,
+    });
+    // A shape this build cannot read is dropped, and the board still loads.
+    expect(
+      Schema.decodeUnknownSync(KanbanCard)(stored({ deciding: { since: 7 } })).deciding,
+    ).toBeUndefined();
+  });
+
+  it("holds a card for its evaluator until it is moved, parked, started or out of time", () => {
+    const since = Date.parse("2026-10-25T10:00:00.000Z");
+    const held = card("d", {
+      stage: "needs_review",
+      movedAt: "2026-10-25T09:00:00.000Z" as never,
+      deciding: { since: "2026-10-25T10:00:00.000Z" as never, why: "PR closed", toldAt: null },
+    });
+    expect(kanbanDeciding(held)).toBe(true);
+    expect(kanbanDeciding(held, since + KANBAN_DECIDE_MS - 1)).toBe(true);
+    expect(kanbanDeciding(held, since + KANBAN_DECIDE_MS)).toBe(false);
+    expect(kanbanDeciding({ ...held, movedAt: "2026-10-25T10:05:00.000Z" as never })).toBe(false);
+    expect(kanbanDeciding({ ...held, activeThreadId: "thread-1" as never })).toBe(false);
+    expect(
+      kanbanDeciding({ ...held, wait: wait({ at: "2026-10-25T10:05:00.000Z" as never }) }),
+    ).toBe(false);
+    expect(kanbanDeciding(kanbanWithoutDeciding(held))).toBe(false);
+    // Not ready, and it gathers no age, while the evaluator decides.
+    const todo = { ...held, stage: "todo" as const };
+    const byId = new Map([[todo.id as string, todo]]);
+    expect(kanbanCardFlow(todo, byId, kanbanSchedule([todo]), since + 1).ready).toBe(false);
+    expect(kanbanCardFlow(todo, byId, kanbanSchedule([todo]), since + KANBAN_DECIDE_MS).ready).toBe(
+      true,
+    );
+  });
+
+  it("an old-shape client reads a waiting card's detail while wait events are written as edits", () => {
+    // A build from before the tolerant decoder: a closed event-kind list and no wait field.
+    const { wait: _wait, ...oldCardFields } = KanbanCard.fields;
+    const OldCardDetail = Schema.Struct({
+      card: Schema.Struct(oldCardFields),
+      events: Schema.Array(
+        Schema.Struct({
+          ...KanbanCardEvent.fields,
+          kind: Schema.Literals([
+            "created",
+            "moved",
+            "edited",
+            "linked",
+            "flagged",
+            "comment",
+            "thread",
+            "review",
+            "subtask",
+          ]),
+        }),
+      ),
+      threads: KanbanCardDetail.fields.threads,
+    });
+    const event = (id: number, kind: KanbanCardEvent["kind"], body: string): KanbanCardEvent => ({
+      id: id as KanbanCardEvent["id"],
+      cardId: "stored" as KanbanCardEvent["cardId"],
+      at: "2026-10-25T10:00:00.000Z" as KanbanCardEvent["at"],
+      actor: { _tag: "system", component: "waits" },
+      kind,
+      fromStage: null,
+      toStage: null,
+      body,
+      head: null,
+    });
+    const detail = (events: ReadonlyArray<KanbanCardEvent>): unknown =>
+      JSON.parse(
+        JSON.stringify(
+          Schema.encodeSync(KanbanCardDetail)({
+            card: card("stored", {
+              wait: wait({
+                on: "script",
+                pr: null,
+                sinceHead: null,
+                script: "linear-state" as never,
+                args: { issue: "ENG-123" },
+                status: "In Review",
+                failures: 3,
+              }),
+            }),
+            events,
+            threads: [],
+          }),
+        ),
+      );
+    // What the server writes while its event-kind switch is off.
+    const asEdits = detail([
+      event(1, "edited", "Waiting for the linear-state script's check: ENG-123 to be Done"),
+      event(2, "edited", "Wait check failing: 3 failures in a row"),
+      event(3, "edited", "Wait expired: waited 7d with no change"),
+      event(4, "edited", "Wait ended: ENG-123 is Done"),
+    ]);
+    const old = Schema.decodeUnknownSync(OldCardDetail)(asEdits);
+    expect(old.events.map((entry) => entry.kind)).toEqual(["edited", "edited", "edited", "edited"]);
+    expect(old.card.id).toBe("stored");
+    expect("wait" in old.card).toBe(false);
+    // The same history under its own kinds fails that client's whole card read.
+    const asKinds = detail([event(1, "wait_set", "Waiting for ENG-123 to be Done")]);
+    expect(() => Schema.decodeUnknownSync(OldCardDetail)(asKinds)).toThrow();
+    // This build reads both, with the wait.
+    expect(Schema.decodeUnknownSync(KanbanCardDetail)(asKinds).events[0]?.kind).toBe("wait_set");
+    expect(Schema.decodeUnknownSync(KanbanCardDetail)(asEdits).card.wait?.script).toBe(
+      "linear-state",
+    );
+  });
+
+  it("drops the wait key, not sets it to undefined", () => {
+    const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
+    expect("wait" in cleared).toBe(false);
+    const plain = card("p");
+    expect(kanbanWithoutWait(plain)).toBe(plain);
+  });
+
+  it("expires by the kind's limit, the wait's own until, or never for a time wait", () => {
+    const at = Date.parse("2026-10-25T10:00:00.000Z");
+    expect(kanbanWaitDeadlineMs(wait())).toBe(at + KANBAN_WAIT_LIMIT_MS.push!);
+    expect(kanbanWaitExpired(wait(), at + KANBAN_WAIT_LIMIT_MS.push! - 1)).toBe(false);
+    expect(kanbanWaitExpired(wait(), at + KANBAN_WAIT_LIMIT_MS.push!)).toBe(true);
+    const own = wait({ until: "2026-10-25T12:00:00.000Z" as never });
+    expect(kanbanWaitDeadlineMs(own)).toBe(Date.parse("2026-10-25T12:00:00.000Z"));
+    const time = wait({ on: "time", pr: null, until: "2026-10-25T12:00:00.000Z" as never });
+    expect(kanbanWaitDeadlineMs(time)).toBeNull();
+    expect(kanbanWaitExpired(time, at + 365 * 24 * 60 * 60 * 1000)).toBe(false);
+    expect(kanbanWaitExpired(wait({ expiredAt: "2026-10-25T10:05:00.000Z" as never }), at)).toBe(
+      true,
+    );
   });
 });

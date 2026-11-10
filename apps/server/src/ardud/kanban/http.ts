@@ -32,6 +32,7 @@ import * as Struct from "effect/Struct";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
+import { OWNER_SESSION_REQUIRED, isOwnerSession } from "../auth/provenance.ts";
 import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
@@ -246,6 +247,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       if (!session.scopes.includes(scope)) {
         return yield* fail("denied", `This token lacks the ${scope} scope.`);
       }
+      return session;
     });
 
     /** A board by id or slug. */
@@ -279,11 +281,38 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         Effect.andThen(effect),
         Effect.map((value) => json(value)),
       );
+    /**
+     * A write only the owner makes: his answer to an ask, a hand-over, a
+     * snooze, a reply as him. The operate scope is not enough, since every
+     * component credential and CLI-issued session has it. The session itself
+     * must carry the owner claim (minted from one of the owner's pairing
+     * roots, see `SessionOrigins.ts`), read from the session the cookie or
+     * bearer maps to and never from the request.
+     */
+    const ownerWrite = <A, R>(effect: Effect.Effect<A, KanbanError, R>) =>
+      authenticate(AuthOrchestrationOperateScope).pipe(
+        Effect.flatMap((session) =>
+          isOwnerSession(session)
+            ? effect
+            : Effect.fail(
+                fail(
+                  "denied",
+                  `Only the owner answers, hands over, snoozes or replies on an ask${
+                    session.origin?._tag === "component"
+                      ? `; this is the ${session.origin.component} component's session`
+                      : ""
+                  }. ${OWNER_SESSION_REQUIRED}`,
+                ),
+              ),
+        ),
+        Effect.map((value) => json(value)),
+      );
 
     const handle = <R>(
       effect: Effect.Effect<HttpServerResponse.HttpServerResponse, KanbanError, R>,
     ) =>
-      annotateHttpAction.pipe(Effect.andThen(effect),
+      annotateHttpAction.pipe(
+        Effect.andThen(effect),
         Effect.catchTags({
           KanbanError: (error) =>
             Effect.succeed(
@@ -579,7 +608,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const answerAsk = write(
+    const answerAsk = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
         const askId = yield* param("ask");
@@ -590,7 +619,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     );
 
     // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
-    const answerAsks = write(
+    const answerAsks = ownerWrite(
       Effect.gen(function* () {
         const { items, ...answer } = yield* body(AskBatchBody);
         if (items.length === 0) return yield* fail("invalid", "items is empty.");
@@ -625,7 +654,12 @@ export const kanbanRouteLayer = HttpRouter.addAll(
               { ...answer, revision: item.revision },
               OWNER,
             );
-            return { card: item.card, askId: item.askId, ok: true as const, stage: result.card.stage };
+            return {
+              card: item.card,
+              askId: item.askId,
+              ok: true as const,
+              stage: result.card.stage,
+            };
           }).pipe(
             Effect.catchTags({
               KanbanError: (error) =>
@@ -642,7 +676,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const replyOnAsk = write(
+    const replyOnAsk = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
         const askId = yield* param("ask");
@@ -658,7 +692,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const handAsk = write(
+    const handAsk = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
         const askId = yield* param("ask");
@@ -704,7 +738,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const snoozeAsk = write(
+    const snoozeAsk = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
         const askId = yield* param("ask");
@@ -714,7 +748,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
     );
 
     // Each ask is snoozed on its own: one that can't be doesn't hold back the rest.
-    const snoozeAsks = write(
+    const snoozeAsks = ownerWrite(
       Effect.gen(function* () {
         const { items, until } = yield* body(AskSnoozeBatchBody);
         if (items.length === 0) return yield* fail("invalid", "items is empty.");

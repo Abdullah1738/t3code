@@ -7,9 +7,12 @@
  */
 import {
   KANBAN_BACKLOG,
+  KANBAN_DONE_STAGES,
   KanbanCardId,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanLink,
+  type KanbanWait,
   type ModelSelection,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -180,4 +183,187 @@ export function soakCards(input: SoakBoardInput): ReadonlyArray<KanbanCard> {
     open.push(card.id);
   }
   return cards;
+}
+
+/** Open cards (To-Do and awaiting review) parked on a wait. */
+export const SOAK_WAIT_SHARE = 0.05;
+/** At least one card of every kind of park below, so the smoke board has them all. */
+export const SOAK_WAITS_MIN = 18;
+
+/** The board script the soak's script waits name. No process runs: the soak answers for it. */
+export const SOAK_SCRIPT = "soak-check";
+
+/**
+ * The parks the soak seeds, one after the other and round again. `from` is where
+ * the card sits. `ends` is when its wait is over: at the first tick (`start`),
+ * when the driver changes the reading or the time comes mid-run (`mid`), or not
+ * in this run (`never`: these are the steady cost of a parked card). `thread`:
+ * the card has an idle work thread. On a pull request wait that thread watches
+ * the PR, so the tick reads the PR from the thread's view; without one the host
+ * reader is asked.
+ *
+ * A script wait's check is a real process that the scripts' own pass starts,
+ * and this harness runs none. Its cards are parked all the same: the tick
+ * holds them, and the soak answers for the script through the one batch call
+ * that pass makes (`answerWaits`).
+ */
+export const SOAK_PARKS = [
+  { kind: "merge", on: "merge", from: "todo", ends: "mid", thread: false },
+  { kind: "merge, own thread", on: "merge", from: "todo", ends: "mid", thread: true },
+  { kind: "push, own thread", on: "push", from: "todo", ends: "never", thread: true },
+  { kind: "time, due", on: "time", from: "todo", ends: "start", thread: false },
+  { kind: "time", on: "time", from: "todo", ends: "mid", thread: false },
+  { kind: "time, far off", on: "time", from: "todo", ends: "never", thread: true },
+  { kind: "card, done", on: "card", from: "todo", ends: "start", thread: false },
+  { kind: "card, open", on: "card", from: "todo", ends: "never", thread: true },
+  { kind: "merge, open", on: "merge", from: "todo", ends: "never", thread: false },
+  { kind: "push", on: "push", from: "review", ends: "mid", thread: false },
+  { kind: "ci", on: "ci", from: "review", ends: "mid", thread: false },
+  { kind: "ci, pending", on: "ci", from: "review", ends: "never", thread: false },
+  { kind: "push, open", on: "push", from: "review", ends: "never", thread: false },
+  { kind: "merge, reviewed", on: "merge", from: "reviewed", ends: "mid", thread: false },
+  { kind: "time, reviewed", on: "time", from: "reviewed", ends: "mid", thread: false },
+  // Three of them: one script's check answers for several cards at once.
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
+] as const satisfies ReadonlyArray<{
+  readonly kind: string;
+  readonly on: KanbanWait["on"];
+  /** `review`: awaiting review. `reviewed`: its review passed, it sits in review with nobody on it. */
+  readonly from: "todo" | "review" | "reviewed";
+  readonly ends: "start" | "mid" | "never";
+  readonly thread: boolean;
+}>;
+
+export type SoakPark = (typeof SOAK_PARKS)[number];
+
+/** One parked card, and what the driver needs to end its wait. */
+export interface SoakParked {
+  readonly cardId: KanbanCard["id"];
+  readonly park: SoakPark;
+  /** The pull request it waits on, if any. */
+  readonly pr: string | null;
+  /** The commit a push wait was set at. */
+  readonly sinceHead: string | null;
+  /** The card it waits on, if any. */
+  readonly waitsOn: KanbanCard["id"] | null;
+  /** An idle work thread the harness must stand up; it watches `pr` when there is one. */
+  readonly workThreadId: string | null;
+}
+
+export interface SoakWaitsInput {
+  readonly cards: ReadonlyArray<KanbanCard>;
+  readonly seed: number;
+  readonly nowMs: number;
+  /** When a `mid` time wait comes due, from `nowMs`. */
+  readonly midMs: number;
+  /** Steps in each review chain, by name: a reviewed card has passed them all. */
+  readonly chainSteps: ReadonlyMap<string, number>;
+}
+
+/**
+ * Parks about one open card in twenty on a wait, of every kind in SOAK_PARKS.
+ * Returns the board's cards with the waits set and what was parked.
+ *
+ * The parked cards are To-Do cards no other card waits on, so the blocking
+ * graph and the seeded review queue stay as they were; a park that sits in
+ * review moves its card there. A card whose wait ends in the run has no
+ * blockers, so that the wake can start it.
+ */
+export function soakWaits(input: SoakWaitsInput): {
+  readonly cards: ReadonlyArray<KanbanCard>;
+  readonly parked: ReadonlyArray<SoakParked>;
+} {
+  const random = soakRandom(input.seed);
+  const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+  const byId = new Map(input.cards.map((card) => [card.id as string, card]));
+  const blockers = new Set(input.cards.flatMap((card) => card.blockedBy as ReadonlyArray<string>));
+  const open = input.cards.filter((card) => card.stage === "todo" || card.stage === "needs_review");
+  const blocked = (card: KanbanCard) =>
+    card.blockedBy.some((id) => {
+      const blocker = byId.get(id);
+      return blocker !== undefined && !KANBAN_DONE_STAGES.has(blocker.stage);
+    });
+  const free = input.cards.filter((card) => card.stage === "todo" && !blockers.has(card.id));
+  for (let i = free.length - 1; i > 0; i -= 1) {
+    const j = random.below(i + 1);
+    [free[i], free[j]] = [free[j]!, free[i]!];
+  }
+  const done = input.cards.filter((card) => card.stage === "verified");
+  const held = input.cards.filter((card) => card.stage === "todo" && blocked(card));
+  const count = Math.max(SOAK_WAITS_MIN, Math.round(open.length * SOAK_WAIT_SHARE));
+  // The wait was set half a minute ago: after every seeded card last moved.
+  const at = iso(input.nowMs - 30_000);
+  const patched = new Map<string, KanbanCard>();
+  const parked: Array<SoakParked> = [];
+  for (let i = 0; i < count; i += 1) {
+    const park = SOAK_PARKS[i % SOAK_PARKS.length]!;
+    const card = free.pop();
+    if (card === undefined) break;
+    const onPr = park.on === "merge" || park.on === "push" || park.on === "ci";
+    const pr = onPr ? `https://github.com/soak/app/pull/${1000 + i}` : null;
+    const sinceHead = park.on === "push" ? `a${1000 + i}000` : null;
+    const workThreadId = park.thread ? `soak-parked-thread-${i}` : null;
+    const waitsOn = park.on !== "card" ? null : random.pick(park.ends === "start" ? done : held).id;
+    const until =
+      park.on !== "time"
+        ? null
+        : iso(
+            park.ends === "start"
+              ? input.nowMs - 10_000
+              : park.ends === "mid"
+                ? input.nowMs + input.midMs
+                : input.nowMs + 20 * DAY_MS,
+          );
+    const wait: KanbanWait = {
+      on: park.on,
+      script: park.on === "script" ? SOAK_SCRIPT : null,
+      args: park.on === "script" ? { issue: `SOAK-${i}` } : null,
+      pr: pr as KanbanWait["pr"],
+      card: waitsOn,
+      ask: null,
+      until,
+      sinceHead,
+      note: `Soak: ${park.kind}`,
+      by: { _tag: "owner" },
+      at,
+      wakeRole: null,
+      expiredAt: null,
+      status: null,
+      lastCheckedAt: null,
+      failures: 0,
+      problem: null,
+    };
+    // A merge wait's PR is one the card tracks; a push or ci wait points at one it only cites.
+    const link: KanbanLink | null =
+      pr === null
+        ? null
+        : {
+            kind: "pr",
+            url: pr as KanbanLink["url"],
+            label: null,
+            state: park.on === "merge" ? "open" : null,
+            checkedAt: park.on === "merge" ? at : null,
+          };
+    patched.set(card.id, {
+      ...card,
+      ...(park.from === "review" ? { stage: "needs_review" as const, blockedBy: [] } : {}),
+      ...(park.from === "reviewed"
+        ? {
+            stage: "in_review" as const,
+            blockedBy: [],
+            reviewStep: input.chainSteps.get(card.reviewChain ?? "") ?? 1,
+          }
+        : {}),
+      ...(park.from === "todo" && park.ends !== "never"
+        ? { blockedBy: [], priority: card.priority === KANBAN_BACKLOG ? 3 : card.priority }
+        : {}),
+      links: link === null ? card.links : [...card.links, link],
+      workThreadId: workThreadId as KanbanCard["workThreadId"],
+      wait,
+    });
+    parked.push({ cardId: card.id, park, pr, sinceHead, waitsOn, workThreadId });
+  }
+  return { cards: input.cards.map((card) => patched.get(card.id) ?? card), parked };
 }

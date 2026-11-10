@@ -15,6 +15,7 @@ import * as TestClock from "effect/testing/TestClock";
 import {
   kanbanRetryNotBefore,
   kanbanRetrying,
+  kanbanWaiting,
   ProjectId,
   ThreadId,
   type KanbanActor,
@@ -487,6 +488,124 @@ it.effect("a board paused during the wait starts the retry when the pause lifts"
       assert.isFalse(detail.events.some((event) => event.kind === "flagged"));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+const HOUR = 60 * 60_000;
+const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+
+it.effect("a card parked on a wait is invisible to the retry backstops", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      // The owner takes the card off its worker and parks it; the worker's run then fails.
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      yield* kanban.waitCard(
+        card.id,
+        { on: "time", until: iso(START + 3 * HOUR), note: "after the audit" },
+        owner,
+      );
+      const parked = (yield* now).card;
+      assert.isTrue(kanbanWaiting(parked));
+      assert.strictEqual(parked.workThreadId, thread);
+      const sent = fake.messages(thread).length;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      for (let turn = 0; turn < 4; turn += 1) {
+        yield* TestClock.adjust("30 seconds");
+        yield* kanban.tick;
+      }
+      const detail = yield* now;
+      assert.strictEqual(detail.card.stage, "todo");
+      assert.isNull(detail.card.stalled);
+      assert.isUndefined(detail.card.retries);
+      assert.isTrue(kanbanWaiting(detail.card));
+      assert.lengthOf(fake.messages(thread), sent);
+      assert.isFalse(
+        detail.events.some(
+          (event) => event.kind === "flagged" || event.body?.startsWith("Run failed"),
+        ),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card held for its retry, with no wait, is invisible to the wait pass", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      const held = yield* now;
+      for (let turn = 0; turn < 2; turn += 1) {
+        yield* TestClock.adjust("20 seconds");
+        yield* kanban.tick;
+      }
+      let detail = yield* now;
+      // The wait pass wrote nothing: no wait, no wait event, the card as the retry left it.
+      assert.deepStrictEqual(detail.card, held.card);
+      assert.lengthOf(detail.events, held.events.length);
+      assert.isUndefined(detail.card.wait);
+      assert.isFalse(kanbanWaiting(detail.card));
+      assert.isFalse(detail.events.some((event) => /^wait/i.test(event.body ?? "")));
+      // And it does not keep the retry from starting.
+      yield* pastBackoff;
+      yield* kanban.tick;
+      detail = yield* now;
+      assert.strictEqual(detail.card.stage, "working");
+      assert.strictEqual(detail.card.activeThreadId, thread);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "a card held for its retry and parked on a wait: the wait holds it, then the retry runs",
+  () =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now } = yield* workingCard;
+        fake.fail(thread);
+        yield* kanban.turnEnded(thread);
+        yield* kanban.waitCard(
+          card.id,
+          { on: "time", until: iso(START + HOUR), note: "provider maintenance window" },
+          owner,
+        );
+        const sent = fake.messages(thread).length;
+
+        // The backoff is long over; the wait still holds the card.
+        yield* TestClock.adjust("30 minutes");
+        yield* kanban.tick;
+        let detail = yield* now;
+        assert.strictEqual(detail.card.stage, "todo");
+        assert.isNull(detail.card.stalled);
+        assert.isTrue(kanbanWaiting(detail.card));
+        assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+        assert.lengthOf(fake.messages(thread), sent);
+
+        // The wait ends: the same thread is woken, told about both.
+        yield* TestClock.adjust("31 minutes");
+        yield* kanban.tick;
+        detail = yield* now;
+        assert.strictEqual(detail.card.stage, "working");
+        assert.strictEqual(detail.card.activeThreadId, thread);
+        assert.isUndefined(detail.card.wait);
+        assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+        const wake = fake.messages(thread).at(-1) ?? "";
+        assert.include(wake, 'Your last run on this card failed: "upstream closed the stream"');
+        assert.include(wake, "provider maintenance window");
+
+        // It was still the card's one retry: the next failure flags.
+        fake.fail(thread, { message: "upstream closed the stream again" });
+        yield* kanban.turnEnded(thread);
+        assert.strictEqual(
+          (yield* now).card.stalled?.reason,
+          "Run failed: upstream closed the stream again",
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("failures a retry can't help are flagged at once", () =>
