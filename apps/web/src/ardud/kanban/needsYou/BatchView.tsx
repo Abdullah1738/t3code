@@ -29,10 +29,13 @@ export function BatchView(props: {
   onLeave: () => void;
 }) {
   const plan = planAskBatch(props.entries);
-  const included = plan.included.slice(0, ASK_BATCH_MAX);
-  const over = plan.included.length - included.length;
+  const offered = plan.included.slice(0, ASK_BATCH_MAX);
+  const over = plan.included.length - offered.length;
+  // Every ask is in until he unticks it.
+  const [left, setLeft] = useState<ReadonlySet<string>>(new Set());
+  const included = offered.filter((entry) => !left.has(askKey(entry)));
   const count = included.length;
-  const first = included[0];
+  const first = offered[0];
   const response = first ? kanbanAskResponse(first.ask) : null;
   const shape = plan.shape?.split(":")[0] ?? null;
   const [optionIds, setOptionIds] = useState<ReadonlyArray<string>>([]);
@@ -45,7 +48,14 @@ export function BatchView(props: {
   const approve = labels.size === 1 ? (response?.verdict?.approve ?? "Approve") : "Approve";
   const rejects = new Set(included.map((entry) => kanbanAskResponse(entry.ask).verdict?.reject));
   const reject = rejects.size === 1 ? (response?.verdict?.reject ?? "Reject") : "Reject";
-  const all = count === 2 ? "both" : `all ${count}`;
+  const all =
+    count === 1
+      ? "this one"
+      : count < offered.length
+        ? `these ${count}`
+        : count === 2
+          ? "both"
+          : `all ${count}`;
 
   const send = (intent: "primary" | "refuse") => {
     if (count === 0 || shape === null) return;
@@ -86,7 +96,7 @@ export function BatchView(props: {
   const snooze = () => {
     const until = tomorrowMorning();
     props.onLeave();
-    void snoozeAsks(props.entries.slice(0, ASK_BATCH_MAX), until.iso, until.label);
+    void snoozeAsks(included.length > 0 ? included : offered, until.iso, until.label);
   };
 
   useImperativeHandle(props.handle, () => ({
@@ -131,12 +141,30 @@ export function BatchView(props: {
             </h2>
           </header>
 
-          {count > 0 ? (
+          {offered.length > 0 ? (
             <section aria-label="Answered together">
               <Label className="mb-2">
-                One answer goes to {count === 2 ? "both" : `these ${count}`}
+                {count === 0
+                  ? "Tick the ones to answer"
+                  : `One answer goes to ${count === 1 ? "this one" : count === 2 ? "both" : `these ${count}`}`}
               </Label>
-              <AskList entries={included} onOpenAsk={props.onOpenAsk} />
+              <AskList
+                entries={offered}
+                left={left}
+                onToggle={(key) =>
+                  setLeft((current) => {
+                    const next = new Set(current);
+                    if (!next.delete(key)) next.add(key);
+                    return next;
+                  })
+                }
+                onToggleAll={() =>
+                  setLeft(
+                    left.size === 0 ? new Set(offered.map((entry) => askKey(entry))) : new Set(),
+                  )
+                }
+                onOpenAsk={props.onOpenAsk}
+              />
               {over > 0 ? (
                 <p className="mt-2 text-sm text-(--m-muted)">
                   {over} more stay in the queue: one answer takes {ASK_BATCH_MAX} at most.
@@ -191,7 +219,7 @@ export function BatchView(props: {
                         "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
                         checked
                           ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
-                          : "ring-(--m-bar-2) hover:bg-(--m-surface)",
+                          : "ring-(--ny-edge) hover:bg-(--m-surface)",
                       )}
                     >
                       <Key className="mt-0.5">{index + 1}</Key>
@@ -274,15 +302,45 @@ export function BatchView(props: {
   );
 }
 
+const tick =
+  "size-4 shrink-0 translate-y-0.5 accent-(--m-accent) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
+
 function AskList(props: {
   entries: ReadonlyArray<KanbanAskFeedItem>;
   why?: ReadonlyArray<string>;
+  /** With these, each row has a tick box: the asks he took out of the answer. */
+  left?: ReadonlySet<string>;
+  onToggle?: (key: string) => void;
+  onToggleAll?: () => void;
   onOpenAsk: (key: string) => void;
 }) {
+  const { left, onToggle } = props;
   return (
     <ul className="flex flex-col divide-y divide-(--m-rule) rounded-xl ring-1 ring-(--m-rule)">
+      {left && props.onToggleAll && props.entries.length > 1 ? (
+        <li className="px-3.5 py-2 text-sm">
+          <label className="flex items-baseline gap-3 pointer-coarse:min-h-8">
+            <input
+              type="checkbox"
+              className={tick}
+              checked={left.size === 0}
+              onChange={props.onToggleAll}
+            />
+            Select all
+          </label>
+        </li>
+      ) : null}
       {props.entries.map((entry, index) => (
         <li key={askKey(entry)} className="flex min-w-0 items-baseline gap-3 px-3.5 py-2.5 text-sm">
+          {left && onToggle ? (
+            <input
+              type="checkbox"
+              className={tick}
+              aria-label={`Answer #${entry.cardNumber} with the rest`}
+              checked={!left.has(askKey(entry))}
+              onChange={() => onToggle(askKey(entry))}
+            />
+          ) : null}
           <button
             type="button"
             onClick={() => props.onOpenAsk(askKey(entry))}
@@ -294,6 +352,14 @@ function AskList(props: {
             <span className="block [overflow-wrap:anywhere]">
               {entry.ask.title ?? entry.ask.text}
             </span>
+            {entry.ask.action?.command ? (
+              <code
+                translate="no"
+                className="mt-0.5 block font-mono text-xs text-(--m-muted) [overflow-wrap:anywhere]"
+              >
+                {entry.ask.action.command}
+              </code>
+            ) : null}
             {props.why?.[index] ? (
               <span className="block text-(--m-muted)">{props.why[index]}</span>
             ) : null}

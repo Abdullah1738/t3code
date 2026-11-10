@@ -19,7 +19,7 @@ export function ShortcutsSheet(props: { open: boolean; onClose: () => void }) {
           aria-hidden
           className={cn(
             "flex h-5.5 w-9.5 shrink-0 items-center rounded-full p-0.5 transition-colors duration-150",
-            singleKeys ? "bg-(--m-accent)" : "bg-(--m-bar-2)",
+            singleKeys ? "bg-(--m-accent)" : "bg-(--ny-edge)",
           )}
         >
           <span

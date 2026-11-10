@@ -7,6 +7,12 @@
   --ny-posband: color-mix(in oklab, var(--m-positive) 12%, var(--m-ground));
   --ny-warnband: color-mix(in oklab, var(--m-warning) 13%, var(--m-ground));
   --ny-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  /* The edge of a control (a field, an option, an off switch): 3:1 or more on the ground. */
+  --ny-edge: var(--m-bar-2);
+}
+
+.dark {
+  --ny-edge: color-mix(in oklab, var(--m-text) 45%, var(--m-ground));
 }
 
 html[data-theme-id="desk"] {

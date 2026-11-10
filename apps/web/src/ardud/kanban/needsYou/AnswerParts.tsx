@@ -128,7 +128,7 @@ export function OptionList(props: {
                 "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
                 checked
                   ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
-                  : "ring-(--m-bar-2) hover:bg-(--m-surface)",
+                  : "ring-(--ny-edge) hover:bg-(--m-surface)",
                 blocked && !checked && "opacity-50",
               )}
             >
@@ -163,7 +163,7 @@ export function OptionList(props: {
               "relative grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-2 rounded-xl px-3.5 py-3 ring-1 ring-inset",
               own
                 ? "bg-(--m-band) ring-2 ring-(--m-accent)"
-                : "ring-(--m-bar-2) hover:bg-(--m-surface)",
+                : "ring-(--ny-edge) hover:bg-(--m-surface)",
             )}
           >
             <Key className="mt-0.5">{choose.options.length + 1}</Key>

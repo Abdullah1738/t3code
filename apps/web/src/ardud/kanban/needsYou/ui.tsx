@@ -144,7 +144,7 @@ export function FilterChip({
 
 /** Classes for a text input, textarea or select. */
 export const fieldClass =
-  "block w-full min-w-0 rounded-xl bg-(--m-ground) px-3 py-2 text-sm leading-5 text-(--m-text) ring-1 ring-inset ring-(--m-bar-2) outline-none placeholder:text-(--m-muted) focus:ring-2 focus:ring-(--m-accent) aria-invalid:ring-(--m-negative) pointer-coarse:text-base";
+  "block w-full min-w-0 rounded-xl bg-(--m-ground) px-3 py-2 text-sm leading-5 text-(--m-text) ring-1 ring-inset ring-(--ny-edge) outline-none placeholder:text-(--m-muted) focus:ring-2 focus:ring-(--m-accent) aria-invalid:ring-(--m-negative) pointer-coarse:text-base";
 
 /** A quiet text link. */
 export const linkClass =

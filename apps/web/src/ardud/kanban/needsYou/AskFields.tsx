@@ -150,7 +150,7 @@ export function FieldRow(props: {
             aria-hidden
             className={cn(
               "flex h-5.5 w-9.5 shrink-0 items-center rounded-full p-0.5 transition-colors duration-150",
-              value === true ? "bg-(--m-accent)" : "bg-(--m-bar-2)",
+              value === true ? "bg-(--m-accent)" : "bg-(--ny-edge)",
             )}
           >
             <span
@@ -255,7 +255,7 @@ const pillChoice = (checked: boolean) =>
     "inline-flex h-8.5 min-w-0 items-center gap-1.5 rounded-full px-3.5 text-sm outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent) disabled:opacity-50 pointer-coarse:h-11 pointer-coarse:text-base",
     checked
       ? "bg-(--m-band) font-medium text-(--m-accent-text) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
-      : "ring-(--m-bar-2) hover:bg-(--m-surface)",
+      : "ring-(--ny-edge) hover:bg-(--m-surface)",
   );
 
 /** A few options are shown as pills; a long list folds into a menu. */
@@ -383,7 +383,7 @@ function RankControl(props: {
           <li
             key={id}
             className={cn(
-              "flex min-w-0 items-center gap-2 rounded-xl py-1.5 ps-1.5 pe-1.5 ring-1 ring-inset ring-(--m-bar-2)",
+              "flex min-w-0 items-center gap-2 rounded-xl py-1.5 ps-1.5 pe-1.5 ring-1 ring-inset ring-(--ny-edge)",
               dragging === id ? "bg-(--m-band) ring-(--m-accent)" : "bg-(--m-ground)",
             )}
           >
