@@ -177,7 +177,8 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
     for (const ask of card.asks) {
       if (ask.closedAt === null && card.settledAt !== null) continue;
       const own = thread.filter(
-        (message) => message.askId === ask.id || (message.askId === undefined && message.seq === ask.seq),
+        (message) =>
+          message.askId === ask.id || (message.askId === undefined && message.seq === ask.seq),
       );
       const item: KanbanAskFeedItem = {
         boardId: card.boardId,
@@ -197,9 +198,7 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
         waitsOn: kanbanAskWaitsOn(ask),
         expired: ask.closedAt === null && kanbanAskExpired(ask, nowMs),
         messages:
-          own.length > ASK_MESSAGES_MAX + 1
-            ? [own[0]!, ...own.slice(-ASK_MESSAGES_MAX)]
-            : own,
+          own.length > ASK_MESSAGES_MAX + 1 ? [own[0]!, ...own.slice(-ASK_MESSAGES_MAX)] : own,
       };
       (ask.closedAt === null ? open : closed).push(item);
     }

@@ -27,7 +27,11 @@ const cardJson = (number: number, boardId: string) => {
     subtasks: [],
     subtaskSeq: 0,
     // The card after an asking card is unfinished and waits on it; other odd cards are done.
-    stage: open ? "needs_owner" : number % 2 === 0 || number % OPEN_EVERY === 1 ? "todo" : "verified",
+    stage: open
+      ? "needs_owner"
+      : number % 2 === 0 || number % OPEN_EVERY === 1
+        ? "todo"
+        : "verified",
     priority: 3,
     goalId: null,
     projects: [],
@@ -133,7 +137,11 @@ it.effect("reads the open asks of a 3,700-card board without decoding the board"
     assert.strictEqual(all.value.open.at(-1)!.cardRef, "other:100");
 
     const history = yield* timed(
-      readAskFeed(sql, { boardId: "board-big" as never, closedSince: "2026-11-10T09:00:00.000Z" }, AT),
+      readAskFeed(
+        sql,
+        { boardId: "board-big" as never, closedSince: "2026-11-10T09:00:00.000Z" },
+        AT,
+      ),
     );
     assert.strictEqual(history.value.open.length, CARDS / OPEN_EVERY);
     assert.strictEqual(history.value.closed.length, Math.floor(CARDS / 30));

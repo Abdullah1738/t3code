@@ -135,7 +135,11 @@ const setup = Effect.gen(function* () {
     defaultProjectId: ProjectId.make("project-1"),
   });
   yield* kanban.setPool(board.id, board.defaultCardModel, 1);
-  const card = yield* kanban.createCard(board.id, { prompt: "Long prompt text", title: "A" }, owner);
+  const card = yield* kanban.createCard(
+    board.id,
+    { prompt: "Long prompt text", title: "A" },
+    owner,
+  );
   return { kanban, board, card };
 });
 
@@ -147,11 +151,20 @@ it.effect("card_ask takes a template with blocks and answers with a small summar
       question: "Replace the tool description?",
       title: "card_get description",
       context: "The old one never says it returns history.",
-      change: { label: "card_get description", before: "One card.", after: "One card with its history." },
+      change: {
+        label: "card_get description",
+        before: "One card.",
+        after: "One card with its history.",
+      },
       batchKey: "tool-texts",
       blocks: [
         { _tag: "md", text: "Before and after, side by side" },
-        { _tag: "html", html: "<table><tr><td>old</td><td>new</td></tr></table>", title: "Diff", height: 200 },
+        {
+          _tag: "html",
+          html: "<table><tr><td>old</td><td>new</td></tr></table>",
+          title: "Diff",
+          height: 200,
+        },
         { _tag: "image", url: "https://example.com/diff.png", alt: "The diff as a picture" },
       ],
     });
@@ -194,7 +207,9 @@ it.effect("card_ask takes a template with blocks and answers with a small summar
     const pick = yield* call(evaluator, "card_ask", {
       card: card.id,
       question: "Pick?",
-      blocks: [{ _tag: "choice", id: "c", style: "pick", question: "?", options: [], multi: false }],
+      blocks: [
+        { _tag: "choice", id: "c", style: "pick", question: "?", options: [], multi: false },
+      ],
     });
     assert.isTrue(pick.isError);
     assert.include(pick.text, "put the answers in options");
@@ -202,63 +217,81 @@ it.effect("card_ask takes a template with blocks and answers with a small summar
   }).pipe(Effect.provide(testLayer())),
 );
 
-it.effect("card_ask_change edits an open ask, and its action is an operation or an action body", () =>
-  Effect.gen(function* () {
-    const { kanban, card } = yield* setup;
-    yield* call(evaluator, "card_ask", {
-      card: card.id,
-      question: "Deploy?",
-      action: { summary: "Deploy build 41", command: "make deploy" },
-    });
-    const edited = yield* call(evaluator, "card_ask_change", {
-      card: card.id,
-      ask: "q1",
-      action: { summary: "Deploy build 42", command: "make deploy", undo: "make rollback" },
-      basis: "build 42",
-      revisionNote: "Newer build",
-    });
-    assert.isFalse(edited.isError, edited.text);
-    assert.deepStrictEqual(edited.structured.card.ask, {
-      id: "q1",
-      kind: "action",
-      revision: 1,
-      blocking: false,
-      open: true,
-      blocks: 0,
-    });
-    const ask = (yield* kanban.card(card.id)).card.asks[0]!;
-    assert.strictEqual(ask.action?.summary, "Deploy build 42");
-    assert.strictEqual(ask.revisionNote, "Newer build");
+it.effect(
+  "card_ask_change edits an open ask, and its action is an operation or an action body",
+  () =>
+    Effect.gen(function* () {
+      const { kanban, card } = yield* setup;
+      yield* call(evaluator, "card_ask", {
+        card: card.id,
+        question: "Deploy?",
+        action: { summary: "Deploy build 41", command: "make deploy" },
+      });
+      const edited = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        action: { summary: "Deploy build 42", command: "make deploy", undo: "make rollback" },
+        basis: "build 42",
+        revisionNote: "Newer build",
+      });
+      assert.isFalse(edited.isError, edited.text);
+      assert.deepStrictEqual(edited.structured.card.ask, {
+        id: "q1",
+        kind: "action",
+        revision: 1,
+        blocking: false,
+        open: true,
+        blocks: 0,
+      });
+      const ask = (yield* kanban.card(card.id)).card.asks[0]!;
+      assert.strictEqual(ask.action?.summary, "Deploy build 42");
+      assert.strictEqual(ask.revisionNote, "Newer build");
 
-    const nothing = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1" });
-    assert.isTrue(nothing.isError);
-    assert.include(nothing.text, "Pass the fields to change, or an action.");
-    const async = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1", blocking: false });
-    assert.isTrue(async.isError);
-    assert.include(async.text, "can't be made async");
+      const nothing = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1" });
+      assert.isTrue(nothing.isError);
+      assert.include(nothing.text, "Pass the fields to change, or an action.");
+      const async = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        blocking: false,
+      });
+      assert.isTrue(async.isError);
+      assert.include(async.text, "can't be made async");
 
-    // Edit and block in one call, then the old operations.
-    const blocked = yield* call(evaluator, "card_ask_change", {
-      card: card.id,
-      ask: "q1",
-      title: "Deploy go",
-      blocking: true,
-    });
-    assert.isFalse(blocked.isError, blocked.text);
-    assert.deepStrictEqual(
-      [blocked.structured.card.stage, blocked.structured.card.ask.blocking, blocked.structured.card.ask.revision],
-      ["needs_owner", true, 2],
-    );
-    const dropped = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1", action: "drop" });
-    assert.isFalse(dropped.isError, dropped.text);
-    assert.isFalse(dropped.structured.card.ask.open);
-    assert.strictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.verdict, "dropped");
+      // Edit and block in one call, then the old operations.
+      const blocked = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        title: "Deploy go",
+        blocking: true,
+      });
+      assert.isFalse(blocked.isError, blocked.text);
+      assert.deepStrictEqual(
+        [
+          blocked.structured.card.stage,
+          blocked.structured.card.ask.blocking,
+          blocked.structured.card.ask.revision,
+        ],
+        ["needs_owner", true, 2],
+      );
+      const dropped = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        action: "drop",
+      });
+      assert.isFalse(dropped.isError, dropped.text);
+      assert.isFalse(dropped.structured.card.ask.open);
+      assert.strictEqual((yield* kanban.card(card.id)).card.asks[0]!.answer?.verdict, "dropped");
 
-    yield* call(evaluator, "card_ask", { card: card.id, question: "Later?" });
-    const operation = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q2", action: "block" });
-    assert.isFalse(operation.isError, operation.text);
-    assert.isTrue(operation.structured.card.ask.blocking);
-  }).pipe(Effect.provide(testLayer())),
+      yield* call(evaluator, "card_ask", { card: card.id, question: "Later?" });
+      const operation = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q2",
+        action: "block",
+      });
+      assert.isFalse(operation.isError, operation.text);
+      assert.isTrue(operation.structured.card.ask.blocking);
+    }).pipe(Effect.provide(testLayer())),
 );
 
 it.effect("discussion_post with ask replies on the ask without closing it", () =>
@@ -285,7 +318,11 @@ it.effect("discussion_post with ask replies on the ask without closing it", () =
     assert.strictEqual(kanbanAskWaitsOn(after.asks[0]!), "owner");
     assert.strictEqual(after.stage, "needs_owner");
 
-    const missing = yield* call(evaluator, "discussion_post", { card: card.id, ask: "q7", text: "Hi" });
+    const missing = yield* call(evaluator, "discussion_post", {
+      card: card.id,
+      ask: "q7",
+      text: "Hi",
+    });
     assert.isTrue(missing.isError);
     assert.include(missing.text, "open ask q7");
   }).pipe(Effect.provide(testLayer())),
@@ -305,12 +342,20 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
     const fromWorker = yield* call(worker, "card_ask_answer", { ask: "q1", verdict: "approved" });
     assert.isTrue(fromWorker.isError);
     assert.include(fromWorker.text, "Only evaluators use this tool");
-    const notHanded = yield* call(evaluator, "card_ask_answer", { card: card.id, ask: "q1", verdict: "approved" });
+    const notHanded = yield* call(evaluator, "card_ask_answer", {
+      card: card.id,
+      ask: "q1",
+      verdict: "approved",
+    });
     assert.isTrue(notHanded.isError);
     assert.include(notHanded.text, "was not handed to the evaluator");
 
     yield* kanban.handAsk(card.id, "q1", "hand", owner);
-    const returned = yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1", action: "return" });
+    const returned = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: "return",
+    });
     assert.isFalse(returned.isError, returned.text);
     assert.isUndefined(returned.structured.card.ask.handed);
     const workerReturn = yield* call(worker, "card_ask_change", { ask: "q1", action: "return" });
@@ -336,7 +381,16 @@ it.effect("card_ask_answer is for evaluators and for asks the owner handed over"
 
 it("the card_ask description teaches the five templates and blocks, and stays short", () => {
   const description = KanbanToolkit.tools.card_ask.description ?? "";
-  for (const word of ["question", "decision", "draft", "action", "change", "blocks", "html", "alt text"]) {
+  for (const word of [
+    "question",
+    "decision",
+    "draft",
+    "action",
+    "change",
+    "blocks",
+    "html",
+    "alt text",
+  ]) {
     assert.include(description, word);
   }
   assert.isBelow(description.length, 1_800);

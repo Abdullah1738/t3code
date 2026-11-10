@@ -336,7 +336,10 @@ const CardAskChange = tool(
     ask: Schema.String,
     question: Schema.optional(Schema.String),
     blocking: Schema.optional(
-      describe(Schema.Boolean, "true makes an async ask blocking. A blocking ask can't be made async."),
+      describe(
+        Schema.Boolean,
+        "true makes an async ask blocking. A blocking ask can't be made async.",
+      ),
     ),
     revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
     ...AskFieldsInput,
@@ -357,7 +360,7 @@ const CardAskChange = tool(
 const CardAskAnswer = tool(
   "card_ask_answer",
   "Decide a handed ask",
-  "Evaluators only: decide an ask the owner handed to you (you are told when he does). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it back with card_ask_change action \"return\" instead.",
+  'Evaluators only: decide an ask the owner handed to you (you are told when he does). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it back with card_ask_change action "return" instead.',
   {
     card: Schema.optional(CardRef),
     ask: Schema.String,
@@ -415,7 +418,10 @@ const DiscussionPost = tool(
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
     ask: Schema.optional(
-      describe(Schema.String, "An open ask on the card (q1, q2...) to reply on, without closing it."),
+      describe(
+        Schema.String,
+        "An open ask on the card (q1, q2...) to reply on, without closing it.",
+      ),
     ),
     ...BlocksInput,
   },

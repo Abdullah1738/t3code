@@ -24,11 +24,25 @@ const LATER = "2026-11-10T11:00:00.000Z";
 const ask = (fields: Asks.AskFieldsInput = {}, text = "Ship it?"): KanbanOwnerAsk => {
   const typed = Asks.askFields(fields);
   if (Asks.isAskProblem(typed)) throw new Error(typed.detail);
-  return { id: "q1", text, blocking: true, by: worker, at: AT as never, seq: 3, closedAt: null, ...typed };
+  return {
+    id: "q1",
+    text,
+    blocking: true,
+    by: worker,
+    at: AT as never,
+    seq: 3,
+    closedAt: null,
+    ...typed,
+  };
 };
 
 const card = (asks: ReadonlyArray<KanbanOwnerAsk>) =>
-  ({ id: KanbanCardId.make("card-1"), number: 12, stage: "needs_owner", asks }) as unknown as KanbanCard;
+  ({
+    id: KanbanCardId.make("card-1"),
+    number: 12,
+    stage: "needs_owner",
+    asks,
+  }) as unknown as KanbanCard;
 
 const problem = (value: unknown) => {
   if (!Asks.isAskProblem(value)) throw new Error("expected a problem");
@@ -94,7 +108,9 @@ describe("stored asks", () => {
   it("an ask can't hold a pick block", () => {
     const withPick = {
       ...old,
-      blocks: [{ _tag: "choice", id: "c1", style: "pick", question: "?", options: [], multi: false }],
+      blocks: [
+        { _tag: "choice", id: "c1", style: "pick", question: "?", options: [], multi: false },
+      ],
     };
     assert.throws(() => decode(withPick));
   });
@@ -115,11 +131,20 @@ describe("askFields", () => {
   });
 
   it("checks each kind for what it needs", () => {
-    assert.include(problem(Asks.askFields({ kind: "decision", options: ["Only"] })).detail, "two options");
+    assert.include(
+      problem(Asks.askFields({ kind: "decision", options: ["Only"] })).detail,
+      "two options",
+    );
     assert.include(problem(Asks.askFields({ kind: "draft" })).detail, "draft: { text }");
-    assert.include(problem(Asks.askFields({ kind: "draft", draft: { text: "  " } })).detail, "draft");
+    assert.include(
+      problem(Asks.askFields({ kind: "draft", draft: { text: "  " } })).detail,
+      "draft",
+    );
     assert.include(problem(Asks.askFields({ kind: "action" })).detail, "action: { summary }");
-    assert.include(problem(Asks.askFields({ kind: "change" })).detail, "change: { label, before, after }");
+    assert.include(
+      problem(Asks.askFields({ kind: "change" })).detail,
+      "change: { label, before, after }",
+    );
     assert.include(
       problem(Asks.askFields({ change: { label: "Rule", before: "same", after: "same" } })).detail,
       "differ",
@@ -130,12 +155,19 @@ describe("askFields", () => {
     );
     assert.strictEqual(mixed.code, "invalid");
     assert.include(mixed.detail, "can't carry action");
-    assert.include(problem(Asks.askFields({ kind: "question", draft: { text: "Hi" } })).detail, "draft");
+    assert.include(
+      problem(Asks.askFields({ kind: "question", draft: { text: "Hi" } })).detail,
+      "draft",
+    );
   });
 
   it("numbers options like the pick block always did and keeps given ids", () => {
     const fields = Asks.askFields({
-      options: ["Yes", "  ", { id: "later", label: " Later ", detail: "Waits a day", recommended: true }],
+      options: [
+        "Yes",
+        "  ",
+        { id: "later", label: " Later ", detail: "Waits a day", recommended: true },
+      ],
       multi: true,
     });
     if (Asks.isAskProblem(fields)) throw new Error(fields.detail);
@@ -145,21 +177,34 @@ describe("askFields", () => {
     ]);
     assert.strictEqual(fields.multi, true);
     assert.include(
-      problem(Asks.askFields({ options: [{ id: "x", label: "A" }, { id: "x", label: "B" }] })).detail,
+      problem(
+        Asks.askFields({
+          options: [
+            { id: "x", label: "A" },
+            { id: "x", label: "B" },
+          ],
+        }),
+      ).detail,
       'option id "x" is used twice',
     );
   });
 
   it("caps sizes with a clear error", () => {
     const tooLong = (input: Asks.AskFieldsInput) => problem(Asks.askFields(input)).detail;
-    assert.include(tooLong({ context: "x".repeat(4_001) }), "context is at most 4000 characters (got 4001)");
+    assert.include(
+      tooLong({ context: "x".repeat(4_001) }),
+      "context is at most 4000 characters (got 4001)",
+    );
     assert.include(tooLong({ title: "x".repeat(201) }), "title is at most 200");
     assert.include(tooLong({ draft: { text: "x".repeat(20_001) } }), "draft text is at most 20000");
     assert.include(
       tooLong({ change: { label: "Rule", before: "x".repeat(20_001), after: "b" } }),
       "change before is at most 20000",
     );
-    assert.include(tooLong({ options: Array.from({ length: 13 }, (_, i) => `o${i}`) }), "at most 12 options");
+    assert.include(
+      tooLong({ options: Array.from({ length: 13 }, (_, i) => `o${i}`) }),
+      "at most 12 options",
+    );
     assert.include(tooLong({ expiresAt: "tomorrow" }), "expiresAt is not a time");
   });
 
@@ -178,7 +223,13 @@ describe("ask blocks", () => {
   });
   const file = (name: string): KanbanBlock => ({
     _tag: "attachment",
-    attachment: { type: "file", id: `kept-${name}`, name, mimeType: "application/pdf", sizeBytes: 10 },
+    attachment: {
+      type: "file",
+      id: `kept-${name}`,
+      name,
+      mimeType: "application/pdf",
+      sizeBytes: 10,
+    },
   });
 
   it("takes every block type but a pick", () => {
@@ -203,18 +254,23 @@ describe("ask blocks", () => {
   });
 
   it("refuses an oversized page, too many files and an image with no alt text", () => {
-    assert.include(Asks.askBlocksProblem([html(256 * 1024 + 1)])!.detail, "at most 256 KB (got 257 KB)");
+    assert.include(
+      Asks.askBlocksProblem([html(256 * 1024 + 1)])!.detail,
+      "at most 256 KB (got 257 KB)",
+    );
     assert.isUndefined(Asks.askBlocksProblem([html(256 * 1024)]));
     const files = Array.from({ length: 9 }, (_, i) => file(`f${i}.pdf`));
     assert.include(Asks.askBlocksProblem(files)!.detail, "at most 8 images and files (got 9)");
     assert.include(
-      Asks.askBlocksProblem(Array.from({ length: 13 }, () => ({ _tag: "md", text: "x" }) as KanbanBlock))!
-        .detail,
+      Asks.askBlocksProblem(
+        Array.from({ length: 13 }, () => ({ _tag: "md", text: "x" }) as KanbanBlock),
+      )!.detail,
       "at most 12 blocks",
     );
     assert.include(
-      Asks.askBlocksProblem([{ _tag: "image", url: "https://example.com/a.png" as never, alt: null }])!
-        .detail,
+      Asks.askBlocksProblem([
+        { _tag: "image", url: "https://example.com/a.png" as never, alt: null },
+      ])!.detail,
       "needs alt text",
     );
     assert.include(
@@ -255,7 +311,15 @@ describe("askBlocks", () => {
     const legacy = Asks.askBlocks(ask(), ["A", " ", "B"], true);
     assert.deepStrictEqual(
       legacy.map((block) => (block._tag === "choice" ? [block.options, block.multi] : null)),
-      [[[{ id: "o1", label: "A" }, { id: "o2", label: "B" }], true]],
+      [
+        [
+          [
+            { id: "o1", label: "A" },
+            { id: "o2", label: "B" },
+          ],
+          true,
+        ],
+      ],
     );
   });
 
@@ -272,7 +336,13 @@ describe("askBlocks", () => {
     const [detail, pick] = blocks;
     assert.strictEqual(detail?._tag, "md");
     const text = detail?._tag === "md" ? detail.text : "";
-    for (const part of ["**PR comment**", "The reviewer asked why.", "comment on PR #512", "Because.", "head abc123"]) {
+    for (const part of [
+      "**PR comment**",
+      "The reviewer asked why.",
+      "comment on PR #512",
+      "Because.",
+      "head abc123",
+    ]) {
       assert.include(text, part);
     }
     assert.deepStrictEqual(pick?._tag === "choice" ? pick.options : [], [
@@ -284,7 +354,10 @@ describe("askBlocks", () => {
 
 describe("answerFor and answerText", () => {
   const draftAsk = ask(
-    { title: "PR comment", draft: { text: "Thanks, fixed in abc123.", target: "comment on PR #512" } },
+    {
+      title: "PR comment",
+      draft: { text: "Thanks, fixed in abc123.", target: "comment on PR #512" },
+    },
     "Post this reply?",
   );
 
@@ -321,7 +394,13 @@ describe("answerFor and answerText", () => {
 
   it("an untouched draft says so, and trailing whitespace is not an edit", () => {
     for (const finalDraft of [undefined, "Thanks, fixed in abc123.\n"]) {
-      const answer = Asks.answerFor(card([draftAsk]), draftAsk, { verdict: "approved", finalDraft }, owner, LATER);
+      const answer = Asks.answerFor(
+        card([draftAsk]),
+        draftAsk,
+        { verdict: "approved", finalDraft },
+        owner,
+        LATER,
+      );
       if (Asks.isAskProblem(answer)) throw new Error(answer.detail);
       assert.strictEqual(answer.draftEdited, false);
       assert.strictEqual(
@@ -332,7 +411,13 @@ describe("answerFor and answerText", () => {
   });
 
   it("a rejection says not to go ahead and never carries a text to post", () => {
-    const answer = Asks.answerFor(card([draftAsk]), draftAsk, { verdict: "rejected", note: "Too curt." }, owner, LATER);
+    const answer = Asks.answerFor(
+      card([draftAsk]),
+      draftAsk,
+      { verdict: "rejected", note: "Too curt." },
+      owner,
+      LATER,
+    );
     if (Asks.isAskProblem(answer)) throw new Error(answer.detail);
     const text = Asks.answerText(card([draftAsk]), draftAsk, answer);
     assert.strictEqual(
@@ -342,11 +427,25 @@ describe("answerFor and answerText", () => {
   });
 
   it("a pick names the labels after the note, and his own words come first", () => {
-    const pickAsk = ask({ options: [{ id: "a", label: "Tonight" }, { id: "b", label: "Tomorrow" }], multi: true }, "When?");
+    const pickAsk = ask(
+      {
+        options: [
+          { id: "a", label: "Tonight" },
+          { id: "b", label: "Tomorrow" },
+        ],
+        multi: true,
+      },
+      "When?",
+    );
     const answer = Asks.answerFor(
       card([pickAsk]),
       pickAsk,
-      { verdict: "picked", optionIds: ["b", "a"], text: "Either works.", note: "Not during the demo." },
+      {
+        verdict: "picked",
+        optionIds: ["b", "a"],
+        text: "Either works.",
+        note: "Not during the demo.",
+      },
       owner,
       LATER,
     );
@@ -367,32 +466,58 @@ describe("answerFor and answerText", () => {
     const detail = (input: Asks.AskAnswerInput, on = pickAsk) =>
       problem(Asks.answerFor(card([on]), on, input, owner, LATER)).detail;
     assert.include(detail({ verdict: "picked" }), "needs optionIds");
-    assert.include(detail({ verdict: "picked", optionIds: ["zz"] }), 'no option "zz" (it has o1, o2)');
+    assert.include(
+      detail({ verdict: "picked", optionIds: ["zz"] }),
+      'no option "zz" (it has o1, o2)',
+    );
     assert.include(detail({ verdict: "picked", optionIds: ["o1", "o2"] }), "takes one option");
     assert.include(detail({ verdict: "answered" }), "needs text");
     assert.include(detail({ verdict: "approved", finalDraft: "x" }), "has no draft");
-    assert.include(detail({ verdict: "approved", finalDraft: "  " }, draftAsk), "reject the draft instead");
-    assert.include(detail({ verdict: "approved", note: "x".repeat(4_001) }), "note is at most 4000");
+    assert.include(
+      detail({ verdict: "approved", finalDraft: "  " }, draftAsk),
+      "reject the draft instead",
+    );
+    assert.include(
+      detail({ verdict: "approved", note: "x".repeat(4_001) }),
+      "note is at most 4000",
+    );
   });
 
   it("a stale ask conflicts: revised since it was read, or past its expiry", () => {
     const revised = Asks.reviseAsk(pickable(), { context: "More detail." }, LATER);
     if (Asks.isAskProblem(revised)) throw new Error(revised.detail);
     const stale = problem(
-      Asks.answerFor(card([revised]), revised, { verdict: "picked", optionIds: ["o1"], revision: 0 }, owner, LATER),
+      Asks.answerFor(
+        card([revised]),
+        revised,
+        { verdict: "picked", optionIds: ["o1"], revision: 0 },
+        owner,
+        LATER,
+      ),
     );
     assert.strictEqual(stale.code, "conflict");
-    assert.include(stale.detail, "was updated since you read it (revision 1, you answered revision 0)");
+    assert.include(
+      stale.detail,
+      "was updated since you read it (revision 1, you answered revision 0)",
+    );
     assert.isFalse(
       Asks.isAskProblem(
-        Asks.answerFor(card([revised]), revised, { verdict: "picked", optionIds: ["o1"], revision: 1 }, owner, LATER),
+        Asks.answerFor(
+          card([revised]),
+          revised,
+          { verdict: "picked", optionIds: ["o1"], revision: 1 },
+          owner,
+          LATER,
+        ),
       ),
     );
 
     const expiring = ask({ action: { summary: "Deploy" }, basis: "head abc123", expiresAt: LATER });
     const before = Asks.answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, AT);
     assert.isFalse(Asks.isAskProblem(before));
-    const expired = problem(Asks.answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, LATER));
+    const expired = problem(
+      Asks.answerFor(card([expiring]), expiring, { verdict: "approved" }, owner, LATER),
+    );
     assert.strictEqual(expired.code, "conflict");
     assert.include(expired.detail, "expired at 2026-11-10T11:00:00.000Z");
     assert.include(expired.detail, "head abc123");
@@ -406,7 +531,13 @@ describe("answerFor and answerText", () => {
 
   it("an evaluator's decision on a handed ask is recorded as handed, with what it decided", () => {
     const handed = { ...pickable(), handedAt: AT as never };
-    const answer = Asks.answerFor(card([handed]), handed, { verdict: "picked", optionIds: ["o2"], note: "Cheaper." }, evaluator, LATER);
+    const answer = Asks.answerFor(
+      card([handed]),
+      handed,
+      { verdict: "picked", optionIds: ["o2"], note: "Cheaper." },
+      evaluator,
+      LATER,
+    );
     if (Asks.isAskProblem(answer)) throw new Error(answer.detail);
     assert.strictEqual(answer.verdict, "handed");
     assert.strictEqual(answer.decision, "picked");
@@ -423,11 +554,26 @@ describe("answerFor and answerText", () => {
   });
 
   it("shows the answer on the pick block for clients that only read the discussion", () => {
-    const approve = Asks.answerFor(card([draftAsk]), draftAsk, { verdict: "approved", note: "ok" }, owner, LATER);
+    const approve = Asks.answerFor(
+      card([draftAsk]),
+      draftAsk,
+      { verdict: "approved", note: "ok" },
+      owner,
+      LATER,
+    );
     if (Asks.isAskProblem(approve)) throw new Error(approve.detail);
-    assert.deepStrictEqual(Asks.blockAnswer(draftAsk, approve), { choice: ["approve"], text: "ok" });
+    assert.deepStrictEqual(Asks.blockAnswer(draftAsk, approve), {
+      choice: ["approve"],
+      text: "ok",
+    });
     const plain = ask();
-    const words = Asks.answerFor(card([plain]), plain, { verdict: "answered", text: "Friday" }, owner, LATER);
+    const words = Asks.answerFor(
+      card([plain]),
+      plain,
+      { verdict: "answered", text: "Friday" },
+      owner,
+      LATER,
+    );
     if (Asks.isAskProblem(words)) throw new Error(words.detail);
     assert.deepStrictEqual(Asks.blockAnswer(plain, words), { choice: [], text: "Friday" });
   });
@@ -437,7 +583,10 @@ describe("answerFor and answerText", () => {
 
 describe("reviseAsk", () => {
   it("bumps the revision, records the note and gives the owner the turn back", () => {
-    const waiting = { ...ask({ options: ["A", "B"], context: "Old" }), clarifyAskedAt: AT as never };
+    const waiting = {
+      ...ask({ options: ["A", "B"], context: "Old" }),
+      clarifyAskedAt: AT as never,
+    };
     const revised = Asks.reviseAsk(
       waiting,
       { question: "Ship tonight?", context: "Clearer.", revisionNote: "Said what tonight means" },
@@ -451,8 +600,14 @@ describe("reviseAsk", () => {
     assert.strictEqual(revised.context, "Clearer.");
     assert.isUndefined(revised.clarifyAskedAt);
     // What the edit didn't name stays.
-    assert.deepStrictEqual(revised.options?.map((option) => option.label), ["A", "B"]);
-    assert.strictEqual(Asks.revisedLine(revised), "Updated q1 (revision 1): Said what tonight means");
+    assert.deepStrictEqual(
+      revised.options?.map((option) => option.label),
+      ["A", "B"],
+    );
+    assert.strictEqual(
+      Asks.revisedLine(revised),
+      "Updated q1 (revision 1): Said what tonight means",
+    );
     const again = Asks.reviseAsk(revised, { title: "Tonight" }, LATER);
     if (Asks.isAskProblem(again)) throw new Error(again.detail);
     assert.strictEqual(again.revision, 2);
@@ -461,9 +616,19 @@ describe("reviseAsk", () => {
 
   it("checks the edited ask for its kind, and a new body changes the kind", () => {
     const decision = ask({ options: ["A", "B"] });
-    assert.include(problem(Asks.reviseAsk(decision, { options: ["Only"] }, LATER)).detail, "two options");
-    assert.include(problem(Asks.reviseAsk(decision, { question: "  " }, LATER)).detail, "needs the question");
-    const drafted = Asks.reviseAsk(ask({ action: { summary: "Deploy" } }), { draft: { text: "Hi" } }, LATER);
+    assert.include(
+      problem(Asks.reviseAsk(decision, { options: ["Only"] }, LATER)).detail,
+      "two options",
+    );
+    assert.include(
+      problem(Asks.reviseAsk(decision, { question: "  " }, LATER)).detail,
+      "needs the question",
+    );
+    const drafted = Asks.reviseAsk(
+      ask({ action: { summary: "Deploy" } }),
+      { draft: { text: "Hi" } },
+      LATER,
+    );
     if (Asks.isAskProblem(drafted)) throw new Error(drafted.detail);
     assert.strictEqual(drafted.kind, "draft");
     assert.isUndefined(drafted.action);
@@ -501,7 +666,12 @@ describe("turns and closing", () => {
   it("closing stores the answer and ends anyone's turn", () => {
     const waiting = Asks.markClarify(card([ask()]), "q1", AT);
     const record = Asks.plainAnswer(owner, LATER, false);
-    const closed = Asks.closeAsks(waiting, LATER, () => true, () => record).asks[0]!;
+    const closed = Asks.closeAsks(
+      waiting,
+      LATER,
+      () => true,
+      () => record,
+    ).asks[0]!;
     assert.strictEqual(closed.closedAt, LATER);
     assert.deepStrictEqual(closed.answer, { verdict: "answered", by: owner, at: LATER });
     assert.isUndefined(closed.clarifyAskedAt);
@@ -512,20 +682,33 @@ describe("turns and closing", () => {
   });
 
   it("a clarifying reply tells the asker to reply and fix the ask, not to treat it as the answer", () => {
-    const text = Asks.clarifyText(card([ask({ title: "Go live" })]), ask({ title: "Go live" }), "Which env?", false);
+    const text = Asks.clarifyText(
+      card([ask({ title: "Go live" })]),
+      ask({ title: "Go live" }),
+      "Which env?",
+      false,
+    );
     assert.include(text, 'The owner replied on q1 on card #12 ("Go live") without answering it.');
     assert.include(text, "still holds the card");
     assert.include(text, "His message:\nWhich env?");
     assert.include(text, 'discussion_post (card #12, ask "q1")');
     assert.include(text, "card_ask_change");
     assert.include(text, "Don't treat his message as the answer.");
-    const passed = Asks.clarifyText(card([ask()]), ask({ options: ["A", "B"] }), "Which env?", true);
+    const passed = Asks.clarifyText(
+      card([ask()]),
+      ask({ options: ["A", "B"] }),
+      "Which env?",
+      true,
+    );
     assert.include(passed, "can't hear this");
     assert.include(passed, "Options: o1 = A; o2 = B");
   });
 
   it("a tool reply is a summary, never the card", () => {
-    const shown = { ...ask({ draft: { text: "Hi" } }), blocks: [{ _tag: "md" as const, text: "x" }] };
+    const shown = {
+      ...ask({ draft: { text: "Hi" } }),
+      blocks: [{ _tag: "md" as const, text: "x" }],
+    };
     assert.deepStrictEqual(Asks.askSummary(card([shown]), "q1"), {
       card: 12,
       stage: "needs_owner",

@@ -77,9 +77,6 @@ export const updateAsk = (
 export const openBlockingAsk = (card: KanbanCard) =>
   kanbanOpenAsks(card).findLast((ask) => ask.blocking);
 
-// ---------------------------------------------------------------------------
-// Typed asks: the five templates, their limits and per-kind checks.
-
 export const ASK_LIMITS = {
   title: 200,
   context: 4_000,
@@ -461,10 +458,7 @@ export const askFields = (input: AskFieldsInput): AskFields | AskProblem => {
     expiresAt: expiresAt as AskFields["expiresAt"],
     batchKey,
     // Whole here; `inlineBlocks` trims them once the ask's message holds them.
-    blocks:
-      blocks.length > 0
-        ? askOnly(blocks)
-        : undefined,
+    blocks: blocks.length > 0 ? askOnly(blocks) : undefined,
   });
 };
 
@@ -568,7 +562,11 @@ export const replaceAsk = (card: KanbanCard, next: KanbanOwnerAsk): KanbanCard =
 export const markClarify = (card: KanbanCard, askId: string, at: string): KanbanCard =>
   updateAsk(card, askId, { clarifyAskedAt: at as NonNullable<KanbanOwnerAsk["clarifyAskedAt"]> });
 
-const without = (card: KanbanCard, askId: string, key: "clarifyAskedAt" | "handedAt"): KanbanCard =>
+const without = (
+  card: KanbanCard,
+  askId: string,
+  key: "clarifyAskedAt" | "handedAt",
+): KanbanCard =>
   card.asks.some((ask) => ask.id === askId && ask[key] !== undefined)
     ? {
         ...card,
@@ -591,9 +589,6 @@ export const markHanded = (card: KanbanCard, askId: string, at: string): KanbanC
 
 export const clearHanded = (card: KanbanCard, askId: string): KanbanCard =>
   without(card, askId, "handedAt");
-
-// ---------------------------------------------------------------------------
-// How an ask reads in the card discussion.
 
 const APPROVAL_OPTIONS: ReadonlyArray<KanbanAskOption> = [
   { id: "approve" as KanbanAskOption["id"], label: "Approve" as KanbanAskOption["label"] },
@@ -685,9 +680,6 @@ export const askBlocks = (
   ];
 };
 
-// ---------------------------------------------------------------------------
-// Answering one ask.
-
 export type OwnerVerdict = "approved" | "rejected" | "picked" | "answered";
 export interface AskAnswerInput {
   readonly verdict: OwnerVerdict;
@@ -753,7 +745,8 @@ export const answerFor = (
   let draftEdited: boolean | undefined;
   if (input.finalDraft !== undefined) {
     if (ask.draft === undefined) return invalid(`${ref} has no draft`);
-    if (input.finalDraft.trim() === "") return invalid("finalDraft is empty: reject the draft instead");
+    if (input.finalDraft.trim() === "")
+      return invalid("finalDraft is empty: reject the draft instead");
     const long = tooLong("finalDraft", input.finalDraft, ASK_LIMITS.draft);
     if (long) return long;
     finalDraft = input.finalDraft;
@@ -847,9 +840,6 @@ export const plainAnswer = (by: KanbanActor, at: string, dropped: boolean): Kanb
   by,
   at: at as KanbanAskAnswer["at"],
 });
-
-// ---------------------------------------------------------------------------
-// Wake texts.
 
 /** For an evaluator passing on an answer whose asker can't hear it any more. */
 export const passOnText = (card: KanbanCard, ask: KanbanOwnerAsk, answer: string) =>

@@ -117,12 +117,7 @@ describe("needsYouItems", () => {
       list.entries.map((entry) =>
         entry._tag === "batch" ? [entry.batchKey, keys(entry.items)] : entry.item.key,
       ),
-    ).toEqual([
-      "card-2:q1",
-      ["deploy-go", ["card-3:q1", "card-1:q1"]],
-      "card-4:q1",
-      "card-5:q1",
-    ]);
+    ).toEqual(["card-2:q1", ["deploy-go", ["card-3:q1", "card-1:q1"]], "card-4:q1", "card-5:q1"]);
     expect(list.items.length).toBe(5);
     expect(keys(list.waitingOnAgent)).toEqual(["card-6:q1"]);
     expect(list.items.find((item) => item.key === "card-3:q1")?.kind).toBe("action");
@@ -133,10 +128,12 @@ describe("needsYouItems", () => {
       state([card(1, { asks: [ask("q1"), ask("q2", { kind: "draft", revision: 2 })] })]),
       NOW,
     );
-    expect(list.items.map((item) => [item.ask.id, item.kind, item.revision, item.updated])).toEqual([
-      ["q1", "question", 0, false],
-      ["q2", "draft", 2, true],
-    ]);
+    expect(list.items.map((item) => [item.ask.id, item.kind, item.revision, item.updated])).toEqual(
+      [
+        ["q1", "question", 0, false],
+        ["q2", "draft", 2, true],
+      ],
+    );
   });
 });
 

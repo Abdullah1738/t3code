@@ -7195,7 +7195,9 @@ const make = Effect.gen(function* () {
         }
         const discussion = yield* cardDiscussionUnlocked(card.id);
         const next = { ...Asks.markHanded(yield* cardOf(card.id), ask.id, at), updatedAt: at };
-        yield* logEvent(next, actor, "comment", { body: `Owner handed ${ask.id} to the evaluator` });
+        yield* logEvent(next, actor, "comment", {
+          body: `Owner handed ${ask.id} to the evaluator`,
+        });
         yield* saveCard(next);
         yield* toEvaluator(discussion, Asks.handText(next, ask));
         return next;
