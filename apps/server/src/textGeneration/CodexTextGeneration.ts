@@ -227,6 +227,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     modelSelection,
     attachments,
     investigate,
+    timeoutMs,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
     TextGenerationError,
@@ -362,20 +363,26 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       concurrency: "unbounded",
     }).pipe(Effect.asVoid);
 
+    const limitMs = TextGenerationOperations.requestTimeoutMs(
+      { investigate, timeoutMs },
+      CODEX_TIMEOUT_MS,
+    );
     return yield* Effect.gen(function* () {
-      yield* runCodexCommand().pipe(
-        Effect.scoped,
-        Effect.timeoutOption(investigate?.timeoutMs ?? CODEX_TIMEOUT_MS),
-        Effect.flatMap(
-          Option.match({
-            onNone: () =>
-              Effect.fail(
-                new TextGenerationError({ operation, detail: "Codex CLI request timed out." }),
-              ),
-            onSome: () => Effect.void,
-          }),
-        ),
-      );
+      const codexRun = runCodexCommand().pipe(Effect.scoped);
+      yield* limitMs === null
+        ? codexRun
+        : codexRun.pipe(
+            Effect.timeoutOption(limitMs),
+            Effect.flatMap(
+              Option.match({
+                onNone: () =>
+                  Effect.fail(
+                    new TextGenerationError({ operation, detail: "Codex CLI request timed out." }),
+                  ),
+                onSome: () => Effect.void,
+              }),
+            ),
+          );
 
       const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));
 
