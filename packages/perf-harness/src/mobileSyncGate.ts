@@ -15,10 +15,10 @@
  * - contended sync (what the owner's phone met on 10 Nov 2026): the phone syncs with its
  *   own user agent and a 20 s deadline per page while a desktop client pages the list in
  *   a loop (idle subagents omitted) and whole-list requests hold the snapshot reply lane,
- *   as board snapshots and control lists did live (7-45 s holds). The installed phone
- *   build starts again from page one when a page times out; a client built from this
- *   tree asks for the same page again with a longer deadline. Then foreground resumes
- *   15 s apart under the same load.
+ *   as board snapshots and control lists did live (7-45 s holds). A timed-out page is
+ *   asked for again with a longer deadline, or with ROBOB_PERF_PHONE_RESTARTS=1 the load
+ *   starts again from page one (the phone build before 10 Nov 2026). Then foreground
+ *   resumes 15 s apart under the same load.
  *
  * HTTP bodies are paced by `shapedFetch`. Socket frames are not paced; their link time is
  * added arithmetically (one round trip + bytes at the link rate) and reported separately.
@@ -26,7 +26,8 @@
  * usage: node packages/perf-harness/src/mobileSyncGate.ts FIXTURE LABEL OUT.json
  * env:   ROBOB_PERF_SERVER_ENTRY (default apps/server/src/bin.ts), ROBOB_PERF_WRITES_PER_S
  *        (default 100), ROBOB_PERF_RECENT_FIRST=1 (ask for the recent page first, as a
- *        client built from this tree does); any other ROBOB_* switch is passed to the server.
+ *        client built from this tree does), ROBOB_PERF_PHONE_RESTARTS=1; any other ROBOB_*
+ *        switch is passed to the server.
  * The same file runs unchanged in the base tree (copy it there).
  */
 import * as NodeChildProcess from "node:child_process";
@@ -92,6 +93,10 @@ const DESKTOP_USER_AGENT =
 // A client built from this tree asks for the most recently updated threads first; the
 // installed mobile app does not. Older servers ignore the option.
 const recentFirst = process.env.ROBOB_PERF_RECENT_FIRST === "1";
+// The phone build before 10 Nov 2026 threw a load away when one page timed out and began
+// again from page one; builds since (f38524e638) ask for the same page with 2x then 3x the
+// deadline.
+const phoneRestartsOnTimeout = process.env.ROBOB_PERF_PHONE_RESTARTS === "1";
 const token = "synthetic-performance-credential-only";
 const delay = (ms: number) => new Promise<void>((ok) => setTimeout(ok, ms));
 const pct = (values: ReadonlyArray<number>, p: number) => {
@@ -645,7 +650,7 @@ try {
             recent,
             userAgent: NATIVE_USER_AGENT,
             pageTimeoutMs: contended.pageTimeoutMs,
-            onPageTimeout: recentFirst ? "retry" : "restart",
+            onPageTimeout: phoneRestartsOnTimeout ? "restart" : "retry",
             giveUpAt: phoneStarted + contended.giveUpAfterMs,
           }),
         );
@@ -673,7 +678,11 @@ try {
         contending = false;
         yield* Effect.promise(() => Promise.all([...holders, desktop]));
         result.contendedSync = {
-          phoneClient: recentFirst ? "this tree" : "installed build",
+          phoneClient: recentFirst
+            ? "this tree"
+            : phoneRestartsOnTimeout
+              ? "phone build before 10 Nov (restarts a timed-out load)"
+              : "phone build 2.0.0 of 10 Nov (retries a timed-out page)",
           synchronized: phoneSocket !== null,
           synchronizedMs,
           firstPageMs: phoneHttp.firstPageMs,

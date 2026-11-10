@@ -7,7 +7,7 @@ it("turns every speed-up on when nothing is set", () => {
     sweepReadsOffWriter: true,
     narrowRunControlReads: true,
     threadReplyLane: true,
-    shellResumeMaxGap: 20_000,
+    shellResumeMaxGap: 100_000,
     shellResumeMaxThreads: 2_000,
     shellRecentFirst: true,
     threadsPullRequestIndex: true,

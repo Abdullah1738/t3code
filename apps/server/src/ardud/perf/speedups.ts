@@ -14,7 +14,9 @@
  *   reply lane again, behind shell pages and board snapshots.
  * - `ROBOB_SHELL_RESUME_MAX_GAP=1000`: a shell subscription that resumes more than this
  *   many events behind gets the whole thread list again (the old limit). The default
- *   lets a resume up to 20,000 events behind catch up from a list of changed threads.
+ *   lets a resume up to 100,000 events behind (about an hour at 30 events/s) catch up from
+ *   a list of changed threads. Listing them costs a reader about 0.18 s warm and 0.73 s
+ *   after a reopen at that gap, 0.33 s / 1.2 s at 200,000 (shellChangesGate, 10 Nov 2026).
  * - `ROBOB_SHELL_RESUME_MAX_THREADS=<n>`: most changed threads one such catch-up may
  *   refetch before the whole list is sent instead (default 2,000).
  * - `ROBOB_THREADS_PR_INDEX=0`: drops the partial index over threads that have pull request
@@ -81,7 +83,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   shellResumeMaxGap: count(
     env,
     "ROBOB_SHELL_RESUME_MAX_GAP",
-    20_000,
+    100_000,
     SHELL_RESUME_LEGACY_MAX_GAP,
     2_000_000,
   ),
