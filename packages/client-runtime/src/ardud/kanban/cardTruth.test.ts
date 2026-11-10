@@ -76,7 +76,15 @@ const wait = (patch: Partial<KanbanWait> = {}): KanbanWait =>
 
 const state = (cards: KanbanCard[], threads: KanbanThreadState[] = [], board: object = {}) =>
   boardStateFromSnapshot({
-    board: { id: "board-toy", name: "Toy", pause: null, setup: null, reviewChains: [], defaultReviewChain: null, ...board },
+    board: {
+      id: "board-toy",
+      name: "Toy",
+      pause: null,
+      setup: null,
+      reviewChains: [],
+      defaultReviewChain: null,
+      ...board,
+    },
     cards,
     goals: [],
     pools: [],
@@ -103,7 +111,16 @@ const truth = (
 ) => cardTruth(target, state([target, ...others], threads), NOW, { timeZone: "UTC", ...hints });
 
 const subtask = (owner: "work" | "evaluator" | "script", text: string) =>
-  ({ id: "s3", step: 1, text, owner, state: "open", note: null, doneBy: null, doneAt: null }) as never;
+  ({
+    id: "s3",
+    step: 1,
+    text,
+    owner,
+    state: "open",
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  }) as never;
 
 describe("cardTruth: To-Do", () => {
   it("is ready with nothing in the way", () => {
@@ -117,23 +134,27 @@ describe("cardTruth: To-Do", () => {
   });
 
   it("names every unfinished blocker, lowest first, and skips finished ones", () => {
-    const blocked = card(1, { stage: "todo", blockedBy: ["card-14", "card-12", "card-9"] as never });
+    const blocked = card(1, {
+      stage: "todo",
+      blockedBy: ["card-14", "card-12", "card-9"] as never,
+    });
     const result = truth(blocked, [
       card(14, { stage: "working" }),
       card(12, { stage: "todo" }),
       card(9, { stage: "deployed" }),
     ]);
-    expect(result).toMatchObject({ state: "blocked", label: "Blocked by #12, #14", stuckReason: null });
+    expect(result).toMatchObject({
+      state: "blocked",
+      label: "Blocked by #12, #14",
+      stuckReason: null,
+    });
   });
 
   it("shows the backlog, the setup hold and the evaluator's step", () => {
     expect(truth(card(1, { stage: "todo", priority: 5 })).label).toBe("In the backlog");
     expect(
-      cardTruth(
-        card(1, { stage: "todo" }),
-        state([], [], { setup: { status: "running" } }),
-        NOW,
-      ).label,
+      cardTruth(card(1, { stage: "todo" }), state([], [], { setup: { status: "running" } }), NOW)
+        .label,
     ).toBe("Setup is running");
     expect(
       truth(card(1, { stage: "todo", subtasks: [subtask("evaluator", "write the packet")] })),
@@ -179,13 +200,22 @@ describe("cardTruth: working", () => {
       label: "Failed",
       stuckReason: "Failed 1h: Run failed: Provider turn failed.",
     });
-    expect(truth(failed, [], [], { retries: 1 })).toMatchObject({ state: "retrying", stuckReason: null });
+    expect(truth(failed, [], [], { retries: 1 })).toMatchObject({
+      state: "retrying",
+      stuckReason: null,
+    });
   });
 
   it("is stuck when its thread went quiet or waits on its own question", () => {
-    const quiet = truth(working(), [], [thread({ running: false, lastActivityAt: "2026-11-10T11:00:00.000Z" as never })]);
+    const quiet = truth(
+      working(),
+      [],
+      [thread({ running: false, lastActivityAt: "2026-11-10T11:00:00.000Z" as never })],
+    );
     expect(quiet).toMatchObject({ state: "idle", label: "Worker idle 1h" });
-    expect(quiet.stuckReason).toBe("Worker thread has been idle for 1h with the card still in Working");
+    expect(quiet.stuckReason).toBe(
+      "Worker thread has been idle for 1h with the card still in Working",
+    );
     const fresh = truth(working(), [], [thread({ running: false })]);
     expect(fresh).toMatchObject({ state: "idle", stuckReason: null });
     expect(truth(working(), [], [thread({ running: false, needsInput: true })]).stuckReason).toBe(
@@ -204,9 +234,16 @@ describe("cardTruth: review", () => {
 
   it("is reviewing while a reviewer thread runs", () => {
     const reviewing = card(1, { activeThreadId: "thread-1" as never, activeRole: "review" });
-    expect(truth(reviewing, [], [thread()])).toMatchObject({ state: "reviewing", label: "Reviewing" });
+    expect(truth(reviewing, [], [thread()])).toMatchObject({
+      state: "reviewing",
+      label: "Reviewing",
+    });
     expect(
-      truth(reviewing, [], [thread({ running: false, lastActivityAt: "2026-11-10T10:00:00.000Z" as never })]),
+      truth(
+        reviewing,
+        [],
+        [thread({ running: false, lastActivityAt: "2026-11-10T10:00:00.000Z" as never })],
+      ),
     ).toMatchObject({ state: "idle", label: "Reviewer idle 2h" });
     // A wait left on a card a thread now runs is ignored: the thread is the truth.
     expect(truth({ ...reviewing, wait: wait() }, [], [thread()]).state).toBe("reviewing");
@@ -239,22 +276,36 @@ describe("cardTruth: review", () => {
   });
 
   it("surfaces an expired wait as stuck, with its reason", () => {
-    const old = truth(card(1, { movedAt: "2026-11-05T09:00:00.000Z" as never, wait: wait({ at: "2026-11-06T10:00:00.000Z" as never }) }));
+    const old = truth(
+      card(1, {
+        movedAt: "2026-11-05T09:00:00.000Z" as never,
+        wait: wait({ at: "2026-11-06T10:00:00.000Z" as never }),
+      }),
+    );
     expect(old.wait).toMatchObject({ expired: true, age: "4d 2h" });
     expect(old.stuckReason).toBe(
       "Waiting on the author (PR #512) for 4d 2h, past its limit: Pavan to push F1-F3",
     );
-    const marked = truth(card(1, { wait: wait({ expiredAt: "2026-11-10T11:00:00.000Z" as never }) }));
+    const marked = truth(
+      card(1, { wait: wait({ expiredAt: "2026-11-10T11:00:00.000Z" as never }) }),
+    );
     expect(marked.stuckReason).not.toBeNull();
   });
 
   it("ignores a wait once someone moved the card", () => {
-    const moved = card(1, { stage: "todo", movedAt: "2026-11-10T11:00:00.000Z" as never, wait: wait() });
+    const moved = card(1, {
+      stage: "todo",
+      movedAt: "2026-11-10T11:00:00.000Z" as never,
+      wait: wait(),
+    });
     expect(truth(moved).state).toBe("ready");
   });
 
   it("says the evaluator's step is owed after a passed review", () => {
-    const owed = card(1, { movedAt: "2026-11-08T09:00:00.000Z" as never, subtasks: [subtask("evaluator", "merge and deploy")] });
+    const owed = card(1, {
+      movedAt: "2026-11-08T09:00:00.000Z" as never,
+      subtasks: [subtask("evaluator", "merge and deploy")],
+    });
     expect(truth(owed)).toMatchObject({
       state: "evaluator",
       label: "Evaluator's step: s3",
@@ -264,7 +315,9 @@ describe("cardTruth: review", () => {
 
   it("knows a reviewed card with an open tracked PR waits on its merge, without guessing", () => {
     const reviewed = card(1, {
-      links: [{ kind: "pr", url: PR, label: null, state: "open", checkedAt: "2026-11-10T09:00:00.000Z" }] as never,
+      links: [
+        { kind: "pr", url: PR, label: null, state: "open", checkedAt: "2026-11-10T09:00:00.000Z" },
+      ] as never,
     });
     expect(truth(reviewed)).toMatchObject({
       state: "waiting",
@@ -299,7 +352,9 @@ describe("cardTruth: the guess for cards with no wait", () => {
     card(1, { stalled: { reason, by: evaluator, at } as never });
 
   it("reads a stalled flag that is really a wait, and marks it as a guess", () => {
-    const result = truth(stalled("Waiting on jashwanth9845 for a new head on backoffice-frontend#248."));
+    const result = truth(
+      stalled("Waiting on jashwanth9845 for a new head on backoffice-frontend#248."),
+    );
     expect(result).toEqual({
       state: "waiting",
       label: "Waiting on the author",
@@ -343,20 +398,52 @@ describe("cardTruth: the guess for cards with no wait", () => {
     expect(truth(bySubtask)).toMatchObject({ label: "Waiting on the author", derived: true });
 
     const byLabel = card(1, {
-      links: [{ kind: "pr", url: PR, label: "D4 parent PR #1100 (merge gate)", state: null, checkedAt: null }] as never,
+      links: [
+        {
+          kind: "pr",
+          url: PR,
+          label: "D4 parent PR #1100 (merge gate)",
+          state: null,
+          checkedAt: null,
+        },
+      ] as never,
     });
     expect(truth(byLabel)).toMatchObject({ label: "Waiting on merge", derived: true });
 
     const events = [
-      { id: 1, cardId: "card-1", at: "2026-11-09T10:00:00.000Z", actor: evaluator, kind: "comment", fromStage: null, toStage: null, body: "Review posted to the author.", head: null },
-      { id: 2, cardId: "card-1", at: "2026-11-10T10:00:00.000Z", actor: evaluator, kind: "comment", fromStage: null, toStage: null, body: "Merge waits on #3178, #3167 and #45.", head: null },
+      {
+        id: 1,
+        cardId: "card-1",
+        at: "2026-11-09T10:00:00.000Z",
+        actor: evaluator,
+        kind: "comment",
+        fromStage: null,
+        toStage: null,
+        body: "Review posted to the author.",
+        head: null,
+      },
+      {
+        id: 2,
+        cardId: "card-1",
+        at: "2026-11-10T10:00:00.000Z",
+        actor: evaluator,
+        kind: "comment",
+        fromStage: null,
+        toStage: null,
+        body: "Merge waits on #3178, #3167 and #45.",
+        head: null,
+      },
     ] as unknown as KanbanCardEvent[];
     expect(truth(card(1), [], [], { events })).toMatchObject({
       label: "Held for #3178",
       derived: true,
     });
 
-    expect(truth(card(1, { wakeNote: "pending" }), [], [], { wakeNote: "Verdict remains Waiting on CI." })).toMatchObject({
+    expect(
+      truth(card(1, { wakeNote: "pending" }), [], [], {
+        wakeNote: "Verdict remains Waiting on CI.",
+      }),
+    ).toMatchObject({
       label: "Waiting on CI",
       derived: true,
     });
@@ -376,25 +463,37 @@ describe("cardTruth: the guess for cards with no wait", () => {
 describe("guessWait", () => {
   it("reads the phrasings found on real cards", () => {
     const kind = (text: string) => guessWait(text)?.on ?? null;
-    expect(kind("Waiting on jashwanth9845 for a new head on backoffice-frontend#248.")).toBe("push");
+    expect(kind("Waiting on jashwanth9845 for a new head on backoffice-frontend#248.")).toBe(
+      "push",
+    );
     expect(kind("New head -> reopen s2-s5, fresh Sol review, then Astra card.")).toBe("push");
     expect(kind("waiting on jashwanth9845")).toBe("push");
     expect(
-      kind("waiting on Pavan: round-2 asks F1-F3 posted 30 Oct (issuecomment-6521229343); resume at a new head or his reply"),
+      kind(
+        "waiting on Pavan: round-2 asks F1-F3 posted 30 Oct (issuecomment-6521229343); resume at a new head or his reply",
+      ),
     ).toBe("push");
     expect(kind("When Jashwanth pushes a fix, a round-3 card takes the merge path.")).toBe("push");
-    expect(kind("q4 was dropped, so the default applies: wait for js to mark it ready.")).toBe("push");
+    expect(kind("q4 was dropped, so the default applies: wait for js to mark it ready.")).toBe(
+      "push",
+    );
     expect(kind("Verdict remains Waiting on CI.")).toBe("ci");
     expect(
-      kind("Evaluator CI hold: waiting on hosted run 42844979311 at 705c2b2cc153fed63d5aaadb5dbdf49d8676ee22; …"),
+      kind(
+        "Evaluator CI hold: waiting on hosted run 42844979311 at 705c2b2cc153fed63d5aaadb5dbdf49d8676ee22; …",
+      ),
     ).toBe("ci");
     expect(
-      kind("Dependency hold, not a CI wait: s5 stays unfinished until PR451 merges into native-v1; …"),
+      kind(
+        "Dependency hold, not a CI wait: s5 stays unfinished until PR451 merges into native-v1; …",
+      ),
     ).toBe("merge");
     expect(kind("Hold merge for D4, then rebase and validate native-v1 head.")).toBe("merge");
     expect(kind("D4 parent PR #1100 (merge gate)")).toBe("merge");
     expect(
-      guessWait("Waiting on #2694 (card-010b55d3-5176-4748-98fb-8bea07b63169): owner q2 chose to ride its full-root dev apply, …"),
+      guessWait(
+        "Waiting on #2694 (card-010b55d3-5176-4748-98fb-8bea07b63169): owner q2 chose to ride its full-root dev apply, …",
+      ),
     ).toMatchObject({ on: "card", cardNumber: 2694 });
     expect(guessWait("Merge waits on #3178, #3167 and #45.")).toMatchObject({
       on: "card",
@@ -406,7 +505,9 @@ describe("guessWait", () => {
 
   it("says nothing for text that is not a wait", () => {
     expect(guessWait("backoffice-core #527 — c010acde, CI green")).toBeNull();
-    expect(guessWait("crypko-frontend#1551 reviewed f8eac05b: Findings (P3 shared-reader migration)")).toBeNull();
+    expect(
+      guessWait("crypko-frontend#1551 reviewed f8eac05b: Findings (P3 shared-reader migration)"),
+    ).toBeNull();
     expect(guessWait("Missing AWS access for the staging account")).toBeNull();
     expect(guessWait("Run failed: Provider turn failed.")).toBeNull();
     expect(guessWait("Woken")).toBeNull();
@@ -424,7 +525,10 @@ describe("stuckCards", () => {
     const board = state([
       card(1),
       card(2, { movedAt: "2026-11-07T09:00:00.000Z" as never }),
-      card(3, { movedAt: "2026-11-05T09:00:00.000Z" as never, wait: wait({ at: "2026-11-06T10:00:00.000Z" as never }) }),
+      card(3, {
+        movedAt: "2026-11-05T09:00:00.000Z" as never,
+        wait: wait({ at: "2026-11-06T10:00:00.000Z" as never }),
+      }),
       card(4, { wait: wait() }),
       card(5, { stage: "todo" }),
     ]);

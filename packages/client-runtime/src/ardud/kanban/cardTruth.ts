@@ -120,9 +120,13 @@ function waitLabel(
     case "ci":
       return `Waiting on CI${prNumber(detail.pr)}`;
     case "owner_go":
-      return detail.ask === null ? "Held for the owner's go" : `Held for the owner's go (${detail.ask})`;
+      return detail.ask === null
+        ? "Held for the owner's go"
+        : `Held for the owner's go (${detail.ask})`;
     case "card":
-      return detail.cardNumber === null ? "Held for another card" : `Held for #${detail.cardNumber}`;
+      return detail.cardNumber === null
+        ? "Held for another card"
+        : `Held for #${detail.cardNumber}`;
     case "time":
       return detail.until === null
         ? "Held for a recheck"
@@ -130,7 +134,11 @@ function waitLabel(
   }
 }
 
-const base = (state: CardTruthState, label: string, stuckReason: string | null = null): CardTruth => ({
+const base = (
+  state: CardTruthState,
+  label: string,
+  stuckReason: string | null = null,
+): CardTruth => ({
   state,
   label,
   wait: null,
@@ -216,16 +224,19 @@ const numeric = (value: unknown): number =>
  * wake note, the open subtasks of the step the card is on, then link labels.
  */
 function guessTexts(card: KanbanCard, hints: CardTruthHints): ReadonlyArray<string | null> {
-  const recent = (hints.events ?? [])
+  const bodies = (hints.events ?? [])
     .filter(
       (event) =>
         (event.kind === "comment" || event.kind === "flagged" || event.kind === "moved") &&
         event.body !== null &&
         event.actor._tag !== "owner",
     )
-    .slice(-5)
-    .toReversed()
     .map((event) => event.body);
+  // The newest five, newest first.
+  const recent: Array<string | null> = [];
+  for (let index = bodies.length - 1; index >= Math.max(0, bodies.length - 5); index -= 1) {
+    recent.push(bodies[index] ?? null);
+  }
   const wakeNote = hints.wakeNote ?? (card.wakeNote === "pending" ? null : card.wakeNote);
   return [
     card.stalled?.reason ?? null,
@@ -316,7 +327,9 @@ export function cardTruth(
     return base(
       "idle",
       "No thread",
-      elapsed(card.movedAt, nowMs) >= TRUTH_QUIET_MS ? `In Working for ${since} with no thread` : null,
+      elapsed(card.movedAt, nowMs) >= TRUTH_QUIET_MS
+        ? `In Working for ${since} with no thread`
+        : null,
     );
   }
   if (card.stage === "todo") {
@@ -373,7 +386,12 @@ export function cardTruth(
     return {
       state: "waiting",
       label,
-      wait: { on: "merge", note: "Review passed; the card completes when its PRs land", age: since, expired: false },
+      wait: {
+        on: "merge",
+        note: "Review passed; the card completes when its PRs land",
+        age: since,
+        expired: false,
+      },
       derived: false,
       stuckReason:
         elapsed(card.movedAt, nowMs) >= (KANBAN_WAIT_LIMIT_MS.merge ?? TRUTH_IDLE_STUCK_MS)
@@ -395,7 +413,11 @@ export function cardTruth(
 export function stuckCards(
   state: KanbanBoardState,
   nowMs: number,
-): ReadonlyArray<{ readonly card: KanbanCard; readonly truth: CardTruth; readonly reason: string }> {
+): ReadonlyArray<{
+  readonly card: KanbanCard;
+  readonly truth: CardTruth;
+  readonly reason: string;
+}> {
   const stuck: Array<{ card: KanbanCard; truth: CardTruth; reason: string }> = [];
   for (const card of state.cards.values()) {
     const truth = cardTruth(card, state, nowMs);

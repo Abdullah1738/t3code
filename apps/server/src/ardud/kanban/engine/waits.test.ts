@@ -145,14 +145,17 @@ describe("waitSatisfied", () => {
   it("push: an unknown head or an unread PR never ends it, and a merged or closed PR does", () => {
     const waiting = card(1, { wait: wait() });
     expect(waitSatisfied(waiting, facts({ prs: [{ url: PR, state: "open" }] })).over).toBe(false);
-    expect(waitSatisfied(waiting, facts({ prs: [{ url: PR, state: "open", head: null }] })).over).toBe(
+    expect(
+      waitSatisfied(waiting, facts({ prs: [{ url: PR, state: "open", head: null }] })).over,
+    ).toBe(false);
+    expect(waitSatisfied(waiting, facts({ prs: [{ url: OTHER_PR, state: "merged" }] })).over).toBe(
       false,
     );
     expect(
-      waitSatisfied(waiting, facts({ prs: [{ url: OTHER_PR, state: "merged" }] })).over,
-    ).toBe(false);
-    expect(
-      waitSatisfied(card(1, { wait: wait({ sinceHead: null }) }), facts({ prs: [{ url: PR, state: "open", head: "ffee0011" }] })).over,
+      waitSatisfied(
+        card(1, { wait: wait({ sinceHead: null }) }),
+        facts({ prs: [{ url: PR, state: "open", head: "ffee0011" }] }),
+      ).over,
     ).toBe(false);
     expect(waitSatisfied(waiting, facts({ prs: [{ url: PR, state: "merged" }] }))).toEqual({
       over: true,
@@ -221,9 +224,10 @@ describe("waitSatisfied", () => {
       outcome: "met",
       reason: "Card #2102 is done",
     });
-    expect(
-      waitSatisfied(waiting, other({ stage: "todo", settledAt: AT as never })),
-    ).toMatchObject({ over: true, reason: "Card #2102 is settled" });
+    expect(waitSatisfied(waiting, other({ stage: "todo", settledAt: AT as never }))).toMatchObject({
+      over: true,
+      reason: "Card #2102 is settled",
+    });
     expect(waitSatisfied(waiting, facts())).toEqual({
       over: true,
       outcome: "moot",
@@ -244,7 +248,15 @@ describe("waitSatisfied", () => {
 
   it("owner_go: ends when the question is closed, or is no longer on the card", () => {
     const ask = (closedAt: string | null) =>
-      ({ id: "q1", text: "Merge?", blocking: false, by: evaluator, at: SET_AT, seq: null, closedAt }) as never;
+      ({
+        id: "q1",
+        text: "Merge?",
+        blocking: false,
+        by: evaluator,
+        at: SET_AT,
+        seq: null,
+        closedAt,
+      }) as never;
     const waiting = (asks: KanbanCard["asks"]) =>
       card(1, { asks, wait: wait({ on: "owner_go", pr: null, ask: "q1" as never }) });
     expect(waitSatisfied(waiting([ask(null)]), facts()).over).toBe(false);
@@ -447,7 +459,11 @@ describe("resolveWait", () => {
   });
 
   it("drops a wait left on a card someone moved, without a wake", () => {
-    const moved = card(1, { stage: "todo", movedAt: "2026-11-10T11:00:00.000Z" as never, wait: wait() });
+    const moved = card(1, {
+      stage: "todo",
+      movedAt: "2026-11-10T11:00:00.000Z" as never,
+      wait: wait(),
+    });
     const step = resolveWait(moved, facts(), ctx, AT);
     expect(step._tag).toBe("end");
     if (step._tag !== "end") return;
@@ -504,9 +520,13 @@ describe("checkWait", () => {
     expect(reason(card(1, { activeThreadId: "t" as never }), request())).toContain(
       "denied: card #1 has a running thread",
     );
-    expect(reason(card(1, { settledAt: AT as never }), request())).toBe("denied: card #1 is settled");
+    expect(reason(card(1, { settledAt: AT as never }), request())).toBe(
+      "denied: card #1 is settled",
+    );
     expect(reason(card(1, { stage: "verified" }), request())).toContain("is verified");
-    const flagged = card(1, { stalled: { reason: "Waiting on Pavan", by: evaluator, at: SET_AT } as never });
+    const flagged = card(1, {
+      stalled: { reason: "Waiting on Pavan", by: evaluator, at: SET_AT } as never,
+    });
     expect(reason(flagged, request(), evaluator)).toBe("ok");
     expect(reason(flagged, request(), worker)).toContain("flagged stalled by someone else");
     expect(mayClearFlag(flagged, owner)).toBe(true);
@@ -546,7 +566,15 @@ describe("checkWait", () => {
     expect(reason(card(1), go("q1"))).toContain("ask the owner with card_ask first");
     const asked = card(1, {
       asks: [
-        { id: "q1", text: "Merge?", blocking: false, by: evaluator, at: SET_AT, seq: null, closedAt: null },
+        {
+          id: "q1",
+          text: "Merge?",
+          blocking: false,
+          by: evaluator,
+          at: SET_AT,
+          seq: null,
+          closedAt: null,
+        },
       ] as never,
     });
     expect(reason(asked, go("q1"))).toBe("ok");
@@ -603,7 +631,13 @@ describe("helpers", () => {
     const two = card(1, {
       links: [
         { kind: "pr", url: PR, label: null, state: "open", checkedAt: null },
-        { kind: "pr", url: "https://github.com/Equicom-Crypto/edge-api/pull/512", label: null, state: null, checkedAt: null },
+        {
+          kind: "pr",
+          url: "https://github.com/Equicom-Crypto/edge-api/pull/512",
+          label: null,
+          state: null,
+          checkedAt: null,
+        },
         { kind: "url", url: "https://example.com/512", label: null, state: null, checkedAt: null },
       ],
     });
@@ -620,7 +654,10 @@ describe("helpers", () => {
       card(1, { wait: wait({ on: "card", pr: null, card: "card-9" as never }) }),
       card(2, { wait: wait({ on: "card", pr: null, card: "card-8" as never }) }),
       card(3, { wait: wait() }),
-      card(4, { wait: wait({ on: "card", pr: null, card: "card-9" as never }), activeThreadId: "t" as never }),
+      card(4, {
+        wait: wait({ on: "card", pr: null, card: "card-9" as never }),
+        activeThreadId: "t" as never,
+      }),
     ];
     expect(waitersOn(cards, "card-9").map((entry) => entry.number)).toEqual([1]);
   });

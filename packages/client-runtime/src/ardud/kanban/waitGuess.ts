@@ -35,7 +35,10 @@ const PUSH = new RegExp(
   ].join("|"),
   "i",
 );
-const CARD = new RegExp(String.raw`\b${HOLD}\b[^.;\n]{0,24}?\b(?:on|for|by|until|behind)\s+${CARD_REF}`, "i");
+const CARD = new RegExp(
+  String.raw`\b${HOLD}\b[^.;\n]{0,24}?\b(?:on|for|by|until|behind)\s+${CARD_REF}`,
+  "i",
+);
 const MERGE = new RegExp(
   [
     String.raw`\bmerge (?:gate|hold)\b`,
@@ -53,7 +56,8 @@ const OWNER = new RegExp(
 );
 const TIME = /\b(?:re-?check|check[- ]back)\b|\bstill held\b/i;
 // "waiting on jashwanth9845", "waiting on Pavan: ...": a person, so the PR's author.
-const PERSON = /\bwait(?:s|ing)? (?:on|for) (?!the\b|a\b|an\b|ci\b|pr\b|merge\b|it\b|#)([A-Za-z][\w-]{1,38})\b/i;
+const PERSON =
+  /\bwait(?:s|ing)? (?:on|for) (?!the\b|a\b|an\b|ci\b|pr\b|merge\b|it\b|#)([A-Za-z][\w-]{1,38})\b/i;
 
 const cut = (text: string) => {
   const line = text.replace(/\s+/g, " ").trim();

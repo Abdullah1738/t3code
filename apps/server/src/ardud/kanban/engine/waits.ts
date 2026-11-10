@@ -166,7 +166,10 @@ function prVerdict(wait: KanbanWait, pr: WaitPrFacts): WaitVerdict {
  * Whether the card's wait is over, and why. Facts the tick has no reading for
  * (a PR it could not read) never end a wait: unknown is not done.
  */
-export function waitSatisfied(card: Pick<KanbanCard, "wait" | "asks">, facts: WaitFacts): WaitVerdict {
+export function waitSatisfied(
+  card: Pick<KanbanCard, "wait" | "asks">,
+  facts: WaitFacts,
+): WaitVerdict {
   const wait = kanbanWait(card);
   if (wait === null) return HOLD;
   switch (wait.on) {
@@ -432,7 +435,8 @@ export function endWait(
  */
 export function expireWait(card: KanbanCard, facts: WaitFacts, at: string): WaitEnd | null {
   const wait = kanbanWait(card);
-  if (wait === null || wait.expiredAt !== null || !kanbanWaitExpired(wait, facts.nowMs)) return null;
+  if (wait === null || wait.expiredAt !== null || !kanbanWaitExpired(wait, facts.nowMs))
+    return null;
   const waited = `Waited ${waitedFor(wait.at, facts.nowMs)} on ${waitTarget(wait, facts.cards)} with no change${quoted(wait.note)}`;
   return {
     card: { ...card, wait: { ...wait, expiredAt: at }, updatedAt: at },
@@ -490,7 +494,9 @@ export const waitersOn = (
   cards: ReadonlyArray<KanbanCard>,
   cardId: string,
 ): ReadonlyArray<KanbanCard> =>
-  cards.filter((card) => kanbanWaiting(card) && card.wait?.on === "card" && card.wait.card === cardId);
+  cards.filter(
+    (card) => kanbanWaiting(card) && card.wait?.on === "card" && card.wait.card === cardId,
+  );
 
 /** What card_wait asks for, with the PR and card already found. */
 export interface WaitRequest {
@@ -499,7 +505,10 @@ export interface WaitRequest {
   /** push, merge, ci: the PR's URL. */
   readonly pr?: string | null | undefined;
   /** card: the card to wait on. */
-  readonly card?: Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks"> | null | undefined;
+  readonly card?:
+    | Pick<KanbanCard, "id" | "number" | "stage" | "settledAt" | "subtasks">
+    | null
+    | undefined;
   /** owner_go: the open ask's id. */
   readonly ask?: string | null | undefined;
   readonly until?: string | null | undefined;
@@ -586,9 +595,7 @@ export function checkWait(
       const prs = card.links.filter((link) => link.kind === "pr");
       if (prs.length === 0) return bad(`${n} has no pull request link: attach it first (links)`);
       if (!request.pr) {
-        return bad(
-          `say which pull request: ${prs.map((link) => prName(link.url)).join(", ")}`,
-        );
+        return bad(`say which pull request: ${prs.map((link) => prName(link.url)).join(", ")}`);
       }
       const link = prs.find((entry) => entry.url === request.pr);
       if (link === undefined) {
