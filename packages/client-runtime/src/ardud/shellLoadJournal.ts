@@ -135,7 +135,7 @@ export function makeKeyValueShellLoadJournal<E>(
         .pipe(Effect.flatMap((raw) => decodeRecord(raw).pipe(Effect.option)));
       if (Option.isSome(record)) found.push(record.value);
     }
-    return found.toSorted((a, b) => b.updatedAt - a.updatedAt);
+    return found.sort((a, b) => b.updatedAt - a.updatedAt);
   });
   return ShellLoadJournal.of({
     read: (environmentId) =>
