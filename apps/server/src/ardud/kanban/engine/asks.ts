@@ -771,13 +771,11 @@ export const fieldValue = (
     case "secret":
       return invalid(SECRET_PRIVATE);
     case "custom": {
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       const json = JSON.stringify(value);
       if (json === undefined) return invalid("is not a JSON value");
       if (utf8Bytes(json) > ASK_LIMITS.customBytes) {
         return invalid(`is at most ${ASK_LIMITS.customBytes / 1024} KB of JSON`);
       }
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       return { value: JSON.parse(json) as unknown };
     }
     default: {
@@ -1859,7 +1857,6 @@ const valueText = (
     case "secret":
       return "he entered it privately";
     case "custom":
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
       return JSON.stringify(value);
     default:
       return String(value);

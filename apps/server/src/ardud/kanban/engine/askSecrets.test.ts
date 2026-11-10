@@ -109,14 +109,15 @@ const dumpDatabase = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const tables = yield* sql<{ name: string }>`SELECT name FROM sqlite_master WHERE type = 'table'`;
   const rows = yield* Effect.forEach(tables, (table) =>
-    sql.unsafe(`SELECT * FROM "${table.name}"`).pipe(
-      Effect.map((found) =>
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        JSON.stringify(found, (_key, value: unknown) =>
-          value instanceof Uint8Array ? Buffer.from(value).toString("utf8") : value,
+    sql
+      .unsafe(`SELECT * FROM "${table.name}"`)
+      .pipe(
+        Effect.map((found) =>
+          JSON.stringify(found, (_key, value: unknown) =>
+            value instanceof Uint8Array ? Buffer.from(value).toString("utf8") : value,
+          ),
         ),
       ),
-    ),
   );
   return rows.join("\n");
 });
@@ -137,7 +138,6 @@ const dumpFiles = Effect.gen(function* () {
   return { names, text: texts.join("\n") };
 });
 
-// @effect-diagnostics-next-line preferSchemaOverJson:off
 const text = (value: unknown) => JSON.stringify(value) ?? "";
 
 it.effect(
