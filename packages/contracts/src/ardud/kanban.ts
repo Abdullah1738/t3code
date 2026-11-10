@@ -175,12 +175,24 @@ export const KanbanCardRetry = Schema.Struct({
   runId: Schema.NullOr(Schema.String),
   /** Why, in the provider's words or the board's. */
   reason: Schema.String,
-  /** When the failure was seen (waiting), then when the card was restarted. */
+  /** When the failure was seen; for a failed run the retry may start KANBAN_RETRY_BACKOFF_MS later. */
   at: IsoDateTime,
-  /** waiting: the card keeps its thread until the backoff is over. restarted: the one retry is used. */
+  /**
+   * waiting: a failed run's one retry. The card went back to its queue with its
+   * thread and no slot, isn't started before the backoff is over, and keeps the
+   * record until the retried turn ends. restarted: a review with no verdict,
+   * started again at once.
+   */
   state: Schema.Literals(["waiting", "restarted"]),
 });
 export type KanbanCardRetry = typeof KanbanCardRetry.Type;
+
+/**
+ * How long a failed run's card waits in its queue before the dispatcher may start
+ * it again, so a provider that just failed is not hit again at once. The card holds
+ * no pool slot meanwhile.
+ */
+export const KANBAN_RETRY_BACKOFF_MS = 60_000;
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -247,13 +259,30 @@ export type KanbanCard = typeof KanbanCard.Type;
 
 /**
  * The retry a card is in the middle of, for a board to show "Retrying": a failed
- * run waiting to be restarted, or a restarted run that hasn't ended. A flagged card
- * is past retrying.
+ * run waiting in its queue to be started again, or the retried run that hasn't
+ * ended. A flagged card is past retrying.
  */
 export const kanbanRetrying = (
   card: Pick<KanbanCard, "retries" | "stalled" | "settledAt">,
 ): KanbanCardRetry | undefined =>
   card.stalled !== null || card.settledAt !== null ? undefined : card.retries?.at(-1);
+
+/**
+ * The time (epoch ms) before which the dispatcher must not start a card: the end
+ * of a failed run's backoff. Null when the card waits on no retry. It says nothing
+ * about a card that is running; the dispatcher only asks it of cards in a queue.
+ */
+export const kanbanRetryNotBefore = (card: Pick<KanbanCard, "retries">): number | null => {
+  let notBefore: number | null = null;
+  for (const retry of card.retries ?? []) {
+    if (retry.state !== "waiting") continue;
+    const at = Date.parse(retry.at);
+    // A stamp that doesn't parse holds nothing back.
+    if (!Number.isFinite(at)) continue;
+    notBefore = Math.max(notBefore ?? 0, at + KANBAN_RETRY_BACKOFF_MS);
+  }
+  return notBefore;
+};
 
 /** The models a card's work may start on, highest weight first. */
 export const kanbanCardModels = (card: KanbanCard): ReadonlyArray<KanbanCardModel> =>

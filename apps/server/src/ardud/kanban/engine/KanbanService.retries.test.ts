@@ -1,7 +1,8 @@
 /**
  * Retry once before flagging, through the board service: a failed worker or
  * reviewer run, and a reviewer that ends without a verdict, are run again once
- * before the card is flagged. The pure decision is tested in retries.test.ts.
+ * before the card is flagged. A failed run's card waits out its backoff in its
+ * queue and holds no slot. The pure decision is tested in retries.test.ts.
  */
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -12,6 +13,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  kanbanRetryNotBefore,
   kanbanRetrying,
   ProjectId,
   ThreadId,
@@ -47,11 +49,14 @@ interface FakeThread {
 /** Threads that are idle unless a test says otherwise; a failure stands until the test clears it. */
 const makeFake = () => {
   const threads = new Map<string, FakeThread>();
+  /** Reads of each thread (its view or its last failure), for tests that count them. */
+  const reads = new Map<string, number>();
+  const counted = (threadId: string) => reads.set(threadId, (reads.get(threadId) ?? 0) + 1);
   let nextThread = 0;
   let nextRun = 0;
   const read = (threadId: ThreadId) =>
     Effect.map(Clock.currentTimeMillis, (nowMs): KanbanThreadView | null =>
-      threads.has(threadId)
+      (counted(threadId), threads.has(threadId))
         ? {
             threadId,
             projectId: ProjectId.make("project-1"),
@@ -67,7 +72,10 @@ const makeFake = () => {
         : null,
     );
   const failureOf = (threadId: ThreadId) =>
-    Effect.sync(() => threads.get(threadId)?.failure ?? null);
+    Effect.sync(() => {
+      counted(threadId);
+      return threads.get(threadId)?.failure ?? null;
+    });
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
@@ -111,7 +119,8 @@ const makeFake = () => {
     threads.get(threadId)!.failure = null;
   };
   const messages = (threadId: string) => threads.get(threadId)?.messages ?? [];
-  return { layer, fail, recover, messages };
+  const readsOf = (threadId: string) => reads.get(threadId) ?? 0;
+  return { layer, fail, recover, messages, readsOf };
 };
 
 const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
@@ -177,7 +186,7 @@ const retriesOf = (card: KanbanCard) =>
   (card.retries ?? []).map((retry) => `${retry.kind}/${retry.role}/${retry.state}`);
 
 it.effect(
-  "a worker's first failed run is not flagged: it waits, then the same thread is woken once",
+  "a worker's first failed run is not flagged: the card waits in To-Do with no slot, then the same thread is woken once",
   () =>
     Effect.gen(function* () {
       const fake = makeFake();
@@ -187,27 +196,36 @@ it.effect(
         yield* kanban.turnEnded(thread);
 
         let detail = yield* now;
-        assert.strictEqual(detail.card.stage, "working");
+        assert.strictEqual(detail.card.stage, "todo");
         assert.isNull(detail.card.stalled);
-        assert.strictEqual(detail.card.activeThreadId, thread);
+        assert.isNull(detail.card.activeThreadId);
+        assert.isNull(detail.card.activePool);
+        assert.strictEqual(detail.card.workThreadId, thread);
+        // Back in the queue it keeps the age it had.
+        assert.strictEqual(detail.card.movedAt, card.movedAt);
         assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
         assert.strictEqual(kanbanRetrying(detail.card)?.reason, "upstream closed the stream");
+        assert.strictEqual(kanbanRetryNotBefore(detail.card), START + Retries.RETRY_BACKOFF_MS);
         assert.isTrue(
           detail.events.some(
             (event) =>
-              event.kind === "thread" &&
+              event.kind === "moved" &&
+              event.fromStage === "working" &&
+              event.toStage === "todo" &&
               event.body === "Run failed, retrying once: upstream closed the stream",
           ),
         );
         assert.isFalse(detail.events.some((event) => event.kind === "flagged"));
 
-        // Inside the backoff the tick sees the failed thread again and leaves it.
+        // Inside the backoff neither dispatch, the tick nor the failed run reported again starts it.
         const sent = fake.messages(thread).length;
+        yield* kanban.dispatchNow;
         yield* TestClock.adjust("30 seconds");
         yield* kanban.tick;
         yield* kanban.turnEnded(thread);
         detail = yield* now;
-        assert.strictEqual(detail.card.stage, "working");
+        assert.strictEqual(detail.card.stage, "todo");
+        assert.isNull(detail.card.stalled);
         assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
         assert.lengthOf(fake.messages(thread), sent);
         assert.lengthOf(
@@ -215,26 +233,18 @@ it.effect(
           1,
         );
 
-        // Past it, the tick sends the card back to To-Do unflagged and dispatch wakes the same thread.
+        // Past it, the tick's dispatch wakes the same thread like any other start.
         yield* pastBackoff;
         yield* kanban.tick;
-        yield* kanban.dispatchNow;
         detail = yield* now;
         assert.strictEqual(detail.card.stage, "working");
         assert.strictEqual(detail.card.activeThreadId, thread);
         assert.strictEqual(detail.card.workThreadId, thread);
         assert.isNull(detail.card.stalled);
-        assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/restarted"]);
-        assert.isTrue(
-          detail.events.some(
-            (event) =>
-              event.kind === "moved" &&
-              event.fromStage === "working" &&
-              event.toStage === "todo" &&
-              event.body === "Retrying after a failed run: upstream closed the stream",
-          ),
-        );
+        assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+        assert.isFalse(detail.events.some((event) => event.kind === "flagged"));
         const wake = fake.messages(thread).at(-1) ?? "";
+        assert.lengthOf(fake.messages(thread), sent + 1);
         assert.include(wake, `Card #${card.number} is back with you.`);
         assert.include(wake, 'Your last run on this card failed: "upstream closed the stream"');
       }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -250,8 +260,7 @@ it.effect("the second failed run flags the card as before", () =>
       yield* kanban.turnEnded(thread);
       yield* pastBackoff;
       yield* kanban.tick;
-      yield* kanban.dispatchNow;
-      assert.deepStrictEqual(retriesOf((yield* now).card), ["run_failed/work/restarted"]);
+      assert.strictEqual((yield* now).card.stage, "working");
 
       fake.fail(thread, { message: "upstream closed the stream again" });
       yield* kanban.turnEnded(thread);
@@ -282,8 +291,7 @@ it.effect("a turn that ends normally resets the count: the next failure is retri
       yield* kanban.turnEnded(thread);
       yield* pastBackoff;
       yield* kanban.tick;
-      yield* kanban.dispatchNow;
-      assert.deepStrictEqual(retriesOf((yield* now).card), ["run_failed/work/restarted"]);
+      assert.deepStrictEqual(retriesOf((yield* now).card), ["run_failed/work/waiting"]);
 
       // The restarted run is a good one; its turn ends without a move, so the worker is nudged.
       fake.recover(thread);
@@ -297,7 +305,7 @@ it.effect("a turn that ends normally resets the count: the next failure is retri
       yield* kanban.turnEnded(thread);
       card = (yield* now).card;
       assert.isNull(card.stalled);
-      assert.strictEqual(card.stage, "working");
+      assert.strictEqual(card.stage, "todo");
       assert.deepStrictEqual(retriesOf(card), ["run_failed/work/waiting"]);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -311,8 +319,8 @@ it.effect("a real move resets the count too", () =>
       fake.fail(thread);
       yield* kanban.turnEnded(thread);
       assert.deepStrictEqual(retriesOf((yield* now).card), ["run_failed/work/waiting"]);
-      // The owner pulls the card back while it waits for its retry.
-      const pulled = yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      // The owner takes the card over while it waits for its retry.
+      const pulled = yield* kanban.moveCard(card.id, "needs_owner", "owner", owner);
       assert.isUndefined(pulled.retries);
       assert.isNull(pulled.stalled);
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -328,16 +336,155 @@ it.effect("a restart that starts no new run is flagged once it has had time to",
       yield* kanban.turnEnded(thread);
       yield* pastBackoff;
       yield* kanban.tick;
-      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* now).card.stage, "working");
       // The wake went out but the old failed run is still the thread's latest.
       yield* kanban.turnEnded(thread);
       assert.isNull((yield* now).card.stalled);
+      assert.strictEqual((yield* now).card.stage, "working");
       yield* TestClock.adjust(Retries.RETRY_SETTLE_MS);
       yield* kanban.turnEnded(thread);
       assert.strictEqual(
         (yield* now).card.stalled?.reason,
         "Run failed: upstream closed the stream",
       );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card waiting out its retry costs the tick no thread read and no card write", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      const before = yield* now;
+      const reads = fake.readsOf(thread);
+
+      for (let tick = 0; tick < 3; tick += 1) {
+        yield* TestClock.adjust("15 seconds");
+        yield* kanban.tick;
+      }
+      const after = yield* now;
+      assert.strictEqual(fake.readsOf(thread), reads);
+      assert.deepStrictEqual(after.card, before.card);
+      assert.lengthOf(after.events, before.events.length);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+/** The one-slot board with a second card waiting for the slot the first one holds. */
+const twoCards = Effect.gen(function* () {
+  const { kanban, board, card, thread, now } = yield* workingCard;
+  const second = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+  yield* kanban.dispatchNow;
+  const other = kanban.card(second.id);
+  assert.strictEqual((yield* other).card.stage, "todo");
+  return { kanban, board, card, thread, now, other };
+});
+
+it.effect("the slot is free during the wait: another card starts in it", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, thread, now, other } = yield* twoCards;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      yield* kanban.dispatchNow;
+
+      const started = (yield* other).card;
+      assert.strictEqual(started.stage, "working");
+      assert.isNotNull(started.activeThreadId);
+      assert.notStrictEqual(started.activeThreadId, thread);
+      const waiting = (yield* now).card;
+      assert.strictEqual(waiting.stage, "todo");
+      assert.isNull(waiting.activeThreadId);
+      assert.isNull(waiting.activePool);
+      assert.isNull(waiting.stalled);
+      assert.deepStrictEqual(retriesOf(waiting), ["run_failed/work/waiting"]);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "a due card with no free slot waits without being flagged, and starts when one frees",
+  () =>
+    Effect.gen(function* () {
+      const fake = makeFake();
+      yield* Effect.gen(function* () {
+        const { kanban, card, thread, now, other } = yield* twoCards;
+        fake.fail(thread);
+        yield* kanban.turnEnded(thread);
+        yield* kanban.dispatchNow;
+        const otherThread = (yield* other).card.activeThreadId!;
+        const sent = fake.messages(thread).length;
+
+        // Due, and due for a long time: the only slot is taken, so it waits like any card.
+        yield* pastBackoff;
+        yield* kanban.tick;
+        yield* TestClock.adjust("20 minutes");
+        yield* kanban.tick;
+        yield* kanban.turnEnded(thread);
+        let detail = yield* now;
+        assert.strictEqual(detail.card.stage, "todo");
+        assert.isNull(detail.card.stalled);
+        assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+        assert.isFalse(detail.events.some((event) => event.kind === "flagged"));
+        assert.lengthOf(fake.messages(thread), sent);
+
+        // The other card hands off to review. Reviews go first and this board reviews on
+        // the same pool, so the retry still waits; it gets the slot when the review is done.
+        yield* kanban.moveCard((yield* other).card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: otherThread,
+        });
+        yield* kanban.turnEnded(otherThread);
+        yield* kanban.dispatchNow;
+        const reviewer = (yield* other).card.activeThreadId!;
+        assert.strictEqual((yield* other).card.stage, "in_review");
+        assert.strictEqual((yield* now).card.stage, "todo");
+        assert.isNull((yield* now).card.stalled);
+        yield* kanban.reviewResult(reviewer, "clear", []);
+        yield* kanban.turnEnded(reviewer);
+        yield* kanban.dispatchNow;
+        detail = yield* now;
+        assert.strictEqual(detail.card.stage, "working");
+        assert.strictEqual(detail.card.activeThreadId, thread);
+        assert.isNull(detail.card.stalled);
+        assert.include(
+          fake.messages(thread).at(-1) ?? "",
+          `Card #${card.number} is back with you.`,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("a board paused during the wait starts the retry when the pause lifts", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, board, thread, now } = yield* workingCard;
+      fake.fail(thread);
+      yield* kanban.turnEnded(thread);
+      yield* kanban.pauseBoard(board.id, { reason: "Cutover", keep: [] }, owner);
+      const sent = fake.messages(thread).length;
+
+      yield* pastBackoff;
+      yield* kanban.tick;
+      yield* kanban.dispatchNow;
+      let detail = yield* now;
+      assert.strictEqual(detail.card.stage, "todo");
+      assert.isNull(detail.card.stalled);
+      assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+      assert.lengthOf(fake.messages(thread), sent);
+
+      yield* kanban.pauseBoard(board.id, null, owner);
+      yield* kanban.tick;
+      detail = yield* now;
+      assert.strictEqual(detail.card.stage, "working");
+      assert.strictEqual(detail.card.activeThreadId, thread);
+      assert.isNull(detail.card.stalled);
+      assert.isFalse(detail.events.some((event) => event.kind === "flagged"));
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -398,11 +545,19 @@ it.effect("a paused board neither retries nor flags; the retry starts when the p
       assert.strictEqual(detail.card.stage, "working");
       assert.isFalse(detail.events.some((event) => event.body?.startsWith("Run failed")));
 
+      // The pause lifts: the failed run is seen, and the card goes to wait out its backoff.
       yield* kanban.pauseBoard(board.id, null, owner);
       yield* kanban.tick;
       detail = yield* now;
       assert.isNull(detail.card.stalled);
+      assert.strictEqual(detail.card.stage, "todo");
       assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/work/waiting"]);
+      yield* pastBackoff;
+      yield* kanban.tick;
+      detail = yield* now;
+      assert.strictEqual(detail.card.stage, "working");
+      assert.strictEqual(detail.card.activeThreadId, thread);
+      assert.isNull(detail.card.stalled);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -415,19 +570,29 @@ it.effect("a reviewer's failed run is retried once on the same review thread, th
       fake.fail(reviewer);
       yield* kanban.turnEnded(reviewer);
       let detail = yield* now;
-      assert.strictEqual(detail.card.stage, "in_review");
-      assert.strictEqual(detail.card.activeThreadId, reviewer);
+      const reviewStarted = detail.events.findLast((event) => event.toStage === "in_review")!.at;
+      // Back in Needs review with no slot, keeping its place in the queue.
+      assert.strictEqual(detail.card.stage, "needs_review");
+      assert.isNull(detail.card.activeThreadId);
+      assert.isNull(detail.card.activePool);
+      assert.strictEqual(detail.card.reviewThreadId, reviewer);
+      assert.strictEqual(detail.card.movedAt, reviewStarted);
       assert.isNull(detail.card.stalled);
       assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/review/waiting"]);
+      const sent = fake.messages(reviewer).length;
+      yield* kanban.dispatchNow;
+      yield* TestClock.adjust("30 seconds");
+      yield* kanban.tick;
+      assert.strictEqual((yield* now).card.stage, "needs_review");
+      assert.lengthOf(fake.messages(reviewer), sent);
 
       yield* pastBackoff;
       yield* kanban.tick;
-      yield* kanban.dispatchNow;
       detail = yield* now;
       assert.strictEqual(detail.card.stage, "in_review");
       assert.strictEqual(detail.card.activeThreadId, reviewer);
       assert.strictEqual(detail.card.reviewThreadId, reviewer);
-      assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/review/restarted"]);
+      assert.deepStrictEqual(retriesOf(detail.card), ["run_failed/review/waiting"]);
       assert.include(
         fake.messages(reviewer).at(-1) ?? "",
         'Your last review run on this card failed: "upstream closed the stream"',

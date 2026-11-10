@@ -1,11 +1,13 @@
 import {
   KANBAN_BACKLOG,
+  KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
   ThreadId,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardRetry,
   type KanbanDiscussion,
   type KanbanPool,
   type ModelSelection,
@@ -31,6 +33,7 @@ import {
   modelOnPool,
   nextProbeDelay,
   planDispatch,
+  heldSlots,
   aliasPool,
   poolFor,
   poolKey,
@@ -495,6 +498,105 @@ describe("planDispatch", () => {
       ready: false,
       waitsOn: [root],
       heldUpBy: root,
+    });
+  });
+
+  describe("a failed run waiting for its one retry", () => {
+    const failedAt = Date.parse("2026-10-25T12:00:00Z");
+    const due = failedAt + KANBAN_RETRY_BACKOFF_MS;
+    const retry = (role: "work" | "review" = "work"): KanbanCardRetry => ({
+      kind: "run_failed",
+      role,
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at: iso(failedAt),
+      state: "waiting",
+    });
+    const failed = (patch: Partial<KanbanCard> = {}) =>
+      card({
+        workThreadId: ThreadId.make("t-failed"),
+        retries: [retry()],
+        updatedAt: iso(failedAt),
+        ...patch,
+      });
+    const planAt = (
+      cards: ReadonlyArray<KanbanCard>,
+      available: ReadonlyArray<KanbanPool>,
+      nowMs: number,
+    ) => planDispatch(board, cards, available, new Map(), () => 0, nowMs).map((e) => e.cardId);
+
+    it("is not started before its backoff is over, and holds no slot meanwhile", () => {
+      const waiting = failed({ priority: 1 });
+      const other = card({ priority: 4 });
+      const one = pools([[opus, 1]]);
+      // The slot it gave up goes to another card, however low its priority.
+      expect(planAt([waiting, other], one, failedAt)).toEqual([other.id]);
+      expect(planAt([waiting, other], one, due - 1)).toEqual([other.id]);
+      // Due: a card like any other, started again on its own thread.
+      const plan = planDispatch(board, [waiting, other], one, new Map(), () => 0, due);
+      expect(plan.map((entry) => entry.cardId)).toEqual([waiting.id]);
+      expect(plan[0]).toMatchObject({ role: "work", joins: false, fresh: false });
+    });
+
+    it("competes at its own priority once due: no jump ahead, and its age still counts", () => {
+      const waiting = failed({ priority: 3 });
+      const urgent = card({ priority: 1 });
+      const younger = card({ priority: 3 });
+      const cards = [younger, urgent, waiting];
+      expect(planAt(cards, pools([[opus, 1]]), due)).toEqual([urgent.id]);
+      // Among equals the older card goes first, and the retry is the older one here.
+      expect(planAt(cards, pools([[opus, 2]]), due)).toEqual([urgent.id, waiting.id]);
+      expect(planAt(cards, pools([[opus, 3]]), due)).toEqual([urgent.id, waiting.id, younger.id]);
+      // With every slot taken it waits like any other card, for as long as it takes.
+      expect(planAt(cards, pools([[opus, 0]]), due + 24 * 60 * 60_000)).toEqual([]);
+    });
+
+    it("takes the dispatcher's clock from its held slots", () => {
+      const waiting = failed();
+      const one = pools([[opus, 1]]);
+      expect(planDispatch(board, [waiting], one, heldSlots([], due - 1))).toEqual([]);
+      expect(planDispatch(board, [waiting], one, heldSlots([], due)).map((e) => e.cardId)).toEqual([
+        waiting.id,
+      ]);
+      // An explicit clock wins, and the held slots are still slots.
+      expect(planDispatch(board, [waiting], one, heldSlots([], due), () => 0, due - 1)).toEqual([]);
+      expect(
+        planDispatch(board, [waiting], one, heldSlots([["t-held", poolKey(opus)]], due)),
+      ).toEqual([]);
+    });
+
+    it("with no clock at all, measures against the board's newest card stamp", () => {
+      const waiting = failed();
+      const one = pools([[opus, 1]]);
+      expect(planDispatch(board, [waiting], one)).toEqual([]);
+      const touched = card({ stage: "verified", updatedAt: iso(due) });
+      expect(planDispatch(board, [waiting, touched], one).map((e) => e.cardId)).toEqual([
+        waiting.id,
+      ]);
+    });
+
+    it("holds a failed review back the same way", () => {
+      const review = card({
+        stage: "needs_review",
+        retries: [retry("review")],
+        updatedAt: iso(failedAt),
+      });
+      const todo = card();
+      const two = pools([[opus, 2]]);
+      expect(planAt([review, todo], two, due - 1)).toEqual([todo.id]);
+      expect(planAt([review, todo], two, due)).toEqual([review.id, todo.id]);
+    });
+
+    it("holds nothing back for a review started again at once, or a stamp that does not parse", () => {
+      const noVerdict = card({
+        stage: "needs_review",
+        retries: [{ ...retry("review"), kind: "no_verdict", runId: null, state: "restarted" }],
+      });
+      const broken = failed({ retries: [{ ...retry(), at: "not a time" }] });
+      expect(planAt([noVerdict, broken], pools([[opus, 2]]), failedAt)).toEqual([
+        noVerdict.id,
+        broken.id,
+      ]);
     });
   });
 

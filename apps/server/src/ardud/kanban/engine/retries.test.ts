@@ -138,43 +138,44 @@ describe("noRetryReason", () => {
 });
 
 describe("decideRetry: a failed run", () => {
-  it("does not flag the first failure: it records it and waits with its thread", () => {
+  it("does not flag the first failure: it records it and releases the card to wait", () => {
     const decision = decide();
     expect(decision).toEqual({ _tag: "wait", retries: [waiting] });
   });
 
-  it("holds while the same failed run is seen again inside the backoff", () => {
-    expect(decide({ retries: [waiting], afterMs: 30_000 })).toEqual({ _tag: "hold" });
-    expect(decide({ retries: [waiting], afterMs: RETRY_BACKOFF_MS - 1 })).toEqual({ _tag: "hold" });
-  });
-
-  it("restarts the card once the backoff is over", () => {
-    expect(decide({ retries: [waiting], afterMs: RETRY_BACKOFF_MS })).toEqual({
-      _tag: "restart",
-      retries: [restarted],
-    });
-  });
-
-  it("flags the second failure", () => {
+  it("flags the second failure: the card carries the record, so its retry already ran", () => {
     const second = { ...dropped, runId: "run-2" };
     expect(
-      decide({ retries: [restarted], failure: second, afterMs: RETRY_BACKOFF_MS + 5_000 }),
-    ).toEqual({
-      _tag: "flag",
-      why: "the retry failed too",
-    });
-    // A different run failing while the first still waits is a second failure too.
+      decide({
+        retries: [waiting],
+        failure: second,
+        afterMs: RETRY_BACKOFF_MS + 5_000,
+        startedAtMs: start + RETRY_BACKOFF_MS + 1_000,
+      }),
+    ).toEqual({ _tag: "flag", why: "the retry failed too" });
+    // However soon after the start, and whatever the record's state.
     expect(decide({ retries: [waiting], failure: second, afterMs: 10_000 })._tag).toBe("flag");
+    expect(decide({ retries: [restarted], failure: second, afterMs: 10_000 })._tag).toBe("flag");
   });
 
-  it("gives the restart time to start a new run, then flags if the old failure still stands", () => {
-    expect(decide({ retries: [restarted], afterMs: RETRY_BACKOFF_MS + 30_000 })).toEqual({
+  it("gives the started retry time to begin a new run, then flags if the old failure still stands", () => {
+    // Started ten minutes after the failure (it waited for a slot): the time counts from the start.
+    const startedAtMs = start + 10 * 60_000;
+    expect(decide({ retries: [waiting], afterMs: 10 * 60_000 + 30_000, startedAtMs })).toEqual({
       _tag: "hold",
     });
-    expect(decide({ retries: [restarted], afterMs: RETRY_BACKOFF_MS + RETRY_SETTLE_MS })).toEqual({
-      _tag: "flag",
-      why: "the restart did not start a new run",
-    });
+    expect(
+      decide({ retries: [waiting], afterMs: 10 * 60_000 + RETRY_SETTLE_MS - 1, startedAtMs }),
+    ).toEqual({ _tag: "hold" });
+    expect(
+      decide({ retries: [waiting], afterMs: 10 * 60_000 + RETRY_SETTLE_MS, startedAtMs }),
+    ).toEqual({ _tag: "flag", why: "the restart did not start a new run" });
+    // With no start time it counts from the failure.
+    expect(decide({ retries: [waiting], afterMs: RETRY_SETTLE_MS - 1 })).toEqual({ _tag: "hold" });
+    expect(decide({ retries: [waiting], afterMs: RETRY_SETTLE_MS })._tag).toBe("flag");
+    expect(
+      decide({ retries: [waiting], afterMs: RETRY_SETTLE_MS, startedAtMs: Number.NaN })._tag,
+    ).toBe("flag");
   });
 
   it("flags at once what a retry can't help", () => {
@@ -283,8 +284,8 @@ describe("retry records and notes", () => {
   it("tells a restarted reviewer why, and nobody else", () => {
     expect(reviewRetryNote({ retries: undefined })).toBeNull();
     expect(reviewRetryNote({ retries: [waiting, restarted] })).toBeNull();
-    expect(reviewRetryNote({ retries: [{ ...waiting, role: "review" }] })).toBeNull();
-    expect(reviewRetryNote({ retries: [{ ...restarted, role: "review" }] })).toMatch(
+    // A reviewer's failed run keeps the waiting record until the retried turn ends.
+    expect(reviewRetryNote({ retries: [{ ...waiting, role: "review" }] })).toMatch(
       /failed: "upstream closed the stream"/,
     );
     expect(

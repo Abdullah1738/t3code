@@ -15,11 +15,13 @@ import {
   kanbanEvaluatorStep,
   kanbanHeldUpBy,
   kanbanPickOrder,
+  kanbanRetryNotBefore,
   kanbanRetrying,
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   KANBAN_AGING_STEP_MS,
+  KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
   KANBAN_BOARD_IMAGE_MAX,
   KanbanSubtask,
@@ -104,6 +106,32 @@ describe("KanbanCard retries", () => {
         stalled: { reason: "Run failed: x", by: { _tag: "owner" }, at: decoded.createdAt },
       }),
     ).toBeUndefined();
+  });
+
+  it("says when a failed run's card may start again, and nothing for other cards", () => {
+    const at = "2026-11-10T10:00:00.000Z";
+    const waiting = {
+      kind: "run_failed",
+      role: "work",
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at,
+      state: "waiting",
+    } as const;
+    expect(kanbanRetryNotBefore({ retries: undefined })).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [] })).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [waiting] })).toBe(
+      Date.parse(at) + KANBAN_RETRY_BACKOFF_MS,
+    );
+    // A review started again at once waits for nothing; a stamp that doesn't parse holds nothing back.
+    expect(
+      kanbanRetryNotBefore({
+        retries: [
+          { ...waiting, kind: "no_verdict", role: "review", runId: null, state: "restarted" },
+        ],
+      }),
+    ).toBeNull();
+    expect(kanbanRetryNotBefore({ retries: [{ ...waiting, at: "not a time" }] })).toBeNull();
   });
 });
 

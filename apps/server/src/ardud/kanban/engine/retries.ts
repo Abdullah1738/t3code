@@ -4,9 +4,19 @@
  * once, and an evaluator had to restart it by hand. Now the first failure of a
  * kind restarts the same role on the same card once, and only the second flags.
  *
+ * A failed run's card goes straight back to its queue (To-Do or Needs review)
+ * with its thread and no pool slot. The dispatcher does not start it before
+ * RETRY_BACKOFF_MS is over (Rules.planDispatch, "not before"); after that it is
+ * started like any other card, on the same thread.
+ *
  * Pure decisions; the engine's turn-end code calls them where it used to flag.
  */
-import { type KanbanBoard, type KanbanCard, type KanbanCardRetry } from "@t3tools/contracts";
+import {
+  KANBAN_RETRY_BACKOFF_MS,
+  type KanbanBoard,
+  type KanbanCard,
+  type KanbanCardRetry,
+} from "@t3tools/contracts";
 
 import { isContextFull, isOutage } from "./rules.ts";
 
@@ -14,22 +24,22 @@ export type RetryKind = KanbanCardRetry["kind"];
 export type RetryRole = KanbanCardRetry["role"];
 
 /**
- * How long a failed run waits before its restart, so a provider that is down is not
- * hammered. The card keeps its thread and slot meanwhile; the tick (every 30
- * seconds) sees the failed idle thread again and restarts it once this has passed.
+ * How long a failed run's card waits in its queue before it may start again, so a
+ * provider that just failed is not hit again at once. The card holds no slot
+ * meanwhile. The dispatcher runs at least every 30 seconds (the tick), so the
+ * retry starts 60 to 90 seconds after the failure when a slot is free.
  */
-export const RETRY_BACKOFF_MS = 60_000;
+export const RETRY_BACKOFF_MS = KANBAN_RETRY_BACKOFF_MS;
 
 /**
- * How long after a restart the old failed run may still be the thread's latest
- * (the wake is on its way) before that counts as the retry having failed.
+ * How long after the dispatcher started the retry the old failed run may still be
+ * the thread's latest (the wake is on its way) before that counts as the retry
+ * having failed.
  */
 export const RETRY_SETTLE_MS = 2 * 60_000;
 
-/** Card event when a failed run is held for its one retry; a board shows "Retrying". */
+/** Card event when a failed run's card goes back to its queue for its one retry; a board shows "Retrying". */
 export const RETRYING_EVENT = "Run failed, retrying once";
-/** Card event when the card goes back to its queue for the retry. */
-export const RESTARTED_EVENT = "Retrying after a failed run";
 export const NO_VERDICT_RESTARTED_EVENT = "Reviewer stopped without a verdict, retrying once";
 export const NO_VERDICT_REASON = "Reviewer stopped without a verdict";
 
@@ -97,11 +107,15 @@ export function noRetryReason(failure: RetryFailure): string | null {
 export type RetryDecision =
   /** Flag the card as before. `why` says why no (further) retry. */
   | { readonly _tag: "flag"; readonly why: string }
-  /** First sighting of a failed run: save `retries`, log RETRYING_EVENT, leave the card with its thread. */
+  /**
+   * A failed run's first failure: release the card to its queue unflagged, with
+   * `retries`, and log RETRYING_EVENT. It keeps its thread and holds no slot; the
+   * dispatcher starts it again once the backoff is over.
+   */
   | { readonly _tag: "wait"; readonly retries: ReadonlyArray<KanbanCardRetry> }
-  /** Nothing to do now: the backoff is still running, the restart is on its way, or the board is paused. */
+  /** Nothing to do now: the retry's wake is on its way, or the board is paused. */
   | { readonly _tag: "hold" }
-  /** Release the card to its queue unflagged, with `retries`; the dispatcher starts it again. */
+  /** A review with no verdict: release the card to its queue unflagged, with `retries`; the dispatcher starts it again at once. */
   | { readonly _tag: "restart"; readonly retries: ReadonlyArray<KanbanCardRetry> };
 
 export interface RetryInput {
@@ -116,16 +130,19 @@ export interface RetryInput {
   readonly nowMs: number;
   /** The decision's own stamp, as the card stores it. */
   readonly at: string;
+  /** When the card's running turn was started (its `movedAt`), for a card that failed again. */
+  readonly startedAtMs?: number | undefined;
 }
 
 /**
  * What to do where the engine used to flag.
  *
- * run_failed: the first failed run of an attempt is recorded and waits
- * RETRY_BACKOFF_MS with its thread (`wait`, then `hold` each time the same run is
- * seen again), then the card is released for one restart (`restart`). A different
- * failed run after that, or the old one still standing RETRY_SETTLE_MS after the
- * restart, flags. A failure that a retry can't help (see noRetryReason) flags at once.
+ * run_failed: the first failed run of an attempt is recorded and the card is
+ * released to its queue (`wait`); the dispatcher holds it back for RETRY_BACKOFF_MS
+ * and then starts it once more. Asked again about a card that carries the record,
+ * the card is running, so its retry was started: a different failed run, or the
+ * old one still standing RETRY_SETTLE_MS after that start, flags. A failure that a
+ * retry can't help (see noRetryReason) flags at once.
  *
  * no_verdict: asked only once the reviewer's nudge is used. The first time the
  * review is restarted at once (there is no provider to spare); the second flags.
@@ -173,18 +190,13 @@ export function decideRetry(input: RetryInput): RetryDecision {
       ],
     };
   }
+  // The card runs again, so the dispatcher started its one retry. The old run can
+  // still be the thread's latest while the wake is on its way.
   const sameRun = entry.runId === runId;
-  const since = input.nowMs - Date.parse(entry.at);
-  if (entry.state === "waiting") {
-    // Another run failed while this one waited: that was the second failure.
-    if (!sameRun) return { _tag: "flag", why: "a second run failed" };
-    if (since < RETRY_BACKOFF_MS) return { _tag: "hold" };
-    return {
-      _tag: "restart",
-      retries: [...others, { ...entry, at: input.at, state: "restarted" }],
-    };
-  }
-  // Restarted. The old run can still be the latest while the wake is on its way.
+  const started = input.startedAtMs;
+  const since =
+    input.nowMs -
+    (started !== undefined && Number.isFinite(started) ? started : Date.parse(entry.at));
   if (sameRun && since < RETRY_SETTLE_MS) return { _tag: "hold" };
   return {
     _tag: "flag",
@@ -220,9 +232,7 @@ export const withRetryNote = (note: string | null | undefined, message: string) 
 
 /** The line a restarted reviewer's brief opens with, or null when the card isn't on a review retry. */
 export const reviewRetryNote = (card: Pick<KanbanCard, "retries">): string | null => {
-  const retry = card.retries?.findLast(
-    (entry) => entry.role === "review" && entry.state === "restarted",
-  );
+  const retry = card.retries?.findLast((entry) => entry.role === "review");
   if (retry === undefined) return null;
   return retry.kind === "no_verdict"
     ? "Your last turn on this review ended without a verdict, also after a reminder. The board is starting the review again once; if it ends without a verdict again the card is flagged. If you already reached a verdict, record it now with card_review_result."

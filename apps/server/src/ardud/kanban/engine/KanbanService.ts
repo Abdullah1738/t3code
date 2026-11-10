@@ -1450,19 +1450,24 @@ const make = Effect.gen(function* () {
     Effect.flatMap(nowMillis, (at) =>
       Ref.update(holds, (all) => new Map(all).set(threadId, { boardId, pool, at })),
     );
-  /** One board's held slots, thread id to pool, as the rules take them. `except`: a start's own key. */
+  /**
+   * One board's held slots, thread id to pool, as the rules take them, stamped with
+   * the time of the read: the planner measures a waiting retry's backoff against it
+   * (see Rules.HeldSlots). `except`: a start's own key.
+   */
   const boardHolds = (boardId: string, except?: string) =>
-    Effect.map(
-      Ref.get(holds),
-      (all) =>
-        new Map([
+    Effect.zipWith(Ref.get(holds), nowMillis, (all, now) =>
+      Rules.heldSlots(
+        [
           ...[...all].flatMap(([threadId, held]) =>
             held.boardId === boardId ? [[threadId as string, held.pool] as const] : [],
           ),
           ...[...starting]
             .filter(([key]) => key.startsWith(`${boardId}:`) && key !== except)
             .map(([key, value]) => [value.threadId ?? key, value.pool] as const),
-        ]),
+        ],
+        now,
+      ),
     );
   // Threads confirmed missing at the previous tick; a failed read is not a miss.
   const missing = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
@@ -5555,8 +5560,9 @@ const make = Effect.gen(function* () {
             continue;
           }
           // The first failure a retry can help is run again once (see Retries): the
-          // card waits with its thread for the backoff, then goes back to To-Do
-          // unflagged and the dispatcher wakes the same thread. Anything else is flagged.
+          // card goes back to To-Do unflagged, with its thread and no slot. The
+          // dispatcher holds it back for the backoff, then wakes the same thread like
+          // any other start. Anything else is flagged.
           const retry = Retries.decideRetry({
             kind: "run_failed",
             role: "work",
@@ -5565,30 +5571,29 @@ const make = Effect.gen(function* () {
             paused: Retries.heldByPause(yield* boardOf(entry.boardId), entry),
             nowMs: Date.parse(at),
             at,
+            startedAtMs: Date.parse(entry.movedAt),
           });
           if (retry._tag === "hold") continue;
           const next: KanbanCard =
             retry._tag === "wait"
-              ? { ...entry, retries: retry.retries, updatedAt: at }
-              : retry._tag === "restart"
-                ? {
-                    ...release(entry),
-                    stage: "todo",
-                    stalled: null,
-                    nudgedAt: null,
-                    retries: retry.retries,
-                    wakeNote: Retries.withRetryNote(entry.wakeNote, failure.message),
-                    movedAt: at,
-                    updatedAt: at,
-                  }
-                : {
-                    ...Retries.withoutRetries(release(entry)),
-                    stage: "todo",
-                    stalled: { reason, by: system, at },
-                    nudgedAt: null,
-                    movedAt: at,
-                    updatedAt: at,
-                  };
+              ? {
+                  ...release(entry),
+                  stage: "todo",
+                  stalled: null,
+                  nudgedAt: null,
+                  retries: retry.retries,
+                  wakeNote: Retries.withRetryNote(entry.wakeNote, failure.message),
+                  // movedAt stays: back in the queue the card keeps the age it had.
+                  updatedAt: at,
+                }
+              : {
+                  ...Retries.withoutRetries(release(entry)),
+                  stage: "todo",
+                  stalled: { reason, by: system, at },
+                  nudgedAt: null,
+                  movedAt: at,
+                  updatedAt: at,
+                };
           if (
             expectedFailedWorkRunId !== undefined &&
             compactSent?._tag !== "Success" &&
@@ -5596,17 +5601,10 @@ const make = Effect.gen(function* () {
           )
             return;
           if (retry._tag === "wait") {
-            yield* logEvent(next, system, "thread", {
-              body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
-            });
-            yield* saveCard(next);
-            continue;
-          }
-          if (retry._tag === "restart") {
             yield* logEvent(next, system, "moved", {
               fromStage: entry.stage,
               toStage: "todo",
-              body: `${Retries.RESTARTED_EVENT}: ${failure.message}`,
+              body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
             });
             yield* saveCard(next);
             continue;
@@ -5687,7 +5685,8 @@ const make = Effect.gen(function* () {
         return;
       }
       const reason = `Run failed: ${failure.message}`;
-      // As for a worker: the first failure a retry can help is run again once.
+      // As for a worker: the first failure a retry can help is run again once. The
+      // card goes back to Needs review with no slot and waits out the backoff there.
       const retry = Retries.decideRetry({
         kind: "run_failed",
         role: "review",
@@ -5696,32 +5695,25 @@ const make = Effect.gen(function* () {
         paused: Retries.heldByPause(yield* boardOf(card.boardId), card),
         nowMs: Date.parse(at),
         at,
+        startedAtMs: Date.parse(card.movedAt),
       });
       if (retry._tag === "hold") return;
       if (retry._tag === "wait") {
-        const waiting: KanbanCard = { ...card, retries: retry.retries, updatedAt: at };
-        yield* logEvent(waiting, system, "thread", {
-          body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
-        });
-        yield* saveCard(waiting);
-        return;
-      }
-      if (retry._tag === "restart") {
-        const again: KanbanCard = {
+        const waiting: KanbanCard = {
           ...release(card),
           stage: "needs_review",
           stalled: null,
           nudgedAt: null,
           retries: retry.retries,
-          movedAt: at,
+          // movedAt stays: back in the queue the card keeps the age it had.
           updatedAt: at,
         };
-        yield* logEvent(again, system, "moved", {
+        yield* logEvent(waiting, system, "moved", {
           fromStage: card.stage,
-          toStage: again.stage,
-          body: `${Retries.RESTARTED_EVENT}: ${failure.message}`,
+          toStage: waiting.stage,
+          body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
         });
-        yield* saveCard(again);
+        yield* saveCard(waiting);
         yield* kick;
         return;
       }

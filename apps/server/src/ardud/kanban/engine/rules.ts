@@ -10,6 +10,7 @@ import {
   kanbanCardModels,
   kanbanHeldUpBy,
   kanbanPickOrder,
+  kanbanRetryNotBefore,
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
@@ -472,6 +473,26 @@ export function poolThreads(
   return byPool;
 }
 
+/** The newest stamp on any card: the clock of a caller that passes none. */
+const newestStamp = (cards: ReadonlyArray<KanbanCard>): number => {
+  let newest = Number.NEGATIVE_INFINITY;
+  for (const card of cards) {
+    const at = Date.parse(card.updatedAt);
+    if (at > newest) newest = at;
+  }
+  return newest;
+};
+
+/**
+ * A board's held slots (thread id to pool) as the dispatcher reads them, with the
+ * time of the read. The dispatcher's plan call hands planDispatch its holds and
+ * no clock, so `asOf` is the time a waiting retry is measured against there. A
+ * plain Map is a HeldSlots with no time.
+ */
+export type HeldSlots = ReadonlyMap<string, string> & { readonly asOf?: number };
+export const heldSlots = (entries: Iterable<readonly [string, string]>, asOf: number): HeldSlots =>
+  Object.assign(new Map(entries), { asOf });
+
 /**
  * Fill free pool slots: reviews first (oldest first), then todo in pick
  * order (see `schedule`), skipping blocked, settled and backlog cards. Lowering a pool below what is
@@ -481,12 +502,18 @@ export function poolThreads(
  * A card with no work thread yet starts on its highest-weight model with a
  * free slot; `pick(n)` returns an index below n to break a tie. `nowMs` is the
  * clock waiting cards age against; left out, it is the board's newest card stamp.
+ *
+ * Not before: a card whose run failed waits in its queue for its one retry and
+ * is not started until its backoff is over (kanbanRetryNotBefore). It holds no
+ * slot meanwhile, and once due it is a card like any other: same rank, same
+ * age, same wait for a free slot. The clock for this is `nowMs`, else the
+ * holds' `asOf`, else the board's newest card stamp.
  */
 export function planDispatch(
   board: KanbanBoard,
   cards: ReadonlyArray<KanbanCard>,
   pools: ReadonlyArray<KanbanPool>,
-  holds: ReadonlyMap<string, string> = new Map(),
+  holds: HeldSlots = new Map(),
   pick: (count: number) => number = () => 0,
   nowMs?: number,
 ): ReadonlyArray<Dispatch> {
@@ -504,6 +531,13 @@ export function planDispatch(
   const free = new Map<string, number>();
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const clock = nowMs ?? holds.asOf;
+  let newest: number | undefined;
+  const retryHeld = (card: KanbanCard) => {
+    const notBefore = kanbanRetryNotBefore(card);
+    if (notBefore === null) return false;
+    return notBefore > (clock ?? (newest ??= newestStamp(cards)));
+  };
   const waiting = cards.filter(
     (card) =>
       (kept === null || kept.has(card.id)) &&
@@ -511,6 +545,7 @@ export function planDispatch(
       card.activeThreadId === null &&
       card.stalled === null &&
       card.priority !== KANBAN_BACKLOG &&
+      !retryHeld(card) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
       !kanbanWaitsOnEvaluator(card),
