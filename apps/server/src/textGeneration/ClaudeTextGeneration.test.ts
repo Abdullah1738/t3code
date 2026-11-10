@@ -228,18 +228,16 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
   const ProbeJson = Schema.Struct({ ok: Schema.Boolean });
   const runStalledJson = (port: number, timeoutMs?: number | null) =>
     withFakeClaudeEnv({ output: "", lifecyclePort: port }, (textGeneration) =>
-      textGeneration
-        .generateJson!({
-          cwd: process.cwd(),
-          prompt: "Reply ok",
-          outputSchema: ProbeJson,
-          modelSelection: {
-            instanceId: ProviderInstanceId.make("claudeAgent"),
-            model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
-          },
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        })
-        .pipe(Effect.flip),
+      textGeneration.generateJson!({
+        cwd: process.cwd(),
+        prompt: "Reply ok",
+        outputSchema: ProbeJson,
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+        },
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }).pipe(Effect.flip),
     );
   // Past the CLI's 1-second force kill, so a run the clock timed out has ended by then.
   const settle = Effect.sleep("2 seconds").pipe(TestClock.withLive);

@@ -220,15 +220,13 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
   const ProbeJson = Schema.Struct({ ok: Schema.Boolean });
   const runStalledJson = (port: number, timeoutMs?: number | null) =>
     withFakeCodexEnv({ output: "", lifecycle: { port, command: "exec" } }, (textGeneration) =>
-      textGeneration
-        .generateJson!({
-          cwd: process.cwd(),
-          prompt: "Reply ok",
-          outputSchema: ProbeJson,
-          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
-          ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        })
-        .pipe(Effect.flip),
+      textGeneration.generateJson!({
+        cwd: process.cwd(),
+        prompt: "Reply ok",
+        outputSchema: ProbeJson,
+        modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }).pipe(Effect.flip),
     );
   // Past the CLI's 1-second force kill, so a run the clock timed out has ended by then.
   const settle = Effect.sleep("2 seconds").pipe(TestClock.withLive);

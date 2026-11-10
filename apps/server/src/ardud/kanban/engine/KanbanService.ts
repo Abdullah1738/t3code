@@ -1211,12 +1211,9 @@ const make = Effect.gen(function* () {
   const goalsRunning = yield* Ref.make<ReadonlySet<KanbanBoardId>>(new Set());
   // Cards with a title writer running, each with the fields of a write asked for meanwhile
   // (null when none). One writer per card; the asked-for write runs after it, on the latest card.
-  const titlesRunning = yield* Ref.make<
-    ReadonlyMap<
-      KanbanCardId,
-      { readonly title: boolean; readonly description: boolean } | null
-    >
-  >(new Map());
+  type WriterFields = { readonly title: boolean; readonly description: boolean };
+  type WritersRunning = ReadonlyMap<KanbanCardId, WriterFields | null>;
+  const titlesRunning = yield* Ref.make<WritersRunning>(new Map());
   const dropHold = (threadId: ThreadId) =>
     Ref.update(holds, (all) => {
       if (!all.has(threadId)) return all;
@@ -1730,7 +1727,6 @@ const make = Effect.gen(function* () {
     );
   });
 
-  type WriterFields = { readonly title: boolean; readonly description: boolean };
   // Runs the writer, then any write asked for while it ran, until none is left.
   const writerRuns = (cardId: KanbanCard["id"], fields: WriterFields): Effect.Effect<void> =>
     writeTitle(cardId, fields).pipe(
@@ -1738,7 +1734,7 @@ const make = Effect.gen(function* () {
         Effect.logWarning("kanban title writer failed", { cardId, cause }),
       ),
       Effect.andThen(
-        Ref.modify(titlesRunning, (all): [WriterFields | null, typeof all] => {
+        Ref.modify(titlesRunning, (all): [WriterFields | null, WritersRunning] => {
           const next = all.get(cardId) ?? null;
           if (next !== null) return [next, new Map(all).set(cardId, null)];
           const rest = new Map(all);
@@ -1754,7 +1750,7 @@ const make = Effect.gen(function* () {
   // the writer itself stays interruptible, so closing the scope still kills its CLI child.
   const forkWriter = (cardId: KanbanCard["id"], fields: WriterFields) =>
     Effect.uninterruptibleMask((restore) =>
-      Ref.modify(titlesRunning, (all): [boolean, typeof all] => [
+      Ref.modify(titlesRunning, (all): [boolean, WritersRunning] => [
         !all.has(cardId),
         new Map(all).set(cardId, all.has(cardId) ? fields : null),
       ]).pipe(
