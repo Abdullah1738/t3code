@@ -7,8 +7,12 @@ import * as Semaphore from "effect/Semaphore";
  * - interactive: the web UI's snapshot builds (WebSocket).
  * - agent: build/serialize step only, for control API replies. Nothing that
  *   reads the database, waits or writes holds it.
- * - snapshot: whole-request admission for the orchestration snapshot and board
- *   HTTP routes and the full-shell control list, whose reads build the reply.
+ * - snapshot: whole-request admission for the shell snapshot and board HTTP
+ *   routes and the full-shell control list, whose reads build the reply.
+ * - thread: whole-request admission for one thread's HTTP views (snapshot,
+ *   bounded window, history page, transcript). Opening a thread on a phone
+ *   has a 6 s client deadline; on the shared snapshot lane it queued behind
+ *   shell pages and board snapshots (p95 3.3 s, max 4.9 s on 10 Nov 2026).
  * - poll: the per-thread control message read, so bridge polls queue only
  *   behind each other, never behind lists, snapshots or MCP reads.
  * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).
@@ -20,21 +24,22 @@ import * as Semaphore from "effect/Semaphore";
  * GET /threads (p95 14.6 s) and MCP reads (t3_thread_read up to 153 s, while
  * waiting for reader slots), and everything else on it hit client timeouts.
  */
-export type Lane = "interactive" | "agent" | "snapshot" | "poll" | "mcp";
+export type Lane = "interactive" | "agent" | "snapshot" | "thread" | "poll" | "mcp";
 
 export class ReplyBuilders extends Context.Service<
   ReplyBuilders,
   { readonly [K in Lane]: Semaphore.Semaphore }
 >()("t3/ardud/http/ReplyBuilders") {}
 
-// Payload construction is still bounded: at most 2 + 2 + 2 + 4 admitted 16 MiB
-// builds (160 MiB, excluding object/encoding overhead); poll reads are one
+// Payload construction is still bounded: at most 2 + 2 + 2 + 2 + 4 admitted 16 MiB
+// builds (192 MiB, excluding object/encoding overhead); poll reads are one
 // thread's messages each. Each lane is shared across connections, not
 // allocated per board or request.
 export const PERMITS: { readonly [K in Lane]: number } = {
   interactive: 2,
   agent: 2,
   snapshot: 2,
+  thread: 2,
   poll: 4,
   mcp: 4,
 };
@@ -46,6 +51,7 @@ export const layer = Layer.effect(
       interactive: yield* Semaphore.make(PERMITS.interactive),
       agent: yield* Semaphore.make(PERMITS.agent),
       snapshot: yield* Semaphore.make(PERMITS.snapshot),
+      thread: yield* Semaphore.make(PERMITS.thread),
       poll: yield* Semaphore.make(PERMITS.poll),
       mcp: yield* Semaphore.make(PERMITS.mcp),
     };
