@@ -386,6 +386,12 @@ export interface ProjectionTimelinePage {
 
 export interface ShellSnapshotOptions {
   readonly afterThreadId?: string;
+  /**
+   * Only these threads (and their fork sources), from one bounded read. Used by
+   * the control API's live lists instead of one shell transaction per thread.
+   * A targeted read carries no snapshot sequence (0): it is not a sync baseline.
+   */
+  readonly threadIds?: ReadonlyArray<string>;
   readonly limit?: number;
   readonly location?: "active" | "archive";
   readonly projectId?: ProjectId;
@@ -5916,6 +5922,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         idleSubagentsUpdatedSince,
         afterThreadId,
         limit,
+        threadIds,
       }: ShellSnapshotOptions = {},
     ) =>
       sql<ShellThreadRow>`
@@ -5926,6 +5933,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             -- clients fetch ~60 pages at 8s each, and the PR sync stalled every 30s.
             WITH${omitIdleSubagents ? sql` RECURSIVE` : sql``} shell_runs AS ${
               threadId === undefined &&
+              threadIds === undefined &&
               limit === undefined &&
               projectId === undefined &&
               !unsettledOnly &&
@@ -5934,7 +5942,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : sql`NOT MATERIALIZED`
             } (
               SELECT * FROM orchestration_v2_projection_runs
-              ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}
+              ${
+                threadId !== undefined
+                  ? sql`WHERE thread_id = ${threadId}`
+                  : threadIds !== undefined && threadIds.length > 0
+                    ? sql`WHERE thread_id IN ${sql.in(threadIds)}`
+                    : sql``
+              }
             )${
               omitIdleSubagents
                 ? sql`,
@@ -6121,8 +6135,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               LIMIT 1
             ) AND blocked.status = 'failed'
             WHERE t.deleted_at IS NULL${threadId === undefined ? sql`` : sql` AND t.thread_id = ${threadId}`}${
-              projectId === undefined ? sql`` : sql` AND t.project_id = ${projectId}`
-            }${
+              threadIds === undefined
+                ? sql``
+                : threadIds.length === 0
+                  ? sql` AND 0`
+                  : sql` AND t.thread_id IN ${sql.in(threadIds)}`
+            }${projectId === undefined ? sql`` : sql` AND t.project_id = ${projectId}`}${
               location === "active"
                 ? sql` AND json_extract(t.payload_json, '$.archivedAt') IS NULL`
                 : location === "archive"
@@ -6579,7 +6597,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         yield* Effect.all([
           readForThreadIds((ids) => ShellQueries.selectShellRunRows(sql, ids), forkSourceIds),
           readForThreadIds((ids) => ShellQueries.selectShellRunItemCounts(sql, ids), forkSourceIds),
-          sql<{ readonly snapshot_sequence: number | null }>`
+          // A targeted read is not a sync baseline; skip the events-table scan.
+          options?.threadIds !== undefined
+            ? Effect.succeed([] as ReadonlyArray<{ readonly snapshot_sequence: number | null }>)
+            : sql<{ readonly snapshot_sequence: number | null }>`
         SELECT MAX(sequence) AS snapshot_sequence
         FROM orchestration_events
         WHERE application_event_version = 2
@@ -6833,6 +6854,12 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             if (
               options?.projectId !== undefined &&
               projection.thread.projectId !== options.projectId
+            ) {
+              return false;
+            }
+            if (
+              options?.threadIds !== undefined &&
+              !options.threadIds.includes(projection.thread.id)
             ) {
               return false;
             }

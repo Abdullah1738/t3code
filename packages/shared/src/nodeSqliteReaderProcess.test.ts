@@ -56,3 +56,47 @@ it("keeps a spawned process owned until exit even after an IPC error", async () 
   runtime.terminate();
   expect(kill).toHaveBeenCalledTimes(1);
 });
+
+// A stand-in worker for the guard: "block" spins like a long native SQLite call.
+const guardWorker = `
+const { parentPort, workerData } = require("node:worker_threads");
+let db = { isTransaction: false };
+parentPort.on("message", ({ id, op, ms }) => {
+  if (op === "begin") db.isTransaction = true;
+  if (op === "commit") db.isTransaction = false;
+  if (op === "block") { const end = Date.now() + ms; while (Date.now() < end) {} }
+  parentPort.postMessage({ id });
+});`;
+
+const runGuarded = (data: Record<string, unknown>, ops: ReadonlyArray<Record<string, unknown>>) =>
+  new Promise<"answered" | "killed">((resolve) => {
+    const runtime = startReaderProcess(guardWorker, data);
+    let answered = 0;
+    runtime.on("message", () => {
+      if (++answered === ops.length) {
+        resolve("answered");
+        void runtime.terminate();
+      }
+    });
+    runtime.on("exit", () => resolve("killed"));
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a child process, not a window.
+    ops.forEach((op, id) => runtime.postMessage({ id, ...op }));
+  });
+
+it("the child's guard gives autocommit work the long limit and an open transaction its own", async () => {
+  const limits = { statementLimitMs: 4_000, transactionLimitMs: 400 };
+  // Past the transaction limit but outside a transaction: not killed.
+  expect(await runGuarded(limits, [{ op: "block", ms: 1_200 }])).toBe("answered");
+  // The same work inside a transaction is killed at the transaction limit.
+  expect(
+    await runGuarded(limits, [{ op: "begin" }, { op: "block", ms: 3_000 }, { op: "commit" }]),
+  ).toBe("killed");
+  // Without a transaction limit (the view reader) a transaction keeps the one limit.
+  expect(
+    await runGuarded({ statementLimitMs: 4_000 }, [
+      { op: "begin" },
+      { op: "block", ms: 1_200 },
+      { op: "commit" },
+    ]),
+  ).toBe("answered");
+}, 30_000);

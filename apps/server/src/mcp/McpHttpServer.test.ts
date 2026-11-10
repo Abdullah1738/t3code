@@ -226,6 +226,56 @@ it.effect("returns a clear bounded tool error before serializing a giant result"
   );
 });
 
+it.effect("a large-read tool that waits holds only its own mcp lane", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let calls = 0;
+    const ReadToolkit = Toolkit.make(
+      Tool.make("t3_thread_read", {
+        description: "Read a synthetic thread.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      ReadToolkit,
+      McpToolAccess.toLayer(ReadToolkit, {
+        // 10 Nov 2026: t3_thread_read held a permit up to 153 s while it waited for
+        // reader slots and acknowledged task results.
+        t3_thread_read: McpToolAccess.reads(() =>
+          Effect.suspend(() => {
+            calls++;
+            return (calls === 2 ? Deferred.succeed(entered, undefined) : Effect.void).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as({ ready: true }),
+            );
+          }),
+        ),
+      }),
+    ).pipe(Layer.provideMerge(McpServer.McpServer.layer), Layer.provideMerge(ReplyBuilders.layer));
+    yield* Effect.gen(function* () {
+      const requests = yield* Effect.forEach([1, 2], () =>
+        callTool("t3_thread_read", {}).pipe(Effect.forkScoped),
+      );
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      // Control, snapshot and poll lanes stay free while large reads wait.
+      for (const lane of ["agent", "snapshot", "poll", "interactive"] as const) {
+        expect(yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane])).toBe(true);
+        yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+      }
+      // The two waiting reads hold two mcp permits: large results stay bounded.
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 1)).toBe(false);
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp - 2)).toBe(true);
+      yield* builders.mcp.release(ReplyBuilders.PERMITS.mcp - 2);
+      yield* Deferred.succeed(release, undefined);
+      for (const request of requests) expect((yield* Fiber.join(request)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.scoped),
+);
+
 it.effect("board tool readiness waits leave the shared reply builders available", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();

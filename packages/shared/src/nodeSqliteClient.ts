@@ -39,7 +39,7 @@ import {
   ReaderLane,
 } from "./nodeSqliteReaderLanes.ts";
 
-export { ReaderLane } from "./nodeSqliteReaderLanes.ts";
+export { ReaderLane, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
 export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 
@@ -49,6 +49,12 @@ export interface SqliteClientConfig {
   readonly filename: string;
   /** Reserve a bounded process for fresh session lookups. */
   readonly authReaderProcess?: boolean | undefined;
+  /**
+   * Reserved (auth/identity) lanes: an autocommit statement still running this
+   * long retires its process. Callers stop waiting at readerStatementLimit and
+   * get a typed "busy". Default max(30 s, 6 x readerStatementLimit).
+   */
+  readonly readerWedgeLimit?: Duration.Input | undefined;
   /** Reserve a separate bounded process for execution identity lookups. */
   readonly identityReaderProcess?: boolean | undefined;
 
