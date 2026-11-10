@@ -96,7 +96,6 @@ import * as PullRequestReadCache from "./PullRequestReadCache.ts";
 import * as PullRequestProviderRegistry from "./PullRequestProviderRegistry.ts";
 import * as ViewedFiles from "./pullRequestViewedFiles.ts";
 
-
 type ProjectShellRead = ReturnType<ProjectService.ProjectService["Service"]["getShell"]>;
 
 /**

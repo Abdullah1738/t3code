@@ -28,12 +28,23 @@ if (
   throw new Error("Output already contains a paired experiment; choose a new directory");
 const controllerHash = hash(
   await Promise.all(
-    ["driver.ts", "sampler.ts", "network.ts", "process.ts", "host.ts", "paired.ts", "ownerAnswers.ts", "ownerMessagePosts.ts", "ownerAnswerFixture.ts", "compare.ts", "metrics.ts"].map((name) =>
-      fileHash(new URL(name, import.meta.url).pathname),
-    ),
+    [
+      "driver.ts",
+      "sampler.ts",
+      "network.ts",
+      "process.ts",
+      "host.ts",
+      "paired.ts",
+      "ownerAnswers.ts",
+      "ownerMessagePosts.ts",
+      "ownerAnswerFixture.ts",
+      "compare.ts",
+      "metrics.ts",
+    ].map((name) => fileHash(new URL(name, import.meta.url).pathname)),
   ),
 );
-const harnessHash = hash([controllerHash,
+const harnessHash = hash([
+  controllerHash,
   await fileHash(resolve("apps/server/scripts/acp-mock-agent.ts")),
   await fileHash(resolve("apps/server/scripts/acpMockCancellationState.ts")),
   await fileHash(new URL("../budgets.json", import.meta.url).pathname),

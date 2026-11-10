@@ -24,9 +24,15 @@ const serverHash = await artifactHash(resolve(entry));
 const harnessHash = hash([
   process.env.ROBOB_PERF_LEGACY_BURST === "1" ? "legacy-burst" : "steady",
   await Promise.all(
-    ["driver.ts", "sampler.ts", "network.ts", "process.ts", "ownerAnswers.ts", "ownerMessagePosts.ts", "ownerAnswerFixture.ts"].map((name) =>
-      fileHash(resolve("packages/perf-harness/src", name)),
-    ),
+    [
+      "driver.ts",
+      "sampler.ts",
+      "network.ts",
+      "process.ts",
+      "ownerAnswers.ts",
+      "ownerMessagePosts.ts",
+      "ownerAnswerFixture.ts",
+    ].map((name) => fileHash(resolve("packages/perf-harness/src", name))),
   ),
   await fileHash(resolve("apps/server/scripts/acp-mock-agent.ts")),
   await fileHash(resolve("apps/server/scripts/acpMockCancellationState.ts")),

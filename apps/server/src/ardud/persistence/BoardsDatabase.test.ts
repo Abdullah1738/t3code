@@ -281,12 +281,20 @@ it.live("identity import reads bypass a held boards reader", () =>
     yield* db.ready;
     const held = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
-    const reader = yield* Effect.forkChild(db.sql.withTransaction(db.sql`SELECT 1`.pipe(
-      Effect.andThen(Deferred.succeed(held, undefined)),
-      Effect.andThen(Deferred.await(release)),
-    )).pipe(NodeSqliteClient.readOnly));
+    const reader = yield* Effect.forkChild(
+      db.sql
+        .withTransaction(
+          db.sql`SELECT 1`.pipe(
+            Effect.andThen(Deferred.succeed(held, undefined)),
+            Effect.andThen(Deferred.await(release)),
+          ),
+        )
+        .pipe(NodeSqliteClient.readOnly),
+    );
     yield* Deferred.await(held);
-    const rows = yield* db.sql<{ thread_id: string }>`SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = 'ses_1'`.pipe(
+    const rows = yield* db.sql<{
+      thread_id: string;
+    }>`SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = 'ses_1'`.pipe(
       NodeSqliteClient.identityReadOnly,
       Effect.timeout("2 seconds"),
       Effect.ensuring(Deferred.succeed(release, undefined)),

@@ -469,10 +469,8 @@ function useSidebarThreads(input: {
   // Same atom the thread route reads, so this adds no subscription.
   const routeThreadLineage =
     Option.getOrNull(
-      useEnvironmentThread(
-        routeThreadRef?.environmentId ?? null,
-        routeThreadRef?.threadId ?? null,
-      ).data,
+      useEnvironmentThread(routeThreadRef?.environmentId ?? null, routeThreadRef?.threadId ?? null)
+        .data,
     )?.thread.lineage ?? null;
   const routeRowThreadKey =
     routeThreadRef === null

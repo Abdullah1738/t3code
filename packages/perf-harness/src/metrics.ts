@@ -27,8 +27,27 @@ export type Run = {
   serverHash?: string;
   harnessHash?: string;
   workloadMode?: "steady" | "legacy-burst";
-  ownerAnswers?: { workload: string; rpcAnswers: number; consumedAsks: number; routedAsks: number; launchedEvaluators: number; mockProvider: "acp-local"; mockDelivered: number; liveDelivery: "unmeasured" };
-  ownerMessagePosts?: { workload: string; rpcPosts: number; persistedPosts: number; consumedAsks: number; routedPosts: number; launchedEvaluators: number; mockProvider: "acp-local"; mockDelivered: number; liveDelivery: "unmeasured" };
+  ownerAnswers?: {
+    workload: string;
+    rpcAnswers: number;
+    consumedAsks: number;
+    routedAsks: number;
+    launchedEvaluators: number;
+    mockProvider: "acp-local";
+    mockDelivered: number;
+    liveDelivery: "unmeasured";
+  };
+  ownerMessagePosts?: {
+    workload: string;
+    rpcPosts: number;
+    persistedPosts: number;
+    consumedAsks: number;
+    routedPosts: number;
+    launchedEvaluators: number;
+    mockProvider: "acp-local";
+    mockDelivered: number;
+    liveDelivery: "unmeasured";
+  };
   fixtureHash: string;
   runtimeHash: string;
   hardwareHash: string;
@@ -84,11 +103,17 @@ export function phaseMetrics(spans: readonly TraceSpan[]) {
   return {
     ...waits,
     ...sqlWaits,
-    ...Object.fromEntries(["routing", "evaluating"].map((queue) => [
-      queue === "routing" ? "kanbanRoutingAdmission" : "kanbanEvaluatingAdmission",
-      percentiles(spans.filter((span) => span.attributes?.["serial.queue"] === queue)
-        .map((span) => span.attributes?.["serial.wait_ms"]).filter((value): value is number => typeof value === "number")),
-    ])),
+    ...Object.fromEntries(
+      ["routing", "evaluating"].map((queue) => [
+        queue === "routing" ? "kanbanRoutingAdmission" : "kanbanEvaluatingAdmission",
+        percentiles(
+          spans
+            .filter((span) => span.attributes?.["serial.queue"] === queue)
+            .map((span) => span.attributes?.["serial.wait_ms"])
+            .filter((value): value is number => typeof value === "number"),
+        ),
+      ]),
+    ),
     ...Object.fromEntries(
       Object.entries(phases).map(([phase, pattern]) => [
         phase,

@@ -939,79 +939,78 @@ const makeRoutes = Effect.gen(function* () {
     readonly origin: string | null;
     readonly limit: number;
   }) {
-      const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
-      // updated_at is an ISO string; widen by a second so precision differences can't drop a
-      // row at the edge, then compare instants exactly.
-      const rows = yield* store
-        .threadsUpdatedSince(DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)))
+    const { location, since, active, states, projectId, parentThreadId, origin, limit } = input;
+    // updated_at is an ISO string; widen by a second so precision differences can't drop a
+    // row at the edge, then compare instants exactly.
+    const rows = yield* store
+      .threadsUpdatedSince(DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)))
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    let matched = rows.filter(
+      (row) =>
+        row.archived === (location === "archive") &&
+        Date.parse(row.updatedAt) > since &&
+        (input.includeSubagents ||
+          parentThreadId !== null ||
+          row.relationshipToParent !== "subagent") &&
+        (parentThreadId === null || row.parentThreadId === parentThreadId) &&
+        (projectId === null || row.projectId === projectId) &&
+        (input.creationSources === undefined ||
+          (row.creationSource !== null && input.creationSources.includes(row.creationSource))),
+    );
+    if (origin !== null) {
+      const origins = yield* store
+        .getOrigins(matched.flatMap((row) => [row.threadId, row.rootThreadId ?? row.threadId]))
         .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      let matched = rows.filter(
-        (row) =>
-          row.archived === (location === "archive") &&
-          Date.parse(row.updatedAt) > since &&
-          (input.includeSubagents ||
-            parentThreadId !== null ||
-            row.relationshipToParent !== "subagent") &&
-          (parentThreadId === null || row.parentThreadId === parentThreadId) &&
-          (projectId === null || row.projectId === projectId) &&
-          (input.creationSources === undefined ||
-            (row.creationSource !== null && input.creationSources.includes(row.creationSource))),
-      );
-      if (origin !== null) {
-        const origins = yield* store
-          .getOrigins(matched.flatMap((row) => [row.threadId, row.rootThreadId ?? row.threadId]))
-          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-        matched = matched.filter((row) => {
-          const value =
-            origins.get(row.threadId) ?? origins.get(row.rootThreadId ?? row.threadId) ?? null;
-          return origin === "none" ? value === null : value === origin;
-        });
-      }
-      const needsState = active !== undefined || states !== undefined;
-      // Shells are re-read, so a thread that moved since the range read is filtered again.
-      const stillMatches = (shell: OrchestrationV2ThreadShell) =>
-          DateTime.toEpochMillis(shell.updatedAt) > since &&
-          (input.includeSubagents ||
-            parentThreadId !== null ||
-            shell.lineage.relationshipToParent !== "subagent") &&
-          (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
-          (projectId === null || shell.projectId === projectId) &&
-          (input.creationSources === undefined ||
-            input.creationSources.includes(shell.creationSource));
-      let shells: Array<OrchestrationV2ThreadShell> = [];
-      // Candidates archived, deleted or moved between the two reads drop out of the page and of
-      // total; the next candidates refill the page.
-      let dropped = 0;
-      let offset = 0;
-      // With a state filter every candidate is loaded: the state decides what the page holds.
-      const wanted = needsState ? Number.POSITIVE_INFINITY : limit;
-      while (offset < matched.length && shells.length < wanted) {
-        const batch = matched.slice(offset, offset + wanted - shells.length);
-        offset += batch.length;
-        const loaded = (yield* shellsFor(
-          batch.map((row) => row.threadId),
-          location,
-        )).filter(stillMatches);
-        dropped += batch.length - loaded.length;
-        shells.push(...loaded);
-      }
-      if (active !== undefined) {
-        shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
-      }
-      if (states !== undefined) {
-        shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
-      }
-      shells = shells.toSorted(
-        (left, right) =>
-          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-      );
-      const summaries = yield* summarize(needsState ? shells : shells.slice(0, limit));
-      return json({
-        ok: true,
-        total: needsState ? shells.length : matched.length - dropped,
-        threads: summaries.slice(0, limit),
+      matched = matched.filter((row) => {
+        const value =
+          origins.get(row.threadId) ?? origins.get(row.rootThreadId ?? row.threadId) ?? null;
+        return origin === "none" ? value === null : value === origin;
       });
+    }
+    const needsState = active !== undefined || states !== undefined;
+    // Shells are re-read, so a thread that moved since the range read is filtered again.
+    const stillMatches = (shell: OrchestrationV2ThreadShell) =>
+      DateTime.toEpochMillis(shell.updatedAt) > since &&
+      (input.includeSubagents ||
+        parentThreadId !== null ||
+        shell.lineage.relationshipToParent !== "subagent") &&
+      (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+      (projectId === null || shell.projectId === projectId) &&
+      (input.creationSources === undefined || input.creationSources.includes(shell.creationSource));
+    let shells: Array<OrchestrationV2ThreadShell> = [];
+    // Candidates archived, deleted or moved between the two reads drop out of the page and of
+    // total; the next candidates refill the page.
+    let dropped = 0;
+    let offset = 0;
+    // With a state filter every candidate is loaded: the state decides what the page holds.
+    const wanted = needsState ? Number.POSITIVE_INFINITY : limit;
+    while (offset < matched.length && shells.length < wanted) {
+      const batch = matched.slice(offset, offset + wanted - shells.length);
+      offset += batch.length;
+      const loaded = (yield* shellsFor(
+        batch.map((row) => row.threadId),
+        location,
+      )).filter(stillMatches);
+      dropped += batch.length - loaded.length;
+      shells.push(...loaded);
+    }
+    if (active !== undefined) {
+      shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
+    }
+    if (states !== undefined) {
+      shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
+    }
+    shells = shells.toSorted(
+      (left, right) =>
+        DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
+    );
+    const summaries = yield* summarize(needsState ? shells : shells.slice(0, limit));
+    return json({
+      ok: true,
+      total: needsState ? shells.length : matched.length - dropped,
+      threads: summaries.slice(0, limit),
     });
+  });
 
   const listThreads = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);

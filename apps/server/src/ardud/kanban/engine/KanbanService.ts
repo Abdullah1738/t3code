@@ -1403,9 +1403,7 @@ const make = Effect.gen(function* () {
     const board = yield* boardOf(boardId);
     const cards = yield* feed ? store.feedCards(boardId, page) : store.cards(boardId);
     const live = liveThreadIds(cards);
-    const states = deferThreads
-      ? []
-      : yield* Effect.forEach(live, threadState, { concurrency: 8 });
+    const states = deferThreads ? [] : yield* Effect.forEach(live, threadState, { concurrency: 8 });
     const discussions = yield* store.discussions(boardId);
     const unread = discussions.flatMap((discussion) => {
       const owner = discussion.participants.find(
@@ -3313,27 +3311,26 @@ const make = Effect.gen(function* () {
   );
 
   /** Starts the discussion's drain, or asks the running one to look again. */
-  const triggerOwnerDrain = Effect.fn("KanbanService.triggerOwnerDrain")(
-    function* (discussionId: string) {
-      const waiter = yield* Deferred.make<void>();
-      const state = yield* Effect.sync(() => {
-        const active = ownerRouteDrains.get(discussionId);
-        if (active) {
-          active.dirty = true;
-          // Behind a route in slow retries, a caller waits for no attempt of its own.
-          if (!active.slow) active.waiters.push(waiter);
-          return active.slow ? "settled" : null;
-        }
-        const started: OwnerDrain = { dirty: false, slow: false, waiters: [waiter] };
-        ownerRouteDrains.set(discussionId, started);
-        return started;
-      });
-      if (state === "settled") yield* Deferred.succeed(waiter, undefined);
-      else if (state !== null)
-        yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
-      return waiter;
-    },
-  );
+  const triggerOwnerDrain = Effect.fn("KanbanService.triggerOwnerDrain")(function* (
+    discussionId: string,
+  ) {
+    const waiter = yield* Deferred.make<void>();
+    const state = yield* Effect.sync(() => {
+      const active = ownerRouteDrains.get(discussionId);
+      if (active) {
+        active.dirty = true;
+        // Behind a route in slow retries, a caller waits for no attempt of its own.
+        if (!active.slow) active.waiters.push(waiter);
+        return active.slow ? "settled" : null;
+      }
+      const started: OwnerDrain = { dirty: false, slow: false, waiters: [waiter] };
+      ownerRouteDrains.set(discussionId, started);
+      return started;
+    });
+    if (state === "settled") yield* Deferred.succeed(waiter, undefined);
+    else if (state !== null) yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
+    return waiter;
+  });
 
   /**
    * After an owner answer or post commits: in production the reply returns now
@@ -7985,12 +7982,10 @@ const make = Effect.gen(function* () {
             { concurrency: 8 },
           ),
           Stream.flatMap(Stream.fromIterable),
-          Stream.map(
-            (thread): KanbanWatchEvent => ({
-              _tag: "change",
-              change: { _tag: "thread", thread },
-            }),
-          ),
+          Stream.map((thread): KanbanWatchEvent => ({
+            _tag: "change",
+            change: { _tag: "thread", thread },
+          })),
         );
         const live = Stream.fromSubscription(subscription).pipe(
           Stream.filter((entry) => entry.boardId === boardId),

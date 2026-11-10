@@ -741,13 +741,15 @@ it.live(
         const overBudgetAtCursor = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
           ...fixture.application,
           getReplayStats: (range) =>
-            fixture.application.getReplayStats(range).pipe(
-              Effect.map((stats) =>
-                range.afterSequence < fixture.cursor
-                  ? { ...stats, rawPayloadBytes: Number.MAX_SAFE_INTEGER }
-                  : stats,
+            fixture.application
+              .getReplayStats(range)
+              .pipe(
+                Effect.map((stats) =>
+                  range.afterSequence < fixture.cursor
+                    ? { ...stats, rawPayloadBytes: Number.MAX_SAFE_INTEGER }
+                    : stats,
+                ),
               ),
-            ),
         });
         const [firstOverBudget] = yield* subscribeOrchestrationV2Shell({
           ...input,

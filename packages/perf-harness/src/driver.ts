@@ -4,8 +4,23 @@ import { shapedFetch } from "./network.ts";
 import { assertRuntime } from "./runtime.ts";
 import { configureOwnerAnswerMock, ownerAnswerRoutingEvidence } from "./ownerAnswerFixture.ts";
 import * as NodeSqlite from "node:sqlite";
-import { assertOpenOwnerAsk, assertClosedOwnerAsk, mockAnswerDelivery, ownerAnswerCases, ownerAnswerRequest, ownerAnswerSamples, ownerAnswerWorkload } from "./ownerAnswers.ts";
-import { assertOpenOwnerPost, assertPersistedOwnerPost, assertClosedOwnerPost, ownerMessagePostCases, ownerMessagePostInput, ownerMessagePostSamples } from "./ownerMessagePosts.ts";
+import {
+  assertOpenOwnerAsk,
+  assertClosedOwnerAsk,
+  mockAnswerDelivery,
+  ownerAnswerCases,
+  ownerAnswerRequest,
+  ownerAnswerSamples,
+  ownerAnswerWorkload,
+} from "./ownerAnswers.ts";
+import {
+  assertOpenOwnerPost,
+  assertPersistedOwnerPost,
+  assertClosedOwnerPost,
+  ownerMessagePostCases,
+  ownerMessagePostInput,
+  ownerMessagePostSamples,
+} from "./ownerMessagePosts.ts";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import {
@@ -110,7 +125,9 @@ export async function drive(
     const sourceFixture = JSON.parse(readFileSync(resolve(pristine, "fixture.json"), "utf8"));
     if (sourceFixture.synthetic !== true) throw new Error("Synthetic fixture marker required");
     if (sourceFixture.version !== 3 || sourceFixture.ownerWrites !== ownerAnswerWorkload)
-      throw new Error("Owner-writes-v3 fixture required; upgrade retained synthetic fixtures with ownerAnswerFixture.ts");
+      throw new Error(
+        "Owner-writes-v3 fixture required; upgrade retained synthetic fixtures with ownerAnswerFixture.ts",
+      );
     const dirtyBefore = dirtyPages();
     const syncStarted = performance.now();
     flushFixtureDatabases(pristine);
@@ -224,7 +241,9 @@ export async function drive(
     const messagePostActionIds = new Set<string>();
     let consumedAsks = 0;
     let rpcAnswers = 0;
-    let rpcPosts = 0, persistedPosts = 0, consumedPostAsks = 0;
+    let rpcPosts = 0,
+      persistedPosts = 0,
+      consumedPostAsks = 0;
     const request = async (path: string, body?: unknown, measured = true) => {
       const start = performance.now(),
         actionId = randomUUID();
@@ -445,7 +464,10 @@ export async function drive(
               const before = await request(cardPath, undefined, false);
               const message = await request(messagePath, undefined, false);
               assertOpenOwnerAsk(answer, before.value.card, message.value);
-              appendLedger(resolve(home, "perf/owner-answers.ndjson"), { ...answer, status: "open" });
+              appendLedger(resolve(home, "perf/owner-answers.ndjson"), {
+                ...answer,
+                status: "open",
+              });
             });
             const answerAction = randomUUID();
             actionIds.add(answerAction);
@@ -453,8 +475,12 @@ export async function drive(
             const input = ownerAnswerRequest(answer).body;
             const startedAnswer = performance.now();
             const answerResult = yield* client["kanban.answer"]({
-              discussionId: KanbanDiscussionId.make(answer.discussionId), ...input,
-            }).pipe(RpcClient.withHeaders({ "x-robob-action-id": answerAction }), Effect.timeout("60 seconds"));
+              discussionId: KanbanDiscussionId.make(answer.discussionId),
+              ...input,
+            }).pipe(
+              RpcClient.withHeaders({ "x-robob-action-id": answerAction }),
+              Effect.timeout("60 seconds"),
+            );
             const answerMs = performance.now() - startedAnswer;
             record("answer.response.ms", answerMs);
             rpcAnswers++;
@@ -468,13 +494,21 @@ export async function drive(
               while (true) {
                 const after = await request(cardPath, undefined, false);
                 const saved = await request(messagePath, undefined, false);
-                if (after.value.card.asks.find((ask: { id: string }) => ask.id === answer.askId)?.closedAt !== null) {
+                if (
+                  after.value.card.asks.find((ask: { id: string }) => ask.id === answer.askId)
+                    ?.closedAt !== null
+                ) {
                   assertClosedOwnerAsk(answer, after.value.card, saved.value);
                   consumedAsks++;
-                  appendLedger(resolve(home, "perf/owner-answers.ndjson"), { ...answer, status: "closed", responseMs: requests["answer.response.ms"]!.at(-1) });
+                  appendLedger(resolve(home, "perf/owner-answers.ndjson"), {
+                    ...answer,
+                    status: "closed",
+                    responseMs: requests["answer.response.ms"]!.at(-1),
+                  });
                   break;
                 }
-                if (performance.now() >= until) throw new Error(`Owner-answer sample ${sample} closure timed out`);
+                if (performance.now() >= until)
+                  throw new Error(`Owner-answer sample ${sample} closure timed out`);
                 await delay(50);
               }
             });
@@ -483,17 +517,28 @@ export async function drive(
             const postMessagesPath = `/api/ardud/kanban/discussions/${ownerPost.discussionId}/messages`;
             yield* Effect.promise(async () => {
               const before = await request(postCardPath, undefined, false);
-              const question = await request(`${postMessagesPath}/${ownerPost.seq}`, undefined, false);
+              const question = await request(
+                `${postMessagesPath}/${ownerPost.seq}`,
+                undefined,
+                false,
+              );
               assertOpenOwnerPost(ownerPost, before.value.card, question.value);
-              appendLedger(resolve(home, "perf/owner-message-posts.ndjson"), { ...ownerPost, status: "open" });
+              appendLedger(resolve(home, "perf/owner-message-posts.ndjson"), {
+                ...ownerPost,
+                status: "open",
+              });
             });
             const postAction = randomUUID();
             actionIds.add(postAction);
             messagePostActionIds.add(postAction);
             const startedPost = performance.now();
             const posted = yield* client["kanban.message.post"]({
-              discussionId: KanbanDiscussionId.make(ownerPost.discussionId), ...ownerMessagePostInput(ownerPost),
-            }).pipe(RpcClient.withHeaders({ "x-robob-action-id": postAction }), Effect.timeout("60 seconds"));
+              discussionId: KanbanDiscussionId.make(ownerPost.discussionId),
+              ...ownerMessagePostInput(ownerPost),
+            }).pipe(
+              RpcClient.withHeaders({ "x-robob-action-id": postAction }),
+              Effect.timeout("60 seconds"),
+            );
             const postMs = performance.now() - startedPost;
             record("messagePost.response.ms", postMs);
             rpcPosts++;
@@ -506,20 +551,30 @@ export async function drive(
               assertPersistedOwnerPost(ownerPost, saved.value);
               persistedPosts++;
               appendLedger(resolve(home, "perf/owner-message-posts.ndjson"), {
-                ...ownerPost, status: "persisted", responseMs: postMs, returnedSeq: posted.seq,
+                ...ownerPost,
+                status: "persisted",
+                responseMs: postMs,
+                returnedSeq: posted.seq,
               });
               // Persistence, ask closure and provider delivery are separate from
               // the RPC response budget when routing runs after acknowledgement.
               const until = performance.now() + 60000;
               while (true) {
                 const after = await request(postCardPath, undefined, false);
-                if (after.value.card.asks.find((ask: { id: string }) => ask.id === ownerPost.askId)?.closedAt !== null) {
+                if (
+                  after.value.card.asks.find((ask: { id: string }) => ask.id === ownerPost.askId)
+                    ?.closedAt !== null
+                ) {
                   assertClosedOwnerPost(ownerPost, after.value.card);
                   consumedPostAsks++;
-                  appendLedger(resolve(home, "perf/owner-message-posts.ndjson"), { ...ownerPost, status: "closed" });
+                  appendLedger(resolve(home, "perf/owner-message-posts.ndjson"), {
+                    ...ownerPost,
+                    status: "closed",
+                  });
                   break;
                 }
-                if (performance.now() >= until) throw new Error(`Owner-post sample ${sample} closure timed out`);
+                if (performance.now() >= until)
+                  throw new Error(`Owner-post sample ${sample} closure timed out`);
                 await delay(50);
               }
             });
@@ -531,8 +586,11 @@ export async function drive(
             while (performance.now() < deliveryUntil) {
               const path = resolve(home, "perf/mock-requests.ndjson");
               const raw = existsSync(path) ? readFileSync(path, "utf8") : "";
-              if (mockAnswerDelivery(raw).observed === ownerAnswerSamples &&
-                mockAnswerDelivery(raw, messagePostCases).observed === ownerMessagePostSamples) break;
+              if (
+                mockAnswerDelivery(raw).observed === ownerAnswerSamples &&
+                mockAnswerDelivery(raw, messagePostCases).observed === ownerMessagePostSamples
+              )
+                break;
               await delay(100);
             }
           });
@@ -561,8 +619,8 @@ export async function drive(
           metrics["mobile.resume.p95.ms"] = null;
           stop = true;
           yield* Effect.forEach(loadFibers, Fiber.join, { discard: true });
-        // Forty 10–43s posts cannot fit the old read-focused two-minute window.
-        // Bound each write RPC while allowing the slow baseline to finish both families.
+          // Forty 10–43s posts cannot fit the old read-focused two-minute window.
+          // Bound each write RPC while allowing the slow baseline to finish both families.
         }).pipe(Effect.scoped, Effect.provide(protocol), Effect.timeout("90 minutes")),
       );
       stop = true;
@@ -592,15 +650,35 @@ export async function drive(
       );
       const mockLog = resolve(home, "perf/mock-requests.ndjson");
       const delivery = mockAnswerDelivery(existsSync(mockLog) ? readFileSync(mockLog, "utf8") : "");
-      const postDelivery = mockAnswerDelivery(existsSync(mockLog) ? readFileSync(mockLog, "utf8") : "", ownerMessagePostCases());
-      const ownerAnswers = { workload: ownerAnswerWorkload, rpcAnswers, consumedAsks,
-        routedAsks: 0, launchedEvaluators: 0,
-        mockProvider: "acp-local" as const, mockDelivered: delivery.observed, liveDelivery: "unmeasured" as const };
-      if (delivery.missing.length) gaps.push(`ACP mock did not receive owner-answer samples: ${delivery.missing.join(",")}`);
-      const ownerMessagePosts = { workload: ownerAnswerWorkload, rpcPosts, persistedPosts, consumedAsks: consumedPostAsks,
-        routedPosts: 0, launchedEvaluators: 0, mockProvider: "acp-local" as const,
-        mockDelivered: postDelivery.observed, liveDelivery: "unmeasured" as const };
-      if (postDelivery.missing.length) gaps.push(`ACP mock did not receive owner-post samples: ${postDelivery.missing.join(",")}`);
+      const postDelivery = mockAnswerDelivery(
+        existsSync(mockLog) ? readFileSync(mockLog, "utf8") : "",
+        ownerMessagePostCases(),
+      );
+      const ownerAnswers = {
+        workload: ownerAnswerWorkload,
+        rpcAnswers,
+        consumedAsks,
+        routedAsks: 0,
+        launchedEvaluators: 0,
+        mockProvider: "acp-local" as const,
+        mockDelivered: delivery.observed,
+        liveDelivery: "unmeasured" as const,
+      };
+      if (delivery.missing.length)
+        gaps.push(`ACP mock did not receive owner-answer samples: ${delivery.missing.join(",")}`);
+      const ownerMessagePosts = {
+        workload: ownerAnswerWorkload,
+        rpcPosts,
+        persistedPosts,
+        consumedAsks: consumedPostAsks,
+        routedPosts: 0,
+        launchedEvaluators: 0,
+        mockProvider: "acp-local" as const,
+        mockDelivered: postDelivery.observed,
+        liveDelivery: "unmeasured" as const,
+      };
+      if (postDelivery.missing.length)
+        gaps.push(`ACP mock did not receive owner-post samples: ${postDelivery.missing.join(",")}`);
       for (const [key, summary] of Object.entries(summaries)) {
         // Gate v2 compares the median of per-run request p95, not p50.
         metrics[key] = summary.p95;
@@ -626,18 +704,39 @@ export async function drive(
         traceFlushed = false;
       }
       if (traceFlushed) {
-        const boardEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/boards.sqlite"), { readOnly: true });
-        const mainEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/statev2.sqlite"), { readOnly: true });
+        const boardEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/boards.sqlite"), {
+          readOnly: true,
+        });
+        const mainEvidence = new NodeSqlite.DatabaseSync(resolve(home, "userdata/statev2.sqlite"), {
+          readOnly: true,
+        });
         try {
           Object.assign(ownerAnswers, ownerAnswerRoutingEvidence(boardEvidence, mainEvidence));
-          if (ownerAnswers.routedAsks !== ownerAnswerSamples || ownerAnswers.launchedEvaluators !== 10)
-            gaps.push(`Owner-answer routing incomplete: ${ownerAnswers.routedAsks}/40 recipients, ${ownerAnswers.launchedEvaluators}/10 evaluator launches`);
-          const postRouting = ownerAnswerRoutingEvidence(boardEvidence, mainEvidence, ownerMessagePostCases());
+          if (
+            ownerAnswers.routedAsks !== ownerAnswerSamples ||
+            ownerAnswers.launchedEvaluators !== 10
+          )
+            gaps.push(
+              `Owner-answer routing incomplete: ${ownerAnswers.routedAsks}/40 recipients, ${ownerAnswers.launchedEvaluators}/10 evaluator launches`,
+            );
+          const postRouting = ownerAnswerRoutingEvidence(
+            boardEvidence,
+            mainEvidence,
+            ownerMessagePostCases(),
+          );
           ownerMessagePosts.routedPosts = postRouting.routedAsks;
           ownerMessagePosts.launchedEvaluators = postRouting.launchedEvaluators;
-          if (ownerMessagePosts.routedPosts !== ownerMessagePostSamples || ownerMessagePosts.launchedEvaluators !== 10)
-            gaps.push(`Owner-post routing incomplete: ${ownerMessagePosts.routedPosts}/40 recipients, ${ownerMessagePosts.launchedEvaluators}/10 evaluator launches`);
-        } finally { boardEvidence.close(); mainEvidence.close(); }
+          if (
+            ownerMessagePosts.routedPosts !== ownerMessagePostSamples ||
+            ownerMessagePosts.launchedEvaluators !== 10
+          )
+            gaps.push(
+              `Owner-post routing incomplete: ${ownerMessagePosts.routedPosts}/40 recipients, ${ownerMessagePosts.launchedEvaluators}/10 evaluator launches`,
+            );
+        } finally {
+          boardEvidence.close();
+          mainEvidence.close();
+        }
       }
       try {
         if (!traceFlushed) throw new Error("Unflushed trace");
@@ -660,13 +759,21 @@ export async function drive(
         const phases = phaseMetrics(spans.filter((s) => selected.has(s.spanId)));
         for (const [name, distribution] of Object.entries(phases))
           metrics[`phase.${name}.p95.ms`] = distribution?.p95 ?? null;
-        for (const [family, ids] of [["answer", answerActionIds], ["messagePost", messagePostActionIds]] as const) {
-          const familySpans = new Set<string>(spans.filter((s) => ids.has(s.attributes?.["action.id"])).map((s) => s.spanId));
+        for (const [family, ids] of [
+          ["answer", answerActionIds],
+          ["messagePost", messagePostActionIds],
+        ] as const) {
+          const familySpans = new Set<string>(
+            spans.filter((s) => ids.has(s.attributes?.["action.id"])).map((s) => s.spanId),
+          );
           for (let size = -1; size !== familySpans.size;) {
             size = familySpans.size;
-            for (const span of spans) if (familySpans.has(span.parentSpanId)) familySpans.add(span.spanId);
+            for (const span of spans)
+              if (familySpans.has(span.parentSpanId)) familySpans.add(span.spanId);
           }
-          for (const [name, distribution] of Object.entries(phaseMetrics(spans.filter((s) => familySpans.has(s.spanId)))))
+          for (const [name, distribution] of Object.entries(
+            phaseMetrics(spans.filter((s) => familySpans.has(s.spanId))),
+          ))
             metrics[`phase.${family}.${name}.p95.ms`] = distribution?.p95 ?? null;
         }
       } catch {

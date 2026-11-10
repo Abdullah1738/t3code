@@ -178,9 +178,15 @@ describe("ControlStore native ids", () => {
             "ambiguous",
           );
           yield* sql`DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = 'pt-conflict'`;
-          assert.strictEqual((yield* identity.resolve({ nativeId: "ses_import" })).robobThreadId, "t-moved");
+          assert.strictEqual(
+            (yield* identity.resolve({ nativeId: "ses_import" })).robobThreadId,
+            "t-moved",
+          );
           yield* controlSql`UPDATE ardud_opencode_import SET thread_id = 't-detached' WHERE native_session_id = 'ses_import'`;
-          assert.strictEqual((yield* identity.resolve({ nativeId: "ses_import" })).robobThreadId, "t-detached");
+          assert.strictEqual(
+            (yield* identity.resolve({ nativeId: "ses_import" })).robobThreadId,
+            "t-detached",
+          );
           assert.deepStrictEqual(
             yield* sql`SELECT name FROM sqlite_schema WHERE name IN ('ardud_thread_origin', 'ardud_opencode_import')`,
             [],

@@ -590,8 +590,21 @@ describe("control listings", () => {
 
   it.effect("lists /threads?updatedSince from the changed rows, never the shell snapshot", () => {
     const at = (iso: string) => DateTime.makeUnsafe(iso);
-    const changed = (id: string, iso: string, overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
-      shell(id, { ...idle, updatedAt: at(iso), lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null }, ...overrides });
+    const changed = (
+      id: string,
+      iso: string,
+      overrides: Partial<OrchestrationV2ThreadShell> = {},
+    ) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at(iso),
+        lineage: {
+          rootThreadId: ThreadId.make(id),
+          parentThreadId: null,
+          relationshipToParent: null,
+        },
+        ...overrides,
+      });
     const extra = [
       changed("new-1", "2026-03-01T00:00:03.000Z"),
       changed("new-2", "2026-03-01T00:00:02.000Z", { projectId: "other" as never }),
@@ -599,11 +612,19 @@ describe("control listings", () => {
       // Exactly at the cut: updatedSince is exclusive.
       changed("edge", "2026-03-01T00:00:00.000Z"),
       changed("stale", "2026-02-01T00:00:00.000Z"),
-      changed("new-archived", "2026-03-01T00:00:04.000Z", { archivedAt: at("2026-03-01T00:00:04.000Z") }),
-      changed("new-deleted", "2026-03-01T00:00:04.000Z", { deletedAt: at("2026-03-01T00:00:04.000Z") }),
+      changed("new-archived", "2026-03-01T00:00:04.000Z", {
+        archivedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
+      changed("new-deleted", "2026-03-01T00:00:04.000Z", {
+        deletedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
       changed("new-child", "2026-03-01T00:00:05.000Z", {
         creationSource: "provider",
-        lineage: { rootThreadId: ThreadId.make("new-3"), parentThreadId: ThreadId.make("new-3"), relationshipToParent: "subagent" },
+        lineage: {
+          rootThreadId: ThreadId.make("new-3"),
+          parentThreadId: ThreadId.make("new-3"),
+          relationshipToParent: "subagent",
+        },
       }),
     ];
     const since = Date.parse("2026-03-01T00:00:00.000Z");
@@ -624,7 +645,10 @@ describe("control listings", () => {
             );
           // Newest first, cut to the limit, total still counts every match.
           assert.deepStrictEqual(yield* list("&limit=2"), { total: 3, ids: ["new-1", "new-2"] });
-          assert.deepStrictEqual(yield* list("&limit=50"), { total: 3, ids: ["new-1", "new-2", "new-3"] });
+          assert.deepStrictEqual(yield* list("&limit=50"), {
+            total: 3,
+            ids: ["new-1", "new-2", "new-3"],
+          });
           // ISO form of the same instant.
           assert.deepStrictEqual(
             (yield* get("/threads?updatedSince=2026-03-01T00:00:00.000Z&limit=50")).body.total,
@@ -638,9 +662,15 @@ describe("control listings", () => {
             total: 1,
             ids: ["new-child"],
           });
-          assert.deepStrictEqual(yield* list("&parentThreadId=new-3"), { total: 1, ids: ["new-child"] });
+          assert.deepStrictEqual(yield* list("&parentThreadId=new-3"), {
+            total: 1,
+            ids: ["new-child"],
+          });
           assert.deepStrictEqual(yield* list("&projectId=other"), { total: 1, ids: ["new-2"] });
-          assert.deepStrictEqual(yield* list("&archived=true"), { total: 1, ids: ["new-archived"] });
+          assert.deepStrictEqual(yield* list("&archived=true"), {
+            total: 1,
+            ids: ["new-archived"],
+          });
           // A state filter that can match idle threads reads the changed range's shells.
           assert.deepStrictEqual(yield* list("&state=idle&limit=1"), { total: 3, ids: ["new-1"] });
           assert.deepStrictEqual(yield* list("&active=false&includeSubagents=true"), {
@@ -661,37 +691,44 @@ describe("control listings", () => {
     );
   });
 
-  it.effect("orders /threads?updatedSince ties by thread id and refills vanished candidates", () => {
-    const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
-    const tied = (id: string) =>
-      shell(id, {
-        ...idle,
-        updatedAt: at,
-        lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null },
-      });
-    const since = Date.parse("2026-03-01T00:00:00.000Z");
-    return run(
-      ({ get }) =>
-        Effect.gen(function* () {
-          const page = (limit: number) =>
-            get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
-              Effect.map((response) => ({
-                total: response.body.total as number,
-                ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
-                  (thread) => thread.threadId,
-                ),
-              })),
-            );
-          // Equal timestamps keep the full listing's thread id order; tie-a vanished after
-          // the range read, so tie-b fills its place and total drops it.
-          assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
-          assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
-        }),
-      undefined,
-      [tied("tie-c"), tied("tie-a"), tied("tie-b")],
-      new Set(["tie-a"]),
-    );
-  });
+  it.effect(
+    "orders /threads?updatedSince ties by thread id and refills vanished candidates",
+    () => {
+      const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
+      const tied = (id: string) =>
+        shell(id, {
+          ...idle,
+          updatedAt: at,
+          lineage: {
+            rootThreadId: ThreadId.make(id),
+            parentThreadId: null,
+            relationshipToParent: null,
+          },
+        });
+      const since = Date.parse("2026-03-01T00:00:00.000Z");
+      return run(
+        ({ get }) =>
+          Effect.gen(function* () {
+            const page = (limit: number) =>
+              get(`/threads?updatedSince=${since}&limit=${limit}`).pipe(
+                Effect.map((response) => ({
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                })),
+              );
+            // Equal timestamps keep the full listing's thread id order; tie-a vanished after
+            // the range read, so tie-b fills its place and total drops it.
+            assert.deepStrictEqual(yield* page(1), { total: 2, ids: ["tie-b"] });
+            assert.deepStrictEqual(yield* page(5), { total: 2, ids: ["tie-b", "tie-c"] });
+          }),
+        undefined,
+        [tied("tie-c"), tied("tie-a"), tied("tie-b")],
+        new Set(["tie-a"]),
+      );
+    },
+  );
 
   it.effect("orders /threads?updatedSince ties by thread id like the full listing", () => {
     const at = DateTime.makeUnsafe("2026-03-01T00:00:01.000Z");
@@ -699,7 +736,11 @@ describe("control listings", () => {
       shell(id, {
         ...idle,
         updatedAt: at,
-        lineage: { rootThreadId: ThreadId.make(id), parentThreadId: null, relationshipToParent: null },
+        lineage: {
+          rootThreadId: ThreadId.make(id),
+          parentThreadId: null,
+          relationshipToParent: null,
+        },
       });
     const since = Date.parse("2026-03-01T00:00:00.000Z");
     return run(

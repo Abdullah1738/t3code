@@ -426,8 +426,7 @@ describe("authenticated environment HTTP requests", () => {
           ),
         ),
       );
-      const afters = () =>
-        harness.calls.map((call) => new URL(call.url).searchParams.get("after"));
+      const afters = () => harness.calls.map((call) => new URL(call.url).searchParams.get("after"));
 
       expect(Option.isNone(yield* loader.load(PREPARED))).toBe(true);
       const resumed = yield* loader.load(PREPARED);

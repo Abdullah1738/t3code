@@ -22,19 +22,22 @@ export const queryPlanExceptions = [
     route: "shell.client-selection",
     queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
-    reason: "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
+    reason:
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
   },
   {
     route: "shell.client-selection",
     queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
-    reason: "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
+    reason:
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
   },
   {
     route: "shell.client-selection",
     queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
-    reason: "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
+    reason:
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
   },
   {
     route: "board.thread-state",

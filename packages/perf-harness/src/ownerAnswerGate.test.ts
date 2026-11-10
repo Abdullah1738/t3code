@@ -7,24 +7,70 @@ import { percentiles, type Run } from "./metrics.ts";
 
 function evidence(sha: string, answerMs = 100, postMs = 100): Run[] {
   return Array.from({ length: 10 }, (_, repeat) => {
-    const requests = Object.fromEntries(["boards", "board", "discussion", "post", "move", "answer", "messagePost"].map((name) =>
-      [name + ".response.ms", Array(40).fill(name === "answer" ? answerMs : name === "messagePost" ? postMs : 100)]));
-    return { gateVersion: "paired-bootstrap-v2", sha, repeat, scale: "5x", agents: 128,
-      fixtureHash: "fixture", hardwareHash: "host", harnessHash: "harness", runtimeHash: "runtime", seed: 42,
-      correctness: "unmeasured", requests,
-      ownerAnswers: { workload: "owner-writes-v3", rpcAnswers: 40, consumedAsks: 40, routedAsks: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
-      ownerMessagePosts: { workload: "owner-writes-v3", rpcPosts: 40, persistedPosts: 40, consumedAsks: 40, routedPosts: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
-      metrics: { ...Object.fromEntries(Object.entries(requests).map(([key, values]) => [key, percentiles(values)!.p95])),
-        "answer.response.ms.p95": answerMs, "messagePost.response.ms.p95": postMs, "eventLoop.p99.ms": 10, "eventLoop.max.ms": 20, "wal.writeBytesPerOp": 100 }, gaps: [],
+    const requests = Object.fromEntries(
+      ["boards", "board", "discussion", "post", "move", "answer", "messagePost"].map((name) => [
+        name + ".response.ms",
+        Array(40).fill(name === "answer" ? answerMs : name === "messagePost" ? postMs : 100),
+      ]),
+    );
+    return {
+      gateVersion: "paired-bootstrap-v2",
+      sha,
+      repeat,
+      scale: "5x",
+      agents: 128,
+      fixtureHash: "fixture",
+      hardwareHash: "host",
+      harnessHash: "harness",
+      runtimeHash: "runtime",
+      seed: 42,
+      correctness: "unmeasured",
+      requests,
+      ownerAnswers: {
+        workload: "owner-writes-v3",
+        rpcAnswers: 40,
+        consumedAsks: 40,
+        routedAsks: 40,
+        launchedEvaluators: 10,
+        mockProvider: "acp-local",
+        mockDelivered: 40,
+        liveDelivery: "unmeasured",
+      },
+      ownerMessagePosts: {
+        workload: "owner-writes-v3",
+        rpcPosts: 40,
+        persistedPosts: 40,
+        consumedAsks: 40,
+        routedPosts: 40,
+        launchedEvaluators: 10,
+        mockProvider: "acp-local",
+        mockDelivered: 40,
+        liveDelivery: "unmeasured",
+      },
+      metrics: {
+        ...Object.fromEntries(
+          Object.entries(requests).map(([key, values]) => [key, percentiles(values)!.p95]),
+        ),
+        "answer.response.ms.p95": answerMs,
+        "messagePost.response.ms.p95": postMs,
+        "eventLoop.p99.ms": 10,
+        "eventLoop.max.ms": 20,
+        "wal.writeBytesPerOp": 100,
+      },
+      gaps: [],
     };
   });
 }
-const budgets = { metrics: { "answer.response.ms.p95": { max: 500 }, "messagePost.response.ms.p95": { max: 500 } } };
+const budgets = {
+  metrics: { "answer.response.ms.p95": { max: 500 }, "messagePost.response.ms.p95": { max: 500 } },
+};
 
 test("owner-answer response and mock delivery coverage cannot silently disappear", () => {
-  const base = evidence("base"), candidate = evidence("candidate");
+  const base = evidence("base"),
+    candidate = evidence("candidate");
   assert.partialDeepStrictEqual(compare(base, candidate, budgets), {
-    performanceVerdict: "pass", budgetVerdict: "incomplete",
+    performanceVerdict: "pass",
+    budgetVerdict: "incomplete",
     ownerAnswerCoverage: { asks: "pass", mockDelivery: "pass", liveDelivery: "unmeasured" },
     ownerAnswerTarget: { verdict: "pass", candidateP95Ms: 100 },
   });
@@ -51,28 +97,46 @@ test("owner-answer response and mock delivery coverage cannot silently disappear
 });
 
 test("5x pooled owner-answer p95 must be strictly below 500ms even with no relative regression", () => {
-  for (const [ms, verdict] of [[499, "pass"], [500, "fail"], [501, "fail"]] as const) {
+  for (const [ms, verdict] of [
+    [499, "pass"],
+    [500, "fail"],
+    [501, "fail"],
+  ] as const) {
     const result = compare(evidence("base", ms), evidence("candidate", ms), budgets);
     assert.equal(result.ownerAnswerTarget.verdict, verdict);
     assert.equal(result.performanceVerdict, verdict);
   }
-  const base = evidence("base", 600), candidate = evidence("candidate", 600);
+  const base = evidence("base", 600),
+    candidate = evidence("candidate", 600);
   for (const run of [...base, ...candidate]) run.scale = "1x";
   assert.equal(compare(base, candidate, budgets).ownerAnswerTarget.verdict, "not-applicable");
 });
 
 test("owner-answer p95 shift and clustered p99 regression are gated", () => {
-  assert.equal(compare(evidence("base", 100), evidence("candidate", 120), budgets).performanceVerdict, "fail");
-  const base = evidence("base"), candidate = evidence("candidate");
+  assert.equal(
+    compare(evidence("base", 100), evidence("candidate", 120), budgets).performanceVerdict,
+    "fail",
+  );
+  const base = evidence("base"),
+    candidate = evidence("candidate");
   for (const run of candidate) run.requests!["answer.response.ms"]![39] = 150;
   assert.partialDeepStrictEqual(compare(base, candidate, budgets), {
-    performanceVerdict: "fail", tails: { "answer.response.ms": { verdict: "fail", ratio: 1.5 } },
+    performanceVerdict: "fail",
+    tails: { "answer.response.ms": { verdict: "fail", ratio: 1.5 } },
   });
 });
 
 test("message-post p95 is separate from answer and HTTP post and fails at 500ms", () => {
-  for (const [postMs, verdict] of [[499, "pass"], [500, "fail"], [501, "fail"]] as const) {
-    const result = compare(evidence("base", 100, postMs), evidence("candidate", 100, postMs), budgets);
+  for (const [postMs, verdict] of [
+    [499, "pass"],
+    [500, "fail"],
+    [501, "fail"],
+  ] as const) {
+    const result = compare(
+      evidence("base", 100, postMs),
+      evidence("candidate", 100, postMs),
+      budgets,
+    );
     assert.equal(result.ownerMessagePostTarget.verdict, verdict);
     assert.equal(result.ownerMessagePostTarget.candidateP95Ms, postMs);
     assert.equal(result.ownerAnswerTarget.candidateP95Ms, 100);

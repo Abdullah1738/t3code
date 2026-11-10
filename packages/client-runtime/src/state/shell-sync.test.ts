@@ -359,8 +359,18 @@ describe("environment shell synchronization", () => {
 
       // The server sends an asking subagent's omitted parent right after it, at its sequence.
       yield* Queue.offerAll(events, [
-        { kind: "thread.updated", sequence: 2, location: "active", thread: thread("asking", "middle") },
-        { kind: "thread.updated", sequence: 2, location: "active", thread: thread("middle", "root") },
+        {
+          kind: "thread.updated",
+          sequence: 2,
+          location: "active",
+          thread: thread("asking", "middle"),
+        },
+        {
+          kind: "thread.updated",
+          sequence: 2,
+          location: "active",
+          thread: thread("middle", "root"),
+        },
       ] as never);
       const settled = yield* SubscriptionRef.changes(shellState).pipe(
         Stream.filter(

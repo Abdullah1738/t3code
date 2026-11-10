@@ -654,7 +654,9 @@ describe("withSubagentRequestAncestors", () => {
     lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "root" as never },
   });
   const middle = sub("middle", "root");
-  const asking = sub("asking", "middle", { pendingRuntimeRequest: { kind: "user_input" } as never });
+  const asking = sub("asking", "middle", {
+    pendingRuntimeRequest: { kind: "user_input" } as never,
+  });
   const byId = new Map([root, middle, asking].map((shell) => [shell.id as string, shell]));
   const updated = (thread: OrchestrationV2ThreadShell) =>
     ({ kind: "thread.updated", sequence: 9, location: "active", thread }) as const;
@@ -700,7 +702,9 @@ describe("withSubagentRequestAncestors", () => {
       const deep = sub("deep", "lower", {
         pendingRuntimeRequest: { kind: "user_input" } as never,
       });
-      const shells = new Map([root, upper, lower, deep].map((shell) => [shell.id as string, shell]));
+      const shells = new Map(
+        [root, upper, lower, deep].map((shell) => [shell.id as string, shell]),
+      );
       for (const batch of [
         [updated(lower), updated(deep)],
         [updated(deep), updated(lower)],
@@ -727,7 +731,9 @@ describe("withSubagentRequestAncestors", () => {
 
   it.effect("skips ancestors already in the batch and stops on cycles", () =>
     Effect.gen(function* () {
-      const loopA = sub("loop-a", "loop-b", { pendingRuntimeRequest: { kind: "approval" } as never });
+      const loopA = sub("loop-a", "loop-b", {
+        pendingRuntimeRequest: { kind: "approval" } as never,
+      });
       const loopB = sub("loop-b", "loop-a");
       const items = yield* withSubagentRequestAncestors(
         [updated(middle), updated(asking), updated(loopA)],

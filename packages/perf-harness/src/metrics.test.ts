@@ -15,8 +15,27 @@ const runs = (sha: string, value: number | null): Run[] =>
     agents: 32,
     scale: "1x",
     correctness: "pass",
-    ownerAnswers: { workload: "owner-writes-v3", rpcAnswers: 40, consumedAsks: 40, routedAsks: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
-    ownerMessagePosts: { workload: "owner-writes-v3", rpcPosts: 40, persistedPosts: 40, consumedAsks: 40, routedPosts: 40, launchedEvaluators: 10, mockProvider: "acp-local", mockDelivered: 40, liveDelivery: "unmeasured" },
+    ownerAnswers: {
+      workload: "owner-writes-v3",
+      rpcAnswers: 40,
+      consumedAsks: 40,
+      routedAsks: 40,
+      launchedEvaluators: 10,
+      mockProvider: "acp-local",
+      mockDelivered: 40,
+      liveDelivery: "unmeasured",
+    },
+    ownerMessagePosts: {
+      workload: "owner-writes-v3",
+      rpcPosts: 40,
+      persistedPosts: 40,
+      consumedAsks: 40,
+      routedPosts: 40,
+      launchedEvaluators: 10,
+      mockProvider: "acp-local",
+      mockDelivered: 40,
+      liveDelivery: "unmeasured",
+    },
     metrics: { latency: value },
     gaps: [],
   }));
@@ -27,10 +46,22 @@ test("nearest rank handles small samples and rejects invalid timings", () => {
 });
 test("Kanban serial admission waits stay separate from total span duration", () => {
   const phases = phaseMetrics([
-    { name: "KanbanService.serial", spanId: "r", durationMs: 200,
-      attributes: { "serial.queue": "routing", "serial.key": "discussion-1", "serial.wait_ms": 15 } },
-    { name: "KanbanService.serial", spanId: "e", durationMs: 900,
-      attributes: { "serial.queue": "evaluating", "serial.key": "board-0:discussion-1", "serial.wait_ms": 30 } },
+    {
+      name: "KanbanService.serial",
+      spanId: "r",
+      durationMs: 200,
+      attributes: { "serial.queue": "routing", "serial.key": "discussion-1", "serial.wait_ms": 15 },
+    },
+    {
+      name: "KanbanService.serial",
+      spanId: "e",
+      durationMs: 900,
+      attributes: {
+        "serial.queue": "evaluating",
+        "serial.key": "board-0:discussion-1",
+        "serial.wait_ms": 30,
+      },
+    },
   ]);
   assert.equal(phases.kanbanRoutingAdmission?.p95, 15);
   assert.equal(phases.kanbanEvaluatingAdmission?.p95, 30);

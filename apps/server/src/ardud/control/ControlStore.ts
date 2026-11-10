@@ -296,18 +296,16 @@ export const make = Effect.gen(function* () {
     `.pipe(
       NodeSqliteClient.readOnly,
       Effect.map((rows) =>
-        rows.map(
-          (row): ControlThreadRow => ({
-            threadId: row.thread_id,
-            projectId: row.project_id,
-            updatedAt: row.updated_at,
-            archived: Boolean(row.archived),
-            relationshipToParent: row.relationship_to_parent,
-            parentThreadId: row.parent_thread_id,
-            rootThreadId: row.root_thread_id,
-            creationSource: row.creation_source,
-          }),
-        ),
+        rows.map((row): ControlThreadRow => ({
+          threadId: row.thread_id,
+          projectId: row.project_id,
+          updatedAt: row.updated_at,
+          archived: Boolean(row.archived),
+          relationshipToParent: row.relationship_to_parent,
+          parentThreadId: row.parent_thread_id,
+          rootThreadId: row.root_thread_id,
+          creationSource: row.creation_source,
+        })),
       ),
       Effect.mapError(fail("read-updated-threads")),
     );

@@ -673,21 +673,29 @@ describe("ExecutionIdentity", () => {
         yield* Deferred.await(writerHeld);
         const readerHeld = yield* Deferred.make<void>();
         const releaseReader = yield* Deferred.make<void>();
-        const reader = yield* Effect.forkChild(sql.withTransaction(
-          sql`SELECT 1`.pipe(
-            Effect.andThen(Deferred.succeed(readerHeld, undefined)),
-            Effect.andThen(Deferred.await(releaseReader)),
-          ),
-        ).pipe(NodeSqliteClient.readOnly));
+        const reader = yield* Effect.forkChild(
+          sql
+            .withTransaction(
+              sql`SELECT 1`.pipe(
+                Effect.andThen(Deferred.succeed(readerHeld, undefined)),
+                Effect.andThen(Deferred.await(releaseReader)),
+              ),
+            )
+            .pipe(NodeSqliteClient.readOnly),
+        );
         yield* Deferred.await(readerHeld);
         const authHeld = yield* Deferred.make<void>();
         const releaseAuth = yield* Deferred.make<void>();
-        const auth = yield* Effect.forkChild(sql.withTransaction(
-          sql`SELECT 1`.pipe(
-            Effect.andThen(Deferred.succeed(authHeld, undefined)),
-            Effect.andThen(Deferred.await(releaseAuth)),
-          ),
-        ).pipe(NodeSqliteClient.authReadOnly));
+        const auth = yield* Effect.forkChild(
+          sql
+            .withTransaction(
+              sql`SELECT 1`.pipe(
+                Effect.andThen(Deferred.succeed(authHeld, undefined)),
+                Effect.andThen(Deferred.await(releaseAuth)),
+              ),
+            )
+            .pipe(NodeSqliteClient.authReadOnly),
+        );
         yield* Deferred.await(authHeld);
         const result = yield* identity
           .resolve({ nativeId, driver })
