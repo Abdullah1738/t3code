@@ -1,11 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as SqlError from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 import * as Tracer from "effect/Tracer";
 
@@ -377,4 +379,75 @@ it.effect("pool picks the least loaded slot and bounds in-flight reads", () =>
     yield* Fiber.interrupt(other);
     assert.equal(pool.inFlight(), 0);
   }),
+);
+
+it.effect("concurrent reads awaiting their worker spread across slots and respect the lane bound", () =>
+  Effect.gen(function* () {
+    const connection = {} as never;
+    const ready = yield* Deferred.make<void>();
+    // Each acquisition waits for the worker, as a real reader's startup promise does.
+    const slot = Effect.as(Deferred.await(ready), connection);
+    const pool = yield* makeReaderPool({ lane: "foreground", slots: [slot, slot], queueLimit: 2 });
+    const first = yield* Effect.forkChild(pool.acquire);
+    const second = yield* Effect.forkChild(pool.acquire);
+    yield* Effect.yieldNow;
+    assert.equal(pool.inFlight(), 2);
+    // A third read while two are still acquiring is refused, not queued without bound.
+    const refused = yield* pool.acquire.pipe(Effect.flip);
+    assert.include(String(refused.reason.message), "Reader lane admission queue full");
+    yield* Deferred.succeed(ready, undefined);
+    const a = yield* Fiber.join(first);
+    const b = yield* Fiber.join(second);
+    assert.notEqual(a!.slot, b!.slot);
+    assert.equal(pool.inFlight(), 0);
+  }),
+);
+
+it.effect("an interrupted acquisition releases its reservation", () =>
+  Effect.gen(function* () {
+    const pool = yield* makeReaderPool({
+      lane: "background",
+      slots: [Effect.never as Effect.Effect<never>],
+      queueLimit: 1,
+    });
+    const waiting = yield* Effect.forkChild(pool.acquire);
+    yield* Effect.yieldNow;
+    assert.equal(pool.inFlight(), 1);
+    yield* Fiber.interrupt(waiting);
+    assert.equal(pool.inFlight(), 0);
+  }),
+);
+
+it.effect(
+  "work forked from a foreground request uses the background lane once the request ends",
+  () =>
+    withLanes({ foregroundReaderSlots: 1 }, (sql) =>
+      Effect.gen(function* () {
+        yield* background(countEntries(sql));
+        const released = yield* Deferred.make<void>();
+        const lanes: Array<unknown> = [];
+        const spans = yield* spanAttributes(
+          Effect.gen(function* () {
+            let deferred: Fiber.Fiber<number | undefined, SqlError.SqlError> | undefined;
+            yield* SqliteClient.foregroundReads(
+              Effect.gen(function* () {
+                // During the request: foreground.
+                yield* countEntries(sql).pipe(SqliteClient.readOnly);
+                // A delivery drain the request leaves behind.
+                deferred = yield* Effect.forkDetach(
+                  Deferred.await(released).pipe(
+                    Effect.andThen(countEntries(sql).pipe(SqliteClient.readOnly)),
+                  ),
+                );
+              }),
+            );
+            yield* Deferred.succeed(released, undefined);
+            yield* Fiber.join(deferred!);
+          }).pipe(Effect.orDie),
+        );
+        for (const span of spans) if (span["db.connection"] === "reader") lanes.push(span["db.reader.lane"]);
+        assert.deepStrictEqual(lanes, ["foreground", "background"]);
+      }),
+    ),
+  30_000,
 );

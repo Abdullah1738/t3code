@@ -25,6 +25,26 @@ export const ReaderLane = Context.Reference<ReaderLaneName>(
   { defaultValue: () => "background" },
 );
 
+/**
+ * Set by `foregroundReads` and switched off when that request ends. A fiber
+ * forked from the request (a delivery drain, a retry loop) inherits the
+ * foreground lane only while the request itself is running; afterwards its
+ * reads use the background lane, so deferred work never squats on the slots
+ * interactive views need.
+ */
+export const ForegroundScope = Context.Reference<{ active: boolean } | undefined>(
+  "@t3tools/shared/nodeSqliteClient/ForegroundScope",
+  { defaultValue: () => undefined },
+);
+
+/** The lane a read uses: an ended foreground scope counts as background. */
+export const effectiveLane = (context: Context.Context<never>): ReaderLaneName => {
+  const lane = Context.get(context, ReaderLane);
+  return lane === "foreground" && Context.get(context, ForegroundScope)?.active === false
+    ? "background"
+    : lane;
+};
+
 /** Auth and identity use their own reserved processes and snapshot limits. */
 export const isReservedLane = (lane: ReaderLaneName): lane is "auth" | "identity" =>
   lane === "auth" || lane === "identity";
@@ -56,8 +76,8 @@ export interface ReaderPoolSlot {
 }
 
 export interface ReaderPool {
-  /** Resolves a slot (least loaded first); undefined when that slot's worker is unavailable. */
-  readonly acquire: Effect.Effect<ReaderPoolSlot | undefined>;
+  /** Resolves a slot (least loaded first); undefined when that slot's worker is unavailable. Fails when the lane is full. */
+  readonly acquire: Effect.Effect<ReaderPoolSlot | undefined, SqlError>;
   /** Reads queued or running on this lane, across its slots. */
   readonly inFlight: () => number;
   readonly slots: number;
@@ -76,12 +96,16 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
   readonly queueLimit: number;
 }) {
   let inFlight = 0;
+  // Reads between slot choice and permit request (awaiting their worker). Counted
+  // for admission and slot choice so concurrent reads spread across slots and a
+  // starting worker cannot collect an unbounded queue.
+  let acquiring = 0;
   const entries = yield* Effect.forEach(options.slots, (acquire, slot) =>
-    Effect.map(Semaphore.make(1), (semaphore) => ({ slot, acquire, semaphore, load: 0 })),
+    Effect.map(Semaphore.make(1), (semaphore) => ({ slot, acquire, semaphore, load: 0, acquiring: 0 })),
   );
   type Entry = (typeof entries)[number];
   const admit = (entry: Entry): SqlError | undefined => {
-    if (inFlight >= options.queueLimit) return laneOverloaded(options.lane, options.queueLimit);
+    if (inFlight + acquiring >= options.queueLimit) return laneOverloaded(options.lane, options.queueLimit);
     inFlight++;
     entry.load++;
     return undefined;
@@ -126,18 +150,33 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
   const locks = entries.map(lockFor);
   const pick = (): Entry => {
     let best = entries[0]!;
-    for (const entry of entries) if (entry.load < best.load) best = entry;
+    for (const entry of entries)
+      if (entry.load + entry.acquiring < best.load + best.acquiring) best = entry;
     return best;
   };
   const acquire = Effect.suspend(() => {
+    if (inFlight + acquiring >= options.queueLimit)
+      return Effect.fail(laneOverloaded(options.lane, options.queueLimit));
     const entry = pick();
-    return Effect.map(entry.acquire, (connection) =>
-      connection === undefined
-        ? undefined
-        : { connection, lock: locks[entry.slot]!, lane: options.lane, slot: entry.slot },
+    acquiring++;
+    entry.acquiring++;
+    // Released on success, failure and interruption alike; the permit request that
+    // follows counts the read in `inFlight` instead.
+    return entry.acquire.pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          acquiring--;
+          entry.acquiring--;
+        }),
+      ),
+      Effect.map((connection) =>
+        connection === undefined
+          ? undefined
+          : { connection, lock: locks[entry.slot]!, lane: options.lane, slot: entry.slot },
+      ),
     );
   });
-  return { acquire, inFlight: () => inFlight, slots: entries.length } satisfies ReaderPool;
+  return { acquire, inFlight: () => inFlight + acquiring, slots: entries.length } satisfies ReaderPool;
 });
 
 /** Bounded admission for one reserved connection; opened after migrations. */

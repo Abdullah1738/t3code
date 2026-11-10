@@ -31,6 +31,8 @@ import * as Statement from "effect/sql/Statement";
 import { makeAuthReader, ReadOnly, retireAuthReader } from "./nodeSqliteAuthReader.ts";
 import {
   bindSemaphore,
+  effectiveLane,
+  ForegroundScope,
   isReservedLane,
   makeReaderLanes,
   makeReaderPool,
@@ -208,7 +210,18 @@ export const authReadOnly = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Ef
  * their own lane. Without a foreground pool they use the default reader.
  */
 export const foregroundReads = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-  Effect.provideService(effect, ReaderLane, "foreground");
+  Effect.suspend(() => {
+    const scope = { active: true };
+    return effect.pipe(
+      Effect.provideService(ReaderLane, "foreground"),
+      Effect.provideService(ForegroundScope, scope),
+      Effect.ensuring(
+        Effect.sync(() => {
+          scope.active = false;
+        }),
+      ),
+    );
+  });
 
 /** Sweeps, recovery, maintenance and polling. Same as untagged; use it at loop roots so a sweep started from a foreground fiber does not inherit that lane. */
 export const backgroundReads = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
@@ -1660,7 +1673,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     Effect.withFiber<RouteTarget, SqlError>((fiber) => {
       if (background === undefined || !Context.get(fiber.context, ReadOnly))
         return Effect.succeed(writer);
-      const lane = Context.get(fiber.context, ReaderLane);
+      const lane = effectiveLane(fiber.context);
       if (isReservedLane(lane)) {
         const reserved = reservedReader(lane);
         if (reserved !== undefined)

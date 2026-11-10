@@ -3328,7 +3328,9 @@ const make = Effect.gen(function* () {
       return started;
     });
     if (state === "settled") yield* Deferred.succeed(waiter, undefined);
-    else if (state !== null) yield* runOwnerDrain(discussionId, state).pipe(Effect.forkIn(scope));
+    // Deferred delivery (and its retries) is background work even when an owner's RPC triggered it.
+    else if (state !== null)
+      yield* runOwnerDrain(discussionId, state).pipe(NodeSqliteClient.backgroundReads, Effect.forkIn(scope));
     return waiter;
   });
 
