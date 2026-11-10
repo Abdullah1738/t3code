@@ -388,6 +388,7 @@ export interface ThreadManagementServiceShape {
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     readonly afterThreadId?: string;
+    readonly recentFirst?: boolean;
     readonly limit?: number;
     readonly omitIdleSubagents?: boolean;
   }) => Effect.Effect<

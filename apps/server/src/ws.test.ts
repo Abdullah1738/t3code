@@ -600,6 +600,85 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
           pages.every((item) => Buffer.byteLength(JSON.stringify(item)) < 2 * 1024 * 1024),
         );
         assert.deepEqual(cursors, [undefined, rows[499]!.id, rows[999]!.id]);
+
+        // ardud: asked for recent rows first, the socket sends them as page one and then
+        // the same walk; with the switch off it pages by id from the start.
+        const recentReads: Array<{ recent: boolean; after: string | undefined }> = [];
+        const recentRows = rows.toReversed();
+        const pagesFor = (switches: { readonly shellRecentFirst: boolean }) =>
+          subscribeOrchestrationV2Shell({
+            requestCompletionMarker: true,
+            acceptShellPages: true,
+            recentFirst: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.provideService(ThreadManagement.ThreadManagementService, {
+              ...threads,
+              readShellSnapshot: (options) => {
+                recentReads.push({
+                  recent: options?.recentFirst === true,
+                  after: options?.afterThreadId,
+                });
+                const selected = (options?.recentFirst === true ? recentRows : rows)
+                  .filter(
+                    (row) => options?.afterThreadId === undefined || row.id > options.afterThreadId,
+                  )
+                  .slice(0, options?.limit);
+                return Effect.succeed(
+                  Effect.succeed({
+                    schemaVersion: 1,
+                    snapshotSequence: 0,
+                    threads: selected,
+                    archivedThreads: [],
+                  }),
+                );
+              },
+            }),
+            Effect.provideService(Switches, { ...readSpeedups({}), ...switches }),
+            Effect.map((items) =>
+              Array.from(items).filter(
+                (item): item is Extract<OrchestrationV2ShellStreamItem, { kind: "snapshot" }> =>
+                  item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined,
+              ),
+            ),
+          );
+        const recentPages = yield* pagesFor({ shellRecentFirst: true });
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.threads.length),
+          [500, 500, 500, 101],
+        );
+        assert.deepEqual(
+          recentPages[0]!.snapshot.threads.map((thread) => thread.id),
+          recentRows.slice(0, 500).map((row) => row.id),
+        );
+        assert.deepEqual(
+          recentPages.slice(1).flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        // Page one starts a load for the client's reducer; every later page continues it.
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.page?.after == null),
+          [true, false, false, false],
+        );
+        assert.isNull(recentPages.at(-1)!.snapshot.page?.nextAfter);
+        assert.deepEqual(recentReads, [
+          { recent: true, after: undefined },
+          { recent: false, after: undefined },
+          { recent: false, after: rows[499]!.id },
+          { recent: false, after: rows[999]!.id },
+        ]);
+        recentReads.length = 0;
+        const switchedOff = yield* pagesFor({ shellRecentFirst: false });
+        assert.deepEqual(
+          switchedOff.flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        assert.isFalse(recentReads.some((read) => read.recent));
       }).pipe(Effect.provide(fixture.services));
     }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

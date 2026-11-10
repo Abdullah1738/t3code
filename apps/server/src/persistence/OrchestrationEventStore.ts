@@ -691,8 +691,10 @@ const makeEventStore = Effect.gen(function* () {
     aggregate_kind = 'project'
     OR (application_event_version = 2 AND aggregate_kind = 'thread')
   )`;
-  const getShellChanges: OrchestrationEventStore["Service"]["getShellChanges"] = (input) =>
-    Effect.gen(function* () {
+  const getShellChanges: OrchestrationEventStore["Service"]["getShellChanges"] = Effect.fn(
+    "OrchestrationEventStore.getShellChanges",
+  )(
+    function* (input) {
       const maxThreads = Math.max(0, Math.floor(input.maxThreads));
       const threads = yield* sql<{ readonly streamId: string; readonly sequence: number }>`
         SELECT stream_id AS "streamId", MAX(sequence) AS sequence
@@ -744,12 +746,12 @@ const makeEventStore = Effect.gen(function* () {
             : [],
         ),
       };
-    }).pipe(
-      // One snapshot for both statements.
-      sql.withTransaction,
-      NodeSqliteClient.readOnly,
-      Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.getShellChanges:query")),
-    );
+    },
+    // One snapshot for both statements.
+    sql.withTransaction,
+    NodeSqliteClient.readOnly,
+    Effect.mapError(toPersistenceSqlError("OrchestrationEventStore.getShellChanges:query")),
+  );
 
   const latestAgentSequence: OrchestrationEventStore["Service"]["latestAgentSequence"] = (
     threadId,

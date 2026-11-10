@@ -172,7 +172,9 @@ import {
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
-import { ShellResumeLimits } from "./ardud/perf/speedups.ts";
+import type { OrchestrationEventStoreError } from "./persistence/Errors.ts";
+import { ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
+import { SHELL_PAGE_SIZE, shellPageNextAfter, shellPageRead } from "./ardud/perf/shellPages.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
@@ -978,6 +980,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     readonly requestCompletionMarker?: boolean;
     readonly acceptShellPages?: boolean;
     readonly omitIdleSubagents?: boolean;
+    readonly recentFirst?: boolean;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -1002,17 +1005,24 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         };
       },
     );
+    const recentFirst = input.recentFirst === true && (yield* Switches).shellRecentFirst;
     const loadSnapshot = Effect.fn("ws.orchestrationV2.loadShellSnapshot")(function* (
       after?: string,
     ) {
+      const read =
+        input.acceptShellPages === true
+          ? shellPageRead(after, recentFirst)
+          : after === undefined
+            ? {}
+            : { afterThreadId: after };
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(input.omitIdleSubagents === true ? { omitIdleSubagents: true } : {}),
-            ...(input.acceptShellPages === true ? { limit: 501 } : {}),
-            ...(after === undefined ? {} : { afterThreadId: after }),
+            ...(input.acceptShellPages === true ? { limit: SHELL_PAGE_SIZE + 1 } : {}),
+            ...read,
           }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
@@ -1028,10 +1038,10 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         snapshot: {
           ...base,
           projects: enriched.projects,
-          threads: base.threads.slice(0, 500),
+          threads: base.threads.slice(0, SHELL_PAGE_SIZE),
           page: {
             after: after ?? null,
-            nextAfter: base.threads.length > 500 ? base.threads[499]!.id : null,
+            nextAfter: shellPageNextAfter(read, base.threads),
           },
         } as OrchestrationV2ShellSnapshot,
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
@@ -1200,10 +1210,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       }
       const cursorRepeat = input.afterSequence - replayAfter;
       const limits = yield* ShellResumeLimits;
-      let replayEvents: Stream.Stream<
-        ShellApplicationEvent,
-        OrchestrationEventStore.OrchestrationEventStoreError
-      >;
+      let replayEvents: Stream.Stream<ShellApplicationEvent, OrchestrationEventStoreError>;
       if (
         yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat)
       ) {

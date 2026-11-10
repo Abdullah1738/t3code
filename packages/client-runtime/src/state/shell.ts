@@ -347,7 +347,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         const omitIdleSubagents = yield* ShellSnapshotLoader.OmitIdleSubagents;
         const shellPages = {
           ...(initialConfig?.shellSnapshotPagination === true
-            ? { acceptShellPages: true as const }
+            ? { acceptShellPages: true as const, recentFirst: true as const }
             : {}),
           ...(omitIdleSubagents ? { omitIdleSubagents: true as const } : {}),
         };

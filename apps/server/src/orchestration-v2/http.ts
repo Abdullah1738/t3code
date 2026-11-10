@@ -35,6 +35,8 @@ import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.
 import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
 import { checkJsonReply } from "../ardud/http/jsonReply.ts";
+import { SHELL_PAGE_SIZE, shellPageNextAfter, shellPageRead } from "../ardud/perf/shellPages.ts";
+import { Switches } from "../ardud/perf/speedups.ts";
 
 const isThreadTranscriptTooLargeError = Schema.is(
   ThreadManagementService.ThreadTranscriptTooLargeError,
@@ -81,15 +83,21 @@ export const layer = HttpApiBuilder.group(
       after?: string,
       paged = false,
       omitIdleSubagents = false,
+      recentFirst = false,
     ) {
+      const read = paged
+        ? shellPageRead(after, recentFirst && (yield* Switches).shellRecentFirst)
+        : after === undefined
+          ? {}
+          : { afterThreadId: after };
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
           readThreads: threadManagement.readShellSnapshot({
             location: "active",
             ...(omitIdleSubagents ? { omitIdleSubagents: true } : {}),
-            ...(paged ? { limit: 501 } : {}),
-            ...(after === undefined ? {} : { afterThreadId: after }),
+            ...(paged ? { limit: SHELL_PAGE_SIZE + 1 } : {}),
+            ...read,
           }),
           listProjects: projectStore.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
@@ -97,14 +105,13 @@ export const layer = HttpApiBuilder.group(
       );
       const projects = yield* enrichProjectShells(base.projects);
       if (!paged) return { ...base, projects };
-      const threads = base.threads.slice(0, 500);
       return {
         ...base,
         projects,
-        threads,
+        threads: base.threads.slice(0, SHELL_PAGE_SIZE),
         page: {
           after: after ?? null,
-          nextAfter: base.threads.length > 500 ? threads.at(-1)!.id : null,
+          nextAfter: shellPageNextAfter(read, base.threads),
         },
       };
     });
@@ -180,6 +187,7 @@ export const layer = HttpApiBuilder.group(
             args.query.after,
             args.query.paged === "true",
             args.query.omitIdleSubagents === "true",
+            args.query.recentFirst === "true",
           ).pipe(
             checkJsonReply,
             traceLocalHandlerWork,

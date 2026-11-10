@@ -17,6 +17,8 @@
  *   lets a resume up to 20,000 events behind catch up from a list of changed threads.
  * - `ROBOB_SHELL_RESUME_MAX_THREADS=<n>`: most changed threads one such catch-up may
  *   refetch before the whole list is sent instead (default 2,000).
+ * - `ROBOB_SHELL_RECENT_FIRST=0`: a client asking for the most recently updated threads
+ *   as the first page of a paged thread list gets pages by thread id from the start.
  */
 import * as Context from "effect/Context";
 
@@ -51,6 +53,7 @@ export interface Speedups {
   readonly threadReplyLane: boolean;
   readonly shellResumeMaxGap: number;
   readonly shellResumeMaxThreads: number;
+  readonly shellRecentFirst: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -65,6 +68,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
     2_000_000,
   ),
   shellResumeMaxThreads: count(env, "ROBOB_SHELL_RESUME_MAX_THREADS", 2_000, 1, 20_000),
+  shellRecentFirst: !isOff(env, "ROBOB_SHELL_RECENT_FIRST"),
 });
 
 /** Process-wide switches, read once at start. */

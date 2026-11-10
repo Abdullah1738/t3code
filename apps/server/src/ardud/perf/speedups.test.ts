@@ -9,6 +9,7 @@ it("turns every speed-up on when nothing is set", () => {
     threadReplyLane: true,
     shellResumeMaxGap: 20_000,
     shellResumeMaxThreads: 2_000,
+    shellRecentFirst: true,
   });
   expect(readSpeedups({ ROBOB_SWEEP_READS_ON_WRITER: " ", ROBOB_THREAD_REPLY_LANE: "" })).toEqual(
     readSpeedups({}),
@@ -23,6 +24,7 @@ it("restores each old behaviour from its documented value", () => {
       ROBOB_THREAD_REPLY_LANE: "0",
       ROBOB_SHELL_RESUME_MAX_GAP: "1000",
       ROBOB_SHELL_RESUME_MAX_THREADS: "50",
+      ROBOB_SHELL_RECENT_FIRST: "off",
     }),
   ).toEqual({
     sweepReadsOffWriter: false,
@@ -30,6 +32,7 @@ it("restores each old behaviour from its documented value", () => {
     threadReplyLane: false,
     shellResumeMaxGap: SHELL_RESUME_LEGACY_MAX_GAP,
     shellResumeMaxThreads: 50,
+    shellRecentFirst: false,
   });
 });
 
@@ -41,6 +44,7 @@ it("ignores values that are not the documented ones and clamps counts", () => {
       ROBOB_THREAD_REPLY_LANE: "1",
       ROBOB_SHELL_RESUME_MAX_GAP: "-5",
       ROBOB_SHELL_RESUME_MAX_THREADS: "1e9",
+      ROBOB_SHELL_RECENT_FIRST: "1",
     }),
   ).toEqual(readSpeedups({}));
   expect(readSpeedups({ ROBOB_SHELL_RESUME_MAX_GAP: "5" }).shellResumeMaxGap).toBe(

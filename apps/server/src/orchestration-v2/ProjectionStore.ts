@@ -393,6 +393,8 @@ export interface ProjectionTimelinePage {
 
 export interface ShellSnapshotOptions {
   readonly afterThreadId?: string;
+  /** With `limit`: the most recently updated rows, newest first, instead of the first by id. */
+  readonly recentFirst?: boolean;
   /**
    * Only these threads (and their fork sources), from one bounded read. Used by
    * the control API's live lists instead of one shell transaction per thread.
@@ -5987,6 +5989,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         omitIdleSubagents = false,
         idleSubagentsUpdatedSince,
         afterThreadId,
+        recentFirst = false,
         limit,
         threadIds,
       }: ShellSnapshotOptions = {},
@@ -6165,7 +6168,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE i.thread_id = t.thread_id
                   AND i.run_key = ''
               ) AS runless_item_count
-            FROM orchestration_v2_projection_threads t
+            FROM orchestration_v2_projection_threads t${
+              // Walk the recency index and stop at the limit; a sort would build every row.
+              recentFirst && limit !== undefined
+                ? sql` INDEXED BY ardud_v2_threads_updated_idx`
+                : sql``
+            }
             LEFT JOIN shell_runs active ON active.run_id = (
               SELECT r.run_id
               FROM shell_runs r
@@ -6230,7 +6238,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : sql``
             }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
-            ${limit === undefined ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC` : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`}
+            ${
+              limit === undefined
+                ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
+                : recentFirst
+                  ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
+                  : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
+            }
           `;
 
     const runMapsByThreadId = (input: {
