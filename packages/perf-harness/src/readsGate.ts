@@ -268,7 +268,8 @@ export async function readsGate(
       );
       const boardId = KanbanBoardId.make("synthetic-board-0");
       const discussionId = KanbanDiscussionId.make("synthetic-board-0-card-0-discussion");
-      const thread = "synthetic-thread-1";
+      // A thread whose synthetic history is complete (ownerAnswerFixture repairs 20 and 21).
+      const thread = "synthetic-thread-20";
       const holders = { idleMs: 0, loadedMs: [] as Array<number>, failures: 0 };
       const aborted = { issued: 0, completedBeforeAbort: 0 };
       await Effect.runPromise(
