@@ -32,6 +32,8 @@ import {
   type KanbanGroup,
   type KanbanLink,
   type KanbanMessage,
+  type KanbanAskAnswer,
+  type KanbanAskFeed,
   type KanbanOwnerAsk,
   type KanbanParticipant,
   type KanbanPool,
@@ -72,6 +74,7 @@ import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
 import { actorKey, KanbanStore } from "../store/KanbanStore.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
+import * as AskFeed from "./askFeed.ts";
 import * as Asks from "./asks.ts";
 import { modelProblem } from "./modelCheck.ts";
 import * as Briefs from "./briefs.ts";
@@ -316,11 +319,9 @@ export interface KanbanServiceShape {
    */
   readonly askOwner: (
     cardId: KanbanCard["id"],
-    input: {
+    input: Asks.AskFieldsInput & {
       readonly question: string;
       readonly blocking: boolean;
-      readonly options?: ReadonlyArray<string> | undefined;
-      readonly multi?: boolean | undefined;
     },
     actor: KanbanActor,
     role: Rules.MoveRole,
@@ -333,6 +334,66 @@ export interface KanbanServiceShape {
     actor: KanbanActor,
     role: Rules.MoveRole,
   ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * The asker (or an evaluator) edits an open ask. Every edit bumps its
+   * revision, shows the new version in the ask's discussion and gives the
+   * owner the turn back.
+   */
+  readonly editAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    edit: Asks.AskEdit,
+    actor: KanbanActor,
+    role: Rules.MoveRole,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * The owner's answer to one ask (or an evaluator's, for an ask he handed
+   * over): it closes, the answer is stored on it, and whoever asked is woken
+   * with the verdict, his note and the text to post. A stale ask (expired, or
+   * revised since `revision`) fails with `conflict`. `heard` is false when
+   * nobody but the answerer was told.
+   */
+  readonly answerAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    input: Asks.AskAnswerInput,
+    actor: KanbanActor,
+  ) => Effect.Effect<{ readonly card: KanbanCard; readonly heard: boolean }, KanbanError>;
+  /**
+   * A message in one ask's discussion. From the owner it does not answer the
+   * ask: the ask waits on its asker, who is woken to reply or fix the ask.
+   * From an agent it gives the owner the turn back. The ask stays open.
+   */
+  readonly replyOnAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    actor: KanbanActor,
+    blocks: ReadonlyArray<KanbanBlock>,
+    role: Rules.MoveRole,
+  ) => Effect.Effect<KanbanMessage, KanbanError>;
+  /** The owner hands one ask to the evaluator or takes it back; an evaluator returns it. */
+  readonly handAsk: (
+    cardId: KanbanCard["id"],
+    askId: string,
+    action: "hand" | "take_back" | "return",
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /** One ask, open or closed, with its blocks whole (the card holds big ones as stubs). */
+  readonly askDetail: (
+    cardId: KanbanCard["id"],
+    askId: string,
+  ) => Effect.Effect<
+    {
+      readonly boardId: KanbanBoard["id"];
+      readonly cardId: KanbanCard["id"];
+      readonly cardNumber: number;
+      readonly discussionId: KanbanCard["discussionId"];
+      readonly ask: KanbanOwnerAsk;
+    },
+    KanbanError
+  >;
+  /** Every open ask across boards (or on one), with an optional window of closed ones. */
+  readonly askFeed: (input: AskFeed.AskFeedInput) => Effect.Effect<KanbanAskFeed, KanbanError>;
   /** Marks a subtask done, skipped (with why) or, for evaluators and the owner, open again. */
   readonly markSubtask: (
     cardId: KanbanCard["id"],
@@ -2635,11 +2696,18 @@ const make = Effect.gen(function* () {
     /** Who answered when it isn't the owner (an evaluator dropping an ask): not told. */
     answeredBy: KanbanActor = { _tag: "owner" },
     note = false,
+    /** A typed answer to store on the asks it closes, and how the card's move reads in its history. */
+    record?: { readonly answer: KanbanAskAnswer; readonly moved: string },
   ) {
     const at = yield* nowIso;
     const open = kanbanOpenAsks(card);
     const answered = open.filter(which);
-    let next = Asks.closeAsks(card, at, which);
+    let next = Asks.closeAsks(
+      card,
+      at,
+      which,
+      () => record?.answer ?? Asks.plainAnswer(answeredBy, at, note),
+    );
     let current = discussion;
     const told = new Set<string>(
       answeredBy._tag === "thread" || answeredBy._tag === "evaluator" ? [answeredBy.threadId] : [],
@@ -2681,7 +2749,7 @@ const make = Effect.gen(function* () {
       yield* logEvent(next, answeredBy, "moved", {
         fromStage: card.stage,
         toStage: stage,
-        body: answeredBy._tag === "owner" ? "Owner replied" : "Question dropped",
+        body: record?.moved ?? (answeredBy._tag === "owner" ? "Owner replied" : "Question dropped"),
       });
       if (wake && workThread !== null) {
         current = withParticipant(
@@ -3378,6 +3446,8 @@ const make = Effect.gen(function* () {
     dedupe = false,
     /** Commit an owner post with its routing obligation (see `saveOwnerRoute`). */
     saveRoute = false,
+    /** The ask whose discussion the message belongs to. */
+    askId?: string,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
@@ -3424,6 +3494,7 @@ const make = Effect.gen(function* () {
       blocks: storedBlocks,
       answers: [],
       createdAt: at,
+      ...(askId === undefined ? {} : { askId }),
     };
     const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
     const durablePost = saveRoute && author._tag === "owner";
@@ -6799,17 +6870,39 @@ const make = Effect.gen(function* () {
     ask: KanbanOwnerAsk,
     options: ReadonlyArray<string>,
     multi = false,
+    /** The typed part of the ask (kind, context, options, draft...), stored with its seq. */
+    fields: Asks.AskFields = {},
   ) {
     const discussion = yield* cardDiscussionUnlocked(card.id);
+    // The ask's own blocks lead the message: the post path checks them and keeps the files,
+    // and the card holds them trimmed (see `Asks.storedBlocks`).
+    const rich = fields.blocks ?? [];
     const message = yield* postUnlocked(
       discussion.id,
       ask.by,
-      Asks.askBlocks(ask, options, multi),
+      [...rich, ...Asks.askBlocks({ ...ask, ...fields }, options, multi)],
       false,
+      false,
+      false,
+      ask.id,
     );
-    const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, { seq: message.seq });
+    const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, {
+      ...fields,
+      ...Asks.storedBlocks(message.blocks, rich.length),
+      seq: message.seq,
+    });
     yield* saveCard(next);
     return next;
+  });
+
+  /** Keeps an ask's files before the card changes, so a file that can't be kept refuses the whole ask. */
+  const adoptAskFiles = Effect.fn("KanbanService.adoptAskFiles")(function* (
+    boardId: KanbanBoard["id"],
+    fields: Asks.AskFields,
+  ) {
+    if (!fields.blocks?.some((block) => block._tag === "attachment")) return fields;
+    const claim = yield* attachments.claim(boardId, fields.blocks.map(normalizeMessageBlock));
+    return { ...fields, blocks: Asks.askOnly(claim.blocks) } satisfies Asks.AskFields;
   });
 
   /** A card thread acts only on the card it is running. */
@@ -6823,12 +6916,16 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* checkText([
           ["question", input.question],
-          ...(input.options ?? []).map((option) => ["question", option] as const),
+          ...Asks.askTextFields(input),
+          ...messageTextFields(input.blocks ?? []),
         ]);
         const card = yield* cardOf(cardId);
         yield* checkCardThread(card, actor, role);
         const question = input.question.trim();
         if (!question) return yield* failWith("invalid", "an ask needs the question");
+        const written = Asks.askFields(input);
+        if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
+        const fields = yield* adoptAskFiles(card.boardId, written);
         if (card.settledAt !== null) return yield* failWith("denied", "card is settled");
         const at = yield* nowIso;
         let next: KanbanCard;
@@ -6846,7 +6943,7 @@ const make = Effect.gen(function* () {
           yield* evaluatorTurn(card, next, actor);
         }
         const ask = next.asks.at(-1);
-        return ask ? yield* postAsk(next, ask, input.options ?? [], input.multi ?? false) : next;
+        return ask ? yield* postAsk(next, ask, [], false, fields) : next;
       }),
     );
 
@@ -6890,6 +6987,245 @@ const make = Effect.gen(function* () {
         return next;
       }),
     );
+
+  const openAskOf = (card: KanbanCard, askId: string) => {
+    const ask = Asks.findOpenAsk(card, askId);
+    return ask
+      ? Effect.succeed(ask)
+      : failWith("not-found", `open ask ${askId} on card #${card.number}`);
+  };
+
+  const editAsk: KanbanServiceShape["editAsk"] = (cardId, askId, edit, actor, role) =>
+    guard(
+      Effect.gen(function* () {
+        yield* checkText([
+          ["question", edit.question],
+          ["revisionNote", edit.revisionNote],
+          ...Asks.askTextFields(edit),
+          ...messageTextFields(edit.blocks ?? []),
+        ]);
+        const card = yield* cardOf(cardId);
+        yield* checkCardThread(card, actor, role);
+        const ask = yield* openAskOf(card, askId);
+        const at = yield* nowIso;
+        const written = Asks.reviseAsk(ask, edit, at);
+        if (Asks.isAskProblem(written)) return yield* failWith(written.code, written.detail);
+        const { blocks: _blocks, ...revised } = written;
+        // New blocks replace the old ones; otherwise the last version's come along whole.
+        const kept = ask.blocks?.length ?? 0;
+        const rich: ReadonlyArray<KanbanBlock> =
+          edit.blocks !== undefined
+            ? ((yield* adoptAskFiles(card.boardId, { blocks: written.blocks ?? [] })).blocks ?? [])
+            : kept > 0 && ask.seq !== null && card.discussionId !== null
+              ? ((yield* store.message(card.discussionId, ask.seq))?.blocks.slice(0, kept) ?? [])
+              : [];
+        // The new version is a message on the ask, and the one a pick answers from now on.
+        const discussion = yield* cardDiscussionUnlocked(card.id);
+        const message = yield* postUnlocked(
+          discussion.id,
+          actor,
+          [...rich, { _tag: "md", text: Asks.revisedLine(revised) }, ...Asks.askBlocks(revised)],
+          false,
+          false,
+          false,
+          ask.id,
+        );
+        const edited = Asks.replaceAsk(yield* cardOf(card.id), {
+          ...revised,
+          ...Asks.storedBlocks(message.blocks, rich.length),
+          seq: message.seq,
+        });
+        const next: KanbanCard = {
+          ...edited,
+          question:
+            edited.stage === "needs_owner"
+              ? (Asks.openBlockingAsk(edited)?.text ?? edited.question)
+              : edited.question,
+          updatedAt: at,
+        };
+        yield* logEvent(next, actor, "comment", { body: Asks.revisedLine(revised) });
+        yield* saveCard(next);
+        return next;
+      }),
+    );
+
+  const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor) =>
+    guard(
+      Effect.gen(function* () {
+        yield* checkText([
+          ["answer", input.text],
+          ["note", input.note],
+          ["finalDraft", input.finalDraft],
+        ]);
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const byOwner = actor._tag === "owner";
+        if (!byOwner && ask.handedAt === undefined) {
+          return yield* failWith(
+            "denied",
+            `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
+          );
+        }
+        const answer = Asks.answerFor(card, ask, input, actor, yield* nowIso);
+        if (Asks.isAskProblem(answer)) return yield* failWith(answer.code, answer.detail);
+        const discussion = yield* cardDiscussionUnlocked(card.id);
+        // The ask's pick block shows the answer to clients that only read the discussion.
+        const asked = ask.seq === null ? null : yield* store.message(discussion.id, ask.seq);
+        if (asked?.blocks.some((block) => block._tag === "choice" && block.id === ask.id)) {
+          const key = actorKey(actor);
+          const shown: KanbanMessage = {
+            ...asked,
+            answers: [
+              ...asked.answers.filter(
+                (entry) => !(entry.blockId === ask.id && actorKey(entry.by) === key),
+              ),
+              { blockId: ask.id, by: actor, ...Asks.blockAnswer(ask, answer), at: answer.at },
+            ],
+          };
+          yield* store.putMessage(shown);
+          yield* publish(discussion.boardId, { _tag: "message", message: shown });
+        }
+        const fresh = yield* cardOf(card.id);
+        const moved = `${byOwner ? "Owner" : "Evaluator, for the owner,"} ${answer.decision ?? answer.verdict} ${ask.id}`;
+        // Logged first: answerAsks saves the card, which tells the clients to re-read.
+        yield* logEvent(fresh, actor, "comment", { body: moved });
+        const result = yield* answerAsks(
+          discussion,
+          fresh,
+          Asks.answerText(fresh, ask, answer),
+          (open) => open.id === ask.id,
+          actor,
+          false,
+          { answer, moved },
+        );
+        const self = byOwner ? null : (actor as { readonly threadId?: string }).threadId;
+        return {
+          card: result.card,
+          heard:
+            result.card.wakeNote !== fresh.wakeNote ||
+            [...result.told].some((threadId) => threadId !== self),
+        };
+      }),
+    );
+
+  const replyOnAsk: KanbanServiceShape["replyOnAsk"] = (cardId, askId, actor, blocks, role) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        yield* checkCardThread(card, actor, role);
+        const ask = yield* openAskOf(card, askId);
+        const discussion = yield* cardDiscussionUnlocked(card.id);
+        // Never routed as an owner reply: that would answer every open ask on the card.
+        const message = yield* postUnlocked(
+          discussion.id,
+          actor,
+          blocks,
+          false,
+          actor._tag !== "owner",
+          false,
+          ask.id,
+        );
+        const fresh = yield* cardOf(card.id);
+        if (actor._tag !== "owner") {
+          // The agent replied: it is the owner's turn again.
+          const next = Asks.clearClarify(fresh, ask.id);
+          if (next !== fresh) yield* saveCard({ ...next, updatedAt: message.createdAt });
+          return message;
+        }
+        const next: KanbanCard = {
+          ...Asks.markClarify(fresh, ask.id, message.createdAt),
+          updatedAt: message.createdAt,
+        };
+        yield* saveCard(next);
+        const said = blocksText(message.blocks, attachments.pathOf);
+        const current = yield* discussionOf(discussion.id);
+        const by = ask.by;
+        const live =
+          by._tag === "thread"
+            ? by.threadId === next.activeThreadId
+            : by._tag === "evaluator" && (yield* liveEvaluator(by.threadId));
+        // A live asker hears it itself; a parked or ended one is the evaluator's to handle.
+        if (live && (by._tag === "thread" || by._tag === "evaluator")) {
+          yield* deliver(
+            current,
+            by,
+            by._tag === "evaluator" ? "Evaluator" : roleName(next.activeRole ?? "work"),
+            by.threadId,
+            Asks.clarifyText(next, ask, said, false),
+          );
+        } else {
+          yield* toEvaluator(current, Asks.clarifyText(next, ask, said, true));
+        }
+        return message;
+      }),
+    );
+
+  const handAsk: KanbanServiceShape["handAsk"] = (cardId, askId, action, actor) =>
+    guard(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = yield* openAskOf(card, askId);
+        const ref = `${ask.id} on card #${card.number}`;
+        if ((action === "return") === (actor._tag === "owner")) {
+          return yield* failWith(
+            "denied",
+            action === "return"
+              ? "only an evaluator returns a handed ask"
+              : "only the owner hands an ask over or takes it back",
+          );
+        }
+        const at = yield* nowIso;
+        if (action !== "hand") {
+          if (ask.handedAt === undefined) {
+            return yield* failWith("invalid", `${ref} is not with the evaluator`);
+          }
+          const next = { ...Asks.clearHanded(card, ask.id), updatedAt: at };
+          yield* logEvent(next, actor, "comment", {
+            body:
+              action === "return"
+                ? `Evaluator returned ${ask.id} to the owner`
+                : `Owner took ${ask.id} back`,
+          });
+          yield* saveCard(next);
+          return next;
+        }
+        if (ask.handedAt !== undefined) {
+          return yield* failWith("invalid", `${ref} is already with the evaluator`);
+        }
+        const discussion = yield* cardDiscussionUnlocked(card.id);
+        const next = { ...Asks.markHanded(yield* cardOf(card.id), ask.id, at), updatedAt: at };
+        yield* logEvent(next, actor, "comment", { body: `Owner handed ${ask.id} to the evaluator` });
+        yield* saveCard(next);
+        yield* toEvaluator(discussion, Asks.handText(next, ask));
+        return next;
+      }),
+    );
+
+  const askDetail: KanbanServiceShape["askDetail"] = (cardId, askId) =>
+    readDb(
+      Effect.gen(function* () {
+        const card = yield* cardOf(cardId);
+        const ask = card.asks.find((entry) => entry.id === askId);
+        if (!ask) return yield* failWith("not-found", `ask ${askId} on card #${card.number}`);
+        const kept = ask.blocks?.length ?? 0;
+        // The card holds big blocks as stubs; the ask's message holds them whole.
+        const asked =
+          kept > 0 && ask.seq !== null && card.discussionId !== null
+            ? yield* store.message(card.discussionId, ask.seq)
+            : null;
+        return {
+          boardId: card.boardId,
+          cardId: card.id,
+          cardNumber: card.number,
+          discussionId: card.discussionId,
+          ask: asked ? { ...ask, blocks: Asks.askOnly(asked.blocks.slice(0, kept)) } : ask,
+        };
+      }),
+    );
+
+  const askFeed: KanbanServiceShape["askFeed"] = (input) =>
+    readDb(nowIso.pipe(Effect.flatMap((at) => AskFeed.readAskFeed(boardSql, input, at))));
 
   const flagCard: KanbanServiceShape["flagCard"] = (cardId, reason, actor) =>
     guard(
@@ -8169,6 +8505,12 @@ const make = Effect.gen(function* () {
     handBack,
     askOwner,
     changeAsk,
+    editAsk,
+    answerAsk,
+    replyOnAsk,
+    handAsk,
+    askDetail,
+    askFeed,
     reviewResult,
     cardThread,
     setPool,

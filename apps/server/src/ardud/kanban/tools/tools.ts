@@ -222,23 +222,106 @@ const CardMove = tool(
   { readonly: false },
 );
 
+const AskFormat = Schema.Literals(["markdown", "text"]);
+
+/** What an asker writes on an ask beyond the question; card_ask_change edits the same fields. */
+const AskFieldsInput = {
+  kind: Schema.optional(
+    describe(
+      Schema.Literals(["question", "decision", "draft", "action", "change"]),
+      "The template. Left out: taken from what you pass (draft, action, change, else decision with 2+ options, else question).",
+    ),
+  ),
+  title: Schema.optional(describe(Schema.String, "One short line saying what you ask.")),
+  context: Schema.optional(
+    describe(
+      Schema.String,
+      "Markdown: why you ask and what he must know to answer without opening the card.",
+    ),
+  ),
+  options: Schema.optional(
+    describe(
+      Schema.Array(
+        Schema.Union([
+          Schema.String,
+          Schema.Struct({
+            id: Schema.optional(Schema.String),
+            label: Schema.String,
+            detail: Schema.optional(Schema.String),
+            recommended: Schema.optional(Schema.Boolean),
+          }),
+        ]),
+      ),
+      "Answers to pick from: a label, or {label, detail: what picking it leads to, recommended: true on yours}.",
+    ),
+  ),
+  multi: Schema.optional(
+    describe(Schema.Boolean, "With options: he may tick several. Default: one pick."),
+  ),
+  draft: Schema.optional(
+    describe(
+      Schema.Struct({
+        text: Schema.String,
+        format: Schema.optional(AskFormat),
+        target: Schema.optional(Schema.String),
+      }),
+      'The exact text you will post or send, and where (target, e.g. "comment on PR #512").',
+    ),
+  ),
+  action: Schema.optional(
+    describe(
+      Schema.Struct({
+        summary: Schema.String,
+        command: Schema.optional(Schema.String),
+        target: Schema.optional(Schema.String),
+        evidence: Schema.optional(Schema.Array(Schema.String)),
+        undo: Schema.optional(Schema.String),
+      }),
+      "What you will do, the command, where, the proof it is ready, and how to undo it.",
+    ),
+  ),
+  change: Schema.optional(
+    describe(
+      Schema.Struct({
+        label: Schema.String,
+        before: Schema.String,
+        after: Schema.String,
+        format: Schema.optional(AskFormat),
+      }),
+      "A text being replaced (a tool description, a rule): what it is, the full text before and after.",
+    ),
+  ),
+  basis: Schema.optional(
+    describe(Schema.String, "The facts the ask rests on, e.g. a head commit or a version."),
+  ),
+  expiresAt: Schema.optional(
+    describe(Schema.String, "ISO time after which the ask is stale and can't be answered."),
+  ),
+  batchKey: Schema.optional(
+    describe(
+      Schema.String,
+      'Same key = same shape of ask on this board; he can answer them together (e.g. "deploy-go").',
+    ),
+  ),
+  blocks: Schema.optional(
+    describe(
+      Schema.Array(KanbanBlockInput),
+      "Evidence shown inside the ask, in order (at most 12, 8 of them images or files): md {text}, collapse {title, text}, html {html, title, height}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (id from t3_attachment_prepare_upload), card {cardId}. No choice blocks: answers go in options.",
+    ),
+  ),
+};
+
+const AskActionInput = AskFieldsInput.action;
+
 const CardAsk = tool(
   "card_ask",
   "Ask the owner",
-  "Ask the owner a question on a card; it shows in Needs Owner and in the card's discussion, and his answer comes back to you. Async by default: the card and its work go on, and the owner can make it blocking later. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). Options make it a pick; multi lets him tick several.",
+  "Ask the owner on a card. He answers from a list, without opening the card, so the ask must stand on its own; his answer comes back to you. Async by default: the card and its work go on. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). One thing per ask, in the template that fits: question (something only he knows: question + context); decision (he picks: options, each with detail and your recommended one); draft (a text you will post or send: draft; he may edit it, and you post exactly what comes back); action (something you will run: action with command, evidence and undo); change (a text you replace: change with before and after). Always give title and context. Show evidence instead of describing it, with blocks: attach screenshots, screen recordings, audio, PDFs or files (upload with t3_attachment_prepare_upload, then pass an attachment block), and put a visualization in an html block (a self-contained page like the ones html_render publishes: chart, table, before/after, diagram; no external scripts, fonts or fetches; readable at phone width, in light and dark). Give every image alt text and a one-line caption (an md block after it). The question and options must still read on their own, without opening anything.",
   {
     card: Schema.optional(CardRef),
-    question: Schema.String,
+    question: describe(Schema.String, "The question itself, one or two sentences."),
     blocking: Schema.optional(Schema.Boolean),
-    options: Schema.optional(
-      describe(Schema.Array(Schema.String), "Answers to pick from, when they are known."),
-    ),
-    multi: Schema.optional(
-      describe(
-        Schema.Boolean,
-        "With options: let the owner tick several (a checklist). Default: one pick.",
-      ),
-    ),
+    ...AskFieldsInput,
   },
   { card: Record },
   { readonly: false },
@@ -247,11 +330,47 @@ const CardAsk = tool(
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  "Make an open async ask (q1, q2... on the card) blocking, or drop one that is no longer needed. A work thread changes only its own card's asks.",
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, change...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask he handed over back to him. A work thread changes only its own card\'s asks.',
   {
     card: Schema.optional(CardRef),
     ask: Schema.String,
-    action: Schema.Literals(["block", "drop"]),
+    question: Schema.optional(Schema.String),
+    blocking: Schema.optional(
+      describe(Schema.Boolean, "true makes an async ask blocking. A blocking ask can't be made async."),
+    ),
+    revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
+    ...AskFieldsInput,
+    action: Schema.optional(
+      describe(
+        Schema.Union([
+          Schema.Literals(["block", "drop", "return"]),
+          ...AskActionInput.schema.members,
+        ]),
+        'An operation ("block", "drop" or "return"), or the new action body of an action ask.',
+      ),
+    ),
+  },
+  { card: Record },
+  { readonly: false },
+);
+
+const CardAskAnswer = tool(
+  "card_ask_answer",
+  "Decide a handed ask",
+  "Evaluators only: decide an ask the owner handed to you (you are told when he does). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it back with card_ask_change action \"return\" instead.",
+  {
+    card: Schema.optional(CardRef),
+    ask: Schema.String,
+    verdict: describe(
+      Schema.Literals(["approved", "rejected", "picked", "answered"]),
+      "approved / rejected for a draft, action or change; picked with optionIds; answered with text.",
+    ),
+    optionIds: Schema.optional(Schema.Array(Schema.String)),
+    text: Schema.optional(describe(Schema.String, "The answer in your own words.")),
+    note: Schema.optional(describe(Schema.String, "What whoever acts on it must know first.")),
+    finalDraft: Schema.optional(
+      describe(Schema.String, "A draft ask: the text to post, when you changed the draft."),
+    ),
   },
   { card: Record },
   { readonly: false },
@@ -291,10 +410,13 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
+    ask: Schema.optional(
+      describe(Schema.String, "An open ask on the card (q1, q2...) to reply on, without closing it."),
+    ),
     ...BlocksInput,
   },
   { message: Record },
@@ -588,6 +710,7 @@ export const KanbanToolkit = Toolkit.make(
   CardMove,
   CardAsk,
   CardAskChange,
+  CardAskAnswer,
   CardFlag,
   CardReviewResult,
   DiscussionPost,

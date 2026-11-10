@@ -24,6 +24,7 @@ import {
   ProjectId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -36,6 +37,7 @@ import { KanbanService } from "./engine/KanbanService.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
 import { textProblem } from "./engine/text.ts";
+import { stubMessage } from "./engine/messagePages.ts";
 import * as BoardReplies from "./engine/boardReplies.ts";
 import { jsonReply } from "../http/jsonReply.ts";
 
@@ -134,6 +136,37 @@ const AnswerBody = Schema.Struct({
   choice: Schema.Array(Schema.String),
   text: Schema.optional(Schema.NullOr(Schema.String)),
 });
+
+const AskVerdict = Schema.Literals(["approved", "rejected", "picked", "answered"]);
+const AskAnswerFields = {
+  verdict: AskVerdict,
+  optionIds: Schema.optional(Schema.Array(Schema.String)),
+  text: Text,
+  /** For the agent that acts on the answer. Never saved as a rule. */
+  note: Text,
+};
+const AskAnswerBody = Schema.Struct({
+  ...AskAnswerFields,
+  /** A draft ask: the text to post, as the owner left it. */
+  finalDraft: Text,
+  /** The revision the client showed; a newer one answers with 409. */
+  revision: Schema.optional(Schema.Int),
+});
+const AskBatchBody = Schema.Struct({
+  ...AskAnswerFields,
+  items: Schema.Array(
+    Schema.Struct({
+      card: Schema.String,
+      askId: Schema.String,
+      revision: Schema.optional(Schema.Int),
+    }),
+  ),
+});
+const AskHandBody = Schema.Struct({
+  action: Schema.optional(Schema.Literals(["hand", "take_back"])),
+});
+/** At most this many asks in one batch answer. */
+const ASK_BATCH_MAX = 50;
 
 const BoardBody = Schema.Struct({
   name: Text,
@@ -489,6 +522,116 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    /** `closed`: an ISO time, or a window back from now such as `24h` or `7d`. */
+    const closedSince = Effect.fn("KanbanHttp.closedSince")(function* (value: string | null) {
+      if (value === null || value.trim() === "") return undefined;
+      const window = /^(\d{1,4})([hd])$/.exec(value.trim());
+      if (window) {
+        const hours = Number(window[1]) * (window[2] === "d" ? 24 : 1);
+        return DateTime.formatIso(DateTime.subtract(yield* DateTime.now, { hours }));
+      }
+      const time = DateTime.make(value.trim());
+      if (Option.isNone(time)) {
+        return yield* fail("invalid", "closed must be an ISO time or a window like 24h or 7d.");
+      }
+      return DateTime.formatIso(time.value);
+    });
+
+    const askOf = (card: KanbanCard, askId: string) => {
+      const ask = card.asks.find((entry) => entry.id === askId);
+      return {
+        card: { id: card.id, number: card.number, stage: card.stage },
+        ask: ask ?? null,
+      };
+    };
+
+    const listAsks = read(
+      Effect.gen(function* () {
+        const ref = yield* query("board");
+        const board = ref ? yield* boardOf(ref) : null;
+        return yield* service.askFeed({
+          boardId: board?.id,
+          closedSince: yield* closedSince(yield* query("closed")),
+        });
+      }),
+    );
+
+    const getAsk = read(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        return yield* service.askDetail(card.id, yield* param("ask"));
+      }),
+    );
+
+    const answerAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(AskAnswerBody);
+        const result = yield* service.answerAsk(card.id, askId, input, OWNER);
+        return askOf(result.card, askId);
+      }),
+    );
+
+    // Each ask is answered on its own: one stale or closed ask doesn't hold back the rest.
+    const answerAsks = write(
+      Effect.gen(function* () {
+        const { items, ...answer } = yield* body(AskBatchBody);
+        if (items.length === 0) return yield* fail("invalid", "items is empty.");
+        if (items.length > ASK_BATCH_MAX) {
+          return yield* fail("invalid", `At most ${ASK_BATCH_MAX} asks in one batch.`);
+        }
+        const results = yield* Effect.forEach(items, (item) =>
+          Effect.gen(function* () {
+            const card = yield* cardOf(item.card);
+            const result = yield* service.answerAsk(
+              card.id,
+              item.askId,
+              { ...answer, revision: item.revision },
+              OWNER,
+            );
+            return { card: item.card, askId: item.askId, ok: true as const, stage: result.card.stage };
+          }).pipe(
+            Effect.catchTags({
+              KanbanError: (error) =>
+                Effect.succeed({
+                  card: item.card,
+                  askId: item.askId,
+                  ok: false as const,
+                  error: { code: error.code, message: error.detail },
+                }),
+            }),
+          ),
+        );
+        return { answered: results.filter((result) => result.ok).length, results };
+      }),
+    );
+
+    const replyOnAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(PostBody);
+        const problem = textProblem([["message", input.text]]);
+        if (problem) return yield* fail("invalid", problem);
+        const blocks = [
+          ...(input.text?.trim() ? [{ _tag: "md" as const, text: input.text }] : []),
+          ...(input.blocks ?? []),
+        ];
+        if (blocks.length === 0) return yield* fail("invalid", "Nothing to post.");
+        return stubMessage(yield* service.replyOnAsk(card.id, askId, OWNER, blocks, "owner"));
+      }),
+    );
+
+    const handAsk = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const askId = yield* param("ask");
+        const input = yield* body(AskHandBody);
+        return askOf(yield* service.handAsk(card.id, askId, input.action ?? "hand", OWNER), askId);
+      }),
+    );
+
     const startEvaluator = write(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
@@ -566,6 +709,12 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),
+      HttpRouter.route("GET", `${p}/asks`, handle(listAsks)),
+      HttpRouter.route("POST", `${p}/asks/answer`, handle(answerAsks)),
+      HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),
+      HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/hand`, handle(handAsk)),
       HttpRouter.route("PATCH", `${p}/discussions/:discussion`, handle(updateDiscussion)),
       HttpRouter.route("GET", `${p}/discussions/:discussion/messages`, handle(listMessages)),
       HttpRouter.route("POST", `${p}/discussions/:discussion/messages`, handle(postMessage)),

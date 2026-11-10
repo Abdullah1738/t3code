@@ -144,9 +144,159 @@ export const KanbanSubtask = Schema.Struct({
 });
 export type KanbanSubtask = typeof KanbanSubtask.Type;
 
+const BlockId = TrimmedNonEmptyString;
+const ChoiceOption = Schema.Struct({ id: TrimmedNonEmptyString, label: TrimmedNonEmptyString });
+
+/**
+ * Set on a big md, collapse or html block in a list read: the text field holds a short preview
+ * and the full block comes from the message read by seq. Optional, so older decoders drop them
+ * and show the preview as the block.
+ */
+const KanbanBlockStub = {
+  truncated: Schema.optional(Schema.Boolean),
+  /** UTF-8 size of the full text or html. */
+  fullBytes: Schema.optional(NonNegativeInt),
+};
+
+const MdBlock = Schema.TaggedStruct("md", { text: Schema.String, ...KanbanBlockStub });
+const CollapseBlock = Schema.TaggedStruct("collapse", {
+  title: TrimmedNonEmptyString,
+  text: Schema.String,
+  ...KanbanBlockStub,
+});
+const HtmlBlock = Schema.TaggedStruct("html", {
+  html: Schema.String,
+  title: Schema.NullOr(Schema.String),
+  height: Schema.NullOr(PositiveInt),
+  ...KanbanBlockStub,
+});
+/** Poll and pick render the same way; poll shows everyone's answers, pick is a decision. */
+const ChoiceBlock = Schema.TaggedStruct("choice", {
+  id: BlockId,
+  style: Schema.Literals(["poll", "pick"]),
+  question: TrimmedNonEmptyString,
+  options: Schema.Array(ChoiceOption),
+  multi: Schema.Boolean,
+});
+const CardBlock = Schema.TaggedStruct("card", { cardId: KanbanCardId });
+const ImageBlock = Schema.TaggedStruct("image", {
+  url: TrimmedNonEmptyString,
+  alt: Schema.NullOr(Schema.String),
+});
+/** A file uploaded through the attachment store; the board keeps it under its own id. */
+const AttachmentBlock = Schema.TaggedStruct("attachment", {
+  attachment: Schema.Union([ChatImageAttachment, ChatFileAttachment]),
+});
+
+export const KanbanBlock = Schema.Union([
+  MdBlock,
+  CollapseBlock,
+  HtmlBlock,
+  ChoiceBlock,
+  CardBlock,
+  ImageBlock,
+  AttachmentBlock,
+]);
+export type KanbanBlock = typeof KanbanBlock.Type;
+
+/** What an ask can show beside its question: every discussion block but a pick (its options are their own field). */
+export const KanbanAskBlock = Schema.Union([
+  MdBlock,
+  CollapseBlock,
+  HtmlBlock,
+  CardBlock,
+  ImageBlock,
+  AttachmentBlock,
+]);
+export type KanbanAskBlock = typeof KanbanAskBlock.Type;
+
+export const KANBAN_ASK_KINDS = ["question", "decision", "draft", "action", "change"] as const;
+/**
+ * What an ask is for: an open question, a pick between options, a text to
+ * approve before it is posted or sent, an action to approve before it runs, or
+ * a text being replaced.
+ */
+export const KanbanAskKind = Schema.Literals(KANBAN_ASK_KINDS);
+export type KanbanAskKind = typeof KanbanAskKind.Type;
+
+export const KanbanAskTextFormat = Schema.Literals(["markdown", "text"]);
+export type KanbanAskTextFormat = typeof KanbanAskTextFormat.Type;
+
+/** One answer to pick. Its id is also the option id of the ask's pick block. */
+export const KanbanAskOption = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  label: TrimmedNonEmptyString,
+  /** What picking it leads to. */
+  detail: Schema.optional(Schema.String),
+  recommended: Schema.optional(Schema.Boolean),
+});
+export type KanbanAskOption = typeof KanbanAskOption.Type;
+
+/** The exact text the agent will post or send, and where. */
+export const KanbanAskDraft = Schema.Struct({
+  text: Schema.String,
+  format: KanbanAskTextFormat,
+  /** Where it goes, e.g. "comment on PR #512". */
+  target: Schema.optional(Schema.String),
+});
+export type KanbanAskDraft = typeof KanbanAskDraft.Type;
+
+/** What will be done, where, the proof it is ready, and how to undo it. */
+export const KanbanAskAction = Schema.Struct({
+  summary: Schema.String,
+  command: Schema.optional(Schema.String),
+  target: Schema.optional(Schema.String),
+  evidence: Schema.optional(Schema.Array(Schema.String)),
+  undo: Schema.optional(Schema.String),
+});
+export type KanbanAskAction = typeof KanbanAskAction.Type;
+
+/** A text being replaced. Clients render before, after and a diff; the server only stores both. */
+export const KanbanAskChange = Schema.Struct({
+  label: Schema.String,
+  before: Schema.String,
+  after: Schema.String,
+  format: KanbanAskTextFormat,
+});
+export type KanbanAskChange = typeof KanbanAskChange.Type;
+
+export const KANBAN_ASK_VERDICTS = [
+  "approved",
+  "rejected",
+  "picked",
+  "answered",
+  "handed",
+  "dropped",
+] as const;
+export const KanbanAskVerdict = Schema.Literals(KANBAN_ASK_VERDICTS);
+export type KanbanAskVerdict = typeof KanbanAskVerdict.Type;
+
+/** How an ask closed. Asks closed before typed asks existed have none. */
+export const KanbanAskAnswer = Schema.Struct({
+  verdict: KanbanAskVerdict,
+  /** With `handed`: what the evaluator decided on the owner's behalf. */
+  decision: Schema.optional(Schema.Literals(["approved", "rejected", "picked", "answered"])),
+  optionIds: Schema.optional(Schema.Array(Schema.String)),
+  /** The answer in the answerer's own words. */
+  text: Schema.optional(Schema.String),
+  /** The owner's note for the agent that acts on the answer. Never saved as a rule. */
+  note: Schema.optional(Schema.String),
+  /** A draft ask: the text to post, as the owner left it. */
+  finalDraft: Schema.optional(Schema.String),
+  /** True when `finalDraft` differs from the draft the agent wrote. */
+  draftEdited: Schema.optional(Schema.Boolean),
+  by: KanbanActor,
+  at: IsoDateTime,
+});
+export type KanbanAskAnswer = typeof KanbanAskAnswer.Type;
+
 /**
  * A question for the owner. A blocking ask holds the card in Needs Owner; an
  * async one lets its work go on and can be made blocking later.
+ *
+ * Everything after `closedAt` is optional and absent on asks stored before
+ * typed asks: read `kind` and `revision` through `kanbanAskKind` and
+ * `kanbanAskRevision`.
  */
 export const KanbanOwnerAsk = Schema.Struct({
   /** `q1`, `q2`, ... per card; also the id of its pick block when it has options. */
@@ -155,12 +305,65 @@ export const KanbanOwnerAsk = Schema.Struct({
   blocking: Schema.Boolean,
   by: KanbanActor,
   at: IsoDateTime,
-  /** The card discussion message that asked it; null when it wasn't posted. */
+  /** The card discussion message that asked it (its latest version, once edited); null when it wasn't posted. */
   seq: Schema.NullOr(PositiveInt),
   /** Set once answered or dropped. */
   closedAt: Schema.NullOr(IsoDateTime),
+  /** Absent means "question". */
+  kind: Schema.optional(KanbanAskKind),
+  /** One short line saying what is being asked. */
+  title: Schema.optional(Schema.String),
+  /** Markdown: why it is asked and what the owner needs to know to answer without opening the card. */
+  context: Schema.optional(Schema.String),
+  options: Schema.optional(Schema.Array(KanbanAskOption)),
+  /** With options: several may be picked. */
+  multi: Schema.optional(Schema.Boolean),
+  draft: Schema.optional(KanbanAskDraft),
+  action: Schema.optional(KanbanAskAction),
+  change: Schema.optional(KanbanAskChange),
+  /** The facts the ask rests on (a head commit, a version). */
+  basis: Schema.optional(Schema.String),
+  /** Past this time the ask is stale and can't be answered until its asker renews it. */
+  expiresAt: Schema.optional(IsoDateTime),
+  /** Asks with the same key on a board are the same shape and can be answered together. */
+  batchKey: Schema.optional(Schema.String),
+  /** Bumped every time the agent edits the open ask. Absent means 0. */
+  revision: Schema.optional(NonNegativeInt),
+  revisedAt: Schema.optional(IsoDateTime),
+  revisionNote: Schema.optional(Schema.String),
+  /** Set when it closes through the answer path, a hand-over or a drop. */
+  answer: Schema.optional(KanbanAskAnswer),
+  /** The owner asked a clarifying question: the ask waits for the agent, not for him. */
+  clarifyAskedAt: Schema.optional(IsoDateTime),
+  /** The owner handed it to the evaluator, which answers on his behalf. */
+  handedAt: Schema.optional(IsoDateTime),
+  /**
+   * Evidence and visuals shown with the ask: text, an html page, images and
+   * files. On the card a big md, collapse or html body is a stub (`truncated`,
+   * `fullBytes`); the single-ask read returns them whole. Absent means none.
+   */
+  blocks: Schema.optional(Schema.Array(KanbanAskBlock)),
 });
 export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
+
+export const kanbanAskKind = (ask: Pick<KanbanOwnerAsk, "kind">): KanbanAskKind =>
+  ask.kind ?? "question";
+export const kanbanAskRevision = (ask: Pick<KanbanOwnerAsk, "revision">): number =>
+  ask.revision ?? 0;
+/** An open ask the owner is not expected to act on right now, and why. */
+export const kanbanAskWaitsOn = (
+  ask: Pick<KanbanOwnerAsk, "clarifyAskedAt" | "handedAt" | "closedAt">,
+): "owner" | "agent" | "evaluator" | null =>
+  ask.closedAt !== null
+    ? null
+    : ask.handedAt !== undefined
+      ? "evaluator"
+      : ask.clarifyAskedAt !== undefined
+        ? "agent"
+        : "owner";
+/** Past its `expiresAt`: its asker must renew it before it can be answered. */
+export const kanbanAskExpired = (ask: Pick<KanbanOwnerAsk, "expiresAt">, nowMs: number): boolean =>
+  ask.expiresAt !== undefined && Date.parse(ask.expiresAt) <= nowMs;
 
 export const KanbanCard = Schema.Struct({
   id: KanbanCardId,
@@ -564,50 +767,6 @@ export type KanbanBoard = typeof KanbanBoard.Type;
 export const kanbanBoardIcon = (board: KanbanBoard): KanbanBoardIcon | null =>
   KANBAN_BOARD_ICONS.find((name) => name === board.icon) ?? null;
 
-const BlockId = TrimmedNonEmptyString;
-const ChoiceOption = Schema.Struct({ id: TrimmedNonEmptyString, label: TrimmedNonEmptyString });
-
-/**
- * Set on a big md, collapse or html block in a list read: the text field holds a short preview
- * and the full block comes from the message read by seq. Optional, so older decoders drop them
- * and show the preview as the block.
- */
-const KanbanBlockStub = {
-  truncated: Schema.optional(Schema.Boolean),
-  /** UTF-8 size of the full text or html. */
-  fullBytes: Schema.optional(NonNegativeInt),
-};
-
-export const KanbanBlock = Schema.Union([
-  Schema.TaggedStruct("md", { text: Schema.String, ...KanbanBlockStub }),
-  Schema.TaggedStruct("collapse", {
-    title: TrimmedNonEmptyString,
-    text: Schema.String,
-    ...KanbanBlockStub,
-  }),
-  Schema.TaggedStruct("html", {
-    html: Schema.String,
-    title: Schema.NullOr(Schema.String),
-    height: Schema.NullOr(PositiveInt),
-    ...KanbanBlockStub,
-  }),
-  /** Poll and pick render the same way; poll shows everyone's answers, pick is a decision. */
-  Schema.TaggedStruct("choice", {
-    id: BlockId,
-    style: Schema.Literals(["poll", "pick"]),
-    question: TrimmedNonEmptyString,
-    options: Schema.Array(ChoiceOption),
-    multi: Schema.Boolean,
-  }),
-  Schema.TaggedStruct("card", { cardId: KanbanCardId }),
-  Schema.TaggedStruct("image", { url: TrimmedNonEmptyString, alt: Schema.NullOr(Schema.String) }),
-  /** A file uploaded through the attachment store; the board keeps it under its own id. */
-  Schema.TaggedStruct("attachment", {
-    attachment: Schema.Union([ChatImageAttachment, ChatFileAttachment]),
-  }),
-]);
-export type KanbanBlock = typeof KanbanBlock.Type;
-
 // Preserve poster text until the board service has checked it, rather than
 // letting TrimmedNonEmptyString erase control characters during decoding.
 const RawBoardText = Schema.toType(TrimmedNonEmptyString);
@@ -652,8 +811,48 @@ export const KanbanMessage = Schema.Struct({
   blocks: Schema.Array(KanbanBlock),
   answers: Schema.Array(KanbanAnswer),
   createdAt: IsoDateTime,
+  /** Set on a message that belongs to one ask's discussion (`q1`, ... on the discussion's card). */
+  askId: Schema.optional(Schema.String),
 });
 export type KanbanMessage = typeof KanbanMessage.Type;
+
+/**
+ * One ask as the Needs-you page reads it: the ask with its card, what the card
+ * holds up, and the ask's own discussion.
+ */
+export const KanbanAskFeedItem = Schema.Struct({
+  boardId: KanbanBoardId,
+  boardSlug: Schema.String,
+  boardName: Schema.String,
+  cardId: KanbanCardId,
+  cardNumber: PositiveInt,
+  /** `<board slug>:<number>`, the form the HTTP routes take. */
+  cardRef: Schema.String,
+  cardTitle: Schema.String,
+  stage: KanbanStage,
+  priority: KanbanPriority,
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  /** Unfinished cards that list this card in `blockedBy`. */
+  blocks: NonNegativeInt,
+  ask: KanbanOwnerAsk,
+  /** `ask.kind` and `ask.revision` with their defaults applied. */
+  kind: KanbanAskKind,
+  revision: NonNegativeInt,
+  /** Whose turn it is on an open ask; null once closed. */
+  waitsOn: Schema.NullOr(Schema.Literals(["owner", "agent", "evaluator"])),
+  expired: Schema.Boolean,
+  /** The message that asked it and every message posted on the ask, oldest first. Big blocks are stubs. */
+  messages: Schema.Array(KanbanMessage),
+});
+export type KanbanAskFeedItem = typeof KanbanAskFeedItem.Type;
+
+export const KanbanAskFeed = Schema.Struct({
+  at: IsoDateTime,
+  open: Schema.Array(KanbanAskFeedItem),
+  /** Asks closed since the `closed` time asked for, newest first; empty when none was asked for. */
+  closed: Schema.Array(KanbanAskFeedItem),
+});
+export type KanbanAskFeed = typeof KanbanAskFeed.Type;
 
 export const KanbanParticipant = Schema.Struct({
   actor: KanbanActor,

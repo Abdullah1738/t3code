@@ -20,18 +20,18 @@ const previewOf = (text: string, chars = MD_PREVIEW_CHARS) => {
   return `${text.slice(0, end)}…`;
 };
 
-/** A big block as its preview, keeping `_tag` so older clients still render it. */
-export const stubBlock = (block: KanbanBlock): KanbanBlock => {
+/** A block past `limit` bytes as its preview, keeping `_tag` so older clients still render it. */
+export const stubBlockAt = <B extends KanbanBlock>(block: B, limit: number): B => {
   switch (block._tag) {
     case "md":
     case "collapse": {
       const fullBytes = utf8Bytes(block.text);
-      if (fullBytes <= BIG_BLOCK_BYTES) return block;
+      if (fullBytes <= limit) return block;
       return { ...block, text: previewOf(block.text), truncated: true, fullBytes };
     }
     case "html": {
       const fullBytes = utf8Bytes(block.html);
-      if (fullBytes <= BIG_BLOCK_BYTES) return block;
+      if (fullBytes <= limit) return block;
       const kb = Math.round(fullBytes / 1024);
       const label = block.title?.trim() ? escapeHtml(block.title.trim()) : "Page";
       return {
@@ -46,16 +46,23 @@ export const stubBlock = (block: KanbanBlock): KanbanBlock => {
   }
 };
 
-/** The message as list reads send it: same object when nothing is big. */
-export const stubMessage = (message: KanbanMessage): KanbanMessage => {
+/** One argument on purpose: it is passed straight to `map`. */
+export const stubBlock = (block: KanbanBlock): KanbanBlock => stubBlockAt(block, BIG_BLOCK_BYTES);
+
+/** The message with every md, collapse or html body past `limit` bytes as a stub. */
+export const stubMessageAt = (message: KanbanMessage, limit: number): KanbanMessage => {
   let changed = false;
   const blocks = message.blocks.map((block) => {
-    const next = stubBlock(block);
+    const next = stubBlockAt(block, limit);
     if (next !== block) changed = true;
     return next;
   });
   return changed ? { ...message, blocks } : message;
 };
+
+/** The message as list reads send it: same object when nothing is big. One argument on purpose. */
+export const stubMessage = (message: KanbanMessage): KanbanMessage =>
+  stubMessageAt(message, BIG_BLOCK_BYTES);
 
 export const messageBytes = (message: KanbanMessage) => utf8Bytes(JSON.stringify(message));
 
