@@ -1103,7 +1103,11 @@ const make = Effect.gen(function* () {
     (effect, _input, id) =>
       effect.pipe(
         Effect.ignore,
-        Effect.ensuring(touching(id, threadIo.interrupt(id, "Board state changed during launch"))),
+        Effect.ensuring(
+          touching(id, threadIo.interrupt(id, "Board state changed during launch")).pipe(
+            Effect.ignore,
+          ),
+        ),
       ),
   );
   const threads: typeof threadIo = {
@@ -1170,8 +1174,31 @@ const make = Effect.gen(function* () {
         );
       }),
     setModel: (id, model) => locks.outside(touching(id, threadIo.setModel(id, model))),
-    interrupt: (id, reason) => locks.outside(touching(id, threadIo.interrupt(id, reason))),
+    // Best effort, as before, for the board's own inline stops; saved stops use `runPendingStops`.
+    interrupt: (id, reason) =>
+      locks.outside(touching(id, threadIo.interrupt(id, reason)).pipe(Effect.ignore)),
   };
+  /** Thread reads that confirm the current run: always read, never replayed. */
+  const freshThreads = {
+    find: (threadId: ThreadId) => locks.outside(threadIo.find(threadId), undefined, true),
+    findLastFailure: (threadId: ThreadId) =>
+      locks.outside(threadIo.findLastFailure(threadId), undefined, true),
+  };
+  // A saved model switch applies the model the thread's cards have now, not the
+  // one it was saved with: switches saved on different card lanes may run in
+  // any order, and the last to run must leave the newest model. One at a time,
+  // and the read is a plain committed read, taken without any board gate.
+  const modelSwitching = yield* Semaphore.make(1);
+  const switchToLatestModel = (threadId: string) =>
+    modelSwitching.withPermits(1)(
+      Effect.gen(function* () {
+        const cards = yield* rawStore.cardsByThread(threadId);
+        const working = cards.find((card) => card.activeRole === "work");
+        // No card works on it any more: the switch is obsolete.
+        if (working === undefined) return;
+        yield* touching(threadId, threadIo.setModel(ThreadId.make(threadId), working.model));
+      }),
+    );
   /**
    * A write's thread follow-on. While `guardDeferred` runs the write (durable
    * route modes) it is saved after the write and run by its lane's drain;
@@ -3371,7 +3398,7 @@ const make = Effect.gen(function* () {
           runPendingStops(effect.threadId, { key: routeKey, reason: effect.reason }),
         );
       case "setModel":
-        return threads.setModel(ThreadId.make(effect.threadId), effect.model);
+        return locks.outside(switchToLatestModel(effect.threadId));
       case "tellEvaluator":
         return Effect.gen(function* () {
           const threadId = ThreadId.make(effect.threadId);
@@ -5001,14 +5028,15 @@ const make = Effect.gen(function* () {
     }
     const failedRunIsCurrent = Effect.fn("KanbanService.failedRunIsCurrent")(function* () {
       if (expectedFailedWorkRunId === undefined) return true;
-      const found = yield* Effect.result(threads.find(threadId));
+      // Never replayed: this confirms which run is current right now.
+      const found = yield* Effect.result(freshThreads.find(threadId));
       // An unreadable shell is not a superseded run: keep the turn end for the next tick.
       if (Result.isFailure(found)) {
         yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
         return false;
       }
       if (found.success?.state !== "idle") return false;
-      const latest = yield* Effect.result(threads.findLastFailure(threadId));
+      const latest = yield* Effect.result(freshThreads.findLastFailure(threadId));
       if (Result.isFailure(latest)) {
         yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
         return false;

@@ -13837,6 +13837,8 @@ it.live("a let-go interrupt still held back runs before the thread's next assign
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     const order: Array<string> = [];
+    // Set once the board is up: the send hook reads the stop's row as the send goes out.
+    let rowsAtSend: Effect.Effect<ReadonlyArray<{ done_at: string | null }>> | undefined;
     const layer = Layer.effect(
       KanbanThreads,
       Effect.map(KanbanThreads, (real) =>
@@ -13849,14 +13851,23 @@ it.live("a let-go interrupt still held back runs before the thread's next assign
               Effect.andThen(real.interrupt(threadId, reason)),
             ),
           send: (input) =>
-            Effect.sync(() => order.push(`send ${input.threadId}`)).pipe(
-              Effect.andThen(real.send(input)),
-            ),
+            Effect.gen(function* () {
+              const rows = rowsAtSend === undefined ? [] : yield* rowsAtSend;
+              order.push(`send ${input.threadId}${rows.some((row) => row.done_at === null) ? " (stop open)" : ""}`);
+              return yield* real.send(input);
+            }),
         }),
       ),
     ).pipe(Layer.provide(fake.layer));
     yield* Effect.gen(function* () {
       const { kanban, card, threadId } = yield* workingCard;
+      const sql = yield* SqlClient.SqlClient;
+      // A restart must never reload a stop that already ran, so its row is
+      // closed before the next send to its thread goes out.
+      rowsAtSend = sql<{ done_at: string | null }>`
+        SELECT done_at FROM ardud_kanban_owner_routes WHERE json_extract(json, '$.kind') = 'effect'`.pipe(
+        Effect.orDie,
+      );
       yield* kanban.moveCard(card.id, "todo", "owner", owner);
       yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
       const from = order.length - 1;
@@ -13953,6 +13964,57 @@ it.live("a card_edit model switch replies before its thread switches; the switch
       const switched = fake.modelSwitches.filter((entry) => entry.threadId === workThread);
       assert.strictEqual(switched.length, 1);
       assert.strictEqual(switched[0]!.model.model, "opus/cx/gpt-6.1-sol");
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);
+
+it.live("saved model switches for two cards sharing a thread leave the newest model, whatever their order", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let calls = 0;
+    const layer = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          // The first switch (card A's lane) is held until card B's newer edit is saved.
+          setModel: (threadId, model) =>
+            Effect.suspend(() =>
+              (calls += 1) === 1
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(real.setModel(threadId, model)),
+                  )
+                : real.setModel(threadId, model),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+      yield* kanban.setPool(board.id, sol, 3);
+      const a = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(a.id)).card.activeThreadId!;
+      const b = yield* kanban.createForThread(thread, { prompt: "B", title: "B" });
+      assert.strictEqual(b.card.activeThreadId, thread);
+      yield* kanban.editCard(a.id, { model: sol }, owner);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      yield* kanban.editCard(b.card.id, { model: board.defaultCardModel }, owner);
+      yield* Effect.sleep("200 millis");
+      yield* Deferred.succeed(release, undefined);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      const last = fake.modelSwitches.filter((entry) => entry.threadId === thread).at(-1);
+      assert.strictEqual(last?.model.model, board.defaultCardModel.model);
+      assert.strictEqual((yield* kanban.card(a.id)).card.model.model, board.defaultCardModel.model);
+      assert.strictEqual(
+        (yield* kanban.card(b.card.id)).card.model.model,
+        board.defaultCardModel.model,
+      );
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
   }),
 );

@@ -118,19 +118,25 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     );
     yield* forkParked(
       Stream.runForEach(engine.streamDomainEvents, (event) => {
-        const changed = threadEventOf(event);
-        const touched = changed === null ? Effect.void : service.threadEvent(changed);
         const route = boardEventRoute(event);
-        if (route === "turnEnd")
-          return touched.pipe(Effect.andThen(service.notifyTurnEnded(event.threadId)));
+        if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
         if (route === "threadChanged")
-          return touched.pipe(
-            Effect.andThen(service.notifyThreadChanged(event.threadId)),
-            Effect.catchCause(warnUnlessInterrupted("missions board thread change")),
-          );
-        return touched;
+          return service
+            .notifyThreadChanged(event.threadId)
+            .pipe(Effect.catchCause(warnUnlessInterrupted("missions board thread change")));
+        return Effect.void;
       }).pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board stopped following run updates")),
+      ),
+    );
+    // Its own subscriber: a fence moves as soon as its event arrives, never
+    // queued behind the slow thread-change reads above.
+    yield* forkParked(
+      Stream.runForEach(engine.streamDomainEvents, (event) => {
+        const changed = threadEventOf(event);
+        return changed === null ? Effect.void : service.threadEvent(changed);
+      }).pipe(
+        Effect.catchCause(warnUnlessInterrupted("missions board stopped following thread events")),
       ),
     );
     yield* forkParked(
