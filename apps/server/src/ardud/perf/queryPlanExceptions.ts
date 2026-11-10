@@ -40,6 +40,35 @@ export const queryPlanExceptions = [
       "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
   },
   {
+    route: "shell.recent-page",
+    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    pattern: "^SCAN\\ t\\ USING\\ INDEX\\ ardud_v2_threads_updated_idx$",
+    reason:
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+  },
+  {
+    route: "shell.recent-page",
+    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
+    reason:
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+  },
+  {
+    route: "shell.recent-page",
+    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    reason:
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+  },
+  {
+    route: "sweep.threads-with-pull-requests",
+    queryHash: "6fdcccdbe09fd257750a34b85e921d104c6ae04dcf1b5494238b668394d3aa9d",
+    pattern:
+      "^SCAN\\ orchestration_v2_projection_threads\\ USING\\ INDEX\\ ardud_v2_threads_pull_requests_idx$",
+    reason:
+      "A full scan of the partial index that holds only threads with pull request links, in the query's order; it replaces a scan of every thread row.",
+  },
+  {
     route: "board.thread-state",
     queryHash: "ddadfd7116f5f1550d086ce91157d3915c22eeec29cc94cb31ab1e7cc7d67442",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",

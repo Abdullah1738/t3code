@@ -88,6 +88,40 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
 }
 
+/**
+ * ardud: the events a shell stream replays for a range it only knows by its changed
+ * aggregates (OrchestrationEventStore.getShellChanges): one per changed thread at its
+ * latest sequence plus every project event, in sequence order, as replay delivers them.
+ */
+export function shellChangeEvents(changes: {
+  readonly threads: ReadonlyArray<{
+    readonly threadId: OrchestrationV2StoredEvent["event"]["threadId"];
+    readonly sequence: number;
+  }>;
+  readonly projects: ReadonlyArray<{
+    readonly projectId: Extract<
+      ApplicationStoredEvent,
+      { readonly aggregateKind: "project" }
+    >["aggregateId"];
+    readonly sequence: number;
+    readonly type: Extract<ApplicationStoredEvent, { readonly aggregateKind: "project" }>["type"];
+  }>;
+}): ReadonlyArray<ShellApplicationEvent> {
+  const events: Array<ShellApplicationEvent> = [
+    ...changes.threads.map((thread) => ({
+      sequence: thread.sequence,
+      event: { threadId: thread.threadId },
+    })),
+    ...changes.projects.map((project) => ({
+      aggregateKind: "project" as const,
+      aggregateId: project.projectId,
+      type: project.type,
+      sequence: project.sequence,
+    })),
+  ];
+  return events.sort((left, right) => left.sequence - right.sequence);
+}
+
 export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
   events: ReadonlyArray<A>,
 ): ReadonlyArray<A> {

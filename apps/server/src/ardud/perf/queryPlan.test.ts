@@ -147,6 +147,21 @@ it.effect(
           }),
         },
         {
+          // The recent-first page: walks the recency index to the limit, never sorts.
+          route: "shell.recent-page",
+          run: projection.getShellSnapshot({ location: "active", limit: 501, recentFirst: true }),
+        },
+        {
+          // The pull-request sweeps' list: the partial index of threads that have links.
+          route: "sweep.threads-with-pull-requests",
+          run: projection.getThreadsWithPullRequests(),
+        },
+        {
+          // Turn-start run-control checks: one run row by primary key.
+          route: "turn-start.run-control",
+          run: projection.getRunControlState(threadId, RunId.make("synthetic-run")),
+        },
+        {
           // Control /threads?updatedSince: the changed range only, never every shell.
           route: "control.threads-updated-since",
           run: control.threadsUpdatedSince("2026-01-01T00:00:00.000Z"),
@@ -200,6 +215,8 @@ it.effect(
             ![
               "shell.selection",
               "shell.client-selection",
+              "shell.recent-page",
+              "turn-start.run-control",
               "board.thread-state",
               "boards.tallies",
               "discussion.messages",

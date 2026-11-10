@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import * as NodeHttp from "node:http";
+import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
@@ -83,6 +85,84 @@ export async function install(ops, { rollback = false } = {}) {
 
 /** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
  * the child in U state, where even SIGKILL waits, so it is abandoned. */
+/**
+ * One JSON GET for the readiness polls, on node:http rather than global fetch. Under Node
+ * 26.2 fetch (undici) threw `setTypeOfService EINVAL` from a socket callback while the new
+ * server was not listening yet: outside any promise, so no try/catch saw it and the
+ * installer died after `launched` (10 Nov 2026). Every failure here rejects instead.
+ */
+export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let request;
+    let settled = false;
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      request?.destroy();
+      settle(value);
+    };
+    const fail = (error) => finish(reject, error);
+    // One deadline for the whole exchange, redirects included, as AbortSignal.timeout gave
+    // fetch: a socket inactivity timeout never fires on a reply that trickles in.
+    const deadline = setTimeout(() => fail(new Error("Request timed out")), timeoutMs);
+    const origin = new URL(url).origin;
+    const send = (target, redirectsLeft) => {
+      // Node throws synchronously for a URL it cannot turn into a request (a redirect to
+      // `http://bad%ZZ@host/`). In a response callback nothing else would catch that, and
+      // the installer would exit.
+      try {
+        request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
+          target,
+          // Credentials stay with the origin they were given for.
+          { headers: target.origin === origin ? headers : {}, agent: false },
+          (response) => {
+            const status = response.statusCode ?? 0;
+            const location = response.headers.location;
+            if ([301, 302, 303, 307, 308].includes(status) && location !== undefined) {
+              response.resume();
+              if (redirectsLeft <= 0) return fail(new Error("Too many redirects"));
+              let next;
+              try {
+                next = new URL(location, target);
+              } catch (error) {
+                return fail(error);
+              }
+              if (next.protocol !== "http:" && next.protocol !== "https:")
+                return fail(new Error(`Unsupported redirect to ${next.protocol}`));
+              request.destroy();
+              return send(next, redirectsLeft - 1);
+            }
+            const chunks = [];
+            let bytes = 0;
+            response.on("data", (chunk) => {
+              bytes += chunk.length;
+              if (bytes > JSON_REPLY_LIMIT_BYTES) return fail(new Error("Reply too large"));
+              chunks.push(chunk);
+            });
+            response.on("error", fail);
+            response.on("end", () => {
+              if (status < 200 || status > 299) return fail(new Error(`HTTP ${status}`));
+              try {
+                finish(resolve, JSON.parse(Buffer.concat(chunks).toString("utf8")));
+              } catch (error) {
+                fail(error);
+              }
+            });
+          },
+        );
+        request.on("error", fail);
+      } catch (error) {
+        fail(error);
+      }
+    };
+    send(new URL(url), JSON_REDIRECT_LIMIT);
+  });
+}
+// The readiness replies are a few hundred bytes; fetch followed up to 20 redirects.
+const JSON_REPLY_LIMIT_BYTES = 1024 * 1024;
+const JSON_REDIRECT_LIMIT = 5;
+
 export function probeDirectory(dir, timeoutMs = 10_000, command = ["/bin/ls", ["-f", dir]]) {
   return new Promise((resolve) => {
     let settled = false;
@@ -390,14 +470,8 @@ async function main(args) {
     ),
   );
   const origin = (cfg.url || "http://127.0.0.1:3773").replace(/\/$/, "");
-  const get = async (route) => {
-    const response = await fetch(`${origin}${route}`, {
-      headers: { authorization: `Bearer ${cfg.token}` },
-      signal: AbortSignal.timeout(1000),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
-  };
+  const get = (route) =>
+    getJson(`${origin}${route}`, { headers: { authorization: `Bearer ${cfg.token}` } });
   let oldBootId;
   try {
     oldBootId = (await get("/api/ardud/control/install-report")).bootId;

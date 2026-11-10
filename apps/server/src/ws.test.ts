@@ -7,6 +7,7 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  NodeId,
   OrchestrationV2GetThreadProjectionError,
   ProjectId,
   ProviderDriverKind,
@@ -41,6 +42,8 @@ import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as Tracer from "effect/Tracer";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
@@ -106,6 +109,8 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import { KanbanService } from "./ardud/kanban/engine/KanbanService.ts";
+import { SHELL_RECENT_PAGE_SIZE } from "./ardud/perf/shellPages.ts";
+import { readSpeedups, ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
@@ -494,6 +499,7 @@ const fileReplayFixture = Effect.gen(function* () {
       ensureLegacyTranscript: (id) => importer.ensureTranscript(id).pipe(Effect.asVoid),
       streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
       getThreadShell: orchestrator.getThreadShell,
+      getShellSnapshot: orchestrator.getShellSnapshot,
       getThreadSnapshot: orchestrator.getThreadSnapshot,
       getThreadSnapshotWindow: orchestrator.getThreadSnapshotWindow,
       readShellSnapshot: orchestrator.readShellSnapshot,
@@ -537,6 +543,108 @@ const fileReplayFixture = Effect.gen(function* () {
   };
 });
 
+it.live(
+  "a shell resume reads its changed threads in one batch, with the items one read per thread gives",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-shell-batch-" });
+      yield* Effect.gen(function* () {
+        const fixture = yield* fileReplayFixture;
+        // After the cursor: the reader thread changed (fixture), a new thread appears and
+        // the archived thread changes too (the stream reports it as removed from the list).
+        const addedId = ThreadId.make("thread:ws-reader-added");
+        yield* fixture.orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${addedId}`),
+          threadId: addedId,
+          projectId: fixture.projectId,
+          title: "Added thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.1-codex" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const archivedThread = (yield* fixture.orchestrator.getThreadRecords(
+          fixture.archivedId,
+          [],
+        )).thread;
+        yield* fixture.sink.write({
+          events: [
+            {
+              id: EventId.make("ws-reader:archive-again"),
+              type: "thread.archived",
+              threadId: fixture.archivedId,
+              occurredAt: fixture.now,
+              payload: { ...archivedThread, archivedAt: fixture.now },
+            },
+          ],
+        });
+        const reads = { perThread: 0, batches: [] as Array<number> };
+        const counted = Layer.mock(ThreadManagement.ThreadManagementService)({
+          streamStoredEventsFrom: fixture.orchestrator.streamStoredEventsFrom,
+          readShellSnapshot: fixture.orchestrator.readShellSnapshot,
+          getThreadShell: (threadId) =>
+            Effect.suspend(() => {
+              reads.perThread++;
+              return fixture.orchestrator.getThreadShell(threadId);
+            }),
+          getShellSnapshot: (options) =>
+            Effect.suspend(() => {
+              reads.batches.push(options?.threadIds?.length ?? -1);
+              return fixture.orchestrator.getShellSnapshot(options);
+            }),
+        });
+        const resume = (batched: boolean) =>
+          subscribeOrchestrationV2Shell({
+            afterSequence: fixture.cursor,
+            requestCompletionMarker: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(Layer.mergeAll(fixture.services, counted)),
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellBatchedStreamReads: batched,
+            }),
+          );
+        const batched = yield* resume(true);
+        assert.deepEqual(reads, { perThread: 0, batches: [3] });
+        assert.deepEqual(
+          batched.map((item) => [
+            item.kind,
+            item.kind === "thread.updated"
+              ? item.thread.id
+              : item.kind === "thread.removed"
+                ? item.threadId
+                : null,
+          ]),
+          [
+            ["thread.updated", fixture.threadId],
+            ["project.updated", null],
+            ["thread.updated", addedId],
+            ["thread.removed", fixture.archivedId],
+            ["synchronized", null],
+          ],
+        );
+        reads.batches = [];
+        // ROBOB_SHELL_STREAM_BATCH_READS=0: one reader transaction per thread, same items.
+        assert.deepEqual(yield* resume(false), batched);
+        assert.deepEqual(reads, { perThread: 3, batches: [] });
+      }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live("streams a synthetic large shell as bounded pages before synchronizing", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -545,11 +653,24 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
     yield* Effect.gen(function* () {
       const fixture = yield* fileReplayFixture;
       const base = (yield* fixture.orchestrator.getThreadShell(fixture.threadId))!;
+      // Row 500, the last of page one, is named like the walk cursor's earlier spelling
+      // ("!recent-first", a legal thread id): its cursor must continue the walk, not
+      // restart it. Ids stay in id order.
       const rows = Array.from({ length: 1101 }, (_, index) => ({
         ...base,
-        id: ThreadId.make(`thread:${String(index).padStart(5, "0")}`),
+        id: ThreadId.make(
+          index < 499
+            ? `!a:${String(index).padStart(5, "0")}`
+            : index === 499
+              ? "!recent-first"
+              : `thread:${String(index).padStart(5, "0")}`,
+        ),
         lastError: "x".repeat(16_000),
       }));
+      assert.deepEqual(
+        rows.map((row) => row.id),
+        rows.map((row) => row.id).toSorted(),
+      );
       const cursors: Array<string | undefined> = [];
       yield* Effect.gen(function* () {
         const threads = yield* ThreadManagement.ThreadManagementService;
@@ -599,6 +720,85 @@ it.live("streams a synthetic large shell as bounded pages before synchronizing",
           pages.every((item) => Buffer.byteLength(JSON.stringify(item)) < 2 * 1024 * 1024),
         );
         assert.deepEqual(cursors, [undefined, rows[499]!.id, rows[999]!.id]);
+
+        // ardud: asked for recent rows first, the socket sends them as page one and then
+        // the same walk; with the switch off it pages by id from the start.
+        const recentReads: Array<{ recent: boolean; after: string | undefined }> = [];
+        const recentRows = rows.toReversed();
+        const pagesFor = (switches: { readonly shellRecentFirst: boolean }) =>
+          subscribeOrchestrationV2Shell({
+            requestCompletionMarker: true,
+            acceptShellPages: true,
+            recentFirst: true,
+          }).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.provideService(ThreadManagement.ThreadManagementService, {
+              ...threads,
+              readShellSnapshot: (options) => {
+                recentReads.push({
+                  recent: options?.recentFirst === true,
+                  after: options?.afterThreadId,
+                });
+                const selected = (options?.recentFirst === true ? recentRows : rows)
+                  .filter(
+                    (row) => options?.afterThreadId === undefined || row.id > options.afterThreadId,
+                  )
+                  .slice(0, options?.limit);
+                return Effect.succeed(
+                  Effect.succeed({
+                    schemaVersion: 1,
+                    snapshotSequence: 0,
+                    threads: selected,
+                    archivedThreads: [],
+                  }),
+                );
+              },
+            }),
+            Effect.provideService(Switches, { ...readSpeedups({}), ...switches }),
+            Effect.map((items) =>
+              Array.from(items).filter(
+                (item): item is Extract<OrchestrationV2ShellStreamItem, { kind: "snapshot" }> =>
+                  item.kind === "snapshot" && item.resolvedRepositoryIdentityRoots === undefined,
+              ),
+            ),
+          );
+        const recentPages = yield* pagesFor({ shellRecentFirst: true });
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.threads.length),
+          [SHELL_RECENT_PAGE_SIZE, 500, 500, 101],
+        );
+        assert.deepEqual(
+          recentPages[0]!.snapshot.threads.map((thread) => thread.id),
+          recentRows.slice(0, SHELL_RECENT_PAGE_SIZE).map((row) => row.id),
+        );
+        assert.deepEqual(
+          recentPages.slice(1).flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        // Page one starts a load for the client's reducer; every later page continues it.
+        assert.deepEqual(
+          recentPages.map((item) => item.snapshot.page?.after == null),
+          [true, false, false, false],
+        );
+        assert.isNull(recentPages.at(-1)!.snapshot.page?.nextAfter);
+        assert.deepEqual(recentReads, [
+          { recent: true, after: undefined },
+          { recent: false, after: undefined },
+          { recent: false, after: rows[499]!.id },
+          { recent: false, after: rows[999]!.id },
+        ]);
+        recentReads.length = 0;
+        const switchedOff = yield* pagesFor({ shellRecentFirst: false });
+        assert.deepEqual(
+          switchedOff.flatMap((item) => item.snapshot.threads.map((thread) => thread.id)),
+          rows.map((row) => row.id),
+        );
+        assert.isFalse(recentReads.some((read) => read.recent));
       }).pipe(Effect.provide(fixture.services));
     }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -684,6 +884,126 @@ it.live.each([false, true])(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.live("background sweep scans stay off a held writer unless switched back", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ws-sweep-reader-" });
+    yield* Effect.gen(function* () {
+      const fixture = yield* fileReplayFixture;
+      const sweeps = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return {
+          pullRequests: yield* store.getThreadsWithPullRequests(),
+          limits: yield* store.getLimitRecoveryCandidates({
+            now: fixture.now,
+            autoResume: true,
+            snooze: false,
+          }),
+        };
+      });
+      // A store built with ROBOB_SWEEP_READS_ON_WRITER=1, on the same database.
+      const onWriter = sweeps.pipe(
+        Effect.provide(
+          // Fresh: the fixture already built this layer with the default switches.
+          Layer.fresh(ProjectionStore.layer).pipe(
+            Layer.provide(
+              Layer.succeed(Switches, {
+                ...readSpeedups({}),
+                sweepReadsOffWriter: false,
+              }),
+            ),
+          ),
+        ),
+      );
+      const baseline = yield* sweeps;
+      assert.deepEqual(yield* onWriter, baseline);
+
+      // Where each read runs, from its statement span.
+      const routes = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.gen(function* () {
+          const spans: Array<Tracer.Span> = [];
+          const observe: Statement.Transformer = (statement, _sql, _fiber, span) => {
+            spans.push(span);
+            return Effect.succeed(statement);
+          };
+          yield* effect.pipe(
+            Effect.provideService(Statement.CurrentTransformer, observe),
+            Effect.provideService(Statement.SpanPropagationEnabled, true),
+          );
+          return [
+            ...new Set(
+              spans.map((span) => {
+                const connection = String(span.attributes.get("db.connection"));
+                return connection === "reader"
+                  ? `reader:${String(span.attributes.get("db.reader.lane"))}`
+                  : connection;
+              }),
+            ),
+          ];
+        });
+      const nodeId = NodeId.make("node:ws-sweep-reader");
+      const dedupe = Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        return yield* store.isNodeStored({
+          id: nodeId,
+          threadId: fixture.threadId,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: nodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: fixture.now,
+          completedAt: null,
+        });
+      });
+      assert.deepEqual(yield* routes(sweeps), ["reader:background"]);
+      assert.deepEqual(yield* routes(dedupe), ["reader:foreground"]);
+      const switchedBack = ProjectionStore.layer.pipe(
+        Layer.fresh,
+        Layer.provide(
+          Layer.succeed(Switches, {
+            ...readSpeedups({}),
+            sweepReadsOffWriter: false,
+            ingestDedupeForeground: false,
+          }),
+        ),
+      );
+      assert.deepEqual(yield* routes(sweeps.pipe(Effect.provide(switchedBack))), ["writer"]);
+      assert.deepEqual(yield* routes(dedupe.pipe(Effect.provide(switchedBack))), [
+        "reader:background",
+      ]);
+
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writer = yield* fixture.sql
+        .withTransaction(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(held);
+      const offWriter = yield* sweeps.pipe(
+        Effect.timeout("10 seconds"),
+        Effect.onError(() => Deferred.succeed(release, undefined)),
+      );
+      assert.deepEqual(offWriter, baseline);
+      // The old placement queues behind the writer's transaction.
+      const blocked = yield* onWriter.pipe(Effect.forkScoped);
+      yield* Effect.sleep("300 millis");
+      assert.isUndefined(blocked.pollUnsafe());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(writer);
+      assert.deepEqual(yield* Fiber.join(blocked), baseline);
+    }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.live(
   "replays shell changes and reads initial, archive and enrichment while a writer is held",
   () =>
@@ -751,6 +1071,7 @@ it.live(
                 ),
               ),
         });
+        const legacyLimits = { replayMaxGap: 1_000, changesMaxGap: 1_000, maxThreads: 2_000 };
         const [firstOverBudget] = yield* subscribeOrchestrationV2Shell({
           ...input,
           omitIdleSubagents: true,
@@ -758,8 +1079,72 @@ it.live(
           Effect.flatMap((stream) => stream.pipe(Stream.take(1), Stream.runCollect)),
           Effect.scoped,
           Effect.provide(Layer.mergeAll(fixture.services, overBudgetAtCursor)),
+          Effect.provideService(ShellResumeLimits, legacyLimits),
         );
         assert.equal(firstOverBudget?.kind, "snapshot");
+        // ardud: a range replay refuses (too many events, or bodies over budget) catches up
+        // from the list of changed threads and project events: the same rows, no bodies read.
+        const resume = (
+          resumeInput: Parameters<typeof subscribeOrchestrationV2Shell>[0],
+          limits: typeof legacyLimits,
+          store?: Layer.Layer<OrchestrationEventStore.OrchestrationEventStore>,
+        ) =>
+          subscribeOrchestrationV2Shell(resumeInput).pipe(
+            Effect.flatMap((stream) =>
+              stream.pipe(
+                Stream.takeUntil((item) => item.kind === "synchronized"),
+                Stream.runCollect,
+              ),
+            ),
+            Effect.map((items) => Array.from(items)),
+            Effect.scoped,
+            Effect.provide(
+              store === undefined ? fixture.services : Layer.mergeAll(fixture.services, store),
+            ),
+            Effect.provideService(ShellResumeLimits, limits),
+          );
+        const noBodies = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          readApplicationEvents: () => Stream.die("a changes resume must not read event bodies"),
+        });
+        const changeLimits = { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, changeLimits, noBodies), baseline);
+        // The list serves every gap it covers, a replayable one included: with the default
+        // limits a resume reads no event bodies. ROBOB_SHELL_RESUME_CHANGES_FIRST=0 replays
+        // such a range as before and never asks for the list.
+        const defaultLimits = { replayMaxGap: 1_000, changesMaxGap: 100_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, defaultLimits, noBodies), baseline);
+        const noChangeList = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          getShellChanges: () => Effect.die("a range replay must not list changes"),
+        });
+        assert.deepEqual(
+          yield* resume(input, defaultLimits, noChangeList).pipe(
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellResumeChangesFirst: false,
+            }),
+          ),
+          baseline,
+        );
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, noBodies),
+          optedIn,
+        );
+        assert.deepEqual(
+          yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, overBudgetAtCursor),
+          optedIn,
+        );
+        // Past the changes gap, over the thread cap, or with the switch at the legacy limit,
+        // the client still gets the whole list.
+        for (const limits of [
+          { replayMaxGap: 0, changesMaxGap: 1, maxThreads: 2_000 },
+          { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 0 },
+          { replayMaxGap: 0, changesMaxGap: 0, maxThreads: 2_000 },
+        ]) {
+          const [first] = yield* resume(input, limits);
+          assert.equal(first?.kind, "snapshot");
+        }
         const held = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const writer = yield* fixture.sql

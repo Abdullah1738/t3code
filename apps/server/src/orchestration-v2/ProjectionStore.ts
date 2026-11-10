@@ -93,6 +93,7 @@ import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
 // ardud: control turns
 import { CONTROL_MESSAGE_PREFIX } from "../ardud/control/turns.ts";
+import { Switches } from "../ardud/perf/speedups.ts";
 import {
   isThreadHistoryUserTurn,
   isConversationHistoryItem,
@@ -125,6 +126,12 @@ export class ProjectionStoreSetupError extends Schema.TaggedError<ProjectionStor
   override get message(): string {
     return "Failed to initialize orchestration projection store.";
   }
+}
+
+/** ardud: the fields run-control checks compare. See `getRunControlState`. */
+export interface ProjectionRunControlState {
+  readonly activeAttemptId: OrchestrationV2Run["activeAttemptId"];
+  readonly status: OrchestrationV2Run["status"];
 }
 
 export class ProjectionStoreThreadNotFoundError extends Schema.TaggedError<ProjectionStoreThreadNotFoundError>()(
@@ -386,6 +393,8 @@ export interface ProjectionTimelinePage {
 
 export interface ShellSnapshotOptions {
   readonly afterThreadId?: string;
+  /** With `limit`: the most recently updated rows, newest first, instead of the first by id. */
+  readonly recentFirst?: boolean;
   /**
    * Only these threads (and their fork sources), from one bounded read. Used by
    * the control API's live lists instead of one shell transaction per thread.
@@ -533,6 +542,14 @@ export interface ProjectionStoreV2Shape {
   readonly getRuntimeRecoveryProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<ProjectionRuntimeRecoveryState, ProjectionStoreV2Error>;
+  /**
+   * ardud: what a run-control check needs from one run, read by primary key. Null when
+   * the thread has no such run; a missing thread fails like the full recovery read.
+   */
+  readonly getRunControlState: (
+    threadId: ThreadId,
+    runId: RunId,
+  ) => Effect.Effect<ProjectionRunControlState | null, ProjectionStoreV2Error>;
   readonly getPendingNativeUserInputs: (
     threadId: ThreadId,
     providerTurnId: ProviderTurnId,
@@ -2036,6 +2053,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const speedups = yield* Switches;
+    // ardud: the writer connection is synchronous on the main thread, so a scan there
+    // freezes every request for as long as it runs. Sweeps only need committed data;
+    // inside an open write transaction readOnly keeps using the writer.
+    const offWriter = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      speedups.sweepReadsOffWriter ? NodeSqliteClient.readOnly(effect) : effect;
 
     // For run upserts: a snapshot without `path` keeps the value another event recorded there.
     const keepRecordedRunField = (payload: Statement.Fragment, path: string) => sql`
@@ -4023,7 +4046,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               )
             )
           ORDER BY thread_id
-        `;
+        `.pipe(offWriter);
         const candidates: Array<ProjectionLimitRecoveryCandidate> = [];
         for (const row of rows) {
           const thread = yield* decodeThreadPayload(row.payload_json);
@@ -4855,6 +4878,51 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ),
       );
 
+    // The full recovery read costs eleven statements on the main-thread writer (up to
+    // 3.5 s on a long thread at finalize) to answer a question about one run row.
+    const getRunControlState: ProjectionStoreV2Shape["getRunControlState"] = Effect.fn(
+      "ProjectionStore.getRunControlState",
+    )(
+      function* (threadId, runId) {
+        yield* Effect.annotateCurrentSpan("thread.id", threadId);
+        if (!speedups.narrowRunControlReads) {
+          const current = yield* getRuntimeRecoveryProjection(threadId);
+          const run = current.runs.find((candidate) => candidate.id === runId);
+          return run === undefined
+            ? null
+            : { activeAttemptId: run.activeAttemptId, status: run.status };
+        }
+        const rows = yield* sql<{
+          readonly thread_found: number | null;
+          readonly payload_json: string | null;
+        }>`
+          SELECT
+            (
+              SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}
+            ) AS thread_found,
+            (
+              SELECT payload_json FROM orchestration_v2_projection_runs
+              WHERE run_id = ${runId} AND thread_id = ${threadId}
+            ) AS payload_json
+        `;
+        const row = rows[0];
+        if (row === undefined || row.thread_found === null) {
+          return yield* new ProjectionStoreThreadNotFoundError({ threadId });
+        }
+        if (row.payload_json === null) return null;
+        const run = yield* decodeRunPayload(row.payload_json);
+        return { activeAttemptId: run.activeAttemptId, status: run.status };
+      },
+      (effect, threadId) =>
+        effect.pipe(
+          Effect.mapError((cause) =>
+            isProjectionStoreThreadNotFoundError(cause)
+              ? cause
+              : new ProjectionStoreReadError({ threadId, cause }),
+          ),
+        ),
+    );
+
     const getThread: ProjectionStoreV2Shape["getThread"] = Effect.fn("ProjectionStore.getThread")(
       function* (threadId) {
         const rows = yield* sql<PayloadRow>`
@@ -4993,9 +5061,15 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         const payloadJson = yield* encodeNodePayload(node);
         // Ingest dedupe runs before its write, outside any transaction; the
         // reader sees every committed node, so it need not queue on the writer.
+        // ardud: on the foreground pool. It is one row by primary key in the path of
+        // streamed agent output; on the background reader it waited behind sweeps and
+        // reports (wait p95 12.4 s, max 67 s on 10 Nov).
         const rows = yield* sql<PayloadRow>`
           SELECT payload_json FROM orchestration_v2_projection_nodes WHERE node_id = ${node.id}
-        `.pipe(NodeSqliteClient.readOnly);
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          speedups.ingestDedupeForeground ? NodeSqliteClient.foregroundReads : (effect) => effect,
+        );
         return rows[0]?.payload_json === payloadJson;
       },
       (effect, node) => effect.pipe(Effect.mapError(controlReadError(node.threadId))),
@@ -5921,6 +5995,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         omitIdleSubagents = false,
         idleSubagentsUpdatedSince,
         afterThreadId,
+        recentFirst = false,
         limit,
         threadIds,
       }: ShellSnapshotOptions = {},
@@ -6099,7 +6174,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE i.thread_id = t.thread_id
                   AND i.run_key = ''
               ) AS runless_item_count
-            FROM orchestration_v2_projection_threads t
+            FROM orchestration_v2_projection_threads t${
+              // Walk the recency index and stop at the limit; a sort would build every row.
+              recentFirst && limit !== undefined
+                ? sql` INDEXED BY ardud_v2_threads_updated_idx`
+                : sql``
+            }
             LEFT JOIN shell_runs active ON active.run_id = (
               SELECT r.run_id
               FROM shell_runs r
@@ -6164,7 +6244,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 : sql``
             }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
-            ${limit === undefined ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC` : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`}
+            ${
+              limit === undefined
+                ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
+                : recentFirst
+                  ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
+                  : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
+            }
           `;
 
     const runMapsByThreadId = (input: {
@@ -6359,7 +6445,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(payload_json, '$.archivedAt') IS NULL
             AND json_array_length(payload_json, '$.pullRequests') > 0
           ORDER BY updated_at ASC, thread_id ASC
-        `;
+        `.pipe(
+            // One thread is a primary-key lookup; only the whole-table scan leaves the writer.
+            threadId === undefined ? offWriter : (effect) => effect,
+          );
           return yield* Effect.forEach(rows, (row) =>
             decodeThreadPayload(row.payload_json).pipe(
               Effect.map((thread): ProjectionThreadPullRequests => ({
@@ -6776,6 +6865,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getTurnStartContext,
       getTurnStartHistory,
       getRuntimeRecoveryProjection,
+      getRunControlState,
       getRunningTurnContext,
       getThreadProviderContext,
       getRuntimeResponseContext,
@@ -7548,6 +7638,15 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             ),
           ),
       getRuntimeRecoveryProjection: (threadId) => service.getThreadProjection(threadId),
+      getRunControlState: (threadId, runId) =>
+        service.getThreadProjection(threadId).pipe(
+          Effect.map((projection) => {
+            const run = projection.runs.find((candidate) => candidate.id === runId);
+            return run === undefined
+              ? null
+              : { activeAttemptId: run.activeAttemptId, status: run.status };
+          }),
+        ),
       getThreadSnapshot: (threadId) =>
         service.getThreadProjection(threadId).pipe(
           Effect.flatMap((projection) =>

@@ -71,6 +71,9 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   const baseTimeoutMs = input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS;
   const query = (after: string | undefined) => ({
     paged: "true",
+    // The first page is then the most recently updated threads; the cursor it returns
+    // starts the full walk. A server that does not know the option pages by id as before.
+    recentFirst: "true",
     ...(after === undefined ? {} : { after }),
     ...(input.omitIdleSubagents === true ? { omitIdleSubagents: "true" } : {}),
   });

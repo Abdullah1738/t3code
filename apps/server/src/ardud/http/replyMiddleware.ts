@@ -13,6 +13,7 @@ import {
 } from "effect/http";
 
 import * as LargeReplyLog from "../../observability/LargeReplyLog.ts";
+import { ShellPageReplyLane, ThreadReplyLane } from "../perf/speedups.ts";
 import * as ReplyBuilders from "./ReplyBuilders.ts";
 import * as ReplyReadiness from "./replyReadiness.ts";
 import {
@@ -27,17 +28,28 @@ import {
 // "snapshot": the whole request holds a snapshot-lane permit (its reads build the reply).
 // "control": readiness only; the control handlers take the poll/snapshot lanes for their
 // reads and the agent lane only to encode the reply (ReplyBuilders.ts).
-const replyRoutes = FindMyWay.make<"board" | "snapshot" | "control">({
+// "thread": like "snapshot", on its own lane, so opening one thread never waits for a
+// shell page or a board snapshot (ROBOB_THREAD_REPLY_LANE=0 puts it back on "snapshot").
+// "shell": one page of the paged thread list takes the shell-page lane, so a list sync
+// never waits for a board snapshot or a whole-list read (ROBOB_SHELL_PAGE_REPLY_LANE=0
+// puts pages back on "snapshot"). The unpaged whole list stays on "snapshot".
+const replyRoutes = FindMyWay.make<"board" | "snapshot" | "shell" | "thread" | "control">({
   maxParamLength: Number.MAX_SAFE_INTEGER,
 });
+replyRoutes.on("GET", "/api/orchestration/shell", "shell");
+
+/** The handler pages only for exactly `paged=true`; anything else builds the whole list. */
+const asksForShellPage = (url: string): boolean => {
+  const query = url.indexOf("?");
+  return query >= 0 && new URLSearchParams(url.slice(query + 1)).get("paged") === "true";
+};
 for (const path of [
-  "/api/orchestration/shell",
   "/api/orchestration/threads/:threadId",
   "/api/orchestration/threads/:threadId/bounded",
   "/api/orchestration/threads/:threadId/history",
   "/api/orchestration/threads/:threadId/transcript",
 ] as const)
-  replyRoutes.on("GET", path, "snapshot");
+  replyRoutes.on("GET", path, "thread");
 for (const path of [
   "/api/ardud/control/threads",
   "/api/ardud/control/threads/:threadId/messages",
@@ -136,9 +148,19 @@ export const middleware = HttpMiddleware.make((app) =>
     }
     // This global middleware runs before route authentication: no verified session is
     // in context yet. HTTP snapshot reads stay off the interactive (UI) lane.
-    const admitted = admission === "snapshot" || admission === "board";
+    const admitted =
+      admission === "snapshot" ||
+      admission === "board" ||
+      admission === "thread" ||
+      admission === "shell";
+    const lane: ReplyBuilders.Lane =
+      admission === "thread" && (yield* ThreadReplyLane)
+        ? "thread"
+        : admission === "shell" && asksForShellPage(request.url) && (yield* ShellPageReplyLane)
+          ? "shellPage"
+          : "snapshot";
     return yield* (
-      admitted ? ReplyBuilders.bounded(app, "snapshot").pipe(Effect.interruptible) : app
+      admitted ? ReplyBuilders.bounded(app, lane).pipe(Effect.interruptible) : app
     ).pipe(
       Effect.catchCauseIf(
         (cause) =>
