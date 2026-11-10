@@ -4,8 +4,13 @@
  * a card, post in a discussion, resize a pool, tick its subtask (`subtask`),
  * hand one back to the evaluator (`handback`) or move a card to completed,
  * deployed or verified (`move`); every other line is plain output.
+ *
+ * Waits use an object under `kanban`: `{"kanban":{"wait":{...}}}` answers the
+ * check of a card that waits on this script (it has `result`) or parks a card
+ * (it has `on`), and `{"kanban":{"wake":{...}}}` ends any card's wait.
  */
 import {
+  KanbanWaitKind,
   ProviderOptionSelections,
   type KanbanActor,
   type KanbanCard,
@@ -17,6 +22,8 @@ import {
 import * as Cron from "effect/Cron";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+
+import * as Waits from "./waits.ts";
 
 /** What a run keeps of its output. */
 export const OUTPUT_TAIL_BYTES = 64 * 1024;
@@ -150,8 +157,105 @@ export type MoveCommand = typeof MoveCommand.Type;
 
 const decodeCommand = Schema.decodeUnknownResult(ScriptCommand);
 
+/** A card on the script's board: its number, as 12 or "#12". */
+const CardNumber = Schema.Union([Schema.Int, Schema.String]);
+const cardNumberOf = (ref: number | string): number | null => {
+  const number = typeof ref === "number" ? ref : Number(/^\s*#?(\d+)\s*$/.exec(ref)?.[1]);
+  return Number.isInteger(number) && number > 0 ? number : null;
+};
+
+const WakeTo = Schema.Literals(["work", "review", "evaluator", "none"]);
+
+/** Ends the card's wait, whatever it waits on, and wakes `to` (left out: whoever acts next). */
+const WakeLine = Schema.Struct({
+  card: CardNumber,
+  note: Schema.String,
+  to: Schema.optional(Schema.NullOr(WakeTo)),
+  restart: Schema.optional(Schema.Boolean),
+});
+
+/** Parks a card on a wait: the fields card_wait takes. */
+const ParkLine = Schema.Struct({
+  card: CardNumber,
+  on: KanbanWaitKind,
+  note: Schema.String,
+  pr: Schema.optional(Schema.NullOr(Schema.String)),
+  /** For `card`: the number of the card to wait on. */
+  waitsOn: Schema.optional(Schema.NullOr(CardNumber)),
+  ask: Schema.optional(Schema.NullOr(Schema.String)),
+  until: Schema.optional(Schema.NullOr(Schema.String)),
+  head: Schema.optional(Schema.NullOr(Schema.String)),
+  wakeRole: Schema.optional(Schema.NullOr(Schema.Literals(["work", "review", "evaluator"]))),
+  script: Schema.optional(Schema.NullOr(Schema.String)),
+  args: Schema.optional(Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown))),
+});
+
+const decodeWake = Schema.decodeUnknownResult(WakeLine);
+const decodePark = Schema.decodeUnknownResult(ParkLine);
+
+/** What a script printed about waits, with the card's number read. */
+export type WaitLine =
+  /** Its answer for a card that waits on this script. */
+  | { readonly _tag: "answer"; readonly card: number; readonly answer: Waits.WaitAnswer }
+  /** A wake pushed to a card, whatever it waits on. */
+  | {
+      readonly _tag: "wake";
+      readonly card: number;
+      readonly answer: Extract<Waits.WaitAnswer, { result: "wake" }>;
+    }
+  | {
+      readonly _tag: "park";
+      readonly card: number;
+      readonly waitsOn: number | null;
+      readonly request: Omit<typeof ParkLine.Type, "card" | "waitsOn">;
+    };
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** A `{"kanban":{...}}` line: the wait line it is, or why it isn't one. */
+const waitLineOf = (body: Readonly<Record<string, unknown>>): WaitLine | string => {
+  if (isRecord(body.wake)) {
+    const wake = decodeWake(body.wake);
+    if (Result.isFailure(wake)) return `a wake needs card and note: ${wake.failure.message}`;
+    const card = cardNumberOf(wake.success.card);
+    if (card === null) return `"${wake.success.card}" is not a card number`;
+    const { note, to, restart } = wake.success;
+    return {
+      _tag: "wake",
+      card,
+      answer: {
+        result: "wake",
+        note,
+        ...(to == null ? {} : { to }),
+        ...(restart === undefined ? {} : { restart }),
+      },
+    };
+  }
+  if (!isRecord(body.wait)) return "it needs a wait or a wake";
+  if ("result" in body.wait) {
+    const { card: ref, ...answer } = body.wait;
+    const card = typeof ref === "number" || typeof ref === "string" ? cardNumberOf(ref) : null;
+    if (card === null) return 'a wait answer names its card: 12 or "#12"';
+    // An answer nobody can read is a failed check: the card holds and shows the problem.
+    return { _tag: "answer", card, answer: Waits.decodeAnswer(answer) };
+  }
+  const park = decodePark(body.wait);
+  if (Result.isFailure(park)) {
+    return `a wait needs card, on and note (or result, to answer a check): ${park.failure.message}`;
+  }
+  const { card: ref, waitsOn, ...request } = park.success;
+  const card = cardNumberOf(ref);
+  if (card === null) return `"${ref}" is not a card number`;
+  const target = waitsOn == null ? null : cardNumberOf(waitsOn);
+  if (waitsOn != null && target === null) return `"${waitsOn}" is not a card number`;
+  return { _tag: "park", card, waitsOn: target, request };
+};
+
 export interface ParsedOutput {
   readonly commands: ReadonlyArray<ScriptCommand>;
+  /** Wait answers, pushed wakes and parks, in the order printed. */
+  readonly waits: ReadonlyArray<WaitLine>;
   /** Lines that looked like commands but weren't valid. */
   readonly errors: ReadonlyArray<string>;
   /** Everything else the script printed. */
@@ -162,6 +266,7 @@ const COMMAND_LINE = /^\s*\{.*"kanban"\s*:/;
 
 export const parseOutput = (stdout: string): ParsedOutput => {
   const commands: Array<ScriptCommand> = [];
+  const waits: Array<WaitLine> = [];
   const errors: Array<string> = [];
   const text: Array<string> = [];
   stdout.split("\n").forEach((line, index) => {
@@ -176,11 +281,17 @@ export const parseOutput = (stdout: string): ParsedOutput => {
       errors.push(`Line ${index + 1} is not valid JSON.`);
       return;
     }
+    if (isRecord(value) && isRecord(value.kanban)) {
+      const line = waitLineOf(value.kanban);
+      if (typeof line === "string") errors.push(`Line ${index + 1}: ${line}`);
+      else waits.push(line);
+      return;
+    }
     const decoded = decodeCommand(value);
     if (Result.isSuccess(decoded)) commands.push(decoded.success);
     else errors.push(`Line ${index + 1}: ${decoded.failure.message}`);
   });
-  return { commands, errors, text: text.join("\n").trim() };
+  return { commands, waits, errors, text: text.join("\n").trim() };
 };
 
 /**
@@ -199,6 +310,29 @@ export const duplicateOf = (
   const title = command.title?.trim();
   if (!title) return null;
   return cards.find((card) => card.settledAt === null && card.title === title) ?? null;
+};
+
+/**
+ * Why a run can't be trusted as a wait check, or null for a clean exit. A run
+ * that broke is a failed check for every card it was asked about and printed
+ * nothing for: they hold, and count one more failure.
+ */
+export const checkRunProblem = (
+  name: string,
+  result: {
+    readonly exitCode: number | null;
+    readonly timedOut: boolean;
+    readonly overflow: boolean;
+    readonly spawnError: string | null;
+  },
+  timeoutMs: number,
+): string | null => {
+  if (result.spawnError !== null) return `The ${name} script didn't start: ${result.spawnError}`;
+  if (result.timedOut) {
+    return `The ${name} script timed out after ${Math.round(timeoutMs / 60_000)} minutes`;
+  }
+  if (result.overflow) return `The ${name} script printed too much and was stopped`;
+  return result.exitCode === 0 ? null : `The ${name} script exited with code ${result.exitCode}`;
 };
 
 /** The last `bytes` of `text`, cut at a line start when one is near. */

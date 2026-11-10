@@ -14,6 +14,7 @@ import {
   kanbanRetryNotBefore,
   kanbanSchedule,
   kanbanScriptStep,
+  kanbanWaiting,
   kanbanWaitsOnEvaluator,
   type KanbanBoard,
   type KanbanCard,
@@ -529,7 +530,9 @@ export function planDispatch(
       !retryHeld(card) &&
       // A step that's only the evaluator's is done by an evaluator, not a new thread.
       // Reviews still go: a review never waits on the evaluator's step.
-      !kanbanWaitsOnEvaluator(card),
+      !kanbanWaitsOnEvaluator(card) &&
+      // Parked on a wait: the tick wakes it when the wait ends.
+      !kanbanWaiting(card),
   );
   const reviews = waiting
     .filter((card) => card.stage === "needs_review")
@@ -686,6 +689,11 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
     return no(`card #${card.number} is flagged stalled: ${card.stalled.reason}`);
   }
   if (card.priority === KANBAN_BACKLOG) return no(`card #${card.number} is in the backlog`);
+  if (kanbanWaiting(card)) {
+    return no(
+      `card #${card.number} is waiting (${card.wait?.note.trim() || card.wait?.on}): the board wakes it when that ends; clear the wait with card_wait first to take it now`,
+    );
+  }
   if (kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
