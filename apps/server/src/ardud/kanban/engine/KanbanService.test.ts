@@ -14181,3 +14181,27 @@ it.live("a stop another card saves while an assignment to its thread is out aban
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
   }),
 );
+
+it.live("a thread with a stop still pending takes no new card until the stop has run", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = gatedInterrupts(fake, entered, Deferred.await(release));
+    yield* Effect.gen(function* () {
+      const { kanban, card, threadId } = yield* workingCard;
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      // The owner's move is ACKed and its stop is out: the worker can't take a new card meanwhile.
+      const refused = yield* kanban
+        .createForThread(threadId, { prompt: "Follow-up", title: "Follow-up" })
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, "being stopped");
+      yield* Deferred.succeed(release, undefined);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      const taken = yield* kanban.createForThread(threadId, { prompt: "Later", title: "Later" });
+      assert.strictEqual(taken.card.activeThreadId, threadId);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);

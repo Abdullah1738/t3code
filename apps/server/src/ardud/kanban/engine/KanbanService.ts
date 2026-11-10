@@ -3544,10 +3544,25 @@ const make = Effect.gen(function* () {
     `;
     for (const row of rows) addPendingStop(row.thread_id, row.route_key, row.reason);
   });
+  /**
+   * Follow-ons of a write that failed, saved after its operation ended: each
+   * board's rows, stop registrations and stop-resource bumps run in one fresh
+   * board-wide operation, so no card-scoped assignment can commit between a
+   * stop being saved and its resource moving (as inside the write itself).
+   */
   const saveEffects = Effect.fn("KanbanService.saveEffects")(function* (
     effects: EffectSink["effects"],
   ) {
-    for (const lane of yield* saveEffectRows(effects)) yield* afterOwnerCommit(lane);
+    const byBoard = new Map<string, Array<EffectSink["effects"][number]>>();
+    for (const entry of effects) {
+      let entries = byBoard.get(entry.boardId);
+      if (!entries) byBoard.set(entry.boardId, (entries = []));
+      entries.push(entry);
+    }
+    for (const [boardId, entries] of byBoard) {
+      const lanes = yield* locks.fresh(locks.board(boardId, saveEffectRows(entries)));
+      for (const lane of lanes) yield* afterOwnerCommit(lane);
+    }
   });
 
   const runOwnerRoute = Effect.fn("KanbanService.runOwnerRoute")(function* (
@@ -6987,6 +7002,14 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     how: string,
   ) {
+    // A card let go of this thread and its stop hasn't run yet: the thread is
+    // about to be cut, so it takes no new card until then (claims, follow-ups).
+    if (pendingStops.has(threadId)) {
+      return yield* failWith(
+        "conflict",
+        "This thread is being stopped (the board let it go of a card); it can't take another card until that stop has run.",
+      );
+    }
     const at = yield* nowIso;
     const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
