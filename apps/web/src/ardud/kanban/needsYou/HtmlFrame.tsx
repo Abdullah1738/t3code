@@ -16,6 +16,8 @@ function readAskValue(data: unknown): { readonly value: unknown } | null {
   return null;
 }
 
+const INLINE_MAX_HEIGHT = 520;
+
 /**
  * An html block of an ask: the same sandboxed frame the app draws `html_render`
  * pages in (scripts, no origin), with the same expand-to-full dialog. The page
@@ -63,7 +65,11 @@ export function AskHtmlFrame(props: {
     return () => window.removeEventListener("message", receive);
   }, [listens, onValue]);
 
-  const height = clampHtmlRenderHeight(contentHeight ?? props.height ?? 320);
+  // A long page scrolls inside its frame so the answer stays near; Expand shows it whole.
+  const height = Math.min(
+    INLINE_MAX_HEIGHT,
+    clampHtmlRenderHeight(contentHeight ?? props.height ?? 320),
+  );
   return (
     <figure className="min-w-0 overflow-hidden rounded-2xl ring-1 ring-(--m-rule)">
       <figcaption className="flex items-center gap-2 border-b border-(--m-rule) py-1.5 ps-3.5 pe-1.5 text-sm font-medium">

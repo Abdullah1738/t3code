@@ -177,6 +177,8 @@ export function Layer(props: {
   /** Stops short of the bottom by this many px, so what is under it stays in reach. */
   bottomOffset?: number;
   footer?: ReactNode;
+  /** What is inside brings its own title and Close: the sheet draws no header. */
+  bare?: boolean;
   bodyClassName?: string;
   initialFocus?: RefObject<HTMLElement | null>;
   children: ReactNode;
@@ -191,7 +193,10 @@ export function Layer(props: {
     >
       <Dialog.Portal>
         <Dialog.Backdrop
-          className="fixed inset-x-0 top-0 z-(--z-sheet) bg-black/25 transition-opacity duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0"
+          className={cn(
+            "fixed inset-x-0 top-0 bg-black/25 transition-opacity duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0",
+            side === "center" ? "z-50" : "z-(--z-sheet)",
+          )}
           style={{ bottom: offset }}
         />
         <Dialog.Popup
@@ -199,12 +204,13 @@ export function Layer(props: {
           aria-label={props.title}
           data-ny
           className={cn(
-            "fixed z-(--z-sheet) flex min-h-0 flex-col bg-(--m-raised) text-(--m-text) shadow-xl ring-1 ring-(--m-rule) outline-none transition-[opacity,translate] duration-200 ease-out data-ending-style:opacity-0 data-starting-style:opacity-0",
+            "fixed flex min-h-0 flex-col bg-(--m-raised) text-(--m-text) shadow-xl ring-1 ring-(--m-rule) outline-none transition-[opacity,translate] duration-200 ease-out data-ending-style:opacity-0 data-starting-style:opacity-0",
             side === "right" &&
               "inset-y-0 right-0 w-full max-w-[480px] data-ending-style:translate-x-6 data-starting-style:translate-x-6",
             side === "bottom" &&
               "inset-x-0 max-h-[88dvh] rounded-t-2xl pb-safe data-ending-style:translate-y-8 data-starting-style:translate-y-8",
             side === "bottom" && props.tall && "h-[88dvh]",
+            side === "center" ? "z-50" : "z-(--z-sheet)",
             side === "center" &&
               "top-1/2 left-1/2 max-h-[84dvh] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl",
             side === "center" && (props.wide ? "max-w-[1040px]" : "max-w-[520px]"),
@@ -219,17 +225,21 @@ export function Layer(props: {
               : undefined
           }
         >
-          <header className="flex shrink-0 items-center gap-2 border-b border-(--m-rule) py-2.5 ps-5 pe-2.5">
-            <Dialog.Title className="min-w-0 flex-1 truncate text-base font-semibold">
-              {props.title}
-            </Dialog.Title>
-            {props.meta ? (
-              <span className="shrink-0 text-sm text-(--m-muted) tabular-nums">{props.meta}</span>
-            ) : null}
-            <Dialog.Close render={<IconBtn label="Close" />}>
-              <XIcon />
-            </Dialog.Close>
-          </header>
+          {props.bare ? (
+            <Dialog.Title className="sr-only">{props.title}</Dialog.Title>
+          ) : (
+            <header className="flex shrink-0 items-center gap-2 border-b border-(--m-rule) py-2.5 ps-5 pe-2.5">
+              <Dialog.Title className="min-w-0 flex-1 truncate text-base font-semibold">
+                {props.title}
+              </Dialog.Title>
+              {props.meta ? (
+                <span className="shrink-0 text-sm text-(--m-muted) tabular-nums">{props.meta}</span>
+              ) : null}
+              <Dialog.Close render={<IconBtn label="Close" />}>
+                <XIcon />
+              </Dialog.Close>
+            </header>
+          )}
           <div
             className={cn(
               "min-h-0 flex-1 overflow-y-auto overscroll-contain p-5",

@@ -9,7 +9,7 @@ import {
   type NeedsYouMark,
   type NeedsYouSection,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { SearchIcon, XIcon } from "lucide-react";
+import { ImageIcon, PlayIcon, SearchIcon, XIcon } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 import { cn } from "../../../lib/utils";
@@ -210,6 +210,14 @@ function Row(props: {
   const focused = props.focusKey === item.key;
   const mark = needsYouMarkOf(item, props.marks);
   const board = props.boardNames.get(item.boardId) ?? "";
+  const blocks = item.ask.blocks ?? [];
+  const pictures = blocks.filter(
+    (block) =>
+      block._tag === "image" || (block._tag === "attachment" && block.attachment.type === "image"),
+  ).length;
+  const video = blocks.some(
+    (block) => block._tag === "attachment" && block.attachment.mimeType.startsWith("video/"),
+  );
   return (
     <li>
       <button
@@ -239,6 +247,14 @@ function Row(props: {
                 {MARK_LABELS[mark]}
               </Pill>
             ) : null}
+            {pictures > 0 ? (
+              <span className="inline-flex items-center gap-0.5 tabular-nums">
+                <ImageIcon aria-hidden className="size-3" />
+                {pictures}
+                <span className="sr-only"> {pictures === 1 ? "picture" : "pictures"}</span>
+              </span>
+            ) : null}
+            {video ? <PlayIcon aria-label="Has video" className="size-3" /> : null}
             <span className="tabular-nums">
               {item.snoozed && item.ask.snoozedUntil
                 ? shortWhen(item.ask.snoozedUntil, props.nowMs)

@@ -402,6 +402,13 @@ export function NeedsYouPage(props: {
                 handle={readerRef}
                 onLeave={() => focusOn(null)}
                 onOpenCard={() => openCard((focused as { entry: KanbanAskFeedItem }).entry)}
+                onOpenLinkedCard={(cardId) => {
+                  noteDrawerOpener();
+                  setCard({
+                    boardId: (focused as { entry: KanbanAskFeedItem }).entry.boardId,
+                    cardId,
+                  });
+                }}
               />
             ) : focused?._tag === "batch" ? (
               <BatchView

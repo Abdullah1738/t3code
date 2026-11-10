@@ -4,6 +4,7 @@ import {
   askFieldKind,
   askFormFor,
   askFormWithSecrets,
+  nextChangeView,
   askKindLabel,
   askRefusal,
   askSecretAnswerInput,
@@ -22,6 +23,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import {
+  kanbanAskChanges,
   kanbanAskResponse,
   kanbanAskRevision,
   type KanbanAskFeedItem,
@@ -44,6 +46,7 @@ import { useAtomCommand } from "../../../state/use-atom-command";
 import { BoardIcon } from "../boardIcon";
 import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { ActionBar, type AskTurn } from "./ActionBar";
+import { ActionDetails } from "./ActionDetails";
 import {
   OptionList,
   TaskSteps,
@@ -51,6 +54,7 @@ import {
   askOffersOwnWords,
   type AskProblems,
 } from "./AnswerParts";
+import { AskBlocks, BlockPicture, useAskMedia } from "./AskBlocks";
 import { FieldRow } from "./AskFields";
 import {
   answerAsk,
@@ -65,11 +69,14 @@ import {
   replyOnAsk,
   retryAskSend,
   seeAsk,
+  setAskChangeView,
   snoozeAsks,
   takeBackAsk,
   useAskStore,
 } from "./askStore";
+import { ChangeViewer } from "./ChangeView";
 import { DraftPart } from "./DraftPart";
+import { MediaViewer } from "./MediaViewer";
 import { shortWhen, tomorrowMorning } from "./snoozeTimes";
 import { Btn, Label, Pill, linkClass, type PageLayout } from "./ui";
 
@@ -96,6 +103,8 @@ export function AskReader(props: {
   nowMs: number;
   handle: RefObject<AskReaderHandle | null>;
   onOpenCard: () => void;
+  /** Opens a card the ask links to, which may not be its own. */
+  onOpenLinkedCard: (cardId: string) => void;
   /** He set the ask aside: the page moves on to the next one. */
   onLeave: () => void;
 }) {
@@ -137,6 +146,21 @@ export function AskReader(props: {
     reportFailure: false,
     reportDefect: false,
   });
+
+  const media = useAskMedia(ask);
+  const [viewing, setViewing] = useState<number | null>(null);
+  const changes = kanbanAskChanges(ask);
+  const changeView = useAskStore((state) => state.changeView);
+  const [changeIndex, setChangeIndex] = useState(0);
+  const wide = layout !== "phone";
+  // Blocks a field or an option already draws are not drawn a second time.
+  const optionPictures = (response.choose?.options ?? []).flatMap((option) =>
+    option.block !== undefined && media.indexOf.has(option.block) ? [option.block] : [],
+  );
+  const placed = new Set<number>([
+    ...response.fields.flatMap((field) => (field.block === undefined ? [] : [field.block])),
+    ...optionPictures,
+  ]);
 
   const built = buildAskAnswer(
     ask,
@@ -239,6 +263,12 @@ export function AskReader(props: {
             return undefined;
           }
           return firstText ? focusAt(`field:${firstText.id}`) : undefined;
+        case "view":
+          return setAskChangeView(nextChangeView(changeView, wide));
+        case "change":
+          return setChangeIndex((current) =>
+            Math.max(0, Math.min(changes.length - 1, current + action.delta)),
+          );
         default:
           return undefined;
       }
@@ -347,6 +377,25 @@ export function AskReader(props: {
               </div>
             ) : null}
 
+            {ask.action ? <ActionDetails action={ask.action} /> : null}
+            {changes.length > 0 ? (
+              <ChangeViewer
+                changes={changes}
+                view={changeView}
+                onView={setAskChangeView}
+                index={changeIndex}
+                onIndex={setChangeIndex}
+                wide={wide}
+              />
+            ) : null}
+            <AskBlocks
+              ask={ask}
+              media={media}
+              skip={placed}
+              onOpenMedia={setViewing}
+              onOpenCard={props.onOpenLinkedCard}
+            />
+
             {ask.draft ? (
               <DraftPart
                 entry={entry}
@@ -378,7 +427,25 @@ export function AskReader(props: {
                     form={form}
                     problem={problems.choose}
                     disabled={locked || form.refusing}
+                    renderBlock={(index) => (
+                      <BlockPicture
+                        bare
+                        media={media}
+                        index={index}
+                        onOpen={setViewing}
+                        className="h-40 w-full max-w-none rounded-none object-cover"
+                      />
+                    )}
                   />
+                ) : null}
+                {optionPictures.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setViewing(media.indexOf.get(optionPictures[0]!) ?? 0)}
+                    className={cn(linkClass, "-mt-2 self-start text-sm")}
+                  >
+                    See them full size
+                  </button>
                 ) : null}
                 {response.fields.length > 0 && !form.refusing ? (
                   <div className="flex flex-col gap-4">
@@ -436,6 +503,14 @@ export function AskReader(props: {
             }
           />
         </div>
+        {viewing !== null && media.items.length > 0 ? (
+          <MediaViewer
+            items={media.items}
+            index={viewing}
+            onIndex={setViewing}
+            onClose={() => setViewing(null)}
+          />
+        ) : null}
       </div>
     </KanbanLinksProvider>
   );

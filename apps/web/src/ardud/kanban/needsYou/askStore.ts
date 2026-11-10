@@ -12,6 +12,7 @@ import {
   type AskForm,
   type AskIntent,
   type AskProblemKey,
+  type ChangeView,
   type HeldSend,
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -114,6 +115,8 @@ interface AskState {
   /** Asks read whole (their big blocks are stubs in the feed), by `key@revision`. */
   readonly details: Readonly<Record<string, KanbanOwnerAsk>>;
   readonly toast: AskToast | null;
+  /** How change asks show their texts; kept as he steps from ask to ask. */
+  readonly changeView: ChangeView;
 }
 
 const INITIAL: AskState = {
@@ -133,6 +136,7 @@ const INITIAL: AskState = {
   sent: [],
   details: {},
   toast: null,
+  changeView: "after",
 };
 
 export const useAskStore = create<AskState>(() => INITIAL);
@@ -334,6 +338,8 @@ export function setAskValue(entry: KanbanAskFeedItem, fieldId: string, value: un
   const form = formOf(get(), entry);
   patchAskForm(entry, { values: { ...form.values, [fieldId]: value } });
 }
+
+export const setAskChangeView = (changeView: ChangeView) => set({ changeView });
 
 /** He tried to send with something missing: every problem on the ask shows from now on. */
 export function markAskTried(entry: KanbanAskFeedItem) {
