@@ -137,11 +137,13 @@ export const ArdudKanbanLive = Layer.effectDiscard(
   }),
 ).pipe(
   Layer.provideMerge(KanbanScriptsLayer),
-  Layer.provideMerge(KanbanServiceLayer.pipe(
+  Layer.provideMerge(
+    KanbanServiceLayer.pipe(
       Layer.provide(ownerRouteModeLayer),
       Layer.provide(replayReadsLayer),
       Layer.provide(deferWriteEffectsLayer),
-    )),
+    ),
+  ),
   Layer.provide(KanbanModelsLayer),
   Layer.provide(KanbanThreadsLayer),
   Layer.provideMerge(KanbanStoreLayer),

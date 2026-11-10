@@ -941,7 +941,11 @@ interface AnsweredNotice {
  * forked must not add to a list nobody saves).
  */
 interface EffectSink {
-  readonly effects: Array<{ readonly boardId: string; readonly lane: string; readonly effect: BoardEffect }>;
+  readonly effects: Array<{
+    readonly boardId: string;
+    readonly lane: string;
+    readonly effect: BoardEffect;
+  }>;
   closed: boolean;
 }
 const effectSink = Context.Reference<EffectSink | undefined>("KanbanEffectSink", {

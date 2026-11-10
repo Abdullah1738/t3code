@@ -27,7 +27,7 @@ import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Tracer from "effect/Tracer";
-import * as NodeFs from "node:fs";
+import * as NodeFS from "node:fs";
 
 import {
   ProjectId,
@@ -212,12 +212,15 @@ it.live(
         const parts = (Array.isArray(message) ? message : [message]).map((part) => {
           if (typeof part !== "object" || part === null) return String(part);
           return Object.entries(part)
-            .map(([key, value]) =>
-              `${key}=${Cause.isCause(value) ? Cause.pretty(value) : String(value)}`,
+            .map(
+              ([key, value]) =>
+                `${key}=${Cause.isCause(value) ? Cause.pretty(value) : String(value)}`,
             )
             .join(" ");
         });
-        logged.push(`${parts.join(" ").slice(0, 900)} ${Cause.isCause(cause) && cause.reasons.length > 0 ? Cause.pretty(cause).slice(0, 300) : ""}`);
+        logged.push(
+          `${parts.join(" ").slice(0, 900)} ${Cause.isCause(cause) && cause.reasons.length > 0 ? Cause.pretty(cause).slice(0, 300) : ""}`,
+        );
       });
       const timings = new Map<string, Array<number>>();
       const failures = new Map<string, number>();
@@ -245,7 +248,11 @@ it.live(
         });
         yield* kanban.setPool(board.id, board.defaultCardModel, WORKERS);
         for (let i = 0; i < WORKERS; i += 1) {
-          yield* kanban.createCard(board.id, { prompt: `Work item ${i}`, title: `Work ${i}` }, owner);
+          yield* kanban.createCard(
+            board.id,
+            { prompt: `Work item ${i}`, title: `Work ${i}` },
+            owner,
+          );
         }
         yield* kanban.dispatchNow;
         const working = (yield* kanban.cards(board.id)).filter(
@@ -283,7 +290,10 @@ it.live(
           }),
           TURN_END_EVERY_MS,
         );
-        const ticks = until(timed("background.tick", kanban.tick).pipe(Effect.asVoid), TICK_EVERY_MS);
+        const ticks = until(
+          timed("background.tick", kanban.tick).pipe(Effect.asVoid),
+          TICK_EVERY_MS,
+        );
 
         const ownerCards: Array<KanbanCard> = [];
         let ownerStep = 0;
@@ -324,9 +334,7 @@ it.live(
                 // The owner drops an agent's question: the asker hears it.
                 const cards = yield* kanban.cards(board.id).pipe(Effect.orDie);
                 const asked = cards.flatMap((card) =>
-                  card.asks
-                    .filter((ask) => ask.closedAt === null)
-                    .map((ask) => ({ card, ask })),
+                  card.asks.filter((ask) => ask.closedAt === null).map((ask) => ({ card, ask })),
                 );
                 if (asked.length === 0) return;
                 const { card, ask } = asked[random(asked.length)]!;
@@ -397,7 +405,9 @@ it.live(
         // follow-on must reach an outcome.
         const sql = yield* SqlClient.SqlClient;
         const pending = () =>
-          sql<{ n: number }>`SELECT count(*) AS n FROM ardud_kanban_owner_routes WHERE done_at IS NULL`.pipe(
+          sql<{
+            n: number;
+          }>`SELECT count(*) AS n FROM ardud_kanban_owner_routes WHERE done_at IS NULL`.pipe(
             Effect.map((rows) => rows[0]?.n ?? 0),
             Effect.orDie,
           );
@@ -474,19 +484,15 @@ it.live(
         serialWait: Object.fromEntries([...serialWaits].map(([q, v]) => [q, summary(v)])),
         serialHold: Object.fromEntries([...serialHolds].map(([q, v]) => [q, summary(v)])),
         admissionWait: Object.fromEntries(
-          [...admission]
-            .filter(([, v]) => v.length >= 3)
-            .map(([name, v]) => [name, summary(v)]),
+          [...admission].filter(([, v]) => v.length >= 3).map(([name, v]) => [name, summary(v)]),
         ),
         firstFailure: Object.fromEntries(firstFailure),
         warnings: logged.slice(0, 40),
         turnEnd: { attempts: turnEndAttempts, failedAttempts: turnEndFailedAttempts },
         threadIo: fake.counts,
       };
-      // oxlint-disable-next-line no-console
-      console.log(`KANBAN_LOCK_BENCH ${JSON.stringify(report)}`);
       if (process.env.KANBAN_LOCK_BENCH_OUT)
-        NodeFs.writeFileSync(process.env.KANBAN_LOCK_BENCH_OUT, JSON.stringify(report, null, 2));
+        NodeFS.writeFileSync(process.env.KANBAN_LOCK_BENCH_OUT, JSON.stringify(report, null, 2));
       for (const name of ["owner.createCard", "owner.post", "agent.postStatus"]) {
         assert.isAbove(report.writes[name]?.n ?? 0, 0, `${name} completed at least once`);
       }

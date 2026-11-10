@@ -124,7 +124,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             Effect.interruptible(wait(op, semaphore.withPermits(permits)(Effect.void))),
           );
         }
-        yield* Effect.annotateCurrentSpan('board.admission_wait_ms', performance.now() - started);
+        yield* Effect.annotateCurrentSpan("board.admission_wait_ms", performance.now() - started);
       }),
     );
   const release = Effect.fn("KanbanBoardLocks.release")(function* (op: Operation) {
@@ -353,37 +353,40 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
    * taken before it. Changes made elsewhere (a run ending by itself) can land
    * right after any read anyway. The first attempt always reads.
    */
-  const outsideRead = <A, E, R>(key: string, fence: () => number, effect: Effect.Effect<A, E, R>) =>
-    Effect.gen(function* () {
-      const op = yield* operation;
-      if (!op) return yield* effect;
-      yield* check(op);
-      const index = op.reads.get(key) ?? 0;
-      op.reads.set(key, index + 1);
-      const entry = op.replay.get(key)?.[index];
-      if (
-        entry !== undefined &&
-        entry.fence === fence() &&
-        performance.now() - entry.at < REPLAY_MAX_MS
-      ) {
-        op.replayed += 1;
-        return entry.value as A;
-      }
-      const at = performance.now();
-      const started = fence();
-      // Recorded before the gate is taken back: that is where a stale attempt ends.
-      return yield* outside(
-        Effect.tap(effect, (value) =>
-          Effect.sync(() => {
-            let entries = op.replay.get(key);
-            if (!entries) op.replay.set(key, (entries = []));
-            entries[index] = { value, at, fence: started };
-          }),
-        ),
-        undefined,
-        true,
-      );
-    });
+  const outsideRead = Effect.fn("KanbanBoardLocks.outsideRead")(function* <A, E, R>(
+    key: string,
+    fence: () => number,
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    const op = yield* operation;
+    if (!op) return yield* effect;
+    yield* check(op);
+    const index = op.reads.get(key) ?? 0;
+    op.reads.set(key, index + 1);
+    const entry = op.replay.get(key)?.[index];
+    if (
+      entry !== undefined &&
+      entry.fence === fence() &&
+      performance.now() - entry.at < REPLAY_MAX_MS
+    ) {
+      op.replayed += 1;
+      return entry.value as A;
+    }
+    const at = performance.now();
+    const started = fence();
+    // Recorded before the gate is taken back: that is where a stale attempt ends.
+    return yield* outside(
+      Effect.tap(effect, (value) =>
+        Effect.sync(() => {
+          let entries = op.replay.get(key);
+          if (!entries) op.replay.set(key, (entries = []));
+          entries[index] = { value, at, fence: started };
+        }),
+      ),
+      undefined,
+      true,
+    );
+  });
 
   return {
     run,

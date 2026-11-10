@@ -13632,9 +13632,7 @@ it.live("a give-up decided before a restart posts its notice on replay and never
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// ---- Writes reply on commit; thread follow-ons run from route rows (board-lock-diet) ----
-
-/** A working card on the toy board: its id and work thread. */
+/** A working card on the toy board, for writes that reply before their thread follow-ons. */
 const workingCard = Effect.gen(function* () {
   const { kanban, board } = yield* toyBoard;
   const created = yield* kanban.createCard(board.id, { prompt: "Work", title: "Work" }, owner);
@@ -13818,8 +13816,9 @@ it.live("a saved follow-on cut by a stop is run once after the restart", () =>
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
       yield* kanban.ready;
-      const rows = yield* eventually(effectRows, (all) =>
-        all.length > 0 && all.every((row) => row.done_at !== null),
+      const rows = yield* eventually(
+        effectRows,
+        (all) => all.length > 0 && all.every((row) => row.done_at !== null),
       );
       assert.deepStrictEqual(
         rows.map((row) => [row.kind, row.outcome]),
