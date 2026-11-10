@@ -70,8 +70,18 @@ describe("ask secrets", () => {
 
   it("words each refusal, and never from the request", () => {
     expect(askSecretFailure({ _tag: "EnvironmentAuthorizationError", message: "no" }).message).toBe(
-      "This one carries a secret. Answer it from the Robob app.",
+      "This one carries a secret. Answer it from your own Robob session.",
     );
+    expect(askSecretFailure({ _tag: "KanbanError", code: "denied", detail: "x" }).message).toBe(
+      "This one carries a secret. Answer it from your own Robob session.",
+    );
+    expect(
+      askSecretFailure({
+        _tag: "KanbanError",
+        code: "invalid",
+        detail: "q1 on card #4 needs the revision you are answering. It is at revision 3: read it",
+      }).stale,
+    ).toBe(true);
     expect(askSecretFailure({ _tag: "KanbanError", code: "conflict", detail: "x" }).stale).toBe(
       true,
     );

@@ -24,6 +24,27 @@ export function askDiscussion(entry: Talk): ReadonlyArray<KanbanMessage> {
   );
 }
 
+/** How far apart a reply and the mark it leaves on its ask may be written. */
+const SAME_WRITE_MS = 10_000;
+
+/**
+ * True when the ask waits on its agent because he replied in the card's
+ * discussion, not under the ask: nothing in the ask's own thread says why it
+ * is the agent's turn. False once the agent has posted on the ask since.
+ */
+export function askRepliedOnCard(entry: Talk): boolean {
+  const { ask } = entry;
+  if (ask.closedAt !== null || ask.handedAt !== undefined || ask.clarifyAskedAt === undefined) {
+    return false;
+  }
+  const asked = Date.parse(ask.clarifyAskedAt);
+  if (Number.isNaN(asked)) return false;
+  return !askDiscussion(entry).some((message) => {
+    const at = Date.parse(message.createdAt);
+    return message.author._tag === "owner" ? at >= asked - SAME_WRITE_MS : at >= asked;
+  });
+}
+
 /** What its agent posted after he answered, oldest first. */
 export function askAfterAnswer(entry: Talk): ReadonlyArray<KanbanMessage> {
   const at = entry.ask.answer?.at;

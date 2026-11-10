@@ -93,20 +93,22 @@ const tagOf = (failure: unknown): string | null =>
     ? failure._tag
     : null;
 
+const NOT_THE_OWNER: AskSecretFailure = {
+  message: "This one carries a secret. Answer it from your own Robob session.",
+  stale: false,
+  field: null,
+};
+
 /** A refused secret answer, in the page's words. */
 export function askSecretFailure(failure: unknown): AskSecretFailure {
   const tag = tagOf(failure);
-  if (tag === "EnvironmentAuthorizationError") {
-    return {
-      message: "This one carries a secret. Answer it from the Robob app.",
-      stale: false,
-      field: null,
-    };
-  }
+  if (tag === "EnvironmentAuthorizationError") return NOT_THE_OWNER;
   if (tag === "KanbanError") {
     const { code, detail } = failure as { code?: unknown; detail?: unknown };
     const text = typeof detail === "string" ? detail : "";
-    if (code === "conflict" || code === "not-found") {
+    if (code === "denied") return NOT_THE_OWNER;
+    // A refusal that names the revision the ask is at means the one he read is gone.
+    if (code === "conflict" || code === "not-found" || /\bIt is at revision \d+/.test(text)) {
       return {
         message: "It changed while you were answering. Type the secret again.",
         stale: true,

@@ -11,7 +11,9 @@ export const ASK_REPLY_LIMITS = {
   blocks: 12,
   /** Pictures and files together. */
   media: 8,
+  /** One page. */
   htmlBytes: 256 * 1024,
+  /** One block of text. */
   textChars: 20_000,
 } as const;
 
@@ -29,15 +31,13 @@ export function askReplyProblem(blocks: ReadonlyArray<KanbanBlock>): string | nu
   if (blocks.length > ASK_REPLY_LIMITS.blocks) {
     return `A reply takes up to ${ASK_REPLY_LIMITS.blocks} parts (text, pictures, files). This one has ${blocks.length}.`;
   }
-  const chars = blocks.reduce(
-    (sum, block) =>
-      sum + (block._tag === "md" || block._tag === "collapse" ? block.text.length : 0),
-    0,
-  );
-  if (chars > ASK_REPLY_LIMITS.textChars) {
-    return `Keep a reply under ${ASK_REPLY_LIMITS.textChars.toLocaleString("en-US")} characters. This one has ${chars.toLocaleString("en-US")}.`;
-  }
   for (const block of blocks) {
+    if (
+      (block._tag === "md" || block._tag === "collapse") &&
+      block.text.length > ASK_REPLY_LIMITS.textChars
+    ) {
+      return `Keep a reply under ${ASK_REPLY_LIMITS.textChars.toLocaleString("en-US")} characters. This one has ${block.text.length.toLocaleString("en-US")}.`;
+    }
     if (block._tag === "html" && utf8Bytes(block.html) > ASK_REPLY_LIMITS.htmlBytes) {
       return "A page in a reply can be up to 256 KB.";
     }

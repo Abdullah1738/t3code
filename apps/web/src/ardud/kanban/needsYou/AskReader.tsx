@@ -4,6 +4,7 @@ import {
   askFieldKind,
   askFormFor,
   askDiscussion,
+  askRepliedOnCard,
   askFormWithSecrets,
   nextChangeView,
   askKindLabel,
@@ -564,7 +565,7 @@ export function AskReader(props: {
             {phone ? null : (
               <AskDiscussion
                 entry={entry}
-                waiting={turn === "agent"}
+                waiting={turn === "agent" && !askRepliedOnCard(entry)}
                 open={canTalk}
                 onOpenCard={props.onOpenLinkedCard}
               />
@@ -651,7 +652,7 @@ export function AskReader(props: {
               <AskDiscussion
                 sheet
                 entry={entry}
-                waiting={turn === "agent"}
+                waiting={turn === "agent" && !askRepliedOnCard(entry)}
                 open
                 onOpenCard={props.onOpenLinkedCard}
               />
@@ -789,8 +790,19 @@ function StatePills(props: {
       </Pill>,
     );
   }
+  // His reply went into the card's discussion, so the ask's own thread does not say why it waits.
+  const onCard = turn === "agent" && askRepliedOnCard(entry);
   if (pills.length === 0) return null;
-  return <div className="flex flex-wrap gap-1.5">{pills}</div>;
+  return (
+    <>
+      <div className="flex flex-wrap gap-1.5">{pills}</div>
+      {onCard ? (
+        <p className="text-sm text-(--m-muted)">
+          You replied in the card's discussion; the agent is reading it.
+        </p>
+      ) : null}
+    </>
+  );
 }
 
 function Banner(props: {

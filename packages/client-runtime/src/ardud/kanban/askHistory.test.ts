@@ -1,7 +1,7 @@
 import type { KanbanAskFeedItem, KanbanMessage, KanbanOwnerAsk } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { askAfterAnswer, askDiscussion, askOutcome } from "./askHistory.ts";
+import { askAfterAnswer, askDiscussion, askOutcome, askRepliedOnCard } from "./askHistory.ts";
 
 const ask = (patch: Record<string, unknown>): KanbanOwnerAsk =>
   ({
@@ -200,5 +200,43 @@ describe("askOutcome", () => {
       always: true,
       evaluatorThreadId: "thread-1",
     });
+  });
+});
+
+describe("askRepliedOnCard", () => {
+  const asked = "2026-11-10T11:00:00.000Z";
+
+  it("is true when the ask waits on its agent and its own thread does not say why", () => {
+    expect(askRepliedOnCard(entry({ clarifyAskedAt: asked }, []))).toBe(true);
+    expect(
+      askRepliedOnCard(
+        entry({ clarifyAskedAt: asked }, [
+          message(4, "owner", "2026-11-10T10:30:00.000Z"),
+          message(5, "evaluator", "2026-11-10T10:40:00.000Z"),
+        ]),
+      ),
+    ).toBe(true);
+  });
+
+  it("is false when his reply under the ask is what set it", () => {
+    expect(
+      askRepliedOnCard(
+        entry({ clarifyAskedAt: asked }, [message(4, "owner", "2026-11-10T10:59:58.000Z")]),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false once the agent has posted on the ask since", () => {
+    expect(
+      askRepliedOnCard(
+        entry({ clarifyAskedAt: asked }, [message(4, "evaluator", "2026-11-10T11:05:00.000Z")]),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for an ask that is his turn, handed over or closed", () => {
+    expect(askRepliedOnCard(entry({}, []))).toBe(false);
+    expect(askRepliedOnCard(entry({ clarifyAskedAt: asked, handedAt: asked }, []))).toBe(false);
+    expect(askRepliedOnCard(entry({ clarifyAskedAt: asked, closedAt: asked }, []))).toBe(false);
   });
 });

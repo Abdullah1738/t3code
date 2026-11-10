@@ -48,15 +48,17 @@ export class AskApiError extends Error {
   get stale(): boolean {
     return this.status === 409 || this.revision !== null;
   }
-  /** The server wants proof this is the owner's own app session, and this session has none. */
+  /**
+   * Only the owner's own session answers, hands over, snoozes or replies on an
+   * ask. This session is not one (403 `denied`): a device paired from a link
+   * made on the Mac, a component credential, a session from before the check.
+   */
   get ownerOnly(): boolean {
-    return (
-      this.status === 403 || /owner|authoriz|forbidden/i.test(this.code) || this.code === "denied"
-    );
+    return this.status === 403 || this.code === "denied";
   }
 }
 
-export const ASK_OWNER_ONLY = "Answer this from the Robob app.";
+export const ASK_OWNER_ONLY = "Answer this from your own Robob session.";
 
 /** A failed call in the page's words. */
 export const askFailureText = (error: unknown): string =>
@@ -66,11 +68,18 @@ export const askFailureText = (error: unknown): string =>
       ? error.message
       : "Robob did not confirm it.";
 
+/**
+ * The revision a refusal says the ask is at. The server says it in words
+ * ("It is at revision 3", on an answer that named none); a field is read too,
+ * should it start sending one.
+ */
 const revisionIn = (error: unknown): number | null => {
   if (typeof error !== "object" || error === null) return null;
-  const { revision, currentRevision } = error as Record<string, unknown>;
+  const { revision, currentRevision, message } = error as Record<string, unknown>;
   const value = typeof currentRevision === "number" ? currentRevision : revision;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  const said = typeof message === "string" ? /\bIt is at revision (\d+)/.exec(message) : null;
+  return said ? Number(said[1]) : null;
 };
 
 interface CallOptions {

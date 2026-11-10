@@ -27,6 +27,10 @@ describe("askReplyProblem", () => {
     expect(askReplyProblem([html(ASK_REPLY_LIMITS.htmlBytes)])).toBeNull();
   });
 
+  it("counts text one block at a time, like the server", () => {
+    expect(askReplyProblem([md("a".repeat(12_000)), md("b".repeat(12_000))])).toBeNull();
+  });
+
   it("refuses an empty reply", () => {
     expect(askReplyProblem([])).toBe("Write something first.");
   });
@@ -38,7 +42,7 @@ describe("askReplyProblem", () => {
     expect(askReplyProblem(many(13, (index) => md(`part ${index}`)))).toBe(
       "A reply takes up to 12 parts (text, pictures, files). This one has 13.",
     );
-    expect(askReplyProblem([md("a".repeat(12_000)), md("b".repeat(8_001))])).toBe(
+    expect(askReplyProblem([md("ok"), md("b".repeat(20_001))])).toBe(
       "Keep a reply under 20,000 characters. This one has 20,001.",
     );
     expect(askReplyProblem([html(ASK_REPLY_LIMITS.htmlBytes + 1)])).toBe(
