@@ -17,6 +17,17 @@
  *  - a turn end that reported a failure left nothing behind (see STRICT below);
  *  - at the end nothing startable is left waiting while a slot is free.
  *
+ * About one open card in twenty is parked on a wait (`soakWaits`: merge, push
+ * and ci on pull requests with and without a work thread, another card, a time).
+ * Some waits are over at the first tick, the driver ends others halfway (a PR
+ * merges, its head moves, its checks pass, the time comes) and the rest hold to
+ * the end. A wait that should have ended and did not, or ended and should not
+ * have, is a problem. After the rounds a few quiet ticks run with no reading
+ * changed: they must write no parked card, read no thread of a parked card
+ * beyond the one view that carries a watched PR, and ask the host reader once.
+ * The time of the wait pass in those ticks is reported and held under a ceiling.
+ * Script waits are left out: this harness runs no scripts.
+ *
  * It prints tick, dispatch, turn-end and start-a-card timings and the count of
  * reruns (operations redone because the board changed under them), and fails on
  * generous ceilings: a regression guard, not a benchmark.
@@ -54,6 +65,7 @@ import * as Tracer from "effect/Tracer";
 
 import {
   KANBAN_DONE_STAGES,
+  kanbanWaiting,
   ProjectId,
   ThreadId,
   type KanbanActor,
@@ -74,9 +86,11 @@ import { modelSelectionOf } from "./defaults.ts";
 import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as Rules from "./rules.ts";
-import { soakCards, soakRandom } from "./soakBoard.ts";
+import { soakCards, soakRandom, soakWaits } from "./soakBoard.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
-import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
+import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
+import { KanbanWaitPrs } from "./waitPrs.ts";
+import type * as Waits from "./waits.ts";
 
 const env = (name: string, fallback: number) => {
   const value = Number(process.env[name]);
@@ -92,6 +106,12 @@ const IO_MS = env("KANBAN_SOAK_IO_MS", 1);
 /** Threads whose turn ends in one round. */
 const WORK_ENDS = FULL ? 24 : 6;
 const REVIEW_ENDS = FULL ? 10 : 4;
+/** A `mid` time wait comes due this long after the board is seeded. */
+const WAIT_MID_MS = FULL ? 20_000 : 500;
+/** Before this round's tick the driver ends the `mid` waits. */
+const WAIT_MID_ROUND = Math.floor(ROUNDS / 2);
+/** Ticks run after the rounds with no reading changed. */
+const QUIET_TICKS = FULL ? 5 : 3;
 
 /**
  * Ceilings, about four times what the full board measures on an offbox VM
@@ -113,6 +133,15 @@ const CEILING = {
   turnEndFailedShare: 0.4,
   /** Times a turn end runs on average, counting the reruns after the board changed under it. */
   turnEndAttempts: 6,
+  /**
+   * The wait pass of a tick in which no wait ends: every parked card's check is
+   * asked and nothing is written. On the smoke board it measures about 4 ms on a
+   * loaded Mac (11 Nov 2026: 6 cards still parked of 15, two of them 1 ms reads).
+   * The full board (about 65 parked) is not measured yet, so its ceiling is a
+   * guess with the same wide margin. It catches a pass that reads the board once
+   * per parked card, not a slow machine.
+   */
+  waitPassP95Ms: FULL ? 2_000 : 500,
 };
 
 const opus = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
@@ -157,8 +186,156 @@ interface SoakThread {
   failure: Failure | null;
 }
 
-const makeThreads = () => {
+/**
+ * What one tick did for the parked cards: their rows read and written, their
+ * threads read, the host reader asked. `first` to `last` spans those calls, which
+ * in a tick where no wait ends is the wait pass and nothing else.
+ */
+interface Probe {
+  readonly cards: ReadonlySet<string>;
+  readonly threads: ReadonlySet<string>;
+  first: number | null;
+  last: number | null;
+  cardReads: number;
+  readonly cardWrites: Set<string>;
+  readonly threadReads: Map<string, number>;
+  hostPasses: number;
+  hostRequests: number;
+}
+
+const makeWatch = () => {
+  const state: { probe: Probe | null } = { probe: null };
+  /** Runs `effect`, timed into the open probe when `count` takes it. */
+  const seen = <A, E, R>(count: (probe: Probe) => boolean, effect: Effect.Effect<A, E, R>) =>
+    Effect.suspend(() => {
+      const probe = state.probe;
+      if (probe === null || !count(probe)) return effect;
+      const touch = () => {
+        const now = performance.now();
+        probe.first ??= now;
+        probe.last = now;
+      };
+      touch();
+      return Effect.ensuring(effect, Effect.sync(touch));
+    });
+  return {
+    open: (cards: ReadonlySet<string>, threads: ReadonlySet<string>) => {
+      state.probe = {
+        cards,
+        threads,
+        first: null,
+        last: null,
+        cardReads: 0,
+        cardWrites: new Set(),
+        threadReads: new Map(),
+        hostPasses: 0,
+        hostRequests: 0,
+      };
+    },
+    close: () => {
+      const probe = state.probe;
+      state.probe = null;
+      return probe;
+    },
+    cardRead: <A, E, R>(cardId: string, effect: Effect.Effect<A, E, R>) =>
+      seen((probe) => {
+        if (!probe.cards.has(cardId)) return false;
+        probe.cardReads += 1;
+        return true;
+      }, effect),
+    cardWrite: <A, E, R>(cardId: string, effect: Effect.Effect<A, E, R>) =>
+      seen((probe) => {
+        if (!probe.cards.has(cardId)) return false;
+        probe.cardWrites.add(cardId);
+        return true;
+      }, effect),
+    threadRead: <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+      seen((probe) => {
+        if (!probe.threads.has(threadId)) return false;
+        probe.threadReads.set(threadId, (probe.threadReads.get(threadId) ?? 0) + 1);
+        return true;
+      }, effect),
+    hostRead: <A, E, R>(requests: number, effect: Effect.Effect<A, E, R>) =>
+      seen((probe) => {
+        probe.hostPasses += 1;
+        probe.hostRequests += requests;
+        return true;
+      }, effect),
+  };
+};
+type Watch = ReturnType<typeof makeWatch>;
+
+/** A pull request as its host has it. */
+interface HostPr {
+  state: "open" | "merged";
+  head: string;
+  checks: "passing" | "pending";
+}
+
+/**
+ * The wait PR reader, answering at once from `prs`. The real one asks a host
+ * about a PR at most once in three minutes; this one is asked every tick and
+ * answers every time, so a tick pays for one read however many PRs are waited on.
+ * A PR it does not have is one a work thread watches: that thread's reading stands.
+ */
+const makeHost = (watch: Watch) => {
+  const prs = new Map<string, HostPr>();
+  const counts = { passes: 0, requests: 0 };
+  const layer = Layer.succeed(
+    KanbanWaitPrs,
+    KanbanWaitPrs.of({
+      read: (requests) =>
+        watch.hostRead(
+          requests.length,
+          Effect.gen(function* () {
+            counts.passes += 1;
+            counts.requests += requests.length;
+            yield* Effect.sleep(IO_MS);
+            const at = DateTime.formatIso(yield* DateTime.now);
+            const readings: Array<Waits.WaitPrFacts> = [];
+            const read: Array<string> = [];
+            for (const request of requests) {
+              const pr = prs.get(request.url);
+              if (pr === undefined) {
+                if (request.live !== null) readings.push(request.live);
+                continue;
+              }
+              read.push(request.url);
+              readings.push({
+                url: request.url,
+                state: pr.state,
+                at,
+                head: pr.head,
+                headAt: at,
+                checks: pr.checks,
+              });
+            }
+            return { readings, read, failed: [], carried: [] };
+          }),
+        ),
+    }),
+  );
+  return { prs, counts, layer };
+};
+
+/** The store, with the reads and writes of card rows shown to the watch. */
+const watchedStore = (watch: Watch) =>
+  Layer.effect(
+    KanbanStore.KanbanStore,
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      return KanbanStore.KanbanStore.of({
+        ...store,
+        card: (cardId) => watch.cardRead(cardId, store.card(cardId)),
+        putCard: (card) => watch.cardWrite(card.id, store.putCard(card)),
+      });
+    }),
+  ).pipe(Layer.provide(KanbanStore.layer));
+
+const makeThreads = (watch: Watch) => {
   const threads = new Map<string, SoakThread>();
+  /** Pull requests a thread watches, as its view reports them. */
+  const prs = new Map<string, Array<KanbanThreadPr>>();
   const counts = { reads: 0, sends: 0, launches: 0, interrupts: 0 };
   /** Threads the board stopped; in production their run's end is a turn end. */
   const stopped = new Set<string>();
@@ -190,17 +367,17 @@ const makeThreads = () => {
         quietSince: at,
         runStartedAt: thread.running ? at : null,
         backgroundWork: 0,
-        prs: [],
+        prs: prs.get(threadId) ?? [],
         archived: false,
       };
       return view;
-    });
+    }).pipe((effect) => watch.threadRead(threadId, effect));
   const failureOf = (threadId: ThreadId) =>
     Effect.gen(function* () {
       counts.reads += 1;
       yield* io();
       return threads.get(threadId)?.failure ?? null;
-    });
+    }).pipe((effect) => watch.threadRead(threadId, effect));
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
@@ -276,18 +453,23 @@ const makeThreads = () => {
       nextStart = { title, done };
       return Deferred.await(done);
     });
-  return { threads, counts, stopped, layer, fail, awaitStart };
+  return { threads, prs, counts, stopped, layer, fail, awaitStart };
 };
 
-const soakLayer = (threads: Layer.Layer<KanbanThreads>) =>
+const soakLayer = (
+  threads: Layer.Layer<KanbanThreads>,
+  host: Layer.Layer<KanbanWaitPrs>,
+  watch: Watch,
+) =>
   KanbanService.layer.pipe(
     // As production: owner routes and write follow-ons are delivered after the reply.
     Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, "deferred")),
     Layer.provide(Layer.succeed(KanbanService.ReplayReads, true)),
     Layer.provide(Layer.succeed(KanbanService.DeferWriteEffects, true)),
     Layer.provideMerge(threads),
+    Layer.provide(host),
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(watchedStore(watch)),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     // No project folders here: the scribe and the title writer find none and stop.
@@ -390,7 +572,9 @@ it.live(
   `soak: ${CARDS} cards, ${ROUNDS} rounds of turn ends, verdicts, answers and creates`,
   () =>
     Effect.gen(function* () {
-      const fake = makeThreads();
+      const watch = makeWatch();
+      const fake = makeThreads(watch);
+      const host = makeHost(watch);
       const spans: Array<Tracer.NativeSpan> = [];
       const tracer = Tracer.make({
         span: (options) => {
@@ -418,6 +602,8 @@ it.live(
         if (entry) entry.count += 1;
         else logged.set(key, { count: 1, example: text.slice(0, 300) });
       });
+      /** Ticks of the board that gave up: logged by the engine, and the tick call still succeeds. */
+      const boardTicksFailed = () => logged.get("kanban board tick failed")?.count ?? 0;
       const timings = new Map<string, Array<number>>();
       const failed = new Map<string, number>();
       const firstFailure = new Map<string, string>();
@@ -455,7 +641,7 @@ it.live(
         });
         for (const [model, slots] of POOLS) yield* kanban.setPool(board.id, model, slots);
         const seededAt = yield* Clock.currentTimeMillis;
-        const seeded = soakCards({
+        const unparked = soakCards({
           board,
           cards: CARDS,
           seed: SEED,
@@ -466,8 +652,90 @@ it.live(
           ],
           chains: CHAINS.map((chain) => chain.name),
         });
+        const { cards: seeded, parked } = soakWaits({
+          cards: unparked,
+          seed: SEED + 2,
+          nowMs: seededAt,
+          midMs: WAIT_MID_MS,
+          chainSteps: new Map(CHAINS.map((chain) => [chain.name, chain.steps.length])),
+        });
         yield* Effect.forEach(seeded, (card) => store.putCard(card), { discard: true });
         const expected = new Set<string>(seeded.map((card) => card.id));
+        // What the parked cards wait on: a PR its idle work thread watches is in that
+        // thread's view, any other PR is on the host.
+        const seededById = new Map(seeded.map((card) => [card.id as string, card]));
+        for (const entry of parked) {
+          const card = seededById.get(entry.cardId)!;
+          const head = entry.sinceHead ?? "b0000000";
+          if (entry.workThreadId === null) {
+            if (entry.pr !== null)
+              host.prs.set(entry.pr, { state: "open", head, checks: "pending" });
+            continue;
+          }
+          const model = card.model ?? opus;
+          fake.threads.set(entry.workThreadId, {
+            running: false,
+            model,
+            messages: [],
+            failure: null,
+          });
+          if (entry.pr !== null) {
+            fake.prs.set(entry.workThreadId, [
+              { url: entry.pr, title: null, state: "open", head, checks: "pending", at: null },
+            ]);
+          }
+          yield* store.putThreadLink({
+            threadId: ThreadId.make(entry.workThreadId),
+            boardId: board.id,
+            cardId: card.id,
+            role: "work",
+            purpose: null,
+            discussionId: null,
+            model,
+            startedAt: card.movedAt,
+            endedAt: null,
+            paused: null,
+          });
+        }
+        /** The `mid` waits end: PRs merge, a head moves, checks pass, the time comes. */
+        const endMidWaits = Effect.gen(function* () {
+          for (const entry of parked) {
+            if (entry.park.ends !== "mid" || entry.pr === null) continue;
+            if (entry.workThreadId !== null) {
+              fake.prs.set(
+                entry.workThreadId,
+                (fake.prs.get(entry.workThreadId) ?? []).map((pr) => ({ ...pr, state: "merged" })),
+              );
+              continue;
+            }
+            const pr = host.prs.get(entry.pr);
+            if (pr === undefined) continue;
+            if (entry.park.on === "merge") pr.state = "merged";
+            else if (entry.park.on === "push") pr.head = `c${pr.head.slice(1)}`;
+            else pr.checks = "passing";
+          }
+          const left = seededAt + WAIT_MID_MS - (yield* Clock.currentTimeMillis);
+          if (left >= 0) yield* Effect.sleep(left + 5);
+        });
+        /**
+         * Whether each round's tick did its work. A board's tick that gives up (the board
+         * changed under it eight times over) is logged and skipped, not failed, so the tick
+         * call succeeds and every step of it, the wait pass included, comes a tick later.
+         */
+        const tickDone: Array<boolean> = [];
+        const firstDone = (from: number) => {
+          const round = tickDone.indexOf(true, from);
+          return round === -1 ? null : round;
+        };
+        /** The round after whose tick a parked card's wait was first seen gone. */
+        const wokenAt = new Map<string, number>();
+        const noteWoken = (cards: ReadonlyArray<KanbanCard>, round: number) => {
+          const byId = new Map(cards.map((card) => [card.id as string, card]));
+          for (const entry of parked) {
+            if (wokenAt.has(entry.cardId)) continue;
+            if (byId.get(entry.cardId)?.wait === undefined) wokenAt.set(entry.cardId, round);
+          }
+        };
         const random = soakRandom(SEED + 1);
         // As production: queued dispatch kicks run on the worker.
         const worker = yield* Effect.forkChild(kanban.worker);
@@ -585,8 +853,12 @@ it.live(
         let made_ = 0;
         let started = 0;
         for (let round = 0; round < ROUNDS; round += 1) {
-          yield* op("tick", kanban.tick);
+          if (round === WAIT_MID_ROUND) yield* endMidWaits;
+          const failedBefore = boardTicksFailed();
+          const ticked = yield* op("tick", kanban.tick);
+          tickDone.push(Exit.isSuccess(ticked) && boardTicksFailed() === failedBefore);
           const cards = yield* cardsNow;
+          noteWoken(cards, round);
           const byThread = new Map<string, Array<KanbanCard>>();
           for (const card of cards) {
             if (card.activeThreadId === null) continue;
@@ -834,6 +1106,47 @@ it.live(
           problems.push(`left unstarted with a free slot: ${entry}`);
         const settled = yield* check("after settling");
 
+        // Waits: the ones whose reading changed or whose time came are over, the rest hold.
+        noteWoken(settled, ROUNDS);
+        const settledById = new Map(settled.map((card) => [card.id as string, card]));
+        const kinds = new Map<string, { seeded: number; woken: number }>();
+        for (const entry of parked) {
+          const card = settledById.get(entry.cardId);
+          const woke = wokenAt.get(entry.cardId);
+          const kind = kinds.get(entry.park.kind) ?? { seeded: 0, woken: 0 };
+          kinds.set(entry.park.kind, {
+            seeded: kind.seeded + 1,
+            woken: kind.woken + (woke === undefined ? 0 : 1),
+          });
+          if (card === undefined) continue;
+          const name = `parked #${card.number} (${entry.park.kind})`;
+          if (entry.park.ends === "never") {
+            if (woke === undefined) continue;
+            // The one reading the run itself can change: the card it waits on got done.
+            const target = entry.waitsOn === null ? undefined : settledById.get(entry.waitsOn);
+            if (
+              target === undefined ||
+              (target.settledAt === null && !KANBAN_DONE_STAGES.has(target.stage))
+            ) {
+              problems.push(
+                `${name} lost its wait by round ${woke + 1} with nothing changed: now ${card.stage}`,
+              );
+            }
+            continue;
+          }
+          // Over from the first tick that did its work: at the start, or once the driver ended it.
+          const due = firstDone(entry.park.ends === "start" ? 0 : WAIT_MID_ROUND);
+          if (woke === undefined) {
+            if (due !== null) problems.push(`${name} was still parked at the end`);
+          } else if (entry.park.ends === "mid" && entry.pr !== null && woke < WAIT_MID_ROUND) {
+            problems.push(`${name} ended by round ${woke + 1}, before its reading changed`);
+          } else if (due !== null && woke > due) {
+            problems.push(
+              `${name} ended by round ${woke + 1}; the tick of round ${due + 1} should have ended it`,
+            );
+          }
+        }
+
         // Time to start a card: with a slot free on the busiest work pool, the owner
         // creates an urgent card, and it starts through the production path (the
         // create's queued kick, on the worker). Timed from the create to the launch.
@@ -906,6 +1219,86 @@ it.live(
         yield* check("after opening slots");
         yield* Fiber.interrupt(worker);
 
+        // Quiet ticks: no reading changes, so no wait ends. A parked card must cost its
+        // check and nothing else: no write of its row, no read of its thread unless that
+        // thread's view carries the PR it waits on (one read), one pass of the host reader.
+        // The first tick is not counted: it completes what the settling left ready.
+        yield* Effect.exit(kanban.tick);
+        const quiet = {
+          parked: 0,
+          woken: 0,
+          passMs: [] as Array<number>,
+          cardReads: [] as Array<number>,
+          threadReads: [] as Array<number>,
+          hostRequests: [] as Array<number>,
+        };
+        for (let i = 0; i < QUIET_TICKS; i += 1) {
+          const before = new Map(
+            (yield* cardsNow)
+              .filter((card) => kanbanWaiting(card))
+              .map((card) => [card.id as string, card]),
+          );
+          const threadOf = new Map(
+            [...before.values()].flatMap((card) =>
+              card.workThreadId === null ? [] : [[card.workThreadId as string, card] as const],
+            ),
+          );
+          const spansBefore = spans.length;
+          watch.open(new Set(before.keys()), new Set(threadOf.keys()));
+          yield* op("tick.quiet", kanban.tick);
+          const probe = watch.close();
+          // A tick redone because the board changed under it asks again.
+          const ran =
+            1 +
+            Math.max(
+              0,
+              ...spans.slice(spansBefore).map((span) => {
+                const attempt = span.attributes.get("board.rerun_attempt");
+                return typeof attempt === "number" ? attempt : 0;
+              }),
+            );
+          const after = new Map((yield* cardsNow).map((card) => [card.id as string, card]));
+          if (probe === null) continue;
+          const when = `quiet tick ${i + 1}`;
+          for (const [id, card] of before) {
+            const now = after.get(id);
+            if (now === undefined || !kanbanWaiting(now)) {
+              quiet.woken += 1;
+              continue;
+            }
+            if (probe.cardWrites.has(id) || JSON.stringify(now) !== JSON.stringify(card)) {
+              problems.push(`${when} wrote parked #${card.number} (${card.wait?.note})`);
+            }
+          }
+          for (const [threadId, reads] of probe.threadReads) {
+            const card = threadOf.get(threadId)!;
+            const name = `parked #${card.number} (${card.wait?.note})`;
+            if (card.wait?.pr == null) {
+              problems.push(
+                `${when} read the thread of ${name} ${reads} times; it waits on no pull request`,
+              );
+            } else if (reads > ran) {
+              problems.push(`${when} read the thread of ${name} ${reads} times in ${ran} run(s)`);
+            }
+          }
+          if (probe.hostPasses > ran) {
+            problems.push(`${when} asked the host reader ${probe.hostPasses} times`);
+          }
+          // The locked store reads a card's row twice: once to find its board, once for the card.
+          if (probe.cardReads > 2 * before.size * ran) {
+            problems.push(
+              `${when} read the rows of ${before.size} parked cards ${probe.cardReads} times`,
+            );
+          }
+          quiet.parked = before.size;
+          if (probe.first !== null && probe.last !== null) {
+            quiet.passMs.push(probe.last - probe.first);
+          }
+          quiet.cardReads.push(probe.cardReads);
+          quiet.threadReads.push([...probe.threadReads.values()].reduce((sum, n) => sum + n, 0));
+          quiet.hostRequests.push(probe.hostRequests);
+        }
+
         const stages = new Map<string, number>();
         for (const card of settled) stages.set(card.stage, (stages.get(card.stage) ?? 0) + 1);
         return {
@@ -925,9 +1318,22 @@ it.live(
           startMs,
           turnEnds,
           turnEndsFailed,
+          waits: {
+            parked: parked.length,
+            open: unparked.filter((card) => card.stage === "todo" || card.stage === "needs_review")
+              .length,
+            woken: wokenAt.size,
+            wokenAtFirstTick: [...wokenAt.values()].filter((round) => round === 0).length,
+            byKind: Object.fromEntries(kinds),
+            hostPasses: host.counts.passes,
+            hostRequests: host.counts.requests,
+          },
+          quiet,
         };
       }).pipe(
-        Effect.provide(Layer.mergeAll(soakLayer(fake.layer), Logger.layer([warnings]))),
+        Effect.provide(
+          Layer.mergeAll(soakLayer(fake.layer, host.layer, watch), Logger.layer([warnings])),
+        ),
         Effect.withTracer(tracer),
       );
 
@@ -943,9 +1349,22 @@ it.live(
         }
         if (span.name === "KanbanService.turnEndedUnlocked") turnEndAttempts += 1;
       }
+      const { quiet, ...boardResult } = result;
+      const most = (values: ReadonlyArray<number>) =>
+        values.length === 0 ? 0 : Math.max(...values);
       const report = {
         config: { full: FULL, cards: CARDS, rounds: ROUNDS, seed: SEED, ioMs: IO_MS },
-        board: result,
+        board: boardResult,
+        // Ticks in which no wait ends: what the parked cards cost, the most seen in one tick.
+        waitPass: {
+          ticks: quiet.cardReads.length,
+          parked: quiet.parked,
+          woken: quiet.woken,
+          ms: summary(quiet.passMs),
+          cardRowsRead: most(quiet.cardReads),
+          threadViewsRead: most(quiet.threadReads),
+          hostRequests: most(quiet.hostRequests),
+        },
         timings: Object.fromEntries(
           [...timings].map(([name, values]) => [
             name,
@@ -959,6 +1378,7 @@ it.live(
           turnEndAttempts,
           turnEnds: result.turnEnds,
           turnEndsFailed: result.turnEndsFailed,
+          boardTicksFailed: boardTicksFailed(),
         },
         threadIo: fake.counts,
         firstFailure: Object.fromEntries(firstFailure),
@@ -987,7 +1407,13 @@ it.live(
             line("dispatch"),
             line("turnEnded"),
             `start a card n=${report.startCardMs.n} p50=${report.startCardMs.p50}ms max=${report.startCardMs.max}ms`,
-            `reruns=${reruns} deepest=${deepest} turnEnds=${result.turnEnds} attempts=${turnEndAttempts} failed=${result.turnEndsFailed} savedThenFailed=${savedThenFailed.length}`,
+            `waits parked=${result.waits.parked} of ${result.waits.open} open, woken=${result.waits.woken} (${result.waits.wokenAtFirstTick} at the first tick), still parked=${result.waits.parked - result.waits.woken}; woken/seeded: ${Object.entries(
+              result.waits.byKind,
+            )
+              .map(([kind, entry]) => `${kind} ${entry.woken}/${entry.seeded}`)
+              .join("; ")}`,
+            `wait pass (quiet tick, ${report.waitPass.parked} parked) n=${report.waitPass.ms.n} p50=${report.waitPass.ms.p50}ms p95=${report.waitPass.ms.p95}ms max=${report.waitPass.ms.max}ms; most in a tick: card rows read=${report.waitPass.cardRowsRead} thread views read=${report.waitPass.threadViewsRead} host requests=${report.waitPass.hostRequests} card writes=0; woken in those ticks=${report.waitPass.woken}`,
+            `reruns=${reruns} deepest=${deepest} turnEnds=${result.turnEnds} attempts=${turnEndAttempts} failed=${result.turnEndsFailed} savedThenFailed=${savedThenFailed.length} ticksGivenUp=${boardTicksFailed()}`,
             ...[...logged].map(([key, entry]) => `warning x${entry.count}: ${key}`),
             ...savedThenFailed.slice(0, 5).map((entry) => `SAVED-THEN-FAILED ${entry}`),
             ...problems.slice(0, 20).map((problem) => `PROBLEM ${problem}`),
@@ -1014,6 +1440,9 @@ it.live(
       assert.isAtMost(report.timings.dispatch?.p95 ?? 0, CEILING.dispatchP95Ms, "dispatch p95");
       assert.isAtMost(report.timings.turnEnded?.p95 ?? 0, CEILING.turnEndP95Ms, "turn end p95");
       assert.isAtMost(report.startCardMs.max ?? 0, CEILING.startMs, "time to start a card");
+      assert.isAbove(result.waits.woken, 0, "waits ended during the run");
+      assert.isAbove(report.waitPass.parked, 0, "cards were still parked for the quiet ticks");
+      assert.isAtMost(report.waitPass.ms.p95 ?? 0, CEILING.waitPassP95Ms, "wait pass p95");
     }),
   { timeout: FULL ? 900_000 : 120_000 },
 );
