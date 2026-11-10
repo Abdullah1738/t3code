@@ -8,8 +8,8 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import http from "node:http";
-import https from "node:https";
+import * as NodeHttp from "node:http";
+import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
@@ -94,7 +94,7 @@ export async function install(ops, { rollback = false } = {}) {
 export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
-    const request = (target.protocol === "https:" ? https : http).get(
+    const request = (target.protocol === "https:" ? NodeHttps : NodeHttp).get(
       target,
       { headers, agent: false },
       (response) => {
