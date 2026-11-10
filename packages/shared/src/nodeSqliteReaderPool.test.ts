@@ -219,25 +219,27 @@ it.effect(
   () =>
     withLanes({ foregroundReaderSlots: 1, checkpointWorker: true }, (sql) =>
       Effect.gen(function* () {
+        // Commit cost is not under test here; the open snapshot is.
+        yield* sql`PRAGMA synchronous = OFF`;
         yield* foreground(countEntries(sql));
         const snapshot = yield* Effect.forkChild(
           foreground(
             sql.withTransaction(
-              Effect.andThen(countEntries(sql), Effect.andThen(realPause(1500), countEntries(sql))),
+              Effect.andThen(countEntries(sql), Effect.andThen(realPause(3000), countEntries(sql))),
             ),
           ),
         );
         yield* realPause(100);
-        const started = now();
-        for (let index = 0; index < 200; index++) yield* sql`INSERT INTO entries VALUES ('w')`;
-        const writeMs = now() - started;
-        assert.isBelow(writeMs, 1000);
+        for (let index = 0; index < 100; index++) yield* sql`INSERT INTO entries VALUES ('w')`;
+        // Every commit finished while the snapshot was still open: writers never wait for it.
         assert.isUndefined(snapshot.pollUnsafe());
+        // New reads on the background lane see the commits during the snapshot.
+        assert.equal(yield* background(countEntries(sql)), 101);
+        // The snapshot kept its view for both statements.
         assert.equal(yield* Fiber.join(snapshot), 1);
-        // A passive checkpoint can run past the closed snapshot.
+        // With the snapshot closed, a passive checkpoint is not blocked by it.
         const rows = yield* sql<{ busy: number }>`PRAGMA wal_checkpoint(PASSIVE)`;
         assert.equal(rows[0]?.busy, 0);
-        assert.equal(yield* background(countEntries(sql)), 201);
       }),
     ),
   30_000,
