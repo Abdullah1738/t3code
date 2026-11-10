@@ -190,8 +190,8 @@ export function BatchView(props: {
                       className={cn(
                         "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
                         checked
-                          ? "bg-(--m-band) ring-2 ring-(--m-accent)"
-                          : "ring-(--m-control) hover:bg-(--m-surface)",
+                          ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
+                          : "ring-(--m-bar-2) hover:bg-(--m-surface)",
                       )}
                     >
                       <Key className="mt-0.5">{index + 1}</Key>
@@ -215,7 +215,7 @@ export function BatchView(props: {
               <GrowingText
                 data-ny-at="text"
                 aria-label="Your answer"
-                placeholder="Type one answer for all of them"
+                placeholder="Type one answer for all of them…"
                 value={text}
                 maxLength={20_000}
                 aria-invalid={problem ? true : undefined}
@@ -263,7 +263,7 @@ export function BatchView(props: {
                 <Key>X</Key>
               </Btn>
             ) : null}
-            <Btn tone="ghost" onClick={snooze} className="max-sm:hidden">
+            <Btn tone="ghost" onClick={snooze}>
               Snooze {all}
               <Key>S</Key>
             </Btn>

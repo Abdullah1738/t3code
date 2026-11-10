@@ -149,11 +149,10 @@ export function ReferenceView(props: {
                       {live ? (
                         <button
                           type="button"
-                          aria-label={`See an open ${name} ask`}
                           onClick={() => props.onOpenAsk(askKey(live))}
                           className={linkClass}
                         >
-                          See one
+                          See one<span className="sr-only">: an open {name} ask</span>
                         </button>
                       ) : null}
                     </td>

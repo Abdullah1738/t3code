@@ -30,7 +30,7 @@ export function EvaluatorThreadLink(props: {
 }
 
 const quiet =
-  "flex w-full items-center gap-2 rounded-lg py-1 text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
+  "flex w-full items-center gap-2 rounded-lg py-1 text-start text-sm text-(--m-muted) outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11";
 
 /**
  * "Fewer like this": hand one ask to the board's evaluator, or hand it over
@@ -111,6 +111,7 @@ export function HandOver(props: {
         />
         <p
           id={`${id}-hint`}
+          aria-live="polite"
           className={cn(
             "mt-2 text-sm",
             tried && missing ? "text-(--m-negative)" : "text-(--m-muted)",

@@ -13,7 +13,7 @@ function SecondsLeft(props: { held: HeldSend<AskSend> }) {
     return () => clearInterval(timer);
   }, []);
   return (
-    <span className="ms-2 whitespace-nowrap opacity-70 tabular-nums">
+    <span aria-hidden className="ms-2 whitespace-nowrap opacity-70 tabular-nums">
       sends in {heldSecondsLeft(props.held, nowMs)}s
     </span>
   );

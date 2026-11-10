@@ -274,12 +274,15 @@ export function HistoryView(props: {
         {props.layout === "desktop" ? null : <div className="mb-3">{aside}</div>}
         {closed === null && status !== "error" ? (
           <div aria-busy className="flex flex-col gap-3">
+            <p role="status" className="sr-only">
+              Loading…
+            </p>
             <Bar className="h-24 rounded-2xl" />
             <Bar className="h-24 rounded-2xl" />
           </div>
         ) : null}
         {closed === null && status === "error" ? (
-          <div className="flex flex-col items-start gap-2">
+          <div role="alert" className="flex flex-col items-start gap-2">
             <p className="font-semibold">Couldn't load History.</p>
             <Btn size="sm" onClick={() => void loadClosedAsks()}>
               Retry
@@ -300,7 +303,7 @@ export function HistoryView(props: {
         ) : null}
         {closed !== null ? (
           <>
-            <Label>Today</Label>
+            <h2 className="text-xs text-(--m-muted)">Today</h2>
             {today.length > 0 ? (
               list(today)
             ) : session.length === 0 ? (
@@ -308,7 +311,7 @@ export function HistoryView(props: {
             ) : null}
             {earlier.length > 0 ? (
               <>
-                <Label className="mt-3">Earlier this week</Label>
+                <h2 className="mt-3 text-xs text-(--m-muted)">Earlier this week</h2>
                 {list(earlier)}
               </>
             ) : null}

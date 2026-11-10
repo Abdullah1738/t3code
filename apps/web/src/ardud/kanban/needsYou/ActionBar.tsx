@@ -66,7 +66,7 @@ export function ActionBar(props: {
         onClick={props.onPrimary}
         className={props.phone ? "min-w-0 flex-1" : undefined}
       >
-        <span className="truncate">{props.busy ? "Sending" : askPrimaryLabel(ask, form)}</span>
+        <span className="truncate">{props.busy ? "Sending…" : askPrimaryLabel(ask, form)}</span>
         <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
       </Btn>
       {form.refusing ? (
@@ -98,7 +98,7 @@ export function ActionBar(props: {
 function Shell(props: { children: ReactNode }) {
   return (
     <div className="pb-safe">
-      <div className="flex min-w-0 items-center gap-2 px-5 py-3 max-sm:gap-1.5 max-sm:px-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-2 px-5 py-3 max-sm:flex-nowrap max-sm:gap-1.5 max-sm:px-3">
         {props.children}
       </div>
     </div>

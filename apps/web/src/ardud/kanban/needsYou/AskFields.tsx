@@ -101,7 +101,7 @@ export function FieldRow(props: {
         <GrowingText
           {...common}
           aria-label={props.bare ? "Your answer" : undefined}
-          placeholder={props.bare ? "Type your answer" : undefined}
+          placeholder={props.bare ? "Type your answer…" : undefined}
           value={text}
           onChange={(event) => set(event.target.value)}
         />
@@ -144,13 +144,13 @@ export function FieldRow(props: {
           role="switch"
           aria-checked={value === true}
           onClick={() => set(value !== true)}
-          className="group flex min-w-0 items-center gap-3 rounded-lg py-1 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+          className="group flex min-w-0 items-center gap-3 rounded-lg py-1 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11"
         >
           <span
             aria-hidden
             className={cn(
               "flex h-5.5 w-9.5 shrink-0 items-center rounded-full p-0.5 transition-colors duration-150",
-              value === true ? "bg-(--m-accent)" : "bg-(--m-tick)",
+              value === true ? "bg-(--m-accent)" : "bg-(--m-bar-2)",
             )}
           >
             <span
@@ -174,6 +174,9 @@ export function FieldRow(props: {
         <RankControl
           field={field}
           value={value}
+          id={id}
+          label={label}
+          describedBy={describedBy}
           at={common["data-ny-at"]}
           disabled={props.disabled}
           onChange={set}
@@ -251,8 +254,8 @@ const pillChoice = (checked: boolean) =>
   cn(
     "inline-flex h-8.5 min-w-0 items-center gap-1.5 rounded-full px-3.5 text-sm outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent) disabled:opacity-50 pointer-coarse:h-11 pointer-coarse:text-base",
     checked
-      ? "bg-(--m-band) font-medium text-(--m-accent-text) ring-(--m-accent)"
-      : "ring-(--m-control) hover:bg-(--m-surface)",
+      ? "bg-(--m-band) font-medium text-(--m-accent-text) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
+      : "ring-(--m-bar-2) hover:bg-(--m-surface)",
   );
 
 /** A few options are shown as pills; a long list folds into a menu. */
@@ -330,6 +333,9 @@ function SelectControl(props: {
 function RankControl(props: {
   field: KanbanAskField;
   value: unknown;
+  id: string;
+  label: string;
+  describedBy: string | undefined;
   at: string;
   disabled: boolean;
   onChange: (value: unknown) => void;
@@ -364,12 +370,20 @@ function RankControl(props: {
 
   return (
     <>
-      <ol ref={list} className="flex flex-col gap-1.5">
+      <ol
+        ref={list}
+        id={props.id}
+        tabIndex={-1}
+        aria-label={props.label}
+        aria-describedby={props.describedBy}
+        data-ny-at={props.at}
+        className="flex flex-col gap-1.5 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      >
         {order.map((id, index) => (
           <li
             key={id}
             className={cn(
-              "flex min-w-0 items-center gap-2 rounded-xl py-1.5 ps-1.5 pe-1.5 ring-1 ring-inset ring-(--m-control)",
+              "flex min-w-0 items-center gap-2 rounded-xl py-1.5 ps-1.5 pe-1.5 ring-1 ring-inset ring-(--m-bar-2)",
               dragging === id ? "bg-(--m-band) ring-(--m-accent)" : "bg-(--m-ground)",
             )}
           >
@@ -395,7 +409,6 @@ function RankControl(props: {
             <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{known.get(id)}</span>
             <IconBtn
               label={`Move ${known.get(id)} up`}
-              data-ny-at={index === 0 ? props.at : undefined}
               disabled={props.disabled || index === 0}
               onClick={() => move(id, index - 1)}
             >
@@ -618,7 +631,10 @@ function FileRow(props: {
     <div className="flex min-w-0 items-center gap-2.5 rounded-xl bg-(--m-surface) py-1.5 ps-3 pe-1.5 text-sm">
       <FileIcon aria-hidden className="size-4 shrink-0 text-(--m-muted)" />
       <span className="min-w-0 flex-1 truncate font-medium">{props.name}</span>
-      <span className="shrink-0 text-xs text-(--m-muted) tabular-nums">
+      <span
+        role={props.state === "failed" ? "alert" : undefined}
+        className="shrink-0 text-xs text-(--m-muted) tabular-nums"
+      >
         {props.state === "uploading"
           ? `${Math.round((props.progress ?? 0) * 100)}%`
           : props.state === "failed"

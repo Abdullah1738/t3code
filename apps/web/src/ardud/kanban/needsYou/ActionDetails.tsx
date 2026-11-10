@@ -48,7 +48,10 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
       {action.command ? (
         <>
           <Label className="mb-2">Runs exactly this</Label>
-          <pre className="mb-4 overflow-x-auto rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 ring-1 ring-inset ring-(--m-rule)">
+          <pre
+            translate="no"
+            className="mb-4 overflow-x-auto rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 ring-1 ring-inset ring-(--m-rule)"
+          >
             <span aria-hidden className="text-(--m-muted) select-none">
               ${" "}
             </span>

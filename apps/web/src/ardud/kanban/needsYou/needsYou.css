@@ -44,7 +44,9 @@ html[data-theme-id="desk"].dark {
 [data-ny] ins {
   background: var(--ny-posband);
   color: var(--m-positive);
-  text-decoration: none;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
   border-radius: 3px;
   padding: 1px 0;
 }

@@ -45,6 +45,7 @@ import { BatchView } from "./BatchView";
 import { HistoryView } from "./HistoryView";
 import { QueueRail } from "./QueueRail";
 import { ReferenceView } from "./ReferenceView";
+import { useSingleKeys } from "./keysPref";
 import { patchNeedsYouSearch, type NeedsYouSearch, type NeedsYouView } from "./search";
 import { ShortcutsSheet } from "./ShortcutsSheet";
 import { Bar, Btn, FilterChip, IconBtn, Layer, linkClass, usePageLayout } from "./ui";
@@ -94,7 +95,7 @@ export function NeedsYouPage(props: {
   const hiddenMap = useAskStore((state) => state.hidden);
   const boards = useBoards();
   const nowMs = useNowMs();
-  const sheetRef = useRef<HTMLElement>(null);
+  const sheetRef = useRef<HTMLDivElement>(null);
   const layout = usePageLayout(sheetRef);
   const readerRef = useRef<AskReaderHandle | null>(null);
 
@@ -210,10 +211,19 @@ export function NeedsYouPage(props: {
     setCard({ boardId: entry.boardId, cardId: entry.cardId });
   };
 
+  const singleKeys = useSingleKeys((state) => state.on);
   const onKey = useStableCallback((event: KeyboardEvent) => {
     if (event.defaultPrevented || event.isComposing) return;
     const target = event.target instanceof HTMLElement ? event.target : null;
     const typing = target !== null && textLike(target);
+    const letter = event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey;
+    // He turned one-letter shortcuts off: only arrows, Enter and Escape act.
+    if (letter && !singleKeys && !typing) return;
+    const arrow = event.key === "ArrowUp" || event.key === "ArrowDown";
+    // Arrows belong to the control in focus: an option group, a player, a list of rows.
+    if (arrow && target?.closest("[role=radiogroup], [role=group], video, audio, [data-ny-rows]")) {
+      return;
+    }
     const layerOpen =
       card !== null ||
       queueOpen ||
@@ -257,6 +267,8 @@ export function NeedsYouPage(props: {
       refusable: focused?._tag === "batch" || (response !== null && askRefusal(response) !== null),
     });
     if (action === null) return;
+    // A held key must not answer one ask after another.
+    if (event.repeat && action._tag !== "move") return;
     switch (action._tag) {
       case "close":
         // Escape leaves a text box; a sheet closes itself.
@@ -431,7 +443,7 @@ export function NeedsYouPage(props: {
           </div>
         </WorkspacePageHeader>
 
-        <main
+        <div
           ref={sheetRef}
           className="relative mx-2 mb-2 flex min-h-0 flex-1 overflow-hidden rounded-2xl bg-(--m-ground) ring-1 ring-(--m-rule)"
         >
@@ -503,6 +515,7 @@ export function NeedsYouPage(props: {
               <ReaderSkeleton />
             ) : status === "error" ? (
               <Empty
+                alert
                 title="Couldn't load asks."
                 detail={error ?? undefined}
                 action={<Btn onClick={() => void refreshAsks()}>Retry</Btn>}
@@ -537,7 +550,7 @@ export function NeedsYouPage(props: {
               onClose={() => setCard(null)}
             />
           ) : null}
-        </main>
+        </div>
       </div>
 
       <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
@@ -600,9 +613,18 @@ function CardPeek(props: {
   );
 }
 
-function Empty(props: { title: string; detail?: string | undefined; action?: React.ReactNode }) {
+function Empty(props: {
+  title: string;
+  detail?: string | undefined;
+  action?: React.ReactNode;
+  /** A failure: read out when it appears. */
+  alert?: boolean;
+}) {
   return (
-    <div className="flex min-h-0 flex-1 flex-col items-start gap-2 px-7 pt-8 max-sm:px-4">
+    <div
+      role={props.alert ? "alert" : undefined}
+      className="flex min-h-0 flex-1 flex-col items-start gap-2 px-7 pt-8 max-sm:px-4"
+    >
       <p className="text-lg font-semibold">{props.title}</p>
       {props.detail ? <p className="text-sm text-(--m-muted)">{props.detail}</p> : null}
       {props.action ? <div className="mt-1">{props.action}</div> : null}
@@ -612,7 +634,10 @@ function Empty(props: { title: string; detail?: string | undefined; action?: Rea
 
 function ReaderSkeleton() {
   return (
-    <div aria-hidden className="flex max-w-[620px] flex-col gap-4 px-7 pt-7 max-sm:px-4">
+    <div className="flex max-w-[620px] flex-col gap-4 px-7 pt-7 max-sm:px-4">
+      <p role="status" className="sr-only">
+        Loading…
+      </p>
       <Bar className="h-3 w-48" />
       <Bar className="h-6 w-4/5" />
       <Bar className="h-3.5" />

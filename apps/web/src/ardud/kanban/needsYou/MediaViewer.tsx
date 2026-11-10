@@ -180,6 +180,8 @@ export function MediaViewer(props: {
           initialFocus={closeRef}
           aria-label={item.name}
           onKeyDown={(event) => {
+            // The player keeps its own keys: arrows seek, they do not step.
+            if (event.target instanceof HTMLMediaElement) return;
             if (event.key === "ArrowRight") go(index + 1);
             else if (event.key === "ArrowLeft") go(index - 1);
             else if (event.key === "+" || event.key === "=") zoomTo(placement.scale * 1.5);
@@ -219,7 +221,7 @@ export function MediaViewer(props: {
                 </ViewerButton>
                 <button
                   type="button"
-                  aria-label="Fit to screen"
+                  aria-label={percent === null ? "Fit to screen" : `${percent}%, fit to screen`}
                   onClick={() => setPlacement(FIT)}
                   className="h-9 min-w-12 rounded-full px-1 text-sm text-white/80 tabular-nums outline-none hover:bg-white/15 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white max-sm:hidden"
                 >
@@ -282,7 +284,9 @@ export function MediaViewer(props: {
             }}
           >
             {item.src === null ? (
-              <p className="text-sm text-white/60">Loading</p>
+              <p role="status" className="text-sm text-white/60">
+                Loading…
+              </p>
             ) : item.kind === "video" ? (
               <video
                 key={item.key}
@@ -321,7 +325,7 @@ export function MediaViewer(props: {
                   label="Previous"
                   disabled={index === 0}
                   onClick={() => go(index - 1)}
-                  className="absolute start-3 top-1/2 size-11 -translate-y-1/2 bg-white/10 max-sm:hidden"
+                  className="absolute start-3 top-1/2 size-11 -translate-y-1/2 bg-white/10"
                 >
                   <ChevronLeftIcon />
                 </ViewerButton>
@@ -329,7 +333,7 @@ export function MediaViewer(props: {
                   label="Next"
                   disabled={index === items.length - 1}
                   onClick={() => go(index + 1)}
-                  className="absolute end-3 top-1/2 size-11 -translate-y-1/2 bg-white/10 max-sm:hidden"
+                  className="absolute end-3 top-1/2 size-11 -translate-y-1/2 bg-white/10"
                 >
                   <ChevronRightIcon />
                 </ViewerButton>

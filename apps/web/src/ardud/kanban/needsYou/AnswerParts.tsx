@@ -98,6 +98,17 @@ export function OptionList(props: {
         role={choose.multi ? "group" : "radiogroup"}
         aria-label="Options"
         aria-describedby={props.problem ? problemId : undefined}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          const options = [
+            ...event.currentTarget.querySelectorAll<HTMLElement>("[data-ny-option]"),
+          ];
+          const at = options.indexOf(document.activeElement as HTMLElement);
+          if (at === -1) return;
+          event.preventDefault();
+          const step = event.key === "ArrowDown" ? 1 : -1;
+          options[(at + step + options.length) % options.length]?.focus();
+        }}
         className={cn("grid gap-2", pictures && "sm:grid-cols-2")}
       >
         {choose.options.map((option, index) => {
@@ -116,8 +127,8 @@ export function OptionList(props: {
               className={cn(
                 "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
                 checked
-                  ? "bg-(--m-band) ring-2 ring-(--m-accent)"
-                  : "ring-(--m-control) hover:bg-(--m-surface)",
+                  ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
+                  : "ring-(--m-bar-2) hover:bg-(--m-surface)",
                 blocked && !checked && "opacity-50",
               )}
             >
@@ -149,10 +160,10 @@ export function OptionList(props: {
         {props.ownWords ? (
           <div
             className={cn(
-              "grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-2 rounded-xl px-3.5 py-3 ring-1 ring-inset",
+              "relative grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-2 rounded-xl px-3.5 py-3 ring-1 ring-inset",
               own
                 ? "bg-(--m-band) ring-2 ring-(--m-accent)"
-                : "ring-(--m-control) hover:bg-(--m-surface)",
+                : "ring-(--m-bar-2) hover:bg-(--m-surface)",
             )}
           >
             <Key className="mt-0.5">{choose.options.length + 1}</Key>
@@ -171,7 +182,11 @@ export function OptionList(props: {
                   patchAskForm(entry, { optionIds: [] });
                 }
               }}
-              className="rounded text-start font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className={cn(
+                "rounded text-start font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+                // The whole card picks it until the text box is open.
+                !own && "after:absolute after:inset-0 after:rounded-xl",
+              )}
             >
               Your own answer
             </button>
@@ -181,7 +196,7 @@ export function OptionList(props: {
                   autoFocus={ownOpen && form.ownWords === ""}
                   data-ny-at="own"
                   aria-label="Your own answer"
-                  placeholder="Type your answer"
+                  placeholder="Type your answer…"
                   value={form.ownWords}
                   maxLength={20_000}
                   onChange={(event) => patchAskForm(entry, { ownWords: event.target.value })}

@@ -37,12 +37,14 @@ export function Btn({
         size === "sm"
           ? "h-7.5 px-3 text-sm pointer-coarse:h-9"
           : "h-9 px-4 text-sm pointer-coarse:h-11 pointer-coarse:text-base",
-        tone === "primary" &&
-          "bg-(--m-accent) text-(--m-accent-ink) hover:opacity-90 focus-visible:ring-(--m-text)",
+        tone === "primary" && "bg-(--m-accent) text-(--m-accent-ink) hover:opacity-90",
         tone === "plain" && "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
         tone === "ghost" && "text-(--m-muted) hover:bg-(--m-chip) hover:text-(--m-text)",
         ring,
-        tone === "primary" && "focus-visible:ring-(--m-text)",
+        // On the accent fill the ring is the fill's own ink, set in from the edge.
+        tone === "primary" &&
+          "focus-visible:ring-0 focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-(--m-accent-ink) focus-visible:outline-solid",
+        size === "sm" && "relative pointer-coarse:after:absolute pointer-coarse:after:-inset-1",
         className,
       )}
     />
@@ -129,7 +131,7 @@ export function FilterChip({
       aria-pressed={pressed}
       {...props}
       className={cn(
-        "inline-flex h-7.5 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm whitespace-nowrap pointer-coarse:h-9",
+        "relative inline-flex h-7.5 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm whitespace-nowrap pointer-coarse:h-9 pointer-coarse:after:absolute pointer-coarse:after:-inset-1",
         pressed
           ? "bg-(--m-chip) font-medium text-(--m-text)"
           : "text-(--m-muted) hover:bg-(--m-chip) hover:text-(--m-text)",
@@ -142,11 +144,11 @@ export function FilterChip({
 
 /** Classes for a text input, textarea or select. */
 export const fieldClass =
-  "block w-full min-w-0 rounded-xl bg-(--m-ground) px-3 py-2 text-sm leading-5 text-(--m-text) ring-1 ring-inset ring-(--m-control) outline-none placeholder:text-(--m-muted) focus:ring-2 focus:ring-(--m-accent) aria-invalid:ring-(--m-negative) pointer-coarse:text-base";
+  "block w-full min-w-0 rounded-xl bg-(--m-ground) px-3 py-2 text-sm leading-5 text-(--m-text) ring-1 ring-inset ring-(--m-bar-2) outline-none placeholder:text-(--m-muted) focus:ring-2 focus:ring-(--m-accent) aria-invalid:ring-(--m-negative) pointer-coarse:text-base";
 
 /** A quiet text link. */
 export const linkClass =
-  "rounded font-medium text-(--m-accent-text) underline-offset-3 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
+  "relative rounded font-medium text-(--m-accent-text) underline-offset-3 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:after:absolute pointer-coarse:after:-inset-x-2 pointer-coarse:after:-inset-y-3";
 
 /** A grey bar that holds the place of a value while it loads. */
 export function Bar({ className }: { className?: string }) {
@@ -194,7 +196,7 @@ export function Layer(props: {
       <Dialog.Portal>
         <Dialog.Backdrop
           className={cn(
-            "fixed inset-x-0 top-0 bg-black/25 transition-opacity duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0",
+            "fixed inset-x-0 top-0 bg-black/25 transition-opacity duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0 motion-reduce:transition-none",
             side === "center" ? "z-50" : "z-(--z-sheet)",
           )}
           style={{ bottom: offset }}
@@ -204,7 +206,7 @@ export function Layer(props: {
           aria-label={props.title}
           data-ny
           className={cn(
-            "fixed flex min-h-0 flex-col bg-(--m-raised) text-(--m-text) shadow-xl ring-1 ring-(--m-rule) outline-none transition-[opacity,translate] duration-200 ease-out data-ending-style:opacity-0 data-starting-style:opacity-0",
+            "fixed flex min-h-0 flex-col bg-(--m-raised) text-(--m-text) shadow-xl ring-1 ring-(--m-rule) outline-none transition-[opacity,translate] duration-200 ease-out data-ending-style:opacity-0 data-starting-style:opacity-0 motion-reduce:transition-none",
             side === "right" &&
               "inset-y-0 right-0 w-full max-w-[480px] data-ending-style:translate-x-6 data-starting-style:translate-x-6",
             side === "bottom" &&

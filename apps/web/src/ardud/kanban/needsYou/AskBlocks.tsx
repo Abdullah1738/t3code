@@ -144,7 +144,7 @@ export function BlockPicture(props: {
       type="button"
       aria-label={`Open ${item.name} full size`}
       onClick={() => props.onOpen(mediaIndex)}
-      className="group relative block w-fit max-w-full cursor-zoom-in overflow-hidden rounded-xl outline-none ring-1 ring-(--m-rule) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      className="group relative block w-fit max-w-full cursor-zoom-in overflow-hidden rounded-xl outline-none ring-1 ring-(--m-rule) after:pointer-events-none after:absolute after:inset-0 after:rounded-xl focus-visible:after:ring-2 focus-visible:after:ring-(--m-accent) focus-visible:after:ring-inset"
     >
       {picture}
       <span
@@ -306,7 +306,7 @@ function Block(props: {
                 <button
                   type="button"
                   onClick={() => props.onOpenMedia(mediaIndex)}
-                  className="ms-auto shrink-0 rounded font-medium text-(--m-accent-text) outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+                  className="relative ms-auto shrink-0 rounded font-medium text-(--m-accent-text) outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:after:absolute pointer-coarse:after:-inset-x-2 pointer-coarse:after:-inset-y-3.5"
                 >
                   Full screen
                 </button>

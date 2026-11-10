@@ -155,6 +155,12 @@ export function AskReader(props: {
     if (needsDetail) void loadAskDetail(entry).catch(() => undefined);
   }, [needsDetail, entry]);
 
+  // After an answer the old ask's button is gone: focus lands on the new ask, not on nothing.
+  useEffect(() => {
+    if (document.activeElement !== document.body) return;
+    root.current?.querySelector<HTMLElement>("[data-ny-scroll]")?.focus({ preventScroll: true });
+  }, []);
+
   // What was new on the ask counts as seen once he moves on from it.
   useEffect(() => () => seeAsk(key), [key]);
 

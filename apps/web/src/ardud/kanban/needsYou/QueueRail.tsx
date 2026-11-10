@@ -10,7 +10,7 @@ import {
   type NeedsYouSection,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { ImageIcon, PlayIcon, SearchIcon, XIcon } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 
 import { cn } from "../../../lib/utils";
 import { shortWhen } from "./snoozeTimes";
@@ -50,13 +50,33 @@ export function QueueRail(props: QueueRailProps) {
   const { filter, sections } = props;
   const listRef = useRef<HTMLDivElement>(null);
 
-  // The focused row stays in view as J and K move through the list.
+  // The focused row stays in view as J and K move through the list, and keeps
+  // keyboard focus when focus was already on a row.
   useEffect(() => {
     if (props.focusKey === null) return;
-    listRef.current
-      ?.querySelector(`[data-ny-row="${CSS.escape(props.focusKey)}"]`)
-      ?.scrollIntoView({ block: "nearest" });
+    const list = listRef.current;
+    const row = list?.querySelector<HTMLElement>(`[data-ny-row="${CSS.escape(props.focusKey)}"]`);
+    row?.scrollIntoView({ block: "nearest" });
+    if (row && list?.contains(document.activeElement) && document.activeElement !== row) {
+      row.focus({ preventScroll: true });
+    }
   }, [props.focusKey]);
+  const onRowKeys = (event: KeyboardEvent<HTMLDivElement>) => {
+    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!keys.includes(event.key) || event.metaKey || event.ctrlKey || event.altKey) return;
+    const rows = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-ny-row]")];
+    const at = rows.indexOf(document.activeElement as HTMLElement);
+    if (at === -1) return;
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? rows.length - 1
+          : Math.max(0, Math.min(rows.length - 1, at + (event.key === "ArrowDown" ? 1 : -1)));
+    event.preventDefault();
+    rows[next]?.focus();
+    rows[next]?.click();
+  };
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -71,7 +91,7 @@ export function QueueRail(props: QueueRailProps) {
             type="search"
             value={filter.query}
             onChange={(event) => props.onFilter({ query: event.target.value })}
-            placeholder="Search asks"
+            placeholder="Search asks…"
             aria-label="Search asks"
             autoComplete="off"
             spellCheck={false}
@@ -90,7 +110,7 @@ export function QueueRail(props: QueueRailProps) {
                 props.onFilter({ query: "" });
                 event.currentTarget.parentElement?.querySelector("input")?.focus();
               }}
-              className="absolute top-1/2 right-1.5 grid size-6 -translate-y-1/2 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="absolute top-1/2 right-1.5 grid size-6 -translate-y-1/2 place-items-center rounded-full text-(--m-muted) outline-none after:absolute hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:after:-inset-2.5"
             >
               <XIcon className="size-3.5" />
             </button>
@@ -125,6 +145,8 @@ export function QueueRail(props: QueueRailProps) {
 
       <div
         ref={listRef}
+        data-ny-rows
+        onKeyDown={onRowKeys}
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-1 pb-3"
         aria-busy={props.status === "loading"}
       >
@@ -144,10 +166,10 @@ export function QueueRail(props: QueueRailProps) {
         ) : (
           sections.map((section) => (
             <section key={section.id} aria-label={section.label}>
-              <h3 className="flex items-baseline justify-between gap-2 px-2.5 pt-3.5 pb-1.5 text-xs text-(--m-muted)">
+              <h2 className="flex items-baseline justify-between gap-2 px-2.5 pt-3.5 pb-1.5 text-xs font-normal text-(--m-muted)">
                 <span>{section.label}</span>
                 <span className="tabular-nums">{section.count}</span>
-              </h3>
+              </h2>
               <ul className="flex flex-col gap-0.5">
                 {section.entries.map((entry) =>
                   entry._tag === "ask" ? (
