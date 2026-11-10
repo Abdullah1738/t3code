@@ -561,3 +561,34 @@ it.live(
   },
   30_000,
 );
+
+// Review r3: with snapshot pinning configured, a BEGIN rejected behind the
+// abandoned statement still queued a ROLLBACK there, which held the lane until
+// the long statement finished (the wedge limit, 60 s here).
+it.live(
+  "snapshot-pinned reads behind an abandoned statement answer as fast and queue no rollback",
+  () =>
+    withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`CREATE TABLE ardud_archive(id INTEGER)`;
+          yield* sql`SELECT id FROM ardud_archive`.pipe(SqliteClient.authReadOnly);
+          const wedged = yield* sql
+            .unsafe(FOREVER)
+            .pipe(SqliteClient.authReadOnly, Effect.flip, Effect.forkChild);
+          yield* Effect.sleep("100 millis");
+          const started = performance.now();
+          const failures = yield* Effect.forEach(
+            Array.from({ length: 4 }, () => undefined),
+            () => sql`SELECT id FROM ardud_archive`.pipe(SqliteClient.authReadOnly, Effect.flip),
+            { concurrency: "unbounded" },
+          );
+          assert.isBelow(performance.now() - started, 2_500);
+          for (const failure of failures)
+            assert.equal(SqliteClient.readerLaneFailure(failure), "retryable");
+          assert.equal(SqliteClient.readerLaneFailure(yield* Fiber.join(wedged)), "busy");
+        }),
+      { readerWedgeLimit: "60 seconds", readerSnapshotSql: ["SELECT 1"] },
+    ),
+  30_000,
+);

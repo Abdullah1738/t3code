@@ -76,3 +76,55 @@ it("classifies reserved-lane failures through cause chains", () => {
   cyclic.cause = cyclic;
   assert.strictEqual(readerLaneFailure(cyclic), undefined);
 });
+
+// Review r3: three healthy 4 s reads at a 5 s statement limit made the third
+// caller wait 8 s for the lane. Admission now has its own deadline.
+it.live("bounds the wait for the lane itself and leaks no permit when it expires", () =>
+  Effect.gen(function* () {
+    const acquire = yield* makeReaderLanes(
+      () => Effect.succeed(Effect.succeed(connection)),
+      "300 millis",
+    );
+    const target = (yield* acquire)!;
+    const release = yield* Deferred.make<void>();
+    const holder = yield* target.lock
+      .withPermits(1)(Deferred.await(release))
+      .pipe(Effect.forkChild);
+    yield* Effect.sleep("20 millis");
+    for (const waiter of [
+      Effect.asVoid(target.lock.withPermits(1)(Effect.succeed("ran"))),
+      Effect.asVoid(target.lock.take(1)),
+    ]) {
+      const started = performance.now();
+      const failure = yield* Effect.flip(waiter);
+      const waited = performance.now() - started;
+      assert.isAtLeast(waited, 250);
+      assert.isBelow(waited, 1_500);
+      assert.equal(failure.reason.operation, "readerBusy");
+      // Busy, not retryable: a retry must not spend a second admission window.
+      assert.equal(readerLaneFailure(failure), "busy");
+    }
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    // Nothing leaked: the lane is free again and admits at once.
+    assert.equal(yield* target.lock.withPermits(1)(Effect.succeed("free")), "free");
+    assert.equal(yield* target.lock.take(1), 1);
+    yield* target.lock.release(1);
+  }),
+);
+
+it.live("a waiter admitted before its deadline runs normally", () =>
+  Effect.gen(function* () {
+    const acquire = yield* makeReaderLanes(
+      () => Effect.succeed(Effect.succeed(connection)),
+      "2 seconds",
+    );
+    const target = (yield* acquire)!;
+    const holder = yield* target.lock
+      .withPermits(1)(Effect.sleep("150 millis"))
+      .pipe(Effect.forkChild);
+    yield* Effect.sleep("20 millis");
+    assert.equal(yield* target.lock.withPermits(1)(Effect.succeed("ran")), "ran");
+    yield* Fiber.join(holder);
+  }),
+);

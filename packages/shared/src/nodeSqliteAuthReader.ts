@@ -13,7 +13,7 @@ import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import { identity } from "effect/Function";
 import type { SqliteClientConfig } from "./nodeSqliteClient.ts";
 import { startReaderProcess, type ReaderRuntime } from "./nodeSqliteReaderProcess.ts";
-import { markNotStarted, readerBusy } from "./nodeSqliteReaderLanes.ts";
+import { markNotStarted, readerBusy, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
 
 export const ReadOnly = Context.Reference<typeof Effect.interruptible | undefined>(
   "@t3tools/shared/nodeSqliteClient/ReadOnly",
@@ -532,23 +532,37 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           !/ardud_(?:archive|\w*history|turn_items)/i.test(sql)
         )
           return effect;
+        // A BEGIN that was never sent (busy behind an abandoned statement) opened
+        // nothing; a ROLLBACK for it would only queue behind that statement and
+        // hold the lane until it finished (review r3). A sent BEGIN, even a
+        // failed one, still gets its ROLLBACK, which also resets transactionOpen.
+        let begun = true;
         return Effect.uninterruptibleMask((restore) =>
           snapshotLock
             .withPermits(1)(
               request({ sql: "BEGIN", params: [], cached: false, values: false, raw: false }).pipe(
+                Effect.tapError((error) =>
+                  Effect.sync(() => {
+                    if (readerLaneFailure(error) === "retryable") begun = false;
+                  }),
+                ),
                 Effect.andThen(pinSnapshots),
               ),
             )
             .pipe(
               Effect.andThen(restore(effect)),
               Effect.ensuring(
-                request({
-                  sql: "ROLLBACK",
-                  params: [],
-                  cached: false,
-                  values: false,
-                  raw: false,
-                }).pipe(Effect.ignore),
+                Effect.suspend(() =>
+                  begun
+                    ? request({
+                        sql: "ROLLBACK",
+                        params: [],
+                        cached: false,
+                        values: false,
+                        raw: false,
+                      }).pipe(Effect.ignore)
+                    : Effect.void,
+                ),
               ),
             ),
         );
