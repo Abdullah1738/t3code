@@ -340,6 +340,56 @@ it.effect("merge: the worker of a To-Do card is started when the PR it waited on
   ),
 );
 
+it.effect("a woken reviewer reads the wake note once: the next review round does not get it", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const card = yield* placed(board, "Review PR 12", {
+        stage: "in_review",
+        reviewStep: 1,
+        links: [tracked(PR)],
+      });
+      yield* kanban.waitCard(
+        card.id,
+        { on: "push", pr: "#12", head: "aaa1111", note: "author to fix the rounding" },
+        owner,
+      );
+      yield* TestClock.adjust(10 * MINUTE);
+      world.host.readings = [
+        { url: PR, state: "open", head: "bbb2222ffff", at: iso(T0 + 10 * MINUTE) },
+      ];
+      yield* kanban.tick;
+      const first = yield* cardOf(card.id);
+      const reviewer = first.activeThreadId!;
+      assert.include(briefOf(world, first), "author to fix the rounding");
+
+      // The verdict is where the note has been read. The PR is still open, so the card stays in review.
+      const cleared = yield* kanban.reviewResult(reviewer, "clear", []);
+      assert.isNull(cleared.wakeNote);
+      assert.strictEqual(cleared.stage, "in_review");
+
+      // A second round on the same review thread: only its own note.
+      yield* kanban.waitCard(
+        card.id,
+        { on: "push", pr: "#12", head: "bbb2222", note: "one more nit" },
+        owner,
+      );
+      yield* TestClock.adjust(10 * MINUTE);
+      world.host.readings = [
+        { url: PR, state: "open", head: "ccc3333ffff", at: iso(T0 + 20 * MINUTE) },
+      ];
+      yield* kanban.tick;
+      const second = yield* cardOf(card.id);
+      assert.strictEqual(second.activeThreadId, reviewer);
+      const brief = world.threads.get(reviewer)!.messages.at(-1) ?? "";
+      assert.include(brief, "one more nit");
+      assert.include(brief, "its head moved from bbb2222 to ccc3333");
+      assert.notInclude(brief, "author to fix the rounding");
+      assert.notInclude(brief, "aaa1111");
+    }),
+  ),
+);
+
 it.effect(
   "merge: a reviewed card whose last PR merges is completed by the same tick, with nobody woken",
   () =>

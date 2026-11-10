@@ -8901,7 +8901,10 @@ const make = Effect.gen(function* () {
               ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
               : moreWork
                 ? Subtasks.nextStepNote({ subtasks }, "The review passed. ")
-                : card.wakeNote,
+                : // A review start keeps the card's wake note so the reviewer reads it
+                  // (startCard). The verdict is where it has been read: without this it
+                  // came back in every later review brief.
+                  null,
           nudgedAt: null,
           movedAt: at,
           updatedAt: at,
