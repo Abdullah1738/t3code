@@ -666,7 +666,7 @@ function ChoiceBlock(props: {
 const NO_SKILLS: ReadonlyArray<ServerProviderSkill> = [];
 const THREAD_LINK = /\[([^\]\n]*)\]\((t3-thread:\/\/v1\/[^\s)]+)\)/g;
 
-type ComposerDraftFile = ComposerImageAttachment | ComposerFileAttachment;
+export type ComposerDraftFile = ComposerImageAttachment | ComposerFileAttachment;
 
 /** One batch of files being prepared; `handed` once they reached the draft. */
 interface PendingPreparation {
@@ -1059,7 +1059,10 @@ function isPostableAttachment(attachment: ChatAttachment): attachment is ChatAtt
  * One picked file as a draft: images are compressed to the send limit, other
  * files are staged as they are. Returns the error text when the file is refused.
  */
-async function prepareDraftFile(raw: File, maxBytes: number): Promise<ComposerDraftFile | string> {
+export async function prepareDraftFile(
+  raw: File,
+  maxBytes: number,
+): Promise<ComposerDraftFile | string> {
   const file = normalizeComposerImageFileMimeType(raw);
   const kind = classifyComposerAttachmentFile(file);
   if (kind === "unsupported-image") return `'${file.name}' is not a supported image type.`;
@@ -1088,7 +1091,7 @@ async function prepareDraftFile(raw: File, maxBytes: number): Promise<ComposerDr
   };
 }
 
-function revokePreview(file: ComposerDraftFile) {
+export function revokePreview(file: ComposerDraftFile) {
   if (file.type === "image") URL.revokeObjectURL(file.previewUrl);
 }
 

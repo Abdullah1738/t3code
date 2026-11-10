@@ -2,19 +2,14 @@
  * The parts of an answer, drawn from what the ask takes back
  * (`kanbanAskResponse`), never from its kind.
  */
-import {
-  askFieldKind,
-  askRefusal,
-  type AskForm,
-  type AskProblemKey,
-} from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanAskField, KanbanAskFeedItem, KanbanAskResponse } from "@t3tools/contracts";
-import { CornerDownRightIcon } from "lucide-react";
+import { askRefusal, type AskForm, type AskProblemKey } from "@t3tools/client-runtime/ardud/kanban";
+import type { KanbanAskFeedItem, KanbanAskResponse, KanbanAskTaskStep } from "@t3tools/contracts";
+import { CheckIcon, CornerDownRightIcon, ExternalLinkIcon } from "lucide-react";
 import { useId, useState, type ReactNode } from "react";
 
 import { cn } from "../../../lib/utils";
-import { patchAskForm, setAskValue } from "./askStore";
-import { Key, Pill, fieldClass } from "./ui";
+import { patchAskForm } from "./askStore";
+import { Key, Pill, fieldClass, linkClass } from "./ui";
 
 export type AskProblems = Readonly<Partial<Record<AskProblemKey, string>>>;
 
@@ -201,80 +196,6 @@ export function OptionList(props: {
   );
 }
 
-/** One value to fill in, with its label, hint and what is wrong with it. */
-export function FieldRow(props: {
-  entry: KanbanAskFeedItem;
-  field: KanbanAskField;
-  value: unknown;
-  /** Shown as required even when the field itself is not (a task's proof). */
-  required: boolean;
-  problem: string | undefined;
-  /** The only field of a plain question: its label is the section's heading. */
-  bare?: boolean;
-  disabled: boolean;
-}) {
-  const { entry, field, value } = props;
-  const id = useId();
-  const kind = askFieldKind(field);
-  const describedBy =
-    [field.hint ? `${id}-hint` : null, props.problem ? `${id}-problem` : null]
-      .filter(Boolean)
-      .join(" ") || undefined;
-  const common = {
-    id,
-    "data-ny-at": `field:${field.id}`,
-    "aria-invalid": props.problem ? true : undefined,
-    "aria-describedby": describedBy,
-    "aria-required": props.required || undefined,
-    disabled: props.disabled,
-  } as const;
-  const text = typeof value === "string" ? value : "";
-
-  let control: ReactNode;
-  switch (kind) {
-    case "longtext":
-      control = (
-        <GrowingText
-          {...common}
-          aria-label={props.bare ? "Your answer" : undefined}
-          placeholder={props.bare ? "Type your answer" : undefined}
-          value={text}
-          onChange={(event) => setAskValue(entry, field.id, event.target.value)}
-        />
-      );
-      break;
-    default:
-      control = (
-        <input
-          {...common}
-          type="text"
-          autoComplete="off"
-          value={text}
-          onChange={(event) => setAskValue(entry, field.id, event.target.value)}
-          className={fieldClass}
-        />
-      );
-  }
-
-  return (
-    <div className="min-w-0">
-      {props.bare ? null : (
-        <label htmlFor={id} className="mb-1.5 flex items-baseline gap-2 text-sm font-medium">
-          {field.label || field.id}
-          {props.required ? null : <span className="font-normal text-(--m-muted)">Optional</span>}
-        </label>
-      )}
-      {control}
-      {field.hint ? (
-        <p id={`${id}-hint`} className="mt-1.5 text-sm text-(--m-muted)">
-          {field.hint}
-        </p>
-      ) : null}
-      {props.problem ? <Problem id={`${id}-problem`}>{props.problem}</Problem> : null}
-    </div>
-  );
-}
-
 /** After a "no": what is wrong, in his words. */
 export function WhyField(props: {
   entry: KanbanAskFeedItem;
@@ -305,5 +226,75 @@ export function WhyField(props: {
       />
       {props.problem ? <Problem id={`${id}-problem`}>{props.problem}</Problem> : null}
     </div>
+  );
+}
+
+const linkHost = (link: string): string => {
+  try {
+    return new URL(link).host.replace(/^www\./, "");
+  } catch {
+    return "the link";
+  }
+};
+
+/** Steps he does himself. Ticking them is for his own count; nothing is sent until Done. */
+export function TaskSteps(props: {
+  entry: KanbanAskFeedItem;
+  steps: ReadonlyArray<KanbanAskTaskStep>;
+  form: AskForm;
+  disabled: boolean;
+}) {
+  const { entry, form } = props;
+  return (
+    <ol className="flex flex-col gap-1">
+      {props.steps.map((step, index) => {
+        const done = form.steps.includes(index);
+        return (
+          // oxlint-disable-next-line react/no-array-index-key -- Steps have no id; their order is fixed for one revision.
+          <li key={index} className="flex min-w-0 flex-wrap items-start gap-x-3 gap-y-1">
+            <button
+              type="button"
+              role="checkbox"
+              aria-checked={done}
+              disabled={props.disabled}
+              onClick={() =>
+                patchAskForm(entry, {
+                  steps: done
+                    ? form.steps.filter((entry) => entry !== index)
+                    : [...form.steps, index],
+                })
+              }
+              className="group flex min-w-0 flex-1 items-start gap-3 rounded-lg py-1.5 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+            >
+              <span
+                aria-hidden
+                className={cn(
+                  "mt-0.5 grid size-5 shrink-0 place-items-center rounded-md ring-1 ring-inset",
+                  done
+                    ? "bg-(--m-accent) text-(--m-accent-ink) ring-(--m-accent)"
+                    : "ring-(--m-control) group-hover:bg-(--m-surface)",
+                )}
+              >
+                {done ? <CheckIcon className="size-3.5" /> : null}
+              </span>
+              <span className={cn("min-w-0 [overflow-wrap:anywhere]", done && "text-(--m-muted)")}>
+                {step.text}
+              </span>
+            </button>
+            {step.link ? (
+              <a
+                href={step.link}
+                target="_blank"
+                rel="noreferrer"
+                className={cn(linkClass, "inline-flex items-center gap-1.5 py-1.5 text-sm")}
+              >
+                <ExternalLinkIcon aria-hidden className="size-3.5" />
+                Open {linkHost(step.link)}
+              </a>
+            ) : null}
+          </li>
+        );
+      })}
+    </ol>
   );
 }

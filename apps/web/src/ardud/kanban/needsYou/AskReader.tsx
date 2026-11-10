@@ -23,7 +23,14 @@ import { cn } from "../../../lib/utils";
 import { BoardIcon } from "../boardIcon";
 import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { ActionBar, type AskTurn } from "./ActionBar";
-import { FieldRow, OptionList, WhyField, askOffersOwnWords, type AskProblems } from "./AnswerParts";
+import {
+  OptionList,
+  TaskSteps,
+  WhyField,
+  askOffersOwnWords,
+  type AskProblems,
+} from "./AnswerParts";
+import { FieldRow } from "./AskFields";
 import {
   answerAsk,
   askAsker,
@@ -37,6 +44,7 @@ import {
   takeBackAsk,
   useAskStore,
 } from "./askStore";
+import { DraftPart } from "./DraftPart";
 import { Btn, Label, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
@@ -136,6 +144,10 @@ export function AskReader(props: {
         case "pick":
           return pick(action.index);
         case "edit":
+          if (response.edit === "draft") {
+            root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
+            return undefined;
+          }
           return firstText ? focusAt(`field:${firstText.id}`) : undefined;
         default:
           return undefined;
@@ -239,11 +251,29 @@ export function AskReader(props: {
               </div>
             ) : null}
 
+            {ask.draft ? (
+              <DraftPart
+                entry={entry}
+                draft={ask.draft}
+                form={form}
+                editable={response.edit === "draft" && !locked && !form.refusing}
+                problem={problems.draft}
+              />
+            ) : null}
+
             {hasAnswerParts ? (
               <section aria-label="Your answer" className="flex flex-col gap-4">
                 <h3 className="text-base font-semibold">
                   {response.task ? "Your part" : "Your answer"}
                 </h3>
+                {response.task && response.task.steps.length > 0 ? (
+                  <TaskSteps
+                    entry={entry}
+                    steps={response.task.steps}
+                    form={form}
+                    disabled={locked}
+                  />
+                ) : null}
                 {response.choose ? (
                   <OptionList
                     entry={entry}
@@ -260,6 +290,7 @@ export function AskReader(props: {
                       <FieldRow
                         key={field.id}
                         entry={entry}
+                        ask={ask}
                         field={field}
                         value={form.values[field.id]}
                         required={field.required === true || response.task?.proof === field.id}
