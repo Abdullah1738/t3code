@@ -206,8 +206,23 @@ def project_context(here: str | None, sources: list[dict], timeout: float = 0.3)
         out["where"] = where
         out["found"] = recall_project.labels((s.get("cwd") for s in sources), budget=timeout / 2)
 
-    worker = threading.Thread(target=lambda: _quiet(work), daemon=True)
-    worker.start()
+    # A stalled mount keeps its worker; cap how many can be outstanding and skip
+    # the context (not the answer) while they are.
+    if not _CONTEXT_SLOTS.acquire(blocking=False):
+        return ""
+
+    def run():
+        try:
+            _quiet(work)
+        finally:
+            _CONTEXT_SLOTS.release()
+
+    try:
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+    except RuntimeError:
+        _CONTEXT_SLOTS.release()
+        return ""
     worker.join(timeout)
     parts = []
     if out.get("where"):
@@ -218,6 +233,10 @@ def project_context(here: str | None, sources: list[dict], timeout: float = 0.3)
     if rows:
         parts.append("<excerpt_projects>\n" + "\n".join(rows) + "\n</excerpt_projects>")
     return "".join(part + "\n\n" for part in parts)
+
+
+import threading as _threading
+_CONTEXT_SLOTS = _threading.BoundedSemaphore(4)
 
 
 def _quiet(fn):

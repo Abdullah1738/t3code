@@ -217,6 +217,30 @@ class HaikuProjectContextTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.6)
         self.assertNotIn("<agent_location>", text)
 
+    def test_stalled_workers_are_capped(self):
+        import threading
+        release = threading.Event()
+        def stall(*_args, **_kwargs):
+            release.wait(5)
+            return ""
+        before = threading.active_count()
+        with patch("recall_project.describe", side_effect=stall):
+            for _ in range(10):
+                ra.project_context(str(self.repos.checkout), self.sources, timeout=0.05)
+            self.assertLessEqual(threading.active_count() - before, 4)
+            release.set()
+        deadline = time.monotonic() + 2
+        while ra._CONTEXT_SLOTS._value < 4 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn("<agent_location>", ra.project_context(str(self.repos.checkout), self.sources))
+
+    def test_borrowed_checkout_follows_its_source(self):
+        self.assertIn("Robob", rp.resolve(str(self.repos.borrowed))["project"])
+        config = self.repos.fork / ".git/config"
+        config.write_text(config.read_text().replace("Abdullah1738/robob-mission-control", "Equicom-Crypto/trading-core")
+                          .replace("pingdotgg/t3code", "Equicom-Crypto/trading-core"))
+        self.assertEqual("Crpko (Equicom-Crypto org)", rp.resolve(str(self.repos.borrowed))["project"])
+
     def test_included_config_is_not_cached(self):
         repo = make_repo(self.root / "work/included")
         (repo / ".git/remotes.inc").write_text(f'[remote "origin"]\n\turl = {ROBOB}\n')

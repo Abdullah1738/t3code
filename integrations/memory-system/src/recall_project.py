@@ -189,6 +189,7 @@ def resolve(cwd: str, depth: int = 0) -> dict:
         if not remotes and depth < 2:
             borrowed = resolve(source, depth + 1)
             result["remotes"], result["project"] = borrowed["remotes"], borrowed["project"]
+            key = None  # the source repo's config decides; it is cached on its own key
     crpko = [label for label in labels if label.startswith("Crpko")]
     known = [label for label in labels if label]
     if crpko:
