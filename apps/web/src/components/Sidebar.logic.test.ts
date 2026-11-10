@@ -2470,7 +2470,7 @@ describe("withWholeActiveOrder", () => {
     const target = withWholeActiveOrder(drop(["b", "c", "a"]), whole, "a");
     expect(target.activeOrder).toEqual(["b", "c", "a", "d", "e"]);
     // With the planned keys the row sits between c and d, so it stays in the drawn slice.
-    const keys = new Map(whole.map((key, index) => [key, null] as const));
+    const keys = new Map(whole.map((key) => [key, null] as const));
     const plan = planSidebarThreadDrop({
       activeKey: "a",
       activeSection: "active",
