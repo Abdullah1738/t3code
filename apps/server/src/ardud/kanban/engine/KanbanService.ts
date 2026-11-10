@@ -6956,6 +6956,19 @@ const make = Effect.gen(function* () {
   });
 
   /** Fails unless the work thread may take `card` now (see `Rules.checkClaim`). */
+  /**
+   * A card let go of this thread and its stop hasn't run yet: the thread is
+   * about to be cut, so nothing attaches work to it until then (claims,
+   * follow-ups, cutover restores). Checked under the board gate before any
+   * write; stops are only registered in board-wide operations.
+   */
+  const refusePendingStop = (threadId: string) =>
+    pendingStops.has(threadId)
+      ? failWith(
+          "conflict",
+          "This thread is being stopped (the board let it go of a card); it can't take another card until that stop has run.",
+        )
+      : Effect.void;
   const checkTake = Effect.fn("KanbanService.checkTake")(function* (
     thread: {
       readonly board: KanbanBoard;
@@ -6967,6 +6980,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     card: KanbanCard,
   ) {
+    yield* refusePendingStop(threadId);
     if (starting.has(`${card.boardId}:${card.id}`)) {
       return yield* failWith(
         "conflict",
@@ -7008,14 +7022,8 @@ const make = Effect.gen(function* () {
     card: KanbanCard,
     how: string,
   ) {
-    // A card let go of this thread and its stop hasn't run yet: the thread is
-    // about to be cut, so it takes no new card until then (claims, follow-ups).
-    if (pendingStops.has(threadId)) {
-      return yield* failWith(
-        "conflict",
-        "This thread is being stopped (the board let it go of a card); it can't take another card until that stop has run.",
-      );
-    }
+    // Checked in `checkTake` before anything is written; again here, defensively.
+    yield* refusePendingStop(threadId);
     const at = yield* nowIso;
     const actor: KanbanActor = { _tag: "thread", threadId };
     const next: KanbanCard = {
@@ -7384,6 +7392,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         // Take the card's board permit before acquiring its SQLite writer.
         yield* cardOf(input.cardId);
+        yield* refusePendingStop(input.threadId);
         const restored = yield* boardSql.withTransaction(
           Effect.gen(function* () {
             const card = yield* cardOf(input.cardId);

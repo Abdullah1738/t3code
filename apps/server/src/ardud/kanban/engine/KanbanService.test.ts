@@ -14213,19 +14213,65 @@ it.live("a thread with a stop still pending takes no new card until the stop has
     const release = yield* Deferred.make<void>();
     const layer = gatedInterrupts(fake, entered, Deferred.await(release));
     yield* Effect.gen(function* () {
-      const { kanban, card, threadId } = yield* workingCard;
+      const { kanban, board, card, threadId } = yield* workingCard;
+      const other = yield* kanban.createCard(board.id, { prompt: "Other", title: "Other" }, owner);
       yield* kanban.moveCard(card.id, "todo", "owner", owner);
       yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
-      // The owner's move is ACKed and its stop is out: the worker can't take a new card meanwhile.
+      const before = (yield* kanban.cards(board.id)).length;
+      // The owner's move is ACKed and its stop is out: the worker can't take a card meanwhile,
+      // and a refused follow-up leaves nothing behind for dispatch.
       const refused = yield* kanban
         .createForThread(threadId, { prompt: "Follow-up", title: "Follow-up" })
         .pipe(Effect.flip);
       assert.strictEqual(refused.code, "conflict");
       assert.include(refused.detail, "being stopped");
+      const claim = yield* kanban.claimCard(threadId, other.id).pipe(Effect.flip);
+      assert.strictEqual(claim.code, "conflict");
+      assert.strictEqual((yield* kanban.cards(board.id)).length, before);
+      assert.isNull((yield* kanban.card(other.id)).card.activeThreadId);
       yield* Deferred.succeed(release, undefined);
       yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
-      const taken = yield* kanban.createForThread(threadId, { prompt: "Later", title: "Later" });
+      // The same follow-up goes through once the stop has run, exactly once.
+      const taken = yield* kanban.createForThread(threadId, {
+        prompt: "Follow-up",
+        title: "Follow-up",
+      });
       assert.strictEqual(taken.card.activeThreadId, threadId);
+      const followUps = (yield* kanban.cards(board.id)).filter(
+        (entry) => entry.title === "Follow-up",
+      );
+      assert.lengthOf(followUps, 1);
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);
+
+it.live("a cutover restore waits for a stop still pending on its thread", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const layer = gatedInterrupts(fake, entered, Deferred.await(release));
+    yield* Effect.gen(function* () {
+      const { kanban, board, card, threadId } = yield* workingCard;
+      yield* kanban.moveCard(card.id, "todo", "owner", owner);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      yield* kanban.pauseBoard(board.id, { reason: "Cutover", keep: [] }, owner);
+      yield* kanban.cardThread(card.id, "stop", "cutover", owner);
+      const refused = yield* kanban
+        .restoreCutoverCard({ cardId: card.id, threadId, stage: "working" })
+        .pipe(Effect.flip);
+      assert.strictEqual(refused.code, "conflict");
+      assert.include(refused.detail, "being stopped");
+      assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+      yield* Deferred.succeed(release, undefined);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      // Once the stop has run the restore is judged on its own terms (here: the toy board has
+      // no migrated pool, which the cutover planner requires), no longer refused for the stop.
+      const after = yield* kanban
+        .restoreCutoverCard({ cardId: card.id, threadId, stage: "working" })
+        .pipe(Effect.flip);
+      assert.notInclude(after.detail, "being stopped");
+      assert.include(after.detail, "no migrated work pool");
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
   }),
 );
