@@ -1247,9 +1247,32 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       }
       const cursorRepeat = input.afterSequence - replayAfter;
       const limits = yield* ShellResumeLimits;
+      // ardud: a busy server passes the replay gap in under a minute (about 18 event
+      // batches a second on 10 Nov 2026), so a client that had just spent minutes
+      // loading every shell page was sent every page again. The shell stream refetches
+      // each changed aggregate anyway; it only needs to know which ones changed.
+      // At the legacy limit the switch is off: every range replay refuses gets a snapshot.
+      const changesAllowed =
+        limits.changesMaxGap > limits.replayMaxGap &&
+        highWater - replayAfter <= limits.changesMaxGap + cursorRepeat;
+      const readChanges = applicationEvents.getShellChanges({
+        afterSequence: replayAfter,
+        throughSequence: highWater,
+        maxThreads: limits.maxThreads,
+      });
+      // The list of changed threads is one indexed read. A range replay is a stats read
+      // plus the event bodies in pages, and each page became its own batch of thread
+      // reads: under a loaded reader pool a resume 450 events behind took 5-10 s that
+      // way (10 Nov 2026). So the list comes first for every gap it covers; the replay
+      // stays for an incomplete list and for ROBOB_SHELL_RESUME_CHANGES_FIRST=0.
+      let changes =
+        changesAllowed && (yield* Switches).shellResumeChangesFirst
+          ? yield* readChanges
+          : undefined;
       let replayEvents: Stream.Stream<ShellApplicationEvent, OrchestrationEventStoreError>;
       if (
-        yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat)
+        changes?.complete !== true &&
+        (yield* canReplayPersistedRange(replayAfter, highWater, limits.replayMaxGap + cursorRepeat))
       ) {
         replayEvents = applicationEvents
           .readApplicationEvents({
@@ -1262,20 +1285,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           })
           .pipe(Stream.map(toShellApplicationEvent));
       } else {
-        // ardud: a busy server passes the replay gap in under a minute (about 18 event
-        // batches a second on 10 Nov 2026), so a client that had just spent minutes
-        // loading every shell page was sent every page again. The shell stream refetches
-        // each changed aggregate anyway; it only needs to know which ones changed.
-        // At the legacy limit the switch is off: every range replay refuses gets a snapshot.
-        const changes =
-          limits.changesMaxGap > limits.replayMaxGap &&
-          highWater - replayAfter <= limits.changesMaxGap + cursorRepeat
-            ? yield* applicationEvents.getShellChanges({
-                afterSequence: replayAfter,
-                throughSequence: highWater,
-                maxThreads: limits.maxThreads,
-              })
-            : undefined;
+        if (changes === undefined && changesAllowed) changes = yield* readChanges;
         if (changes === undefined || !changes.complete) {
           return yield* snapshotThenLive();
         }

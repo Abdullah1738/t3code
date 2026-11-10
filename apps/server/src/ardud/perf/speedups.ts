@@ -17,6 +17,8 @@
  *   lets a resume up to 100,000 events behind (about an hour at 30 events/s) catch up from
  *   a list of changed threads. Listing them costs a reader about 0.18 s warm and 0.73 s
  *   after a reopen at that gap, 0.33 s / 1.2 s at 200,000 (shellChangesGate, 10 Nov 2026).
+ * - `ROBOB_SHELL_RESUME_CHANGES_FIRST=0`: a resume the range replay can serve (up to 1,000
+ *   events) replays the events again, and only larger gaps use the list of changed threads.
  * - `ROBOB_SHELL_RESUME_MAX_THREADS=<n>`: most changed threads one such catch-up may
  *   refetch before the whole list is sent instead (default 2,000).
  * - `ROBOB_THREADS_PR_INDEX=0`: drops the partial index over threads that have pull request
@@ -74,6 +76,7 @@ export interface Speedups {
   readonly shellResumeAcrossSessions: boolean;
   readonly shellPageReplyLane: boolean;
   readonly shellBatchedStreamReads: boolean;
+  readonly shellResumeChangesFirst: boolean;
 }
 
 export const readSpeedups = (env: Env = process.env): Speedups => ({
@@ -94,6 +97,7 @@ export const readSpeedups = (env: Env = process.env): Speedups => ({
   shellResumeAcrossSessions: !isOff(env, "ROBOB_SHELL_KEEP_RESUMABLE"),
   shellPageReplyLane: !isOff(env, "ROBOB_SHELL_PAGE_REPLY_LANE"),
   shellBatchedStreamReads: !isOff(env, "ROBOB_SHELL_STREAM_BATCH_READS"),
+  shellResumeChangesFirst: !isOff(env, "ROBOB_SHELL_RESUME_CHANGES_FIRST"),
 });
 
 /** Process-wide switches, read once at start. */

@@ -1096,6 +1096,24 @@ it.live(
         });
         const changeLimits = { replayMaxGap: 0, changesMaxGap: 20_000, maxThreads: 2_000 };
         assert.deepEqual(yield* resume(input, changeLimits, noBodies), baseline);
+        // The list serves every gap it covers, a replayable one included: with the default
+        // limits a resume reads no event bodies. ROBOB_SHELL_RESUME_CHANGES_FIRST=0 replays
+        // such a range as before and never asks for the list.
+        const defaultLimits = { replayMaxGap: 1_000, changesMaxGap: 100_000, maxThreads: 2_000 };
+        assert.deepEqual(yield* resume(input, defaultLimits, noBodies), baseline);
+        const noChangeList = Layer.succeed(OrchestrationEventStore.OrchestrationEventStore, {
+          ...fixture.application,
+          getShellChanges: () => Effect.die("a range replay must not list changes"),
+        });
+        assert.deepEqual(
+          yield* resume(input, defaultLimits, noChangeList).pipe(
+            Effect.provideService(Switches, {
+              ...readSpeedups({}),
+              shellResumeChangesFirst: false,
+            }),
+          ),
+          baseline,
+        );
         assert.deepEqual(
           yield* resume({ ...input, omitIdleSubagents: true }, changeLimits, noBodies),
           optedIn,
