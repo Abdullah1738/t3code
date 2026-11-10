@@ -8414,6 +8414,26 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  /**
+   * A handed ask is with the evaluators of its card's board: the threads that
+   * board started as evaluators. Another board's evaluator is not one, and
+   * neither is a thread no board started (an outside thread, or a card
+   * thread's subagent, which has no link of its own).
+   */
+  const checkHandedTo = Effect.fn("KanbanService.checkHandedTo")(function* (
+    card: KanbanCard,
+    ask: KanbanOwnerAsk,
+    actor: KanbanActor,
+  ) {
+    const link = actor._tag === "evaluator" ? yield* store.threadLink(actor.threadId) : null;
+    if (link === null || link.role !== "evaluator" || link.boardId !== card.boardId) {
+      return yield* failWith(
+        "denied",
+        `${ask.id} on card #${card.number} is with the evaluators of its own board: this thread is not one of them`,
+      );
+    }
+  });
+
   const answerAsk: KanbanServiceShape["answerAsk"] = (cardId, askId, input, actor, secrets) =>
     guardDeferred(answerAskUnlocked(cardId, askId, input, actor, secrets));
   /** The one place an ask is answered: by the answer route, a tool, or a pick on its message. */
@@ -8434,6 +8454,7 @@ const make = Effect.gen(function* () {
             `${ask.id} on card #${card.number} was not handed to the evaluator: only the owner answers it`,
           );
         }
+        if (!byOwner) yield* checkHandedTo(card, ask, actor);
         const checked = Asks.answerFor(
           card,
           ask,
@@ -8607,6 +8628,7 @@ const make = Effect.gen(function* () {
           );
         }
         const at = yield* nowIso;
+        if (action === "return") yield* checkHandedTo(card, ask, actor);
         if (action !== "hand") {
           if (ask.handedAt === undefined) {
             return yield* failWith("invalid", `${ref} is not with the evaluator`);
