@@ -510,7 +510,7 @@ def start_cmd(con, box_id: str, body: dict) -> dict:
     for ext in ("out", "err"):
         (d / f"{pid}.{ext}").touch()
     unit = f"boatd-cmd-{ct(box_id)}-{pid}"
-    p = subprocess.run(["systemd-run", "--unit", unit, "--collect", "--quiet", "-p", "KillMode=mixed",
+    p = subprocess.run(["systemd-run", "--unit", unit, "--collect", "--quiet", "-p", "KillMode=mixed", "-E", "HOME=/root",
                         "-p", "TimeoutStopSec=30", sys.executable, str(SELF), "run", box_id, str(pid)],
                        capture_output=True, text=True)
     if p.returncode != 0:
@@ -1183,6 +1183,13 @@ class Handler(BaseHTTPRequestHandler):
                                 (bid, pid)).fetchone()
                 if r["status"] not in ("queued", "running"):
                     sizes = {w: (d / f"{pid}.{w}").stat().st_size for w in ("out", "err")}
+                    for which, typ in (("out", "stdout"), ("err", "stderr")):
+                        if offs[which] < sizes[which]:  # an incomplete UTF-8 tail: the run is over, send it as is
+                            with open(d / f"{pid}.{which}", "rb") as f:
+                                f.seek(offs[which])
+                                rest = f.read()
+                            offs[which] += len(rest)
+                            emit({"type": typ, "data": rest.decode(errors="replace"), "nextOffset": offs[which]})
                     if all(offs[w] >= sizes[w] for w in sizes):
                         emit({"type": "exit", "exitCode": r["exit_code"], "signal": r["signal"],
                               "status": r["status"]})

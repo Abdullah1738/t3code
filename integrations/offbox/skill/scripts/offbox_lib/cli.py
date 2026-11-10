@@ -86,6 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sp.add_parser("spend")
     s.add_argument("--json", action="store_true")
     s.add_argument("--check", action="store_true")
+    st = sp.add_parser("stats", help="per-run resource use on the offbox server (right-sizing)")
+    st.add_argument("--days", type=float, default=14)
+    st.add_argument("--json", action="store_true")
     rp = sp.add_parser("reap")
     rp.add_argument("--dry-run", action="store_true")
 
@@ -291,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         elif a.sub == "spend":
             out = spend.check() if a.check else spend.compute()
             spend.print_report(out, a.json)
+        elif a.sub == "stats":
+            misc.stats(a.days, a.json)
         elif a.sub == "reap":
             reap.print_actions(reap.reap(a.dry_run))
         elif a.sub == "save":

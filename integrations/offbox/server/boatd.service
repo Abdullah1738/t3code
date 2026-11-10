@@ -5,6 +5,7 @@ Wants=network-online.target
 Requires=incus.service
 
 [Service]
+Environment=HOME=/root
 ExecStart=/usr/bin/python3 /opt/boatd/boatd.py serve
 Restart=always
 RestartSec=5
