@@ -24,6 +24,12 @@ def main():
     label = "com.abdullah.ovnfs-memguard"
     plist = home / ("Library/LaunchAgents/" + label + ".plist")
     settings = dict(Label=label, ProcessType="Interactive", ProgramArguments=["/bin/zsh", str(home / ".local/bin/ovnfs-memguard")], RunAtLoad=True, StartInterval=300, StandardOutPath=str(home / "Library/Logs/ovnfs-memguard.log"), StandardErrorPath=str(home / "Library/Logs/ovnfs-memguard.log"))
+    # Owner-approved thresholds/cooldowns live in this block; installing a
+    # helper must not silently replace them with the code defaults.
+    if plist.exists():
+        previous = plistlib.loads(plist.read_bytes())
+        if "EnvironmentVariables" in previous:
+            settings["EnvironmentVariables"] = previous["EnvironmentVariables"]
     domain = "gui/" + str(os.getuid())
     if args.check:
         problems = [str(dst) for src, dst, mode in pairs if not dst.exists() or dst.read_bytes() != src.read_bytes() or dst.stat().st_mode & 0o777 != mode]
