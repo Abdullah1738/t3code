@@ -7979,6 +7979,23 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         (yield* store.getRuntimeRecoveryProjection(threadId)).runs.map((run) => run.id),
         [runId, newerRunId],
       );
+      // ardud: run-control checks read one run row; it must agree with the full recovery read.
+      for (const run of (yield* store.getThreadProjection(threadId)).runs) {
+        assert.deepEqual(yield* store.getRunControlState(threadId, run.id), {
+          activeAttemptId: run.activeAttemptId,
+          status: run.status,
+        });
+      }
+      assert.equal(yield* store.getRunControlState(threadId, RunId.make("run:absent")), null);
+      // A run of another thread is not this thread's run.
+      assert.equal(
+        yield* store.getRunControlState(threadId, RunId.make("run:held-completion:elsewhere")),
+        null,
+      );
+      const missingThread = yield* Effect.flip(
+        store.getRunControlState(ThreadId.make("thread:absent"), runId),
+      );
+      assert.equal(missingThread._tag, "ProjectionStoreThreadNotFoundError");
     }),
   );
 });

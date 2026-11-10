@@ -93,6 +93,7 @@ import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
 import { threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
 // ardud: control turns
 import { CONTROL_MESSAGE_PREFIX } from "../ardud/control/turns.ts";
+import { Switches } from "../ardud/perf/speedups.ts";
 import {
   isThreadHistoryUserTurn,
   isConversationHistoryItem,
@@ -125,6 +126,12 @@ export class ProjectionStoreSetupError extends Schema.TaggedError<ProjectionStor
   override get message(): string {
     return "Failed to initialize orchestration projection store.";
   }
+}
+
+/** ardud: the fields run-control checks compare. See `getRunControlState`. */
+export interface ProjectionRunControlState {
+  readonly activeAttemptId: OrchestrationV2Run["activeAttemptId"];
+  readonly status: OrchestrationV2Run["status"];
 }
 
 export class ProjectionStoreThreadNotFoundError extends Schema.TaggedError<ProjectionStoreThreadNotFoundError>()(
@@ -533,6 +540,14 @@ export interface ProjectionStoreV2Shape {
   readonly getRuntimeRecoveryProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<ProjectionRuntimeRecoveryState, ProjectionStoreV2Error>;
+  /**
+   * ardud: what a run-control check needs from one run, read by primary key. Null when
+   * the thread has no such run; a missing thread fails like the full recovery read.
+   */
+  readonly getRunControlState: (
+    threadId: ThreadId,
+    runId: RunId,
+  ) => Effect.Effect<ProjectionRunControlState | null, ProjectionStoreV2Error>;
   readonly getPendingNativeUserInputs: (
     threadId: ThreadId,
     providerTurnId: ProviderTurnId,
@@ -2036,6 +2051,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const speedups = yield* Switches;
+    // ardud: the writer connection is synchronous on the main thread, so a scan there
+    // freezes every request for as long as it runs. Sweeps only need committed data;
+    // inside an open write transaction readOnly keeps using the writer.
+    const offWriter = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      speedups.sweepReadsOffWriter ? NodeSqliteClient.readOnly(effect) : effect;
 
     // For run upserts: a snapshot without `path` keeps the value another event recorded there.
     const keepRecordedRunField = (payload: Statement.Fragment, path: string) => sql`
@@ -4023,7 +4044,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               )
             )
           ORDER BY thread_id
-        `;
+        `.pipe(offWriter);
         const candidates: Array<ProjectionLimitRecoveryCandidate> = [];
         for (const row of rows) {
           const thread = yield* decodeThreadPayload(row.payload_json);
@@ -4854,6 +4875,51 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ),
           ),
       );
+
+    // The full recovery read costs eleven statements on the main-thread writer (up to
+    // 3.5 s on a long thread at finalize) to answer a question about one run row.
+    const getRunControlState: ProjectionStoreV2Shape["getRunControlState"] = Effect.fn(
+      "ProjectionStore.getRunControlState",
+    )(
+      function* (threadId, runId) {
+        yield* Effect.annotateCurrentSpan("thread.id", threadId);
+        if (!speedups.narrowRunControlReads) {
+          const current = yield* getRuntimeRecoveryProjection(threadId);
+          const run = current.runs.find((candidate) => candidate.id === runId);
+          return run === undefined
+            ? null
+            : { activeAttemptId: run.activeAttemptId, status: run.status };
+        }
+        const rows = yield* sql<{
+          readonly thread_found: number | null;
+          readonly payload_json: string | null;
+        }>`
+          SELECT
+            (
+              SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}
+            ) AS thread_found,
+            (
+              SELECT payload_json FROM orchestration_v2_projection_runs
+              WHERE run_id = ${runId} AND thread_id = ${threadId}
+            ) AS payload_json
+        `;
+        const row = rows[0];
+        if (row === undefined || row.thread_found === null) {
+          return yield* new ProjectionStoreThreadNotFoundError({ threadId });
+        }
+        if (row.payload_json === null) return null;
+        const run = yield* decodeRunPayload(row.payload_json);
+        return { activeAttemptId: run.activeAttemptId, status: run.status };
+      },
+      (effect, threadId) =>
+        effect.pipe(
+          Effect.mapError((cause) =>
+            isProjectionStoreThreadNotFoundError(cause)
+              ? cause
+              : new ProjectionStoreReadError({ threadId, cause }),
+          ),
+        ),
+    );
 
     const getThread: ProjectionStoreV2Shape["getThread"] = Effect.fn("ProjectionStore.getThread")(
       function* (threadId) {
@@ -6359,7 +6425,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(payload_json, '$.archivedAt') IS NULL
             AND json_array_length(payload_json, '$.pullRequests') > 0
           ORDER BY updated_at ASC, thread_id ASC
-        `;
+        `.pipe(
+            // One thread is a primary-key lookup; only the whole-table scan leaves the writer.
+            threadId === undefined ? offWriter : (effect) => effect,
+          );
           return yield* Effect.forEach(rows, (row) =>
             decodeThreadPayload(row.payload_json).pipe(
               Effect.map((thread): ProjectionThreadPullRequests => ({
@@ -6776,6 +6845,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getTurnStartContext,
       getTurnStartHistory,
       getRuntimeRecoveryProjection,
+      getRunControlState,
       getRunningTurnContext,
       getThreadProviderContext,
       getRuntimeResponseContext,
@@ -7548,6 +7618,15 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             ),
           ),
       getRuntimeRecoveryProjection: (threadId) => service.getThreadProjection(threadId),
+      getRunControlState: (threadId, runId) =>
+        service.getThreadProjection(threadId).pipe(
+          Effect.map((projection) => {
+            const run = projection.runs.find((candidate) => candidate.id === runId);
+            return run === undefined
+              ? null
+              : { activeAttemptId: run.activeAttemptId, status: run.status };
+          }),
+        ),
       getThreadSnapshot: (threadId) =>
         service.getThreadProjection(threadId).pipe(
           Effect.flatMap((projection) =>

@@ -197,6 +197,15 @@ function startWithMissingWorktree(
               }),
             );
           },
+          getRunControlState: () => {
+            projectionReadCount += 1;
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreReadError({
+                threadId,
+                cause: "simulated run-control read failure",
+              }),
+            );
+          },
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
         Layer.mock(ProviderAuthService.ProviderAuthService)({
@@ -767,6 +776,16 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
+          getRunControlState: (_threadId, wantedRunId) =>
+            Effect.as(
+              failReadIfRunning,
+              (() => {
+                const run = projection.runs.find((candidate) => candidate.id === wantedRunId);
+                return run === undefined
+                  ? null
+                  : { activeAttemptId: run.activeAttemptId, status: run.status };
+              })(),
+            ),
           getTurnStartHistory: () =>
             input.nativeDelivery === true
               ? Effect.succeed(projection.turnItems)
