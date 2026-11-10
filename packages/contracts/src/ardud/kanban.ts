@@ -933,7 +933,13 @@ export const KANBAN_DONE_STAGES: ReadonlySet<KanbanStage> = new Set([
   "verified",
 ]);
 
-const isOpenCard = (card: KanbanCard) =>
+/** The card fields the blocking graph reads: what a list read has to select to count what a card holds up. */
+export type KanbanBlockingCard = Pick<
+  KanbanCard,
+  "id" | "stage" | "settledAt" | "priority" | "blockedBy"
+>;
+
+const isOpenCard = (card: Pick<KanbanCard, "stage" | "settledAt">) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
@@ -1064,8 +1070,8 @@ const popcount = (word: number): number => {
  * right behind it. The sets are bitsets: the cost is cards plus edges, times one
  * word per 32 open cards for each edge.
  */
-function blockingGraph(cards: ReadonlyArray<KanbanCard>, maxWords: number) {
-  const open: Array<KanbanCard> = [];
+function blockingGraph<C extends KanbanBlockingCard>(cards: ReadonlyArray<C>, maxWords: number) {
+  const open: Array<C> = [];
   const index = new Map<string, number>();
   for (const card of cards) {
     if (!isOpenCard(card) || index.has(card.id)) continue;
@@ -1238,8 +1244,12 @@ function blockingGraph(cards: ReadonlyArray<KanbanCard>, maxWords: number) {
 /**
  * What each open card holds up. Done and settled cards are left out, and a
  * backlog card waiting on another doesn't count: nobody is going to do it.
+ * The one count of "unblocks": the dispatcher schedules by it, and the board's
+ * To-Do order, the ask feed and the Needs-you list all show it.
  */
-export function kanbanBlocking(cards: ReadonlyArray<KanbanCard>): Map<string, KanbanBlocking> {
+export function kanbanBlocking(
+  cards: ReadonlyArray<KanbanBlockingCard>,
+): Map<string, KanbanBlocking> {
   const graph = blockingGraph(cards, SCHEDULE_MAX_WORDS);
   return new Map(graph.open.map((card, v) => [card.id as string, graph.of(v)]));
 }
@@ -1587,7 +1597,7 @@ export const KanbanAskFeedItem = Schema.Struct({
   stage: KanbanStage,
   priority: KanbanPriority,
   discussionId: Schema.NullOr(KanbanDiscussionId),
-  /** Unfinished cards that list this card in `blockedBy`. */
+  /** Open cards this card holds up, the whole chain (`kanbanBlocking(...).holds`): what the dispatcher schedules by. */
   blocks: NonNegativeInt,
   ask: KanbanOwnerAsk,
   /** `ask.kind` and `ask.revision` with their defaults applied. */

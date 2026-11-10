@@ -6,17 +6,20 @@
  * page shows plus their matching asks.
  */
 import {
+  KANBAN_DONE_STAGES,
   kanbanAskBackFromSnooze,
   kanbanAskExpired,
   kanbanAskKind,
   kanbanAskRevision,
   kanbanAskSnoozed,
   kanbanAskWaitsOn,
+  kanbanBlocking,
   KanbanCard,
   KanbanMessage,
   KanbanOwnerAsk,
   type KanbanAskFeed,
   type KanbanAskFeedItem,
+  type KanbanBlockingCard,
   type KanbanBoardId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -105,31 +108,54 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
         `;
   const boards = new Map(boardRows.map((row) => [row.id, row]));
 
-  // What each card with an open ask holds up: one pass over the unfinished
-  // cards that wait on anything, reading only their `blockedBy`.
-  const holders = new Set(
-    cards
-      .filter((card) => card.settledAt === null && card.asks.some((ask) => ask.closedAt === null))
-      .map((card) => card.id as string),
+  // What each card with an open ask holds up, counted the way the dispatcher
+  // schedules (the whole chain, backlog waiters left out): one read of the
+  // open cards' few graph fields and one walk of the graph per board, however
+  // many asks there are.
+  const holders = cards.filter(
+    (card) => card.settledAt === null && card.asks.some((ask) => ask.closedAt === null),
   );
   const blocks = new Map<string, number>();
-  if (holders.size > 0) {
+  if (holders.length > 0) {
     // @effect-diagnostics-next-line preferSchemaOverJson:off
-    const boardIds = JSON.stringify([...new Set(cards.map((card) => card.boardId))]);
-    const waiting = yield* sql<{ blockedBy: string | null }>`
-      SELECT json_extract(json, '$.blockedBy') AS blockedBy
+    const boardIds = JSON.stringify([...new Set(holders.map((card) => card.boardId))]);
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    const done = JSON.stringify([...KANBAN_DONE_STAGES]);
+    const open = yield* sql<{
+      id: string;
+      boardId: string;
+      stage: string;
+      priority: number;
+      blockedBy: string | null;
+    }>`
+      SELECT id, board_id AS boardId, stage,
+        json_extract(json, '$.priority') AS priority,
+        json_extract(json, '$.blockedBy') AS blockedBy
       FROM ardud_kanban_cards
       WHERE board_id IN (SELECT value FROM json_each(${boardIds}))
-        AND stage NOT IN ('completed', 'deployed', 'verified')
-        AND instr(json, '"blockedBy":[]') = 0
+        AND stage NOT IN (SELECT value FROM json_each(${done}))
         AND json_extract(json, '$.settledAt') IS NULL
     `;
-    for (const row of waiting) {
-      if (row.blockedBy === null) continue;
+    const byBoard = new Map<string, Array<KanbanBlockingCard>>();
+    for (const row of open) {
       // @effect-diagnostics-next-line preferSchemaOverJson:off
-      const ids = JSON.parse(row.blockedBy) as ReadonlyArray<unknown>;
-      for (const id of new Set(ids)) {
-        if (typeof id === "string" && holders.has(id)) blocks.set(id, (blocks.get(id) ?? 0) + 1);
+      const parsed: unknown = JSON.parse(row.blockedBy ?? "[]");
+      const ids: ReadonlyArray<unknown> = Array.isArray(parsed) ? parsed : [];
+      const board = byBoard.get(row.boardId) ?? [];
+      if (board.length === 0) byBoard.set(row.boardId, board);
+      board.push({
+        id: row.id,
+        stage: row.stage,
+        settledAt: null,
+        priority: row.priority,
+        blockedBy: ids.filter((id) => typeof id === "string"),
+      } as unknown as KanbanBlockingCard);
+    }
+    for (const board of byBoard.values()) {
+      const blocking = kanbanBlocking(board);
+      for (const card of holders) {
+        const held = blocking.get(card.id);
+        if (held !== undefined) blocks.set(card.id, held.holds);
       }
     }
   }

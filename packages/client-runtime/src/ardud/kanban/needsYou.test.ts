@@ -41,6 +41,24 @@ const state = (cards: ReadonlyArray<KanbanCard>) =>
 const keys = (items: ReadonlyArray<{ readonly key: string }>) => items.map((item) => item.key);
 
 describe("needsYouItems", () => {
+  it("counts what a card unblocks the way the dispatcher does: the whole chain, backlog waiters left out", () => {
+    const list = needsYouItems(
+      state([
+        card(1, { stage: "needs_owner", asks: [ask("q1", { blocking: true })] }),
+        // #2 waits on #1, and 400 cards wait on #2.
+        card(2, { stage: "todo", blockedBy: ["card-1"] as never }),
+        ...Array.from({ length: 400 }, (_, index) =>
+          card(index + 3, { stage: "todo", blockedBy: ["card-2"] as never }),
+        ),
+        // A backlog card nobody is going to do, and a finished one, don't count.
+        card(403, { stage: "todo", priority: 5 as never, blockedBy: ["card-1"] as never }),
+        card(404, { stage: "verified", blockedBy: ["card-1"] as never }),
+      ]),
+      NOW,
+    );
+    expect(list.items.map((item) => [item.key, item.unblocks])).toEqual([["card-1:q1", 401]]);
+  });
+
   it("ranks blocking first, then the card that unblocks the most, then the oldest", () => {
     const list = needsYouItems(
       state([

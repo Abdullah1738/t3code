@@ -5,7 +5,7 @@
  * or from the server's ask feed.
  */
 import {
-  KANBAN_DONE_STAGES,
+  kanbanBlocking,
   kanbanAskBackFromSnooze,
   kanbanAskExpired,
   kanbanAskIsNotice,
@@ -44,7 +44,7 @@ export interface NeedsYouItem {
   readonly notice: boolean;
   readonly revision: number;
   readonly blocking: boolean;
-  /** Unfinished cards that wait on this ask's card. */
+  /** Open cards this ask's card holds up, the whole chain (`kanbanBlocking`): what the dispatcher schedules by. */
   readonly unblocks: number;
   readonly ageMs: number;
   /** Past its `expiresAt`: it can't be answered until its asker renews it. */
@@ -207,16 +207,15 @@ export function rankNeedsYou(all: ReadonlyArray<NeedsYouItem>): NeedsYou {
 
 /** The owner's asks on one board, from the state the client holds. */
 export function needsYouItems(state: KanbanBoardState, nowMs: number): NeedsYou {
-  const unblocks = new Map<string, number>();
-  for (const card of state.cards.values()) {
-    if (card.settledAt !== null || KANBAN_DONE_STAGES.has(card.stage)) continue;
-    for (const id of new Set(card.blockedBy)) unblocks.set(id, (unblocks.get(id) ?? 0) + 1);
-  }
+  // The same count the dispatcher schedules by and the To-Do column shows.
+  let blocking: ReadonlyMap<string, { readonly holds: number }> | undefined;
   const items: Array<NeedsYouItem> = [];
   for (const card of state.cards.values()) {
     if (card.settledAt !== null) continue;
     for (const ask of kanbanOpenAsks(card)) {
-      items.push(itemOf(card, ask, unblocks.get(card.id) ?? 0, nowMs));
+      // Walked once, and only on a board that has an open ask.
+      blocking ??= kanbanBlocking([...state.cards.values()]);
+      items.push(itemOf(card, ask, blocking.get(card.id)?.holds ?? 0, nowMs));
     }
   }
   return rankNeedsYou(items);
