@@ -267,7 +267,7 @@ test("reopening a published replica keeps it ready; an abandoned cycle is discar
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
 });
 
-test("a source schema change mid-cycle discards the cycle and clears readiness", () => {
+test("a source schema change mid-cycle discards the cycle, then the reopen rebuilds", () => {
   const f = fixture();
   f.finish();
   const out = f.connect();
@@ -276,10 +276,87 @@ test("a source schema change mid-cycle discards the cycle and clears readiness",
   f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
   expect(() => f.exporter.step()).toThrow("schema changed");
   expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_error")).toContain("schema changed");
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
   expect(() => f.exporter.step()).toThrow("schema changed");
-  expect(() => f.restart()).toThrow("schema changed");
+  // Before 2026-11-10 every reopen threw here until someone deleted the file.
+  f.restart();
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
   expect(metaValue(out, "ready")).toBe("0");
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(f.connect().prepare("SELECT task_id, extra FROM scheduled_tasks").all()).toEqual([
+    { task_id: "task", extra: null },
+  ]);
+  expect(
+    f.connect().prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
+  ).toBe(3);
+});
+
+test("a remounted volume (new st_dev, same inode) keeps exporting without a rebuild", () => {
+  const f = fixture();
+  let now = Date.parse("2026-11-08T23:16:59.000Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  f.exporter.close();
+  // A replica published before the fix stored `${realpath}:${dev}:${ino}`.
+  const real = NodeFS.realpathSync(f.options.sourcePath);
+  const stat = NodeFS.statSync(f.options.sourcePath);
+  const writable = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  writable
+    .prepare("UPDATE ardud_readonly_meta SET value=? WHERE key='source'")
+    .run(`${real}:${stat.dev}:${stat.ino}`);
+  writable.close();
+  // The SSD comes back with a new device number; the file and inode are unchanged.
+  const remounted = new Proxy(NodeFS, {
+    get(target, key, receiver) {
+      if (key !== "statSync") return Reflect.get(target, key, receiver);
+      return (file: NodeFS.PathLike, ...rest: never[]) => {
+        const result = target.statSync(file, ...rest) as NodeFS.Stats;
+        return Object.assign(Object.create(Object.getPrototypeOf(result)), result, {
+          dev: result.dev + 1,
+        });
+      };
+    },
+  });
+  now = Date.parse("2026-11-10T09:00:00.000Z");
+  f.source
+    .exec(`UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after remount"}' WHERE thread_id='a';
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{"id":"a"}');`);
+  const exporter = createReadonlyReplica(NodeSqlite, remounted, NodePath, f.options);
+  cleanups.push(() => exporter.close());
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw new Error("export did not converge");
+  }
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+  expect(metaValue(out, "source")).toBe(`${real}#${stat.ino}`);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "updated_at")).toBe("2026-11-10T09:00:00.000Z");
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"after remount"}');
+});
+
+test("a regressed event history rebuilds instead of failing every open", () => {
+  const f = fixture();
+  f.finish();
+  f.exporter.close();
+  f.source.exec(`DELETE FROM orchestration_events;
+    INSERT INTO orchestration_v2_projection_threads VALUES ('restored','{}');`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
+  cleanups.push(() => exporter.close());
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw new Error("export did not converge");
+  }
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source event sequence regressed");
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(
+    out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
+  ).toBe(4);
 });
 
 test("small table deletions and a compacted event gap converge without publishing partial data", () => {
@@ -654,7 +731,7 @@ test("incomplete boards export legacy data then reopens at completed split", () 
   ).toBe("0");
 });
 
-test("replacing main requires discarding the old replica before rebootstrap", () => {
+test("replacing main rebuilds the replica from the new file", () => {
   const f = fixture();
   f.finish();
   f.exporter.close();
@@ -662,14 +739,26 @@ test("replacing main requires discarding the old replica before rebootstrap", ()
   f.source.close();
   // Keep the original inode allocated so this models the preserved offline base.
   NodeFS.renameSync(f.options.sourcePath, oldPath);
+  NodeFS.copyFileSync(oldPath, f.options.sourcePath);
   const replacement = new NodeSqlite.DatabaseSync(f.options.sourcePath);
-  replacement.exec(
-    "PRAGMA journal_mode=WAL; CREATE TABLE orchestration_events(sequence INTEGER PRIMARY KEY)",
-  );
-  replacement.close();
-  expect(() => createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options)).toThrow(
-    "source changed",
-  );
+  cleanups.push(() => replacement.close());
+  replacement.exec(`PRAGMA journal_mode=WAL;
+    DELETE FROM orchestration_v2_projection_threads WHERE thread_id='c';
+    INSERT INTO orchestration_v2_projection_threads VALUES ('new','{}');`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
+  cleanups.push(() => exporter.close());
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source database was replaced");
+  expect(metaValue(out, "ready")).toBe("0");
+  for (let i = 0; exporter.step(); i++) {
+    if (i > 500) throw new Error("export did not converge");
+  }
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(
+    out
+      .prepare("SELECT thread_id FROM orchestration_v2_projection_threads ORDER BY thread_id")
+      .all(),
+  ).toEqual([{ thread_id: "a" }, { thread_id: "b" }, { thread_id: "new" }]);
 });
 
 test("slow catchup cannot make old auxiliary rows look fresh", () => {

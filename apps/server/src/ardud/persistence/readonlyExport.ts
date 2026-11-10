@@ -53,6 +53,8 @@ export function createReadonlyReplica(
   let baseArchive: NodeSqlite.DatabaseSync | undefined;
   let boardsReady = false;
   let target: NodeSqlite.DatabaseSync | undefined;
+  /** Best effort: the failure stays readable in meta after the worker exits. */
+  let recordFailure = (_error: unknown) => {};
   try {
     const setupReader = (db: NodeSqlite.DatabaseSync, requireWal = true) => {
       db.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=0; PRAGMA cache_size=-8192;");
@@ -128,19 +130,19 @@ export function createReadonlyReplica(
     }
     target = new sqlite.DatabaseSync(options.replicaPath);
     fs.chmodSync(options.replicaPath, 0o600);
-    target.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=0;
-      PRAGMA journal_size_limit=33554432; PRAGMA cache_size=-8192;
-      CREATE TABLE IF NOT EXISTS ardud_readonly_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS ardud_readonly_progress (name TEXT PRIMARY KEY, json TEXT NOT NULL);
+    // Export bookkeeping; a rebuild drops and recreates all of it except meta.
+    const bookkeeping = `CREATE TABLE IF NOT EXISTS ardud_readonly_progress (name TEXT PRIMARY KEY, json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS orchestration_events (
         sequence INTEGER PRIMARY KEY, event_type TEXT NOT NULL, stream_id TEXT, payload_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS ardud_readonly_seen (name TEXT NOT NULL, id TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(name,id));
       CREATE INDEX IF NOT EXISTS ardud_readonly_seen_generation ON ardud_readonly_seen(name,generation);
-      CREATE TABLE IF NOT EXISTS ardud_readonly_dirty_items (thread_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, item_id TEXT NOT NULL, target_cursor INTEGER NOT NULL);`);
-    target.exec(
-      "CREATE TABLE IF NOT EXISTS ardud_readonly_item_fences (item_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL)",
-    );
+      CREATE TABLE IF NOT EXISTS ardud_readonly_dirty_items (thread_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, item_id TEXT NOT NULL, target_cursor INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ardud_readonly_item_fences (item_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL);`;
+    target.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=0;
+      PRAGMA journal_size_limit=33554432; PRAGMA cache_size=-8192;
+      CREATE TABLE IF NOT EXISTS ardud_readonly_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      ${bookkeeping}`);
     const out = target;
     const meta = (key: string, value: string) =>
       out
@@ -148,6 +150,14 @@ export function createReadonlyReplica(
           "INSERT INTO ardud_readonly_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         )
         .run(key, value);
+    recordFailure = (error) => {
+      try {
+        meta("last_error", String((error as Error)?.message ?? error).slice(0, 1000));
+        meta("last_error_at", new Date().toISOString());
+      } catch {
+        // The replica itself may be what failed.
+      }
+    };
     const getMeta = (key: string) =>
       out.prepare("SELECT value FROM ardud_readonly_meta WHERE key=?").get(key)?.value as
         | string
@@ -235,10 +245,88 @@ export function createReadonlyReplica(
       meta("ready", "0");
       return new Error(message);
     };
+    // Path and inode only. st_dev is not stable: an external volume gets a new
+    // device number on every remount or reboot, and the 9 Nov SSD remount left
+    // the old dev-based identity failing every open, forever (ready=0, stale).
     const sourceStat = fs.statSync(options.sourcePath);
-    const identity = `${fs.realpathSync(options.sourcePath)}:${sourceStat.dev}:${sourceStat.ino}`;
-    if (getMeta("source") && getMeta("source") !== identity)
-      throw invalidate("Readonly source changed; rebuild exported replica");
+    const sourceRealPath = fs.realpathSync(options.sourcePath);
+    const identity = `${sourceRealPath}#${sourceStat.ino}`;
+    const sameSource = (stored: string) => {
+      if (stored === identity) return true;
+      // Before 2026-11-10 the identity was `${realpath}:${dev}:${ino}`.
+      const legacy = /^(.*):\d+:(\d+)$/.exec(stored);
+      return (
+        legacy !== null && legacy[1] === sourceRealPath && legacy[2] === String(sourceStat.ino)
+      );
+    };
+    const normalizeSchema = (value: string) =>
+      value
+        .replace(/\s+/g, "")
+        .replace(/IFNOTEXISTS/gi, "")
+        .toLowerCase();
+    const sourceTables = [...projections, ...auxiliary].map((name) => {
+      const db =
+        boards &&
+        boardsReady &&
+        auxiliary.includes(name) &&
+        boards.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name)
+          ? boards
+          : source;
+      const schema = db
+        .prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?")
+        .get(name)?.sql;
+      if (typeof schema !== "string")
+        throw invalidate(`Readonly export source table missing: ${name}`);
+      return { name, db, schema };
+    });
+    // A replaced source, a changed table or a regressed event history cannot be
+    // caught up incrementally. Rebuild in place instead of refusing every open
+    // until someone deletes the file: readers see ready=0 until the fresh
+    // generation publishes, exactly as on a first bootstrap.
+    const storedSource = getMeta("source");
+    const storedSequence = getMeta("sequence");
+    const changedTable = sourceTables.find(({ name, schema }) => {
+      const previous = getMeta(`schema:${name}`);
+      return previous !== undefined && normalizeSchema(previous) !== normalizeSchema(schema);
+    });
+    const rebuildReason =
+      storedSource !== undefined && !sameSource(storedSource)
+        ? "source database was replaced"
+        : changedTable
+          ? `source schema changed: ${changedTable.name}`
+          : storedSequence !== undefined && sequence() < Number(storedSequence)
+            ? "source event sequence regressed"
+            : undefined;
+    if (rebuildReason) {
+      const exported = [...projections, ...auxiliary].filter((name) =>
+        out.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name),
+      );
+      transaction(() => {
+        for (const name of [
+          ...exported,
+          "ardud_readonly_progress",
+          "orchestration_events",
+          "ardud_readonly_seen",
+          "ardud_readonly_dirty_items",
+          "ardud_readonly_item_fences",
+        ])
+          out.exec(`DROP TABLE IF EXISTS ${q(name)}`);
+        out.exec(bookkeeping);
+        out
+          .prepare(
+            "DELETE FROM ardud_readonly_meta WHERE key LIKE 'schema:%' OR key IN ('archive_deletion_sequence','resetting_events')",
+          )
+          .run();
+        meta("ready", "0");
+        meta("source", identity);
+        meta("sequence", String(sequence()));
+        meta("schema_version", "1");
+        meta("last_rebuild_reason", rebuildReason);
+        meta("last_rebuild_at", new Date().toISOString());
+      });
+    } else if (storedSource !== undefined && storedSource !== identity) {
+      meta("source", identity);
+    }
     if (!getMeta("sequence"))
       transaction(() => {
         meta("source", identity);
@@ -296,29 +384,9 @@ export function createReadonlyReplica(
     const threadSequence = (threadId: NodeSqlite.SQLInputValue) =>
       // Journal fences must include events already moved out of main, too.
       Math.max(...threadEventSources.map((statement) => Number(statement.get(threadId)?.n ?? 0)));
-    for (const name of [...projections, ...auxiliary]) {
-      const db =
-        boards &&
-        boardsReady &&
-        auxiliary.includes(name) &&
-        boards.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name)
-          ? boards
-          : source;
-      const schema = db
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?")
-        .get(name)?.sql;
-      if (typeof schema !== "string")
-        throw invalidate(`Readonly export source table missing: ${name}`);
-      const schemaKey = `schema:${name}`;
-      const previousSchema = getMeta(schemaKey);
-      const normalizeSchema = (value: string) =>
-        value
-          .replace(/\s+/g, "")
-          .replace(/IFNOTEXISTS/gi, "")
-          .toLowerCase();
-      if (previousSchema && normalizeSchema(previousSchema) !== normalizeSchema(schema))
-        throw invalidate(`Readonly source schema changed; rebuild replica: ${name}`);
-      meta(schemaKey, schema);
+    for (const { name, db, schema } of sourceTables) {
+      // Any stored schema that differed was rebuilt above.
+      meta(`schema:${name}`, schema);
       sourceSchemas.set(name, schema);
       out.exec(
         schema.replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS "),
@@ -833,6 +901,7 @@ export function createReadonlyReplica(
           // the replica; this exporter must be reopened. Readers keep the last
           // published generation, which goes stale if the failure persists.
           if (abortCycle()) invalidated ??= "Readonly refresh cycle aborted; reopen exporter";
+          recordFailure(error);
           throw error;
         }
       },
@@ -850,6 +919,7 @@ export function createReadonlyReplica(
       },
     };
   } catch (error) {
+    if (target?.isOpen) recordFailure(error);
     target?.close();
     boards?.close();
     archive?.close();
