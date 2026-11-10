@@ -11,6 +11,7 @@ import {
   kanbanNeedsOwner,
   kanbanOpenAsks,
   kanbanStepSubtasks,
+  kanbanWithoutWait,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
@@ -37,6 +38,7 @@ import {
   type KanbanPool,
   type KanbanStage,
   type KanbanThreadLink,
+  type KanbanWait,
   type KanbanThreadRow,
   type KanbanThreadState,
   type KanbanWikiPage,
@@ -83,6 +85,7 @@ import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
+import * as Waits from "./waits.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
 import * as Pages from "./messagePages.ts";
@@ -221,6 +224,19 @@ export type KanbanWatchEvent =
   | { readonly _tag: "snapshot"; readonly snapshot: KanbanBoardSnapshot }
   | { readonly _tag: "change"; readonly change: KanbanChange };
 
+export interface CardWaitInput {
+  readonly on: KanbanWait["on"];
+  readonly note: string;
+  readonly pr?: string | null | undefined;
+  /** The card to wait on, for `card`. */
+  readonly card?: KanbanCard["id"] | null | undefined;
+  readonly ask?: string | null | undefined;
+  readonly until?: string | null | undefined;
+  /** For `push`: the reviewed commit. Left out, the card's latest review event's head. */
+  readonly head?: string | null | undefined;
+  readonly wakeRole?: Waits.WaitRole | null | undefined;
+}
+
 export interface KanbanServiceShape {
   readonly ready: Effect.Effect<void>;
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanError>;
@@ -305,6 +321,16 @@ export interface KanbanServiceShape {
   readonly flagCard: (
     cardId: KanbanCard["id"],
     reason: string | null,
+    actor: KanbanActor,
+  ) => Effect.Effect<KanbanCard, KanbanError>;
+  /**
+   * Sets what a card with no running thread waits on (replacing any wait it
+   * had, and a stalled flag the caller may clear), or clears it with null.
+   * `pr` is the PR's URL, "#544" or "repo#544" from the card's links.
+   */
+  readonly waitCard: (
+    cardId: KanbanCard["id"],
+    input: CardWaitInput | null,
     actor: KanbanActor,
   ) => Effect.Effect<KanbanCard, KanbanError>;
   /** Reattaches an existing thread without starting a turn or lifting the board pause. */
@@ -7699,6 +7725,69 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const waitCard: KanbanServiceShape["waitCard"] = (cardId, input, actor) =>
+    guard(
+      Effect.gen(function* () {
+        yield* checkText([["note", input?.note]]);
+        const card = yield* cardOf(cardId);
+        const at = yield* nowIso;
+        if (input === null) {
+          if (card.wait === undefined) {
+            return yield* failWith("invalid", `card #${card.number} has no wait to clear`);
+          }
+          const next: KanbanCard = { ...kanbanWithoutWait(card), updatedAt: at };
+          yield* logEvent(next, actor, "wait_cleared", {
+            body: `Cleared by hand: was waiting on ${Waits.waitTarget(card.wait)}`,
+          });
+          yield* saveCard(next);
+          yield* kick;
+          return next;
+        }
+        const onPr = input.on === "push" || input.on === "merge" || input.on === "ci";
+        const link = onPr && input.pr?.trim() ? Waits.findPrLink(card, input.pr) : null;
+        if (link === "ambiguous") {
+          return yield* failWith(
+            "invalid",
+            `card #${card.number} has several pull requests matching ${input.pr}: pass its URL`,
+          );
+        }
+        const target = input.on === "card" && input.card ? yield* store.card(input.card) : null;
+        if (target !== null && target.boardId !== card.boardId) {
+          return yield* failWith("invalid", `card #${target.number} is on another board`);
+        }
+        // The reviewed commit is on the card already: its latest review event.
+        const reviewed =
+          input.on === "push" && !input.head?.trim()
+            ? ((yield* store.cardEvents(card.id)).findLast(
+                (event) => event.kind === "review" && event.head !== null,
+              )?.head ?? null)
+            : null;
+        const request: Waits.WaitRequest = {
+          on: input.on,
+          note: input.note,
+          // An unknown ref goes through as written, so the refusal names it.
+          pr: onPr ? (link?.url ?? input.pr?.trim() ?? null) : null,
+          card: target,
+          ask: input.ask?.trim() || null,
+          until: input.until?.trim() || null,
+          sinceHead: input.head?.trim() || reviewed,
+          wakeRole: input.wakeRole ?? null,
+        };
+        const check = Waits.checkWait(card, request, actor, yield* nowMillis);
+        if (!check.ok) return yield* failWith(check.code, check.reason);
+        const wait = Waits.newWait(request, actor, at);
+        const next: KanbanCard = { ...card, wait, stalled: null, updatedAt: at };
+        const known = target === null ? undefined : new Map([[target.id as string, target]]);
+        yield* logEvent(next, actor, "wait_set", {
+          body:
+            Waits.waitSetBody(wait, known) +
+            (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
+        });
+        yield* saveCard(next);
+        return next;
+      }),
+    );
+
   const settleCard: KanbanServiceShape["settleCard"] = (cardId) =>
     guard(
       Effect.gen(function* () {
@@ -8916,6 +9005,7 @@ const make = Effect.gen(function* () {
     moveCard,
     restoreCutoverCard,
     flagCard,
+    waitCard,
     settleCard,
     markSubtask,
     handBack,

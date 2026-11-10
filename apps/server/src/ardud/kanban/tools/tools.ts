@@ -8,6 +8,7 @@ import {
   KanbanBoardIcon,
   KanbanPriority,
   KanbanStage,
+  KanbanWaitKind,
   NonNegativeInt,
   OrchestratorMcpFailure,
   PositiveInt,
@@ -22,6 +23,7 @@ import * as ThreadManagementService from "../../../orchestration-v2/ThreadManage
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
 import { MAX_BATCH } from "../engine/rules.ts";
+import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -267,6 +269,48 @@ const CardFlag = tool(
     reason: Schema.optional(Schema.String),
   },
   { card: Record },
+  { readonly: false },
+);
+
+const CardWait = tool(
+  "card_wait",
+  "Say what a card waits on",
+  'Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing "waiting for the dev to push" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card\'s last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card\'s stage (wakeRole to choose); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only.' +
+    (WAITS_ENGINE_WIRED
+      ? ""
+      : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
+  {
+    card: Schema.optional(CardRef),
+    on: Schema.optional(describe(KanbanWaitKind, "What it waits on. Required unless clear.")),
+    note: Schema.optional(
+      describe(Schema.String, "One line: what exactly is awaited and from whom. Required unless clear."),
+    ),
+    pr: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        'push, merge, ci: the pull request, by URL, "#544" or "trading-core#544". Left out when the card has one PR.',
+      ),
+    ),
+    waitsOn: Schema.optional(describe(CardRef, "card: the card that has to be done first.")),
+    ask: Schema.optional(describe(TrimmedNonEmptyString, "owner_go: the open question's id, e.g. q2.")),
+    until: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "time: when it ends (ISO 8601, at most 30 days ahead). Other kinds: your own deadline, after which the card shows as stuck.",
+      ),
+    ),
+    head: Schema.optional(
+      describe(TrimmedNonEmptyString, "push: the commit you reviewed, when the card's last review didn't record it."),
+    ),
+    wakeRole: Schema.optional(
+      describe(
+        Schema.Literals(["work", "review", "evaluator"]),
+        "Who is woken when it ends. Default: whoever acts next in the card's stage (the reviewer while its review is open, else the evaluator; the worker in To-Do).",
+      ),
+    ),
+    clear: Schema.optional(describe(Schema.Boolean, "Remove the card's wait. Nobody is woken.")),
+  },
+  { card: Record, note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
@@ -589,6 +633,7 @@ export const KanbanToolkit = Toolkit.make(
   CardAsk,
   CardAskChange,
   CardFlag,
+  CardWait,
   CardReviewResult,
   DiscussionPost,
   DiscussionRead,

@@ -14,10 +14,18 @@ import {
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
   KanbanBoardIconImage,
+  KanbanCard,
+  KANBAN_WAIT_LIMIT_MS,
+  kanbanWait,
+  kanbanWaitDeadlineMs,
+  kanbanWaitExpired,
+  kanbanWaiting,
+  kanbanWaitStale,
+  kanbanWithoutWait,
+  type KanbanWait,
   KANBAN_BOARD_IMAGE_MAX,
   KanbanSubtask,
   KanbanThreadLink,
-  type KanbanCard,
 } from "./kanban.ts";
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
@@ -365,5 +373,113 @@ describe("board script steps", () => {
       doneAt: null,
     });
     expect(decoded.script).toBeUndefined();
+  });
+});
+
+describe("KanbanCard wait", () => {
+  const stored = (extra: Record<string, unknown> = {}) => ({
+    ...Schema.encodeSync(KanbanCard)(card("stored")),
+    ...extra,
+  });
+  const wait = (patch: Partial<KanbanWait> = {}): KanbanWait => ({
+    on: "push",
+    pr: "https://github.com/acme/app/pull/12" as never,
+    card: null,
+    ask: null,
+    until: null,
+    sinceHead: "a1b2c3d4",
+    note: "author to push the fix",
+    by: { _tag: "owner" },
+    at: "2026-10-25T10:00:00.000Z" as never,
+    wakeRole: null,
+    expiredAt: null,
+    ...patch,
+  });
+
+  it("decodes a card stored before waits existed, and encodes it back without a wait key", () => {
+    const encoded = stored();
+    expect("wait" in encoded).toBe(false);
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(encoded);
+    expect(decoded.wait).toBeUndefined();
+    expect(kanbanWait(decoded)).toBeNull();
+    expect(kanbanWaiting(decoded)).toBe(false);
+    expect(JSON.parse(JSON.stringify(Schema.encodeSync(KanbanCard)(decoded)))).toEqual(encoded);
+  });
+
+  it("fills the optional parts of a stored wait", () => {
+    const decoded = Schema.decodeUnknownSync(KanbanCard)(
+      stored({
+        wait: {
+          on: "merge",
+          pr: "https://github.com/acme/app/pull/12",
+          note: "parent PR",
+          by: { _tag: "owner" },
+          at: "2026-10-25T10:00:00.000Z",
+        },
+      }),
+    );
+    expect(decoded.wait).toEqual({
+      on: "merge",
+      pr: "https://github.com/acme/app/pull/12",
+      card: null,
+      ask: null,
+      until: null,
+      sinceHead: null,
+      note: "parent PR",
+      by: { _tag: "owner" },
+      at: "2026-10-25T10:00:00.000Z",
+      wakeRole: null,
+      expiredAt: null,
+    });
+  });
+
+  it("decodes the wait event kinds", () => {
+    for (const kind of ["wait_set", "wait_cleared", "wait_expired"]) {
+      const event = Schema.decodeUnknownSync(KanbanCardEvent)({
+        id: 1,
+        cardId: "card-1",
+        at: "2026-10-29T10:00:00.000Z",
+        actor: { _tag: "owner" },
+        kind,
+        fromStage: null,
+        toStage: null,
+        body: "PR merged",
+      });
+      expect(event.kind).toBe(kind);
+    }
+  });
+
+  it("counts a card as waiting only with no thread, unsettled and unmoved since", () => {
+    const waiting = card("w", { stage: "in_review", wait: wait() });
+    expect(kanbanWaiting(waiting)).toBe(true);
+    expect(kanbanWaiting({ ...waiting, activeThreadId: "thread-1" as never })).toBe(false);
+    expect(kanbanWaiting({ ...waiting, settledAt: "2026-10-26T10:00:00.000Z" as never })).toBe(
+      false,
+    );
+    const moved = { ...waiting, movedAt: "2026-10-25T11:00:00.000Z" as never };
+    expect(kanbanWaitStale(moved)).toBe(true);
+    expect(kanbanWaiting(moved)).toBe(false);
+  });
+
+  it("drops the wait key, not sets it to undefined", () => {
+    const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
+    expect("wait" in cleared).toBe(false);
+    const plain = card("p");
+    expect(kanbanWithoutWait(plain)).toBe(plain);
+  });
+
+  it("expires by the kind's limit, the wait's own until, or never for a time wait", () => {
+    const at = Date.parse("2026-10-25T10:00:00.000Z");
+    expect(kanbanWaitDeadlineMs(wait())).toBe(at + KANBAN_WAIT_LIMIT_MS.push!);
+    expect(kanbanWaitExpired(wait(), at + KANBAN_WAIT_LIMIT_MS.push! - 1)).toBe(false);
+    expect(kanbanWaitExpired(wait(), at + KANBAN_WAIT_LIMIT_MS.push!)).toBe(true);
+    const own = wait({ until: "2026-10-25T12:00:00.000Z" as never });
+    expect(kanbanWaitDeadlineMs(own)).toBe(Date.parse("2026-10-25T12:00:00.000Z"));
+    const time = wait({ on: "time", pr: null, until: "2026-10-25T12:00:00.000Z" as never });
+    expect(kanbanWaitDeadlineMs(time)).toBeNull();
+    expect(kanbanWaitExpired(time, at + 365 * 24 * 60 * 60 * 1000)).toBe(false);
+    expect(kanbanWaitExpired(wait({ expiredAt: "2026-10-25T10:05:00.000Z" as never }), at)).toBe(
+      true,
+    );
   });
 });
