@@ -167,12 +167,17 @@ export function QueueRail(props: QueueRailProps) {
           <Key>J</Key>
           <Key>K</Key>
           <span>move</span>
-          <Key className="ms-1.5">A</Key>
-          <span>approve</span>
+          <span className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+            <Key className="ms-1.5">A</Key>
+            <span className="truncate">approve</span>
+          </span>
           <button
             type="button"
             onClick={props.onShortcuts}
-            className={cn(linkClass, "ms-auto inline-flex items-center gap-1.5")}
+            className={cn(
+              linkClass,
+              "ms-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap",
+            )}
           >
             All shortcuts <Key>?</Key>
           </button>

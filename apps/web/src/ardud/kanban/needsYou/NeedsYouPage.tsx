@@ -345,7 +345,14 @@ export function NeedsYouPage(props: {
           inert={card !== null}
           className="relative gap-3 bg-(--m-surface)"
         >
-          <h1 className="min-w-0 shrink truncate font-semibold">{VIEW_TITLES[view]}</h1>
+          <h1
+            className={cn(
+              "font-semibold",
+              view === "queue" ? "shrink-0" : "min-w-0 shrink truncate",
+            )}
+          >
+            {VIEW_TITLES[view]}
+          </h1>
           <p className="flex min-w-0 shrink-0 items-baseline gap-3 text-sm">
             {feed && view === "queue" ? (
               <>
@@ -417,7 +424,7 @@ export function NeedsYouPage(props: {
             <IconBtn
               label="Keyboard shortcuts"
               onClick={() => setShortcutsOpen(true)}
-              className="pointer-coarse:hidden"
+              className={cn("pointer-coarse:hidden", layout === "phone" && "hidden")}
             >
               <KeyboardIcon />
             </IconBtn>

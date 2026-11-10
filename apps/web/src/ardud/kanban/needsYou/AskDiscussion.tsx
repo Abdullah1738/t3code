@@ -16,21 +16,15 @@ export function AskDiscussion(props: {
   waiting: boolean;
   /** He asked to reply: the composer shows even with nothing said yet. */
   open: boolean;
+  /** Inside its own sheet (a phone): it fills the sheet and brings no heading. */
+  sheet?: boolean;
   onOpenCard: (cardId: string) => void;
 }) {
   const { entry } = props;
   const messages = askDiscussion(entry);
-  if (messages.length === 0 && !props.open && !props.waiting) return null;
-  return (
-    <section aria-label="Discussion" data-ny-discussion className="flex min-w-0 flex-col gap-3">
-      <h3 className="flex items-baseline gap-2 text-base font-semibold">
-        Discussion
-        {messages.length > 0 ? (
-          <span className="text-sm font-normal text-(--m-muted) tabular-nums">
-            {messages.length}
-          </span>
-        ) : null}
-      </h3>
+  if (!props.sheet && messages.length === 0 && !props.open && !props.waiting) return null;
+  const talk = (
+    <>
       {messages.length > 0 ? (
         <div className="flex flex-col gap-3">
           {messages.map((message) => (
@@ -44,20 +38,48 @@ export function AskDiscussion(props: {
             />
           ))}
         </div>
+      ) : props.sheet ? (
+        <p className="text-sm text-(--m-muted)">Nothing said yet.</p>
       ) : null}
       {props.waiting ? (
         <p role="status" className="text-sm text-(--m-muted)">
           Waiting on {askAsker(entry)}.
         </p>
       ) : null}
-      <div className="flex flex-col gap-1.5">
-        <Composer
-          placeholder="Ask the agent anything"
-          attachments
-          onSend={(blocks) => replyOnAsk(entry, blocks)}
-        />
-        <p className="-mt-2.5 text-xs text-(--m-muted)">Replying doesn't answer the ask.</p>
+    </>
+  );
+  const composer = (
+    <div className="flex flex-col gap-1.5">
+      <Composer
+        placeholder="Ask the agent anything"
+        attachments
+        onSend={(blocks) => replyOnAsk(entry, blocks)}
+      />
+      <p className="-mt-2.5 text-xs text-(--m-muted)">Replying doesn't answer the ask.</p>
+    </div>
+  );
+  if (props.sheet) {
+    return (
+      <div data-ny-discussion className="flex min-h-0 flex-1 flex-col">
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain p-4">
+          {talk}
+        </div>
+        <div className="shrink-0 px-4 pt-1 pb-3">{composer}</div>
       </div>
+    );
+  }
+  return (
+    <section aria-label="Discussion" data-ny-discussion className="flex min-w-0 flex-col gap-3">
+      <h3 className="flex items-baseline gap-2 text-base font-semibold">
+        Discussion
+        {messages.length > 0 ? (
+          <span className="text-sm font-normal text-(--m-muted) tabular-nums">
+            {messages.length}
+          </span>
+        ) : null}
+      </h3>
+      {talk}
+      {composer}
     </section>
   );
 }

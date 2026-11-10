@@ -3,6 +3,7 @@ import {
   askAge,
   askFieldKind,
   askFormFor,
+  askDiscussion,
   askFormWithSecrets,
   nextChangeView,
   askKindLabel,
@@ -36,12 +37,14 @@ import { MessageSquareIcon } from "lucide-react";
 import {
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
   type RefObject,
 } from "react";
 
+import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../../state/environments";
 import { serverEnvironment } from "../../../state/server";
@@ -84,7 +87,7 @@ import { DraftPart } from "./DraftPart";
 import { EvaluatorThreadLink, HandOver } from "./HandOver";
 import { MediaViewer } from "./MediaViewer";
 import { shortWhen, tomorrowMorning } from "./snoozeTimes";
-import { Btn, Key, Label, Pill, linkClass, type PageLayout } from "./ui";
+import { Btn, Key, Label, Layer, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
   /** Runs a key's action on the ask in focus. */
@@ -130,6 +133,17 @@ export function AskReader(props: {
   const previous = useAskStore((state) => state.previous[key]);
   const [noteOpen, setNoteOpen] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const phone = layout === "phone";
+  // On a phone the discussion is a sheet that stops above the answer bar.
+  const bar = useRef<HTMLDivElement>(null);
+  const [barHeight, setBarHeight] = useState(0);
+  useLayoutEffect(() => {
+    const element = bar.current;
+    if (!element) return;
+    setBarHeight(element.offsetHeight);
+    return observeResize(element, () => setBarHeight(element.offsetHeight));
+  }, []);
   const response = kanbanAskResponse(ask);
   const refusal = askRefusal(response);
   const locked = turn === "evaluator" || turn === "expired";
@@ -256,6 +270,8 @@ export function AskReader(props: {
   };
   const reply = () => {
     setReplyOpen(true);
+    // The sheet focuses its own composer once it is open.
+    if (phone) return;
     requestAnimationFrame(() => {
       const editor = root.current?.querySelector<HTMLElement>(
         "[data-ny-discussion] [contenteditable='true']",
@@ -308,6 +324,7 @@ export function AskReader(props: {
   const title = ask.title ?? entry.cardTitle;
   const plain = response.fields.length === 1 && isPlainAnswerField(ask, response.fields[0]!);
   const showNote = canNote && (noteOpen || form.note !== "");
+  const said = askDiscussion(entry).length;
   const hasAnswerParts =
     response.choose !== null ||
     response.fields.length > 0 ||
@@ -551,32 +568,50 @@ export function AskReader(props: {
               </section>
             ) : null}
 
-            <AskDiscussion
-              entry={entry}
-              waiting={turn === "agent"}
-              open={replyOpen}
-              onOpenCard={props.onOpenLinkedCard}
-            />
+            {phone ? null : (
+              <AskDiscussion
+                entry={entry}
+                waiting={turn === "agent"}
+                open={replyOpen}
+                onOpenCard={props.onOpenLinkedCard}
+              />
+            )}
 
             {layout === "desktop" ? null : aside}
           </article>
           {layout === "desktop" ? <div className="pt-6 pb-8">{aside}</div> : null}
         </div>
 
-        <div className="shrink-0 border-t border-(--m-rule)">
+        <div ref={bar} className="shrink-0 border-t border-(--m-rule)">
           <ActionBar
             ask={ask}
             form={form}
             turn={turn}
-            phone={layout === "phone"}
+            phone={phone}
+            compact={layout === "tablet"}
+            more={
+              <Btn tone="ghost" onClick={() => setMoreOpen(true)}>
+                More
+              </Btn>
+            }
             busy={secretBusy}
             snoozed={item.snoozed}
             onSnooze={snooze}
             lead={
               canTalk ? (
-                <Btn aria-label="Reply in the discussion" onClick={reply} className="px-3">
-                  <MessageSquareIcon aria-hidden />
-                </Btn>
+                <>
+                  <Btn
+                    aria-label={`Discussion, ${said} ${said === 1 ? "message" : "messages"}`}
+                    onClick={reply}
+                    className="px-3"
+                  >
+                    <MessageSquareIcon aria-hidden />
+                    {said > 0 ? <span className="tabular-nums">{said}</span> : null}
+                  </Btn>
+                  <Btn onClick={() => setMoreOpen(true)} className="px-3.5">
+                    More
+                  </Btn>
+                </>
               ) : null
             }
             onPrimary={primary}
@@ -592,7 +627,7 @@ export function AskReader(props: {
               ]).catch(() => undefined)
             }
           >
-            {canNote && !showNote ? (
+            {canNote && !showNote && layout === "desktop" ? (
               <Btn onClick={addNote}>
                 Add a note
                 <Key>N</Key>
@@ -607,6 +642,71 @@ export function AskReader(props: {
             ) : null}
           </ActionBar>
         </div>
+        {layout === "desktop" ? null : (
+          <>
+            <Layer
+              open={replyOpen && phone}
+              onClose={() => setReplyOpen(false)}
+              title={`Discussion · ${entry.boardName} #${entry.cardNumber}`}
+              side="bottom"
+              tall
+              bottomOffset={barHeight}
+              bodyClassName="flex min-h-0 flex-col p-0"
+            >
+              <AskDiscussion
+                sheet
+                entry={entry}
+                waiting={turn === "agent"}
+                open
+                onOpenCard={props.onOpenLinkedCard}
+              />
+            </Layer>
+            <Layer
+              open={moreOpen}
+              onClose={() => setMoreOpen(false)}
+              title="More"
+              side={phone ? "bottom" : "center"}
+              bodyClassName="flex flex-col gap-1 p-3"
+            >
+              {canNote && !showNote ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    addNote();
+                  }}
+                >
+                  Add a note for the agent
+                </MoreRow>
+              ) : null}
+              <MoreRow
+                onClick={() => {
+                  setMoreOpen(false);
+                  snooze();
+                }}
+              >
+                {item.snoozed ? "Bring back" : "Snooze until tomorrow 09:00"}
+              </MoreRow>
+              {phone && refusal && !form.refusing ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    refuse();
+                  }}
+                >
+                  {refusal.label}
+                </MoreRow>
+              ) : null}
+              <MoreRow
+                onClick={() => {
+                  setMoreOpen(false);
+                  props.onOpenCard();
+                }}
+              >
+                Open the card
+              </MoreRow>
+            </Layer>
+          </>
+        )}
         {viewing !== null && media.items.length > 0 ? (
           <MediaViewer
             items={media.items}
@@ -617,6 +717,18 @@ export function AskReader(props: {
         ) : null}
       </div>
     </KanbanLinksProvider>
+  );
+}
+
+function MoreRow(props: { onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={props.onClick}
+      className="flex min-h-11 items-center rounded-xl px-3 text-start text-base outline-none hover:bg-(--m-surface) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+    >
+      {props.children}
+    </button>
   );
 }
 

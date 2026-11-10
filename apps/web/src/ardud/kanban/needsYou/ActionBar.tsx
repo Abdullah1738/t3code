@@ -15,6 +15,10 @@ export function ActionBar(props: {
   form: AskForm;
   turn: AskTurn;
   phone: boolean;
+  /** A narrow reader (a tablet): Snooze moves into More. */
+  compact?: boolean;
+  /** The More button, shown last on a narrow reader. */
+  more?: ReactNode;
   /** The answer is on its way and can't be sent twice. */
   busy?: boolean;
   snoozed: boolean;
@@ -72,7 +76,7 @@ export function ActionBar(props: {
       ) : (
         <>
           {props.phone ? null : props.children}
-          {props.phone ? null : (
+          {props.phone || props.compact ? null : (
             <Btn tone="ghost" onClick={props.onSnooze}>
               {props.snoozed ? "Bring back" : "Snooze"}
               <Key>S</Key>
@@ -84,6 +88,7 @@ export function ActionBar(props: {
               <Key>X</Key>
             </Btn>
           ) : null}
+          {props.compact && !props.phone ? props.more : null}
         </>
       )}
     </Shell>
