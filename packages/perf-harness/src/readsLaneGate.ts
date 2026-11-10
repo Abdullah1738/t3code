@@ -40,7 +40,7 @@ if (lanes === "off") {
 }
 
 export const readsLaneWorkload = {
-  version: 3,
+  version: 4,
   idleCycles: 30,
   holders: 2,
   holderWarmupMs: 1000,
@@ -117,7 +117,7 @@ const record = (phase: string, probe: string, ms: number) =>
   ((probes[phase] ??= {})[probe] ??= []).push(ms);
 const holders = { loadedMs: [] as Array<number>, failures: 0 };
 const writer = { commitMs: [] as Array<number>, failures: 0 };
-const aborted = { issued: 0, completedBeforeAbort: 0 };
+const aborted = { issued: 0, completed: 0, interrupted: 0, failed: 0, errors: [] as Array<string> };
 
 const layer = Projection.layer.pipe(
   Layer.provideMerge(Sqlite.layerFromPath(NodePath.resolve(home, "userdata/statev2.sqlite"))),
@@ -232,7 +232,9 @@ const program = Effect.gen(function* () {
   const until = performance.now() + readsLaneWorkload.loadedMs;
   while (performance.now() < until) yield* cycle("loaded");
   sample("loaded-end");
-  // Client disconnects: foreground reads interrupted while queued or running.
+  // Client disconnects: a burst larger than the foreground slots, so most reads are
+  // still queued (or running) when they are interrupted 5 ms in. Outcomes are kept
+  // apart: completed in time, interrupted by the timeout, or failed with an error.
   yield* Effect.forEach(
     Array.from({ length: readsLaneWorkload.abortBurst }),
     () =>
@@ -242,10 +244,15 @@ const program = Effect.gen(function* () {
           Effect.timeoutOption(readsLaneWorkload.abortAfterMs),
           Effect.tap((result) =>
             Effect.sync(() =>
-              result._tag === "Some" ? aborted.completedBeforeAbort++ : undefined,
+              result._tag === "Some" ? aborted.completed++ : aborted.interrupted++,
             ),
           ),
-          Effect.ignore,
+          Effect.catchCause((cause) =>
+            Effect.sync(() => {
+              aborted.failed++;
+              aborted.errors.push(String(cause).slice(0, 300));
+            }),
+          ),
         );
       }),
     { concurrency: "unbounded", discard: true },

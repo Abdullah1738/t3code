@@ -247,6 +247,9 @@ export async function readsGate(
         throw new Error(
           `${path}: HTTP ${response.status} ${new TextDecoder().decode(body).slice(0, 200)}`,
         );
+      // Unknown GET routes fall back to the web app's index.html with 200.
+      if (!(response.headers.get("content-type") ?? "").includes("json"))
+        throw new Error(`${path}: expected JSON, got ${response.headers.get("content-type")}`);
       return performance.now() - start;
     };
     const post = async (path: string, body: unknown) => {
@@ -303,9 +306,7 @@ export async function readsGate(
               Effect.runPromise(timed(client["kanban.messages"]({ discussionId, limit: 50 }))),
             auth: () => request("/api/auth/session"),
             identity: () =>
-              request(
-                "/api/ardud/control/identity/NodePath.resolve?nativeId=synthetic-native-unknown",
-              ),
+              request("/api/ardud/control/identity/resolve?nativeId=synthetic-native-unknown"),
             backgroundSmall: () =>
               request(
                 `/api/ardud/control/threads?limit=5&updatedSince=${encodeURIComponent("2025-12-31T00:00:00.000Z")}`,
