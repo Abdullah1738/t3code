@@ -3,6 +3,7 @@ import { KANBAN_WAIT_LIMIT_MS } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { poolThreads } from "./rules.ts";
+import type { KanbanThreadPr } from "./threads.ts";
 import {
   checkWait,
   endWait,
@@ -266,6 +267,19 @@ describe("waitSatisfied", () => {
       reason: "Question q1 was answered or dropped",
     });
     expect(waitSatisfied(waiting([]), facts())).toMatchObject({ over: true, outcome: "moot" });
+  });
+});
+
+describe("facts", () => {
+  it("takes the board's thread PR readings as they are", () => {
+    // What threads.view(...).prs returns: the tick passes it straight in.
+    const prs: ReadonlyArray<KanbanThreadPr> = [
+      { url: PR, title: "Fix", state: "open", head: "ffee00112233", checks: "passing" },
+    ];
+    expect(waitSatisfied(card(1, { wait: wait() }), facts({ prs })).over).toBe(true);
+    expect(waitSatisfied(card(1, { wait: wait({ on: "ci" }) }), facts({ prs })).over).toBe(true);
+    const untracked: ReadonlyArray<KanbanThreadPr> = [{ url: PR, title: null, state: "open" }];
+    expect(waitSatisfied(card(1, { wait: wait() }), facts({ prs: untracked })).over).toBe(false);
   });
 });
 
