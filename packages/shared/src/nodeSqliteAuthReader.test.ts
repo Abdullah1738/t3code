@@ -632,3 +632,37 @@ it.live(
   },
   30_000,
 );
+
+// Release 20261110b: the wait for a reserved lane follows the configured
+// statement limit instead of a fixed 5 s, so a holder that stays inside a
+// longer limit no longer turns its waiters away early.
+it.live(
+  "reserved lane admission follows the configured statement limit",
+  () =>
+    withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          const held = yield* Deferred.make<void>();
+          const holder = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* sql`SELECT * FROM sessions`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Effect.sleep("6500 millis");
+              }),
+            )
+            .pipe(SqliteClient.authReadOnly, Effect.forkChild);
+          yield* Deferred.await(held);
+          const started = performance.now();
+          // Before the wiring this failed at 5 s: "not admitted within 5000 ms".
+          assert.deepEqual(
+            yield* sql`SELECT revoked FROM sessions WHERE id=1`.pipe(SqliteClient.authReadOnly),
+            [{ revoked: 0 }],
+          );
+          assert.isAtLeast(performance.now() - started, 5_500);
+          yield* Fiber.join(holder);
+        }),
+      { readerStatementLimit: "8 seconds", readerWedgeLimit: "60 seconds" },
+    ),
+  30_000,
+);

@@ -1631,23 +1631,30 @@ const make = Effect.fn("makeWithDatabase")(function* (
           queueLimit: options.readerQueueLimits?.foreground ?? 128,
         })
       : undefined;
+  // Reserved (auth/identity) lanes: one limit bounds a statement, a snapshot
+  // and the wait for the lane itself, so a configured limit moves all three.
+  const reservedStatementLimit = options.readerStatementLimit ?? "5 seconds";
   const acquireAuth =
     readers && options.authReaderProcess
-      ? yield* makeReaderLanes(() =>
-          makeAuthReader({
-            ...options,
-            readerStatementLimit: options.readerStatementLimit ?? "5 seconds",
-          }),
+      ? yield* makeReaderLanes(
+          () =>
+            makeAuthReader({
+              ...options,
+              readerStatementLimit: reservedStatementLimit,
+            }),
+          reservedStatementLimit,
         )
       : undefined;
 
   const acquireIdentity =
     readers && (options.identityReaderProcess ?? options.authReaderProcess)
-      ? yield* makeReaderLanes(() =>
-          makeAuthReader({
-            ...options,
-            readerStatementLimit: options.readerStatementLimit ?? "5 seconds",
-          }),
+      ? yield* makeReaderLanes(
+          () =>
+            makeAuthReader({
+              ...options,
+              readerStatementLimit: reservedStatementLimit,
+            }),
+          reservedStatementLimit,
         )
       : undefined;
 
