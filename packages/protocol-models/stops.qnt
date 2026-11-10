@@ -158,8 +158,9 @@ module stops {
   // No drop note reaches the thread after it took that card back.
   val noLateNote = s.lateNotes == Set()
   val safe = invariant and owed and givenUp and noLateNote
-  // The same property, named apart for the expected `stepVolatile` counterexample.
+  // The same property, named apart for the expected `stepVolatile` / `stepUnguarded` counterexamples.
   val volatileSafe = safe
+  val unguardedSafe = safe
   run heldStopTest = init.then(request(0)).then(runEnds).then(sendStart).then(sendCapture)
     .then(sendStops(true, true)).then(accept).then(commit)
     .then(all { assert(safe and s.rows == Set() and s.running and s.committed == 1), s' = s })

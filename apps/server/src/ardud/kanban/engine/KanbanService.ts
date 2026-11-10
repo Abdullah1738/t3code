@@ -7058,7 +7058,7 @@ const make = Effect.gen(function* () {
           Effect.andThen(
             locks.outside(
               runPendingStops(threadId).pipe(
-                Effect.catchTag("KanbanThreadError", () => Effect.void),
+                Effect.catchTags({ KanbanThreadError: () => Effect.void }),
               ),
             ),
           ),

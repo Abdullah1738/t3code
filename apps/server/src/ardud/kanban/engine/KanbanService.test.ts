@@ -14279,10 +14279,10 @@ it.live("a cutover restore waits for a stop still pending on its thread", () =>
 /** Sends of a drop/pause note go through `gate` first; everything else is sent as usual. */
 const gatedNotes = (
   fake: Effect.Success<typeof makeFake>,
-  gate: (input: { readonly threadId: ThreadId; readonly text: string }) => Effect.Effect<
-    void,
-    KanbanThreadError
-  >,
+  gate: (input: {
+    readonly threadId: ThreadId;
+    readonly text: string;
+  }) => Effect.Effect<void, KanbanThreadError>,
 ) =>
   Layer.effect(
     KanbanThreads,
