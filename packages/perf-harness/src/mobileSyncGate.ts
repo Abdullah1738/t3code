@@ -18,7 +18,8 @@
  *
  * usage: node packages/perf-harness/src/mobileSyncGate.ts FIXTURE LABEL OUT.json
  * env:   ROBOB_PERF_SERVER_ENTRY (default apps/server/src/bin.ts), ROBOB_PERF_WRITES_PER_S
- *        (default 100), any ROBOB_* switch is passed to the server.
+ *        (default 100), ROBOB_PERF_RECENT_FIRST=1 (ask for the recent page first, as a
+ *        client built from this tree does); any other ROBOB_* switch is passed to the server.
  * The same file runs unchanged in the base tree (copy it there).
  */
 import * as NodeChildProcess from "node:child_process";
@@ -69,6 +70,9 @@ export const mobileSyncWorkload = {
   shellLoaders: 3,
 } as const;
 
+// A client built from this tree asks for the most recently updated threads first; the
+// installed mobile app does not. Older servers ignore the option.
+const recentFirst = process.env.ROBOB_PERF_RECENT_FIRST === "1";
 const token = "synthetic-performance-credential-only";
 const delay = (ms: number) => new Promise<void>((ok) => setTimeout(ok, ms));
 const pct = (values: ReadonlyArray<number>, p: number) => {
@@ -176,7 +180,7 @@ const pagedLoad = async (input: {
   let recentCompleteMs: number | null = null;
   let recentCompletePage: number | null = null;
   while (input.stop?.() !== true) {
-    const path = `/api/orchestration/shell?paged=true${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`;
+    const path = `/api/orchestration/shell?paged=true${recentFirst ? "&recentFirst=true" : ""}${after === undefined ? "" : `&after=${encodeURIComponent(after)}`}`;
     const pageStarted = performance.now();
     let text = "";
     let bytes = 0;
@@ -248,6 +252,7 @@ const result: Record<string, unknown> = {
   host: { cpus: NodeOS.cpus().length, node: process.version },
   serverEntry,
   switches,
+  recentFirst,
 };
 
 try {
