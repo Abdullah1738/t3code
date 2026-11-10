@@ -73,7 +73,9 @@ export const makeFake = Effect.gen(function* () {
       launch: (input) =>
         // A test makes one launch fail by putting this marker in what the thread is told.
         input.text.includes(FAIL_LAUNCH)
-          ? Effect.fail(new KanbanThreadError({ operation: "launch", detail: "the provider is down" }))
+          ? Effect.fail(
+              new KanbanThreadError({ operation: "launch", detail: "the provider is down" }),
+            )
           : Ref.modify(threads, (all) => {
               const threadId = ThreadId.make(`thread-${all.size + 1}`);
               const copy = new Map(all);
@@ -171,62 +173,78 @@ export const writePending = (name: string, mimeType: string, bytes: string) =>
     return attachment;
   });
 
-/** The board's HTTP routes over the service under test, acting as the owner. */
-export const makeHttp = Effect.gen(function* () {
-  const kanban = yield* KanbanService.KanbanService;
-  const sql = yield* SqlClient.SqlClient;
-  const web = yield* Effect.acquireRelease(
-    Effect.sync(() =>
-      HttpRouter.toWebHandler(
-        kanbanRouteLayer.pipe(
-          Layer.provide(
-            Layer.mergeAll(
-              Layer.mock(EnvironmentAuth.EnvironmentAuth)({
-                authenticateHttpRequest: () =>
-                  Effect.succeed({
-                    sessionId: AuthSessionId.make("session-owner"),
-                    subject: "owner",
-                    method: "bearer-access-token" as const,
-                    scopes: ["orchestration:read", "orchestration:operate"],
-                  }),
-              }),
-              Layer.succeed(KanbanService.KanbanService, kanban),
-              Layer.mock(KanbanScripts)({}),
-              Layer.succeed(SqlClient.SqlClient, sql),
-            ).pipe(Layer.provideMerge(NodeServices.layer)),
-          ),
-          Layer.provide(
-            HttpPlatform.layer.pipe(
-              Layer.provideMerge(NodeServices.layer),
-              Layer.provideMerge(Etag.layerWeak),
+/** The session an HTTP caller holds: the owner's paired app unless a test says otherwise. */
+export type HttpCaller =
+  | { readonly _tag: "owner" }
+  | { readonly _tag: "component"; readonly component: string }
+  /** A session nobody marked: a Mac link, `t3 auth session issue`, the old shared control token. */
+  | { readonly _tag: "unmarked" };
+
+/** The board's HTTP routes over the service under test, as the owner's app or as `caller`. */
+export const makeHttpAs = (caller: HttpCaller) => makeHttpFor(caller);
+export const makeHttp = Effect.suspend(() => makeHttpFor({ _tag: "owner" }));
+
+const makeHttpFor = (caller: HttpCaller) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const sql = yield* SqlClient.SqlClient;
+    const web = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        HttpRouter.toWebHandler(
+          kanbanRouteLayer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+                  authenticateHttpRequest: () =>
+                    Effect.succeed({
+                      sessionId: AuthSessionId.make("session-owner"),
+                      subject: "owner",
+                      method: "bearer-access-token" as const,
+                      scopes: ["orchestration:read", "orchestration:operate"],
+                      ...(caller._tag === "owner"
+                        ? { origin: { _tag: "owner" as const, source: "paired-client" as const } }
+                        : caller._tag === "component"
+                          ? { origin: { _tag: "component" as const, component: caller.component } }
+                          : {}),
+                    }),
+                }),
+                Layer.succeed(KanbanService.KanbanService, kanban),
+                Layer.mock(KanbanScripts)({}),
+                Layer.succeed(SqlClient.SqlClient, sql),
+              ).pipe(Layer.provideMerge(NodeServices.layer)),
+            ),
+            Layer.provide(
+              HttpPlatform.layer.pipe(
+                Layer.provideMerge(NodeServices.layer),
+                Layer.provideMerge(Etag.layerWeak),
+              ),
             ),
           ),
+          { disableLogger: true },
         ),
-        { disableLogger: true },
       ),
-    ),
-    (handler) => Effect.promise(() => handler.dispose()),
-  );
-  // The routes read the server settings per request.
-  const context = Context.make(
-    ServerSettings.ServerSettingsService,
-    yield* ServerSettings.ServerSettingsService,
-  );
-  const call = (method: "GET" | "POST", path: string, body?: unknown) =>
-    Effect.promise(async () => {
-      const response = await web.handler(
-        new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
-          method,
-          headers: { authorization: "Bearer owner", "content-type": "application/json" },
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        }),
-        context,
-      );
-      return { status: response.status, body: (await response.json()) as Record<string, any> };
-    });
-  return {
-    get: (path: string) => call("GET", path),
-    post: (path: string, body?: unknown) => call("POST", path, body),
-  };
-});
+      (handler) => Effect.promise(() => handler.dispose()),
+    );
+    // The routes read the server settings per request.
+    const context = Context.make(
+      ServerSettings.ServerSettingsService,
+      yield* ServerSettings.ServerSettingsService,
+    );
+    const call = (method: "GET" | "POST", path: string, body?: unknown) =>
+      Effect.promise(async () => {
+        const response = await web.handler(
+          new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
+            method,
+            headers: { authorization: "Bearer owner", "content-type": "application/json" },
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          }),
+          context,
+        );
+        return { status: response.status, body: (await response.json()) as Record<string, any> };
+      });
+    return {
+      get: (path: string) => call("GET", path),
+      post: (path: string, body?: unknown) => call("POST", path, body),
+    };
+  });
