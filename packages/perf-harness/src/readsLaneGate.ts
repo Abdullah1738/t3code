@@ -40,10 +40,12 @@ if (lanes === "off") {
 }
 
 export const readsLaneWorkload = {
-  version: 2,
+  version: 3,
   idleCycles: 30,
   holders: 2,
   holderWarmupMs: 1000,
+  holderPauseMs: 1,
+  probeTimeoutMs: 60_000,
   loadedMs: 30_000,
   writerEveryMs: 50,
   abortBurst: 20,
@@ -156,7 +158,18 @@ const program = Effect.gen(function* () {
     Effect.forEach(
       Object.keys(run),
       (probe) =>
-        time(run[probe]!(), probe).pipe(
+        time(
+          run[probe]!().pipe(
+            Effect.timeoutOrElse({
+              duration: readsLaneWorkload.probeTimeoutMs,
+              orElse: () =>
+                Effect.fail(
+                  new Error(`probe timed out after ${readsLaneWorkload.probeTimeoutMs} ms`),
+                ),
+            }),
+          ),
+          probe,
+        ).pipe(
           Effect.tap((ms) => Effect.sync(() => record(phase, probe, ms))),
           Effect.catchCause((cause) =>
             Effect.sync(() => (failures[probe] ??= []).push(String(cause).slice(0, 300))),
@@ -193,6 +206,11 @@ const program = Effect.gen(function* () {
           const exit = yield* Effect.exit(time(holderTransaction, "holder"));
           if (exit._tag === "Success") holders.loadedMs.push(exit.value);
           else holders.failures++;
+          // Effect's Semaphore lets a releasing fiber retake the permit before woken
+          // waiters run, so a loop with no async boundary starves every other waiter
+          // (base hung indefinitely in smoke 3). Production callers yield between reads;
+          // a 1 ms pause keeps the reader ~99% busy without modelling that starvation.
+          yield* Effect.sleep(readsLaneWorkload.holderPauseMs);
         }
       }),
     ),
