@@ -188,7 +188,10 @@ export function soakCards(input: SoakBoardInput): ReadonlyArray<KanbanCard> {
 /** Open cards (To-Do and awaiting review) parked on a wait. */
 export const SOAK_WAIT_SHARE = 0.05;
 /** At least one card of every kind of park below, so the smoke board has them all. */
-export const SOAK_WAITS_MIN = 15;
+export const SOAK_WAITS_MIN = 18;
+
+/** The board script the soak's script waits name. No process runs: the soak answers for it. */
+export const SOAK_SCRIPT = "soak-check";
 
 /**
  * The parks the soak seeds, one after the other and round again. `from` is where
@@ -199,8 +202,10 @@ export const SOAK_WAITS_MIN = 15;
  * the PR, so the tick reads the PR from the thread's view; without one the host
  * reader is asked.
  *
- * Script waits are not seeded: their checks are real processes that the
- * scripts' own pass starts, and this harness runs no scripts.
+ * A script wait's check is a real process that the scripts' own pass starts,
+ * and this harness runs none. Its cards are parked all the same: the tick
+ * holds them, and the soak answers for the script through the one batch call
+ * that pass makes (`answerWaits`).
  */
 export const SOAK_PARKS = [
   { kind: "merge", on: "merge", from: "todo", ends: "mid", thread: false },
@@ -218,6 +223,10 @@ export const SOAK_PARKS = [
   { kind: "push, open", on: "push", from: "review", ends: "never", thread: false },
   { kind: "merge, reviewed", on: "merge", from: "reviewed", ends: "mid", thread: false },
   { kind: "time, reviewed", on: "time", from: "reviewed", ends: "mid", thread: false },
+  // Three of them: one script's check answers for several cards at once.
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
+  { kind: "script", on: "script", from: "todo", ends: "never", thread: false },
 ] as const satisfies ReadonlyArray<{
   readonly kind: string;
   readonly on: KanbanWait["on"];
@@ -309,8 +318,8 @@ export function soakWaits(input: SoakWaitsInput): {
           );
     const wait: KanbanWait = {
       on: park.on,
-      script: null,
-      args: null,
+      script: park.on === "script" ? SOAK_SCRIPT : null,
+      args: park.on === "script" ? { issue: `SOAK-${i}` } : null,
       pr: pr as KanbanWait["pr"],
       card: waitsOn,
       ask: null,

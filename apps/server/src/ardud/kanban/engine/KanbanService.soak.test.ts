@@ -26,7 +26,10 @@
  * changed: they must write no parked card, read no thread of a parked card
  * beyond the one view that carries a watched PR, and ask the host reader once.
  * The time of the wait pass in those ticks is reported and held under a ceiling.
- * Script waits are left out: this harness runs no scripts.
+ * Script waits are parked too. No script runs here: after the quiet ticks the soak
+ * answers "hold" for all of them in the one batch call the scripts' pass makes, which
+ * must load the board once and read or write no card. A tick that runs by itself
+ * must never give up (see `ticksGivenUp`).
  *
  * It prints tick, dispatch, turn-end and start-a-card timings and the count of
  * reruns (operations redone because the board changed under them), and fails on
@@ -86,7 +89,7 @@ import { modelSelectionOf } from "./defaults.ts";
 import * as KanbanModels from "./models.ts";
 import * as KanbanService from "./KanbanService.ts";
 import * as Rules from "./rules.ts";
-import { soakCards, soakRandom, soakWaits } from "./soakBoard.ts";
+import { SOAK_SCRIPT, soakCards, soakRandom, soakWaits } from "./soakBoard.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
 import { KanbanWaitPrs } from "./waitPrs.ts";
@@ -142,6 +145,16 @@ const CEILING = {
    * per parked card, not a slow machine.
    */
   waitPassP95Ms: FULL ? 2_000 : 500,
+  /**
+   * Ticks of the board that give up: redone eight times because the board kept
+   * changing under them, then skipped (the tick call still succeeds, and every
+   * step of that tick comes 30 seconds later). On the base this branch started
+   * from (release-20261110c, 11 Nov 2026, smoke, three runs) 3 of 9 ticks give up,
+   * each of them a tick started in the middle of a round's whole traffic, which
+   * every second round does. No worse than that: at most the ticks run that way,
+   * and never a tick that runs by itself.
+   */
+  ticksGivenUp: Math.floor(ROUNDS / 2),
 };
 
 const opus = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
@@ -197,6 +210,8 @@ interface Probe {
   first: number | null;
   last: number | null;
   cardReads: number;
+  /** Loads of the whole board's cards. */
+  boardLoads: number;
   readonly cardWrites: Set<string>;
   readonly threadReads: Map<string, number>;
   hostPasses: number;
@@ -226,6 +241,7 @@ const makeWatch = () => {
         first: null,
         last: null,
         cardReads: 0,
+        boardLoads: 0,
         cardWrites: new Set(),
         threadReads: new Map(),
         hostPasses: 0,
@@ -243,6 +259,12 @@ const makeWatch = () => {
         probe.cardReads += 1;
         return true;
       }, effect),
+    // Counted, not timed: every step of a tick loads the board, not only the wait pass.
+    boardLoad: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.suspend(() => {
+        if (state.probe !== null) state.probe.boardLoads += 1;
+        return effect;
+      }),
     cardWrite: <A, E, R>(cardId: string, effect: Effect.Effect<A, E, R>) =>
       seen((probe) => {
         if (!probe.cards.has(cardId)) return false;
@@ -326,6 +348,7 @@ const watchedStore = (watch: Watch) =>
       const store = yield* KanbanStore.KanbanStore;
       return KanbanStore.KanbanStore.of({
         ...store,
+        cards: (boardId) => watch.boardLoad(store.cards(boardId)),
         card: (cardId) => watch.cardRead(cardId, store.card(cardId)),
         putCard: (card) => watch.cardWrite(card.id, store.putCard(card)),
       });
@@ -723,6 +746,8 @@ it.live(
          * call succeeds and every step of it, the wait pass included, comes a tick later.
          */
         const tickDone: Array<boolean> = [];
+        /** The ticks that gave up, by where they ran. */
+        const gaveUp: Array<string> = [];
         const firstDone = (from: number) => {
           const round = tickDone.indexOf(true, from);
           return round === -1 ? null : round;
@@ -857,6 +882,7 @@ it.live(
           const failedBefore = boardTicksFailed();
           const ticked = yield* op("tick", kanban.tick);
           tickDone.push(Exit.isSuccess(ticked) && boardTicksFailed() === failedBefore);
+          if (boardTicksFailed() > failedBefore) gaveUp.push(`round ${round + 1}, by itself`);
           const cards = yield* cardsNow;
           noteWoken(cards, round);
           const byThread = new Map<string, Array<KanbanCard>>();
@@ -1051,13 +1077,21 @@ it.live(
           // Odd rounds: everything at once, with a tick running through it. Even
           // rounds: the turn ends land together first, then the owner's writes.
           if (round % 2 === 1) {
-            yield* Effect.all(
-              [...agents, ...ownerWork, op("tick", kanban.tick).pipe(Effect.asVoid)],
-              {
-                concurrency: "unbounded",
-                discard: true,
-              },
+            const failedBefore = boardTicksFailed();
+            const midTick = op("tick", kanban.tick).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (boardTicksFailed() > failedBefore) {
+                    gaveUp.push(`round ${round + 1}, in the round's traffic`);
+                  }
+                }),
+              ),
+              Effect.asVoid,
             );
+            yield* Effect.all([...agents, ...ownerWork, midTick], {
+              concurrency: "unbounded",
+              discard: true,
+            });
           } else {
             yield* Effect.all(agents, { concurrency: "unbounded", discard: true });
             yield* Effect.all(ownerWork, { concurrency: "unbounded", discard: true });
@@ -1223,6 +1257,7 @@ it.live(
         // check and nothing else: no write of its row, no read of its thread unless that
         // thread's view carries the PR it waits on (one read), one pass of the host reader.
         // The first tick is not counted: it completes what the settling left ready.
+        const failedBeforeQuiet = boardTicksFailed();
         yield* Effect.exit(kanban.tick);
         const quiet = {
           parked: 0,
@@ -1284,10 +1319,10 @@ it.live(
           if (probe.hostPasses > ran) {
             problems.push(`${when} asked the host reader ${probe.hostPasses} times`);
           }
-          // The locked store reads a card's row twice: once to find its board, once for the card.
-          if (probe.cardReads > 2 * before.size * ran) {
+          // A wait that holds is checked on the card the tick already loaded.
+          if (probe.cardReads > 0) {
             problems.push(
-              `${when} read the rows of ${before.size} parked cards ${probe.cardReads} times`,
+              `${when} read the rows of parked cards ${probe.cardReads} times; none of them had anything to save`,
             );
           }
           quiet.parked = before.size;
@@ -1297,6 +1332,57 @@ it.live(
           quiet.cardReads.push(probe.cardReads);
           quiet.threadReads.push([...probe.threadReads.values()].reduce((sum, n) => sum + n, 0));
           quiet.hostRequests.push(probe.hostRequests);
+        }
+        if (boardTicksFailed() > failedBeforeQuiet) {
+          gaveUp.push(
+            `${boardTicksFailed() - failedBeforeQuiet} of the quiet ticks, by themselves`,
+          );
+        }
+
+        // A script's check came back with nothing new for any of its cards: the answers
+        // go to the board as the scripts' pass sends them, in one batch. That is one
+        // load of the board, whatever the number of cards, and no card read or written.
+        const scripted = (yield* cardsNow).filter(
+          (card) => kanbanWaiting(card) && card.wait?.on === "script",
+        );
+        const batch = { cards: scripted.length, boardLoads: 0, cardReads: 0, cardWrites: 0, ms: 0 };
+        if (scripted.length > 0) {
+          watch.open(new Set(scripted.map((card) => card.id as string)), new Set());
+          const from = performance.now();
+          const outcomes = yield* kanban
+            .answerWaits(
+              board.id,
+              scripted.map((card) => ({
+                card: card.id,
+                answer: { result: "hold" as const },
+                script: SOAK_SCRIPT,
+                expect: card.wait?.at ?? null,
+              })),
+              { _tag: "system", component: "wait-checks" },
+            )
+            .pipe(Effect.orDie);
+          batch.ms = Math.round((performance.now() - from) * 10) / 10;
+          const probe = watch.close();
+          batch.boardLoads = probe?.boardLoads ?? 0;
+          batch.cardReads = probe?.cardReads ?? 0;
+          batch.cardWrites = probe?.cardWrites.size ?? 0;
+          const refused = outcomes.filter((outcome) => !outcome.ok);
+          if (refused.length > 0) {
+            problems.push(
+              `script batch: ${refused.length} of ${outcomes.length} answers were refused: ${refused[0]?.ok === false ? refused[0].detail : ""}`,
+            );
+          }
+          if (batch.boardLoads !== 1 || batch.cardReads > 0 || batch.cardWrites > 0) {
+            problems.push(
+              `script batch of ${batch.cards} holds: ${batch.boardLoads} board loads, ${batch.cardReads} card rows read, ${batch.cardWrites} cards written (one load, none read, none written)`,
+            );
+          }
+          const after = new Map((yield* cardsNow).map((card) => [card.id as string, card]));
+          for (const card of scripted) {
+            if (JSON.stringify(after.get(card.id)) !== JSON.stringify(card)) {
+              problems.push(`script batch changed parked #${card.number}, whose check said hold`);
+            }
+          }
         }
 
         const stages = new Map<string, number>();
@@ -1318,6 +1404,9 @@ it.live(
           startMs,
           turnEnds,
           turnEndsFailed,
+          gaveUp,
+          firstTickDone: tickDone[0] === true,
+          batch,
           waits: {
             parked: parked.length,
             open: unparked.filter((card) => card.stage === "todo" || card.stage === "needs_review")
@@ -1379,6 +1468,7 @@ it.live(
           turnEnds: result.turnEnds,
           turnEndsFailed: result.turnEndsFailed,
           boardTicksFailed: boardTicksFailed(),
+          ticksGivenUpAt: result.gaveUp,
         },
         threadIo: fake.counts,
         firstFailure: Object.fromEntries(firstFailure),
@@ -1413,7 +1503,9 @@ it.live(
               .map(([kind, entry]) => `${kind} ${entry.woken}/${entry.seeded}`)
               .join("; ")}`,
             `wait pass (quiet tick, ${report.waitPass.parked} parked) n=${report.waitPass.ms.n} p50=${report.waitPass.ms.p50}ms p95=${report.waitPass.ms.p95}ms max=${report.waitPass.ms.max}ms; most in a tick: card rows read=${report.waitPass.cardRowsRead} thread views read=${report.waitPass.threadViewsRead} host requests=${report.waitPass.hostRequests} card writes=0; woken in those ticks=${report.waitPass.woken}`,
-            `reruns=${reruns} deepest=${deepest} turnEnds=${result.turnEnds} attempts=${turnEndAttempts} failed=${result.turnEndsFailed} savedThenFailed=${savedThenFailed.length} ticksGivenUp=${boardTicksFailed()}`,
+            `reruns=${reruns} deepest=${deepest} turnEnds=${result.turnEnds} attempts=${turnEndAttempts} failed=${result.turnEndsFailed} savedThenFailed=${savedThenFailed.length}`,
+            `ticksGivenUp=${boardTicksFailed()} of ${(report.timings.tick?.n ?? 0) + (report.timings["tick.quiet"]?.n ?? 0) + 1}${result.gaveUp.length > 0 ? ` (${result.gaveUp.join("; ")})` : ""}`,
+            `script batch (${result.batch.cards} cards, all hold): board loads=${result.batch.boardLoads} card rows read=${result.batch.cardReads} cards written=${result.batch.cardWrites} in ${result.batch.ms}ms`,
             ...[...logged].map(([key, entry]) => `warning x${entry.count}: ${key}`),
             ...savedThenFailed.slice(0, 5).map((entry) => `SAVED-THEN-FAILED ${entry}`),
             ...problems.slice(0, 20).map((problem) => `PROBLEM ${problem}`),
@@ -1443,6 +1535,16 @@ it.live(
       assert.isAbove(result.waits.woken, 0, "waits ended during the run");
       assert.isAbove(report.waitPass.parked, 0, "cards were still parked for the quiet ticks");
       assert.isAtMost(report.waitPass.ms.p95 ?? 0, CEILING.waitPassP95Ms, "wait pass p95");
+      assert.isTrue(result.firstTickDone, "the first tick did its work");
+      assert.deepStrictEqual(
+        result.gaveUp.filter(
+          (where) => where.includes("by itself") || where.includes("by themselves"),
+        ),
+        [],
+        "no tick that runs by itself gives up",
+      );
+      assert.isAtMost(boardTicksFailed(), CEILING.ticksGivenUp, "ticks that gave up");
+      assert.isAbove(result.batch.cards, 0, "cards waited on a script for the batch");
     }),
   { timeout: FULL ? 900_000 : 120_000 },
 );
