@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import http from "node:http";
+import https from "node:https";
 import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
@@ -83,6 +85,38 @@ export async function install(ops, { rollback = false } = {}) {
 
 /** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
  * the child in U state, where even SIGKILL waits, so it is abandoned. */
+/**
+ * One JSON GET for the readiness polls, on node:http rather than global fetch. Under Node
+ * 26.2 fetch (undici) threw `setTypeOfService EINVAL` from a socket callback while the new
+ * server was not listening yet: outside any promise, so no try/catch saw it and the
+ * installer died after `launched` (10 Nov 2026). Every failure here rejects instead.
+ */
+export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const request = (target.protocol === "https:" ? https : http).get(
+      target,
+      { headers, agent: false },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("error", reject);
+        response.on("end", () => {
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status > 299) return reject(new Error(`HTTP ${status}`));
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("Request timed out")));
+    request.on("error", reject);
+  });
+}
+
 export function probeDirectory(dir, timeoutMs = 10_000, command = ["/bin/ls", ["-f", dir]]) {
   return new Promise((resolve) => {
     let settled = false;
@@ -390,14 +424,8 @@ async function main(args) {
     ),
   );
   const origin = (cfg.url || "http://127.0.0.1:3773").replace(/\/$/, "");
-  const get = async (route) => {
-    const response = await fetch(`${origin}${route}`, {
-      headers: { authorization: `Bearer ${cfg.token}` },
-      signal: AbortSignal.timeout(1000),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
-  };
+  const get = (route) =>
+    getJson(`${origin}${route}`, { headers: { authorization: `Bearer ${cfg.token}` } });
   let oldBootId;
   try {
     oldBootId = (await get("/api/ardud/control/install-report")).bootId;

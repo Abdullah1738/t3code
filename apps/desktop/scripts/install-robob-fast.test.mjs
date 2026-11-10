@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import {
   checkSignature,
   clearStaleStaging,
+  getJson,
   hostPreflight,
   install,
   otherInstallerPids,
@@ -469,4 +470,41 @@ test("installer and process-path parsers", () => {
   const comm = "5 /A/.Robob.next.app/Contents/MacOS/Robob\n6 /A/Robob.app/Contents/MacOS/Robob\n";
   assert.deepEqual(pidsRunningFrom(comm, "/A/.Robob.next.app"), [{ pid: 5 }]);
   assert.deepEqual(pidsRunningFrom(comm, "/A/Robob.app"), [{ pid: 6 }]);
+});
+
+test("readiness polls reject on every failure and never use global fetch", async () => {
+  const hits = [];
+  const server = createServer((req, res) => {
+    hits.push(req.headers.authorization);
+    if (req.url === "/ok") {
+      res.setHeader("content-type", "application/json");
+      return res.end('{"bootId":"b1"}');
+    }
+    if (req.url === "/bad") {
+      res.statusCode = 503;
+      return res.end("starting");
+    }
+    if (req.url === "/text") return res.end("not json");
+    // "/slow" never answers.
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    assert.deepEqual(await getJson(`${origin}/ok`, { headers: { authorization: "Bearer t" } }), {
+      bootId: "b1",
+    });
+    assert.deepEqual(hits, ["Bearer t"]);
+    await assert.rejects(getJson(`${origin}/bad`), /HTTP 503/);
+    await assert.rejects(getJson(`${origin}/text`), SyntaxError);
+    await assert.rejects(getJson(`${origin}/slow`, { timeoutMs: 50 }), /timed out/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  // The server is gone: what the installer polls right after launching the new app.
+  for (let i = 0; i < 20; i++) await assert.rejects(getJson(`${origin}/ok`), /ECONNREFUSED/);
+  // Node 26.2's fetch crashed the installer from a socket callback; keep it out.
+  const source = await readFile(new URL("./install-robob-fast.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source.replace(/^\s*(\*|\/\/).*$/gm, ""), /\bfetch\(/);
 });
