@@ -12,7 +12,9 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -44,7 +46,12 @@ import * as KanbanService from "./KanbanService.ts";
 import * as KanbanModels from "./models.ts";
 import * as ScriptService from "./ScriptService.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
-import { KanbanThreads, type KanbanThreadPr, type KanbanThreadView } from "./threads.ts";
+import {
+  KanbanThreadError,
+  KanbanThreads,
+  type KanbanThreadPr,
+  type KanbanThreadView,
+} from "./threads.ts";
 import { KanbanWaitPrs } from "./waitPrs.ts";
 import * as Waits from "./waits.ts";
 
@@ -74,6 +81,17 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     readings: [],
     asked: [],
   };
+  /**
+   * Holds an evaluator's start: `entered` is done when the board tries to start one,
+   * and the start goes through once `open` is done. `fail` makes it fail instead.
+   */
+  const gate: {
+    hold: {
+      readonly entered: Deferred.Deferred<void>;
+      readonly open: Deferred.Deferred<void>;
+    } | null;
+    fail: boolean;
+  } = { hold: null, fail: false };
   let next = 0;
   const view = (threadId: ThreadId) =>
     Effect.map(Clock.currentTimeMillis, (nowMs): KanbanThreadView | null => {
@@ -102,7 +120,16 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       latestRun: () => Effect.succeed(null),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          if (input.title.startsWith("Evaluator")) {
+            if (gate.hold !== null) {
+              yield* Deferred.succeed(gate.hold.entered, undefined);
+              yield* Deferred.await(gate.hold.open);
+            }
+            if (gate.fail) {
+              return yield* new KanbanThreadError({ operation: "launch", detail: "host is down" });
+            }
+          }
           next += 1;
           const threadId = ThreadId.make(`thread-${next}`);
           threads.set(threadId, {
@@ -170,6 +197,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     threads,
     prs,
     host,
+    gate,
     layer,
     /** Messages anywhere that include `text`. */
     said,
@@ -804,6 +832,117 @@ it.effect("an evaluator that parks the card again in its turn keeps it out of Co
       assert.isTrue(kanbanWaiting(card));
     }),
   ),
+);
+
+/** A reviewed card with nothing to land, parked until `T0 + HOUR`. */
+const reviewedAndParked = (board: KanbanBoard) =>
+  Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const created = yield* kanban.createCard(
+      board.id,
+      { prompt: "Review PR 12", title: "Review PR 12", links: [{ url: PR }] },
+      owner,
+    );
+    yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+    yield* kanban.waitCard(
+      created.id,
+      { on: "time", until: iso(T0 + HOUR), note: "see if the author replied" },
+      owner,
+    );
+    return created;
+  });
+
+it.effect(
+  "a wake pushed to a reviewed card holds it from the write on: a tick before the ask is sent does not complete it",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        const created = yield* reviewedAndParked(board);
+        // The ask to the evaluator is sent after the write, by its lane's drain. Hold it there.
+        const hold = {
+          entered: yield* Deferred.make<void>(),
+          open: yield* Deferred.make<void>(),
+        };
+        world.gate.hold = hold;
+        const answering = yield* Effect.forkChild(
+          kanban.answerWait(
+            created.id,
+            { result: "wake", note: "The author replied on the PR" },
+            { script: null },
+            owner,
+          ),
+        );
+        yield* Deferred.await(hold.entered);
+        // The write is in (the wait is gone) and nobody has been asked yet.
+        let card = yield* cardOf(created.id);
+        assert.isUndefined(card.wait);
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
+        yield* kanban.tick;
+        yield* TestClock.adjust(MINUTE);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(created.id)).stage, "in_review");
+
+        // The ask goes out: now the reply the evaluator owes holds the card.
+        yield* Deferred.succeed(hold.open, undefined);
+        yield* Fiber.join(answering);
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 1);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(created.id)).stage, "in_review");
+
+        const evaluator = ThreadId.make(
+          [...world.threads].find(([, thread]) => thread.title.startsWith("Evaluator"))![0],
+        );
+        yield* kanban.turnEnded(evaluator);
+        yield* kanban.tick;
+        card = yield* cardOf(created.id);
+        assert.strictEqual(card.stage, "completed");
+      }),
+    ),
+);
+
+it.effect(
+  "an ask that cannot be sent holds a pushed wake's card until the limit, and a tick's card not at all",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        world.gate.fail = true;
+        // From a write: the drain keeps trying, and the card is held until the limit.
+        const pushed = yield* reviewedAndParked(board);
+        const answering = yield* Effect.forkChild(
+          kanban
+            .answerWait(
+              pushed.id,
+              { result: "wake", note: "The author replied on the PR" },
+              { script: null },
+              owner,
+            )
+            .pipe(Effect.exit),
+        );
+        yield* Effect.yieldNow;
+        yield* kanban.tick;
+        assert.isUndefined((yield* cardOf(pushed.id)).wait);
+        assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+        yield* TestClock.adjust(Waits.WAIT_DECIDE_MS - MINUTE);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(pushed.id)).stage, "in_review");
+        yield* TestClock.adjust(2 * MINUTE);
+        yield* kanban.tick;
+        assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
+        assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
+        yield* Fiber.interrupt(answering);
+
+        // From the tick: the send fails then and there, nobody was told, so nothing holds it.
+        const ticked = yield* reviewedAndParked(board);
+        yield* TestClock.adjust(2 * HOUR);
+        yield* kanban.tick;
+        const done = yield* cardOf(ticked.id);
+        assert.isUndefined(done.wait);
+        assert.strictEqual(done.stage, "completed");
+      }),
+    ),
 );
 
 it.effect("an evaluator that never ends its turn cannot keep a reviewed card from completing", () =>
