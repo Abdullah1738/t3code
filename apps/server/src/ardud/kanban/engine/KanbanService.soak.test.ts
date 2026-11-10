@@ -98,8 +98,11 @@ const REVIEW_ENDS = FULL ? 10 : 4;
  * (10 Nov 2026, board-lock-diet engine: tick p50 430 ms and p95 3.7 s, dispatch
  * p50 250 ms and p95 2.1 s, turn end p95 380 ms, an urgent card started 110 ms
  * after its create, 2.4 attempts per turn end, 18% of turn ends reporting a
- * failure). They catch a tick or a dispatch that goes quadratic, or turn ends
- * that start failing far more often under contention, not a slow machine.
+ * failure). With the retry-once change the tick's median is about 2.2 s here:
+ * a card waiting out its retry keeps its thread, the tick checks each one, and
+ * the soak fails one turn in twelve. They catch a tick or a dispatch that goes
+ * quadratic, or turn ends that start failing far more often under contention,
+ * not a slow machine.
  */
 const CEILING = {
   tickP95Ms: FULL ? 15_000 : 3_000,
@@ -116,6 +119,14 @@ const opus = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" }
 const sol = modelSelectionOf({ model: "opus/cx/gpt-6.1-sol", variant: "xhigh" });
 const astra = modelSelectionOf({ model: "opus/gpt-6-astra", variant: "xhigh" });
 const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "high" });
+/**
+ * A card's automatic retry records, read loosely so this file also builds on an
+ * engine without them (the retry change is a separate commit).
+ */
+const retriesOf = (card: KanbanCard) =>
+  (card as { readonly retries?: ReadonlyArray<{ readonly state: string }> }).retries ?? [];
+/** Only the cards whose start is timed run on this one. */
+const urgentModel = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "max" });
 /** 60 slots on the full board, as the real one: two work pools, two that only review. */
 const POOLS: ReadonlyArray<readonly [ModelSelection, number]> = FULL
   ? [
@@ -547,7 +558,7 @@ it.live(
           blockedBy: ReadonlyArray<KanbanCard["id"]>,
           priority: number,
           n: number,
-          /** The card whose start is timed: it runs on the pool with the free slot. */
+          /** The card whose start is timed: it runs on its own pool. */
           urgent = false,
         ) =>
           op(
@@ -560,7 +571,7 @@ it.live(
                 description: "Made during the soak",
                 priority,
                 blockedBy,
-                model: urgent || random.chance(0.6) ? opus : sol,
+                model: urgent ? urgentModel : random.chance(0.6) ? opus : sol,
                 reviewChain: random.pick(CHAINS).name,
               },
               actor,
@@ -825,31 +836,19 @@ it.live(
           problems.push(`left unstarted with a free slot: ${entry}`);
         const settled = yield* check("after settling");
 
-        // Time to start a card: with a slot free on the busiest work pool, the owner
-        // creates an urgent card, and it starts through the production path (the
-        // create's queued kick, on the worker). Timed from the create to the launch.
+        // Time to start a card: the owner creates an urgent card on a pool with a
+        // free slot, and it starts through the production path (the create's queued
+        // kick, on the worker, planning over the whole board). Timed from the create
+        // to the launch. The pool is the urgent cards' own: on the shared pools a
+        // free slot goes to whichever of the board's waiting cards ranks first, so
+        // the time would measure the queue, not the start.
         const startMs: Array<number> = [];
-        const workKey = Rules.poolKey(opus);
-        let slots = (yield* store.pools(board.id).pipe(Effect.orDie)).find(
-          (pool) => pool.key === workKey,
-        )!.slots;
+        const workKey = Rules.poolKey(urgentModel);
+        yield* kanban.setPool(board.id, urgentModel, 5).pipe(Effect.orDie);
         for (let i = 0; i < 5; i += 1) {
-          // Open slots until one stays free after dispatch (ours and the worker's
-          // queued kicks) has taken what it wants.
-          for (let tries = 0; tries < 12; tries += 1) {
-            yield* kanban.dispatchNow.pipe(Effect.orDie);
-            yield* Effect.sleep(30);
-            const busy = new Set(
-              (yield* cardsNow).flatMap((card) =>
-                card.activePool === workKey && card.activeThreadId !== null
-                  ? [card.activeThreadId as string]
-                  : [],
-              ),
-            ).size;
-            if (busy < slots) break;
-            slots += 1;
-            yield* kanban.setPool(board.id, opus, slots).pipe(Effect.orDie);
-          }
+          // Let dispatch (ours and the worker's queued kicks) take what it wants first.
+          yield* kanban.dispatchNow.pipe(Effect.orDie);
+          yield* Effect.sleep(30);
           made_ += 1;
           const waitStart = yield* fake.awaitStart(`Urgent start ${made_}`);
           const from = performance.now();
@@ -858,6 +857,34 @@ it.live(
           if (kicked._tag === "None") {
             problems.push(
               `urgent card "Urgent start ${made_}" had a free slot and did not start in ${CEILING.startMs} ms`,
+            );
+            // What the dispatcher would start instead, and what holds the pool.
+            const now = yield* cardsNow;
+            const pools = yield* store.pools(board.id).pipe(Effect.orDie);
+            const current = yield* store.boards.pipe(
+              Effect.orDie,
+              Effect.map((boards) => boards.find((candidate) => candidate.id === board.id)!),
+            );
+            const byId = new Map(now.map((card) => [card.id as string, card]));
+            const cardLine = (card: KanbanCard | undefined) => {
+              if (!card) return "missing";
+              const thread = fake.threads.get(
+                (card.activeThreadId ?? card.workThreadId ?? "") as string,
+              );
+              return `#${card.number} ${card.stage} p${card.priority} pool=${card.activePool} active=${card.activeThreadId} work=${card.workThreadId} stalled=${card.stalled?.reason ?? null} retries=${JSON.stringify(retriesOf(card))} thread=${thread ? `running:${thread.running} failed:${thread.failure !== null}` : "none"}`;
+            };
+            problems.push(
+              `  the card: ${cardLine(now.find((card) => card.title === `Urgent start ${made_}`))}`,
+              `  pool ${workKey}: ${pools.find((pool) => pool.key === workKey)?.slots} slots`,
+              ...now
+                .filter((entry) => entry.activePool === workKey && entry.activeThreadId !== null)
+                .map((card) => `  holds a slot: ${cardLine(card)}`),
+              ...Rules.planDispatch(current, now, pools)
+                .slice(0, 8)
+                .map(
+                  (dispatch) =>
+                    `  dispatch would start: ${dispatch.role} on ${dispatch.pool} joins=${dispatch.joins} ${cardLine(byId.get(dispatch.cardId))}`,
+                ),
             );
             continue;
           }
@@ -875,6 +902,10 @@ it.live(
           created: expected.size - seeded.length,
           stages: Object.fromEntries(stages),
           flagged: settled.filter((card) => card.stalled !== null).length,
+          retryWaiting: settled.filter((card) => retriesOf(card).at(-1)?.state === "waiting")
+            .length,
+          retryRestarted: settled.filter((card) => retriesOf(card).at(-1)?.state === "restarted")
+            .length,
           started,
           startMs,
           turnEnds,
@@ -936,7 +967,7 @@ it.live(
       yield* Effect.sync(() =>
         process.stdout.write(
           [
-            `soak ${CARDS} cards x ${ROUNDS} rounds (seed ${SEED}): ${JSON.stringify(result.stages)} flagged=${result.flagged} created=${result.created} started=${result.started}`,
+            `soak ${CARDS} cards x ${ROUNDS} rounds (seed ${SEED}): ${JSON.stringify(result.stages)} flagged=${result.flagged} retrying=${result.retryWaiting} waiting, ${result.retryRestarted} restarted created=${result.created} started=${result.started}`,
             line("tick"),
             line("dispatch"),
             line("turnEnded"),
