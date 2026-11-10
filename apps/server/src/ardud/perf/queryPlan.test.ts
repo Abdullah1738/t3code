@@ -211,6 +211,7 @@ it.effect(
               "shell.selection",
               "shell.client-selection",
               "shell.recent-page",
+              "turn-start.run-control",
               "board.thread-state",
               "boards.tallies",
               "discussion.messages",
