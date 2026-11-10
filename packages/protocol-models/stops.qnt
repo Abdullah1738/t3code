@@ -4,9 +4,12 @@
 // A card that lets go of its thread saves a stop row for the assignment the
 // board has committed for that thread. Dispatch reuses a thread in the code's
 // order: it sends first, outside the board gate, then commits the assignment
-// when it takes the gate back; any board write in between (here: any stop
-// request) makes that commit stale, so the assignment is abandoned (the code
-// then tells the thread the board changed). The send runs the thread's pending
+// when it takes the gate back. Dispatch is card-scoped, so only some writes
+// make it stale; saving a stop for its thread does: `gen` is the thread's stop
+// resource (`stops:<thread>`), which dispatch observes before the send and
+// every saved stop moves after registering itself as pending. A stale commit is
+// abandoned (the code then tells the thread the board changed). All modelled
+// stops are on the one thread. The send runs the thread's pending
 // stops under the one stop lock in two steps: capture the pending keys, then
 // interrupt and close their rows (a failed close fails the send). Drains take
 // the same lock the same way. Requests are never blocked by the lock, so they

@@ -14122,3 +14122,62 @@ it.effect("a stop that is never confirmed closes undeliverable, with a notice, a
     }).pipe(Effect.provide(testLayer(layer)));
   }),
 );
+
+it.live("a stop another card saves while an assignment to its thread is out abandons that assignment", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const order: Array<string> = [];
+    let holdFor: string | null = null;
+    const layer = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          interrupt: (threadId, reason) =>
+            Effect.sync(() => order.push(`interrupt ${threadId}`)).pipe(
+              Effect.andThen(real.interrupt(threadId, reason)),
+            ),
+          send: (input) =>
+            Effect.suspend(() =>
+              holdFor !== null && input.text.includes(holdFor)
+                ? ((holdFor = null),
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(Effect.sync(() => order.push(`assign ${input.threadId}`))),
+                    Effect.andThen(real.send(input)),
+                  ))
+                : real.send(input),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, card: a, threadId } = yield* workingCard;
+      // B joined the same thread, waited on the owner, and is back in todo with that thread kept.
+      const b = (yield* kanban.createForThread(threadId, { prompt: "B", title: "B" })).card;
+      yield* kanban.moveCard(b.id, "needs_owner", "cardThread", { _tag: "thread", threadId }, {
+        question: "Which one?",
+      });
+      yield* kanban.moveCard(b.id, "todo", "owner", owner);
+      const parked = (yield* kanban.card(b.id)).card;
+      assert.strictEqual(parked.workThreadId, threadId);
+      assert.isNull(parked.activeThreadId);
+      // Dispatch sends B's assignment to the thread; it is held there, past the stop check.
+      holdFor = `#${b.number}`;
+      const dispatching = yield* Effect.forkChild(kanban.dispatchNow);
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"));
+      // The owner lets A go meanwhile: B isn't committed on the thread, so A saves a stop for it.
+      yield* kanban.moveCard(a.id, "todo", "owner", owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(dispatching).pipe(Effect.ignore);
+      yield* eventually(effectRows, (all) => all.every((row) => row.done_at !== null));
+      const nowB = (yield* kanban.card(b.id)).card;
+      const assigned = order.indexOf(`assign ${threadId}`);
+      const cutAfter = order.slice(assigned + 1).includes(`interrupt ${threadId}`);
+      // Never both: B committed on the thread and then cut by A's stop.
+      assert.isFalse(nowB.activeThreadId === threadId && cutAfter, JSON.stringify({ order, stage: nowB.stage }));
+    }).pipe(Effect.provide(withOwnerRouteMode(testLayer(layer), "deferred")));
+  }),
+);

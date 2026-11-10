@@ -1026,6 +1026,7 @@ const make = Effect.gen(function* () {
       if (!lock) modelLocks.set(threadId, (lock = Semaphore.makeUnsafe(1)));
       return lock.withPermits(1)(effect);
     });
+  const stopResource = (threadId: string) => `stops:${threadId}`;
   const addPendingStop = (threadId: string, routeKey: string, reason: string) => {
     let stops = pendingStops.get(threadId);
     if (!stops) pendingStops.set(threadId, (stops = new Map()));
@@ -3505,7 +3506,16 @@ const make = Effect.gen(function* () {
         { discard: true },
       ),
     );
+    // Registered before the thread's stop resource moves: a dispatch that saw
+    // the old value is stale on its return; one that sees the new value finds
+    // the stop pending and runs it before its send.
     for (const [threadId, routeKey, reason] of stops) addPendingStop(threadId, routeKey, reason);
+    for (const [threadId] of stops) {
+      const boardId = effects.find(
+        ({ effect }) => effect.kind === "interrupt" && effect.threadId === threadId,
+      )!.boardId;
+      yield* locks.access(boardId, Effect.void, true, stopResource(threadId));
+    }
     return lanes;
   });
   /** After a restart, stops saved and not yet run hold their threads' sends again. */
@@ -3708,7 +3718,7 @@ const make = Effect.gen(function* () {
       if (!(yield* stopRowOpen(record))) return;
       yield* routeNotice(
         record.discussion_id,
-        `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board no longer holds its sends for this stop.`,
+        `Stopping thread ${stop.effect.threadId} could not be confirmed (${record.route_key}) after 10 minutes of retries; it may still be working on the card it was let go from. The board stops holding its sends for this stop once this outcome is saved.`,
       );
       return yield* closeGivenUpStop(record, stop.effect.threadId);
     }
@@ -4338,6 +4348,10 @@ const make = Effect.gen(function* () {
     if (threadId) {
       const reused = threadId;
       const key = wakeKey(reused, `${card.id}:${at}`);
+      // A stop saved for this thread while the assignment is out (another card
+      // let go of it) makes this assignment stale: it is abandoned rather than
+      // committed and then cut by that stop (see `saveEffectRows`).
+      yield* locks.access(board.id, Effect.void, false, stopResource(reused));
       yield* locks.outside(
         Effect.andThen(
           runPendingStops(reused),
