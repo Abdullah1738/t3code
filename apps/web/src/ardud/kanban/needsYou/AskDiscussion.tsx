@@ -19,7 +19,7 @@ export function AskDiscussion(props: {
   entry: KanbanAskFeedItem;
   /** The ask waits on its agent after his reply. */
   waiting: boolean;
-  /** He asked to reply: the composer shows even with nothing said yet. */
+  /** He may reply: the composer shows even with nothing said yet. */
   open: boolean;
   /** Inside its own sheet (a phone): it fills the sheet and brings no heading. */
   sheet?: boolean;
@@ -88,11 +88,9 @@ export function AskDiscussion(props: {
     <section aria-label="Discussion" data-ny-discussion className="flex min-w-0 flex-col gap-3">
       <h3 className="flex items-baseline gap-2 text-base font-semibold">
         Discussion
-        {messages.length > 0 ? (
-          <span className="text-sm font-normal text-(--m-muted) tabular-nums">
-            {messages.length}
-          </span>
-        ) : null}
+        <span className="text-sm font-normal text-(--m-muted) tabular-nums">
+          {messages.length > 0 ? messages.length : "no messages yet"}
+        </span>
       </h3>
       {talk}
       {composer}

@@ -565,7 +565,7 @@ export function AskReader(props: {
               <AskDiscussion
                 entry={entry}
                 waiting={turn === "agent"}
-                open={replyOpen}
+                open={canTalk}
                 onOpenCard={props.onOpenLinkedCard}
               />
             )}
