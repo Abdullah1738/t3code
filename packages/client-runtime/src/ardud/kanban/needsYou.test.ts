@@ -97,7 +97,57 @@ describe("needsYouItems", () => {
     expect(list.count).toBe(1);
     expect(list.blocking).toBe(0);
     // Each group has its own count; the badge number is `owner`.
-    expect(list.counts).toEqual({ owner: 1, agent: 1, evaluator: 1, expired: 1 });
+    expect(list.counts).toEqual({ owner: 1, agent: 1, evaluator: 1, expired: 1, notices: 0 });
+  });
+
+  it("gives each item its response parts, and keeps notices apart, uncounted and never blocking", () => {
+    const list = needsYouItems(
+      state([
+        card(1, { asks: [ask("q1")] }),
+        card(2, {
+          asks: [
+            ask("q1", {
+              kind: "deploy-go" as never,
+              action: { summary: "Deploy" },
+              respond: {
+                verdict: { approve: "Deploy", reject: "Hold" },
+                fields: [{ id: "when", label: "When", type: "date" }],
+              } as never,
+            }),
+          ],
+        }),
+        card(3, {
+          asks: [
+            // A notice stored as blocking by mistake still never counts as blocking.
+            ask("q1", { kind: "notice", blocking: true, respond: { ack: true } }),
+            ask("q2", {
+              options: [
+                { id: "a", label: "A" },
+                { id: "b", label: "B" },
+              ] as never,
+            }),
+          ],
+        }),
+      ]),
+      NOW,
+    );
+    expect(keys(list.items)).toEqual(["card-1:q1", "card-2:q1", "card-3:q2"]);
+    expect(keys(list.notices)).toEqual(["card-3:q1"]);
+    expect([list.count, list.blocking]).toEqual([3, 0]);
+    expect(list.counts).toEqual({ owner: 3, agent: 0, evaluator: 0, expired: 0, notices: 1 });
+    expect(list.notices[0]).toMatchObject({ notice: true, blocking: false });
+    expect(list.notices[0]!.response.ack).toBe(true);
+
+    const [plain, custom, pick] = list.items;
+    // An ask with no kind and no parts takes a free-text reply.
+    expect(plain!.response.fields.map((field) => [field.id, field.type])).toEqual([
+      ["answer", "longtext"],
+    ]);
+    // A kind this client has never heard of renders from its parts.
+    expect(custom!.kind).toBe("deploy-go");
+    expect(custom!.response.verdict).toEqual({ approve: "Deploy", reject: "Hold" });
+    expect(custom!.response.fields.map((field) => field.id)).toEqual(["when"]);
+    expect(pick!.response.choose).toMatchObject({ multi: false, min: 1, max: 1 });
   });
 
   it("folds asks with the same batch key on a board into one entry at its best item's place", () => {

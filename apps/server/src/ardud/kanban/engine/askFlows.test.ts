@@ -3,11 +3,8 @@
  * asking with a template and blocks, answering, replying without answering,
  * editing, handing one to the evaluator, and the Needs-you feed.
  */
-import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
-  AuthSessionId,
-  ProjectId,
   ThreadId,
   kanbanAskWaitsOn,
   type KanbanActor,
@@ -15,222 +12,22 @@ import {
   type KanbanBlock,
   type KanbanCard,
 } from "@t3tools/contracts";
-import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
-import * as Layer from "effect/Layer";
-import * as Path from "effect/Path";
-import * as Ref from "effect/Ref";
-import * as Etag from "effect/http/Etag";
-import * as HttpPlatform from "effect/http/HttpPlatform";
-import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { createPendingAttachmentId, resolveAttachmentPath } from "../../../attachmentStore.ts";
-import * as EnvironmentAuth from "../../../auth/EnvironmentAuth.ts";
+import { resolveAttachmentPath } from "../../../attachmentStore.ts";
 import * as ServerConfig from "../../../config.ts";
-import * as ProjectService from "../../../project/ProjectService.ts";
-import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
-import * as Sqlite from "../../../persistence/Sqlite.ts";
-import * as ServerSettings from "../../../serverSettings.ts";
-import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
-import { KANBAN_ROUTE_PREFIX, kanbanRouteLayer } from "../http.ts";
-import * as KanbanStore from "../store/KanbanStore.ts";
-import * as KanbanModels from "./models.ts";
-import * as KanbanService from "./KanbanService.ts";
-import { KanbanScripts } from "./ScriptService.ts";
-import { opencodeTestProvider } from "./testProviders.ts";
-import { KanbanThreads, type KanbanThreadView } from "./threads.ts";
-
-const owner: KanbanActor = { _tag: "owner" };
-
-interface FakeThread {
-  readonly title: string;
-  readonly messages: Array<string>;
-}
-
-const makeFake = Effect.gen(function* () {
-  const threads = yield* Ref.make(new Map<string, FakeThread>());
-  const view = (threadId: ThreadId) =>
-    Ref.get(threads).pipe(
-      Effect.map((all): KanbanThreadView | null => {
-        const thread = all.get(threadId);
-        if (!thread) return null;
-        return {
-          threadId,
-          projectId: ProjectId.make("project-1"),
-          title: thread.title,
-          state: "idle",
-          updatedAt: "2026-11-10T10:00:00.000Z",
-          quietSince: "2026-11-10T10:00:00.000Z",
-          runStartedAt: null,
-          backgroundWork: 0,
-          prs: [],
-          archived: false,
-        };
-      }),
-    );
-  const layer = Layer.succeed(
-    KanbanThreads,
-    KanbanThreads.of({
-      view,
-      find: view,
-      launch: (input) =>
-        Ref.modify(threads, (all) => {
-          const threadId = ThreadId.make(`thread-${all.size + 1}`);
-          const copy = new Map(all);
-          copy.set(threadId, { title: input.title, messages: [input.text] });
-          return [threadId, copy] as const;
-        }),
-      send: (input) =>
-        Ref.update(threads, (all) => {
-          all.get(input.threadId)?.messages.push(input.text);
-          return all;
-        }),
-      lastFailure: () => Effect.succeed(null),
-      findLastFailure: () => Effect.succeed(null),
-      latestRun: () => Effect.succeed(null),
-      compactRun: () => Effect.succeed(null),
-      model: () => Effect.succeed(null),
-      setModel: () => Effect.void,
-      interrupt: () => Effect.void,
-    }),
-  );
-  /** Every text a thread was sent, its first message included. */
-  const heard = (threadId: string) =>
-    Ref.get(threads).pipe(Effect.map((all) => all.get(threadId)?.messages ?? []));
-  /** The evaluator thread that was started for a card's discussion, and what it was told. */
-  const evaluators = Ref.get(threads).pipe(
-    Effect.map((all) =>
-      [...all.entries()]
-        .filter(([, thread]) => thread.title.startsWith("Evaluator"))
-        .map(([threadId, thread]) => ({ threadId: ThreadId.make(threadId), ...thread })),
-    ),
-  );
-  return { threads, layer, heard, evaluators };
-});
-
-const filesLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-kanban-asks-" }).pipe(
-  Layer.provideMerge(NodeServices.layer),
-  Layer.provideMerge(ServerSettings.layerTest()),
-);
-
-const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
-  KanbanService.layer.pipe(
-    Layer.provideMerge(fake),
-    Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
-    Layer.provideMerge(Sqlite.layerMemory),
-    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
-    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
-    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
-    Layer.provideMerge(filesLayer),
-  );
-
-const toyBoard = (slug = "toy") =>
-  Effect.gen(function* () {
-    const kanban = yield* KanbanService.KanbanService;
-    const board = yield* kanban.ensureBoard({
-      slug,
-      name: "Toy",
-      defaultProjectId: ProjectId.make("project-1"),
-    });
-    yield* kanban.setPool(board.id, board.defaultCardModel, 2);
-    return { kanban, board };
-  });
-
-/** A card with a live work thread. */
-const workingCard = (title = "A") =>
-  Effect.gen(function* () {
-    const { kanban, board } = yield* toyBoard();
-    const card = yield* kanban.createCard(board.id, { prompt: title, title }, owner);
-    yield* kanban.dispatchNow;
-    const threadId = (yield* kanban.card(card.id)).card.activeThreadId!;
-    const worker: KanbanActor = { _tag: "thread", threadId };
-    return { kanban, board, card, threadId, worker };
-  });
-
-const askOf = (card: KanbanCard, id = "q1") => card.asks.find((ask) => ask.id === id)!;
-
-/** A pending upload written the way the upload endpoint stores it. */
-const writePending = (name: string, mimeType: string, bytes: string) =>
-  Effect.gen(function* () {
-    const config = yield* ServerConfig.ServerConfig;
-    const path = yield* Path.Path;
-    const fs = yield* FileSystem.FileSystem;
-    const attachment = {
-      type: "file" as const,
-      id: createPendingAttachmentId(path.extname(name).slice(1) || undefined),
-      name,
-      mimeType,
-      sizeBytes: new TextEncoder().encode(bytes).byteLength,
-    };
-    yield* fs.makeDirectory(config.attachmentsDir, { recursive: true });
-    yield* fs.writeFileString(
-      resolveAttachmentPath({ attachmentsDir: config.attachmentsDir, attachment })!,
-      bytes,
-    );
-    return attachment;
-  });
-
-/** The board's HTTP routes over the service under test, acting as the owner. */
-const makeHttp = Effect.gen(function* () {
-  const kanban = yield* KanbanService.KanbanService;
-  const sql = yield* SqlClient.SqlClient;
-  const web = yield* Effect.acquireRelease(
-    Effect.sync(() =>
-      HttpRouter.toWebHandler(
-        kanbanRouteLayer.pipe(
-          Layer.provide(
-            Layer.mergeAll(
-              Layer.mock(EnvironmentAuth.EnvironmentAuth)({
-                authenticateHttpRequest: () =>
-                  Effect.succeed({
-                    sessionId: AuthSessionId.make("session-owner"),
-                    subject: "owner",
-                    method: "bearer-access-token" as const,
-                    scopes: ["orchestration:read", "orchestration:operate"],
-                  }),
-              }),
-              Layer.succeed(KanbanService.KanbanService, kanban),
-              Layer.mock(KanbanScripts)({}),
-              Layer.succeed(SqlClient.SqlClient, sql),
-            ).pipe(Layer.provideMerge(NodeServices.layer)),
-          ),
-          Layer.provide(
-            HttpPlatform.layer.pipe(
-              Layer.provideMerge(NodeServices.layer),
-              Layer.provideMerge(Etag.layerWeak),
-            ),
-          ),
-        ),
-        { disableLogger: true },
-      ),
-    ),
-    (handler) => Effect.promise(() => handler.dispose()),
-  );
-  // The routes read the server settings per request.
-  const context = Context.make(
-    ServerSettings.ServerSettingsService,
-    yield* ServerSettings.ServerSettingsService,
-  );
-  const call = (method: "GET" | "POST", path: string, body?: unknown) =>
-    Effect.promise(async () => {
-      const response = await web.handler(
-        new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
-          method,
-          headers: { authorization: "Bearer owner", "content-type": "application/json" },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        }),
-        context,
-      );
-      return { status: response.status, body: (await response.json()) as Record<string, any> };
-    });
-  return {
-    get: (path: string) => call("GET", path),
-    post: (path: string, body?: unknown) => call("POST", path, body),
-  };
-});
+import {
+  askOf,
+  makeFake,
+  makeHttp,
+  owner,
+  testLayer,
+  toyBoard,
+  workingCard,
+  writePending,
+} from "./askFlows.testkit.ts";
 
 it.effect(
   "a draft ask stores its template, posts a pick an old client can answer, and keeps its blocks",
