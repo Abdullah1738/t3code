@@ -113,7 +113,6 @@ for (const [name, askers] of [
           const posted = yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: REPLY }]);
           assert.strictEqual(posted.author._tag, "owner");
           if (askers !== null) {
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             const recorded = JSON.stringify(askers);
             yield* sql`
               UPDATE ardud_kanban_owner_routes SET json = json_set(json, '$.askers', json(${recorded}))`;
@@ -122,7 +121,6 @@ for (const [name, askers] of [
           const saved = yield* routes;
           assert.lengthOf(saved, 1);
           assert.isNull(saved[0]!.done_at);
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
           const payload = JSON.parse(saved[0]!.json) as Record<string, unknown>;
           assert.deepStrictEqual(
             [payload.kind, payload.seq, payload.askers ?? null],
@@ -130,7 +128,6 @@ for (const [name, askers] of [
           );
           const rows = yield* sql<{ json: string }>`
             SELECT json FROM ardud_kanban_cards WHERE id = ${card.id}`;
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
           const stored = JSON.parse(rows[0]!.json) as KanbanCard;
           assert.deepStrictEqual(Object.keys(stored.asks[0]!), OLD_KEYS);
           assert.deepStrictEqual([stored.asks[0]!.closedAt, stored.stage], [null, "needs_owner"]);

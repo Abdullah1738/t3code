@@ -134,7 +134,7 @@ export const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
 export const fileTestLayer = (
   fake: Layer.Layer<KanbanThreads>,
   dbPath: string,
-  store: Layer.Layer<KanbanStore.KanbanStore, never, SqlClient.SqlClient> = KanbanStore.layer,
+  store: typeof KanbanStore.layer = KanbanStore.layer,
 ) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
