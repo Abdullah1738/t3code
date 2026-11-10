@@ -1,9 +1,10 @@
-import type { KanbanCard, ThreadId } from "@t3tools/contracts";
+import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
 export type Saved =
   | { readonly kind: "card"; readonly card: KanbanCard }
+  | { readonly kind: "message"; readonly message: KanbanMessage }
   | { readonly kind: "evaluator"; readonly threadId: ThreadId };
 
 export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWrite", {

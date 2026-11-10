@@ -12,6 +12,7 @@ export const TOOLS = new Set([
   "card_edit",
   "card_ask_change",
   "evaluator_start",
+  "discussion_post",
 ]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
@@ -27,19 +28,25 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
         ? { card: { id: receipt.card.id, number: receipt.card.number, stage: receipt.card.stage } }
         : receipt?.kind === "evaluator"
           ? { threadId: receipt.threadId }
-          : {};
+          : receipt?.kind === "message"
+            ? { message: { discussionId: receipt.message.discussionId, seq: receipt.message.seq } }
+            : {};
     const message =
-      receipt === undefined
-        ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
-        : "Saved; card_get for details.";
+      tool === "discussion_post"
+        ? receipt === undefined
+          ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
+          : "Saved; discussion_read for details."
+        : receipt === undefined
+          ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
+          : "Saved; card_get for details.";
     return Effect.logWarning("kanban saved write reply unavailable", {
       timedOut,
       saved: receipt !== undefined,
     }).pipe(
       Effect.as(
         new McpSchema.CallToolResult({
-          isError: false,
-          structuredContent: { ...details, saved: receipt === undefined ? null : true, message },
+          isError: tool === "discussion_post" && receipt === undefined,
+          structuredContent: { saved: receipt === undefined ? null : true, message, ...details },
           content: [{ type: "text", text: message }],
         }),
       ),
@@ -50,6 +57,15 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       parent(saved);
       if (tool === "evaluator_start") {
         if (saved.kind === "evaluator") receipt = saved;
+      } else if (tool === "discussion_post") {
+        if (
+          saved.kind === "message" &&
+          (receipt === undefined ||
+            (receipt.kind === "message" &&
+              saved.message.discussionId === receipt.message.discussionId &&
+              saved.message.seq === receipt.message.seq))
+        )
+          receipt = saved;
       } else if (
         saved.kind === "card" &&
         (receipt?.kind !== "card" || saved.card.id === receipt.card.id)

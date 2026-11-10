@@ -1901,20 +1901,22 @@ const make = Effect.gen(function* () {
           {},
         );
 
+  const discussionForSave = (discussion: KanbanDiscussion): KanbanDiscussion =>
+    discussion.settledAt !== null || discussion.archivedAt !== null
+      ? {
+          ...discussion,
+          participants: discussion.participants.map((participant) =>
+            participant.deferred
+              ? { ...participant, deferred: false, owes: null, typingUntil: null }
+              : participant,
+          ),
+        }
+      : discussion;
+
   const saveDiscussion = Effect.fn("KanbanService.saveDiscussion")(function* (
     discussion: KanbanDiscussion,
   ) {
-    const next =
-      discussion.settledAt !== null || discussion.archivedAt !== null
-        ? {
-            ...discussion,
-            participants: discussion.participants.map((participant) =>
-              participant.deferred
-                ? { ...participant, deferred: false, owes: null, typingUntil: null }
-                : participant,
-            ),
-          }
-        : discussion;
+    const next = discussionForSave(discussion);
     yield* store.putDiscussion(next);
     yield* publish(next.boardId, { _tag: "discussion", discussion: next });
     return next;
@@ -2834,7 +2836,10 @@ const make = Effect.gen(function* () {
         const sameBlocks =
           // @effect-diagnostics-next-line preferSchemaOverJson:off
           JSON.stringify(blocks.map(normalizeMessageBlock)) === JSON.stringify(last.blocks);
-        if (sameBlocks) return last;
+        if (sameBlocks) {
+          yield* SavedWrite.record({ kind: "message", message: last });
+          return last;
+        }
       }
     }
     const at = yield* nowIso;
@@ -2860,9 +2865,6 @@ const make = Effect.gen(function* () {
       answers: [],
       createdAt: at,
     };
-    yield* store
-      .putMessage(message)
-      .pipe(Effect.onError(() => attachments.release(claim.claimedPaths)));
     // A board discussion with no evaluator yet belongs to the first one that
     // speaks in it. Card discussions keep starting their own, which knows the card.
     const owned =
@@ -2872,17 +2874,25 @@ const make = Effect.gen(function* () {
     // Someone else speaking brings a settled or snoozed discussion back, like a thread waking.
     const woken =
       author._tag === "owner" ? owned : { ...owned, settledAt: null, snoozedUntil: null };
-    const posted = withParticipant(
-      { ...woken, lastSeq: message.seq, lastMessageAt: at },
-      author,
-      authorName,
-      {
+    const posted = discussionForSave(
+      withParticipant({ ...woken, lastSeq: message.seq, lastMessageAt: at }, author, authorName, {
         lastReadSeq: message.seq,
         typingUntil: null,
         owes: null,
-      },
+      }),
     );
-    yield* saveDiscussion(posted);
+    // The acknowledged sequence must survive cancellation with its message.
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        yield* boardSql
+          .withTransaction(
+            store.putMessage(message).pipe(Effect.andThen(store.putDiscussion(posted))),
+          )
+          .pipe(Effect.onError(() => attachments.release(claim.claimedPaths)));
+        yield* SavedWrite.record({ kind: "message", message });
+      }),
+    );
+    yield* publish(discussion.boardId, { _tag: "discussion", discussion: posted });
     yield* publish(discussion.boardId, { _tag: "message", message });
 
     const text = blocksText(storedBlocks, attachments.pathOf);
@@ -7675,16 +7685,26 @@ const make = Effect.gen(function* () {
         }),
       ),
     post: (discussionId, author, blocks) =>
-      guard(postUnlocked(discussionId, author, blocks, author._tag !== "owner", true)).pipe(
-        Effect.tap(routeOwnerPost),
-      ),
+      SavedWrite.recover(
+        guard(postUnlocked(discussionId, author, blocks, author._tag !== "owner", true)),
+        (saved) => (saved.kind === "message" ? saved.message : undefined),
+      ).pipe(Effect.tap((message) => SavedWrite.bestEffort(routeOwnerPost(message), undefined))),
     postToCard: (cardId, author, blocks) =>
-      guard(
-        Effect.gen(function* () {
-          const discussion = yield* cardDiscussionUnlocked(cardId);
-          return yield* postUnlocked(discussion.id, author, blocks, author._tag !== "owner", true);
-        }),
-      ).pipe(Effect.tap(routeOwnerPost)),
+      SavedWrite.recover(
+        guard(
+          Effect.gen(function* () {
+            const discussion = yield* cardDiscussionUnlocked(cardId);
+            return yield* postUnlocked(
+              discussion.id,
+              author,
+              blocks,
+              author._tag !== "owner",
+              true,
+            );
+          }),
+        ),
+        (saved) => (saved.kind === "message" ? saved.message : undefined),
+      ).pipe(Effect.tap((message) => SavedWrite.bestEffort(routeOwnerPost(message), undefined))),
     attachmentPath: (attachment) => attachments.pathOf(attachment),
     answer,
     markRead,

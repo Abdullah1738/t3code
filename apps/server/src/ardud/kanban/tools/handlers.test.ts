@@ -9,8 +9,11 @@ import {
   ThreadId,
   type KanbanActor,
   type KanbanCard,
+  type KanbanMessage,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -88,7 +91,7 @@ const fakeThreads = (
   postToCardError?: KanbanError,
   launchGate?: { held: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   replyControl?: {
-    mode: "encode" | "slow" | "budget" | "conflict";
+    mode: "encode" | "slow" | "budget" | "conflict" | "pre-save";
     saved: Deferred.Deferred<void>;
   },
 ) => {
@@ -146,32 +149,33 @@ const fakeThreads = (
   const boardFilesLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-kanban-tools-test-",
   }).pipe(Layer.provideMerge(NodeServices.layer), Layer.provideMerge(ServerSettings.layerTest()));
-  const reply = (card: KanbanCard) =>
+  const reply = <A extends KanbanCard | KanbanMessage>(card: A): Effect.Effect<A, KanbanError> =>
     replyControl === undefined
       ? Effect.succeed(card)
       : Deferred.succeed(replyControl.saved, undefined).pipe(
           Effect.andThen(
-            replyControl.mode === "conflict"
-              ? Effect.fail(
+            Effect.suspend((): Effect.Effect<A, KanbanError> => {
+              if (replyControl.mode === "conflict")
+                return Effect.fail(
                   new KanbanError({
                     code: "conflict",
                     detail:
                       "Board changed during this operation. Re-read its state before retrying.",
                   }),
-                )
-              : replyControl.mode === "slow"
-                ? Effect.never
-                : replyControl.mode === "budget"
-                  ? Effect.succeed({ ...card, prompt: "x".repeat(6 * 1024 * 1024) })
-                  : Effect.sync(() =>
-                      Object.assign(card, {
-                        brokenReply: {
-                          toJSON() {
-                            throw new Error("reply encoding failed");
-                          },
-                        },
-                      }),
-                    ),
+                );
+              if (replyControl.mode === "slow") return Effect.never;
+              if (replyControl.mode === "budget")
+                return Effect.succeed({ ...card, prompt: "x".repeat(6 * 1024 * 1024) });
+              return Effect.sync(() =>
+                Object.assign(card, {
+                  brokenReply: {
+                    toJSON() {
+                      throw new Error("reply encoding failed");
+                    },
+                  },
+                }),
+              );
+            }),
           ),
         );
   const serviceLayer =
@@ -188,7 +192,21 @@ const fakeThreads = (
               moveCard: (...args) => service.moveCard(...args).pipe(Effect.flatMap(reply)),
               changeAsk: (...args) => service.changeAsk(...args).pipe(Effect.flatMap(reply)),
               postToCard: (...args) =>
-                postToCardError ? Effect.fail(postToCardError) : service.postToCard(...args),
+                postToCardError
+                  ? Effect.fail(postToCardError)
+                  : replyControl?.mode === "pre-save"
+                    ? Deferred.succeed(replyControl.saved, undefined).pipe(
+                        Effect.andThen(Effect.never),
+                      )
+                    : service.postToCard(...args).pipe(Effect.flatMap(reply)),
+              post: (...args) =>
+                postToCardError
+                  ? Effect.fail(postToCardError)
+                  : replyControl?.mode === "pre-save"
+                    ? Deferred.succeed(replyControl.saved, undefined).pipe(
+                        Effect.andThen(Effect.never),
+                      )
+                    : service.post(...args).pipe(Effect.flatMap(reply)),
             }),
           ),
         ).pipe(Layer.provide(KanbanService.layer))
@@ -1600,4 +1618,115 @@ it.effect(
       assert.strictEqual(after.stage, "needs_owner");
     }).pipe(Effect.provide(fake.layer));
   },
+);
+
+it.effect.each(
+  (["card", "discussion"] as const).flatMap((target) =>
+    (["conflict", "encode", "slow"] as const).flatMap((mode) =>
+      [false, true].map((dedupe) => ({ target, mode, dedupe })),
+    ),
+  ),
+)(
+  "saved discussion_post ($target, $mode, dedupe=$dedupe) returns its sequence",
+  ({ target, mode, dedupe }) =>
+    Effect.gen(function* () {
+      const saved = yield* Deferred.make<void>();
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, { mode, saved });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "post-reply",
+          name: "Reply",
+          defaultProjectId: null,
+        });
+        const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const thread = ThreadId.make("outside");
+        if (dedupe) {
+          const store = yield* KanbanStore.KanbanStore;
+          yield* store.putMessage({
+            discussionId: discussion.id,
+            seq: 1,
+            author: { _tag: "evaluator", threadId: thread },
+            authorName: "Agent",
+            blocks: [{ _tag: "md", text: "Saved exactly once" }],
+            answers: [],
+            createdAt: DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis)),
+          });
+          yield* store.putDiscussion({ ...discussion, lastSeq: 1 });
+        }
+        const request = yield* call(thread, "discussion_post", {
+          ...(target === "card" ? { card: card.id } : { discussionId: discussion.id }),
+          text: "Saved exactly once",
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(saved);
+        if (mode === "slow") yield* TestClock.adjust("25 seconds");
+        const result = yield* Fiber.join(request);
+        assert.isFalse(result.isError, result.text);
+        assert.strictEqual(result.structured.saved, true);
+        assert.deepStrictEqual(result.structured.message, { discussionId: discussion.id, seq: 1 });
+        assert.lengthOf(yield* kanban.messages(discussion.id), 1);
+      }).pipe(Effect.provide(fake.layer));
+    }),
+);
+
+it.effect.each(["card", "discussion"] as const)(
+  "discussion_post to %s keeps a conflict when no message was saved",
+  (target) => {
+    const error = new KanbanError({
+      code: "conflict",
+      detail: "Board changed during this operation. Re-read its state before retrying.",
+    });
+    const fake = fakeThreads(undefined, undefined, error);
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "post-conflict",
+        name: "Conflict",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const result = yield* call(ThreadId.make("outside"), "discussion_post", {
+        ...(target === "card" ? { card: card.id } : { discussionId: discussion.id }),
+        text: "Not saved",
+      });
+      assert.isTrue(result.isError, result.text);
+      assert.include(result.text, "Board changed");
+      assert.lengthOf(yield* kanban.messages(discussion.id), 0);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each(["card", "discussion"] as const)(
+  "discussion_post to %s reports an error when its reply times out before a save",
+  (target) =>
+    Effect.gen(function* () {
+      const saved = yield* Deferred.make<void>();
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, {
+        mode: "pre-save",
+        saved,
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const board = yield* kanban.ensureBoard({
+          slug: "post-timeout",
+          name: "Timeout",
+          defaultProjectId: null,
+        });
+        const card = yield* kanban.createCard(board.id, { title: "Post", prompt: "Post" }, owner);
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const request = yield* call(ThreadId.make("outside"), "discussion_post", {
+          ...(target === "card" ? { card: card.id } : { discussionId: discussion.id }),
+          text: "Not saved",
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(saved);
+        yield* TestClock.adjust("25 seconds");
+        const result = yield* Fiber.join(request);
+        assert.isTrue(result.isError, result.text);
+        assert.isNull(result.structured.saved);
+        assert.include(result.text, "discussion_read");
+        assert.lengthOf(yield* kanban.messages(discussion.id), 0);
+      }).pipe(Effect.provide(fake.layer));
+    }),
 );
