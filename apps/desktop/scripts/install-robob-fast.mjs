@@ -91,6 +91,14 @@ export async function install(ops, { rollback = false } = {}) {
  * server was not listening yet: outside any promise, so no try/catch saw it and the
  * installer died after `launched` (10 Nov 2026). Every failure here rejects instead.
  */
+/** Pre-quit migration check limit. It runs before the quit, so a longer wait costs no outage.
+ * Closing the check's sandbox checkpoints its WAL into an APFS clone of a ~160 GB database, and
+ * copy-on-write of shared extents made that exceed 120 s on 11 Nov 2026 under disk load. */
+export function migrationCheckTimeoutMs(env = process.env) {
+  const value = Number(env.ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS);
+  return Number.isFinite(value) && value >= 30_000 ? value : 600_000;
+}
+
 export function getJson(url, { headers = {}, timeoutMs = 1000 } = {}) {
   return new Promise((resolve, reject) => {
     let request;
@@ -564,7 +572,7 @@ async function main(args) {
         const result = await run(
           path.join(candidate, "Contents/MacOS/Robob"),
           [entry, "__install-migration-check", sandbox],
-          120_000,
+          migrationCheckTimeoutMs(),
           { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
         );
         if (!result.stdout.includes('"migrationCheck":"passed"'))
