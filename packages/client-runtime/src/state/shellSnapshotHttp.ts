@@ -216,7 +216,7 @@ export function mergeHttpShellPages(
   };
 }
 
-const decodeJsonBody = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const decodeJsonBody = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const decodeEnvironmentHttpCommonError = Schema.decodeUnknownEffect(
   Schema.toCodecJson(EnvironmentHttpCommonError),
@@ -341,7 +341,11 @@ export const layer: Layer.Layer<ShellSnapshotLoader, never, HttpClient.HttpClien
       };
     });
     return ShellSnapshotLoader.of({
-      load: Effect.fnUntraced(function* (prepared: PreparedConnection, onPage, options) {
+      load: Effect.fnUntraced(function* (
+        prepared: PreparedConnection,
+        onPage?: (snapshot: DeferredShellSnapshot) => Effect.Effect<void>,
+        options?: ShellLoadOptions,
+      ) {
         const omitIdleSubagents = yield* OmitIdleSubagents;
         const serverVersion = serverVersionOf(prepared, options);
         const key = progressKey(prepared, omitIdleSubagents, serverVersion);
