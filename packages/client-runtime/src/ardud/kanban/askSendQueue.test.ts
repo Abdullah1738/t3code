@@ -21,7 +21,8 @@ function harness() {
   });
   const advance = (ms: number) => {
     now += ms;
-    for (const [handle, timer] of [...timers]) {
+    // A copy: a timer that fires may set another, which must wait for its own time.
+    for (const [handle, timer] of Array.from(timers)) {
       if (timer.at <= now) {
         timers.delete(handle);
         timer.run();
