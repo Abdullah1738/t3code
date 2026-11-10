@@ -48,6 +48,38 @@ def _fail(code):
     journal.fail(code)
 
 
+def guard_checkout_notices(row):
+    if 'checkoutWarningPopup' not in row or row['checkoutWarningPopup'] is not None:
+        _fail('NOWNOW_CHECKOUT_WARNING_REQUIRES_REVIEW')
+    vip = row.get('vipSingleCheckoutInfo')
+    if isinstance(vip, dict) and vip.get('isAddedToCart') is False:
+        return
+    if isinstance(vip, dict) and vip.get('isAddedToCart') is True:
+        _fail('NOWNOW_MEMBERSHIP_PURCHASE_REQUIRES_APPROVAL')
+    # Existing members below the delivery threshold have no membership upsell.
+    # Accept only the observed, zero-benefit shape; missing data is not consent.
+    membership = row.get('membershipInfo')
+    keys = {'hasMembership', 'orderValue', 'applyMinOrder', 'applyAfter',
+            'isMovExceeded', 'membershipSaving', 'isAutoApplied'}
+    if ('vipSingleCheckoutInfo' not in row or vip is not None
+            or type(membership) is not dict or set(membership) != keys
+            or membership['hasMembership'] is not True
+            or membership['isMovExceeded'] is not False
+            or membership['isAutoApplied'] is not None):
+        _fail('NOWNOW_MEMBERSHIP_STATE_UNVERIFIED')
+    from noon_nownow_review import money, ReviewError
+    try:
+        values = {k: money(membership[k], 'membershipInfo.' + k)
+                  for k in ('orderValue', 'applyMinOrder', 'applyAfter', 'membershipSaving')}
+        subtotal = money(row.get('orderSubtotal'), 'orderSubtotal')
+    except ReviewError:
+        _fail('NOWNOW_MEMBERSHIP_STATE_UNVERIFIED')
+    if not (values['membershipSaving'] == 0 and values['orderValue'] == subtotal > 0
+            and values['applyMinOrder'] > subtotal
+            and values['applyAfter'] == values['applyMinOrder'] - subtotal):
+        _fail('NOWNOW_MEMBERSHIP_STATE_UNVERIFIED')
+
+
 def saved_card(client, *, timeout=25):
     """Unique live default Mastercard (order_card.LAST4) from the account paymentcards read.
 
@@ -392,6 +424,7 @@ class NowNowOrderFlow:
         return {'validated': True}
 
     def _guard_state(self, row):
+        guard_checkout_notices(row)
         if row.get('checkoutSessionCode') != self.session_code \
                 or not isinstance(row.get('storeInfo'), dict) \
                 or row['storeInfo'].get('storeCode') != self.store_code:
@@ -563,8 +596,7 @@ class NowNowOrderFlow:
         misc = row.get('prepaidPaymentMisc') or {}
         if row.get('isVerifyDeviceRequired') is not False:
             _fail('NOWNOW_DEVICE_VERIFICATION_REQUIRED_NO_FINANCIAL_SEND')
-        if row.get('checkoutWarningPopup') is not None or (row.get('vipSingleCheckoutInfo') or {}).get('isAddedToCart') is not False:
-            _fail('NOWNOW_CHECKOUT_WARNING_OR_MEMBERSHIP')
+        guard_checkout_notices(row)
         if type(misc.get('isCvvRequired')) is not bool:
             _fail('NOWNOW_PAYMENT_FLAGS_UNVERIFIED')
         if misc['isCvvRequired'] and not journal.preorder_status(self.flow_id)['payment_confirmed']:
@@ -590,8 +622,7 @@ class NowNowOrderFlow:
             return
         if misc.get('isCvvRequired') is not True or cvv_loader is None:
             _fail('NOWNOW_CVV_REQUIRED_USE_CVV_FROM_KEYCHAIN')
-        if row.get('checkoutWarningPopup') is not None or (row.get('vipSingleCheckoutInfo') or {}).get('isAddedToCart') is not False:
-            _fail('NOWNOW_CHECKOUT_WARNING_OR_MEMBERSHIP')
+        guard_checkout_notices(row)
         self.retain_review()
         encrypted = encrypt(self.client.payment_config(timeout=25).wire, cvv_loader())
         body = {'addressCode': row['addressCode'], 'addressVersion': row['addressVersion'], 'paymentToken': self.card.token}

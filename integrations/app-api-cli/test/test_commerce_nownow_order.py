@@ -522,10 +522,6 @@ class CompletionTests(BankFixtureTests):
             self.assertEqual(j.inspect(flow.flow_id)['state'], 'COMPLETE')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TransportEdgeTests(unittest.TestCase):
     def test_homepage_null_active_means_no_active_orders(self):
         import noon_nownow_checkout as transport
@@ -544,3 +540,86 @@ class TransportEdgeTests(unittest.TestCase):
         client._request = request
         projection = client.home().projection
         self.assertEqual(projection['active_orders'], [])
+
+
+class CheckoutNoticeTests(unittest.TestCase):
+    def member_row(self):
+        row = nn_state(subtotal=1475, delivery=600, service_fee=600)['data']
+        row['vipSingleCheckoutInfo'] = None
+        row['membershipInfo'] = {
+            'hasMembership': True, 'orderValue': 14.75, 'applyMinOrder': 50.0,
+            'applyAfter': 35.25, 'isMovExceeded': False,
+            'membershipSaving': 0.0, 'isAutoApplied': None}
+        return row
+
+    def test_existing_member_without_upsell_or_savings(self):
+        c.guard_checkout_notices(self.member_row())
+        c.guard_checkout_notices(nn_state()['data'])
+
+    def test_member_prepare_reviews_exact_total_without_financial_send(self):
+        responses = happy_responses()
+        row = self.member_row()
+        row.update(paymentMethodCode='prepaid', creditCardMask='52287301xxxx2342',
+                   deliveryPreference={code: True for code in c.QUIET_FLAGS},
+                   driverNotes=native.QUIET_NOTE)
+        responses['cart_get'] = {'data': row}
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                patch.object(c.receipts, 'ROOT', Path(temp).resolve() / 'commerce'):
+            flow, harness = make_flow(responses)
+            prepared = flow.prepare_only()
+            self.assertEqual(prepared['review']['total_minor'], 2675)
+            flow.payment_guard()
+            self.assertFalse({'place', 'payment_subscription', 'payment_complete'} &
+                             {op for op, _ in harness.calls})
+
+    def test_unknown_or_paid_membership_and_warning_refuse(self):
+        mutations = [
+            lambda r: r.update(checkoutWarningPopup={'title': 'Accept terms'}),
+            lambda r: r.pop('checkoutWarningPopup'),
+            lambda r: r.pop('vipSingleCheckoutInfo'),
+            lambda r: r.update(vipSingleCheckoutInfo={'isAddedToCart': True}),
+            lambda r: r.update(vipSingleCheckoutInfo={}),
+            lambda r: r.update(membershipInfo=None),
+        ]
+        for key, value in [('hasMembership', False), ('membershipSaving', 6),
+                           ('orderValue', 15), ('applyAfter', 0), ('isMovExceeded', True),
+                           ('isAutoApplied', True), ('extraCharge', 24.99),
+                           ('orderValue', '14.75'), ('membershipSaving', False)]:
+            mutations.append(lambda r, k=key, v=value: r['membershipInfo'].update({k: v}))
+        for mutate in mutations:
+            row = self.member_row()
+            mutate(row)
+            with self.subTest(row=row), self.assertRaises(j.JournalError):
+                c.guard_checkout_notices(row)
+
+    def test_prepare_and_payment_paths_share_notice_guard(self):
+        for vip in (None, {'isAddedToCart': True}):
+            responses = happy_responses()
+            row = responses['cart_get']['data']
+            row['vipSingleCheckoutInfo'] = vip
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(j, 'ROOT', Path(temp).resolve() / 'commerce'), \
+                    patch.object(c.receipts, 'ROOT', Path(temp).resolve() / 'commerce'):
+                flow, harness = make_flow(responses)
+                with self.assertRaisesRegex(j.JournalError, 'NOWNOW_MEMBERSHIP_'):
+                    flow.prepare_only()
+                self.assertFalse({'place', 'payment_subscription', 'payment_complete'} &
+                                 {op for op, _ in harness.calls})
+        row = self.member_row()
+        row['prepaidPaymentMisc']['isCvvRequired'] = True
+        flow = object.__new__(c.NowNowOrderFlow)
+        flow.current = native.Snapshot({'data': row}, {}, time.time())
+        flow.flow_id = 'fixture'
+        with patch.object(j, 'preorder_status', return_value={'payment_confirmed': False}):
+            with self.assertRaisesRegex(j.JournalError, 'NOWNOW_CVV_VERIFICATION_REQUIRED'):
+                flow.payment_guard()
+            row['vipSingleCheckoutInfo'] = {'isAddedToCart': True}
+            loader = unittest.mock.Mock()
+            with self.assertRaisesRegex(j.JournalError, 'NOWNOW_MEMBERSHIP_PURCHASE_REQUIRES_APPROVAL'):
+                flow.prepare_payment(cvv_loader=loader)
+            loader.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()
