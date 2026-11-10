@@ -187,6 +187,9 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  * it began on: once that worker exits, its statements fail rather than silently
  * continuing outside the transaction on a replacement.
  */
+/** How often the reserved reader's watchdog abandons callers past the statement limit. */
+export const RESERVED_READER_WATCHDOG_MS = 250;
+
 export const makeAuthReader = Effect.fnUntraced(function* (
   options: SqliteClientConfig,
   awaitStartup: (started: Promise<ReaderStartup>) => Effect.Effect<ReaderStartup> = (started) =>
@@ -345,7 +348,7 @@ export const makeAuthReader = Effect.fnUntraced(function* (
         request.reported = true;
         runFork(Effect.logWarning("SQLite reader statement is slow", details));
       }
-    }, 250);
+    }, RESERVED_READER_WATCHDOG_MS);
     watchdog.unref();
     const stop = (message: string) => {
       // A retirement terminates the worker, whose exit then reports here too.

@@ -28,7 +28,12 @@ import type { Borrower, Connection } from "effect/sql/SqlConnection";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import * as Statement from "effect/sql/Statement";
 
-import { makeAuthReader, ReadOnly, retireAuthReader } from "./nodeSqliteAuthReader.ts";
+import {
+  makeAuthReader,
+  ReadOnly,
+  RESERVED_READER_WATCHDOG_MS,
+  retireAuthReader,
+} from "./nodeSqliteAuthReader.ts";
 import {
   bindSemaphore,
   effectiveLane,
@@ -1631,9 +1636,17 @@ const make = Effect.fn("makeWithDatabase")(function* (
           queueLimit: options.readerQueueLimits?.foreground ?? 128,
         })
       : undefined;
-  // Reserved (auth/identity) lanes: one limit bounds a statement, a snapshot
-  // and the wait for the lane itself, so a configured limit moves all three.
+  // Reserved (auth/identity) lanes: one limit bounds a statement and a
+  // snapshot, and the wait for the lane follows it. A waiter must outlast one
+  // statement plus the watchdog's detection lag (it abandons a caller up to one
+  // tick after the limit), or a read queued just behind a slow statement times
+  // out at admission (busy, not retryable) instead of reaching the fail-fast
+  // path (never started, retryable). Default 5 s statement, 5.5 s admission.
   const reservedStatementLimit = options.readerStatementLimit ?? "5 seconds";
+  const reservedAdmissionLimit = Duration.sum(
+    Duration.fromInputUnsafe(reservedStatementLimit),
+    Duration.millis(2 * RESERVED_READER_WATCHDOG_MS),
+  );
   const acquireAuth =
     readers && options.authReaderProcess
       ? yield* makeReaderLanes(
@@ -1642,7 +1655,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
               ...options,
               readerStatementLimit: reservedStatementLimit,
             }),
-          reservedStatementLimit,
+          reservedAdmissionLimit,
         )
       : undefined;
 
@@ -1654,7 +1667,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
               ...options,
               readerStatementLimit: reservedStatementLimit,
             }),
-          reservedStatementLimit,
+          reservedAdmissionLimit,
         )
       : undefined;
 
