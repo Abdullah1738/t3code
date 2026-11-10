@@ -66,12 +66,17 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
     const thread = yield* McpInvocationContext.requireThreadScope(scope, "Missions board tools");
     const service = yield* KanbanService;
     const threadId = thread.thread.threadId;
-    const link = yield* service.caller(threadId);
-    const actor: KanbanActor =
-      link !== null && link.role !== "evaluator"
-        ? { _tag: "thread", threadId }
-        : { _tag: "evaluator", threadId };
-    return yield* run(service, { threadId, link, actor });
+    return yield* service.agentCall(
+      threadId,
+      Effect.gen(function* () {
+        const link = yield* service.caller(threadId);
+        const actor: KanbanActor =
+          link !== null && link.role !== "evaluator"
+            ? { _tag: "thread", threadId }
+            : { _tag: "evaluator", threadId };
+        return yield* run(service, { threadId, link, actor });
+      }),
+    );
   },
   Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) }),
 );

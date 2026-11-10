@@ -23,7 +23,10 @@ import type {
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
-import { latestExecutedRun, latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
+import {
+  latestExecutedRun,
+  latestRootProviderFailure,
+} from "@t3tools/shared/orchestrationV2ThreadError";
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -86,8 +89,8 @@ export interface KanbanThreadsShape {
   readonly view: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null>;
   /** Like view, but a failed read fails: null means the thread is gone. */
   readonly find: (threadId: ThreadId) => Effect.Effect<KanbanThreadView | null, KanbanThreadError>;
-  /** The model the thread runs now, or null when the thread is gone. */
-  readonly model: (threadId: ThreadId) => Effect.Effect<ModelSelection | null>;
+  /** The selected model, or the active run's recorded model when requested. */
+  readonly model: (threadId: ThreadId, activeRun?: boolean) => Effect.Effect<ModelSelection | null>;
   /** The root provider failure of the thread's latest executed run, if that run failed. */
   // runId names the executed run, so a repeated notification of the same run is recognised.
   readonly lastFailure: (threadId: ThreadId) => Effect.Effect<
@@ -127,7 +130,10 @@ export interface KanbanThreadsShape {
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
-  readonly setModel: (threadId: ThreadId, model: ModelSelection) => Effect.Effect<void, KanbanThreadError>;
+  readonly setModel: (
+    threadId: ThreadId,
+    model: ModelSelection,
+  ) => Effect.Effect<void, KanbanThreadError>;
   readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
 }
 
@@ -147,11 +153,7 @@ const detailOf = (error: unknown) =>
 export const viewStateOf = (
   shell: Pick<
     OrchestrationV2ThreadShell,
-    | "pendingRuntimeRequest"
-    | "activityRunStatus"
-    | "status"
-    | "updatedAt"
-    | "latestRunCompletedAt"
+    "pendingRuntimeRequest" | "activityRunStatus" | "status" | "updatedAt" | "latestRunCompletedAt"
   >,
 ): { readonly state: ControlThreadState; readonly quietSince: DateTime.Utc } => {
   const request = shell.pendingRuntimeRequest;
@@ -212,11 +214,25 @@ const make = Effect.gen(function* () {
   const view: KanbanThreadsShape["view"] = (threadId) =>
     find(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
 
-  const model: KanbanThreadsShape["model"] = (threadId) =>
+  const model: KanbanThreadsShape["model"] = (threadId, activeRun = false) =>
     threads.getThreadShell(threadId).pipe(
-      Effect.map((shell) =>
-        shell === null || shell.deletedAt !== null ? null : shell.modelSelection,
-      ),
+      Effect.flatMap((shell) => {
+        if (shell === null || shell.deletedAt !== null) return Effect.succeed(null);
+        if (!activeRun) return Effect.succeed(shell.modelSelection);
+        if (shell.activeRunId === null) return Effect.succeed(null);
+        return threads
+          .getThreadRecords(threadId, ["runs"])
+          .pipe(
+            Effect.map(
+              (records) =>
+                records.runs.find(
+                  (run) =>
+                    run.id === shell.activeRunId &&
+                    ["preparing", "starting", "running", "waiting"].includes(run.status),
+                )?.modelSelection ?? null,
+            ),
+          );
+      }),
       Effect.catchCause(() => Effect.succeed(null)),
     );
 
@@ -243,7 +259,9 @@ const make = Effect.gen(function* () {
           ? null
           : { ...failure, runId: run?.id ?? null, model: run?.modelSelection ?? null };
       }),
-      Effect.mapError((error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) })),
+      Effect.mapError(
+        (error) => new KanbanThreadError({ operation: "lastFailure", detail: detailOf(error) }),
+      ),
     );
   const lastFailure: KanbanThreadsShape["lastFailure"] = (threadId) =>
     findLastFailure(threadId).pipe(Effect.catchCause(() => Effect.succeed(null)));
@@ -374,7 +392,10 @@ const make = Effect.gen(function* () {
       }
       if (modelSelectionsEqual(shell.modelSelection, model)) return;
       yield* threads.dispatch({
-        type: model.instanceId === shell.providerInstanceId ? "thread.model-selection.set" : "provider.switch",
+        type:
+          model.instanceId === shell.providerInstanceId
+            ? "thread.model-selection.set"
+            : "provider.switch",
         commandId: commandId("model"),
         threadId,
         modelSelection: model,
