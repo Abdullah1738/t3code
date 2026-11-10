@@ -58,15 +58,24 @@ export const WAIT_PR_READS_PER_PASS = 10;
 export const WAIT_PR_READ_TIMEOUT_MS = 15 * 1000;
 
 /**
- * False until the tick calls `resolveWait` and the planner skips waiting cards
- * (`waitHoldsDispatch`). While false nothing ends a wait by itself and the
- * dispatcher would start a waiting To-Do or Needs Review card anyway, so
- * `checkWait` refuses those stages and the tool says waits don't wake yet.
- * Wait events are also written under an old kind until then (`waitEventKind`):
- * a client built before these kinds fails a card's whole history on one, so
- * flip this only once such builds are gone.
+ * Whether the engine acts on waits: the tick resolves them, the planner and
+ * card_claim skip waiting cards, script checks run and a pushed wake ends a
+ * wait. False turns all of that off again: nothing ends a wait by itself and
+ * the dispatcher would start a waiting To-Do or Needs Review card anyway, so
+ * `checkWait` then refuses those stages and the tool says waits don't wake.
  */
-export const WAITS_ENGINE_WIRED: boolean = false;
+export const WAITS_ENGINE_WIRED: boolean = true;
+
+/**
+ * Whether wait events are stored under their own kinds (`wait_set`,
+ * `wait_cleared`, `wait_expired`). A client built before those kinds fails to
+ * decode a card's whole history when it holds one, so its card page never
+ * loads. While false they are stored as plain `edited` events, which every
+ * client reads; their bodies ("Waiting for ...", "Wait ended: ...", "Wait
+ * expired: ...") say what happened either way. Set true once no installed
+ * client predates the tolerant decoder.
+ */
+export const WAIT_EVENT_KINDS_LIVE: boolean = false;
 
 /** Stages where the engine as it is today leaves a thread-less card alone. */
 const QUIET_STAGES: ReadonlySet<KanbanStage> = new Set([
@@ -189,7 +198,7 @@ const readBefore = (readAt: string | null | undefined, wait: KanbanWait): boolea
 
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
-/** What a wait is waiting for, to finish "waiting on ...". */
+/** What a wait is waiting for, as a noun phrase: "trading-core#544 to merge". */
 export function waitTarget(wait: KanbanWait, cards?: WaitFacts["cards"]): string {
   switch (wait.on) {
     case "push":
@@ -471,16 +480,27 @@ export function waitSlotProblem(
 
 type WaitEventKind = Extract<KanbanCardEvent["kind"], "wait_set" | "wait_cleared" | "wait_expired">;
 
-/**
- * The kind a wait event is stored under. Clients built before the wait kinds
- * fail to decode a card's whole history when it holds one (the card page never
- * loads), so until the engine is live they are written as plain edits; the
- * body says what happened either way.
- */
+/** The kind a wait event is stored under: its own, or a plain edit (see `WAIT_EVENT_KINDS_LIVE`). */
 export const waitEventKind = (
   kind: WaitEventKind,
-  wired: boolean = WAITS_ENGINE_WIRED,
-): KanbanCardEvent["kind"] => (wired ? kind : "edited");
+  live: boolean = WAIT_EVENT_KINDS_LIVE,
+): KanbanCardEvent["kind"] => (live ? kind : "edited");
+
+/** "for trading-core#544 to merge", "until 2026-11-14T05:00:00.000Z": finishes "waiting ...". */
+export const waitingFor = (wait: KanbanWait, cards?: WaitFacts["cards"]): string =>
+  wait.on === "time" && wait.until !== null
+    ? `until ${wait.until}`
+    : `for ${waitTarget(wait, cards)}`;
+
+// What a wait event says in the card's history. Each reads as a full line by
+// itself, since an older client shows it as a plain edit.
+
+/** A wait that ended, with why: "Wait ended: trading-core#544 merged". */
+export const waitEndedBody = (reason: string) => `Wait ended: ${reason}`;
+
+/** A wait someone cleared with card_wait clear. */
+export const waitClearedBody = (wait: KanbanWait, cards?: WaitFacts["cards"]) =>
+  waitEndedBody(`cleared by hand (was waiting ${waitingFor(wait, cards)})`);
 
 /** The card event a wait change writes. */
 export interface WaitEvent {
@@ -640,14 +660,14 @@ export function endWait(
   const cleared: KanbanCard = { ...kanbanWithoutWait(card), updatedAt: at };
   const event = (toStage: KanbanStage): WaitEvent => ({
     kind: waitEventKind("wait_cleared"),
-    body: reason,
+    body: waitEndedBody(reason),
     fromStage: card.stage === toStage ? null : card.stage,
     toStage: card.stage === toStage ? null : toStage,
   });
   if (wait === null) {
     return { card, event: event(card.stage), wake: { to: "none", why: "the card had no wait" } };
   }
-  const was = `It was waiting on ${waitTarget(wait, facts.cards)}${quoted(wait.note)}.`;
+  const was = `It was waiting ${waitingFor(wait, facts.cards)}${quoted(wait.note)}.`;
   const asked = answer.to ?? wait.wakeRole ?? nextActor(card, ctx);
   if (asked === "none") {
     return { card: cleared, event: event(card.stage), wake: { to: "none", why: reason } };
@@ -722,13 +742,18 @@ export function expireWait(
   const wait = kanbanWait(card);
   if (wait === null || wait.expiredAt !== null || !kanbanWaitExpired(wait, facts.nowMs))
     return null;
-  const waited = `Waited ${waitedFor(wait.at, facts.nowMs)} on ${waitTarget(wait, facts.cards)} with no change${quoted(wait.note)}`;
+  const waited = `waited ${waitedFor(wait.at, facts.nowMs)} ${waitingFor(wait, facts.cards)} with no change${quoted(wait.note)}`;
   return {
     card: { ...card, wait: { ...wait, expiredAt: at as KanbanWait["at"] }, updatedAt: at },
-    event: { kind: waitEventKind("wait_expired"), body: waited, fromStage: null, toStage: null },
+    event: {
+      kind: waitEventKind("wait_expired"),
+      body: `Wait expired: ${waited}`,
+      fromStage: null,
+      toStage: null,
+    },
     wake: {
       to: "evaluator",
-      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is stuck: ${waited.charAt(0).toLowerCase()}${waited.slice(1)}. Chase it, set a new wait with card_wait, or clear the wait and move the card on.`,
+      text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is stuck: ${waited}. Chase it, set a new wait with card_wait, or clear the wait and move the card on.`,
     },
   };
 }
@@ -773,19 +798,19 @@ export function applyAnswer(
       updatedAt: at,
     };
     if (failures === KANBAN_WAIT_CHECK_FAILURES) {
-      const body = `The check for ${waitTarget(wait, facts.cards)} failed ${failures} times in a row: ${problem}`;
+      const waiting = waitingFor(wait, facts.cards);
       return {
         _tag: "failing",
         card: failed,
         event: {
           kind: waitEventKind("wait_expired"),
-          body,
+          body: `Wait check failing: ${failures} failures in a row while waiting ${waiting}: ${problem}`,
           fromStage: null,
           toStage: null,
         },
         wake: {
           to: "evaluator",
-          text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is waiting on a check that keeps failing: ${body.charAt(0).toLowerCase()}${body.slice(1)}. Nothing can end this wait until the check works: fix it, set another wait with card_wait, or clear the wait and move the card on.`,
+          text: `Card #${card.number} (${card.title || "untitled"}, in ${card.stage}) is waiting ${waiting} and its check has failed ${failures} times in a row: ${problem}. Nothing can end this wait until the check works: fix it, set another wait with card_wait, or clear the wait and move the card on.`,
         },
       };
     }
@@ -828,7 +853,9 @@ export function resolveWait(
       card: { ...kanbanWithoutWait(card), updatedAt: at },
       event: {
         kind: waitEventKind("wait_cleared"),
-        body: `The card was moved to ${card.stage} while it waited on ${waitTarget(card.wait, facts.cards)}`,
+        body: waitEndedBody(
+          `the card was moved to ${card.stage} while it waited ${waitingFor(card.wait, facts.cards)}`,
+        ),
         fromStage: null,
         toStage: null,
       },
@@ -849,6 +876,29 @@ export function resolveWait(
     answer = { result: "fail", reason: `The check threw: ${String(error)}` };
   }
   return applyAnswer(card, answer, facts, ctx, at);
+}
+
+/**
+ * A card whose links have caught up with what a host said: a PR link the board
+ * tracks takes a merged or closed reading. No work thread watches an outside
+ * author's PR, so without this the board's PRs-landed step would never see the
+ * merge that just ended the card's wait.
+ */
+export function withLandedLinks(
+  card: KanbanCard,
+  readings: ReadonlyArray<WaitPrFacts>,
+  at: string,
+): KanbanCard {
+  const byKey = new Map(mergePrReadings(readings).map((reading) => [prKey(reading.url), reading]));
+  let changed = false;
+  const links = card.links.map((link) => {
+    if (link.kind !== "pr" || link.state === null) return link;
+    const state = byKey.get(prKey(link.url))?.state;
+    if ((state !== "merged" && state !== "closed") || state === link.state) return link;
+    changed = true;
+    return { ...link, state, checkedAt: at as KanbanLink["checkedAt"] };
+  });
+  return changed ? { ...card, links, updatedAt: at } : card;
 }
 
 /** The answer the board's own check gives a card right now; null when its check isn't one of them. */
@@ -1196,6 +1246,6 @@ export function newWait(request: WaitRequest, by: KanbanActor, at: string): Kanb
   };
 }
 
-/** The event body for a wait that was set: "Waiting on trading-core#544 to merge: note". */
+/** The event body for a wait that was set: "Waiting for trading-core#544 to merge: note". */
 export const waitSetBody = (wait: KanbanWait, cards?: WaitFacts["cards"]) =>
-  `Waiting on ${waitTarget(wait, cards)}${wait.note.trim() ? `: ${wait.note.trim()}` : ""}`;
+  `Waiting ${waitingFor(wait, cards)}${wait.note.trim() ? `: ${wait.note.trim()}` : ""}`;

@@ -86,6 +86,7 @@ import * as Defaults from "./defaults.ts";
 import * as Rules from "./rules.ts";
 import * as Scribe from "./scribe.ts";
 import * as Subtasks from "./subtasks.ts";
+import { KanbanWaitPrs } from "./waitPrs.ts";
 import * as Waits from "./waits.ts";
 import * as Summaries from "./summaries.ts";
 import * as Text from "./text.ts";
@@ -614,6 +615,8 @@ const waitingOnEvaluatorStep = (card: KanbanCard) =>
   card.settledAt === null &&
   card.activeThreadId === null &&
   card.stalled?.by._tag !== "evaluator" &&
+  // Parked on a wait: its evaluator is told when that ends, not reminded meanwhile.
+  !Waits.waitSkipsNudge(card) &&
   kanbanEvaluatorStep(card);
 // An owner message a running evaluator hasn't answered gets one reminder; its turn
 // end covers an idle evaluator, so the tick doesn't double it.
@@ -1056,6 +1059,9 @@ const make = Effect.gen(function* () {
   const boardSql = yield* BoardsDatabase.client;
   const store = LockedStore.wrap(rawStore, locks);
   const threadIo = yield* KanbanThreads;
+  // Host readings for the pull requests waits point at. Provided around the
+  // board layers (server.ts); without it a wait only sees what work threads know.
+  const waitPrs = yield* Effect.serviceOption(KanbanWaitPrs);
   // Bumped before and after anything this process does to a thread, so a stale
   // rerun never replays a read of it taken across that change (see `outsideRead`).
   const threadFences = new Map<string, number>();
@@ -6375,11 +6381,74 @@ const make = Effect.gen(function* () {
                 if (!current || !Rules.discussionSettleDue(current, currentCard, now)) continue;
                 yield* saveDiscussion({ ...current, settledAt: idleNow, snoozedUntil: null });
               }
+              // Waits: each parked card's check is asked once a tick, and a wait that
+              // ended is cleared here, before the PRs-landed step below.
+              const parked = Waits.WAITS_ENGINE_WIRED
+                ? (yield* cardsForPlan).filter(
+                    (card) => card.wait !== undefined && card.activeThreadId === null,
+                  )
+                : [];
+              if (parked.length > 0) {
+                // What the work threads already know about the PRs these waits point at.
+                const live: Array<Waits.WaitPrFacts> = [];
+                for (const card of parked) {
+                  if (card.wait?.pr == null || card.workThreadId === null) continue;
+                  const view = yield* planView(card.workThreadId);
+                  if (view) live.push(...view.prs);
+                }
+                // A script's waits are read for by its own pass (ScriptService.checkWaits).
+                const requests = Waits.waitPrRequests(
+                  parked.filter((card) => card.wait?.on !== "script"),
+                  board,
+                  live,
+                );
+                // The host read leaves the board's gate; a stale rerun of this tick replays it.
+                const readings =
+                  requests.length > 0 && Option.isSome(waitPrs)
+                    ? (yield* locks.outsideRead(
+                        `waitPrs:${board.id}`,
+                        () => 0,
+                        waitPrs.value.read(requests),
+                      )).readings
+                    : Waits.mergePrReadings(live);
+                const facts: Waits.WaitFacts = {
+                  nowMs: now,
+                  prs: readings,
+                  cards: new Map((yield* cardsForPlan).map((card) => [card.id as string, card])),
+                };
+                const waits: KanbanActor = { _tag: "system", component: "waits" };
+                for (const card of parked) {
+                  const current = yield* store.card(card.id);
+                  if (!current || current.wait === undefined) continue;
+                  const at = yield* nowIso;
+                  const step = Waits.resolveWait(
+                    current,
+                    facts,
+                    { chainLength: Rules.chainFor(board, current)?.steps.length ?? 1 },
+                    at,
+                  );
+                  if (step._tag === "none" || (step._tag === "hold" && step.save === null))
+                    continue;
+                  // The card is saved before its evaluator is told, one card at a time: a note
+                  // that leaves the gate can only cost the cards after it this tick, not a note.
+                  yield* applyWaitStep(
+                    // A PR no thread watches: the card's link takes the merge the host reported.
+                    step._tag === "end"
+                      ? { ...step, card: Waits.withLandedLinks(step.card, facts.prs, at) }
+                      : step,
+                    waits,
+                  );
+                  views.clear();
+                  invalidateCards();
+                }
+              }
               // Reviewed cards wait in review until their PRs land.
               const chains = board.reviewChains;
               // syncPrs and evaluatorTurn can change cards and send to other threads.
               for (const card of yield* cardsForPlan) {
                 if (card.stage !== "in_review" || card.activeThreadId !== null) continue;
+                // Parked on a wait: it stays in review until the wait pass above ends it.
+                if (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(card)) continue;
                 const chain = Rules.chainFor({ ...board, reviewChains: chains }, card);
                 if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) continue;
                 const current = yield* store.card(card.id);
@@ -6387,6 +6456,7 @@ const make = Effect.gen(function* () {
                   !current ||
                   current.stage !== "in_review" ||
                   current.activeThreadId !== null ||
+                  (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(current)) ||
                   !Rules.reviewFinished(
                     current,
                     Rules.chainFor({ ...board, reviewChains: chains }, current)?.steps.length ?? 1,
@@ -7756,7 +7826,7 @@ const make = Effect.gen(function* () {
           }
           const next: KanbanCard = { ...kanbanWithoutWait(card), updatedAt: at };
           yield* logEvent(next, actor, Waits.waitEventKind("wait_cleared"), {
-            body: `Cleared by hand: was waiting on ${Waits.waitTarget(card.wait)}`,
+            body: Waits.waitClearedBody(card.wait),
           });
           yield* saveCard(next);
           yield* kick;
@@ -7836,7 +7906,22 @@ const make = Effect.gen(function* () {
       toStage: step.event.toStage,
     });
     yield* saveCard(step.card);
-    if (step.wake.to === "evaluator") yield* noteDiscussion(step.card, step.wake.text);
+    if (step.wake.to === "evaluator") {
+      // A thread follow-on like any other: saved and sent by its lane's drain
+      // under `guardDeferred`, sent here (outside the gate) from the tick.
+      const text = step.wake.text;
+      const discussion = yield* cardDiscussionUnlocked(step.card.id);
+      yield* later(
+        step.card.boardId,
+        discussion.id,
+        { kind: "toEvaluator", discussionId: discussion.id, text, note: true },
+        toEvaluator(discussion, text, true).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban wait note failed", { cardId: step.card.id, cause }),
+          ),
+        ),
+      );
+    }
     // Back in To-Do or Needs Review with its wake note: the dispatcher takes it from here.
     else if (step.wake.to !== "none") yield* kick;
   });
@@ -7848,12 +7933,16 @@ const make = Effect.gen(function* () {
     actor,
     wired = Waits.WAITS_ENGINE_WIRED,
   ) =>
-    guard(
+    // Deferred: the note to an evaluator is saved with the write and sent by its lane's drain.
+    guardDeferred(
       Effect.gen(function* () {
         const card = yield* cardOf(cardId);
         const n = `card #${card.number}`;
         if (!wired) {
-          return yield* failWith("conflict", "waits are not live on this board yet: nothing changed");
+          return yield* failWith(
+            "conflict",
+            "waits are not live on this board yet: nothing changed",
+          );
         }
         if (card.wait === undefined) return yield* failWith("conflict", `${n} is not waiting`);
         if (card.activeThreadId !== null) {
