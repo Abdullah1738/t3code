@@ -202,6 +202,11 @@ const make = Effect.gen(function* () {
   // Host readings for the PRs script waits point at; without the reader a
   // check still gets the states on the card's own links.
   const waitPrs = yield* Effect.serviceOption(KanbanWaitPrs);
+  if (Waits.WAITS_ENGINE_WIRED && Option.isNone(waitPrs)) {
+    yield* Effect.logWarning(
+      "board scripts: no wait PR reader is provided, so script checks only see PR states already on their cards",
+    );
+  }
   // When each script last ran its checks, by board and name. In memory: a
   // restart checks once more, which costs one run.
   const waitChecks = new Map<string, number>();

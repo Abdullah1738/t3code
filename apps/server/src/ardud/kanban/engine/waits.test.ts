@@ -552,6 +552,17 @@ describe("PR readings from the reader and the work thread", () => {
       { url: PR, projectId: "project-default", needsHead: true, live: live[0] },
       { url: OTHER_PR, projectId: "project-default", needsHead: false, live: null },
     ]);
+    // A script's check is given every PR its card links, so those are read too, in full.
+    const linked = card(7, {
+      links: [
+        { kind: "pr", url: OTHER_PR, label: null, state: null, checkedAt: null },
+        { kind: "url", url: "https://example.com/spec", label: null, state: null, checkedAt: null },
+      ],
+      wait: scriptWait(),
+    });
+    expect(waitPrRequests([linked], board)).toEqual([
+      { url: OTHER_PR, projectId: "project-default", needsHead: true, live: null },
+    ]);
   });
 });
 

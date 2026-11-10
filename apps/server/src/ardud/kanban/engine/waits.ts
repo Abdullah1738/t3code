@@ -915,8 +915,11 @@ export interface WaitPrRequest {
 }
 
 /**
- * The distinct pull requests the board's open waits point at: one request per
- * PR however many cards wait on it, with what the work threads already know.
+ * The distinct pull requests the board's open waits need a reading for: one
+ * request per PR however many cards wait on it, with what the work threads
+ * already know. A built-in wait needs its own PR; a script wait needs every
+ * PR its card links, head and checks included, since its check is given them
+ * all.
  */
 export function waitPrRequests(
   cards: Iterable<KanbanCard>,
@@ -927,15 +930,23 @@ export function waitPrRequests(
   const byKey = new Map<string, WaitPrRequest>();
   for (const card of cards) {
     const wait = kanbanWaiting(card) ? kanbanWait(card) : null;
-    if (wait === null || wait.pr === null) continue;
-    const key = prKey(wait.pr);
-    const held = byKey.get(key);
-    byKey.set(key, {
-      url: held?.url ?? wait.pr,
-      projectId: held?.projectId ?? card.projectId ?? board.defaultProjectId,
-      needsHead: (held?.needsHead ?? false) || wait.on === "push",
-      live: liveByKey.get(key) ?? null,
-    });
+    if (wait === null) continue;
+    const byScript = wait.on === "script";
+    const urls = byScript
+      ? card.links.flatMap((link) => (link.kind === "pr" ? [link.url as string] : []))
+      : wait.pr === null
+        ? []
+        : [wait.pr as string];
+    for (const url of urls) {
+      const key = prKey(url);
+      const held = byKey.get(key);
+      byKey.set(key, {
+        url: held?.url ?? url,
+        projectId: held?.projectId ?? card.projectId ?? board.defaultProjectId,
+        needsHead: (held?.needsHead ?? false) || byScript || wait.on === "push",
+        live: liveByKey.get(key) ?? null,
+      });
+    }
   }
   return [...byKey.values()];
 }

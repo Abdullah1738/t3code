@@ -40,6 +40,8 @@ import { selectionRoutingEnabled } from "./selectionSettings.ts";
 import { layer as providerRegistryLayer } from "../../../provider/testUtils/providerRegistryMock.ts";
 import { opencodeTestProvider } from "./testProviders.ts";
 import { KanbanThreads } from "./threads.ts";
+import { KanbanWaitPrs } from "./waitPrs.ts";
+import type * as Waits from "./waits.ts";
 
 // Threads only matter here as somewhere for script posts to go.
 const threads = Layer.succeed(
@@ -1535,4 +1537,75 @@ it.effect(
       assert.strictEqual(woken.reviewStep, 0);
       assert.include(woken.wakeNote ?? "", "PR #12 was marked ready for review");
     }).pipe(Effect.provide(waitTestLayer)),
+);
+
+it.effect(
+  "gives a script check a host reading of the PRs its card links, when the wait PR reader is provided from outside",
+  () => {
+    const asked: Array<ReadonlyArray<Waits.WaitPrRequest>> = [];
+    const pr = "https://github.com/acme/app/pull/12";
+    // Provided around the board's own layers, the way server.ts does it.
+    const withReader = waitTestLayer.pipe(
+      Layer.provide(
+        Layer.succeed(
+          KanbanWaitPrs,
+          KanbanWaitPrs.of({
+            read: (requests) =>
+              Effect.sync(() => {
+                asked.push(requests);
+                return {
+                  readings: [
+                    {
+                      url: pr,
+                      state: "open" as const,
+                      head: "ffee0011",
+                      at: "1970-01-01T00:00:00.000Z",
+                    },
+                  ],
+                  read: [pr],
+                  failed: [],
+                  carried: [],
+                };
+              }),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const store = yield* KanbanStore.KanbanStore;
+      const scripts = yield* ScriptService.KanbanScripts;
+      const board = yield* toyBoard;
+      const example = NodePath.resolve(
+        import.meta.dirname,
+        "../../../../../../docs/user/board-wait-checks/pr-ready.py",
+      );
+      yield* register(board, example, manual, "pr-ready");
+      // An outside author's PR: attached as context, so the card's link has no state of its own.
+      const created = yield* kanban.createCard(
+        board.id,
+        {
+          prompt: "Review PR 12",
+          title: "Review PR 12",
+          description: "Explicit",
+          links: [{ url: pr }],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...created, stage: "in_review", reviewStep: 1 });
+      yield* kanban.waitCard(
+        created.id,
+        { on: "script", script: "pr-ready", note: "author to mark it ready" },
+        owner,
+      );
+      yield* scripts.checkWaits;
+      yield* scripts.idle;
+      assert.deepStrictEqual(asked, [
+        [{ url: pr, projectId: board.defaultProjectId, needsHead: true, live: null }],
+      ]);
+      const woken = yield* waitOf(created.id);
+      assert.isUndefined(woken.wait);
+      assert.strictEqual(woken.stage, "needs_review");
+    }).pipe(Effect.provide(withReader));
+  },
 );
