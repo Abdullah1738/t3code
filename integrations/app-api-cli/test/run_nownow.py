@@ -14,5 +14,5 @@ package=types.ModuleType('test')
 package.__path__=[str(Path(__file__).resolve().parent)]
 sys.modules['test']=package
 if __name__ == '__main__':
-    suite=unittest.TestSuite(unittest.defaultTestLoader.discover('test', pattern=p) for p in ('test_*nownow*.py', 'test_food_capture_close.py', 'test_commerce_preorder*.py', 'test_commerce_journal.py', 'test_noon_visa_policy.py'))
+    suite=unittest.TestSuite(unittest.defaultTestLoader.discover('test', pattern=p) for p in ('test_*nownow*.py', 'test_food_capture_close.py', 'test_commerce_preorder*.py', 'test_commerce_journal.py', 'test_noon_visa_policy.py', 'test_commerce_minutes.py', 'test_marketplace_payment.py'))
     raise SystemExit(not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful())

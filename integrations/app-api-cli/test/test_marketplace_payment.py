@@ -43,6 +43,9 @@ def failed_responses(order, amount):
 
 class PaymentTests(unittest.TestCase):
     def setUp(self):
+        browser = patch('commerce_redirect.open_dia', return_value=True)
+        self.redirect_opener = browser.start()
+        self.addCleanup(browser.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve() / 'commerce'
@@ -307,6 +310,7 @@ class PaymentTests(unittest.TestCase):
             return {'queued': True}
         self.assertTrue(flow.await_success(sleep=lambda _: None, notify=notify)['paid'])
         self.assertEqual(seen, ['FENCED'])
+        self.redirect_opener.assert_called_once_with('https://bank.invalid/challenge')
         self.assertEqual(j.inspect(flow.flow_id)['state'], 'ACTIVE')
 
     def test_missing_cvv_stops_before_place(self):
@@ -480,12 +484,12 @@ class PaymentTests(unittest.TestCase):
         open_now = j.open_payments()
         self.assertEqual([f['flow_id'] for f in open_now], [flow.flow_id])
         self.assertEqual((open_now[0]['order_id'], open_now[0]['amount_minor']), (main.ORDER, 1980))
-        self.assertEqual(j.open_payments(now=time.time() + 3600), [])
+        self.assertEqual(len(j.open_payments(now=time.time() + 3600)), 1)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(['open-flows']), 0)
         printed = json.loads(out.getvalue())
-        self.assertEqual(printed['bank_prompt'], 'ours: approve it')
+        self.assertIn('not a payment approval request', printed['bank_prompt'])
         self.assertFalse(printed['financial_send'])
         with self.assertRaises(j.PaymentError):
             flow.await_success(attempts=1, sleep=lambda _: None, notify=None)

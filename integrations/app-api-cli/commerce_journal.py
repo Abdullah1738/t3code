@@ -488,6 +488,11 @@ def reconcile_marketplace_paid(flow_id, *, evidence_hash):
     return _reconcile_noon_paid(flow_id,evidence_hash=evidence_hash,verticals=('main','supermall'))
 
 
+def reconcile_minutes_challenge(flow_id, *, evidence_hash):
+    """Exact capture supersedes an observed bank challenge, never an unknown send."""
+    return _reconcile_noon_paid(flow_id, evidence_hash=evidence_hash, verticals=('minutes',))
+
+
 def retract_food_capture_claim(flow_id, *, evidence_hash):
     """Append a correction when merchant processing was mistaken for capture.
 
@@ -578,9 +583,12 @@ def _reconcile_noon_paid(flow_id, *, evidence_hash, verticals):
         success = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? "
             "AND operation=? AND outcome='PAYMENT_REPORTED_SUCCESS' AND order_id=?",
             (flow_id, financial['name'], flow['order_id'])).fetchone()['s']
-        fences = list(db.execute("SELECT o.sequence,p.kind FROM observations o JOIN operations p "
+        fences = list(db.execute("SELECT o.sequence,o.outcome,p.kind FROM observations o JOIN operations p "
             "ON p.flow_id=o.flow_id AND p.name=o.operation WHERE o.flow_id=? "
             "AND o.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')", (flow_id,)))
+        if flow['vertical'] == 'minutes' and any(
+                r['kind'] != 'payment' or r['outcome'] != 'CHALLENGE_REQUIRED' for r in fences):
+            fail('MINUTES_CHALLENGE_RECONCILIATION_UNPROVEN')
         if flow['vertical'] == 'nownow':
             reconciled = db.execute("SELECT MAX(sequence) AS s FROM observations WHERE flow_id=? AND outcome='NOWNOW_PREORDER_RECONCILED'", (flow_id,)).fetchone()['s']
             if reconciled:
@@ -1243,9 +1251,11 @@ def _snapshot(path, tries=20):
 
 
 def open_payments(*, since_seconds=1800, now=None):
-    """Flows with a payment send in the window that haven't closed, newest first. Read only.
+    """All account-blocking flows, including ACTIVE preparations. Read only.
 
-    A bank prompt (ENBD X 3DS) that shows up while one of these is listed is ours."""
+    since_seconds is retained for CLI compatibility; unresolved fences do not
+    disappear with age, and a preparation never authorizes a bank prompt.
+    """
     now = time.time() if now is None else now
     path = ROOT / 'journal.sqlite'
     if not path.is_file():
@@ -1262,17 +1272,18 @@ def open_payments(*, since_seconds=1800, now=None):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
-            "MAX(o.created_at) AS sent_at FROM flows f JOIN operations o ON o.flow_id=f.id "
-            "WHERE o.kind IN ('place','payment','preauthorize','prepay') "
-            "AND f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
-            "GROUP BY f.id HAVING sent_at >= ? ORDER BY sent_at DESC", (now - since_seconds,)).fetchall()
+            "MAX(CASE WHEN o.kind IN ('place','payment','preauthorize','prepay') THEN o.created_at END) AS sent_at "
+            "FROM flows f LEFT JOIN operations o ON o.flow_id=f.id "
+            "WHERE f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
+            "GROUP BY f.id ORDER BY f.created_at DESC").fetchall()
     except sqlite3.Error:
         fail('JOURNAL_BUSY_OR_UNAVAILABLE')
     finally:
         db.close()
     return [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
              'order_id': r['order_id'], 'amount_minor': r['reserved_minor'],
-             'sent_seconds_ago': round(now - r['sent_at'])} for r in rows]
+             'financial_send': r['sent_at'] is not None,
+             'sent_seconds_ago': round(now - r['sent_at']) if r['sent_at'] is not None else None} for r in rows]
 
 
 def flow_created_at(flow_id):

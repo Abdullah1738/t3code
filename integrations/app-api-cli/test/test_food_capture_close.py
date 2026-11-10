@@ -117,7 +117,10 @@ class CaptureCloseTests(unittest.TestCase):
             j.consume(self.flow, 'anything', kind='cart', request_hash='a'*64)
         with self.assertRaises(j.JournalError):
             j.observe(self.flow, 'place', outcome='RESPONSE_RECEIVED', evidence_hash='a'*64)
-        self.assertFalse(j.open_payments(since_seconds=1e10))
+        remaining = j.open_payments(since_seconds=1e10)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]['state'], 'ACTIVE')
+        self.assertFalse(remaining[0]['financial_send'])
 
     def test_active_delivered_automatic_flow_can_close(self):
         with j._db() as db:db.execute("UPDATE flows SET state='ACTIVE' WHERE id=?",(self.flow,))

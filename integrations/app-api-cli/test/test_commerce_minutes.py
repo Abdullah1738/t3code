@@ -290,10 +290,20 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
     order-watch subprocesses. Journal, receipts, watcher files and card status
     live in a temp dir. CVV encryption is real, with the captured public key.
     """
-    def order(self, *, cvv_required, seconds_before_place=0):
+    def order(self, *, cvv_required, seconds_before_place=0, redirect=None):
         events=[];commands=[]
         auth=_NoonAuth(events)
-        transport=_NoonTransport(_noon_script(cvv_required),events)
+        script = _noon_script(cvv_required)
+        if redirect:
+            challenge = {'status': 'payment_ready_to_redirect',
+                         'redirect_url': 'https://bank.invalid/challenge'}
+            index = next(i for i, (route, _) in enumerate(script) if route == 'payment_complete')
+            if redirect == 'immediate':
+                script[index] = ('payment_complete', challenge)
+            else:
+                script.insert(index+1, ('payment_status', challenge))
+        expected_routes = [x[0] for x in script]
+        transport=_NoonTransport(script,events)
         real_time=time.time;offset=[0.0]
         def keychain():
             events.append('keychain')
@@ -301,6 +311,13 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
             return b'123'
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp).resolve()
+            def open_browser(url):
+                if redirect == 'immediate':
+                    active = c.j.open_payments()[0]
+                    self.assertEqual(active['state'], 'FENCED')
+                    resumed = c.MinutesFlow.resume_payment(active['flow_id'], auth=auth)
+                    self.assertEqual(resumed.review['order'], ORDER)
+                return True
             def run(command,**kwargs):
                 commands.append(command)
                 if command[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI:
@@ -325,14 +342,17 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
                     patch.object(c.m.urllib.request,'build_opener',transport.build_opener), \
                     patch.object(c.m.urllib.request,'urlopen',side_effect=AssertionError('network')), \
                     patch.object(c.subprocess,'run',run), \
+                    patch('commerce_redirect.open_dia', side_effect=open_browser) as browser, \
                     patch.object(c.time,'time',lambda:real_time()+offset[0]), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 code=cli.main(['order','minutes','--sku','SYNTHETIC_SHAKE','--cvv-from-keychain',
                                '--label','minutes e2e test'])
                 lines=[json.loads(x) for x in output.getvalue().splitlines() if x] or [{}]
                 journal=c.j.inspect(lines[-1]['flow_id']) if lines[-1].get('flow_id') else None
+                if redirect:
+                    browser.assert_called_once_with('https://bank.invalid/challenge')
         self.assertEqual(code,0,lines[-1])
-        self.assertEqual([x[0] for x in transport.calls],[x[0] for x in _noon_script(cvv_required)])
+        self.assertEqual([x[0] for x in transport.calls],expected_routes)
         cvv.assert_called_once_with()
         return {'result':lines[-1],'lines':lines,'events':events,'calls':transport.calls,
                 'commands':commands,'journal':journal}
@@ -360,6 +380,13 @@ class OrderMinutesEndToEndTests(unittest.TestCase):
         alerts=[x for x in run['commands'] if x[:len(c.TELEGRAM_CLI)]==c.TELEGRAM_CLI]
         self.assertEqual(len(alerts),1)
         self.assertEqual(alerts[0][alerts[0].index('--key')+1],f'minutes-cli-3ds-{ORDER}')
+
+    def test_immediate_and_delayed_redirect_complete_without_resend(self):
+        for redirect in ('immediate', 'delayed'):
+            with self.subTest(redirect=redirect):
+                run = self.order(cvv_required=True, redirect=redirect)
+                self.assertEqual(run['journal']['state'], 'COMPLETE')
+                self.assertEqual(sum(route == 'payment_complete' for route, _ in run['calls']), 1)
 
     def test_order_minutes_places_and_pays_300s_after_preparation(self):
         """Done-when path 2: 300 s pass between real preparation and place. The home

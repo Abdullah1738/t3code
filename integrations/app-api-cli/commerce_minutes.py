@@ -582,14 +582,19 @@ class MinutesFlow:
                 self.review[key]=value+'+04:00'
             elif isinstance(value,str) and value:
                 self.review[key]=value
-        return self.client.complete_payment(order=order,client_secret=body['clientSecret'],card=self.card,
-            provider_code=provider,cvv_encryption=cvv_encryption,optional_fields=optional,before_send=self._before,timeout=25).projection
+        result = self.client.complete_payment(order=order,client_secret=body['clientSecret'],card=self.card,
+            provider_code=provider,cvv_encryption=cvv_encryption,optional_fields=optional,before_send=self._before,timeout=25)
+        if result.projection.get('redirect_required'):
+            from commerce_redirect import open_once
+            open_once(self.flow_id, hashlib.sha256(body['clientSecret'].encode()).hexdigest(), result.wire.get('redirect_url'))
+        return result.projection
 
     def notify_3ds(self):
         return telegram_3ds_notify(self.review['order'],self.review['amount'])
 
     def await_payment(self,*,notify=None,poll_seconds=5.0,wait_seconds=240.0,
-                      sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS):
+                      sleep=time.sleep,clock=time.monotonic,stall=None,stall_seconds=STALL_SECONDS,
+                      open_redirect=False):
         """Poll the payment intent through the out-of-band 3DS window.
 
         notify(order,total_minor) runs exactly once before the first poll.
@@ -617,6 +622,9 @@ class MinutesFlow:
                 snap=self.client.payment_intent_status(order=order,client_secret=secret,
                     total_minor=self.review['amount'],timeout=25)
                 p=snap.projection
+                if open_redirect and p.get('redirect_required'):
+                    from commerce_redirect import open_once
+                    open_once(self.flow_id, hashlib.sha256(secret.encode()).hexdigest(), snap.wire.get('redirect_url'))
             except m.MinutesError as exc:
                 # Transient read failures never end the wait and never resend
                 # anything; auth loss must surface for an app rebind instead.
@@ -710,7 +718,7 @@ class MinutesFlow:
         sent on this path; only order reads and status polling remain.
         """
         binding=j.binding(flow_id);state=j.inspect(flow_id)
-        if (binding['app']!='noon' or binding['vertical']!='minutes' or state['state']!='ACTIVE'
+        if (binding['app']!='noon' or binding['vertical']!='minutes' or state['state'] not in ('ACTIVE', 'FENCED')
                 or not state['order_id'] or not any(x['kind']=='payment' for x in state['operations'])
                 or any(x['kind'] not in ('cart','instructions','selection','place','payment')
                        for x in state['operations'])):

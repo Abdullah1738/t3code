@@ -197,6 +197,12 @@ class MarketplacePayment:
                         client_secret=secret, timeout=min(timeout, end - clock()))
             if payment is not None:
                 summary = payment.summary()
+                if summary['has_redirect'] and (not getattr(self, '_recovery_only', False)
+                                               or getattr(self, 'open_redirect', False)):
+                    from commerce_redirect import open_once
+                    import hashlib
+                    open_once(self.flow_id, hashlib.sha256(secret.encode()).hexdigest(),
+                              payment.data.get('redirect_url'))
                 current_payment = (summary['raw_status'], summary['transaction_status'],
                                    summary['is_3ds_failure'], summary['has_redirect'])
                 if current_payment != last_payment:

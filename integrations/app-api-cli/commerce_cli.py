@@ -344,7 +344,7 @@ def order_minutes(args):
             journal.fail('MINUTES_AUTH_EXPIRED_NEEDS_APP_REBIND')
         raise
     with minutes_after_send(flow):
-        if payment['payment_status']=='payment_pending':
+        if payment['payment_status'] in ('payment_pending', 'payment_ready_to_redirect'):
             notify=telegram_3ds_notify(placed['order'],review['payable_minor'])
         elif payment['payment_status']=='payment_confirmed':
             # Captured flow always challenges, but a confirmed direct return is paid,
@@ -355,13 +355,15 @@ def order_minutes(args):
             journal.payment_fail('MINUTES_PAYMENT_NOT_PENDING',flow_id=flow.flow_id,order=flow.review.get('order'),
                                  amount_minor=flow.review.get('amount'))
         print(json.dumps({'flow_id':flow.flow_id,'phase':'owner_3ds_notified','notify':notify}),flush=True)
-        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify)
+        paid=flow.await_payment(wait_seconds=600,stall=telegram_stall_notify,open_redirect=True)
         print(json.dumps({'flow_id':flow.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'authorized_minor':paid.get('authorized_minor'),'polls':paid['polls'],
             'timed_out':paid['timed_out']}),flush=True)
         if not paid['paid']:
             minutes_payment_fail(flow,paid)
+        if journal.inspect(flow.flow_id)['state'] == 'FENCED':
+            journal.reconcile_minutes_challenge(flow.flow_id, evidence_hash=journal.digest(paid))
     tracking=flow.verify_tracking()
     registration=flow.register_tracker(args.label,recipient=args.recipient)
     journal.complete(flow.flow_id)
@@ -407,7 +409,20 @@ def order_nownow(args):
     print(json.dumps({'flow_id':flow.flow_id,'phase':'review','review':review}),flush=True)
     if args.prepare_only:
         return verified
-    flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
+    try:
+        flow.prepare_payment(cvv_loader=cvv_from_keychain if args.cvv_from_keychain else None)
+    except journal.PaymentError as exc:
+        if str(exc) != 'NOWNOW_BANK_APPROVAL_OR_PAYMENT_PENDING':
+            raise
+        from commerce_preorder import await_payment
+        paid = await_payment(flow.flow_id, open_redirect=True)
+        if not paid['verification_confirmed']:
+            raise
+        # Bank approval may take minutes. Re-read the same reviewed basket
+        # before the one placement; no CVV/verification operation is replayed.
+        flow = NowNowOrderFlow.resume_active(flow.flow_id, store_code=args.store_code,
+            items=items, auth=auth)
+        flow.prepare_only()
     try:
         placed=flow.place()
     except nownow_transport.NowNowError as exc:
@@ -564,12 +579,17 @@ def await_payment_flow(args):
     tracking, watcher registration and journal completion.
     """
     binding = journal.binding(args.flow_id)
+    if binding['app'] == 'noon' and binding['vertical'] == 'nownow':
+        from commerce_preorder import await_payment
+        return await_payment(args.flow_id, open_redirect=args.open_redirect,
+                             notify=not args.no_notify, wait_seconds=args.minutes*60)
     if binding['app'] == 'noon' and binding['vertical'] in ('main', 'supermall'):
         from commerce_main_order import MainOrderFlow
         from commerce_supermall_order import SupermallOrderFlow
         from commerce_marketplace_payment import telegram_3ds_notify
         cls = MainOrderFlow if binding['vertical'] == 'main' else SupermallOrderFlow
         flow = cls.resume_payment(args.flow_id)
+        flow.open_redirect = args.open_redirect
         if journal.payment_reported(args.flow_id):
             if journal.inspect(args.flow_id)['state'] == 'FENCED':
                 journal.reconcile_marketplace_paid(args.flow_id,
@@ -597,13 +617,16 @@ def await_payment_flow(args):
         notify=None if args.no_notify else (lambda order,total:telegram_3ds_notify(order,total))
         stall=None if args.no_notify else telegram_stall_notify
         with minutes_after_send(flow):
-            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall)
+            paid=flow.await_payment(notify=notify,wait_seconds=args.minutes*60,stall=stall,
+                                   open_redirect=args.open_redirect)
     with minutes_after_send(flow):
         print(json.dumps({'flow_id':args.flow_id,'phase':'payment_awaited','paid':paid['paid'],
             'payment_status':paid['payment_status'],'transaction_status':paid['transaction_status'],
             'polls':paid['polls'],'timed_out':paid['timed_out']}),flush=True)
         if not paid['paid']:
             minutes_payment_fail(flow,paid)
+        if journal.inspect(flow.flow_id)['state'] == 'FENCED':
+            journal.reconcile_minutes_challenge(flow.flow_id, evidence_hash=journal.digest(paid))
     tracking=flow.verify_tracking()
     if not flow.review.get('eta') and tracking.get('eta'):
         flow.review['eta']=tracking['eta']
@@ -1006,8 +1029,9 @@ def main(argv=None):
         if name=='choices':discovery.add_argument('--item',type=int,required=True)
     inspect=commands.add_parser('inspect');inspect.add_argument('flow_id')
     open_flows=commands.add_parser('open-flows',
-        help='Read-only: unsettled payments sent recently. A bank/3DS prompt while one is listed is ours')
-    open_flows.add_argument('--minutes',type=float,default=30.0)
+        help='Read-only: all unresolved account flows, including ACTIVE reviewed preparations')
+    open_flows.add_argument('--minutes',type=float,default=30.0,
+        help='legacy option; unresolved flows are shown regardless of age')
     recover=commands.add_parser('recover-payment');recover.add_argument('flow_id')
     recover.add_argument('--max-reads',type=int,default=90)
     recipient_argument(recover)
@@ -1097,11 +1121,13 @@ def main(argv=None):
         help='continue an ACTIVE flow (pre-place basket readback within 24h, or read-only paid completion)')
     supermall_order.add_argument('--eta',default=None,metavar='ISO_DATE',
         help='absolute promise deliveryDate (with offset) for the watcher; paid resume only')
-    await_cmd=commands.add_parser('await-payment',help='Status-only payment/3DS continuation for Minutes, Main and Supermall')
+    await_cmd=commands.add_parser('await-payment',help='Payment status continuation, including NowNow verification')
     await_cmd.add_argument('flow_id')
     await_cmd.add_argument('--minutes',type=float,default=10.0)
     await_cmd.add_argument('--label',default='Noon order (payment resumed)')
     await_cmd.add_argument('--no-notify',action='store_true')
+    await_cmd.add_argument('--open-redirect',action='store_true',
+        help='authorize opening the retained NowNow bank challenge once in Dia Personal')
     recipient_argument(await_cmd)
     release=commands.add_parser('release-flow',
         help='Evidence-reviewed local release: failed Talabat quote with no financial send, or verified never-paid order')
@@ -1187,7 +1213,7 @@ def main(argv=None):
         elif args.command=='open-flows':
             flows=journal.open_payments(since_seconds=max(0.0,args.minutes)*60)
             result={'ok':True,'open':flows,'financial_send':False,
-                    'bank_prompt':'ours: approve it' if flows else 'no open payment from us in this window'}
+                    'bank_prompt':'Check exact lane/card/amount; an open preparation is not a payment approval request.'}
         elif args.command=='recover-payment':
             result=recover_payment(args.flow_id,max_reads=args.max_reads,recipient=args.recipient)
             if isinstance(result,dict) and result.get('reason') in CARD_DECLINE_REASONS:

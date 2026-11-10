@@ -45,7 +45,7 @@ def payment_outcome(projection):
     return 'UNKNOWN'
 
 
-def recover(flow_id, *, auth=None, vault=None, timeout=20):
+def recover(flow_id, *, auth=None, vault=None, timeout=20, challenge=None):
     """Restart-safe native status POST only; no authorization/complete replay."""
     from commerce_auth_status import CommerceAuth
     from commerce_nownow import reader
@@ -82,5 +82,78 @@ def recover(flow_id, *, auth=None, vault=None, timeout=20):
     journal.observe(flow_id,op,outcome=payment_outcome(result.projection),evidence_hash=journal.digest(result.projection))
     if payment_outcome(result.projection) == 'PREORDER_PAYMENT_CONFIRMED':
         journal.reconcile_nownow_preorder(flow_id)
+    if challenge is not None and payment_outcome(result.projection) == 'CHALLENGE_REQUIRED':
+        challenge(saved, result.wire)
     return {'flow_id':flow_id,**result.projection,'financial_retry':False,
             'journal_state':journal.inspect(flow_id)['state']}
+
+
+def await_payment(flow_id, *, open_redirect=False, notify=True, wait_seconds=600,
+                  poll_seconds=5, sleep=None, clock=None):
+    """Continue a consumed verification; never place or send completion again.
+
+    Opening the bank challenge is explicit on recovery. Plain recovery and
+    await-payment remain status-only, including for old unopened intents.
+    """
+    import time
+    from commerce_redirect import open_once
+    from commerce_nownow_capture import load
+    from noon_checkout import fingerprint
+    from noon_minutes_checkout import amount_minor
+    sleep, clock = sleep or time.sleep, clock or time.monotonic
+    local = journal.inspect(flow_id)
+    if local['order_id'] or any(op['kind'] == 'place' for op in local['operations']):
+        journal.fail('PREORDER_AWAIT_ALREADY_PLACED_USE_RECOVER_PAYMENT')
+    if open_redirect and time.time() - journal.flow_created_at(flow_id) > 24 * 3600:
+        journal.fail('NOWNOW_FLOW_EXPIRED_24H')
+    start = clock()
+    notified = stalled = False
+    amount = None
+    def challenge(saved, wire):
+        nonlocal notified, amount
+        if not open_redirect:
+            return
+        state = load(flow_id)
+        if (fingerprint(wire.get('customer_code')) != state['binding']['account_hash']
+                or fingerprint(str(wire.get('id_token'))) != saved['card_hash']
+                or not str(wire.get('cc_masked') or '').endswith(state['card_last4'])
+                or wire.get('currency_code') != 'AED'):
+            journal.fail('PREORDER_CHALLENGE_IDENTITY_MISMATCH')
+        amount = amount_minor(wire.get('amount'))
+        if amount <= 0 or amount > saved['payable_minor']:
+            journal.fail('PREORDER_CHALLENGE_AMOUNT_INVALID')
+        open_once(flow_id, saved['intent_hash'], wire.get('redirect_url'))
+        if notify and not notified:
+            notified = notify_owner(flow_id, amount, state['card_last4'])
+    while True:
+        result = recover(flow_id, challenge=challenge)
+        confirmed = payment_outcome(result) == 'PREORDER_PAYMENT_CONFIRMED'
+        failed = result['payment_status'] == 'payment_failed' and not result.get('redirect_required')
+        if confirmed or failed:
+            return {**result, 'financial_send': False, 'timed_out': False,
+                    'verification_only': True, 'verification_confirmed': confirmed, 'notified': notified}
+        elapsed = clock() - start
+        if notified and not stalled and elapsed >= 300:
+            stalled = notify_owner(flow_id, amount, load(flow_id)['card_last4'], stalled=True)
+        if elapsed >= wait_seconds:
+            return {**result, 'financial_send': False, 'timed_out': True,
+                    'verification_only': True, 'verification_confirmed': False, 'notified': notified}
+        sleep(min(poll_seconds, wait_seconds-elapsed))
+
+
+def notify_owner(flow_id, amount, card_last4, *, stalled=False):
+    import os
+    import subprocess
+    from commerce_minutes import TELEGRAM_CLI
+    bank = {'9546': 'Mashreq', '2342': 'ENBD X'}.get(card_last4)
+    if bank is None:
+        journal.fail('PREORDER_CHALLENGE_CARD_INVALID')
+    text = (f'noon NowNow AED {amount/100:.2f} still not confirmed after 5 min; no payment was resent.'
+            if stalled else f'this is ours: approve noon NowNow AED {amount/100:.2f} in {bank} now')
+    env = {k:v for k,v in os.environ.items() if k not in ('NODE_OPTIONS','BUN_OPTIONS','BUN_INSPECT')}
+    try:
+        return subprocess.run([*TELEGRAM_CLI, '--source', 'Noon payment', '--severity', 'attention',
+            '--text', text, '--key', f'nownow-{flow_id}-' + ('stall' if stalled else '3ds')],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False

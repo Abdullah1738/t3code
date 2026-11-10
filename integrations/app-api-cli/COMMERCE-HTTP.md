@@ -621,3 +621,25 @@ flows, later writers, unknown sends and placement history refuse. The native
 then the exact store's active session and recent carts independently prove empty.
 A missing response or failed readback keeps the cleanup flow blocking the account.
 No automatic resend, payment, placement or watcher registration occurs.
+
+### Retained bank redirects
+
+Authorized checkout opens a native 3DS redirect once in a dedicated Dia Personal
+window before asking for bank approval. The attempt is persisted before browser
+I/O; a crash or uncertain open is never automatically retried. Redirect URLs
+travel in memory over pipes, and only hashes are written to the attempt record.
+This applies to NowNow pre-order verification and the Minutes/marketplace
+payment-intent redirect paths. No completion or payment request is replayed.
+
+`commerce await-payment FLOW --minutes 10` supports NowNow pre-order verification
+and remains status-only. Add `--open-redirect` only when authorized to start the
+retained bank challenge. NowNow alerts use the native verification amount (which
+can be AED 1), not the basket total. Successful verification is not purchase
+capture: await-payment never places an order. Resume the same basket separately
+with its original `commerce order nownow ... --resume-flow FLOW` arguments.
+The existing 24-hour preparation limit, fresh basket review, and account fences
+still apply. Pending/redirect status with zero authorized/captured is not terminal
+no-charge proof; release-flow requires the existing exact failed-intent evidence.
+
+`commerce open-flows` lists all unresolved flows, including ACTIVE preparations
+and older payment fences. A listed preparation is not a bank approval request.
