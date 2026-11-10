@@ -1,5 +1,10 @@
-import { askDiscussion, type KanbanBoardState } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  askDiscussion,
+  askReplyProblem,
+  type KanbanBoardState,
+} from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem } from "@t3tools/contracts";
+import { useState } from "react";
 
 import { Composer, Message } from "../Chat";
 import { askAsker, replyOnAsk } from "./askStore";
@@ -22,6 +27,8 @@ export function AskDiscussion(props: {
 }) {
   const { entry } = props;
   const messages = askDiscussion(entry);
+  // A reply over a limit is told here, beside the composer that still holds it.
+  const [problem, setProblem] = useState<string | null>(null);
   if (!props.sheet && messages.length === 0 && !props.open && !props.waiting) return null;
   const talk = (
     <>
@@ -53,9 +60,18 @@ export function AskDiscussion(props: {
       <Composer
         placeholder="Ask the agent anything"
         attachments
-        onSend={(blocks) => replyOnAsk(entry, blocks)}
+        onSend={(blocks) => {
+          setProblem(askReplyProblem(blocks));
+          return replyOnAsk(entry, blocks);
+        }}
       />
-      <p className="-mt-2.5 text-xs text-(--m-muted)">Replying doesn't answer the ask.</p>
+      {problem ? (
+        <p role="alert" className="-mt-2.5 text-sm text-(--m-negative)">
+          {problem}
+        </p>
+      ) : (
+        <p className="-mt-2.5 text-xs text-(--m-muted)">Replying doesn't answer the ask.</p>
+      )}
     </div>
   );
   if (props.sheet) {

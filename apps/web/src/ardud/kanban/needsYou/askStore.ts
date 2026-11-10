@@ -4,6 +4,7 @@
  * the page and the sidebar count.
  */
 import {
+  askReplyProblem,
   askFormCarried,
   askFormFor,
   buildAskAnswer,
@@ -26,7 +27,7 @@ import {
 import { create } from "zustand";
 
 import { kanban } from "../kanbanStore";
-import { askApi, AskApiError } from "./askApi";
+import { askApi, AskApiError, askFailureText } from "./askApi";
 
 export const askKey = (entry: Pick<KanbanAskFeedItem, "cardId" | "ask">): string =>
   `${entry.cardId}:${entry.ask.id}`;
@@ -392,8 +393,8 @@ function giveBack(send: AskSend, ref: AskSendRef, error: unknown) {
     set({ hidden, marks: { ...state.marks, [ref.key]: "updated" } });
     return "stale" as const;
   }
-  const message = error instanceof Error ? error.message : "Robob did not confirm it.";
-  if (error instanceof AskApiError && error.status === 400) {
+  const message = askFailureText(error);
+  if (error instanceof AskApiError && error.status === 400 && !error.ownerOnly) {
     // The server names the field that failed: show it on that field.
     const field = /field "([^"]+)"/.exec(message)?.[1];
     set({
@@ -462,7 +463,7 @@ async function deliver(send: AskSend, leaving: boolean) {
         );
       }
     } else {
-      await askApi.answer(first.cardRef, first.askId, send.body, leaving);
+      await askApi.answer(first.cardRef, first.askId, send.body, first.revision, leaving);
     }
   } catch (error) {
     outcome = "failed";
@@ -694,7 +695,7 @@ export async function takeBackAsk(entry: KanbanAskFeedItem) {
     await askApi.hand(entry.cardRef, entry.ask.id, { action: "take_back" });
     showAskToast({ text: `${entry.boardName} #${entry.cardNumber} is yours again.` });
   } catch (error) {
-    showAskToast({ text: `Couldn't take it back. ${error instanceof Error ? error.message : ""}` });
+    showAskToast({ text: `Couldn't take it back. ${askFailureText(error)}` });
   }
   void refreshAsks();
 }
@@ -707,7 +708,13 @@ export async function replyOnAsk(
   entry: KanbanAskFeedItem,
   blocks: ReadonlyArray<KanbanBlock>,
 ): Promise<void> {
-  await askApi.reply(entry.cardRef, entry.ask.id, blocks);
+  const problem = askReplyProblem(blocks);
+  if (problem !== null) throw new Error(problem);
+  try {
+    await askApi.reply(entry.cardRef, entry.ask.id, blocks);
+  } catch (error) {
+    throw new Error(askFailureText(error), { cause: error });
+  }
   showAskToast({
     text: `Reply sent to ${askAsker(entry)}. ${entry.boardName} #${entry.cardNumber} waits until it answers.`,
   });
@@ -718,7 +725,7 @@ const snoozeRefs = (refs: ReadonlyArray<AskSendRef>, until: string | null) =>
   refs.length === 1
     ? askApi.snooze(refs[0]!.cardRef, refs[0]!.askId, until)
     : askApi.snoozeBatch(
-        refs.map((ref) => ({ card: ref.cardRef, askId: ref.askId })),
+        refs.map((ref) => ({ card: ref.cardRef, askId: ref.askId, revision: ref.revision })),
         until,
       );
 
@@ -743,7 +750,7 @@ export async function snoozeAsks(
     else showAskToast({ text: `Snoozed until ${untilLabel} · ${what}.`, undoSnooze: refs }, 8_000);
   } catch (error) {
     showAskToast({
-      text: `Couldn't snooze ${what}. ${error instanceof Error ? error.message : ""}`.trim(),
+      text: `Couldn't snooze ${what}. ${askFailureText(error)}`,
     });
   }
   await refreshAsks();

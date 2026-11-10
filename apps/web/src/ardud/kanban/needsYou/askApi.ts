@@ -1,13 +1,32 @@
 /**
- * The ask routes under `/api/ardud/kanban`, called over HTTP with the web
- * session (cookie, or the connection's bearer token). The rest of the board UI
- * talks over the socket; asks have these routes instead.
+ * Every call the Needs-you page makes to the server, in one place: the ask
+ * routes under `/api/ardud/kanban` over HTTP with the web session (cookie, or
+ * the connection's bearer token), and the one socket call that carries a
+ * secret. Nothing else in the page talks to the server, so a call that moves
+ * (a stricter owner check, HTTP to a socket method) changes here only.
  */
-import type { AskAnswerBody } from "@t3tools/client-runtime/ardud/kanban";
-import type { KanbanAskFeed, KanbanBlock, KanbanMessage, KanbanOwnerAsk } from "@t3tools/contracts";
+import {
+  askSecretFailure,
+  type AskAnswerBody,
+  type AskSecretAnswerInput,
+  type AskSecretFailure,
+} from "@t3tools/client-runtime/ardud/kanban";
+import {
+  isAtomCommandInterrupted,
+  runAtomCommand,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import type {
+  KanbanAskFeed,
+  KanbanAskSecretAnswerInput,
+  KanbanBlock,
+  KanbanMessage,
+  KanbanOwnerAsk,
+} from "@t3tools/contracts";
 
 import { appAtomRegistry } from "../../../rpc/atomRegistry";
 import { primaryEnvironmentIdAtom } from "../../../state/primaryEnvironment";
+import { serverEnvironment } from "../../../state/server";
 import { readPreparedConnection } from "../../../state/session";
 
 const PREFIX = "/api/ardud/kanban";
@@ -16,17 +35,43 @@ const PREFIX = "/api/ardud/kanban";
 export class AskApiError extends Error {
   readonly status: number;
   readonly code: string;
-  constructor(status: number, code: string, message: string) {
+  /** The ask's revision now, when the refusal carried it. */
+  readonly revision: number | null;
+  constructor(status: number, code: string, message: string, revision: number | null = null) {
     super(message);
     this.name = "AskApiError";
     this.status = status;
     this.code = code;
+    this.revision = revision;
   }
-  /** The ask changed or closed since it was read. */
+  /** The ask changed or closed since it was read: read it again and keep what he typed. */
   get stale(): boolean {
-    return this.status === 409;
+    return this.status === 409 || this.revision !== null;
+  }
+  /** The server wants proof this is the owner's own app session, and this session has none. */
+  get ownerOnly(): boolean {
+    return (
+      this.status === 403 || /owner|authoriz|forbidden/i.test(this.code) || this.code === "denied"
+    );
   }
 }
+
+export const ASK_OWNER_ONLY = "Answer this from the Robob app.";
+
+/** A failed call in the page's words. */
+export const askFailureText = (error: unknown): string =>
+  error instanceof AskApiError && error.ownerOnly
+    ? ASK_OWNER_ONLY
+    : error instanceof Error
+      ? error.message
+      : "Robob did not confirm it.";
+
+const revisionIn = (error: unknown): number | null => {
+  if (typeof error !== "object" || error === null) return null;
+  const { revision, currentRevision } = error as Record<string, unknown>;
+  const value = typeof currentRevision === "number" ? currentRevision : revision;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+};
 
 interface CallOptions {
   readonly body?: unknown;
@@ -93,6 +138,7 @@ async function call<T>(
       response.status,
       typeof error?.code === "string" ? error.code : "failed",
       typeof error?.message === "string" ? error.message : `Robob answered ${response.status}.`,
+      revisionIn(error),
     );
   }
   return json as T;
@@ -117,8 +163,15 @@ export interface AskAnswered {
 export interface AskBatchItem {
   readonly card: string;
   readonly askId: string;
-  readonly revision?: number;
+  /** The revision he read. Every answer carries one. */
+  readonly revision: number;
 }
+
+export type AskSecretOutcome =
+  | { readonly _tag: "sent" }
+  /** Another send of the same ask replaced this one. */
+  | { readonly _tag: "interrupted" }
+  | { readonly _tag: "refused"; readonly failure: AskSecretFailure };
 
 export interface AskBatchResult {
   readonly answered: number;
@@ -151,8 +204,51 @@ export const askApi = {
     ),
   /** One ask with its big blocks whole. */
   detail: (cardRef: string, askId: string) => call<AskDetail>("GET", cardPath(cardRef, askId)),
-  answer: (cardRef: string, askId: string, body: AskAnswerBody, keepalive = false) =>
-    call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/answer`, { body, keepalive }),
+  /** One answer. `revision` is the ask as he read it; the server refuses an answer to another one. */
+  answer: (
+    cardRef: string,
+    askId: string,
+    body: AskAnswerBody,
+    revision: number,
+    keepalive = false,
+  ) =>
+    call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/answer`, {
+      body: { ...body, revision },
+      keepalive,
+    }),
+  /**
+   * An answer that carries secret values, whole, over the socket method made
+   * for it. The values are only ever arguments here: nothing is kept, logged
+   * or reported, and a failure is described without the request.
+   */
+  answerSecrets: async (
+    input: AskSecretAnswerInput,
+    revision: number,
+  ): Promise<AskSecretOutcome> => {
+    const environmentId = appAtomRegistry.get(primaryEnvironmentIdAtom);
+    if (environmentId === null) {
+      return {
+        _tag: "refused",
+        failure: { message: "Not connected to Robob.", stale: false, field: null },
+      };
+    }
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      serverEnvironment.answerAskSecrets,
+      {
+        environmentId,
+        input: {
+          ...input,
+          answer: { ...input.answer, revision },
+        } as KanbanAskSecretAnswerInput,
+      },
+      // The failure cause holds the request; keep it out of the console and reports.
+      { label: "answer ask secrets", reportFailure: false, reportDefect: false },
+    );
+    if (result._tag === "Success") return { _tag: "sent" };
+    if (isAtomCommandInterrupted(result)) return { _tag: "interrupted" };
+    return { _tag: "refused", failure: askSecretFailure(squashAtomCommandFailure(result)) };
+  },
   answerBatch: (
     body: Omit<AskAnswerBody, "revision" | "values" | "finalDraft">,
     items: ReadonlyArray<AskBatchItem>,

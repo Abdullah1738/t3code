@@ -8,6 +8,7 @@ export * from "./needsYouQueue.ts";
 export * from "./askAnswer.ts";
 export * from "./askSecrets.ts";
 export * from "./askHistory.ts";
+export * from "./askReply.ts";
 export * from "./askKeys.ts";
 export * from "./askSendQueue.ts";
 export * from "./wordDiff.ts";

@@ -8,8 +8,8 @@ import {
   nextChangeView,
   askKindLabel,
   askRefusal,
+  askRequiresSecret,
   askSecretAnswerInput,
-  askSecretFailure,
   askSecretFieldIds,
   buildAskAnswer,
   isPlainAnswerField,
@@ -22,15 +22,10 @@ import {
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
 import {
-  isAtomCommandInterrupted,
-  squashAtomCommandFailure,
-} from "@t3tools/client-runtime/state/runtime";
-import {
   kanbanAskChanges,
   kanbanAskResponse,
   kanbanAskRevision,
   type KanbanAskFeedItem,
-  type KanbanAskSecretAnswerInput,
   type KanbanBoard,
 } from "@t3tools/contracts";
 import { MessageSquareIcon } from "lucide-react";
@@ -46,9 +41,6 @@ import {
 
 import { observeResize } from "../../../lib/observeResize";
 import { cn } from "../../../lib/utils";
-import { usePrimaryEnvironmentId } from "../../../state/environments";
-import { serverEnvironment } from "../../../state/server";
-import { useAtomCommand } from "../../../state/use-atom-command";
 import { BoardIcon } from "../boardIcon";
 import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { ActionBar, type AskTurn } from "./ActionBar";
@@ -64,6 +56,7 @@ import {
 import { AskBlocks, BlockPicture, useAskMedia } from "./AskBlocks";
 import { AskDiscussion } from "./AskDiscussion";
 import { FieldRow } from "./AskFields";
+import { askApi, askFailureText } from "./askApi";
 import {
   answerAsk,
   askAsker,
@@ -78,6 +71,7 @@ import {
   retryAskSend,
   seeAsk,
   setAskChangeView,
+  showAskToast,
   snoozeAsks,
   takeBackAsk,
   useAskStore,
@@ -168,13 +162,6 @@ export function AskReader(props: {
   const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
   const [secretBusy, setSecretBusy] = useState(false);
   const [secretError, setSecretError] = useState<string | null>(null);
-  const environmentId = usePrimaryEnvironmentId();
-  const answerSecrets = useAtomCommand(serverEnvironment.answerAskSecrets, {
-    label: "answer ask secrets",
-    // The failure cause holds the request; keep it out of the console.
-    reportFailure: false,
-    reportDefect: false,
-  });
 
   const media = useAskMedia(ask);
   const [viewing, setViewing] = useState<number | null>(null);
@@ -212,23 +199,18 @@ export function AskReader(props: {
   // An answer that carries a secret is not held for Undo: it goes at once, over
   // the private channel, and the typed value is dropped as it leaves.
   const sendSecrets = async (input: AskSecretAnswerInput, label: string) => {
-    if (environmentId === null) {
-      setSecretError("Not connected to Robob.");
-      return;
-    }
     setSecretBusy(true);
     setSecretError(null);
     setSecrets({});
-    const result = await answerSecrets({
-      environmentId,
-      input: { ...input, cardId: entry.cardId } as KanbanAskSecretAnswerInput,
-    }).finally(() => setSecretBusy(false));
-    if (result._tag === "Success") {
+    const outcome = await askApi
+      .answerSecrets({ ...input, cardId: entry.cardId }, kanbanAskRevision(ask))
+      .finally(() => setSecretBusy(false));
+    if (outcome._tag === "sent") {
       noteAskAnswered(entry, input.answer, label);
       return;
     }
-    if (isAtomCommandInterrupted(result)) return;
-    const failure = askSecretFailure(squashAtomCommandFailure(result));
+    if (outcome._tag === "interrupted") return;
+    const { failure } = outcome;
     setSecretError(failure.message);
     if (failure.stale) noteAskStale(entry);
     focusAt(`field:${failure.field ?? askSecretFieldIds(ask)[0] ?? ""}`);
@@ -346,7 +328,12 @@ export function AskReader(props: {
       onOpenCard={props.onOpenCard}
       handOver={
         canTalk && !response.ack && ask.to !== "evaluator" ? (
-          <HandOver entry={entry} phone={layout === "phone"} onLeave={props.onLeave} />
+          <HandOver
+            entry={entry}
+            phone={layout === "phone"}
+            needsSecret={askRequiresSecret(ask)}
+            onLeave={props.onLeave}
+          />
         ) : null
       }
     />
@@ -630,7 +617,9 @@ export function AskReader(props: {
                   _tag: "md",
                   text: "This ask is out of date. Please refresh it with the current facts.",
                 },
-              ]).catch(() => undefined)
+              ]).catch((error: unknown) =>
+                showAskToast({ text: `Couldn't ask for a refresh. ${askFailureText(error)}` }),
+              )
             }
           >
             {canNote && !showNote && layout === "desktop" ? (

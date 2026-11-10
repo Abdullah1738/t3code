@@ -39,6 +39,8 @@ const quiet =
 export function HandOver(props: {
   entry: KanbanAskFeedItem;
   phone: boolean;
+  /** It can't close without a secret from him, which an evaluator can't give. */
+  needsSecret?: boolean;
   /** The ask left the queue: the page moves on. */
   onLeave: () => void;
 }) {
@@ -59,6 +61,16 @@ export function HandOver(props: {
     props.onLeave();
     handAsk(entry, words.trim());
   };
+  if (props.needsSecret) {
+    return (
+      <div className="border-t border-(--m-rule) pt-4">
+        <Label className="mb-1.5">Fewer like this</Label>
+        <p className="text-sm text-(--m-muted)">
+          It needs a secret only you can give, so it can't go to the evaluator.
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="border-t border-(--m-rule) pt-4">
       <Label className="mb-1.5">Fewer like this</Label>
