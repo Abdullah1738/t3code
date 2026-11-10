@@ -592,3 +592,43 @@ it.live(
     ),
   30_000,
 );
+
+// Review r4: the explicit-transaction BEGIN (executeUnprepared) had the same
+// unconditional ROLLBACK after a never-sent BEGIN.
+it.live(
+  "an explicit snapshot transaction behind an abandoned statement fails fast and queues no rollback",
+  () => {
+    const { spawned, restore } = countSpawns();
+    return withLaneClient(
+      (sql) =>
+        Effect.gen(function* () {
+          yield* sql`CREATE TABLE ardud_archive(id INTEGER)`;
+          yield* sql
+            .withTransaction(sql`SELECT id FROM ardud_archive`)
+            .pipe(SqliteClient.authReadOnly);
+          const before = spawned.count;
+          const wedged = yield* sql
+            .unsafe(FOREVER)
+            .pipe(SqliteClient.authReadOnly, Effect.flip, Effect.forkChild);
+          yield* Effect.sleep("100 millis");
+          const started = performance.now();
+          const failures = yield* Effect.forEach(
+            Array.from({ length: 3 }, () => undefined),
+            () =>
+              sql
+                .withTransaction(sql`SELECT id FROM ardud_archive`)
+                .pipe(SqliteClient.authReadOnly, Effect.flip),
+            { concurrency: "unbounded" },
+          );
+          assert.isBelow(performance.now() - started, 2_500);
+          for (const failure of failures)
+            assert.equal(SqliteClient.readerLaneFailure(failure), "retryable");
+          assert.equal(SqliteClient.readerLaneFailure(yield* Fiber.join(wedged)), "busy");
+          // A BEGIN that never ran retires nothing.
+          assert.equal(spawned.count, before);
+        }),
+      { readerWedgeLimit: "60 seconds", readerSnapshotSql: ["SELECT 1"] },
+    ).pipe(Effect.ensuring(Effect.sync(restore)));
+  },
+  30_000,
+);

@@ -599,11 +599,19 @@ export const makeAuthReader = Effect.fnUntraced(function* (
           raw: false,
         });
         if (/^\s*BEGIN\b/i.test(sql) && options.readerSnapshotSql !== undefined) {
+          // A BEGIN that was never sent opened nothing: no ROLLBACK, which would
+          // only queue behind the abandoned statement (review r4, as withSnapshot).
+          let begun = true;
           // WAL snapshots are per attached DB. Pin both while no archive mover
           // can replace a cold row between their snapshot acquisitions.
           return Effect.uninterruptible(
             snapshotLock.withPermits(1)(
               effect.pipe(
+                Effect.tapError((error) =>
+                  Effect.sync(() => {
+                    if (readerLaneFailure(error) === "retryable") begun = false;
+                  }),
+                ),
                 Effect.andThen(pinSnapshots),
                 Effect.tap(() =>
                   Effect.sync(() => {
@@ -615,13 +623,15 @@ export const makeAuthReader = Effect.fnUntraced(function* (
             ),
           ).pipe(
             Effect.onError(() =>
-              request({
-                sql: "ROLLBACK",
-                params: [],
-                cached: false,
-                values: false,
-                raw: false,
-              }).pipe(Effect.ignore),
+              begun
+                ? request({
+                    sql: "ROLLBACK",
+                    params: [],
+                    cached: false,
+                    values: false,
+                    raw: false,
+                  }).pipe(Effect.ignore)
+                : Effect.void,
             ),
           );
         }
