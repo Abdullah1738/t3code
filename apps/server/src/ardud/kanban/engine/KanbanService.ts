@@ -1186,6 +1186,22 @@ const effectSink = Context.Reference<EffectSink | undefined>("KanbanEffectSink",
 });
 
 /**
+ * Dispatch kicks asked for by a tick's own steps. The tick dispatches as its last
+ * step, so while its steps run a kick is only noted here: queued, it started the
+ * worker's dispatcher under the rest of the tick, whose card starts made the tick
+ * stale, and a tick that has already written or sent cannot start over. On the
+ * 4,000-card soak that cost one tick in eight that ran with no other traffic
+ * (release-20261110c, 11 Nov 2026): each had handled a failed run, which kicks.
+ */
+interface TickKicks {
+  held: boolean;
+  asked: boolean;
+}
+const tickKicks = Context.Reference<TickKicks | undefined>("KanbanTickKicks", {
+  defaultValue: () => undefined,
+});
+
+/**
  * The asks a durable owner route answers, fixed by its first attempt. Routing
  * closes only these, so a retry never answers an ask opened after the message.
  */
@@ -1767,6 +1783,12 @@ const make = Effect.gen(function* () {
   });
 
   const kick = Effect.gen(function* () {
+    // Inside a tick's steps: its own dispatch, right after them, is the kick.
+    const ticking = yield* tickKicks;
+    if (ticking?.held) {
+      ticking.asked = true;
+      return;
+    }
     const pending = yield* Ref.getAndSet(kickPending, true);
     if (!pending) yield* Queue.offer(jobs, { _tag: "kick" });
   });
@@ -6156,7 +6178,8 @@ const make = Effect.gen(function* () {
   const turnEndedUnlocked = (threadId: ThreadId, runId?: string, retry = false) =>
     serial(turnEnding, threadId, finishTurn(threadId, runId, retry));
 
-  const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
+  /** Everything a tick does before it dispatches. Dispatch kicks are held (see `tickKicks`). */
+  const tickSteps = Effect.fn("KanbanService.tickSteps")(function* () {
     const now = yield* nowMillis;
     for (const threadId of yield* Ref.get(unresolvedTurnEnds)) {
       yield* turnEndedUnlocked(threadId, undefined, true);
@@ -7096,6 +7119,20 @@ const make = Effect.gen(function* () {
     }
     yield* Ref.set(unlistedPools, unlistedNow);
     yield* Ref.set(missing, missed);
+  });
+
+  const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
+    const kicks: TickKicks = { held: true, asked: false };
+    yield* tickSteps().pipe(
+      Effect.provideService(tickKicks, kicks),
+      Effect.ensuring(
+        Effect.sync(() => {
+          kicks.held = false;
+        }),
+      ),
+      // Steps that failed never reach the dispatch below: a kick they asked for is queued.
+      Effect.onError(() => Effect.suspend(() => (kicks.asked ? kick : Effect.void))),
+    );
     yield* dispatchUnlocked();
   });
 
