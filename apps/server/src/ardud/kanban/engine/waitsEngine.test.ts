@@ -16,6 +16,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -1746,4 +1747,93 @@ it.effect(
         assert.strictEqual(world.reading.count, 10);
       }),
     ),
+);
+
+it.effect(
+  "a tick that wakes a card finishes its own work before the dispatcher it kicked writes",
+  () => {
+    const warned: Array<string> = [];
+    const warnings = Logger.make(({ message, logLevel }) => {
+      if (logLevel !== "Warn" && logLevel !== "Error") return;
+      warned.push((Array.isArray(message) ? message : [message]).map(String).join(" "));
+    });
+    return inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        // A reviewed card whose PR has merged: the tick completes it, after its wait pass.
+        const watcher = ThreadId.make("watcher");
+        world.threads.set(watcher, {
+          title: "Work on the reviewed card",
+          model: board.defaultCardModel,
+          messages: [],
+          running: false,
+        });
+        world.prs.set(watcher, [{ url: PR, title: null, state: "merged" }]);
+        const reviewed = yield* placed(board, "Reviewed, PR merged", {
+          stage: "in_review",
+          reviewStep: 1,
+          links: [tracked(PR)],
+          workThreadId: watcher,
+        });
+        // A card parked until a time that comes before the tick: the wait pass wakes it,
+        // and waking a card kicks the dispatcher.
+        const parked = yield* placed(board, "Parked until the hour");
+        yield* kanban.waitCard(
+          parked.id,
+          { on: "time", until: iso(T0 + HOUR), note: "after the window" },
+          owner,
+        );
+        // As in production the kicks run on the worker. The one queued by the setup
+        // starts this card; once it has, the worker is idle.
+        const canary = yield* placed(board, "Started by the setup's kick");
+        const worker = yield* Effect.forkChild(kanban.worker);
+        const startedOf = (cardId: KanbanCard["id"]) =>
+          store.card(cardId).pipe(
+            Effect.map((card) => card?.activeThreadId != null),
+            Effect.orDie,
+          );
+        const turns = (count: number, until: Effect.Effect<boolean>) =>
+          Effect.gen(function* () {
+            for (let i = 0; i < count; i += 1) {
+              if (yield* until) return true;
+              yield* Effect.yieldNow;
+            }
+            return yield* until;
+          });
+        assert.isTrue(yield* turns(20_000, startedOf(canary.id)), "the worker ran the queued kick");
+        yield* turns(200, Effect.succeed(false));
+
+        yield* TestClock.adjust(HOUR + MINUTE);
+        // While the tick reads the reviewed card's thread it is outside the board's gate,
+        // having already saved the woken card. A dispatcher started by that wake would
+        // write the card's start here, the tick would come back to a changed board and,
+        // unable to start over after its own write, drop the rest of its work.
+        world.reading.during = (threadId) =>
+          threadId !== watcher
+            ? Effect.void
+            : store.card(parked.id).pipe(
+                Effect.orDie,
+                Effect.flatMap((card) =>
+                  card?.wait !== undefined
+                    ? Effect.void
+                    : Effect.asVoid(turns(2_000, startedOf(parked.id))),
+                ),
+              );
+        yield* kanban.tick;
+        world.reading.during = null;
+        yield* Fiber.interrupt(worker);
+
+        assert.deepStrictEqual(
+          warned.filter((line) => line.includes("kanban board tick failed")),
+          [],
+          "the tick did not give up",
+        );
+        assert.strictEqual((yield* cardOf(reviewed.id)).stage, "completed");
+        // The woken card is started by the tick's own dispatch, its last step.
+        const woken = yield* cardOf(parked.id);
+        assert.isUndefined(woken.wait);
+        assert.strictEqual(woken.activeRole, "work");
+      }).pipe(Effect.provide(Logger.layer([warnings]))),
+    );
+  },
 );
