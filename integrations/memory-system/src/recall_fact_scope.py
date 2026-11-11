@@ -152,7 +152,7 @@ def nominal_instruction(text):
     return True
 
 
-def finite_result_clause(text):
+def finite_result_clause(text, *, marked=False):
     clause = re.match(r"([a-z]+)\s+(" + _CI_STATES + r"|[a-z]+)\b(.*)", text, re.I)
     if not clause or clause[1].casefold() not in noun_verbs():
         return False
@@ -173,8 +173,11 @@ def finite_result_clause(text):
         # A lexical noun plural is a command object unless it carries an
         # established outcome meaning. Inflection alone cannot turn
         # "release changes" or "build packages" into historical reports.
-        complement = bool(re.match(r"(?:in|from)\b", tail, re.I))
-        finite |= bool(roots) and (not roots & noun_verbs() or outcome or complement)
+        # Prepositions can modify a plural object. Require a resultative
+        # complement or a complete state transition for the verbal reading.
+        complement = bool('result' in roots and re.match(r"(?:in|from)\b", tail, re.I) or
+                          'change' in roots and re.match(r"from\b.+\bto\b", tail, re.I))
+        finite |= bool(roots) and (not roots & noun_verbs() or not marked and (outcome or complement))
     # A finite result after a noun/verb homograph is a report. A participle
     # modifying its object ("release completed builds") remains imperative;
     # plural objects such as "results" are not result predicates.
@@ -203,7 +206,7 @@ def directive_clause(text):
     head = re.match(r"[a-z]+\b", text, re.I)
     if modal:
         return bool(head and (modal[0].strip().lower() != 'only' or
-                              base_verb(head[0]) and not finite_result_clause(text)))
+                              base_verb(head[0]) and not finite_result_clause(text, marked=True)))
     if polite:
         return bool(head and base_verb(head[0]))
     # Use a fixed English lexicon for unmarked imperatives, not a growing

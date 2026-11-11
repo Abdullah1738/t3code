@@ -962,6 +962,43 @@ class FactScopeTests(unittest.TestCase):
                         self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
                         self.assertEqual([fact] if anchored else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
 
+    def test_plural_object_modifiers_keep_instruction_intent(self):
+        from recall_fact_scope import comparison_text, standing_instruction
+        objects = ('changes', 'packages', 'results', 'outputs', 'checks', 'artifacts', 'releases', 'builds')
+        modifiers = ('from source', 'from verified builds', 'in the repository')
+        message = ('Build and release ' + ' '.join(objects) +
+                   ' from source and verified builds in the repository for PR1145 while CI checks are pending.')
+        for verb in ('build', 'release'):
+            for noun in objects:
+                for modifier in modifiers:
+                    command = f'{verb} {noun} {modifier}'
+                    policies = [f'Only {command} after CI checks passed.']
+                    # Unmarked results in/from is the paired historical reading;
+                    # an explicit Only still makes it a directive.
+                    if noun != 'results':
+                        policies += [f'{prefix} CI checks passed, {command}.'
+                                     for prefix in ('After', 'When', 'Once', 'If', 'Until', 'Unless')]
+                    for j, policy in enumerate(policies):
+                        with self.subTest(verb=verb, noun=noun, modifier=modifier, policy=policy):
+                            self.assertTrue(standing_instruction(policy))
+                            self.assertEqual(policy, comparison_text(policy, message))
+                            index = RuleIndex(self.root / f'plural-modifier-{verb}-{noun}-{modifier}-{j}.db')
+                            index.remember(policy, scope=CWD, source_session='owner')
+                            with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                                rules, result = preflight('t3_thread_send', {'message': message}, CWD, index.path, session_id='other')
+                                self.assertEqual([policy], [r['text'] for r in rules])
+                                self.assertEqual('deny', result['decision'])
+                                model.assert_called_once()
+                            engine = CheckEngine(rules_path=index.path)
+                            for trigger in ('first_prompt', 'compaction'):
+                                self.assertEqual([policy], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]])
+        for clause in ('build succeeded', 'release completed', 'build has succeeded'):
+            fact = f'After CI checks passed for PR1145 head 66cfd86f, only {clause}.'
+            with self.subTest(report=fact):
+                self.assertFalse(standing_instruction(fact))
+                self.assertEqual('', comparison_text(fact, message))
+                self.assertEqual(fact, comparison_text(fact, 'PR1145 head 66cfd86f checks failed.'))
+
     def test_linked_ci_labels_keep_original_identities(self):
         from recall_fact_scope import comparison_text, ci_ids
         changed = 'PR1145 head 72a10c19 CI checks pending.'
