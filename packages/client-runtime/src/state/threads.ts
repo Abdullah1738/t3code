@@ -448,21 +448,45 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   // An HTTP miss is not a delete: the thread may not be committed yet (draft
   // promotion, a queued creation) or the read raced. Retry with backoff for a
-  // grace window, then show "not-found" until the shell lists the thread or the
-  // user retries. Nothing is removed from the disk cache and the state is never
+  // grace window, then show "not-found" until the shell lists the thread (a new
+  // presence generation) or the user retries. Nothing is removed from the disk cache and the state is never
   // retained as deleted.
   let missSince: number | undefined;
   let missAttempts = 0;
-  const presence = options?.presence ?? Stream.never;
-  const awaitPresenceAppears = presence.pipe(
-    Stream.changes,
-    // A shell that already lists the thread while the server says it is
-    // missing is not news; wait for it to appear (absent -> present).
-    Stream.dropWhile((present) => present),
-    Stream.filter((present) => present),
-    Stream.runHead,
-    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: () => Effect.void })),
-  );
+  // Presence is observed from the start, not only after the final miss: the
+  // last HTTP read can miss, creation commit, and the shell list the thread
+  // before a late subscriber would see it (11 Nov 2026 review). Each
+  // absent -> present transition (an initial "present" counts) is one
+  // generation, consumed by at most one retry, so a shell that keeps listing a
+  // thread the server can't find causes one retry, not a loop.
+  const presenceGeneration = yield* SubscriptionRef.make(0);
+  let consumedPresenceGeneration = 0;
+  if (options?.presence !== undefined) {
+    yield* Effect.forkScoped(
+      options.presence.pipe(
+        Stream.changes,
+        Stream.runForEach((present) =>
+          present ? SubscriptionRef.update(presenceGeneration, (value) => value + 1) : Effect.void,
+        ),
+      ),
+    );
+  }
+  /** Consumes a presence generation not yet retried, if there is one. */
+  const takePresenceAdvance = Effect.gen(function* () {
+    const generation = yield* SubscriptionRef.get(presenceGeneration);
+    if (generation <= consumedPresenceGeneration) return false;
+    consumedPresenceGeneration = generation;
+    return true;
+  });
+  const awaitPresenceAdvance = Effect.gen(function* () {
+    const seen = consumedPresenceGeneration;
+    const generation = yield* SubscriptionRef.changes(presenceGeneration).pipe(
+      Stream.filter((value) => value > seen),
+      Stream.runHead,
+      Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed })),
+    );
+    consumedPresenceGeneration = Math.max(consumedPresenceGeneration, generation);
+  });
   const clearMiss = Effect.sync(() => {
     missSince = undefined;
     missAttempts = 0;
@@ -478,6 +502,14 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       yield* Effect.sleep(threadNotFoundRetryDelayMs(missAttempts));
       return;
     }
+    // The shell listed the thread during the last read (or already lists it):
+    // read once more before parking.
+    if (yield* takePresenceAdvance) {
+      yield* Effect.logDebug("Thread not found, but the shell lists it; retrying once.").pipe(
+        Effect.annotateLogs({ environmentId, threadId, attempt: missAttempts }),
+      );
+      return;
+    }
     yield* Ref.set(awaitingCompletion, false);
     yield* SubscriptionRef.update(state, (current) =>
       current.status === "deleted"
@@ -490,7 +522,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           },
     );
     yield* remember;
-    yield* awaitPresenceAppears;
+    yield* awaitPresenceAdvance;
     yield* clearMiss;
     yield* SubscriptionRef.update(state, (current) =>
       current.status === "not-found"

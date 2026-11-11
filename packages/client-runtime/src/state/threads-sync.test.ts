@@ -52,6 +52,7 @@ import {
   type ThreadSnapshotLoadResult,
 } from "./threads.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
+import { THREAD_NOT_FOUND_GRACE_MS, threadNotFoundRetryDelayMs } from "./threadRetention.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -2270,6 +2271,74 @@ describe("EnvironmentThreads", () => {
       yield* SubscriptionRef.set(presence, true);
       yield* advance("5 seconds");
       expect(yield* Ref.get(harness.loaderCalls)).toBe(callsAtMiss);
+    }),
+  );
+
+  // The loader call that parks: the first miss at or past the grace window.
+  const finalGraceCall = (() => {
+    let elapsed = 0;
+    let call = 1;
+    while (elapsed < THREAD_NOT_FOUND_GRACE_MS) {
+      elapsed += threadNotFoundRetryDelayMs(call);
+      call += 1;
+    }
+    return call;
+  })();
+
+  it.effect(
+    "loads a thread the shell lists right after the last read of the grace window missed it",
+    () =>
+      Effect.gen(function* () {
+        // 11 Nov 2026 review: the final read misses, creation commits and the
+        // shell lists the thread before the miss parks. Presence was only
+        // watched after parking, and an initial "present" was dropped, so the
+        // thread stayed not-found until a manual retry.
+        let serverHasThread = false;
+        const presence = yield* Queue.unbounded<boolean>();
+        Queue.offerUnsafe(presence, false);
+        const harness = yield* makeHarness({
+          presence: Stream.fromQueue(presence),
+          httpSnapshots: (call) => {
+            if (serverHasThread) {
+              return {
+                _tag: "present",
+                snapshot: { snapshotSequence: 7, projection: BASE_PROJECTION },
+              };
+            }
+            if (call === finalGraceCall) {
+              serverHasThread = true;
+              Queue.offerUnsafe(presence, true);
+            }
+            return { _tag: "missing" };
+          },
+        });
+        yield* advance("1 second", 20);
+        const state = yield* Ref.get(harness.latest);
+        expect(state.status).toBe("live");
+        expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+        expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      }),
+  );
+
+  it.effect("a shell that keeps listing a missing thread costs one retry, not a loop", () =>
+    Effect.gen(function* () {
+      const presence = yield* SubscriptionRef.make(true);
+      const harness = yield* makeHarness({
+        presence: SubscriptionRef.changes(presence),
+        httpSnapshot: { _tag: "missing" },
+      });
+      yield* advance("1 second", 20);
+      expect((yield* Ref.get(harness.latest)).status).toBe("not-found");
+      // One read past the grace window for the already-present thread, then parked.
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+      yield* advance("10 seconds", 6);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+      // A new absent -> present transition is a new generation: one more read.
+      yield* SubscriptionRef.set(presence, false);
+      yield* SubscriptionRef.set(presence, true);
+      yield* advance("1 second");
+      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThan(finalGraceCall + 1);
     }),
   );
 
