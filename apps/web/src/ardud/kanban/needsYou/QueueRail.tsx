@@ -155,12 +155,17 @@ export function QueueRail(props: QueueRailProps) {
           <RailSkeleton />
         ) : sections.length === 0 ? (
           props.filtered ? (
-            <div className="flex flex-col items-start gap-2 px-2.5 pt-4 text-sm">
-              <p className="font-medium">No asks match.</p>
-              <button type="button" onClick={props.onClearFilter} className={linkClass}>
-                Clear filters
-              </button>
-            </div>
+            props.inSheet ? (
+              <div className="flex flex-col items-start gap-2 px-2.5 pt-4 text-sm">
+                <p className="font-medium">No asks match.</p>
+                <button type="button" onClick={props.onClearFilter} className={linkClass}>
+                  Clear filters
+                </button>
+              </div>
+            ) : (
+              // Beside the reader, which says it in full and offers to clear the filters.
+              <p className="px-2.5 pt-4 text-sm text-(--m-muted)">No asks match</p>
+            )
           ) : (
             <p className="px-2.5 pt-4 text-sm text-(--m-muted)">No asks</p>
           )
