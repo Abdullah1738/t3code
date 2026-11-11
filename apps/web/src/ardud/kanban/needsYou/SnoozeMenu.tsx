@@ -128,6 +128,8 @@ function PickForm(props: { onClose: () => void; onSnooze: (until: SnoozeUntil) =
   };
   return (
     <form
+      // The page says what is wrong in its own words, beside the field.
+      noValidate
       className="flex flex-col gap-4 p-5"
       onSubmit={(event) => {
         event.preventDefault();

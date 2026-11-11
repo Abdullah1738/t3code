@@ -187,51 +187,47 @@ const drawsPdf = (): boolean => typeof navigator !== "undefined" && navigator.pd
  * The first page of a PDF, drawn by the browser's own viewer with its chrome
  * off. It is a picture of the page: a click anywhere opens the whole document.
  */
-function PdfPage(props: {
-  attachment: Attachment;
-  /** A file held here: shown from its own URL, not fetched. */
-  localUrl: string | null;
-  onOpen: () => void;
-}) {
-  const { attachment } = props;
-  const environmentId = usePrimaryEnvironmentId();
-  // The viewer needs the file served inline; the block's own URL is a download.
-  const [remote] = useAssetUrls(
-    environmentId ?? ("" as EnvironmentId),
-    props.localUrl === null && environmentId !== null
-      ? [
-          {
-            _tag: "attachment" as const,
-            attachmentId: attachment.id,
-            fileName: attachment.name,
-            mimeType: attachment.mimeType,
-            disposition: "inline" as const,
-          },
-        ]
-      : [],
-  );
-  const url = props.localUrl ?? remote ?? null;
+function PdfPage(props: { name: string; url: string | null; onOpen: () => void }) {
   return (
     <div className="relative h-72 overflow-hidden rounded-xl bg-(--m-surface) ring-1 ring-(--m-rule)">
-      {url === null ? (
+      {props.url === null ? (
         <Bar className="size-full rounded-none" />
       ) : (
         <embed
           aria-hidden
           tabIndex={-1}
-          src={`${url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
+          src={`${props.url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
           type="application/pdf"
           className="pointer-events-none size-full"
         />
       )}
       <button
         type="button"
-        aria-label={`Open ${attachment.name}`}
+        aria-label={`Open ${props.name}`}
         onClick={props.onOpen}
         className="absolute inset-0 cursor-zoom-in rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
       />
     </div>
   );
+}
+
+/** The same for a PDF on the server: the viewer needs it served inline, and the block's own URL is a download. */
+function ServedPdfPage(props: {
+  attachment: Attachment;
+  environmentId: EnvironmentId;
+  onOpen: () => void;
+}) {
+  const { attachment } = props;
+  const [url] = useAssetUrls(props.environmentId, [
+    {
+      _tag: "attachment" as const,
+      attachmentId: attachment.id,
+      fileName: attachment.name,
+      mimeType: attachment.mimeType,
+      disposition: "inline" as const,
+    },
+  ]);
+  return <PdfPage name={attachment.name} url={url ?? null} onOpen={props.onOpen} />;
 }
 
 function FileCard(props: {
@@ -250,10 +246,12 @@ function FileCard(props: {
   const local = props.file !== undefined;
   return (
     <div className="flex min-w-0 flex-col gap-2">
-      {kind === "pdf" && drawsPdf() ? (
-        <PdfPage
+      {kind !== "pdf" || !drawsPdf() ? null : local ? (
+        <PdfPage name={attachment.name} url={props.fileUrl ?? null} onOpen={() => setOpen(true)} />
+      ) : environmentId !== null ? (
+        <ServedPdfPage
           attachment={attachment}
-          localUrl={local ? (props.fileUrl ?? null) : null}
+          environmentId={environmentId}
           onOpen={() => setOpen(true)}
         />
       ) : null}
