@@ -3,6 +3,7 @@ import type { KanbanAskFeedItem, KanbanAskSecretAnswerInput } from "@t3tools/con
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { createAskScopes } from "./askScope";
+import { ASK_AUTO_RETRY_GAP_MS } from "./logic";
 
 const entry = (number: number): KanbanAskFeedItem =>
   ({
@@ -58,6 +59,9 @@ function harness() {
   /** Servers whose reads fail, and servers that drop writes, as a dead network would. */
   const readsDown = new Set<string>();
   const writesDown = new Set<string>();
+  /** Writes that have left the phone and not come back yet: they wait here until let go. */
+  let writesHeld = false;
+  const heldWrites: Array<() => void> = [];
   const feeds: Record<string, ReadonlyArray<KanbanAskFeedItem>> = {
     A: [entry(1)],
     B: [entry(1)],
@@ -68,6 +72,7 @@ function harness() {
     const path = match?.[2] ?? "";
     const method = init?.method ?? "GET";
     requests.push({ server, method, path });
+    if (method !== "GET" && writesHeld) await new Promise<void>((go) => heldWrites.push(go));
     if ((method === "GET" ? readsDown : writesDown).has(server)) throw new TypeError("offline");
     const body = path.endsWith("/asks")
       ? { at: "2026-11-11T08:00:00.000Z", open: feeds[server] ?? [], closed: [] }
@@ -96,6 +101,7 @@ function harness() {
       isForeground: () => true,
     },
     defer: (run) => deferred.push(run),
+    now: () => Date.now(),
     fetch: fetchFake,
   });
   return {
@@ -104,6 +110,15 @@ function harness() {
     secretSends,
     readsDown,
     writesDown,
+    /** From now on a write stays on its way until `landWrites`. */
+    holdWrites: () => {
+      writesHeld = true;
+    },
+    /** The writes on their way come back now, failed or not as the server is at this moment. */
+    landWrites: () => {
+      writesHeld = false;
+      for (const go of heldWrites.splice(0)) go();
+    },
     pair: (next: string | null) => {
       paired = next;
       for (const run of Array.from(pairedListeners)) run();
@@ -128,6 +143,8 @@ afterEach(() => {
 });
 
 const settle = () => vi.advanceTimersByTimeAsync(0);
+/** Long enough after a failure that a good read means the server is back. */
+const aWhile = () => vi.advanceTimersByTimeAsync(ASK_AUTO_RETRY_GAP_MS);
 
 describe("a held answer when the server changes", () => {
   it("is dropped: it goes to neither the new server nor the old one", async () => {
@@ -174,10 +191,10 @@ describe("an answer made offline when the server changes", () => {
 
     h.pair("B");
     const b = h.scopes.current();
-    // The new server reads fine, which is the signal that used to send it again.
-    h.readsDown.add("B");
+    // The new server reads fine a while later, which is the signal that sends it again.
+    await aWhile();
     await b.asks.refreshAsks();
-    h.readsDown.delete("B");
+    await aWhile();
     await b.asks.refreshAsks();
     h.runDeferred();
     a.asks.retryUnreachedAskSends();
@@ -206,6 +223,9 @@ describe("an answer made offline when the server changes", () => {
     h.pair("A");
     const again = h.scopes.current();
     expect(again).not.toBe(a);
+    await aWhile();
+    await again.asks.refreshAsks();
+    await aWhile();
     await again.asks.refreshAsks();
     h.runDeferred();
     await settle();
@@ -290,8 +310,15 @@ describe("what a screen still holds after the server changed", () => {
   });
 });
 
-describe("automatic retries on a flapping connection", () => {
-  it("stop after a few tries, however often the feed comes back", async () => {
+describe("an answer that never reached the server", () => {
+  /** A good read of the feed, and what the scope decided on it. */
+  const read = async (h: ReturnType<typeof harness>) => {
+    await h.scopes.current().asks.refreshAsks();
+    h.runDeferred();
+    await settle();
+  };
+
+  it("stops going by itself after a few tries, however often the feed comes back", async () => {
     const h = harness();
     const scope = h.scopes.current();
     await scope.asks.refreshAsks();
@@ -305,11 +332,9 @@ describe("automatic retries on a flapping connection", () => {
     const flap = async () => {
       h.readsDown.add("A");
       await scope.asks.refreshAsks();
+      await aWhile();
       h.readsDown.delete("A");
-      await scope.asks.refreshAsks();
-      // The store's own subscription decided; this runs what it put off.
-      h.runDeferred();
-      await settle();
+      await read(h);
     };
     for (let round = 1; round <= ASK_AUTO_RETRY_MAX + 4; round += 1) {
       await flap();
@@ -329,7 +354,7 @@ describe("automatic retries on a flapping connection", () => {
     expect(h.answers("A")).toHaveLength(2 + ASK_AUTO_RETRY_MAX);
   });
 
-  it("does not retry while the feed simply reads fine", async () => {
+  it("does not go again on the reads that follow the failure at once", async () => {
     const h = harness();
     const scope = h.scopes.current();
     await scope.asks.refreshAsks();
@@ -337,10 +362,84 @@ describe("automatic retries on a flapping connection", () => {
     h.writesDown.add("A");
     scope.asks.answerAsk(ask, "primary");
     await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    // The store reads the feed itself right after a failure, and so may a screen.
+    for (let n = 0; n < 6; n += 1) await read(h);
+    await vi.advanceTimersByTimeAsync(ASK_AUTO_RETRY_GAP_MS - 1_000);
+    await read(h);
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().failed[askKey(ask)]?.send.autoRetries ?? 0).toBe(0);
+  });
+
+  it("goes again when the feed had already come back while it was on its way", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
     await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+
+    // The feed fails, the answer leaves, and the feed reads fine before the answer is back.
+    h.readsDown.add("A");
     await scope.asks.refreshAsks();
-    h.runDeferred();
+    h.holdWrites();
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.answers("A")).toHaveLength(1);
+    h.readsDown.delete("A");
+    await read(h);
+    expect(scope.cell.getState().failed).toEqual({});
+
+    // Now the answer fails: the feed's recovery is already behind it.
+    h.landWrites();
     await settle();
+    await read(h);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(h.answers("A")).toHaveLength(1);
+
+    // A later good read, with nothing failing in between, sends it once more.
+    h.writesDown.delete("A");
+    await aWhile();
+    await read(h);
+    expect(h.answers("A")).toHaveLength(2);
+    expect(scope.cell.getState().failed).toEqual({});
+    await aWhile();
+    await read(h);
+    expect(h.answers("A")).toHaveLength(2);
+  });
+
+  it("goes again after an outage that hit the answer alone", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+
+    // The feed never fails; only the answer is lost.
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.writesDown.delete("A");
+    await read(h);
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+
+    await aWhile();
+    await read(h);
+    expect(h.answers("A")).toHaveLength(2);
+    expect(scope.cell.getState().failed).toEqual({});
+  });
+
+  it("waits for a good read: a failed one sends nothing", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.readsDown.add("A");
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await read(h);
+    }
     expect(h.answers("A")).toHaveLength(1);
   });
 });

@@ -79,6 +79,7 @@ const askScopes = createAskScopes({
   },
   // After the store update that asked for it has settled, not inside it.
   defer: (run) => setTimeout(run, 0),
+  now: () => Date.now(),
 });
 
 // He leaves the app inside the six seconds an answer is held: it goes out now

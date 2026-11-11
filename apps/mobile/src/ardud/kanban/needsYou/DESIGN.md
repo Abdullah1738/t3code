@@ -114,8 +114,11 @@ it is a web address.
 ## Offline
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached
-the server is kept in memory as "Not sent" and goes again by itself each time the feed comes
-back, three times at most. The count is on the answer (`autoRetries` in the shared store), so
+the server is kept in memory as "Not sent" and goes again by itself on the next good read of
+the feed that comes at least five seconds after it failed (`unreachedRetryTracker`), three
+times at most. It does not matter whether the feed itself ever failed, or came back while the
+answer was still on its way; the read the store makes right after a failure is too soon to
+count, so a dead connection is not hammered. The count is on the answer (`autoRetries` in the shared store), so
 it holds while the answer is on its way; after that the band says it no longer goes by itself.
 Retry by hand always works. Nothing is written to disk, and nothing unsent survives a change
 of server.

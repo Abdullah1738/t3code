@@ -13,7 +13,6 @@
  */
 import {
   AskApiError,
-  askAutoRetryOwed,
   createAskApi,
   createAskStateCell,
   createAskStore,
@@ -26,7 +25,7 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskSecretAnswerInput } from "@t3tools/contracts";
 
-import { unreachedRetryGate } from "./logic";
+import { unreachedRetryTracker } from "./logic";
 
 export interface AskScopeHost {
   /** The server in use now, or null when there is none. */
@@ -43,6 +42,8 @@ export interface AskScopeHost {
   readonly watch: AskWatchHost;
   /** Runs `run` after the current store update has settled. */
   readonly defer: (run: () => void) => void;
+  /** The time now, in epoch ms. */
+  readonly now: () => number;
   readonly fetch?: typeof fetch;
   readonly undoMs?: number;
 }
@@ -106,16 +107,16 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       watch: host.watch,
       ...(host.undoMs === undefined ? {} : { undoMs: host.undoMs }),
     });
-    // An answer made offline is kept in memory as "not sent". When the feed
-    // reads again after failing, the server is back: such answers go once
-    // more, by themselves, while they have tries left.
-    const gate = unreachedRetryGate();
+    // An answer that never reached the server is kept in memory as "not
+    // sent". Once the feed has been read with success a while after it failed,
+    // the server is reachable: the answer goes once more, by itself, while it
+    // has tries left (`unreachedRetryTracker`).
+    const retries = unreachedRetryTracker();
     const stopRetry = cell.subscribe(() => {
-      const state = cell.getState();
-      const reading = state.status === "ready" && state.error === null;
-      if (!gate.next({ reading, owed: askAutoRetryOwed(state) })) return;
+      const due = retries.next(cell.getState(), host.now());
+      if (due.size === 0) return;
       host.defer(() => {
-        if (!closed) asks.retryUnreachedAskSends();
+        if (!closed) asks.retryUnreachedAskSends(undefined, (send) => due.has(send.id));
       });
     });
     const scope: AskScope = {

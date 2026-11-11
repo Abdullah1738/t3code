@@ -32,7 +32,7 @@ import {
   rankOrder,
   readAskHtmlMessage,
   stepWebLink,
-  unreachedRetryGate,
+  unreachedRetryTracker,
 } from "./logic";
 
 const NOW = Date.parse("2026-11-11T12:00:00.000Z");
@@ -377,24 +377,52 @@ describe("history", () => {
   });
 });
 
-describe("answers made offline", () => {
-  it("go again once each time the feed comes back, and not while it reads fine", () => {
-    const gate = unreachedRetryGate();
-    // The send failed but the feed still reads: he retries by hand.
-    expect(gate.next({ reading: true, owed: true })).toBe(false);
-    // Offline: the feed fails too.
-    expect(gate.next({ reading: false, owed: true })).toBe(false);
-    // Back: one automatic try.
-    expect(gate.next({ reading: true, owed: true })).toBe(true);
-    expect(gate.next({ reading: true, owed: true })).toBe(false);
+describe("answers that never reached the server", () => {
+  const send = (id: number, autoRetries?: number) =>
+    ({ id, ...(autoRetries === undefined ? {} : { autoRetries }) }) as unknown as AskSend;
+  const state = (reads: number, sends: ReadonlyArray<AskSend>, ok = true) => ({
+    reads,
+    status: ok ? ("ready" as const) : ("error" as const),
+    error: ok ? null : "Robob did not answer.",
+    failed: Object.fromEntries(
+      sends.map((item) => [`c${item.id}:q1`, { send: item, message: "x", unreached: true }]),
+    ),
   });
 
-  it("does nothing when no answer has automatic tries left", () => {
-    const gate = unreachedRetryGate();
-    expect(gate.next({ reading: false, owed: false })).toBe(false);
-    expect(gate.next({ reading: true, owed: false })).toBe(false);
-    // The answer is on its way, so nothing is owed for a moment: that resets nothing.
-    expect(gate.next({ reading: false, owed: true })).toBe(false);
-    expect(gate.next({ reading: true, owed: true })).toBe(true);
+  it("go again after the next good read that comes a while after the failure", () => {
+    const tracker = unreachedRetryTracker(5_000, 3);
+    expect(tracker.next(state(1, []), 0).size).toBe(0);
+    // The answer fails; the read the store makes right after does not count.
+    expect(tracker.next(state(1, [send(7)]), 1_000).size).toBe(0);
+    expect(tracker.next(state(2, [send(7)]), 1_050).size).toBe(0);
+    // Nothing new was read: nothing goes, however long it has been.
+    expect(tracker.next(state(2, [send(7)]), 30_000).size).toBe(0);
+    // The next good read: it goes, once.
+    expect([...tracker.next(state(3, [send(7)]), 30_100)]).toEqual([7]);
+  });
+
+  it("need no failed read first: an outage that only hit the answer is covered", () => {
+    const tracker = unreachedRetryTracker(5_000, 3);
+    tracker.next(state(4, []), 0);
+    tracker.next(state(4, [send(1)]), 100);
+    expect([...tracker.next(state(5, [send(1)]), 15_100)]).toEqual([1]);
+  });
+
+  it("wait for a good read: a failed one, or the feed's error, sends nothing", () => {
+    const tracker = unreachedRetryTracker(5_000, 3);
+    tracker.next(state(1, [send(1)]), 0);
+    expect(tracker.next(state(1, [send(1)], false), 20_000).size).toBe(0);
+    expect([...tracker.next(state(2, [send(1)]), 40_000)]).toEqual([1]);
+  });
+
+  it("stop at the answer's own limit, and each new failure waits its own while", () => {
+    const tracker = unreachedRetryTracker(5_000, 3);
+    tracker.next(state(1, [send(1, 3), send(2, 1)]), 0);
+    // The one that has used its tries stays for him; the other goes.
+    expect([...tracker.next(state(2, [send(1, 3), send(2, 1)]), 10_000)]).toEqual([2]);
+    // It went again and failed again under a new id: seen now, due only after another while.
+    expect(tracker.next(state(2, [send(1, 3), send(9, 2)]), 10_500).size).toBe(0);
+    expect(tracker.next(state(3, [send(1, 3), send(9, 2)]), 12_000).size).toBe(0);
+    expect([...tracker.next(state(4, [send(1, 3), send(9, 2)]), 60_000)]).toEqual([9]);
   });
 });

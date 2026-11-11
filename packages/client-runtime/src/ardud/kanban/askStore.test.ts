@@ -447,6 +447,45 @@ describe("owner standing", () => {
   });
 });
 
+describe("what a host retries on", () => {
+  it("counts the reads that came back good, not the ones that failed", async () => {
+    const h = harness();
+    h.setFeed([entry(1)]);
+    expect(h.cell.getState().reads).toBe(0);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().reads).toBe(1);
+    h.fail.feed = new AskApiError(0, "network", "Robob did not answer.");
+    await h.store.refreshAsks();
+    expect(h.cell.getState().reads).toBe(1);
+    expect(h.cell.getState().error).not.toBeNull();
+    delete h.fail.feed;
+    await h.store.refreshAsks();
+    expect(h.cell.getState().reads).toBe(2);
+    expect(h.cell.getState().error).toBeNull();
+  });
+
+  it("sends only the answers the host says are due", async () => {
+    const h = harness();
+    const one = entry(1);
+    const two = entry(2);
+    h.setFeed([one, two]);
+    await h.store.refreshAsks();
+    h.fail.answer = new AskApiError(0, "network", "Robob did not answer.");
+    h.store.answerAsk(one, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.store.answerAsk(two, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    const due = h.cell.getState().failed[askKey(two)]!.send.id;
+
+    expect(h.store.retryUnreachedAskSends(undefined, (send) => send.id === due)).toBe(1);
+    expect(Object.keys(h.cell.getState().failed)).toEqual([askKey(one)]);
+    await settle();
+    expect(h.named("answer")).toHaveLength(3);
+    expect(h.cell.getState().failed[askKey(one)]?.send.autoRetries).toBeUndefined();
+    expect(h.cell.getState().failed[askKey(two)]?.send.autoRetries).toBe(1);
+  });
+});
+
 describe("the feed", () => {
   it("an edited ask is marked updated, keeps the version he saw and carries his form", async () => {
     const h = harness();

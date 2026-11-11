@@ -117,6 +117,12 @@ export interface AskState {
   readonly status: "idle" | "loading" | "ready" | "error";
   readonly error: string | null;
   readonly feed: KanbanAskFeed | null;
+  /**
+   * How many times the feed has been read with success. Each good read is a
+   * sign the server is reachable; an answer that never reached it may go
+   * again by itself after a later one (see `retryUnreachedAskSends`).
+   */
+  readonly reads: number;
   /** Asks closed in the History window; null until read. */
   readonly closed: ReadonlyArray<KanbanAskFeedItem> | null;
   readonly closedStatus: "idle" | "loading" | "ready" | "error";
@@ -151,6 +157,7 @@ export const INITIAL_ASK_STATE: AskState = {
   status: "idle",
   error: null,
   feed: null,
+  reads: 0,
   closed: null,
   closedStatus: "idle",
   forms: {},
@@ -345,6 +352,7 @@ export function createAskStore(host: AskStoreHost) {
     for (const key of Object.keys(marks)) if (gone(key)) delete marks[key];
     set({
       feed,
+      reads: state.reads + 1,
       status: "ready",
       error: null,
       marks,
@@ -933,14 +941,19 @@ export function createAskStore(host: AskStoreHost) {
    * refused as out of date and the feed shows the ask closed. An answer that
    * has already gone by itself `max` times stays for him to retry by hand: the
    * count rides on the answer, so it holds while the answer is on its way too.
+   * With `only`, just the answers it picks go (the host decides which are due).
    */
-  function retryUnreachedAskSends(max: number = ASK_AUTO_RETRY_MAX): number {
+  function retryUnreachedAskSends(
+    max: number = ASK_AUTO_RETRY_MAX,
+    only?: (send: AskSend) => boolean,
+  ): number {
     if (disposed) return 0;
     const seen = new Set<number>();
     let count = 0;
     for (const [key, failed] of Object.entries(get().failed)) {
       if (failed.unreached !== true || seen.has(failed.send.id)) continue;
       if ((failed.send.autoRetries ?? 0) >= max) continue;
+      if (only !== undefined && !only(failed.send)) continue;
       // A batch sits under each of its asks: one retry covers them all.
       seen.add(failed.send.id);
       if (get().failed[key] === undefined) continue;

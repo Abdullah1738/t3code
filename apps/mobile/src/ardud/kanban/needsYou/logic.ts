@@ -6,12 +6,14 @@
  */
 import { parseWebLink, type WebLink } from "../../common/pageNavigation";
 import {
+  ASK_AUTO_RETRY_MAX,
   askAge,
   askOutcome,
   needsYouBatchKey,
   shortWhen,
   type AskOutcome,
   type AskSend,
+  type AskState,
   type NeedsYou,
   type NeedsYouEntry,
   type NeedsYouItem,
@@ -520,24 +522,55 @@ export function historyRows(
 
 // Offline
 
+/** The least time between an answer failing to reach the server and its going again by itself. */
+export const ASK_AUTO_RETRY_GAP_MS = 5_000;
+
 /**
- * Decides when answers that never reached the server go again by themselves:
- * once each time the feed goes from failing to reading, never while it simply
- * reads fine. `owed` is whether any such answer still has automatic tries
- * left; that count is kept on the answer itself by the shared store
- * (`ASK_AUTO_RETRY_MAX`, `askAutoRetryOwed`), not here, so it survives the
- * answer leaving the failed list while it is on its way. Retry by hand always
- * stays.
+ * Decides which answers that never reached the server go again by themselves.
+ * An answer is due once the feed has been read with success after it failed:
+ * that read says the server can be reached. It does not matter whether the
+ * feed ever failed, or whether the answer was still on its way when the feed
+ * came back, so a short outage that only hit the answer is covered too.
+ *
+ * Two things keep this from hammering a server that takes reads and drops
+ * writes. The read has to come a while after the failure
+ * (`ASK_AUTO_RETRY_GAP_MS`): the read the store makes right after a failed
+ * send does not count. And each answer goes by itself a few times at most; the
+ * shared store keeps that count on the answer (`ASK_AUTO_RETRY_MAX`). Retry by
+ * hand always stays.
+ *
+ * `next` is called on every change of the store with the time now, and gives
+ * the ids of the sends that are due.
  */
-export function unreachedRetryGate(): {
-  readonly next: (state: { readonly reading: boolean; readonly owed: boolean }) => boolean;
+export function unreachedRetryTracker(
+  gapMs: number = ASK_AUTO_RETRY_GAP_MS,
+  max: number = ASK_AUTO_RETRY_MAX,
+): {
+  readonly next: (
+    state: Pick<AskState, "failed" | "reads" | "status" | "error">,
+    nowMs: number,
+  ) => ReadonlySet<number>;
 } {
-  let wasReading = true;
+  // When each unsent answer was first seen as failed, by its send id.
+  const failedAt = new Map<number, number>();
+  let reads = 0;
   return {
-    next: ({ reading, owed }) => {
-      const cameBack = reading && !wasReading;
-      wasReading = reading;
-      return cameBack && owed;
+    next: (state, nowMs) => {
+      const waiting = new Map<number, AskSend>();
+      for (const failed of Object.values(state.failed)) {
+        if (failed.unreached === true) waiting.set(failed.send.id, failed.send);
+      }
+      for (const id of Array.from(failedAt.keys())) if (!waiting.has(id)) failedAt.delete(id);
+      for (const id of waiting.keys()) if (!failedAt.has(id)) failedAt.set(id, nowMs);
+      const readAgain = state.reads > reads && state.status === "ready" && state.error === null;
+      reads = state.reads;
+      const due = new Set<number>();
+      if (!readAgain) return due;
+      for (const [id, send] of waiting) {
+        if ((send.autoRetries ?? 0) >= max) continue;
+        if (nowMs - (failedAt.get(id) ?? nowMs) >= gapMs) due.add(id);
+      }
+      return due;
     },
   };
 }
