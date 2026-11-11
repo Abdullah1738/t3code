@@ -53,9 +53,7 @@ export function scriptTriggerLabel(trigger: KanbanScriptTrigger): string {
     case "schedule":
       if (trigger.everyMs !== null) return everyLabel(trigger.everyMs);
       if (trigger.cron === null) return "On a schedule";
-      return trigger.timeZone
-        ? `${cronLabel(trigger.cron)} · ${trigger.timeZone}`
-        : cronLabel(trigger.cron);
+      return trigger.timeZone ? `${cronLabel(trigger.cron)} · ${trigger.timeZone}` : cronLabel(trigger.cron);
     case "event":
       return EVENT_LABELS[trigger.event];
     case "webhook":
