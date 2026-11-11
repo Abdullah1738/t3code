@@ -197,3 +197,27 @@ checkout, or place them in an included script run through that command. Keep
 both scales' ledgers, comparison.json and artifact directories. Ten accepted
 interleaved pairs per scale are required. Native/device/correctness gaps can keep
 the controller exit nonzero even when relative performance and both owner-write targets pass.
+
+Shell memory gates (renderer OOM, 10 Nov 2026):
+
+- `shellMemoryBrowserGate.ts` is the regression gate. It runs the built web app
+  (`apps/web/dist`, the bundle the desktop renderer loads) in a headless Chrome against this
+  tree's server on the `shell` fixture (20,000 rows shaped like the live desktop list: two
+  pull request links each, 93% unsettled), with 30 writes/s, and samples the renderer heap
+  over CDP. It fails on a renderer crash, a list that never completes, a saved client list
+  (the shell cache in IndexedDB) with a different row count than the server sent, a heap
+  peak over 1 GB or over 512 MB kept after a forced GC, or a renderer that restarts the walk
+  at page one after a crash mid-load (run in a fresh profile).
+
+  ```sh
+  offbox run --remote --no-fallback -- node packages/perf-harness/src/fixture.ts tmp/fx-shell shell
+  (cd apps/web && vp build)
+  node packages/perf-harness/src/shellMemoryBrowserGate.ts tmp/fx-shell tmp/shell-memory.json
+  ```
+
+  `ROBOB_PERF_PROFILE_AT_PAGE=N` saves a sampling heap profile and a CPU profile once N
+  pages have landed, for attribution against the bundle's source maps.
+
+- `shellMemoryGate.ts` runs the client-runtime shell state and loader alone in Node
+  (`node --expose-gc`), with an in-process fetch. It has no React, so it does not see what
+  the sidebar draws; it guards the page merge and link fill.
