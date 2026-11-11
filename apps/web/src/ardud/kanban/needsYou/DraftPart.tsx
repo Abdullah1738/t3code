@@ -31,7 +31,6 @@ export function DraftPart(props: {
       <Label className="mb-2.5">
         As it will appear
         {draft.target ? ` · ${draft.target}` : ""}
-        {props.editable && !open ? " · click the text to edit" : ""}
       </Label>
       {open ? (
         <GrowingText

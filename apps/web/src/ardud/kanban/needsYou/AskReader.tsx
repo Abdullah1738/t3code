@@ -84,7 +84,8 @@ import { ChangeViewer } from "./ChangeView";
 import { DraftPart } from "./DraftPart";
 import { EvaluatorThreadLink, HandOver } from "./HandOver";
 import { MediaViewer } from "./MediaViewer";
-import { shortWhen, tomorrowMorning } from "./snoozeTimes";
+import { SnoozeMenu, SnoozePick, SnoozeRows } from "./SnoozeMenu";
+import { shortWhen, tomorrowMorning, type SnoozeUntil } from "./snoozeTimes";
 import { Btn, Key, Label, Layer, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
@@ -133,6 +134,7 @@ export function AskReader(props: {
   const [noteOpen, setNoteOpen] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [pickOpen, setPickOpen] = useState(false);
   const phone = layout === "phone";
   // On a phone the discussion is a sheet that stops above the answer bar.
   const bar = useRef<HTMLDivElement>(null);
@@ -194,6 +196,11 @@ export function AskReader(props: {
     ...refused,
   };
 
+  const canEditDraft =
+    ask.draft !== undefined && response.edit === "draft" && !locked && !form.refusing;
+  const editDraft = () => {
+    root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
+  };
   const focusAt = (at: string) => {
     requestAnimationFrame(() => {
       const target = root.current?.querySelector<HTMLElement>(`[data-ny-at="${CSS.escape(at)}"]`);
@@ -255,11 +262,14 @@ export function AskReader(props: {
     const result = answerAsk({ ...entry, ask }, intent);
     if (!result.ok) focusAt(result.first);
   };
+  const snoozeUntil = (until: SnoozeUntil) => {
+    props.onLeave();
+    void snoozeAsks([entry], until.iso, until.label);
+  };
+  // The key and "Bring back": no menu, tomorrow morning or straight back.
   const snooze = () => {
     if (item.snoozed) return void snoozeAsks([entry], null, "");
-    const until = tomorrowMorning();
-    props.onLeave();
-    return void snoozeAsks([entry], until.iso, until.label);
+    return snoozeUntil(tomorrowMorning());
   };
   const primary = () => send(form.refusing ? "refuse" : "primary");
   const refuse = () => {
@@ -311,10 +321,7 @@ export function AskReader(props: {
         case "reply":
           return reply();
         case "edit":
-          if (response.edit === "draft") {
-            root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
-            return undefined;
-          }
+          if (response.edit === "draft") return editDraft();
           return firstText ? focusAt(`field:${firstText.id}`) : undefined;
         case "view":
           return setAskChangeView(nextChangeView(changeView, wide));
@@ -346,9 +353,9 @@ export function AskReader(props: {
       turn={turn}
       onOpenCard={props.onOpenCard}
       handOver={
-        canTalk && !response.ack && ask.to !== "evaluator" ? (
+        canTalk && !response.ack && response.task === null && ask.to !== "evaluator" ? (
           <HandOver
-            entry={entry}
+            entries={[entry]}
             phone={layout === "phone"}
             needsSecret={askRequiresSecret(ask)}
             onLeave={props.onLeave}
@@ -368,13 +375,13 @@ export function AskReader(props: {
           data-ny-enter
           className={cn(
             "min-h-0 flex-1 overflow-y-auto overscroll-contain outline-none",
-            layout === "desktop" && "grid grid-cols-[minmax(0,1fr)_232px] gap-x-7 pe-7",
+            layout === "desktop" && "grid grid-cols-[minmax(0,800px)_232px] gap-x-7 pe-7",
           )}
         >
           <article
             aria-labelledby="ny-ask-title"
             className={cn(
-              "flex min-w-0 flex-col gap-5 pt-6 pb-8",
+              "flex w-full max-w-[800px] min-w-0 flex-col gap-5 pt-6 pb-8",
               layout === "phone" ? "px-4" : layout === "tablet" ? "px-6" : "ps-7",
             )}
           >
@@ -437,7 +444,10 @@ export function AskReader(props: {
             {secretError ? <Banner tone="negative">{secretError}</Banner> : null}
             {mark === "back" && item.backFromSnoozeAt ? (
               <Banner tone="accent">
-                Back from snooze since {shortWhen(item.backFromSnoozeAt, props.nowMs)}.
+                <b className="font-semibold">Back from snooze.</b>{" "}
+                {ask.backFromSnoozeAt
+                  ? `Its agent changed it or replied, ${shortWhen(ask.backFromSnoozeAt, props.nowMs)}.`
+                  : `You set this aside until ${shortWhen(item.backFromSnoozeAt, props.nowMs)}.`}
               </Banner>
             ) : null}
             {mark === "updated" ? (
@@ -512,7 +522,7 @@ export function AskReader(props: {
                 entry={entry}
                 draft={ask.draft}
                 form={form}
-                editable={response.edit === "draft" && !locked && !form.refusing}
+                editable={canEditDraft}
                 problem={problems.draft}
               />
             ) : null}
@@ -544,7 +554,7 @@ export function AskReader(props: {
                         media={media}
                         index={index}
                         onOpen={setViewing}
-                        className="h-40 w-full max-w-none rounded-none object-cover"
+                        className="h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
                       />
                     )}
                   />
@@ -621,8 +631,16 @@ export function AskReader(props: {
               </Btn>
             }
             busy={secretBusy}
-            snoozed={item.snoozed}
-            onSnooze={snooze}
+            snooze={
+              item.snoozed ? (
+                <Btn tone="ghost" onClick={snooze}>
+                  Bring back
+                  <Key>S</Key>
+                </Btn>
+              ) : (
+                <SnoozeMenu label="Snooze" onSnooze={snoozeUntil} />
+              )
+            }
             lead={
               canTalk ? (
                 <>
@@ -655,6 +673,12 @@ export function AskReader(props: {
               )
             }
           >
+            {canEditDraft ? (
+              <Btn onClick={editDraft}>
+                Edit
+                <Key>E</Key>
+              </Btn>
+            ) : null}
             {canNote && !showNote && layout === "desktop" ? (
               <Btn onClick={addNote}>
                 Add a note
@@ -696,6 +720,16 @@ export function AskReader(props: {
               side={phone ? "bottom" : "center"}
               bodyClassName="flex flex-col gap-1 p-3"
             >
+              {canEditDraft && phone ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    editDraft();
+                  }}
+                >
+                  Edit the draft
+                </MoreRow>
+              ) : null}
               {canNote && !showNote ? (
                 <MoreRow
                   onClick={() => {
@@ -706,14 +740,16 @@ export function AskReader(props: {
                   Add a note for the agent
                 </MoreRow>
               ) : null}
-              <MoreRow
-                onClick={() => {
-                  setMoreOpen(false);
-                  snooze();
-                }}
-              >
-                {item.snoozed ? "Bring back" : "Snooze until tomorrow 09:00"}
-              </MoreRow>
+              {item.snoozed ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    snooze();
+                  }}
+                >
+                  Bring back
+                </MoreRow>
+              ) : null}
               {phone && refusal && !form.refusing ? (
                 <MoreRow
                   onClick={() => {
@@ -732,7 +768,26 @@ export function AskReader(props: {
               >
                 Open the card
               </MoreRow>
+              {item.snoozed ? null : (
+                <SnoozeRows
+                  nowMs={props.nowMs}
+                  onSnooze={(until) => {
+                    setMoreOpen(false);
+                    snoozeUntil(until);
+                  }}
+                  onPick={() => {
+                    setMoreOpen(false);
+                    setPickOpen(true);
+                  }}
+                />
+              )}
             </Layer>
+            <SnoozePick
+              open={pickOpen}
+              phone={phone}
+              onClose={() => setPickOpen(false)}
+              onSnooze={snoozeUntil}
+            />
           </>
         )}
         {viewing !== null && media.items.length > 0 ? (

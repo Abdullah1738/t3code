@@ -122,7 +122,7 @@ function SessionRow(props: { send: AskSend; held: boolean; onUndo: () => void })
       board={send.boardName}
       cardNumber={null}
       when={pending ? "now" : "this session"}
-      title={send.refs.length > 1 ? `${send.refs.length} asks: ${send.title}` : send.title}
+      title={send.title}
     >
       <Line who={You}>
         <p>

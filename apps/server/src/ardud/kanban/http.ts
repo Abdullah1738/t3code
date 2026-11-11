@@ -59,6 +59,12 @@ const STATUS: Record<KanbanError["code"], number> = {
 
 const json = (body: unknown, status = 200) => jsonReply(body, status);
 
+/** What a refusal carries beside its code and message, for a client to act on without reading the words. */
+const errorExtras = (error: KanbanError) => ({
+  ...(error.reason === undefined ? {} : { reason: error.reason }),
+  ...(error.revision === undefined ? {} : { revision: error.revision }),
+});
+
 const fail = (code: KanbanError["code"], detail: string) => new KanbanError({ code, detail });
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -172,6 +178,13 @@ const AskBatchBody = Schema.Struct({
 const AskHandBody = Schema.Struct({
   action: Schema.optional(Schema.Literals(["hand", "take_back"])),
   /** With hand: also ask an evaluator to take asks like this one from now on. */
+  always: Schema.optional(Schema.Boolean),
+  /** With always: what the owner said, passed to that evaluator word for word. */
+  text: Text,
+});
+const AskHandBatchBody = Schema.Struct({
+  items: Schema.Array(Schema.Struct({ card: Schema.String, askId: Schema.String })),
+  /** Also ask one evaluator per board to take asks like these from now on. */
   always: Schema.optional(Schema.Boolean),
   /** With always: what the owner said, passed to that evaluator word for word. */
   text: Text,
@@ -310,7 +323,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   error: {
                     code: error.code,
                     message: error.detail,
-                    ...(error.reason === undefined ? {} : { reason: error.reason }),
+                    ...errorExtras(error),
                   },
                 },
                 STATUS[error.code],
@@ -663,7 +676,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   card: item.card,
                   askId: item.askId,
                   ok: false as const,
-                  error: { code: error.code, message: error.detail },
+                  error: { code: error.code, message: error.detail, ...errorExtras(error) },
                 }),
             }),
           ),
@@ -734,6 +747,109 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    // Each ask is handed on its own: one that can't be doesn't hold back the rest. With
+    // always, the ones that were handed share one evaluator per board, told his words once.
+    const handAsks = ownerWrite(
+      Effect.gen(function* () {
+        const { items, always, text } = yield* body(AskHandBatchBody);
+        if (items.length === 0) return yield* fail("invalid", "items is empty.");
+        if (items.length > ASK_BATCH_MAX) {
+          return yield* fail("invalid", `At most ${ASK_BATCH_MAX} asks in one batch.`);
+        }
+        const every = always === true;
+        const words = text?.trim() ?? "";
+        if (every) {
+          const problem =
+            textProblem([["text", words]]) ??
+            (words.length > Asks.ASK_LIMITS.note
+              ? `text is at most ${Asks.ASK_LIMITS.note} characters.`
+              : null);
+          if (problem) return yield* fail("invalid", problem);
+        }
+        const results = yield* Effect.forEach(items, (item) =>
+          Effect.gen(function* () {
+            const card = yield* cardOf(item.card);
+            const handed = every
+              ? yield* service.handAsk(card.id, item.askId, "hand", OWNER, true)
+              : yield* service.handAsk(card.id, item.askId, "hand", OWNER);
+            return { card: item.card, askId: item.askId, ok: true as const, handed };
+          }).pipe(
+            Effect.catchTags({
+              KanbanError: (error) =>
+                Effect.succeed({
+                  card: item.card,
+                  askId: item.askId,
+                  ok: false as const,
+                  error: { code: error.code, message: error.detail, ...errorExtras(error) },
+                }),
+            }),
+          ),
+        );
+        const reply = {
+          handed: results.filter((result) => result.ok).length,
+          results: results.map((result) =>
+            result.ok ? { card: result.card, askId: result.askId, ok: true as const } : result,
+          ),
+        };
+        if (!every) return reply;
+        // The hand-overs stand whether or not an evaluator starts: it is a second step.
+        const byBoard = new Map<string, Array<{ card: KanbanCard; askId: string }>>();
+        for (const result of results) {
+          if (!result.ok) continue;
+          const board = result.handed.boardId;
+          byBoard.set(board, [
+            ...(byBoard.get(board) ?? []),
+            { card: result.handed, askId: result.askId },
+          ]);
+        }
+        const evaluators = yield* Effect.forEach([...byBoard], ([boardId, handedAsks]) =>
+          Effect.gen(function* () {
+            const board = yield* boardOf(boardId);
+            const entries = handedAsks.flatMap(({ card, askId }) => {
+              const ask = card.asks.find((entry) => entry.id === askId);
+              return ask ? [{ card, cardRef: `${board.slug}:${card.number}`, ask }] : [];
+            });
+            if (entries.length === 0) return [];
+            const started = yield* service
+              .startEvaluator(board.id, {
+                kind: "request",
+                text: Asks.alwaysManyText(entries, words),
+              })
+              .pipe(
+                Effect.map((threadId) => ({ threadId, error: null })),
+                Effect.catchTags({
+                  KanbanError: (error) => Effect.succeed({ threadId: null, error: error.detail }),
+                }),
+              );
+            if (started.threadId !== null) {
+              const threadId = started.threadId;
+              yield* Effect.forEach(
+                entries,
+                ({ card, ask }) =>
+                  service
+                    .noteHandEvaluator(card.id, ask.id, threadId)
+                    .pipe(Effect.catchTags({ KanbanError: () => Effect.void })),
+                { discard: true },
+              );
+            }
+            return [
+              {
+                board: board.slug,
+                asks: entries.map(({ card, ask }) => ({
+                  card: `${board.slug}:${card.number}`,
+                  askId: ask.id,
+                })),
+                started: started.threadId !== null,
+                threadId: started.threadId,
+                error: started.error,
+              },
+            ];
+          }),
+        );
+        return { ...reply, evaluators: evaluators.flat() };
+      }),
+    );
+
     const snoozeAsk = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
@@ -763,7 +879,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   card: item.card,
                   askId: item.askId,
                   ok: false as const,
-                  error: { code: error.code, message: error.detail },
+                  error: { code: error.code, message: error.detail, ...errorExtras(error) },
                 }),
             }),
           ),
@@ -858,6 +974,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("GET", `${p}/asks`, handle(listAsks)),
       HttpRouter.route("POST", `${p}/asks/answer`, handle(answerAsks)),
       HttpRouter.route("POST", `${p}/asks/snooze`, handle(snoozeAsks)),
+      HttpRouter.route("POST", `${p}/asks/hand`, handle(handAsks)),
       HttpRouter.route("GET", `${p}/cards/:card/asks/:ask`, handle(getAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/answer`, handle(answerAsk)),
       HttpRouter.route("POST", `${p}/cards/:card/asks/:ask/reply`, handle(replyOnAsk)),

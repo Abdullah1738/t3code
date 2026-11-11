@@ -394,6 +394,12 @@ export const AuthSessionState = Schema.Struct({
   permissions: authScopeResponseFields.permissions,
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
+  // ardud:
+  /**
+   * Whether this session carries the owner claim: what the board's owner
+   * actions check. Absent when signed out, or from a server that does not say.
+   */
+  owner: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;
 

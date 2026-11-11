@@ -1,5 +1,6 @@
 import {
   ASK_BATCH_MAX,
+  askBatchTitle,
   askKindLabel,
   planAskBatch,
   type AskKeyAction,
@@ -11,8 +12,10 @@ import { cn } from "../../../lib/utils";
 import { GrowingText, Problem } from "./AnswerParts";
 import type { AskReaderHandle } from "./AskReader";
 import { answerAskBatch, askKey, snoozeAsks } from "./askStore";
-import { tomorrowMorning } from "./snoozeTimes";
-import { Btn, Key, Label, Pill, linkClass, type PageLayout } from "./ui";
+import { SnoozeMenu, SnoozePick, SnoozeRows } from "./SnoozeMenu";
+import { tomorrowMorning, type SnoozeUntil } from "./snoozeTimes";
+import { HandOver } from "./HandOver";
+import { Btn, Key, Label, Layer, Pill, linkClass, type PageLayout } from "./ui";
 
 /**
  * Several asks of one shape, answered with one answer. Asks that take more
@@ -24,6 +27,7 @@ export function BatchView(props: {
   boardName: string;
   entries: ReadonlyArray<KanbanAskFeedItem>;
   layout: PageLayout;
+  nowMs: number;
   handle: RefObject<AskReaderHandle | null>;
   onOpenAsk: (key: string) => void;
   onLeave: () => void;
@@ -35,6 +39,11 @@ export function BatchView(props: {
   const [left, setLeft] = useState<ReadonlySet<string>>(new Set());
   const included = offered.filter((entry) => !left.has(askKey(entry)));
   const count = included.length;
+  // What History calls this answer: the asks it went to, not the whole batch.
+  const only = count === 1 ? included[0] : undefined;
+  const sentTitle = only
+    ? (only.ask.title ?? only.ask.text)
+    : askBatchTitle(included.map((entry) => entry.kind));
   const first = offered[0];
   const response = first ? kanbanAskResponse(first.ask) : null;
   const shape = plan.shape?.split(":")[0] ?? null;
@@ -43,6 +52,12 @@ export function BatchView(props: {
   const [note, setNote] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
   const root = useRef<HTMLDivElement>(null);
+  const phone = props.layout === "phone";
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [pickOpen, setPickOpen] = useState(false);
+  // An evaluator can take what an owner can decide: not a notice, not one already asked of it.
+  const handable =
+    shape !== null && shape !== "ack" && included.every((entry) => entry.ask.to !== "evaluator");
 
   const labels = new Set(included.map((entry) => kanbanAskResponse(entry.ask).verdict?.approve));
   const approve = labels.size === 1 ? (response?.verdict?.approve ?? "Approve") : "Approve";
@@ -62,7 +77,7 @@ export function BatchView(props: {
     const trimmedNote = note.trim();
     const extra = shape === "ack" || trimmedNote === "" ? {} : { note: trimmedNote };
     const go = (verdict: string, label: string, more: object = {}) =>
-      answerAskBatch(included, props.batchKey, { verdict, ...more, ...extra }, label, props.title);
+      answerAskBatch(included, props.batchKey, { verdict, ...more, ...extra }, label, sentTitle);
     if (shape === "ack") return go("acknowledged", "Seen");
     if (shape === "verdict") {
       return intent === "refuse"
@@ -93,11 +108,11 @@ export function BatchView(props: {
     return go("answered", "Answer sent", { text: text.trim() });
   };
 
-  const snooze = () => {
-    const until = tomorrowMorning();
+  const snoozeUntil = (until: SnoozeUntil) => {
     props.onLeave();
     void snoozeAsks(included.length > 0 ? included : offered, until.iso, until.label);
   };
+  const snooze = () => snoozeUntil(tomorrowMorning());
 
   useImperativeHandle(props.handle, () => ({
     act: (action: AskKeyAction) => {
@@ -128,7 +143,7 @@ export function BatchView(props: {
           aria-labelledby="ny-ask-title"
           className={cn(
             "flex max-w-[760px] min-w-0 flex-col gap-5 pt-6 pb-8",
-            props.layout === "phone" ? "px-4" : "px-7",
+            phone ? "px-4" : "px-7",
           )}
         >
           <header className="flex flex-col gap-2.5">
@@ -272,35 +287,91 @@ export function BatchView(props: {
               />
             </div>
           ) : null}
+          {count > 0 && handable ? (
+            <HandOver
+              entries={included}
+              focusKey={props.batchKey}
+              title={sentTitle}
+              phone={phone}
+              onLeave={props.onLeave}
+            />
+          ) : null}
         </article>
       </div>
       {count > 0 && shape !== null ? (
         <div className="shrink-0 border-t border-(--m-rule) pb-safe">
-          <div className="flex items-center gap-2 px-5 py-3 max-sm:px-3">
+          <div className="flex min-w-0 items-center gap-2 px-5 py-3 max-sm:gap-1.5 max-sm:px-3">
+            {phone ? (
+              <Btn onClick={() => setMoreOpen(true)} className="px-3.5">
+                More
+              </Btn>
+            ) : null}
             <Btn
               tone="primary"
               onClick={() => send("primary")}
-              className={props.layout === "phone" ? "min-w-0 flex-1" : undefined}
+              className={phone ? "min-w-0 flex-1" : undefined}
             >
               <span className="truncate">{primaryLabel}</span>
-              <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
+              <Key className="text-(--m-accent-ink) ring-(--m-accent-ink)/40">A</Key>
             </Btn>
-            {shape === "verdict" ? (
+            {phone ? null : <SnoozeMenu label={`Snooze ${all}`} onSnooze={snoozeUntil} />}
+            {/* The "no" is last, as under a single ask. */}
+            {shape === "verdict" && !phone ? (
               <Btn tone="ghost" onClick={() => send("refuse")}>
                 {reject} {all}
                 <Key>X</Key>
               </Btn>
             ) : null}
-            <Btn tone="ghost" onClick={snooze}>
-              Snooze {all}
-              <Key>S</Key>
-            </Btn>
           </div>
         </div>
+      ) : null}
+      {phone ? (
+        <>
+          <Layer
+            open={moreOpen}
+            onClose={() => setMoreOpen(false)}
+            title="More"
+            side="bottom"
+            bodyClassName="flex flex-col gap-1 p-3"
+          >
+            {shape === "verdict" ? (
+              <button
+                type="button"
+                className={moreRow}
+                onClick={() => {
+                  setMoreOpen(false);
+                  send("refuse");
+                }}
+              >
+                {reject} {all}
+              </button>
+            ) : null}
+            <SnoozeRows
+              nowMs={props.nowMs}
+              onSnooze={(until) => {
+                setMoreOpen(false);
+                snoozeUntil(until);
+              }}
+              onPick={() => {
+                setMoreOpen(false);
+                setPickOpen(true);
+              }}
+            />
+          </Layer>
+          <SnoozePick
+            open={pickOpen}
+            phone
+            onClose={() => setPickOpen(false)}
+            onSnooze={snoozeUntil}
+          />
+        </>
       ) : null}
     </div>
   );
 }
+
+const moreRow =
+  "flex min-h-11 items-center rounded-xl px-3 text-start text-base outline-none hover:bg-(--m-surface) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
 
 const tick =
   "size-4 shrink-0 translate-y-0.5 accent-(--m-accent) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";

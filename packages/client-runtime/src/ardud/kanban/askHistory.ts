@@ -4,6 +4,7 @@
  */
 import {
   kanbanAskResponse,
+  kanbanAskRevision,
   type KanbanAskFeedItem,
   type KanbanMessage,
   type KanbanOwnerAsk,
@@ -13,15 +14,45 @@ import { askFieldKind } from "./askAnswer.ts";
 
 type Talk = Pick<KanbanAskFeedItem, "ask" | "messages">;
 
+/**
+ * True for a message that is the ask itself, as asked or as edited, and not
+ * something said about it. The server marks these with the revision they show;
+ * messages stored before it did are told by their place and their pick block.
+ */
+const isAskVersion = (ask: KanbanOwnerAsk, message: KanbanMessage): boolean =>
+  message.askRevision !== undefined ||
+  message.seq === ask.seq ||
+  message.seq === ask.firstSeq ||
+  message.blocks.some((block) => block._tag === "choice" && block.id === ask.id);
+
 /** The messages posted on an ask, without the message that asked it or its rewrites. */
 export function askDiscussion(entry: Talk): ReadonlyArray<KanbanMessage> {
   const { ask } = entry;
-  return entry.messages.filter(
-    (message) =>
-      message.seq !== ask.seq &&
-      message.seq !== ask.firstSeq &&
-      !message.blocks.some((block) => block._tag === "choice" && block.id === ask.id),
-  );
+  return entry.messages.filter((message) => !isAskVersion(ask, message));
+}
+
+export interface AskThreadItem {
+  readonly message: KanbanMessage;
+  /** An older version of the ask, shown folded away: what it said before its agent edited it. */
+  readonly earlier: boolean;
+}
+
+/**
+ * The ask's thread as the page draws it: what was said on it, and between
+ * those the versions of the ask that an edit replaced. The version he is
+ * reading is the page itself, so it is not in the thread.
+ */
+export function askThread(entry: Talk): ReadonlyArray<AskThreadItem> {
+  const { ask } = entry;
+  const revision = kanbanAskRevision(ask);
+  return entry.messages.flatMap((message): ReadonlyArray<AskThreadItem> => {
+    if (message.askRevision !== undefined) {
+      return message.askRevision < revision && message.seq !== ask.seq
+        ? [{ message, earlier: true }]
+        : [];
+    }
+    return isAskVersion(ask, message) ? [] : [{ message, earlier: false }];
+  });
 }
 
 /** How far apart a reply and the mark it leaves on its ask may be written. */

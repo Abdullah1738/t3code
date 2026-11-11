@@ -234,8 +234,21 @@ export function needsYouKinds(
 
 /** A kind as a short label: "flake-triage" reads "Flake triage". */
 export const askKindLabel = (kind: string): string => {
+  if (kind === "signoff") return "Sign-off";
   const words = kind.replace(/[-_]+/g, " ").trim();
   return words === "" ? "Ask" : words.charAt(0).toUpperCase() + words.slice(1);
+};
+
+/**
+ * What a batch is called: how many, and what they are in plain words
+ * ("4 actions alike"). The key agents group by is theirs and is not shown.
+ */
+export const askBatchTitle = (kinds: ReadonlyArray<string>): string => {
+  const count = kinds.length;
+  const kind = kinds[0];
+  const same = kind !== undefined && kinds.every((entry) => entry === kind);
+  const noun = same ? askKindLabel(kind).toLowerCase() : "ask";
+  return `${count} ${noun}${count === 1 ? "" : "s"} alike`;
 };
 
 /** How long an ask has waited: "5d 9h", "3h", "12m", "now". */

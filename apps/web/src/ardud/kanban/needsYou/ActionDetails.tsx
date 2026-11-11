@@ -18,7 +18,7 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
   if (action.summary) {
     rows.push([
       "Changes",
-      <div key="summary" className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      <div key="summary" data-ny-prose className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
         <KanbanMarkdown text={action.summary} />
       </div>,
     ]);
@@ -44,6 +44,15 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
       </span>,
     ]);
   }
+  // What its agent does right after a yes.
+  if (action.then && action.then.trim() !== "") {
+    rows.push([
+      "Then",
+      <span key="then" className="[overflow-wrap:anywhere]">
+        {action.then}
+      </span>,
+    ]);
+  }
   return (
     <section aria-label="What this runs" className="rounded-2xl bg-(--m-surface) p-4">
       {action.command ? (
@@ -51,7 +60,7 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
           <Label className="mb-2">Runs exactly this</Label>
           <pre
             translate="no"
-            className="mb-4 overflow-x-auto rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 ring-1 ring-inset ring-(--m-rule)"
+            className="mb-4 rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 whitespace-pre-wrap ring-1 ring-inset ring-(--m-rule) [overflow-wrap:anywhere]"
           >
             <span aria-hidden className="text-(--m-muted) select-none">
               ${" "}

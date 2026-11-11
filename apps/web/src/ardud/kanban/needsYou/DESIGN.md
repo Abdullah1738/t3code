@@ -145,6 +145,18 @@ of borders so corners stay clean.
   reader's state.
 - **Change viewer**: After, Before, Changes, Side by side; several changes are
   stepped through one at a time.
+- **Snooze**: the Snooze button opens a menu of times (Later today, Tomorrow
+  09:00, Next week, Pick a time); the S key takes tomorrow 09:00 without the
+  menu. On a phone the same rows sit in More. An ask that comes back says so
+  in a line above its title.
+- **Hand-over**: one quiet line under the ask, or under a batch for all of it
+  ("Hand these 4 to the evaluator", "…and ones like these from now on"), that
+  opens a sheet for his words.
+- **File**: a row with the name, size and Open. A PDF also shows its first
+  page above the row, drawn by the browser's viewer; a click opens it whole.
+- **Reference view**: every part is drawn by the page's own components from
+  sample asks, never a picture of one. The agents' instructions are the
+  `CARD_ASK_TOOL_DESCRIPTION` constant, a sentence to a line.
 - **Toast**: bottom of the reader, with the seconds left to undo.
 - **Sheet (`Layer`)**: right on wide screens, bottom on a phone, centred for
   short dialogs. Focus stays inside; Escape closes.

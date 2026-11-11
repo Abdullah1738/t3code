@@ -1,5 +1,6 @@
 import {
   askAge,
+  askBatchTitle,
   askKindLabel,
   needsYouBatchKey,
   needsYouMarkOf,
@@ -97,7 +98,7 @@ export function QueueRail(props: QueueRailProps) {
             spellCheck={false}
             className={cn(
               fieldClass,
-              "h-9 rounded-full ps-9 pe-9 [&::-webkit-search-cancel-button]:hidden",
+              "h-9 rounded-full ps-9 pe-9 pointer-coarse:h-11 [&::-webkit-search-cancel-button]:hidden",
             )}
           />
           {filter.query === "" ? (
@@ -330,13 +331,12 @@ function BatchRows(props: {
             )}
           />
           <span className="min-w-0 truncate">
-            {askKindLabel(first.kind)}
-            {rail.oneBoard ? "" : ` · ${rail.boardNames.get(entry.boardId) ?? ""}`}
+            {rail.oneBoard ? askKindLabel(first.kind) : (rail.boardNames.get(entry.boardId) ?? "")}
           </span>
           <span className="ms-auto shrink-0 tabular-nums">{askAge(oldest)}</span>
         </span>
         <span className={cn("truncate text-sm", focused ? "font-medium" : "")}>
-          {count} alike: {askKindLabel(entry.batchKey).toLowerCase()}
+          {askBatchTitle(entry.items.map((item) => item.kind))}
         </span>
       </button>
       {open ? (

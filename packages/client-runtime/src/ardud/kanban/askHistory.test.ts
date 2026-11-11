@@ -1,7 +1,13 @@
 import type { KanbanAskFeedItem, KanbanMessage, KanbanOwnerAsk } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { askAfterAnswer, askDiscussion, askOutcome, askRepliedOnCard } from "./askHistory.ts";
+import {
+  askAfterAnswer,
+  askDiscussion,
+  askOutcome,
+  askRepliedOnCard,
+  askThread,
+} from "./askHistory.ts";
 
 const ask = (patch: Record<string, unknown>): KanbanOwnerAsk =>
   ({
@@ -42,6 +48,37 @@ describe("askDiscussion", () => {
       message(5, "evaluator", "2026-11-10T10:04:00.000Z"),
     ]);
     expect(askDiscussion(talk).map((entry) => entry.seq)).toEqual([2, 5]);
+  });
+
+  it("folds older versions of the ask away and counts only what was said", () => {
+    const version = (seq: number, askRevision: number) =>
+      ({
+        ...message(seq, "evaluator", "2026-11-10T10:00:00.000Z"),
+        askRevision,
+      }) as KanbanMessage;
+    const talk = entry({ firstSeq: 1, seq: 6, revision: 2 }, [
+      version(1, 0),
+      message(2, "owner", "2026-11-10T10:01:00.000Z"),
+      version(4, 1),
+      message(5, "evaluator", "2026-11-10T10:04:00.000Z"),
+      version(6, 2),
+    ]);
+    expect(askDiscussion(talk).map((entry) => entry.seq)).toEqual([2, 5]);
+    expect(askThread(talk).map((item) => [item.message.seq, item.earlier])).toEqual([
+      [1, true],
+      [2, false],
+      [4, true],
+      [5, false],
+    ]);
+  });
+
+  it("draws no earlier version from messages stored before they were marked", () => {
+    const talk = entry({ firstSeq: 1, seq: 3, revision: 1 }, [
+      message(1, "evaluator", "2026-11-10T10:00:00.000Z"),
+      message(2, "owner", "2026-11-10T10:01:00.000Z"),
+      message(3, "evaluator", "2026-11-10T10:02:00.000Z"),
+    ]);
+    expect(askThread(talk).map((item) => [item.message.seq, item.earlier])).toEqual([[2, false]]);
   });
 
   it("keeps a choice that belongs to another ask", () => {

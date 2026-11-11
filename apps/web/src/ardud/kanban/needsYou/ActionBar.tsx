@@ -21,8 +21,8 @@ export function ActionBar(props: {
   more?: ReactNode;
   /** The answer is on its way and can't be sent twice. */
   busy?: boolean;
-  snoozed: boolean;
-  onSnooze: () => void;
+  /** The Snooze control: a menu of times, or "Bring back" on a snoozed ask. */
+  snooze?: ReactNode;
   onPrimary: () => void;
   onRefuse: () => void;
   onBack: () => void;
@@ -59,7 +59,7 @@ export function ActionBar(props: {
   }
   return (
     <Shell>
-      {props.phone ? props.lead : null}
+      {props.phone && !form.refusing ? props.lead : null}
       <Btn
         tone="primary"
         disabled={props.busy}
@@ -67,7 +67,7 @@ export function ActionBar(props: {
         className={props.phone ? "min-w-0 flex-1" : undefined}
       >
         <span className="truncate">{props.busy ? "Sending…" : askPrimaryLabel(ask, form)}</span>
-        <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
+        <Key className="text-(--m-accent-ink) ring-(--m-accent-ink)/40">A</Key>
       </Btn>
       {form.refusing ? (
         <Btn tone="ghost" onClick={props.onBack}>
@@ -76,12 +76,7 @@ export function ActionBar(props: {
       ) : (
         <>
           {props.phone ? null : props.children}
-          {props.phone || props.compact ? null : (
-            <Btn tone="ghost" onClick={props.onSnooze}>
-              {props.snoozed ? "Bring back" : "Snooze"}
-              <Key>S</Key>
-            </Btn>
-          )}
+          {props.phone || props.compact ? null : props.snooze}
           {refusal && !props.phone ? (
             <Btn tone="ghost" onClick={props.onRefuse}>
               {refusal.label}

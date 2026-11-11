@@ -121,6 +121,7 @@ export const ASK_LIMITS = {
   evidence: 10,
   evidenceLine: 1_000,
   undo: 2_000,
+  then: 2_000,
   changeLabel: 200,
   changeText: 20_000,
   /** Texts one ask replaces. */
@@ -276,6 +277,7 @@ export interface AskFieldsInput {
         readonly target?: string | undefined;
         readonly evidence?: ReadonlyArray<string> | undefined;
         readonly undo?: string | undefined;
+        readonly then?: string | undefined;
       }
     | undefined;
   /** One text being replaced; the same as a one-item `changes`. */
@@ -291,7 +293,12 @@ export interface AskFieldsInput {
   readonly blocks?: ReadonlyArray<KanbanBlock> | undefined;
 }
 
-export type AskProblem = { readonly code: KanbanError["code"]; readonly detail: string };
+export type AskProblem = {
+  readonly code: KanbanError["code"];
+  readonly detail: string;
+  /** The revision the ask is at, when the answer was refused for giving none or an older one. */
+  readonly revision?: number;
+};
 const invalid = (detail: string): AskProblem => ({ code: "invalid", detail });
 const isProblem = (value: unknown): value is AskProblem =>
   typeof value === "object" && value !== null && "code" in value && "detail" in value;
@@ -318,6 +325,7 @@ export const askTextFields = (
   ["action target", input.action?.target],
   ...(input.action?.evidence ?? []).map((line) => ["action evidence", line] as const),
   ["action undo", input.action?.undo],
+  ["action then", input.action?.then],
   ...[...(input.change ? [input.change] : []), ...(input.changes ?? [])].flatMap((change) => [
     ["change label", change.label] as const,
     ["change before", change.before] as const,
@@ -1059,6 +1067,8 @@ export const askFields = (
     if (isProblem(target)) return target;
     const undo = line("action undo", input.action.undo, ASK_LIMITS.undo);
     if (isProblem(undo)) return undo;
+    const then = line("action then", input.action.then, ASK_LIMITS.then);
+    if (isProblem(then)) return then;
     const evidence = (input.action.evidence ?? [])
       .map((entry) => entry.trim())
       .filter((entry) => entry !== "");
@@ -1075,6 +1085,7 @@ export const askFields = (
       target,
       evidence: evidence.length > 0 ? evidence : undefined,
       undo,
+      then,
     });
   }
 
@@ -1475,6 +1486,7 @@ export const askDetail = (ask: KanbanOwnerAsk): string => {
         ask.action.command ? `- Command: \`${ask.action.command}\`` : null,
         ...(ask.action.evidence ?? []).map((entry) => `- Evidence: ${entry}`),
         ask.action.undo ? `- Undo: ${ask.action.undo}` : null,
+        ask.action.then ? `- Then: ${ask.action.then}` : null,
       ]
         .filter((entry) => entry !== null)
         .join("\n"),
@@ -1676,14 +1688,20 @@ export const answerFor = (
   const revision = kanbanAskRevision(ask);
   // Only an ask answered in words alone may be answered without saying which version was read.
   if (input.revision === undefined && !kanbanAskIsFreeText(ask)) {
-    return invalid(
-      `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
-    );
+    return {
+      ...invalid(
+        `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
+      ),
+      revision,
+    };
   }
   if (input.revision !== undefined && input.revision !== revision) {
-    return conflict(
-      `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
-    );
+    return {
+      ...conflict(
+        `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
+      ),
+      revision,
+    };
   }
   if (kanbanAskExpired(ask, Date.parse(at))) {
     return conflict(
@@ -2118,6 +2136,40 @@ export const alwaysText = (
       .join("\n"),
     "He wants asks like this one handled by the evaluator from now on and not sent to him; how to make that happen is your call. This one is already with the card's evaluator to decide.",
   ].join("\n\n");
+
+/**
+ * The same for several asks handed in one go: one evaluator hears his words
+ * once, with the list. One ask reads exactly as `alwaysText`.
+ */
+export const alwaysManyText = (
+  entries: ReadonlyArray<{
+    readonly card: KanbanCard;
+    readonly cardRef: string;
+    readonly ask: KanbanOwnerAsk;
+  }>,
+  ownerWords: string | undefined,
+) => {
+  const [only] = entries;
+  if (entries.length === 1 && only) {
+    return alwaysText(only.card, only.cardRef, only.ask, ownerWords);
+  }
+  return [
+    `The owner handed ${entries.length} asks to the evaluator and said to do that every time for asks like them.`,
+    ownerWords?.trim() ? `His words:\n${ownerWords.trim()}` : "He added no words of his own.",
+    `The asks:\n${entries
+      .map(({ card, cardRef, ask }) =>
+        [
+          `- ${ask.id} on card ${cardRef} ("${card.title}"), kind ${kanbanAskKind(ask)}, asked by ${askerName(ask.by)}.`,
+          ask.title ? `  Title: ${ask.title}` : null,
+          `  Question: ${ask.text}`,
+        ]
+          .filter((entry) => entry !== null)
+          .join("\n"),
+      )
+      .join("\n")}`,
+    "He wants asks like these handled by the evaluator from now on and not sent to him; how to make that happen is your call. Each of these is already with its card's evaluator to decide.",
+  ].join("\n\n");
+};
 
 /**
  * An ask is with the evaluator, which decides it: the owner handed it over,

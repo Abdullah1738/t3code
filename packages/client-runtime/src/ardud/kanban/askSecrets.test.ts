@@ -69,9 +69,13 @@ describe("ask secrets", () => {
   });
 
   it("words each refusal, and never from the request", () => {
-    expect(askSecretFailure({ _tag: "EnvironmentAuthorizationError", message: "no" }).message).toBe(
-      "This one carries a secret. Answer it from your own Robob session.",
-    );
+    // A component's or a hand-issued token: the server's own message, and no device to pair.
+    expect(askSecretFailure({ _tag: "EnvironmentAuthorizationError", message: "no" })).toEqual({
+      message: "no",
+      stale: false,
+      field: null,
+      notOwner: { device: false },
+    });
     expect(
       askSecretFailure({
         _tag: "KanbanError",
@@ -93,9 +97,18 @@ describe("ask secrets", () => {
       askSecretFailure({
         _tag: "KanbanError",
         code: "invalid",
-        detail: "q1 on card #4 needs the revision you are answering. It is at revision 3: read it",
+        detail: "q1 on card #4 needs the revision you are answering.",
+        revision: 3,
       }).stale,
     ).toBe(true);
+    // The words alone do not make it stale: the revision is read from its field.
+    expect(
+      askSecretFailure({
+        _tag: "KanbanError",
+        code: "invalid",
+        detail: "It is at revision 3",
+      }).stale,
+    ).toBe(false);
     expect(askSecretFailure({ _tag: "KanbanError", code: "conflict", detail: "x" }).stale).toBe(
       true,
     );

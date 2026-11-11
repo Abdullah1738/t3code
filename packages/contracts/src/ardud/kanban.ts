@@ -263,13 +263,15 @@ export const KanbanAskDraft = Schema.Struct({
 });
 export type KanbanAskDraft = typeof KanbanAskDraft.Type;
 
-/** What will be done, where, the proof it is ready, and how to undo it. */
+/** What will be done, where, the proof it is ready, how to undo it, and what happens after. */
 export const KanbanAskAction = Schema.Struct({
   summary: Schema.String,
   command: Schema.optional(Schema.String),
   target: Schema.optional(Schema.String),
   evidence: Schema.optional(Schema.Array(Schema.String)),
   undo: Schema.optional(Schema.String),
+  /** What the asker does once it is done, e.g. "Post the before and after on the Linear ticket". */
+  then: Schema.optional(Schema.String),
 });
 export type KanbanAskAction = typeof KanbanAskAction.Type;
 
@@ -1863,6 +1865,13 @@ export const KanbanMessage = Schema.Struct({
   createdAt: IsoDateTime,
   /** Set on a message that belongs to one ask's discussion (`q1`, ... on the discussion's card). */
   askId: Schema.optional(Schema.String),
+  /**
+   * Set on a message that is the ask itself, as asked (0) or as edited: the
+   * revision it shows. Below the ask's own revision, it is an older version.
+   * A reply on the ask carries `askId` without it, and so do messages from
+   * before this field.
+   */
+  askRevision: Schema.optional(NonNegativeInt),
 });
 export type KanbanMessage = typeof KanbanMessage.Type;
 
@@ -2039,6 +2048,11 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
   code: KanbanErrorCode,
   detail: Schema.String,
   reason: Schema.optionalKey(KanbanDeniedReason),
+  /**
+   * The revision an ask is at now, on the refusal of an answer that gave none
+   * (`invalid`) or an older one (`conflict`). The detail says it in words too.
+   */
+  revision: Schema.optionalKey(NonNegativeInt),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

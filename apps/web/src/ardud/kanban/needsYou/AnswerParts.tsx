@@ -115,7 +115,11 @@ export function OptionList(props: {
           const step = event.key === "ArrowDown" ? 1 : -1;
           options[(at + step + options.length) % options.length]?.focus();
         }}
-        className={cn("grid gap-2", pictures && "@xl:grid-cols-2")}
+        className={cn(
+          "grid gap-2",
+          pictures && "@md:grid-cols-2",
+          pictures && choose.options.length % 3 === 0 && "@3xl:grid-cols-3",
+        )}
       >
         {choose.options.map((option, index) => {
           const checked = !own && form.optionIds.includes(option.id);
@@ -145,7 +149,12 @@ export function OptionList(props: {
               ) : null}
               <Key className="mt-0.5">{index + 1}</Key>
               <span className="font-medium [overflow-wrap:anywhere]">{option.label}</span>
-              {option.recommended ? <Pill tone="accent">Recommended</Pill> : <span />}
+              <span className="flex items-center gap-2">
+                {option.recommended ? <Pill tone="accent">Recommended</Pill> : null}
+                {checked ? (
+                  <CheckIcon aria-hidden className="size-4 text-(--m-accent-text)" />
+                ) : null}
+              </span>
               {option.detail ? (
                 <span className="col-span-2 col-start-2 text-sm text-(--m-muted) [overflow-wrap:anywhere] pointer-coarse:col-span-3 pointer-coarse:col-start-1">
                   {option.detail}
@@ -190,8 +199,10 @@ export function OptionList(props: {
               }}
               className={cn(
                 "rounded text-start font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
-                // The whole card picks it until the text box is open.
-                !own && "after:absolute after:inset-0 after:rounded-xl",
+                // The whole card picks it until the text box is open; then a finger still gets a full target.
+                own
+                  ? "relative pointer-coarse:after:absolute pointer-coarse:after:-inset-x-2 pointer-coarse:after:-inset-y-2.5"
+                  : "after:absolute after:inset-0 after:rounded-xl",
               )}
             >
               Your own answer
@@ -319,7 +330,7 @@ export function TaskSteps(props: {
                     : [...form.steps, index],
                 })
               }
-              className="group flex w-full min-w-0 items-start gap-3 rounded-lg py-1.5 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="group flex w-full min-w-0 items-start gap-3 rounded-lg py-1.5 text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:py-2.5"
             >
               <span
                 aria-hidden
@@ -327,7 +338,7 @@ export function TaskSteps(props: {
                   "mt-0.5 grid size-5 shrink-0 place-items-center rounded-md ring-1 ring-inset",
                   done
                     ? "bg-(--m-accent) text-(--m-accent-ink) ring-(--m-accent)"
-                    : "ring-(--m-control) group-hover:bg-(--m-surface)",
+                    : "ring-(--ny-edge) group-hover:bg-(--m-surface)",
                 )}
               >
                 {done ? <CheckIcon className="size-3.5" /> : null}

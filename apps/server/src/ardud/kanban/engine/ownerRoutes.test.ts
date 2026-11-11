@@ -116,6 +116,7 @@ it.effect("every HTTP write but a webhook run and a card's discussion needs the 
             "POST /discussions/:discussion/messages",
             "POST /discussions/:discussion/answer",
             "POST /cards/:card/asks/:ask/answer",
+            "POST /asks/hand",
           ],
         );
 
