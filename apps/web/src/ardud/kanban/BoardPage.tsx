@@ -61,6 +61,7 @@ import { DiscussionsView, NEW_DISCUSSION } from "./DiscussionsView";
 import { GoalsList, GoalView } from "./GoalsView";
 import {
   kanban,
+  kanbanErrorCode,
   kanbanErrorMessage,
   runAction,
   useBoards,
@@ -152,15 +153,24 @@ export function BoardPage(props: {
       : null;
   const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
   const setLens = (next: BoardLens) => go({ lens: next === "stuck" ? "stuck" : undefined });
-  const liftPause = async () => {
-    const held = model ? model.summary.open - model.summary.through : 0;
+  const [lifting, setLifting] = useState(false);
+  const liftPause = () => {
+    // One question and one call, however fast the button is pressed twice.
+    if (lifting) return;
+    setLifting(true);
+    // What the pause holds, as the strip counts it; cards with a thread on them run anyway.
+    const held = model ? model.summary.blocked : 0;
     const message =
       held > 0
         ? `Lift the pause? ${held.toLocaleString("en-US")} held ${held === 1 ? "card" : "cards"} can start again.`
         : "Lift the pause? Held cards can start again.";
-    const confirmed = (await requestConfirmDialog(message)) ?? window.confirm(message);
-    if (!confirmed) return;
-    await runAction("Couldn't lift the pause", () => kanban.liftPause(boardId));
+    // No dialog host answers undefined: the browser's own confirm stands in.
+    void Promise.resolve(requestConfirmDialog(message))
+      .then((answer) => answer ?? window.confirm(message))
+      .then((confirmed) =>
+        confirmed ? runAction("Couldn't lift the pause", () => kanban.liftPause(boardId)) : false,
+      )
+      .finally(() => setLifting(false));
   };
 
   const narrow = useMediaQuery("max-md");
@@ -175,7 +185,7 @@ export function BoardPage(props: {
       reason={pause.reason}
       flow={model?.summary.paused ? model.summary : null}
       canLift={canLiftPause}
-      onLift={() => void liftPause()}
+      onLift={liftPause}
     />
   ) : null;
 
@@ -188,7 +198,11 @@ export function BoardPage(props: {
           inert={drawerOpen}
           className="relative gap-4 bg-(--m-surface)"
         >
-          <WorkspaceBreadcrumb ariaLabel="Board" className="min-w-0 shrink overflow-hidden">
+          {/* The padding keeps the board name's outdented hover fill and focus ring inside the clip. */}
+          <WorkspaceBreadcrumb
+            ariaLabel="Board"
+            className="-mx-1.5 min-w-0 shrink overflow-hidden px-1.5"
+          >
             <WorkspaceBreadcrumbItem className="min-w-0 shrink">
               <BoardSwitcher boardId={boardId} board={state?.board} onHome={() => onSearch({})} />
             </WorkspaceBreadcrumbItem>
@@ -227,10 +241,16 @@ export function BoardPage(props: {
             {state === undefined ? (
               feed.failure ? (
                 <div role="alert" className="flex flex-col items-start gap-3 pe-5">
-                  <p className="font-medium">Couldn't load the board.</p>
-                  <p className="text-sm text-(--m-muted)">
-                    {kanbanErrorMessage(feed.failure.error)}
-                  </p>
+                  {kanbanErrorCode(feed.failure.error) === "not-found" ? (
+                    <p className="font-medium">This board doesn't exist.</p>
+                  ) : (
+                    <>
+                      <p className="font-medium">Couldn't load the board.</p>
+                      <p className="text-sm text-(--m-muted)">
+                        {kanbanErrorMessage(feed.failure.error)}
+                      </p>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={feed.retry}
@@ -572,8 +592,11 @@ function BoardViewControls(
   );
 }
 
+// No max-width here or on the button: with the outdent, a cap of "100%" is 12 px short of
+// the name. Both shrink through min-w-0 when the header runs out of room.
+const BOARD_HEADING = "flex min-w-0";
 const BOARD_NAME =
-  "-mx-1.5 inline-flex min-h-7 max-w-full min-w-0 items-center rounded-lg px-1.5 font-semibold text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11";
+  "-mx-1.5 inline-flex min-h-7 min-w-0 items-center rounded-lg px-1.5 font-semibold text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11";
 
 /**
  * The board's name in the header. With more than one board it opens the list of
@@ -597,7 +620,7 @@ function BoardSwitcher(props: {
   // The board's name is the screen's title: the heading holds the control, as a disclosure's does.
   if (boards.length < 2) {
     return (
-      <h1 className="flex max-w-full min-w-0">
+      <h1 className={BOARD_HEADING}>
         <button type="button" onClick={props.onHome} className={BOARD_NAME}>
           {name}
         </button>
@@ -610,7 +633,7 @@ function BoardSwitcher(props: {
   };
   return (
     <Menu>
-      <h1 className="flex max-w-full min-w-0">
+      <h1 className={BOARD_HEADING}>
         <MenuTrigger
           render={
             <button

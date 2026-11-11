@@ -19,7 +19,8 @@ export const VIRTUAL_ROWS_MIN = 40;
 /** How far past the viewport rows stay mounted, so a fast scroll doesn't show gaps. */
 const DRAW_DISTANCE_PX = 700;
 
-export type BoardRowVariant = "tile" | "raised" | "staged" | "shipped";
+/** "raised" is a Needs you tile on its tinted well; "asks" is the same tile without a well. */
+export type BoardRowVariant = "tile" | "raised" | "asks" | "staged" | "shipped";
 
 /** Opens, folds or expands a state group; `id` is the group row's. */
 export type OnBoardGroup = (id: string, state: BoardGroupState) => void;
@@ -35,7 +36,9 @@ export function LaneHeader(props: { label: string; count: number; tone?: "warn" 
         props.tone === "warn" ? "text-(--m-warning)" : "text-(--m-muted)",
       )}
     >
-      <h2 className="font-medium">{props.label}</h2>
+      <h2 className={cn("font-medium", props.tone === "warn" ? "" : "text-(--m-text)")}>
+        {props.label}
+      </h2>
       <span className="tabular-nums">{props.count.toLocaleString("en-US")}</span>
     </div>
   );
@@ -116,7 +119,9 @@ const RowView = memo(function RowView(props: {
         <button
           type="button"
           aria-label={`Show ${row.count.toLocaleString("en-US")} more`}
-          onClick={() => onGroup?.(row.id, "all")}
+          onClick={(event) => {
+            if (onGroup) showMore(event.currentTarget, () => onGroup(row.id, "all"));
+          }}
           className={cn(
             "flex h-7 w-full items-center rounded-lg px-1 text-left text-xs text-(--m-muted) tabular-nums hover:text-(--m-text) pointer-coarse:h-11 pointer-coarse:text-sm",
             FOCUS,
@@ -158,6 +163,7 @@ const RowView = memo(function RowView(props: {
         <CardTile
           card={row.card}
           raised={props.variant === "raised"}
+          asks={props.variant === "raised" || props.variant === "asks"}
           showStage={props.variant === "staged"}
           selected={props.selected}
           onOpen={props.onOpenCard}
@@ -165,6 +171,35 @@ const RowView = memo(function RowView(props: {
       );
   }
 });
+
+/**
+ * Pressing "N more" removes the pressed row: focus moves to a card it revealed
+ * instead of dropping to the page.
+ */
+function showMore(button: HTMLButtonElement, expand: () => void): void {
+  const lane: ParentNode = button.closest("section, main") ?? document;
+  const cards = () => [...lane.querySelectorAll<HTMLElement>("[data-card]")];
+  const before = new Set(cards().map((tile) => tile.dataset.card));
+  expand();
+  let tries = 0;
+  const focusRevealed = () => {
+    // The topmost new card stands where the pressed row stood; a long list's rows
+    // are not in the page in reading order, so position decides, not order.
+    let revealed: HTMLElement | null = null;
+    let top = Number.POSITIVE_INFINITY;
+    for (const tile of cards()) {
+      if (before.has(tile.dataset.card)) continue;
+      const at = tile.getBoundingClientRect().top;
+      if (at < top) {
+        top = at;
+        revealed = tile;
+      }
+    }
+    if (revealed) revealed.focus({ preventScroll: true });
+    else if ((tries += 1) < 12) requestAnimationFrame(focusRevealed);
+  };
+  requestAnimationFrame(focusRevealed);
+}
 
 const rowKey = (row: BoardRow) => row.key;
 const rowType = (row: BoardRow) => row.kind;
@@ -183,16 +218,24 @@ export const BoardRows = memo(function BoardRows(props: {
   header?: React.ReactNode;
   /** Shown instead of rows when the lane has none. */
   empty?: React.ReactNode;
+  /** Every row in the page, no scroller of its own: for a short list inside a page that scrolls. */
+  plain?: boolean;
+  /**
+   * Cards in the lane. It picks the renderer, so that opening or folding a group
+   * (which changes the row count, not this) never swaps the scroller and loses the place.
+   */
+  count?: number | undefined;
 }) {
   const variant = props.variant ?? "tile";
   const dense = variant === "shipped";
   const selected = props.selectedCardId;
 
-  if (props.rows.length <= VIRTUAL_ROWS_MIN) {
+  if (props.plain || (props.count ?? props.rows.length) <= VIRTUAL_ROWS_MIN) {
     return (
       <div
         className={cn(
-          "flex min-h-0 flex-col overflow-x-hidden overflow-y-auto",
+          "flex min-h-0 flex-col",
+          props.plain ? "shrink-0" : "overflow-x-hidden overflow-y-auto",
           dense ? "gap-1" : "gap-2",
           HIDE_SCROLLBAR,
           props.className,

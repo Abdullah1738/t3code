@@ -94,18 +94,13 @@ export function BoardColumns(props: {
             onChange={props.onLens}
           />
         ) : null}
-        {props.lens === "stuck" && controls === null ? (
-          <p className="ms-2 min-w-0 text-sm text-(--m-text) pointer-coarse:text-base">
-            {model.stuck.line}
-          </p>
-        ) : null}
         <span className="flex-1" />
         {controls}
       </div>
     ) : null;
-  // Beside the switch where there is room, under it where the controls took the row.
+  // Under the switch at every width: beside it the sentence wrapped and moved the board.
   const lensLine =
-    props.lens === "stuck" && controls !== null ? (
+    props.lens === "stuck" ? (
       <p className="shrink-0 text-sm text-(--m-text) pointer-coarse:text-base">
         {model.stuck.line}
       </p>
@@ -443,6 +438,9 @@ function FoldedShipped(props: { lanes: ReadonlyArray<BoardLane>; onOpen: () => v
         FOCUS,
       )}
     >
+      <span className="text-xs font-medium text-(--m-muted) [writing-mode:vertical-rl] pointer-coarse:text-sm">
+        Shipped
+      </span>
       {props.lanes.map((lane) => (
         <span
           key={lane.key}
@@ -510,6 +508,7 @@ function Column(props: {
       ) : null}
       <BoardRows
         rows={lane.rows}
+        count={lane.count}
         variant={props.variant}
         selectedCardId={props.selectedCardId}
         onOpenCard={props.onOpenCard}
@@ -537,7 +536,7 @@ function ShippedColumn(props: {
     >
       {props.handle}
       <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-11 pointer-coarse:text-sm">
-        <h2 className="font-medium">Shipped</h2>
+        <h2 className="font-medium text-(--m-text)">Shipped</h2>
         <button
           type="button"
           aria-expanded={true}
@@ -628,15 +627,27 @@ function GroupGrid(props: ColumnsProps) {
 const SHORT_LABELS: Record<string, string> = {
   todo: "To-Do",
   working: "Working",
-  needs_review: "Review",
+  needs_review: "Reviewing",
   in_review: "Waiting",
   needs_owner: "Needs you",
+};
+
+const showPicked = (button: HTMLButtonElement | null) => {
+  button?.scrollIntoView({ block: "nearest", inline: "nearest" });
 };
 
 /** Phone layout: one column at a time, picked from a switcher that scrolls away with the cards. */
 function StageList(props: ColumnsProps & { top: React.ReactNode }) {
   const board = props.model;
-  const lanes = [...board.active, board.owner, ...board.shipped];
+  // Shipped is one column here as on a wide board: its three stages under their headings.
+  const shipped: BoardLane = {
+    key: "shipped",
+    label: "Shipped",
+    summary: null,
+    count: board.shipped.reduce((sum, lane) => sum + lane.count, 0),
+    rows: board.shippedRows,
+  };
+  const lanes = [...board.active, board.owner, shipped];
   const firstFull = lanes.find((lane) => lane.count > 0)?.key ?? "todo";
   const [picked, setPicked] = useState<string | null>(null);
   const key = picked ?? firstFull;
@@ -660,7 +671,7 @@ function StageList(props: ColumnsProps & { top: React.ReactNode }) {
               rows={lane.rows}
               selectedCardId={undefined}
               onOpenCard={props.onOpenCard}
-              className="max-h-[70dvh]"
+              plain
             />
           </section>
         ))}
@@ -683,6 +694,8 @@ function StageList(props: ColumnsProps & { top: React.ReactNode }) {
               key={lane.key}
               type="button"
               aria-pressed={selected}
+              // The list remounts per column and the row starts over: keep the picked one in sight.
+              ref={selected ? showPicked : undefined}
               onClick={() => setPicked(lane.key)}
               className={cn(
                 "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
@@ -703,10 +716,15 @@ function StageList(props: ColumnsProps & { top: React.ReactNode }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col pe-4">
+      {/* The column buttons name the column to the eye; this names it in the outline. */}
+      <h2 className="sr-only">{current?.label}</h2>
       <BoardRows
         key={key}
         rows={current?.rows ?? []}
-        variant={key === "needs_owner" ? "raised" : undefined}
+        // Needs you and Shipped never fold, and their count is not their row count.
+        count={key === "needs_owner" || key === "shipped" ? undefined : current?.count}
+        // No tinted well here: Needs you tiles show their ask on the fill the other columns have.
+        variant={key === "needs_owner" ? "asks" : key === "shipped" ? "shipped" : undefined}
         selectedCardId={undefined}
         onOpenCard={props.onOpenCard}
         onGroup={props.onGroup}

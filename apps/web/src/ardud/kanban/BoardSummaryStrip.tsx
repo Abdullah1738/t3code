@@ -67,26 +67,29 @@ export function BoardSummaryStrip(props: {
       <Cell label="Waiting on authors" className={phone ? undefined : cn("border-s", rule)}>
         {count(summary.authors)}
       </Cell>
-      <div className={cn("flex min-w-0 border-s", rule)}>
-        <Link
-          to="/needs-you"
-          search={{ board: props.boardId }}
-          className={cn(
-            "flex min-w-0 flex-1 flex-col justify-start px-4 py-2.5 outline-none hover:bg-(--m-surface) focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset",
-            phone ? "rounded-ee-xl" : "rounded-e-xl",
-          )}
-        >
-          <dt className="truncate text-xs text-(--m-muted)">Needs you</dt>
-          <dd
+      {/* The term and its value stay the list's own; the link in the value covers the cell. */}
+      <div
+        className={cn(
+          "relative flex min-w-0 flex-col justify-start border-s px-4 py-2.5 hover:bg-(--m-surface) has-focus-visible:ring-2 has-focus-visible:ring-(--m-accent) has-focus-visible:ring-inset",
+          rule,
+          phone ? "rounded-ee-xl" : "rounded-e-xl",
+        )}
+      >
+        <dt className="truncate text-xs text-(--m-muted)">Needs you</dt>
+        <dd className="text-xl leading-7 font-semibold tabular-nums">
+          <Link
+            to="/needs-you"
+            search={{ board: props.boardId }}
+            aria-label={`${count(summary.needsYou)}, open Needs you for this board`}
             className={cn(
-              "flex items-center gap-1.5 text-xl leading-7 font-semibold tabular-nums",
+              "flex items-center gap-1.5 outline-none after:absolute after:inset-0",
               summary.needsYou > 0 ? "text-(--m-warning)" : "text-(--m-text)",
             )}
           >
             {count(summary.needsYou)}
             <ArrowRightIcon aria-hidden className="size-4" />
-          </dd>
-        </Link>
+          </Link>
+        </dd>
       </div>
     </dl>
   );

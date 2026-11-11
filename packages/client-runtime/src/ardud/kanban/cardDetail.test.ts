@@ -305,7 +305,11 @@ describe("cardHistory", () => {
       event("flagged", "worker stopped with no result"),
       event("flagged", "Cleared"),
       event("review", "clear", { fromStage: "in_review", toStage: "completed" }),
-      event("review", "- one\n- two", { fromStage: "in_review", toStage: "todo" }),
+      // A finding that runs over two lines is still one finding.
+      event("review", "- one\n  still the first\n- two", {
+        fromStage: "in_review",
+        toStage: "todo",
+      }),
       event("edited", "Settled"),
       event("edited", "priority, title"),
       event("edited", null),

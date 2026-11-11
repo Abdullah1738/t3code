@@ -793,5 +793,13 @@ describe("board search", () => {
     expect(engine.model(state, NOW, { filter: { query: "obsidian" }, group: "stage" })).toBe(
       before,
     );
+    // Learning a card's text keeps every lane that did not change: opening a drawer
+    // must not re-render the board.
+    const lanes = engine.model(state, NOW, STAGE);
+    engine.learn({ ...cards[1]!, description: "Text seen for the first time", prompt: "" });
+    const after = engine.model(state, NOW, STAGE);
+    expect(after.active).toBe(lanes.active);
+    expect(after.owner).toBe(lanes.owner);
+    expect(after.shippedRows).toBe(lanes.shippedRows);
   });
 });

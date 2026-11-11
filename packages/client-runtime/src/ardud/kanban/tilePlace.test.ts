@@ -183,6 +183,18 @@ describe("tilePlace", () => {
     expect(flagged.edge).toBe("fail");
     expect(flagged.stuck).toBe("flagged");
 
+    // A flag whose own words ask for a look is not told to twice.
+    const asking = placed(
+      card(4, {
+        stalled: {
+          reason: "Needs a look: the packet names no repo",
+          at: ago(HOUR),
+          by: OWNER,
+        } as never,
+      }),
+    );
+    expect(say(asking)).toEqual(["Flagged", "Needs a look: the packet names no repo"]);
+
     const step = placed(
       card(3, {
         subtasks: [
@@ -192,6 +204,12 @@ describe("tilePlace", () => {
     );
     expect(where(step)).toBe("todo:parked");
     expect(step.reason).toBe("Waiting on the evaluator");
+    // The step in its own words, not its id.
+    expect(say(step)).toEqual([
+      "Evaluator's step",
+      "Write the packet",
+      "Moves when the evaluator has done it",
+    ]);
   });
 
   it("holds To-Do and review cards while the board's setup runs", () => {
@@ -366,9 +384,22 @@ describe("tilePlace", () => {
     ]);
     expect(named.line?.since).toBeNull();
 
-    const late = parked({ at: ago(13 * DAY) });
+    // A wait that ran out says so in words, not only in colour, and keeps its date.
+    const late = parked({ at: ago(13 * DAY), note: "Round-4 feedback posted" });
     expect(late.stuck).toBe("author");
     expect(late.line?.tone).toBe("warn");
+    expect(say(late)).toEqual([
+      "Waiting on the author",
+      "Round-4 feedback posted",
+      "Past its 3-day limit: needs a look",
+    ]);
+    expect(late.line?.since).toBe(ago(13 * DAY));
+    expect(late.line?.sinceAs).toBe("date");
+
+    const lateCi = parked({ at: ago(DAY) }, "ci");
+    expect(lateCi.line?.wake).toBe("Past its 3-hour limit: needs a look");
+    const lateOwn = parked({ at: ago(DAY), until: ago(HOUR) }, "merge");
+    expect(lateOwn.line?.wake).toBe("Past its limit: needs a look");
 
     const merge = parked({ pr: "https://github.com/example-org/api/pull/518" }, "merge");
     expect(where(merge)).toBe("in_review:checks");
@@ -391,7 +422,7 @@ describe("tilePlace", () => {
 
     const until = iso(NOW + 5 * HOUR);
     const timed = parked({ until }, "time");
-    expect(say(timed)).toEqual(["Held for a recheck", "Wakes itself at"]);
+    expect(say(timed)).toEqual(["Held for a recheck", "Wakes itself"]);
     expect(timed.line?.wakeAt).toBe(until);
 
     const script = parked({ script: "release-train" }, "script");
@@ -418,7 +449,7 @@ describe("tilePlace", () => {
     expect(where(guessed)).toBe("in_review:author");
     expect(say(guessed)).toEqual([
       "Waiting on the author",
-      "A guess from the card's notes: nothing is watching for it",
+      "A guess from the card's notes. Nothing is watching for it",
     ]);
   });
 
@@ -442,6 +473,16 @@ describe("tilePlace", () => {
     expect(where(placed(card(1, { stage: "needs_owner" })))).toBe("needs_owner:owner");
     expect(where(placed(card(2, { stage: "deployed" })))).toBe("shipped:done");
     expect(where(placed(card(3, { stage: "verified", settledAt: ago(DAY) })))).toBe("shipped:done");
+    // Neither column is in the Stuck lens: a stale wait there is not counted as stuck.
+    const lateDone = placed(
+      card(4, { stage: "completed", wait: wait("merge", { at: ago(9 * DAY) }) }),
+    );
+    expect(where(lateDone)).toBe("shipped:done");
+    expect(lateDone.stuck).toBeNull();
+    const lateOwner = placed(
+      card(5, { stage: "needs_owner", wait: wait("owner_go", { at: ago(9 * DAY) }) }),
+    );
+    expect(lateOwner.stuck).toBeNull();
   });
 
   it("holds every card off a paused board's keep list, and lets the kept ones through", () => {
@@ -467,6 +508,21 @@ describe("tilePlace", () => {
     expect(say(parked)?.at(-1)).toBe("Wakes itself when the pause lifts");
     // Nothing the pause holds needs a look.
     expect(parked.stuck).toBeNull();
+    // A failure still says so: lifting the pause would not start it.
+    const failedHeld = placed(
+      card(6, { stalled: { reason: "worker stopped", at: ago(HOUR), by: SYSTEM } as never }),
+      [],
+      { board },
+    );
+    expect(where(failedHeld)).toBe("todo:parked");
+    expect(failedHeld.stuck).toBe("failed");
+    // Only a card that is ready promises to start when the pause lifts.
+    const backlogHeld = placed(card(7, { priority: 5 }), [], { board });
+    expect(where(backlogHeld)).toBe("todo:paused");
+    expect(say(backlogHeld)).toEqual(["Not on the pause's keep list"]);
+    // Queued for review but held: not what a reviewer takes next.
+    const queued = placed(card(5, { stage: "needs_review" }), [], { board });
+    expect(where(queued)).toBe("in_review:paused");
 
     // A kept card is placed as on any board; one a thread is already on shows that thread.
     expect(where(placed(card(4, { blockedBy: ["card-9"] as never }), [card(9)], { board }))).toBe(
@@ -493,6 +549,12 @@ describe("stuckSummary", () => {
       ),
     ).toBe(
       "54 stuck: 1 failed after a retry, 46 idle in review, 7 waiting on an author for over 3 days. Every one says why.",
+    );
+    expect(stuckSummary(new Map([["wait", 1]]))).toBe(
+      "1 stuck: 1 past its wait's limit. Every one says why.",
+    );
+    expect(stuckSummary(new Map([["wait", 2]]))).toBe(
+      "2 stuck: 2 past their wait's limit. Every one says why.",
     );
     expect(stuckSummary(new Map())).toBe("Nothing is stuck.");
   });
@@ -683,12 +745,15 @@ describe("the stage board's groups", () => {
     expect(rowsOf(built.active[3]!)).toEqual(["Held by the pause 3", "#60", "#61", "#62"]);
     expect(built.summary).toMatchObject({
       ready: 2,
-      blocked: 18,
+      // The failed card is not the pause's to hold: it shows as failed.
+      blocked: 17,
       paused: true,
       open: 23,
       through: 2,
     });
-    expect(built.stuck.count).toBe(0);
+    // Nothing the pause holds is stuck; the failure still is.
+    expect(built.stuck.count).toBe(1);
+    expect(built.stuck.line).toBe("1 stuck: 1 failed after a retry. Every one says why.");
   });
 });
 

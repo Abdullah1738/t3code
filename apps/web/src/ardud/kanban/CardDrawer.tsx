@@ -212,7 +212,7 @@ export function CardDrawer(props: {
         className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[540px] flex-col bg-(--m-raised) px-5.5 pt-4 shadow-xl ring-1 ring-(--m-rule) outline-none"
       >
         {/* Header scrolls and shrinks first on short windows, so the tabs and tab content stay in the drawer. */}
-        <div className="flex min-h-0 shrink flex-col overflow-y-auto overscroll-contain">
+        <div className="flex min-h-0 shrink flex-col overflow-y-auto overscroll-contain max-sm:max-h-[48dvh]">
           <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
             <Pri priority={card.priority} />
             <span className="tabular-nums">#{card.number}</span>
@@ -604,7 +604,8 @@ function Details(props: {
                 title={patchNote}
                 onClick={() => patch({ stalled: false })}
               >
-                Clear
+                {/* Clearing a failure lets the board start the card again; the Model row reroutes it. */}
+                {card.stalled.by._tag === "system" ? "Restart" : "Clear"}
               </QuietButton>
             </span>
           </Fact>
@@ -620,7 +621,8 @@ function Details(props: {
 function CardState(props: { view: CardStateView }) {
   const { view } = props;
   return (
-    <dl className="mb-3.5 grid grid-cols-[112px_1fr] items-start gap-x-4 gap-y-2 text-sm pointer-coarse:text-base">
+    // On a phone the label sits over its value: beside it the value wrapped to five lines.
+    <dl className="mb-3.5 grid grid-cols-[112px_1fr] items-start gap-x-4 gap-y-2 text-sm max-sm:grid-cols-1 max-sm:gap-y-0.5 pointer-coarse:text-base max-sm:[&>dd:not(:last-child)]:mb-2">
       <dt className="text-(--m-muted)">Waiting on</dt>
       <dd className="min-w-0">
         {view.line ? (
@@ -687,7 +689,7 @@ function History(props: { lines: ReadonlyArray<CardHistoryLine>; nowMs: number }
           const Icon = HISTORY_ICONS[line.kind];
           const actor = HISTORY_ACTORS[line.actor];
           return (
-            <li key={line.id} className="grid grid-cols-[112px_1fr] gap-x-4">
+            <li key={line.id} className="grid grid-cols-[112px_1fr] gap-x-4 max-sm:grid-cols-1">
               <time
                 dateTime={line.at}
                 className="pt-0.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-sm"

@@ -214,7 +214,9 @@ export function cardHistory(events: ReadonlyArray<KanbanCardEvent>): CardHistory
         break;
       }
       case "review": {
-        const findings = body === "" || body === "clear" ? 0 : body.split("\n").length;
+        // One finding per "- " line; a finding may run over several lines.
+        const listed = body.split("\n").filter((entry) => /^\s*[-*]\s+\S/.test(entry)).length;
+        const findings = body === "" || body === "clear" ? 0 : Math.max(1, listed);
         lines.push({
           ...base,
           kind: "plain",

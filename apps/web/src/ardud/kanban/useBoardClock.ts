@@ -18,7 +18,11 @@ function tick(): void {
     now = next;
     for (const listener of listeners) listener();
   }
-  timerId = window.setTimeout(tick, BOARD_CLOCK_MS - (Date.now() % BOARD_CLOCK_MS) + 5);
+  // The last listener may have left during the loop: no timer without one.
+  timerId =
+    listeners.size > 0
+      ? window.setTimeout(tick, BOARD_CLOCK_MS - (Date.now() % BOARD_CLOCK_MS) + 5)
+      : null;
 }
 
 function subscribe(listener: () => void): () => void {

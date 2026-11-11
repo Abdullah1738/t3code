@@ -8,6 +8,7 @@ import {
   kanbanScriptStep,
   kanbanStepSubtasks,
   type KanbanCard,
+  type KanbanWaitKind,
 } from "@t3tools/contracts";
 
 import type { KanbanBoardState } from "./boardState.ts";
@@ -138,7 +139,9 @@ export function stuckSummary(counts: ReadonlyMap<StuckKind, number>): string {
     const count = counts.get(kind) ?? 0;
     if (count === 0) continue;
     total += count;
-    parts.push(`${count.toLocaleString("en-US")} ${STUCK_KIND_PHRASES[kind]}`);
+    const phrase =
+      kind === "wait" && count === 1 ? "past its wait's limit" : STUCK_KIND_PHRASES[kind];
+    parts.push(`${count.toLocaleString("en-US")} ${phrase}`);
   }
   return total === 0
     ? "Nothing is stuck."
@@ -162,7 +165,7 @@ export interface TileLine {
   readonly rest: string | null;
   /** "Wakes itself on the next push". */
   readonly wake: string | null;
-  /** A time the wake line ends with: "Wakes itself at" + this. */
+  /** A time the wake line ends with: "Wakes itself" + "at 15:41" or "on Sat 14 Nov, 09:00". */
   readonly wakeAt: string | null;
 }
 
@@ -228,23 +231,43 @@ function handleIn(note: string): string | null {
   return match ? match[1]! : null;
 }
 
+/** "Past its 3-day limit: needs a look": what a wait says once it has outlasted its kind's limit. */
+function pastLimit(wait: KanbanCard["wait"], on: KanbanWaitKind): string {
+  const limit = wait?.until == null ? KANBAN_WAIT_LIMIT_MS[on] : null;
+  if (limit === null) return "Past its limit: needs a look";
+  const hours = Math.round(limit / 3_600_000);
+  const span = hours % 24 === 0 ? `${hours / 24}-day` : `${hours}-hour`;
+  return `Past its ${span} limit: needs a look`;
+}
+
 function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): TileLine {
   const wait = card.wait;
   const info = truth.wait!;
   const tone = info.checkFailing ? "negative" : info.expired ? "warn" : "muted";
-  const guessed = "A guess from the card's notes: nothing is watching for it";
+  const guessed = "A guess from the card's notes. Nothing is watching for it";
   const failing = "Its check keeps failing: nothing can wake it";
-  const wakes = (text: string) => (truth.derived ? guessed : info.checkFailing ? failing : text);
+  // A wait that ran out says so in words: it no longer promises to wake by itself.
+  const expired = info.expired && !truth.derived && !info.checkFailing;
+  const wakes = (text: string) =>
+    truth.derived
+      ? guessed
+      : info.checkFailing
+        ? failing
+        : expired
+          ? pastLimit(wait, info.on)
+          : text;
   const pr = prNumber(wait?.pr ?? card.links.find((link) => link.kind === "pr")?.url);
   const note = truth.derived ? "" : info.note;
   const since = truth.derived ? null : (wait?.at ?? null);
+  // Since when, on every wait that ran out: the date is what makes it stuck.
+  const stale = expired ? { since, sinceAs: "date" as const } : {};
   switch (info.on) {
     case "push": {
       const who = handleIn(note) ?? "the author";
       // With a note the line is what happened; without one, since when.
       return line("pause", tone, `Waiting on ${who}`, wakes("Wakes itself on the next push"), {
         rest: note,
-        ...(note.trim() ? {} : { since, sinceAs: "date" as const }),
+        ...(note.trim() ? stale : { since, sinceAs: "date" as const }),
       });
     }
     case "merge":
@@ -257,15 +280,17 @@ function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): 
             ? "Completes by itself when the PR lands"
             : "Wakes itself when the PR merges",
         ),
-        { rest: wait === undefined ? null : note },
+        { rest: wait === undefined ? null : note, ...stale },
       );
     case "ci":
       return line("pause", tone, `Waiting on CI${pr}`, wakes("Wakes itself when CI finishes"), {
         rest: info.status ?? note,
+        ...stale,
       });
     case "owner_go":
       return line("pause", tone, "Held for your go", truth.derived ? guessed : "In Needs you", {
         rest: note,
+        ...stale,
       });
     case "card": {
       const target = wait?.card == null ? undefined : state.cards.get(wait.card);
@@ -278,7 +303,7 @@ function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): 
             ? "Wakes itself when that card is done"
             : `Wakes itself when #${target.number} is done`,
         ),
-        { rest: note },
+        { rest: note, ...stale },
       );
     }
     case "time":
@@ -286,7 +311,7 @@ function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): 
         "pause",
         tone,
         "Held for a recheck",
-        wakes(wait?.until == null ? "Wakes itself later" : "Wakes itself at"),
+        wakes(wait?.until == null ? "Wakes itself later" : "Wakes itself"),
         { rest: note, wakeAt: truth.derived ? null : (wait?.until ?? null) },
       );
     case "script": {
@@ -296,18 +321,19 @@ function waitLine(card: KanbanCard, state: KanbanBoardState, truth: CardTruth): 
         tone,
         `Waiting on ${script}`,
         wakes(`Wakes itself when ${script} says so`),
-        {
-          rest: info.status ?? note,
-        },
+        { rest: info.status ?? note, ...stale },
       );
     }
   }
 }
 
-const stepIds = (card: KanbanCard) =>
-  kanbanStepSubtasks(card)
-    .map((subtask) => subtask.id)
-    .join(", ");
+/** The open step in its own words, not its id: "Confirm the rollout order", "… and 2 more". */
+const stepText = (card: KanbanCard) => {
+  const open = kanbanStepSubtasks(card);
+  const first = open[0]?.text.trim() ?? "";
+  if (first === "") return "";
+  return open.length === 1 ? first : `${first} and ${open.length - 1} more`;
+};
 
 /**
  * Where a card sits on the board and the line its tile shows. `kept` is the
@@ -337,8 +363,11 @@ export function tilePlace(
   });
 
   const stage = card.stage;
-  if (card.settledAt !== null || KANBAN_DONE_STAGES.has(stage)) return place("shipped", "done");
-  if (stage === "needs_owner") return place("needs_owner", "owner");
+  // Neither is in a column the Stuck lens shows: counting them would promise a card it can't show.
+  if (card.settledAt !== null || KANBAN_DONE_STAGES.has(stage)) {
+    return { ...place("shipped", "done"), stuck: null };
+  }
+  if (stage === "needs_owner") return { ...place("needs_owner", "owner"), stuck: null };
 
   const reviewStage = stage === "needs_review" || stage === "in_review";
   // The Reviewing column holds what a reviewer is on or takes next; the rest of review waits.
@@ -348,18 +377,27 @@ export function tilePlace(
 
   // A paused board starts and wakes only the cards on its keep list. One with a
   // thread already on it shows what that thread is doing.
-  if (kept !== null && !kept.has(card.id) && card.activeThreadId === null) {
+  // A failed or flagged card still says so: lifting the pause would not start it.
+  if (
+    kept !== null &&
+    !kept.has(card.id) &&
+    card.activeThreadId === null &&
+    truth.state !== "failed"
+  ) {
     return {
-      column: stage === "needs_review" ? reviewing : column,
+      column,
       group: "paused",
       reason: "Not on the keep list",
       line: line(
         "pause",
         "muted",
         "Not on the pause's keep list",
-        stage === "todo"
-          ? "Starts by itself when the pause lifts"
-          : "Wakes itself when the pause lifts",
+        stage !== "todo"
+          ? "Wakes itself when the pause lifts"
+          : // Blocked or in the backlog: the pause is not the only thing holding it.
+            truth.state === "ready"
+            ? "Starts by itself when the pause lifts"
+            : null,
       ),
       edge: null,
       stuck: null,
@@ -429,11 +467,13 @@ export function tilePlace(
       // A reason that already opens with the word ("Failed twice: ...") is the whole line.
       const reason = stalled.reason.trim();
       const says = reason.toLowerCase().startsWith(word.toLowerCase());
+      // A flag whose own words ask for a look is not told to twice.
+      const asks = /needs a look/i.test(reason);
       const shown = line(
         "stop",
         "negative",
         says ? reason.charAt(0).toUpperCase() + reason.slice(1) : word,
-        failed ? "Needs a look: restart it or reroute it" : "Needs a look",
+        failed ? "Needs a look: restart it or reroute it" : asks ? null : "Needs a look",
         { rest: says ? null : reason },
       );
       if (stage === "working") {
@@ -468,7 +508,7 @@ export function tilePlace(
     case "evaluator": {
       const deciding = kanbanDeciding(card, nowMs);
       const script = kanbanScriptStep(card);
-      const ids = stepIds(card);
+      const step = stepText(card);
       const shown = deciding
         ? line("pause", "muted", "Evaluator deciding", "It decides what the card does next", {
             since: card.deciding?.since ?? null,
@@ -477,10 +517,9 @@ export function tilePlace(
         : line(
             "pause",
             truth.stuckReason === null ? "muted" : "warn",
-            script
-              ? `Script's step${ids ? `: ${ids}` : ""}`
-              : `Evaluator's step${ids ? `: ${ids}` : ""}`,
+            script ? "Script's step" : "Evaluator's step",
             script ? "Moves when the script has run" : "Moves when the evaluator has done it",
+            { rest: step },
           );
       return place(column, stage === "todo" ? "parked" : "evaluator", shown, {
         reason: script ? "Waiting on a script" : "Waiting on the evaluator",

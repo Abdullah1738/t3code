@@ -36,6 +36,13 @@ export function clockTime(atIso: string, nowMs: number): string {
   return clock === time ? time : `${clock} ${time}`;
 }
 
+/** How a wake line ends: "at 15:41" today, "on Sat 14 Nov, 09:00" another day. */
+function wakeTime(atIso: string, nowMs: number): string {
+  const time = formatTimeOfDay(atIso);
+  const clock = clockLabel(atIso, nowMs);
+  return clock === time ? `at ${time}` : `on ${clock}, ${time}`;
+}
+
 const LINE_ICONS = { pause: PauseIcon, retry: RotateCwIcon, stop: OctagonXIcon } as const;
 const LINE_TONES = {
   muted: "text-(--m-muted)",
@@ -56,7 +63,7 @@ export function TileWhy(props: { line: TileLine; clamp?: boolean; roomy?: boolea
       ? null
       : line.wakeAt === null
         ? line.wake
-        : `${line.wake} ${clockTime(line.wakeAt, nowMs)}`;
+        : `${line.wake} ${wakeTime(line.wakeAt, nowMs)}`;
   return (
     <span
       className={cn(
@@ -72,7 +79,7 @@ export function TileWhy(props: { line: TileLine; clamp?: boolean; roomy?: boolea
             props.roomy ? "mt-0.75 size-3.5" : "mt-0.5 size-3 pointer-coarse:size-3.5",
           )}
         />
-        <span className={cn("min-w-0 wrap-break-word", props.clamp !== false && "line-clamp-2")}>
+        <span className={cn("min-w-0 wrap-break-word", props.clamp !== false && "line-clamp-3")}>
           {line.lead}
           {sinceText(line, nowMs)}
           {line.rest === null ? "" : `: ${line.rest}`}
@@ -92,15 +99,17 @@ export function TileWhy(props: { line: TileLine; clamp?: boolean; roomy?: boolea
 export const CardTile = memo(function CardTile(props: {
   card: BoardTileView;
   selected: boolean;
-  /** In the Needs you column: on its tinted well, and showing the ask rather than the state. */
+  /** On the Needs you column's tinted well. */
   raised?: boolean;
+  /** In Needs you: showing the ask rather than the state. */
+  asks?: boolean;
   /** Similar and other groupings show the stage instead of the goal. */
   showStage?: boolean;
   onOpen: (cardId: string) => void;
 }) {
   const { card } = props;
   // Needs you is about the question; every other column is about what the card is doing.
-  const ask = props.raised && card.flag?.kind === "ask" ? card.flag : null;
+  const ask = props.asks && card.flag?.kind === "ask" ? card.flag : null;
   const line = ask === null ? card.line : null;
   const flag = ask ?? (line === null ? card.flag : null);
   const failed = card.edge === "fail" || (line === null && card.flag?.kind === "stalled");
@@ -108,6 +117,7 @@ export const CardTile = memo(function CardTile(props: {
     <button
       type="button"
       onClick={() => props.onOpen(card.id)}
+      data-card={card.id}
       aria-current={props.selected ? "true" : undefined}
       className={cn(
         "flex w-full min-w-0 flex-col gap-1.5 rounded-xl px-2.75 pt-2.25 pb-2.5 text-left text-sm text-(--m-text) outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:gap-2 pointer-coarse:px-3.5 pointer-coarse:pt-3 pointer-coarse:pb-3 pointer-coarse:text-base",

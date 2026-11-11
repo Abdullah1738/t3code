@@ -1005,8 +1005,8 @@ export function createBoardView(): BoardViewEngine {
       const text = `${card.description}\n${card.prompt}`.toLowerCase();
       if (learned.get(card.id) === text) return;
       learned.set(card.id, text);
-      // The next model call searches again.
-      last = null;
+      // The next model call searches again, and still hands back whatever did not change.
+      if (last !== null) last = { ...last, validUntil: Number.NEGATIVE_INFINITY };
     },
     place(state, nowMs, cardId) {
       const card = state.cards.get(cardId);

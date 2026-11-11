@@ -157,6 +157,13 @@ export function useFeed(store: SnapshotStore<unknown>): FeedState {
   return { failure, retry: store.retry };
 }
 
+/** The server's code for a refused call ("not-found", "denied"), when it sent one. */
+export function kanbanErrorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("code" in error)) return null;
+  const code = (error as { readonly code: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
 export function kanbanErrorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "detail" in error) {
     const detail = (error as { readonly detail: unknown }).detail;
