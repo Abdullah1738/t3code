@@ -76,7 +76,7 @@ def ci_ids(text):
 
 _CI_STATES = (r"success(?:ful(?:ly)?)?|succeed(?:ed|s)?|pass(?:ed|ing)?|fail(?:ed|ure|ing)?|"
               r"green|red|pending|queued|running|active|cancel(?:led|ed)|timed[_ -]?out|skipped|"
-              r"neutral|completed|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
+              r"neutral|completed|finish(?:ed|es)?|ship(?:ped|s)?|in[_ -]?progress|action[_ -]?required|blocked|waiting|error")
 
 
 def inline_text(text):
@@ -168,12 +168,13 @@ def finite_result_clause(text):
         finite |= bool(roots & base_verbs())
     if predicate.endswith('s'):
         roots = {predicate[:-1], predicate[:-2], predicate[:-3] + 'y'} & base_verbs()
-        # "results" without its verbal in/from complement is also a plural
-        # object ("release results"). Other lexical inflections do not need
-        # a CI-status synonym to establish a finite predicate.
-        if roots == {'result'} and not re.match(r"(?:in|from)\b", tail, re.I):
-            roots = set()
-        finite |= bool(roots)
+        outcome = bool(re.fullmatch(_CI_STATES, predicate)) or any(
+            re.fullmatch(_CI_STATES, root + ending) for root in roots for ending in ('d', 'ed'))
+        # A lexical noun plural is a command object unless it carries an
+        # established outcome meaning. Inflection alone cannot turn
+        # "release changes" or "build packages" into historical reports.
+        complement = bool(re.match(r"(?:in|from)\b", tail, re.I))
+        finite |= bool(roots) and (not roots & noun_verbs() or outcome or complement)
     # A finite result after a noun/verb homograph is a report. A participle
     # modifying its object ("release completed builds") remains imperative;
     # plural objects such as "results" are not result predicates.

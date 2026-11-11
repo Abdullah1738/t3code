@@ -910,6 +910,58 @@ class FactScopeTests(unittest.TestCase):
                         self.assertEqual([fact] if instruction else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0]])
                         self.assertEqual([fact] if instruction or anchored else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
 
+    def test_plural_command_objects_remain_instructions(self):
+        from recall_fact_scope import comparison_text, standing_instruction
+        objects = ('changes', 'packages', 'results', 'outputs', 'checks', 'artifacts', 'releases', 'builds')
+        message = 'Build and release ' + ' '.join(objects) + ' for PR1145 head 72a10c19 while CI checks are pending.'
+        for verb in ('build', 'release'):
+            for noun in objects:
+                command = f'{verb} {noun}'
+                policies = [f'Only {command} after CI checks passed.']
+                policies += [f'{prefix} CI checks passed, {command}.'
+                             for prefix in ('After', 'When', 'Once', 'If', 'Until', 'Unless')]
+                for j, policy in enumerate(policies):
+                    with self.subTest(verb=verb, noun=noun, policy=policy):
+                        self.assertTrue(standing_instruction(policy))
+                        self.assertEqual(policy, comparison_text(policy, message))
+                        index = RuleIndex(self.root / f'plural-object-{verb}-{noun}-{j}.db')
+                        index.remember(policy, scope=CWD, source_session='owner')
+                        with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                            rules, result = preflight('t3_thread_send', {'message': message}, CWD, index.path, session_id='other')
+                            self.assertEqual([policy], [r['text'] for r in rules])
+                            self.assertEqual('deny', result['decision'])
+                            model.assert_called_once()
+                        engine = CheckEngine(rules_path=index.path)
+                        for trigger in ('first_prompt', 'compaction'):
+                            self.assertEqual([policy], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=message))[0]])
+
+    def test_present_report_complements_are_not_plural_command_objects(self):
+        from recall_fact_scope import comparison_text, standing_instruction
+        changed = 'Release changes and results for PR1145 head 72a10c19 while CI checks are pending.'
+        matching = changed.replace('72a10c19', '66cfd86f')
+        predicates = ('results in a published package', 'results from a verified pipeline',
+                      'changes from pending to active')
+        for i, predicate in enumerate(predicates):
+            for anchored in (False, True):
+                anchor = ' for PR1145 head 66cfd86f' if anchored else ''
+                fact = f'After CI checks passed{anchor}, release {predicate}.'
+                with self.subTest(predicate=predicate, anchored=anchored):
+                    self.assertFalse(standing_instruction(fact))
+                    self.assertEqual('', comparison_text(fact, changed))
+                    self.assertEqual(fact if anchored else '', comparison_text(fact, matching))
+                    index = RuleIndex(self.root / f'present-complement-{i}-{anchored}.db')
+                    index.remember(fact, scope=CWD)
+                    with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                        self.assertEqual(([], None), preflight('t3_thread_send', {'message': changed}, CWD, index.path))
+                        model.assert_not_called()
+                        rules, result = preflight('t3_thread_send', {'message': matching}, CWD, index.path)
+                        self.assertEqual([fact] if anchored else [], [r['text'] for r in rules])
+                        self.assertEqual('deny' if anchored else None, result['decision'] if result else None)
+                    engine = CheckEngine(rules_path=index.path)
+                    for trigger in ('first_prompt', 'compaction'):
+                        self.assertEqual([], engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0])
+                        self.assertEqual([fact] if anchored else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
+
     def test_linked_ci_labels_keep_original_identities(self):
         from recall_fact_scope import comparison_text, ci_ids
         changed = 'PR1145 head 72a10c19 CI checks pending.'
