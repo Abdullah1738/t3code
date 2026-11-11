@@ -2041,6 +2041,11 @@ export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError"
   code: KanbanErrorCode,
   detail: Schema.String,
   reason: Schema.optionalKey(KanbanDeniedReason),
+  /**
+   * The revision an ask is at now, on the refusal of an answer that gave none
+   * (`invalid`) or an older one (`conflict`). The detail says it in words too.
+   */
+  revision: Schema.optionalKey(NonNegativeInt),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

@@ -59,6 +59,12 @@ const STATUS: Record<KanbanError["code"], number> = {
 
 const json = (body: unknown, status = 200) => jsonReply(body, status);
 
+/** What a refusal carries beside its code and message, for a client to act on without reading the words. */
+const errorExtras = (error: KanbanError) => ({
+  ...(error.reason === undefined ? {} : { reason: error.reason }),
+  ...(error.revision === undefined ? {} : { revision: error.revision }),
+});
+
 const fail = (code: KanbanError["code"], detail: string) => new KanbanError({ code, detail });
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -310,7 +316,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   error: {
                     code: error.code,
                     message: error.detail,
-                    ...(error.reason === undefined ? {} : { reason: error.reason }),
+                    ...errorExtras(error),
                   },
                 },
                 STATUS[error.code],
@@ -663,7 +669,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   card: item.card,
                   askId: item.askId,
                   ok: false as const,
-                  error: { code: error.code, message: error.detail },
+                  error: { code: error.code, message: error.detail, ...errorExtras(error) },
                 }),
             }),
           ),
@@ -763,7 +769,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
                   card: item.card,
                   askId: item.askId,
                   ok: false as const,
-                  error: { code: error.code, message: error.detail },
+                  error: { code: error.code, message: error.detail, ...errorExtras(error) },
                 }),
             }),
           ),

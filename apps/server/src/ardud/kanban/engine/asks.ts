@@ -293,7 +293,12 @@ export interface AskFieldsInput {
   readonly blocks?: ReadonlyArray<KanbanBlock> | undefined;
 }
 
-export type AskProblem = { readonly code: KanbanError["code"]; readonly detail: string };
+export type AskProblem = {
+  readonly code: KanbanError["code"];
+  readonly detail: string;
+  /** The revision the ask is at, when the answer was refused for giving none or an older one. */
+  readonly revision?: number;
+};
 const invalid = (detail: string): AskProblem => ({ code: "invalid", detail });
 const isProblem = (value: unknown): value is AskProblem =>
   typeof value === "object" && value !== null && "code" in value && "detail" in value;
@@ -1683,14 +1688,20 @@ export const answerFor = (
   const revision = kanbanAskRevision(ask);
   // Only an ask answered in words alone may be answered without saying which version was read.
   if (input.revision === undefined && !kanbanAskIsFreeText(ask)) {
-    return invalid(
-      `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
-    );
+    return {
+      ...invalid(
+        `${ref} needs the revision you are answering, so the answer can't land on a version you did not read. It is at revision ${revision}: read it as it is now, then send revision ${revision} with the answer.`,
+      ),
+      revision,
+    };
   }
   if (input.revision !== undefined && input.revision !== revision) {
-    return conflict(
-      `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
-    );
+    return {
+      ...conflict(
+        `${ref} was updated since you read it (revision ${revision}, you answered revision ${input.revision}). Read it again and answer the current one.`,
+      ),
+      revision,
+    };
   }
   if (kanbanAskExpired(ask, Date.parse(at))) {
     return conflict(
