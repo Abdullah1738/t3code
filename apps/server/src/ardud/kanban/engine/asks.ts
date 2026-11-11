@@ -2138,6 +2138,40 @@ export const alwaysText = (
   ].join("\n\n");
 
 /**
+ * The same for several asks handed in one go: one evaluator hears his words
+ * once, with the list. One ask reads exactly as `alwaysText`.
+ */
+export const alwaysManyText = (
+  entries: ReadonlyArray<{
+    readonly card: KanbanCard;
+    readonly cardRef: string;
+    readonly ask: KanbanOwnerAsk;
+  }>,
+  ownerWords: string | undefined,
+) => {
+  const [only] = entries;
+  if (entries.length === 1 && only) {
+    return alwaysText(only.card, only.cardRef, only.ask, ownerWords);
+  }
+  return [
+    `The owner handed ${entries.length} asks to the evaluator and said to do that every time for asks like them.`,
+    ownerWords?.trim() ? `His words:\n${ownerWords.trim()}` : "He added no words of his own.",
+    `The asks:\n${entries
+      .map(({ card, cardRef, ask }) =>
+        [
+          `- ${ask.id} on card ${cardRef} ("${card.title}"), kind ${kanbanAskKind(ask)}, asked by ${askerName(ask.by)}.`,
+          ask.title ? `  Title: ${ask.title}` : null,
+          `  Question: ${ask.text}`,
+        ]
+          .filter((entry) => entry !== null)
+          .join("\n"),
+      )
+      .join("\n")}`,
+    "He wants asks like these handled by the evaluator from now on and not sent to him; how to make that happen is your call. Each of these is already with its card's evaluator to decide.",
+  ].join("\n\n");
+};
+
+/**
  * An ask is with the evaluator, which decides it: the owner handed it over,
  * or (`fromOwner` false) its asker addressed it to the evaluator.
  */
