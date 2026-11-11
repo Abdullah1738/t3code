@@ -1318,40 +1318,71 @@ def codex_memory_snapshot(chome: Path) -> dict[str, str]:
     return snapshot
 
 
-CODEX_MEMORY_SOURCE = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
-CODEX_MEMORY_DATABASES = ("memories_1.sqlite", "memories_v2_1.sqlite")
-CODEX_MEMORY_MIGRATIONS = (
-    ("0001_memories.sql", "a1af50da50775a70f98da680006b7df4501956753ae98511ab727aa295915d9ae6f4190b4eaa5abc4fd7891642f7d21d"),
-    ("0002_consolidation_progress.sql", "18f0a8dd7fe9a847b30d719029066d7a78e0bc64310dc66e4f7708bad6f1a0a594c0dbd14fec1ccb410cd7ae75dd7b10"),
-)
+# Only Codex versions whose memory stores, migrations and startup gates were read in the upstream
+# source at the tagged commit. Each entry vendors that tag's codex-rs/state/memory_migrations
+# unmodified. A version is added only after diffing state/ and memories/write/src/start.rs
+# against a verified one; anything else fails closed.
+CODEX_MEMORY_VERIFIED = {
+    "0.166.0": {
+        "sourceCommit": "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856",
+        "vendor": "codex-memory-0.166.0",
+        "databases": ("memories_1.sqlite", "memories_v2_1.sqlite"),
+        "migrations": (
+            ("0001_memories.sql", "a1af50da50775a70f98da680006b7df4501956753ae98511ab727aa295915d9ae6f4190b4eaa5abc4fd7891642f7d21d"),
+            ("0002_consolidation_progress.sql", "18f0a8dd7fe9a847b30d719029066d7a78e0bc64310dc66e4f7708bad6f1a0a594c0dbd14fec1ccb410cd7ae75dd7b10"),
+        ),
+    },
+    # rust-v0.167.1: codex-rs/state is the same tree as 0.166.0 (18aa4356) and
+    # memories/write/src/start.rs the same blob (102881cf).
+    "0.167.1": {
+        "sourceCommit": "0a94398fa60c4fac0e7659e4213a0a36e613dd46",
+        "vendor": "codex-memory-0.167.1",
+        "databases": ("memories_1.sqlite", "memories_v2_1.sqlite"),
+        "migrations": (
+            ("0001_memories.sql", "a1af50da50775a70f98da680006b7df4501956753ae98511ab727aa295915d9ae6f4190b4eaa5abc4fd7891642f7d21d"),
+            ("0002_consolidation_progress.sql", "18f0a8dd7fe9a847b30d719029066d7a78e0bc64310dc66e4f7708bad6f1a0a594c0dbd14fec1ccb410cd7ae75dd7b10"),
+        ),
+    },
+}
+# Every store any verified version may create; snapshots treat all of them as SQLite stores.
+CODEX_MEMORY_DATABASES = tuple(sorted({db for spec in CODEX_MEMORY_VERIFIED.values() for db in spec["databases"]}))
+
+
+def codex_memory_spec(version: str) -> dict:
+    spec = CODEX_MEMORY_VERIFIED.get(version)
+    if spec is None:
+        raise HarnessError("Codex memory audit schema has not been verified for this version")
+    return spec
 
 
 class CodexMemoryAudit:
     """Persistent triggers cover even insert+delete between polls in the disposable stores.
 
     StateRuntime opens/migrates v1 unconditionally, even with features.memories=false.
-    Startup jobs are gated separately (Codex 0.166.0 state/src/runtime.rs and
-    memories/write/src/start.rs). A claimed job commits before extraction; cleanup may
-    delete it later, so final row counts alone are insufficient. Audit both v1 and v2.
+    Startup jobs are gated separately (state/src/runtime.rs and memories/write/src/start.rs,
+    identical in every CODEX_MEMORY_VERIFIED version). A claimed job commits before extraction;
+    cleanup may delete it later, so final row counts alone are insufficient. Audit both v1 and v2.
     """
 
     def __init__(self, chome: Path, version: str):
         import sqlite3
         from contextlib import closing
-        if version != "0.166.0":
-            raise HarnessError("Codex memory audit schema has not been verified for this version")
+        spec = codex_memory_spec(version)
         self.home = chome
+        self.version = version
+        self.source_commit = spec["sourceCommit"]
+        self.databases = spec["databases"]
         self.nonce = uuid.uuid4().hex
         self.identities = {}
         self.schemas = {}
         self.migrations = []
-        source = Path(__file__).resolve().parent / "vendor" / "codex-memory-0.166.0"
-        for name, checksum in CODEX_MEMORY_MIGRATIONS:
+        source = Path(__file__).resolve().parent / "vendor" / spec["vendor"]
+        for name, checksum in spec["migrations"]:
             sql = (source / name).read_bytes()
             if hashlib.sha384(sql).hexdigest() != checksum:
                 raise HarnessError("Codex memory audit migration checksum mismatch")
             self.migrations.append((int(name[:4]), name[5:-4].replace("_", " "), bytes.fromhex(checksum), sql.decode()))
-        for name in CODEX_MEMORY_DATABASES:
+        for name in self.databases:
             db = chome / name
             if db.exists():
                 raise HarnessError("Codex audit requires fresh disposable memory databases")
@@ -1392,7 +1423,7 @@ class CodexMemoryAudit:
         from contextlib import closing
         stores = {}
         try:
-            for name in CODEX_MEMORY_DATABASES:
+            for name in self.databases:
                 db = self.home / name
                 st = db.stat()
                 if db.is_symlink() or (st.st_dev, st.st_ino) != self.identities[name]:
@@ -1414,7 +1445,7 @@ class CodexMemoryAudit:
                                     "consolidationProgress": [list(row) for row in progress]}
         except (OSError, sqlite3.Error) as exc:
             raise HarnessError("Codex memory audit could not be inspected") from exc
-        return {"method": "sqlite-triggers-v1", "sourceCommit": CODEX_MEMORY_SOURCE,
+        return {"method": "sqlite-triggers-v1", "sourceCommit": self.source_commit,
                 "identityVerified": True, "stores": stores}
 
 
@@ -1578,8 +1609,9 @@ def run_codex_memory_probe(binary: Path, generated_home: Path, work: Path, model
                            observation_seconds: float | None = None) -> dict:
     """Run Codex against a disposable copy of a generated home, with the memory check.
 
-    Not ephemeral: Codex 0.166.0 disables the memory pipeline for ephemeral sessions, so an
-    ephemeral run proves nothing about memory. The copy lives under `work` and CODEX_HOME points
+    Not ephemeral: Codex (0.166.0 and 0.167.1, memories/write/src/start.rs) disables the
+    memory pipeline for ephemeral sessions, so an ephemeral run proves nothing about memory.
+    The copy lives under `work` and CODEX_HOME points
     at it, so nothing is written to the generator's output or any personal home.
 
     enable_memory=True turns memory ON in the copy: the positive control. The detector must fire
@@ -1901,8 +1933,8 @@ def canary(tool: str, version: str) -> dict:
         if result.get("recorderViolations", 0) or (result.get("cu") or {}).get("recorderViolations", 0):
             reasons.append("recording proxy rejected an unexpected request")
         valid = (valid_claude_canary(result) if tool == "claude" else
-                 valid_codex_canary_home(result, MODEL_CANARIES["codex"])
-                 and valid_codex_canary_home(result.get("cu"), CODEX_CU_MODELS))
+                 valid_codex_canary_home(result, MODEL_CANARIES["codex"], version)
+                 and valid_codex_canary_home(result.get("cu"), CODEX_CU_MODELS, version))
         if not valid:
             reasons.append("canary evidence is incomplete or inconsistent")
     except HarnessError as exc:
@@ -2078,7 +2110,7 @@ def rollback(tool: str) -> dict:
     return {"tool": tool, "version": target, "previous": previous}
 
 
-def valid_codex_canary_home(body, models: list[str]) -> bool:
+def valid_codex_canary_home(body, models: list[str], version: str) -> bool:
     if not isinstance(body, dict):
         return False
     if any(body.get(k) is not True for k in ("memoryCanaryChecked", "positiveControlFired",
@@ -2092,8 +2124,8 @@ def valid_codex_canary_home(body, models: list[str]) -> bool:
     evidence = body.get("positiveControlEvidence")
     if not isinstance(evidence, list) or "memories_1.sqlite:stage1_outputs:content" not in evidence:
         return False
-    if not valid_codex_memory_audit(body.get("memoryAudit"), clean=True) \
-            or not valid_codex_memory_audit(body.get("positiveControlAudit"), clean=False):
+    if not valid_codex_memory_audit(body.get("memoryAudit"), version=version, clean=True) \
+            or not valid_codex_memory_audit(body.get("positiveControlAudit"), version=version, clean=False):
         return False
     window, elapsed, observed = (body.get("observationWindowSeconds"), body.get("positiveElapsedSeconds"),
                                  body.get("observedSeconds"))
@@ -2118,12 +2150,13 @@ def valid_codex_canary_home(body, models: list[str]) -> bool:
             for model in models))
 
 
-def valid_codex_memory_audit(audit, *, clean: bool) -> bool:
-    if not isinstance(audit, dict) or audit.get("method") != "sqlite-triggers-v1" \
-            or audit.get("sourceCommit") != CODEX_MEMORY_SOURCE or audit.get("identityVerified") is not True:
+def valid_codex_memory_audit(audit, *, version: str, clean: bool) -> bool:
+    spec = CODEX_MEMORY_VERIFIED.get(version)
+    if spec is None or not isinstance(audit, dict) or audit.get("method") != "sqlite-triggers-v1" \
+            or audit.get("sourceCommit") != spec["sourceCommit"] or audit.get("identityVerified") is not True:
         return False
     stores = audit.get("stores")
-    if not isinstance(stores, dict) or set(stores) != set(CODEX_MEMORY_DATABASES):
+    if not isinstance(stores, dict) or set(stores) != set(spec["databases"]):
         return False
     for store in stores.values():
         if not isinstance(store, dict):
@@ -2195,8 +2228,8 @@ def latest_canary(tool: str, version: str) -> dict | None:
     if tool == "claude":
         checks_ok = valid_claude_canary(canary_body)
     else:
-        checks_ok = (valid_codex_canary_home(canary_body, MODEL_CANARIES["codex"])
-                     and valid_codex_canary_home(canary_body.get("cu"), CODEX_CU_MODELS))
+        checks_ok = (valid_codex_canary_home(canary_body, MODEL_CANARIES["codex"], version)
+                     and valid_codex_canary_home(canary_body.get("cu"), CODEX_CU_MODELS, version))
     passed = (found.get("canarySchemaVersion") == CANARY_SCHEMA_VERSION
               and found.get("result") == "passed" and not found.get("reasons") and memory_ok and checks_ok
               and not canary_body.get("recorderViolations")
