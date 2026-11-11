@@ -30,6 +30,7 @@ import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import { OrchestratorProjectionError } from "../../../orchestration-v2/Orchestrator.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerConfig from "../../../config.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -101,6 +102,9 @@ const fakeThreads = (
   const running = new Set<string>();
   const rejectSends = new Set<string>();
   const parents = new Map<ThreadId, ThreadId>();
+  const missing = new Set<ThreadId>();
+  const deleted = new Set<ThreadId>();
+  const unreadable = new Set<ThreadId>();
   let launched = 0;
   const launches: Array<string> = [];
   const views: Array<string> = [];
@@ -229,10 +233,15 @@ const fakeThreads = (
     Layer.provideMerge(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: (threadId) => {
+          if (unreadable.has(threadId)) {
+            return Effect.fail(new OrchestratorProjectionError({ threadId }));
+          }
+          if (missing.has(threadId)) return Effect.succeed(null);
           const parentThreadId = parents.get(threadId) ?? null;
           const shell = liveThreadShell(threadId);
           return Effect.succeed({
             ...shell,
+            deletedAt: deleted.has(threadId) ? shell.updatedAt : null,
             lineage: {
               ...shell.lineage,
               parentThreadId,
@@ -252,7 +261,18 @@ const fakeThreads = (
     Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
     Layer.provideMerge(boardFilesLayer),
   );
-  return { running, launches, parents, views, viewControl, rejectSends, layer };
+  return {
+    running,
+    launches,
+    parents,
+    missing,
+    deleted,
+    unreadable,
+    views,
+    viewControl,
+    rejectSends,
+    layer,
+  };
 };
 
 const owner: KanbanActor = { _tag: "owner" };
@@ -839,6 +859,239 @@ it.effect("board_open gives a board its icon only while it has none", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("board helpers resolve delegated ancestry without widening role-bound tools", () => {
+  const { layer, parents, missing, deleted, unreadable } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const boardA = yield* kanban.ensureBoard({
+      slug: "first",
+      name: "First",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(boardA.id, boardA.defaultCardModel, 1);
+    const cardA = yield* kanban.createCard(boardA.id, { prompt: "First card" }, owner);
+    yield* kanban.dispatchNow;
+    const workerA = (yield* kanban.card(cardA.id)).card.activeThreadId!;
+    assert.isNotNull(workerA);
+    const boardB = yield* kanban.ensureBoard({
+      slug: "second",
+      name: "Second",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(boardB.id, boardB.defaultCardModel, 1);
+    const cardB = yield* kanban.createCard(boardB.id, { prompt: "Second card" }, owner);
+    yield* kanban.dispatchNow;
+    const workerB = (yield* kanban.card(cardB.id)).card.activeThreadId!;
+    assert.isNotNull(workerB);
+    const pageA = yield* kanban.writeWiki(boardA.id, { slug: "a", title: "A", body: "A" }, owner);
+    const pageB = yield* kanban.writeWiki(boardB.id, { slug: "b", title: "B", body: "B" }, owner);
+    const child = ThreadId.make("first-child");
+    const grandchild = ThreadId.make("first-grandchild");
+    const root = ThreadId.make("linkless-root");
+    parents.set(child, workerA);
+    parents.set(grandchild, child);
+    const delegated = ThreadId.make(
+      "thread:delegated-task:command%3Amcp%3A471%3Adelegate-task%3Aread-board",
+    );
+    parents.set(delegated, workerA);
+
+    for (const thread of [child, grandchild, delegated]) {
+      const wiki = yield* call(thread, "wiki_read", {});
+      assert.isFalse(wiki.isError, wiki.text);
+      assert.deepStrictEqual(wiki.structured.pages, [pageA]);
+      const board = yield* call(thread, "board_get", {});
+      assert.isFalse(board.isError, board.text);
+      assert.strictEqual((board.structured.board as { board: { id: string } }).board.id, boardA.id);
+      const search = yield* call(thread, "card_search", { query: "First" });
+      assert.isFalse(search.isError, search.text);
+      assert.strictEqual(search.structured.total, 1);
+      const byNumber = yield* call(thread, "card_get", { card: `#${cardA.number}` });
+      assert.isFalse(byNumber.isError, byNumber.text);
+      assert.strictEqual((byNumber.structured.card as { id: string }).id, cardA.id);
+      const discussion = yield* call(thread, "discussion_read", { card: `#${cardA.number}` });
+      assert.isFalse(discussion.isError, discussion.text);
+      assert.strictEqual((discussion.structured.discussion as { cardId: string }).cardId, cardA.id);
+      const noDefault = yield* call(thread, "card_get", {});
+      assert.isTrue(noDefault.isError);
+      assert.include(noDefault.text, "this thread has no card of its own");
+      const create = yield* call(thread, "card_create", { prompt: "No implicit write" });
+      assert.isTrue(create.isError);
+      assert.include(create.text, "Pass boardId: this thread and its parents are not on a board.");
+      const post = yield* call(thread, "discussion_post", {
+        card: `#${cardA.number}`,
+        text: `Report from ${thread}`,
+      });
+      assert.isFalse(post.isError, post.text);
+      const message = post.structured.message as { discussionId: string; author: unknown };
+      const byId = yield* call(thread, "discussion_post", {
+        discussionId: message.discussionId,
+        text: `Report by discussion id from ${thread}`,
+      });
+      assert.isFalse(byId.isError, byId.text);
+      assert.deepStrictEqual(
+        (byId.structured.message as { author: unknown }).author,
+        message.author,
+      );
+      assert.strictEqual(message.discussionId, (yield* kanban.card(cardA.id)).card.discussionId);
+      for (const input of [{}, { boardId: boardA.id }]) {
+        const update = yield* call(thread, "card_update", {
+          card: `#${cardA.number}`,
+          comment: "Denied",
+          ...input,
+        });
+        const subtask = yield* call(thread, "subtask_done", {
+          card: `#${cardA.number}`,
+          subtask: "s1",
+          state: "done",
+          ...input,
+        });
+        for (const denied of [update, subtask]) {
+          assert.isTrue(denied.isError);
+          assert.include(
+            denied.text,
+            `Pass boardId: this thread and its parents are not on a board (card #${cardA.number} needs a board)`,
+          );
+        }
+      }
+      const noDiscussion = yield* call(thread, "discussion_post", { text: "No default" });
+      assert.isTrue(noDiscussion.isError);
+      assert.include(
+        noDiscussion.text,
+        "Pass discussionId: this thread has no discussion of its own.",
+      );
+      assert.isNull(yield* kanban.caller(thread));
+      const write = yield* call(thread, "wiki_write", { slug: "no", title: "No", body: "No" });
+      assert.isTrue(write.isError);
+      assert.include(write.text, "Pass boardId: this thread and its parents are not on a board.");
+      const deniedPause = yield* call(thread, "board_pause", { boardId: "first", clear: true });
+      assert.isTrue(deniedPause.isError);
+      assert.include(deniedPause.text, "Only evaluators");
+    }
+    const evaluator = yield* kanban.startEvaluator(boardA.id, {
+      kind: "request",
+      text: "Read cards",
+    });
+    const evaluatorChild = ThreadId.make("evaluator-child");
+    parents.set(evaluatorChild, evaluator);
+    const evaluatorCard = yield* call(evaluatorChild, "card_get", { card: `#${cardA.number}` });
+    assert.isFalse(evaluatorCard.isError, evaluatorCard.text);
+    assert.strictEqual((evaluatorCard.structured.card as { id: string }).id, cardA.id);
+    const evaluatorPost = yield* call(evaluatorChild, "discussion_post", {
+      card: `#${cardA.number}`,
+      text: "Evaluator helper report",
+    });
+    assert.isFalse(evaluatorPost.isError, evaluatorPost.text);
+    assert.strictEqual(
+      (evaluatorPost.structured.message as { discussionId: string }).discussionId,
+      (yield* kanban.card(cardA.id)).card.discussionId,
+    );
+
+    for (const boardId of [boardB.slug, boardB.id]) {
+      for (const card of [`#${cardB.number}`, `${cardB.number}`, ` #${cardB.number} `]) {
+        const explicitCard = yield* call(root, "card_get", { card, boardId });
+        assert.isFalse(explicitCard.isError, explicitCard.text);
+        assert.strictEqual((explicitCard.structured.card as { id: string }).id, cardB.id);
+        const explicitPost = yield* call(root, "discussion_post", {
+          card,
+          boardId,
+          text: `Explicit ${boardId} ${card}`,
+        });
+        assert.isFalse(explicitPost.isError, explicitPost.text);
+        const explicitRead = yield* call(root, "discussion_read", { card, boardId });
+        assert.isFalse(explicitRead.isError, explicitRead.text);
+        assert.strictEqual(
+          (explicitRead.structured.discussion as { cardId: string }).cardId,
+          cardB.id,
+        );
+      }
+    }
+    const idIgnoresBoard = yield* call(child, "card_get", {
+      card: cardB.id,
+      boardId: "does-not-exist",
+    });
+    assert.isFalse(idIgnoresBoard.isError, idIgnoresBoard.text);
+    assert.strictEqual((idIgnoresBoard.structured.card as { id: string }).id, cardB.id);
+    const noNumberBoard = yield* call(root, "card_get", { card: `#${cardA.number}` });
+    assert.isTrue(noNumberBoard.isError);
+    assert.include(
+      noNumberBoard.text,
+      `Pass boardId: this thread and its parents are not on a board (card #${cardA.number} needs a board)`,
+    );
+
+    for (const thread of [root, workerA, child]) {
+      const explicit = yield* call(thread, "wiki_read", { boardId: "second" });
+      assert.isFalse(explicit.isError, explicit.text);
+      assert.deepStrictEqual(explicit.structured.pages, [pageB]);
+    }
+    const filtered = yield* call(child, "wiki_read", { boardId: boardB.id, slug: "a" });
+    assert.isFalse(filtered.isError, filtered.text);
+    assert.deepStrictEqual(filtered.structured.pages, []);
+    const unknown = yield* call(child, "wiki_read", { boardId: "not-a-board" });
+    assert.isTrue(unknown.isError);
+    assert.include(unknown.text, "No Missions board");
+    assert.include(unknown.text, "not-a-board");
+    const noBoard = yield* call(root, "wiki_read", {});
+    assert.isTrue(noBoard.isError);
+    assert.include(noBoard.text, "Pass boardId: this thread and its parents are not on a board.");
+
+    // The nearer linked board wins even if that thread itself has a linked parent.
+    parents.set(workerB, workerA);
+    const nested = ThreadId.make("second-child");
+    parents.set(nested, workerB);
+    const nearest = yield* call(nested, "wiki_read", {});
+    assert.isFalse(nearest.isError, nearest.text);
+    assert.deepStrictEqual(nearest.structured.pages, [pageB]);
+
+    for (const [kind, broken] of [
+      ["missing", missing],
+      ["deleted", deleted],
+      ["unreadable", unreadable],
+    ] as const) {
+      const parent = ThreadId.make(`${kind}-parent`);
+      const descendant = ThreadId.make(`${kind}-child`);
+      parents.set(descendant, parent);
+      broken.add(parent);
+      const result = yield* call(descendant, "wiki_read", {});
+      assert.isTrue(result.isError);
+      assert.include(result.text, "Pass boardId: this thread and its parents are not on a board.");
+    }
+    const cycleA = ThreadId.make("cycle-a");
+    const cycleB = ThreadId.make("cycle-b");
+    parents.set(cycleA, cycleB);
+    parents.set(cycleB, cycleA);
+    const cycleResult = yield* call(cycleA, "wiki_read", {});
+    assert.isTrue(cycleResult.isError);
+    assert.include(
+      cycleResult.text,
+      "Pass boardId: this thread and its parents are not on a board.",
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("an unreadable ancestry still falls back to the only open board", () => {
+  const { layer, parents, unreadable } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "only",
+      name: "Only",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const page = yield* kanban.writeWiki(
+      board.id,
+      { slug: "one", title: "One", body: "One" },
+      owner,
+    );
+    const parent = ThreadId.make("unreadable-parent");
+    const child = ThreadId.make("unreadable-child");
+    parents.set(child, parent);
+    unreadable.add(parent);
+    const result = yield* call(child, "wiki_read", {});
+    assert.isFalse(result.isError, result.text);
+    assert.deepStrictEqual(result.structured.pages, [page]);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("board_pause is evaluator-only and resolves kept numbers on the selected board", () => {
   const { layer, parents } = fakeThreads();
   return Effect.gen(function* () {
@@ -887,6 +1140,19 @@ it.effect("board_pause is evaluator-only and resolves kept numbers on the select
       name: "Other",
       defaultProjectId: ProjectId.make("project-1"),
     });
+    const reviewChild = ThreadId.make("review-helper");
+    parents.set(reviewChild, reviewer);
+    const page = yield* kanban.writeWiki(
+      board.id,
+      { slug: "review", title: "Review", body: "Read only review rules" },
+      owner,
+    );
+    const reviewWiki = yield* call(reviewChild, "wiki_read", {});
+    assert.isFalse(reviewWiki.isError, reviewWiki.text);
+    assert.deepStrictEqual(reviewWiki.structured.pages, [page]);
+    const reviewCard = yield* call(reviewChild, "card_get", { card: `#${workerCard.number}` });
+    assert.isFalse(reviewCard.isError, reviewCard.text);
+    assert.strictEqual((reviewCard.structured.card as { id: string }).id, workerCard.id);
     const keep = yield* kanban.createCard(other.id, { prompt: "Keep" }, owner);
     const evaluator = ThreadId.make("thread-evaluator");
     const paused = yield* call(evaluator, "board_pause", {

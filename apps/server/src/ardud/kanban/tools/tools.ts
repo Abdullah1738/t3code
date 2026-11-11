@@ -42,6 +42,13 @@ const CardRef = describe(
   'Card id or number ("#12" or "12"). Defaults to your own card when you are a card thread carrying one card.',
 );
 
+const BoardRef = Schema.optional(
+  describe(
+    TrimmedNonEmptyString,
+    "Board id or slug; defaults to this thread's board, or its parent's for a delegated child",
+  ),
+);
+
 const ModelInputFields = {
   model: describe(
     TrimmedNonEmptyString,
@@ -158,7 +165,7 @@ const BoardGet = tool(
   "Read the board",
   "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. Threads outside a board pass boardId.",
   {
-    boardId: Schema.optional(TrimmedNonEmptyString),
+    boardId: BoardRef,
     after: Schema.optional(
       describe(NonNegativeInt, "Cards numbered after this cursor (default 0)."),
     ),
@@ -173,7 +180,7 @@ const CardSearch = tool(
   "Search cards",
   "Find cards on a board by words in their title, description, prompt or links, or by #number. Settled cards are left out unless includeSettled. Returns short rows, newest first; read one in full with card_get.",
   {
-    boardId: Schema.optional(TrimmedNonEmptyString),
+    boardId: BoardRef,
     query: describe(Schema.String, "Words to match (all of them), or #12. Empty lists every card."),
     stage: Schema.optional(KanbanStage),
     includeSettled: Schema.optional(Schema.Boolean),
@@ -187,7 +194,7 @@ const CardGet = tool(
   "card_get",
   "Read a card",
   "One card with its history (moves, edits, comments, review verdicts) and every thread it has had.",
-  { card: Schema.optional(CardRef) },
+  { card: Schema.optional(CardRef), boardId: BoardRef },
   { card: Record, events: Records, threads: Records },
   { readonly: true },
 );
@@ -295,6 +302,7 @@ const DiscussionPost = tool(
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
+    boardId: BoardRef,
     ...BlocksInput,
   },
   { message: Record },
@@ -308,6 +316,7 @@ const DiscussionRead = tool(
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     card: Schema.optional(CardRef),
+    boardId: BoardRef,
     afterSeq: Schema.optional(NonNegativeInt),
     beforeSeq: Schema.optional(NonNegativeInt),
     seq: Schema.optional(describe(PositiveInt, "Read only this message, in full.")),
@@ -330,7 +339,10 @@ const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
   "The board's shared lessons. Without slug: every page.",
-  { slug: Schema.optional(TrimmedNonEmptyString) },
+  {
+    slug: Schema.optional(TrimmedNonEmptyString),
+    boardId: BoardRef,
+  },
   { pages: Records },
   { readonly: true },
 );
