@@ -5,7 +5,7 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, now, say)
 from .identity import thread_get
 
@@ -112,7 +112,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     except OffboxError as e:
         return [f"boat list failed: {e}"]
 
-    def act(box_id, what, why, fn):
+    def act(box_id, what, why, fn, expected=None):
         line = f"{'would ' if dry else ''}{what} {box_id}: {why}"
         actions.append(line)
         if not dry:
@@ -123,6 +123,16 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                         return
                     if lease.active_runs(con, box_id):
                         actions[-1] += ' (busy; skipped)'
+                        return
+                    current = con.execute('SELECT * FROM leases WHERE box_id=?', (box_id,)).fetchone()
+                    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+                        if what == 'stop':
+                            lease.stop_box(con, box_id, 'reap: box-wedged', images=False, locked=True)
+                        actions[-1] += ' (set aside; stale action skipped)'
+                        return
+                    if expected is not None and (not current or any(current[k] != expected[k] for k in
+                            ('last_used_at', 'created_at', 'pinned_until', 'thread_gone_since'))):
+                        actions[-1] += ' (lease changed; stale action skipped)'
                         return
                     fn()
             except OffboxError as e:
@@ -175,6 +185,16 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if running_runs:
             _check_stale_runs(con, bid, state, dry, actions)
             running_runs = lease.active_runs(con, bid)
+            # Failed history reconciliation must not be overwritten by release_if_confirmed's generic lost update.
+            if running_runs:
+                continue
+        # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
+        note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
+        if note.startswith(BOX_WEDGED_NOTE):
+            if not running_runs and state in api.LIVE_STATES:
+                act(bid, 'stop', 'set aside: box-wedged',
+                    lambda bid=bid: lease.stop_box(con, bid, 'reap: box-wedged', images=False, locked=True))
+            continue
         idle = now() - (r["last_used_at"] or r["created_at"] or now())
         docker = lease.docker_recent(con, bid)
         idle_limit = capacity.idle_seconds(r["size"], snap, docker=docker)
@@ -205,23 +225,23 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             continue
         if gone_since and now() - gone_since > ARCHIVED_DELETE_S and not pinned:
             act(bid, "delete", f"thread archived {round((now() - gone_since) / 86400, 1)}d",
-                lambda bid=bid: lease.delete_box(con, bid, "reap: thread archived 7d"))
+                lambda bid=bid: lease.delete_box(con, bid, "reap: thread archived 7d"), expected=r)
             continue
         if idle > UNUSED_DELETE_S and not pinned:
             act(bid, "delete", f"unused {round(idle / 86400, 1)}d, not pinned",
-                lambda bid=bid: lease.delete_box(con, bid, "reap: unused 30d"))
+                lambda bid=bid: lease.delete_box(con, bid, "reap: unused 30d"), expected=r)
             continue
         if state in api.LIVE_STATES and idle <= idle_limit and not dry and not running_runs:
             # Docker boxes get boat-ttl grace so this reaper's stop (which archives images first) wins.
             lease.ensure_ttl(bid, max(60, int(idle_limit-idle)) + (300 if docker else 0), b)
         if state in api.LIVE_STATES and idle > idle_limit:
             act(bid, "stop", f"idle {int(idle // 60)}m",
-                lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True))  # act() holds box-<id>
+                lambda bid=bid: lease.stop_box(con, bid, "reap: idle", locked=True), expected=r)  # act() holds box-<id>
         stopped = iso_ts(b.get("stoppedAt"))
         if pinned and state in api.STOPPED_STATES and stopped and now() - stopped > KEEPALIVE_S and refreshes < 2:
             refreshes += 1
             act(bid, "refresh", f"pinned, stopped {round((now() - stopped) / 86400, 1)}d",
-                lambda bid=bid: lease.refresh_box(con, bid))
+                lambda bid=bid: lease.refresh_box(con, bid), expected=r)
     # Boxes whose recipe was cancelled (lease._retire_recipe_box) and whose delete failed then: delete them now.
     # 'bringing_up' rows are left behind by a bring-up that never finished (Ctrl-C, SIGTERM, a tool timeout): the
     # recipe cannot be trusted, so the box is retired like a quarantined one.
@@ -283,6 +303,13 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
             continue
         if state in api.STOPPED_STATES or state in ('error','cancelled'):
             status = "lost"
+            if run['command_id']:
+                # Process status can disappear on stop; retained history survives it without resuming the box.
+                try:
+                    st = api.cmd_status(bid, run['process_id']) if run['process_id'] else None
+                    code = st.get('exitCode') if st else None
+                except OffboxError:
+                    continue
         elif state not in api.LIVE_STATES:
             continue
         elif run["process_id"]:
@@ -306,8 +333,19 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
         elif now() - (run["start_at"] or 0) > 3600:
             status = "infra"
         if status:
+            if code is None and run['command_id']:
+                try:
+                    code = (api.history_get(bid, run['command_id']) or {}).get('exitCode')
+                except OffboxError:
+                    continue
             actions.append(f"{'would mark' if dry else 'mark'} run {run['run_id']} {status}")
             if not dry:
+                if code == 97:
+                    from .runs import settle_box_wedged, wedged_message
+                    wedged = settle_box_wedged(con, run, code)
+                    if wedged:
+                        actions.append(wedged_message(bid, *wedged))
+                        continue
                 if run['mode'] == 'bg' and status in ('done','failed') and run['pulls']:
                     import json
                     from .runs import do_pulls
@@ -315,6 +353,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) ->
                 con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=?",
                             (status, code, now(), run["run_id"]))
                 con.commit()
+                from .misc import _catch_up_finished
+                _catch_up_finished(con, run['run_id'])
                 event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
                 if state in api.LIVE_STATES:
                     from .runs import settle_docker

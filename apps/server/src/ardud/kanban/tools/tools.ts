@@ -218,7 +218,7 @@ const CardMove = tool(
       describe(Schema.String, "Required for needs_owner: what the owner must decide."),
     ),
   },
-  { card: Record },
+  { card: Record, message: Schema.optional(Schema.String) },
   { readonly: false },
 );
 

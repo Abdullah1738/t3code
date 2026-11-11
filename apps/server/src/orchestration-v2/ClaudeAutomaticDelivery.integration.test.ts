@@ -1,3 +1,4 @@
+import * as TestClock from "effect/testing/TestClock";
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -484,4 +485,375 @@ it.effect.each(deliveries)(
         ),
       ),
     ),
+);
+
+it.effect.each([false, true])(
+  "resumes a transient delegated child once (second failure: %s)",
+  (failAgain) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("claude-delegated-recovery");
+        const queues = new Map<string, Queue.Queue<SDKMessage>>();
+        const offers: Array<{ session: string; message: SDKUserMessage }> = [];
+        let sessionOrdinal = 0;
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: modelSelection.instanceId,
+          settings,
+          environment: {},
+          attachmentsDir: cwd,
+          fileSystem: yield* FileSystem.FileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
+          queryRunner: {
+            allocateSessionId: Effect.sync(() => `recovery-session-${++sessionOrdinal}`),
+            open: (input) =>
+              Effect.gen(function* () {
+                const session = input.options.resume ?? input.options.sessionId!;
+                const queue = yield* Queue.unbounded<SDKMessage>();
+                queues.set(session, queue);
+                return {
+                  messages: Stream.fromQueue(queue),
+                  offer: (message: SDKUserMessage) =>
+                    Effect.sync(() => {
+                      offers.push({ session, message });
+                    }),
+                  setModel: () => Effect.void,
+                  applyFlagSettings: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  backgroundTasks: () => Effect.succeed(false),
+                  stopTask: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const parentId = ThreadId.make("thread:recovery-parent");
+          const watch = (predicate: (event: OrchestrationV2DomainEvent) => boolean) =>
+            orchestrator.streamDomainEvents.pipe(
+              Stream.filter(predicate),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("recovery-create"),
+            threadId: parentId,
+            projectId: ProjectId.make("project:recovery"),
+            title: "Recovery",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            worktreePath: cwd,
+            branch: null,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("recovery-parent-start"),
+            threadId: parentId,
+            messageId: MessageId.make("recovery-parent-start"),
+            text: "Delegate work",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* worker.drain();
+          const parent = (yield* orchestrator.getThreadProjection(parentId)).runs[0]!;
+          yield* orchestrator.dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make("recovery-child"),
+            parentThreadId: parentId,
+            parentRunId: parent.id,
+            parentNodeId: parent.rootNodeId!,
+            task: "Write the file",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          yield* worker.drain();
+          const task = (yield* orchestrator.getThreadProjection(parentId)).subagents[0]!;
+          const childId = task.childThreadId!;
+          const before = yield* orchestrator.getThreadProjection(childId);
+          const nativeId = before.providerThreads[0]!.nativeThreadRef!.nativeId;
+          if (nativeId === null) return yield* Effect.die("child has no native session");
+          const queue = queues.get(nativeId)!;
+          const recovering = yield* watch(
+            (event) =>
+              event.threadId === childId &&
+              event.type === "run.updated" &&
+              event.payload.transientRecovery !== undefined,
+          );
+          yield* Queue.offer(
+            queue,
+            frame({
+              ...result("exhausted-first", false),
+              session_id: nativeId,
+              is_error: true,
+              terminal_reason: "api_error",
+              api_error_status: 529,
+              result: "API Error: 529 overloaded_error",
+            }),
+          );
+          yield* Fiber.join(recovering);
+          const draining = yield* worker.drain().pipe(Effect.forkScoped);
+          yield* TestClock.adjust(1000);
+          yield* Fiber.join(draining);
+          const resumed = yield* orchestrator.getThreadProjection(childId);
+          assert.equal(resumed.providerThreads[0]?.nativeThreadRef?.nativeId, nativeId);
+          assert.deepEqual(resumed.runs[0]?.modelSelection, before.runs[0]?.modelSelection);
+          assert.lengthOf(resumed.attempts, 2);
+          assert.lengthOf(
+            offers.filter((offer) => offer.session === nativeId),
+            2,
+          );
+          const terminal = yield* watch(
+            (event) =>
+              event.threadId === childId &&
+              event.type === "run.updated" &&
+              event.payload.status === (failAgain ? "failed" : "waiting"),
+          );
+          yield* Queue.offer(
+            queue,
+            frame({
+              ...result("resumed-result", false),
+              session_id: nativeId,
+              ...(failAgain
+                ? {
+                    is_error: true,
+                    terminal_reason: "api_error",
+                    api_error_status: 502,
+                    result: "API Error: 502 connection reset",
+                  }
+                : {}),
+            }),
+          );
+          yield* Fiber.join(terminal);
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadProjection(childId);
+          assert.lengthOf(after.attempts, 2);
+          assert.lengthOf(
+            offers.filter((offer) => offer.session === nativeId),
+            2,
+          );
+          if (failAgain) {
+            const failure = after.turnItems
+              .filter((item) => item.type === "error")
+              .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+            assert.include(
+              failure?.type === "error" ? failure.failure.message : "",
+              "First error:",
+            );
+            assert.include(failure?.type === "error" ? failure.failure.message : "", "502");
+          } else assert.equal(after.runs[0]?.status, "completed");
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: "claude-delegated-recovery" },
+              ProviderAdapterRegistry.layerSingle(adapter),
+              { runEffectWorker: false },
+            ),
+          ),
+        );
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+);
+
+it.effect("restarts a running Claude delegated child with interrupt and next-turn delivery", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const cwd = yield* checkpointWorkspace("claude-child-restart");
+      const offers: Array<{ session: string; message: SDKUserMessage }> = [];
+      const interrupted: string[] = [];
+      let sessionOrdinal = 0;
+      const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+        instanceId: modelSelection.instanceId,
+        settings,
+        environment: {},
+        attachmentsDir: cwd,
+        fileSystem: yield* FileSystem.FileSystem,
+        path: yield* Path.Path,
+        crypto: yield* Crypto.Crypto,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        queryRunner: {
+          allocateSessionId: Effect.sync(() => `restart-session-${++sessionOrdinal}`),
+          open: (input) =>
+            Effect.gen(function* () {
+              const session = input.options.resume ?? input.options.sessionId!;
+              const messages = yield* Queue.unbounded<SDKMessage>();
+              return {
+                messages: Stream.fromQueue(messages),
+                offer: (message: SDKUserMessage) =>
+                  Effect.sync(() => {
+                    offers.push({ session, message });
+                  }),
+                setModel: () => Effect.void,
+                applyFlagSettings: () => Effect.void,
+                setPermissionMode: () => Effect.void,
+                backgroundTasks: () => Effect.succeed(false),
+                stopTask: () => Effect.void,
+                interrupt: Effect.sync(() => {
+                  interrupted.push(session);
+                }),
+                close: Queue.shutdown(messages),
+              };
+            }),
+          forkSession: () => Effect.die("unused"),
+          subagentLaunchToolUseId: () => Effect.succeed(null),
+          assertComplete: Effect.void,
+        },
+      });
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const projectId = ProjectId.make("project:claude-child-restart");
+        const parentId = ThreadId.make("thread:claude-child-restart-parent");
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("restart-parent-create"),
+          threadId: parentId,
+          projectId,
+          title: "Restart parent",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          worktreePath: cwd,
+          branch: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("restart-parent-start"),
+          threadId: parentId,
+          messageId: MessageId.make("restart-parent-start"),
+          text: "Delegate work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* worker.drain();
+        const parent = (yield* orchestrator.getThreadProjection(parentId)).runs[0]!;
+        const childRunning = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId.startsWith("thread:delegated-task:") &&
+              event.type === "provider-turn.updated" &&
+              event.payload.status === "running",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* orchestrator.dispatch({
+          type: "delegated_task.request",
+          commandId: CommandId.make("restart-child"),
+          parentThreadId: parentId,
+          parentRunId: parent.id,
+          parentNodeId: parent.rootNodeId!,
+          task: "Write the file",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        yield* worker.drain();
+        yield* Fiber.join(childRunning);
+        const task = (yield* orchestrator.getThreadProjection(parentId)).subagents[0]!;
+        const threadId = task.childThreadId!;
+        assert.include(threadId, "thread:delegated-task:");
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const activeRun = before.runs[0]!;
+        assert.equal(activeRun.status, "running");
+        const providerThread = before.providerThreads.find(
+          (t) => t.id === activeRun.providerThreadId,
+        )!;
+        const session = before.providerSessions.find(
+          (s) => s.id === providerThread.providerSessionId,
+        )!;
+        assert.equal(session.capabilities.turns.supportsInterrupt, true);
+        assert.equal(session.capabilities.turns.supportsSteeringByInterruptRestart, false);
+        const input = {
+          projectId,
+          threadId,
+          senderThreadId: parentId,
+          commandId: CommandId.make("restart-child-send"),
+          messageId: MessageId.make("restart-child-send"),
+          text: "Use the corrected facts",
+          attachments: [],
+          mode: "restart" as const,
+          createdBy: "agent" as const,
+          creationSource: "mcp" as const,
+        };
+        const sent = yield* service.sendToThread(input);
+        assert.equal(sent.delivery, "restarted");
+        yield* worker.drain();
+        yield* orchestrator.resumeQueuedRuns;
+        yield* worker.drain();
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(after.runs.find((r) => r.id === activeRun.id)?.status, "interrupted");
+        assert.lengthOf(after.runs, 2);
+        const next = after.runs.find((r) => r.id === sent.run.id)!;
+        assert.notEqual(next.id, activeRun.id);
+        assert.equal(next.status, "running");
+        assert.lengthOf(interrupted, 1);
+        assert.equal(interrupted[0], providerThread.nativeThreadRef?.nativeId);
+        const childOffers = offers.filter((o) => o.session === interrupted[0]);
+        assert.lengthOf(childOffers, 2);
+        assert.include(JSON.stringify(childOffers[1]!.message.message.content), input.text);
+        assert.lengthOf(
+          after.messages.filter((m) => m.id === input.messageId),
+          1,
+        );
+        const replay = yield* service.sendToThread(input);
+        assert.equal(replay.delivery, "restarted");
+        assert.equal(replay.run.id, next.id);
+        yield* worker.drain();
+        assert.lengthOf(interrupted, 1);
+        assert.lengthOf(
+          offers.filter((o) => o.session === interrupted[0]),
+          2,
+        );
+      }).pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                ProviderReplayHarness.layerWithRegistry(
+                  { name: "claude-child-restart" },
+                  ProviderAdapterRegistry.layerSingle(adapter),
+                  { runEffectWorker: false },
+                ),
+                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+                ServerSettings.layerTest(),
+              ),
+            ),
+          ),
+        ),
+      );
+    }),
+  ).pipe(
+    Effect.provide(
+      Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+    ),
+  ),
 );

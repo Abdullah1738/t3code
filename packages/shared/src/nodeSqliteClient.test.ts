@@ -494,6 +494,28 @@ it.effect("labels only the span of the statement or transaction that took the lo
   );
 });
 
+it.effect("keeps identity reads read-only and preserves an enclosing writer transaction", () =>
+  withReaderClient((sql) =>
+    Effect.gen(function* () {
+      const startedBefore = startedWorkers.length;
+      assert.equal(yield* countEntries(sql).pipe(SqliteClient.identityReadOnly), 1);
+      const error = yield* sql`INSERT INTO entries VALUES ('refused')`.pipe(
+        SqliteClient.identityReadOnly,
+        Effect.flip,
+      );
+      assert.equal(error._tag, "SqlError");
+      assert.equal(yield* countEntries(sql).pipe(SqliteClient.identityReadOnly), 1);
+      assert.equal(startedWorkers.length, startedBefore + 1);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO entries VALUES ('committed')`;
+          assert.equal(yield* countEntries(sql).pipe(SqliteClient.identityReadOnly), 2);
+        }),
+      );
+    }),
+  ),
+);
+
 it.effect("keeps large parameters off the reader worker's cached statements", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

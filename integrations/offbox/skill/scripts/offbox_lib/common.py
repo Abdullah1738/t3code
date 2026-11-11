@@ -49,6 +49,7 @@ SIZES = ("small", "default", "large", "xlarge")
 TEMPLATES = ("crpko-go", "crpko-node", "crpko-harness", "generic")
 TOO_BIG_NOTE = "too-big:"        # leases.note prefix: a stopped box whose disk outgrew its machine size
 DEAD_MOUNT_NOTE = "dead-mount:"  # leases.note prefix: a box whose home filesystem died (ENOTCONN); stopped, out of the pool
+BOX_WEDGED_NOTE = "box-wedged:"
 
 
 def now() -> float:

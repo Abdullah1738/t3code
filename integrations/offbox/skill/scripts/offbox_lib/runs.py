@@ -100,15 +100,58 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
             + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
             .replace('@RECIPE@', base64.b64encode(recipe.read_bytes()).decode()))
 
+# Shared by pre-command probes: neither root ownership nor uninterruptible I/O can extend the deadline.
+BOUNDED_PROCESS = r'''
+import os, selectors, signal, subprocess, sys, time
+def bounded(args, seconds, relay=False, capture=False):
+    try:
+        child = subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE if relay or capture else subprocess.DEVNULL,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError:
+        return 1, b''
+    selector = selectors.DefaultSelector()
+    if child.stdout:
+        selector.register(child.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + seconds
+    output = bytearray()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                # No wait/communicate: even SIGKILL cannot reap a process blocked in kernel I/O.
+                return 124, bytes(output)
+            for key, _ in selector.select(min(left, 0.1)):
+                data = os.read(key.fd, 65536)
+                if data:
+                    if relay:
+                        os.write(2, data)
+                    if capture:
+                        output.extend(data)
+                else:
+                    selector.unregister(key.fileobj)
+            rc = child.poll()
+            if rc is not None and not selector.get_map():
+                return (rc if rc >= 0 else 128 - rc), bytes(output)
+    finally:
+        if child.stdout:
+            child.stdout.close()
+        selector.close()
+'''
+
 # The old helper installed on a box may wait forever behind the boot-time restore. Keep this in the run
-# itself so even boxes made before the fix use the bound. The supervisor never waits for a wedged root child.
+# itself so even boxes made before the fix use the bound.
 IMAGE_WAIT = r'''# offbox-wait-images: bounded even on boxes with an old restore helper
 (
   _offbox_seconds=${OFFBOX_IMAGE_WAIT_SECONDS:-180}
   [[ $_offbox_seconds =~ ^[1-9][0-9]{0,3}$ ]] || _offbox_seconds=180
   echo 'offbox: waiting for kept docker images' >&2
   python3 - "$_offbox_seconds" <<'OFFBOX_IMAGE_WAIT'
-import os, selectors, signal, subprocess, sys, time
+''' + BOUNDED_PROCESS + r'''
 seconds = int(sys.argv[1])
 script = r"""
 set -u -o pipefail
@@ -136,48 +179,43 @@ if [ "$missing" = 1 ]; then
 fi
 touch /run/offbox-images-ready
 """
-# Root timeout can signal Docker; the unprivileged supervisor still returns if sudo/timeout is stuck in D state.
-# Capture and relay output so an abandoned child cannot keep the run's SSH output descriptors open.
-try:
-    child = subprocess.Popen(['sudo', '-n', 'timeout', '-k', '2s', f'{seconds}s', 'bash', '-c', script,
-                              'offbox-image-restore', str(seconds)], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-except OSError:
-    sys.exit(1)
-selector = selectors.DefaultSelector()
-selector.register(child.stdout, selectors.EVENT_READ)
-deadline = time.monotonic() + seconds
-while True:
-    left = deadline - time.monotonic()
-    if left <= 0:
+rc, _ = bounded(['sudo', '-n', 'timeout', '-k', '2s', f'{seconds}s', 'bash', '-c', script,
+                 'offbox-image-restore', str(seconds)], seconds, relay=True)
+if rc:
+    # timeout itself may wait forever on a D-state docker child; supervise that probe too.
+    docker_rc, _ = bounded(['timeout', '-k', '1s', '10s', 'docker', 'info'], 11)
+    if docker_rc:
+        ps_rc, output = bounded(['ps', '-eo', 'stat=,comm='], 2, capture=True)
+        names = [parts[1] for line in output.decode(errors='replace').splitlines()
+                 if len(parts := line.split(None, 1)) == 2 and parts[0].startswith('D')]
+        state = f"{len(names)} ({', '.join(names[:5])})" if ps_rc == 0 else 'unknown (ps did not answer)'
+        lock_rc, output = bounded(['sudo', '-n', 'lslocks', '--json', '-o', 'PID,COMMAND,MODE,PATH'], 2, capture=True)
+        holder = 'unknown'
         try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except OSError:
+            import json
+            for lock in json.loads(output)['locks'] if lock_rc == 0 else []:
+                # A mode ending in '*' is a waiter, not the process holding the lock.
+                if (lock.get('path') == '/run/offbox-image-restore.lock'
+                        and not lock.get('mode', '').endswith('*') and (lock.get('pid') or 0) > 0):
+                    comm = ' '.join((lock.get('command') or 'unknown').split())
+                    holder = f"{lock['pid']} {comm}"
+                    break
+        except (ValueError, KeyError, TypeError, AttributeError):
             pass
-        # No wait/communicate here: SIGKILL cannot reap a process blocked in uninterruptible kernel I/O.
-        child.stdout.close()
-        selector.close()
-        sys.exit(124)
-    for key, _ in selector.select(min(left, 0.1)):
-        data = os.read(key.fd, 65536)
-        if data:
-            os.write(2, data)
-        else:
-            selector.unregister(key.fileobj)
-    rc = child.poll()
-    if rc is not None and not selector.get_map():
-        child.stdout.close()
-        selector.close()
-        sys.exit(rc if rc >= 0 else 128 - rc)
+        print(f'offbox-box-wedged: kept image restore did not finish in {seconds}s and docker does not answer; '
+              f'D-state: {state}; lock holder: {holder}', file=sys.stderr)
+        sys.exit(97)
+sys.exit(1 if rc == 97 else rc)
 OFFBOX_IMAGE_WAIT
   _offbox_rc=$?
   case $_offbox_rc in
     0) ;;
+    97) exit 97 ;;
     124|137) echo "offbox: kept docker images still loading after ${_offbox_seconds}s; continuing without waiting" >&2 ;;
     *) echo 'offbox: could not restore kept docker images; continuing without waiting' >&2 ;;
   esac
   exit 0
-)'''
+) || exit $?'''
 
 
 def needs_image_wait(cmd: str, repo_root: str) -> bool:
@@ -410,6 +448,8 @@ LDCACHE_REPAIR = r'''(
 ) || true'''
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
+BOX_WEDGED_MARKER = "offbox-box-wedged"
+COMMAND_STARTED_MARKER = "offbox-command-started:"
 # boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
 # A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
 SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
@@ -566,6 +606,68 @@ def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
             and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
 
 
+def _wedged_line(text: str) -> str | None:
+    lines = text.splitlines()
+    if COMMAND_STARTED_MARKER in text:
+        return None
+    return next((line for line in lines if line.startswith(BOX_WEDGED_MARKER + ': ')), None)
+
+
+def box_wedged(log_path: Path | None) -> str | None:
+    """Diagnostic only: a merged display log is not sufficient to authorize retry."""
+    if log_path and Path(log_path).exists():
+        return _wedged_line(Path(log_path).read_text(errors="replace"))
+    return None
+
+
+def settle_box_wedged(con, run, code):
+    """Only a confirmed pre-command marker plus exit 97 permits moving off a box. Caller holds its box lock."""
+    if code != 97 or not run:
+        return None
+    # A local start fence rules out retry even when command history is unavailable.
+    try:
+        if run['log_path'] and COMMAND_STARTED_MARKER in Path(run['log_path']).read_text(errors='replace'):
+            return None
+    except OSError:
+        pass
+    # Display logs interleave streams and may split/glue a marker around stdout chunks. Only complete stderr
+    # from offset zero authorizes retry; neither a merged log nor a status tail can prove the command never ran.
+    if not run['command_id']:
+        return None
+    text, offset = '', 0
+    # Errors leave the active row intact so a later refresh can still quarantine the box.
+    for _ in range(8):
+        page = api.history_logs(run['box_id'], run['command_id'], 'stderr', offset)
+        text += page.get('data') or ''
+        if COMMAND_STARTED_MARKER in text:
+            return None
+        if page.get('done'):
+            evidence = _wedged_line(text)
+            break
+        nxt = page.get('nextOffset')
+        if not nxt or nxt <= offset:
+            raise OffboxError(f"{run['run_id']}: exit 97 needs complete stderr before settlement; retry")
+        offset = nxt
+    else:
+        raise OffboxError(f"{run['run_id']}: exit 97 stderr exceeded the settlement page limit; retry")
+    if not evidence:
+        return None
+    stopped = lease.set_aside(con, run['box_id'], 'box-wedged', evidence, run_id=run['run_id'])
+    return evidence, stopped
+
+
+def wedged_message(box, evidence, stopped, retry=False):
+    after = 'stopped and set aside' if stopped else 'set aside (stop could not be confirmed)'
+    return (f"{box} is wedged ({evidence}); {after} (offbox list --all shows it). "
+            + ('Nothing ran there; running on another box' if retry else 'Nothing ran: retry'))
+
+
+class BoxWedged(OffboxError):
+    def __init__(self, box, evidence, stopped):
+        super().__init__(wedged_message(box, evidence, stopped), code=EXIT_INFRA)
+        self.box, self.evidence, self.stopped = box, evidence, stopped
+
+
 def scope_failed(log_path: Path | None) -> bool:
     """True when the run's only output is boat's scope error: nothing of ours ran."""
     if not log_path or not Path(log_path).exists():
@@ -579,24 +681,35 @@ def exit_recording_command(script: str, run_id: str) -> str:
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
     dk = f'"$HOME/.offbox/exit/{run_id}.dk"'
+    persist = '\n'.join([
+        'mkdir -p "$HOME/.offbox/exit" || exit 1',
+        f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" \\) -mtime +2 -delete',
+    ])
+    # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
+    # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
+    persist_block = ('python3 - "$__offbox_rc" <<\'OFFBOX_EXIT_RECORD\'\n' + BOUNDED_PROCESS
+                     + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
+                     + 'OFFBOX_EXIT_RECORD')
     outer = "\n".join([
-        'mkdir -p "$HOME/.offbox/exit" 2>/dev/null',
-        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" \\) -mtime +2 -delete 2>/dev/null',
         '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
-        f'{{ echo "$__offbox_rc" > {f}.tmp && mv -f {f}.tmp {f}; }} 2>/dev/null',
+        persist_block,
         # Whether a container started during the run (events, since testcontainers removes its own): only then
         # does the box get the longer Docker idle window. <run>.dk holds "1" (a container started) or "0" (the query
         # answered, or dockerd is plainly inactive: none did). No file = unknown (failed/odd dockerd state, timeout,
         # error): offbox keeps the Docker window.
         # dockerd is only asked while it runs: the docker CLI would socket-activate it on every run otherwise.
+        # Exit 97 may be a pre-command wedged-Docker failure. Keep usage unknown, without another Docker call.
+        'if [ "$__offbox_rc" != 97 ]; then',
         'if systemctl is-active --quiet docker 2>/dev/null; then',
         '  __offbox_ev=$(timeout 5 docker events --since "$__offbox_t0" --until "$(( $(date +%s) + 1 ))" '
         '--filter type=container --filter event=start --format x 2>/dev/null) && '
         f'{{ [ -n "$__offbox_ev" ] && echo 1 || echo 0; }} > {dk} 2>/dev/null',
         'elif [ "$(systemctl is-active docker 2>/dev/null)" = inactive ]; then',
         f'  echo 0 > {dk} 2>/dev/null',
+        'fi',
         'fi',
         'exit "$__offbox_rc"',
     ])
@@ -647,14 +760,25 @@ def settle_docker(con, run, status: str) -> None:
 
 def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: int,
                       timeout: float = 20) -> tuple[int | None, str]:
-    """A run boat reports as lost may still have ended: take its real code from the box, else the step lines.
-    `timeout` bounds the box read (a caller with a deadline passes what is left of it)."""
+    """A lost process can still have its exit on disk, in step results or in retained command history.
+    Failure to read history propagates, keeping the active row available for later reconciliation."""
+    deadline = time.monotonic() + timeout
     code = recorded_exit(box_id, run_id, timeout=timeout)
     if code is not None:
         return code, "the box's exit file"
     code = steps_exit(log_path, planned)
     if code is not None:
         return code, "the step results"
+    con = db()
+    try:
+        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
+    finally:
+        con.close()
+    if row and row['command_id']:
+        with api.budget(max(0, deadline - time.monotonic())):
+            code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+        if code is not None:
+            return code, 'retained command history'
     return None, ""
 
 
@@ -709,6 +833,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
+              f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
               cmd]
     return "\n".join(lines)
 
@@ -785,6 +910,7 @@ class Runner:
             node_block = node_version.block(w) if w else ""
         except Exception:
             node_block = ""
+        new_checkout_hint(row, self.root)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                repo_key=me["repo_key"])
@@ -1168,10 +1294,29 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             mf.close()
 
 
+def new_checkout_hint(row: dict, root: Path) -> None:
+    if not row.get("_new_checkout") or not (root / "package.json").exists():
+        return
+    try:
+        manifest = json.loads((root / "package.json").read_text())
+    except (OSError, ValueError):
+        manifest = {}
+    uses_vp = isinstance(manifest, dict) and any(
+        isinstance(manifest.get(key), dict) and "vite-plus" in manifest[key]
+        for key in ("dependencies", "devDependencies"))
+    install = ("vp i" if uses_vp
+               else "pnpm install --frozen-lockfile" if (root / "pnpm-lock.yaml").exists()
+               else "yarn install" if (root / "yarn.lock").exists()
+               else "npm ci" if (root / "package-lock.json").exists() else "npm install")
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
+
+
 def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:
     for p in pulls:
         st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]))
-        if st.get("ok"):
+        if st.get("missing"):
+            say(f"pull {p}: not created on the box")
+        elif st.get("ok"):
             say(f"pulled {p} ({st.get('files', 0)} files)")
         else:
             say(f"pull {p} failed: {st.get('error')}")
@@ -1215,6 +1360,22 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
 
 def run_remote(a, me: dict) -> int:
     """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
+    # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
+    if not a.no_sync and getattr(a, "include", None):
+        ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
+    wedged = []
+    for attempt in (1, 2):
+        try:
+            return _run_attempt(a, me)
+        except BoxWedged as e:
+            wedged.append(e.box)
+            if attempt == 2:
+                raise OffboxError(f"{wedged[0]} and {wedged[1]} were both wedged before the command; "
+                                  "both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+            say(wedged_message(e.box, e.evidence, e.stopped, retry=True))
+
+
+def _run_attempt(a, me: dict) -> int:
     rn = Runner(a, me)
     try:
         return _run_remote(a, rn)
@@ -1294,6 +1455,13 @@ def _run_remote(a, rn) -> int:
         rn.record(error="repo toolchain setup failed (exit 98)")
         finish(rn.run_id, None, "infra")
         raise OffboxError("repo toolchain setup failed (exit 98), not your command", code=EXIT_INFRA)
+    if code == 97:
+        con = db()
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        wedged = settle_box_wedged(con, row, code)
+        if wedged:
+            rn.started = False
+            raise BoxWedged(rn.box, *wedged)
     if code == 97 and setup_failed(rn.log_path):
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False

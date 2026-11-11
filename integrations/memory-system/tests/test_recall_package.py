@@ -15,7 +15,7 @@ class RecallPackageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = {k: v for k, v in os.environ.items() if not k.startswith("RECALL_")}
-            env.update(RECALL_DATA=str(root), RECALL_DECISION_LOG=str(root / "decisions.jsonl"))
+            env.update(RECALL_DATA=str(root), RECALL_DECISION_LOG=str(root / "decisions.jsonl"), RECALL_RULE_PREFLIGHT="1")
             result = subprocess.run(
                 [sys.executable, "-I", "-B", "-c", """
 import json

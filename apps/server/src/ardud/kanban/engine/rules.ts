@@ -460,6 +460,7 @@ export function planDispatch(
   pools: ReadonlyArray<KanbanPool>,
   holds: ReadonlyMap<string, string> = new Map(),
   pick: (count: number) => number = () => 0,
+  attempted: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<Dispatch> {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
   if (board.setup?.status === "running") return [];
@@ -477,6 +478,7 @@ export function planDispatch(
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const waiting = cards.filter(
     (card) =>
+      !attempted.has(card.id) &&
       (kept === null || kept.has(card.id)) &&
       card.settledAt === null &&
       card.activeThreadId === null &&
@@ -534,6 +536,72 @@ export function planDispatch(
     }
   }
   return plan;
+}
+
+/** Same provider, model and options, whatever order their keys were written in. */
+const canonical = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(canonical)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(
+          Object.keys(value)
+            .toSorted()
+            .map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
+        )
+      : value;
+const sameModel = (a: ModelSelection, b: ModelSelection): boolean =>
+  JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+
+/**
+ * Whether a planned start still holds against fresh state. A card whose row
+ * changed since planning waits for the next pass, and the board's gates,
+ * the card's blockers and the pool's room are checked again. `holds` must not
+ * count this start's own reservation.
+ */
+export function confirmDispatch(
+  board: KanbanBoard,
+  planned: KanbanCard,
+  cards: ReadonlyArray<KanbanCard>,
+  pools: ReadonlyArray<KanbanPool>,
+  holds: ReadonlyMap<string, string>,
+  dispatch: Dispatch,
+): boolean {
+  if (board.archivedAt !== null || board.setup?.status === "running") return false;
+  if (board.pause && !board.pause.keep.includes(dispatch.cardId)) return false;
+  const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const card = byId.get(dispatch.cardId);
+  if (!card || JSON.stringify(card) !== JSON.stringify(planned)) return false;
+  // The plan's model came from the board as it was then. A review chain (or a step's
+  // model) changed since would send this start to a reviewer the current chain no longer
+  // names. A card already on a work thread stays on that thread's model, as when planned.
+  if (
+    (dispatch.role === "review" || card.workThreadId !== null) &&
+    !sameModel(nextModel(board, card), dispatch.model)
+  )
+    return false;
+  if (
+    dispatch.role === "work" &&
+    (isBlocked(card, byId) || (dispatch.fresh && isBlocked(card, byId, null)))
+  )
+    return false;
+  const thread = dispatch.role === "work" && !dispatch.fresh ? card.workThreadId : null;
+  if (
+    thread !== null &&
+    board.pause &&
+    cards.some((other) => other.activeThreadId === thread && !board.pause!.keep.includes(other.id))
+  )
+    return false;
+  const pool = pools.find((candidate) => candidate.key === dispatch.pool);
+  if (!pool || pool.slots <= 0 || poolFor(pools, dispatch.model)?.key !== pool.key) return false;
+  const holding = poolThreads(cards, holds).get(dispatch.pool) ?? new Set<string>();
+  if (dispatch.joins) {
+    if (thread === null || !holding.has(thread)) return false;
+    const carrying = cards.filter(
+      (other) => other.activeRole === "work" && other.activeThreadId === thread,
+    ).length;
+    return carrying < MAX_BATCH;
+  }
+  return pool.slots - holding.size > 0;
 }
 
 /** What a work thread brings to a claim. */

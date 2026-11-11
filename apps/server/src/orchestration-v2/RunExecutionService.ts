@@ -1,3 +1,4 @@
+import * as DelegatedTaskRecoveryService from "./DelegatedTaskRecoveryService.ts";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -48,6 +49,7 @@ import type { ProjectionStoreV2Error } from "./ProjectionStore.ts";
 import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
+  withPreviousFailure,
 } from "@t3tools/provider-core/server/failure";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
@@ -571,6 +573,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly relatedProviderThreadIds?: ReadonlyArray<ProviderThreadId>;
   readonly shouldStartProviderTurn?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
@@ -602,6 +605,7 @@ export const layer: Layer.Layer<
 > = Layer.effect(
   RunExecutionServiceV2,
   Effect.gen(function* () {
+    const recovery = yield* DelegatedTaskRecoveryService.DelegatedTaskRecoveryService;
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -636,6 +640,19 @@ export const layer: Layer.Layer<
           status: input.terminal.status,
           completedAt,
         };
+        if (input.terminal.status === "failed" && input.run.transientRecovery !== undefined) {
+          input = {
+            ...input,
+            failureItemPersisted: false,
+            terminal: {
+              ...input.terminal,
+              failure: withPreviousFailure(
+                input.terminal.failure,
+                input.run.transientRecovery.firstError,
+              ),
+            },
+          };
+        }
         const shouldFinalizeRun =
           input.shouldFinalizeRun === undefined ? true : yield* input.shouldFinalizeRun();
         if (!shouldFinalizeRun) {
@@ -1015,6 +1032,88 @@ export const layer: Layer.Layer<
           if (yield* Ref.get(rootRunFinalized)) {
             return;
           }
+          if (
+            terminal.status === "failed" &&
+            terminal.threadDisposition === "reusable" &&
+            (input.shouldFinalizeRun === undefined || (yield* input.shouldFinalizeRun())) &&
+            (yield* recovery.shouldResume({
+              thread: input.appThread,
+              run: input.run,
+              failure: terminal.failure,
+              ...(input.loadDelegatedTask === undefined
+                ? {}
+                : { loadDelegatedTask: input.loadDelegatedTask }),
+            }))
+          ) {
+            const now = yield* DateTime.now;
+            const attemptOrdinal = input.attempt.attemptOrdinal + 1;
+            const attemptId = idAllocator.derive.runAttempt({
+              runId: input.run.id,
+              attemptOrdinal,
+            });
+            const run = {
+              ...input.run,
+              status: "starting" as const,
+              activeAttemptId: attemptId,
+              transientRecovery: { firstError: terminal.failure, since: DateTime.formatIso(now) },
+              completedAt: null,
+            };
+            const attempt = {
+              ...input.attempt,
+              id: attemptId,
+              attemptOrdinal,
+              reason: "retry" as const,
+              status: "pending" as const,
+              providerTurnId: null,
+              startedAt: null,
+              completedAt: null,
+            };
+            const payloads = [
+              {
+                type: "run-attempt.updated" as const,
+                payload: { ...input.attempt, status: "failed" as const, completedAt: now },
+              },
+              { type: "run-attempt.updated" as const, payload: attempt },
+              { type: "run.updated" as const, payload: run },
+              {
+                type: "provider-thread.updated" as const,
+                payload: {
+                  ...(yield* Ref.get(latestProviderThread)),
+                  status: "idle" as const,
+                  updatedAt: now,
+                },
+              },
+            ];
+            yield* eventSink.writeIfRunCurrent({
+              threadId: input.run.threadId,
+              runId: input.run.id,
+              activeAttemptId: input.attempt.id,
+              expectedStatus: "running",
+              events: yield* Effect.forEach(payloads, (event) =>
+                Effect.gen(function* () {
+                  return {
+                    ...event,
+                    id: yield* idAllocator.allocate.event({ threadId: input.run.threadId }),
+                    threadId: input.run.threadId,
+                    runId: input.run.id,
+                    nodeId: input.rootNode.id,
+                    providerInstanceId: input.run.providerInstanceId,
+                    occurredAt: now,
+                  };
+                }),
+              ),
+              effects: [
+                {
+                  id: `effect:delegated-transient-resume:${input.run.id}`,
+                  commandId: input.commandId,
+                  threadId: input.run.threadId,
+                  request: { type: "provider-turn.start", runId: input.run.id, retryDelayMs: 1000 },
+                },
+              ],
+            });
+            yield* Ref.set(rootRunFinalized, true);
+            return;
+          }
           const providerThread = yield* Ref.get(latestProviderThread);
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
           yield* writeFinalRunEvents({
@@ -1041,7 +1140,8 @@ export const layer: Layer.Layer<
                 }),
             openRunOwnedSubagents: openSubagents,
             terminal,
-            failureItemPersisted: terminal.status === "failed",
+            failureItemPersisted:
+              terminal.status === "failed" && input.run.transientRecovery === undefined,
             refreshAfterTurn,
           }).pipe(
             Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
@@ -1642,7 +1742,7 @@ export const layer: Layer.Layer<
       }),
     } satisfies RunExecutionServiceV2Shape);
   }),
-);
+).pipe(Layer.provide(DelegatedTaskRecoveryService.layer));
 
 export function makeInterruptResultTurnItem(input: {
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];

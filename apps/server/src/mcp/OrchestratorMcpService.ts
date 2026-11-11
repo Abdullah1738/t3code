@@ -258,7 +258,10 @@ function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return (
+    userFacingDispatchErrorMessage(error) ??
+    (error instanceof Error ? error.message : String(error))
+  );
 }
 
 function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): OrchestratorMcpScheduledTask {
@@ -1724,7 +1727,9 @@ const make = Effect.gen(function* () {
         : progress.state;
     const resultRunIds = [
       ...new Set(
-        [taskResultRun?.id, terminalRun?.id].filter((id): id is RunId => id !== undefined),
+        [taskResultRun?.id, terminalRun?.id, childRun?.id].filter(
+          (id): id is RunId => id !== undefined,
+        ),
       ),
     ];
     const resultRecords = yield* threadManagement
@@ -1797,7 +1802,41 @@ const make = Effect.gen(function* () {
         instanceId: task.providerInstanceId,
         model: task.model,
       };
+    const activeRun = taskResultRun ?? childRun;
+    const activeError = (childProjection.turnItems ?? [])
+      .filter((item) => item.runId === activeRun?.id && item.type === "error")
+      .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+    const retry =
+      !isTerminalTaskStatus(status) &&
+      activeError?.type === "error" &&
+      activeError.retry !== undefined &&
+      activeError.status === "running"
+        ? {
+            state: "retrying" as const,
+            lastError: activeError.failure.message,
+            since: DateTime.formatIso(activeError.startedAt ?? activeError.updatedAt),
+            attempt: activeError.retry.attempt,
+            delayMs: activeError.retry.retryDelayMs ?? 0,
+            filesMayBePartlyWritten: true,
+          }
+        : activeRun?.transientRecovery === undefined ||
+            status === "completed" ||
+            status === "interrupted" ||
+            status === "cancelled"
+          ? null
+          : {
+              state: status === "failed" ? ("failed_transient" as const) : ("resuming" as const),
+              lastError:
+                status === "failed"
+                  ? (derivedResult ?? activeRun.transientRecovery.firstError.message)
+                  : activeRun.transientRecovery.firstError.message,
+              since: activeRun.transientRecovery.since,
+              attempt: 1,
+              delayMs: activeRun.status === "starting" ? 1000 : 0,
+              filesMayBePartlyWritten: true,
+            };
     const response = {
+      retry,
       taskId: task.id,
       childThreadId: task.childThreadId,
       childRunId: childRun?.id ?? null,
@@ -3028,7 +3067,7 @@ const make = Effect.gen(function* () {
               ? threadManagementFailure(error)
               : failure(
                   "orchestration_error",
-                  `Unable to send to thread ${input.threadId}: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                  `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
                 ),
           ),
         );

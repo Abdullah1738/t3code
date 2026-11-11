@@ -38,6 +38,21 @@ export interface Config {
   liveCardChats?: string[];
   /** Stable public origin for shares (a named Cloudflare tunnel to 127.0.0.1:port); unset = quick tunnels. */
   shareOrigin?: { url: string; port: number };
+  /**
+   * How the agent's words reach the chat. "final" (default): the bridge forwards each turn's final
+   * assistant text. "tool": nothing is forwarded; the agent texts the chat itself with the
+   * `imessage_send` MCP tool (or `cli.ts send`), and its final message stays internal.
+   */
+  replyMode?: ReplyMode;
+}
+
+export type ReplyMode = "final" | "tool";
+
+/** `replyMode`: "final" when unset, else exactly "final" or "tool". */
+export function replyModeConfig(raw: unknown): ReplyMode {
+  if (raw === undefined) return "final";
+  if (raw === "final" || raw === "tool") return raw;
+  throw new Error("Invalid bridge configuration");
 }
 
 /** `shareOrigin`: an https origin with no path, and a loopback port its tunnel forwards to. */
@@ -134,7 +149,8 @@ export async function loadConfig(): Promise<Config> {
     || typeof config.timezone !== "string") throw new Error("Invalid bridge configuration");
   new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
   return { ...config, ...appsConfig(config), cardApp: cardAppConfig(config.cardApp),
-    liveCardChats: liveCardChatsConfig(config.liveCardChats), shareOrigin: shareOriginConfig(config.shareOrigin) };
+    liveCardChats: liveCardChatsConfig(config.liveCardChats), shareOrigin: shareOriginConfig(config.shareOrigin),
+    replyMode: replyModeConfig(config.replyMode) };
 }
 
 export async function backendConnection(): Promise<{ baseUrl: string; headers: Record<string, string> }> {

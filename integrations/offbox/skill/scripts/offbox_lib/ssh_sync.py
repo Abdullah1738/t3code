@@ -7,7 +7,9 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -21,7 +23,8 @@ RSYNC = "/opt/homebrew/bin/rsync" if Path("/opt/homebrew/bin/rsync").exists() el
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
 SECRET_EXCLUDES = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.p8", "*.mobileprovision",
                    ".aws/", ".ssh/", ".netrc", ".npmrc", ".pypirc", ".docker/config.json", "*.tfstate", "*.tfstate.*",
-                   ".terraform.d/", "credentials.json", "id_rsa*", "id_ed25519*"]
+                   ".terraform.d/", "credentials.json", "id_rsa*", "id_ed25519*",
+                   ".gnupg/", "gnupg/", "private-keys-v1.d/", "*.keystore", "*.kdbx"]
 SAFE_ENV_TEMPLATES = [".env.example", ".env.sample", ".env.template", ".env.dist"]
 # node_modules without the trailing slash: worktrees often symlink it to the main checkout, and a dir-only
 # pattern would sync that (dangling) symlink over the box's own install.
@@ -53,7 +56,10 @@ def setup(box_id: str) -> Path:
             last = e
             if e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable") \
                     or e.status in (409, 502, 503):
-                time.sleep(1 + attempt)
+                left = api.left()
+                if left is not None and left <= 0:
+                    raise
+                time.sleep(1 + attempt if left is None else min(1 + attempt, left))
                 continue
             raise
     else:
@@ -104,11 +110,12 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
 
 
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
-    deadline = time.time() + timeout
+    left = api.left()
+    deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
     err = ""
     while time.time() < deadline:
         try:
-            p = ssh(box_id, "true", timeout=20)
+            p = ssh(box_id, "true", timeout=min(20, deadline - time.time()))
             if p.returncode == 0:
                 return
             err = p.stderr.decode(errors="replace")[-300:]
@@ -116,13 +123,18 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
-        time.sleep(1)
+        time.sleep(max(0, min(1, deadline - time.time())))
     raise OffboxError(f"ssh to {box_id} not ready after {int(timeout)}s: {err}")
 
 
 def close_master(box_id: str) -> None:
-    if cfg_path(box_id).exists():
-        subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=10)
+    try:
+        left = api.left()
+        timeout = 10 if left is None else min(10, max(0, left))
+        if timeout > 0 and cfg_path(box_id).exists():
+            subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # closing a cached connection must not undo a confirmed box stop
 
 
 DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)
@@ -188,6 +200,11 @@ def _soft_partial(stderr: str) -> list[str] | None:
     return bad or None
 
 
+def _include_refused(inc: str) -> OffboxError:
+    return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
+                       "so it won't send it (local filter inspection failed)", code=2)
+
+
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
     """For each --include, its shortest ancestor dir that git ignores (tmp for tmp/a/b.sh), once each."""
     tops: list[str] = []
@@ -198,8 +215,10 @@ def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
             try:
                 p = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--", anc + "/"],
                                    capture_output=True, timeout=10)
-            except Exception:  # noqa: BLE001 - no git: keep today's rules
-                return tops
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise _include_refused(inc) from e
+            if p.returncode not in (0, 1):
+                raise _include_refused(inc)
             if p.returncode == 0:
                 if anc not in tops:
                     tops.append(anc)
@@ -238,21 +257,105 @@ def _reclaim(box_id: str, remote_dir: str) -> bool:
     return p.returncode == 0
 
 
+def _visible_include_ancestors(root: Path, ancestors: set[str], inc: str) -> set[str]:
+    # Rsync's inherited merge rules differ from Git's. Probe only a synthetic ancestor tree, never
+    # the checkout's subtrees, so checking an include cannot walk unrelated scratch or copy its files.
+    try:
+        with tempfile.TemporaryDirectory(prefix="offbox-include-filters-") as tmp:
+            source, dest = Path(tmp) / "source", Path(tmp) / "dest"
+            source.mkdir()
+            dest.mkdir()
+            for anc in ancestors:
+                (source / anc).mkdir(parents=True, exist_ok=True)
+            paths = {""} | {str(p.relative_to(source)) for p in source.rglob("*")}
+            for rel in paths:
+                ignore = root / rel / ".gitignore"
+                try:
+                    ignore.lstat()
+                except FileNotFoundError:
+                    continue
+                shutil.copyfile(ignore, source / rel / ".gitignore")
+            cmd = [RSYNC, "-r", "--dry-run", "-8", "--out-format=%n"]
+            cmd += push_filters(root, False)
+            result = subprocess.run(cmd + [f"{source}/", f"{dest}/"], capture_output=True, timeout=20)
+            if result.returncode != 0:
+                raise _include_refused(inc)
+            # Rsync escapes control bytes and literal escape-like names even with -8. Decode once,
+            # after splitting output records, so embedded newlines never become record separators.
+            return {os.fsdecode(re.sub(rb"\\#([0-7]{3})", lambda m: bytes([int(m[1], 8)]), name[:-1]))
+                    for name in result.stdout.split(b"\n") if name.endswith(b"/")}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise _include_refused(inc) from e
+
+
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
+    ancestors: set[str] = set()
     for inc in includes or []:      # explicit opt-in (e.g. committed test certs); wins over every exclude
         inc = inc.strip("/")
         parts = inc.split("/")
         for i in range(1, len(parts)):
-            f.append("--filter=+ /" + "/".join(parts[:i]) + "/")
+            anc = "/".join(parts[:i])
+            ancestors.add(anc)
+            f.append(f"--filter=+ /{anc}/")
         f.append(f"--filter=+ /{inc}")
         f.append(f"--filter=+ /{inc}/**")
+    is_git = False
+    if includes:
+        try:
+            p = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                               capture_output=True, timeout=10)
+            is_git = p.returncode == 0 and p.stdout.strip() == b"true"
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # No Git index: guard every opened ancestor.
+    guarded = ancestors.copy()
+    if is_git and ancestors:
+        try:
+            p = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *sorted(ancestors)],
+                               capture_output=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise _include_refused(includes[0]) from e
+        if p.returncode != 0:
+            raise _include_refused(includes[0])
+        for raw in p.stdout.split(b"\0"):
+            if raw:
+                parts = os.fsdecode(raw).split("/")
+                for i in range(1, len(parts)):
+                    guarded.discard("/".join(parts[:i]))
+    # A whole-directory include already authorizes these siblings, even with redundant child includes.
+    unchecked = {anc for anc in ancestors - guarded
+                 if not any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes)}
+    visible = _visible_include_ancestors(root, unchecked, includes[0]) if unchecked else set()
+    for anc in sorted(unchecked):
+        inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
+        try:
+            # Bypass the index to see ignored dirs with tracked descendants. No trailing slash: tmp/*
+            # matches tmp/'s empty child in check-ignore, but does not ignore tmp itself.
+            p = subprocess.run(["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", anc],
+                               capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise _include_refused(inc) from e
+        if p.returncode not in (0, 1):
+            raise _include_refused(inc)
+        # Check this directory's own name so safe env template parents don't look excluded again.
+        excluded = _offbox_skips(anc.rsplit("/", 1)[-1]) or any(
+            anc == pat or anc.endswith("/" + pat)
+            for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
+        )
+        if p.returncode == 0 or excluded or anc not in visible:
+            raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
+                              "offbox can't send only the named path there. Pass the script inline in argv or "
+                              "with --step, or move it out of the excluded directory", code=2)
+    # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
+    # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
+    for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
+        f.append(f"--filter=- /{anc}/*")
     # An include under an ignored dir (tmp/) makes rsync walk that dir, and --delete would then remove the box's own
     # files there (31 Oct: root-owned tmp/localstack, written by the LocalStack container, failed the sync with 23).
     # Protect the rest of that dir on the box; the included path itself still mirrors.
-    for top in _ignored_include_tops(root, includes):
+    for top in _ignored_include_tops(root, includes) if is_git else []:
         f.append(f"--filter=P /{top}/**")
     for t in SAFE_ENV_TEMPLATES:
         f.append(f"--filter=+ {t}")
@@ -506,6 +609,19 @@ def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: 
     return p.stdout or ""
 
 
+def _missing_pull(code: int, error: str) -> bool:
+    if code != 23:
+        return False
+    missing = False
+    for line in error.splitlines():
+        if re.fullmatch(r'rsync: (?:\[sender\] )?link_stat ".*" failed: No such file or directory \(2\)', line):
+            missing = True
+        elif not (line.startswith("rsync error: some files/attrs were not transferred")
+                  or re.fullmatch(r'rsync: \[.*\] write error: Broken pipe \(32\)', line)):
+            return False
+    return missing
+
+
 def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
@@ -522,6 +638,7 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path)
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:
+        st["missing"] = _missing_pull(p.returncode, p.stderr.strip())
         st["error"] = p.stderr.strip()[-300:]
     return st
 

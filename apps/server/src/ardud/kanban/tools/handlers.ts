@@ -66,12 +66,17 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
     const thread = yield* McpInvocationContext.requireThreadScope(scope, "Missions board tools");
     const service = yield* KanbanService;
     const threadId = thread.thread.threadId;
-    const link = yield* service.caller(threadId);
-    const actor: KanbanActor =
-      link !== null && link.role !== "evaluator"
-        ? { _tag: "thread", threadId }
-        : { _tag: "evaluator", threadId };
-    return yield* run(service, { threadId, link, actor });
+    return yield* service.agentCall(
+      threadId,
+      Effect.gen(function* () {
+        const link = yield* service.caller(threadId);
+        const actor: KanbanActor =
+          link !== null && link.role !== "evaluator"
+            ? { _tag: "thread", threadId }
+            : { _tag: "evaluator", threadId };
+        return yield* run(service, { threadId, link, actor });
+      }),
+    );
   },
   Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) }),
 );
@@ -263,7 +268,6 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (cardRef?.trim()) {
     const card = yield* cardFor(service, caller, cardRef);
-    yield* ownCard(caller, card);
     return yield* service.cardDiscussion(card.id);
   }
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
@@ -460,7 +464,17 @@ const handlers = {
           caller.actor,
           { note: input.note ?? null, question: input.question ?? null },
         );
-        return { card: moved };
+        return {
+          card: moved,
+          ...(moved.stage === card.stage
+            ? {
+                message:
+                  input.to === moved.stage
+                    ? `already in ${moved.stage}; nothing changed`
+                    : `already moved to ${input.to}; now ${moved.stage}, nothing changed`,
+              }
+            : {}),
+        };
       }),
     ),
   ),

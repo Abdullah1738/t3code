@@ -218,6 +218,7 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
     raises OffboxError without sending. `connect_retries=0` disables the not-delivered connect retries."""
     if _DEADLINE is not None:
         retries = 0
+        deadline = _DEADLINE if deadline is None else min(deadline, _DEADLINE)
     if deadline is not None:
         _check_deadline(deadline, method, path)
     max_connect = CONNECT_RETRIES if connect_retries is None else connect_retries
@@ -653,9 +654,10 @@ def cmd_attach(box_id: str, pid: int, out_off: int = 0, err_off: int = 0, timeou
                   timeout=timeout, deadline=deadline)
 
 
-def history_logs(box_id: str, command_id: str, which: str, offset: int = 0) -> dict:
+def history_logs(box_id: str, command_id: str, which: str, offset: int = 0,
+                 *, deadline: float | None = None) -> dict:
     qs = urllib.parse.urlencode({"stream": which, "offset": offset})
-    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}")
+    return call("GET", f"/sandboxes/{box_id}/command-history/{command_id}/logs?{qs}", deadline=deadline)
 
 
 def history_get(box_id: str, command_id: str) -> dict:
