@@ -4,7 +4,7 @@ import {
   type KanbanAskSecretAnswerInput,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   ASK_UNREADABLE_TEXT,
@@ -564,6 +564,50 @@ describe("what the server sent is read through the apps' read schemas", () => {
     expect((await api.feed()).open[0]).toBe(first.open[0]);
   });
 
+  it("a poll that brings the same asks again is not parsed: the last feed, with the new time", async () => {
+    let at = 0;
+    let open: ReadonlyArray<unknown> = [wireItem(1), { ...wireItem(2), priority: "high" }];
+    const { api } = harness(() => json(200, wireFeed(open, `2026-11-11T08:00:0${(at += 1)}.000Z`)));
+    const first = await api.feed();
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const next = await api.feed();
+      expect(parse).not.toHaveBeenCalled();
+      expect(next.at).toBe("2026-11-11T08:00:02.000Z");
+      expect(next.open).toBe(first.open);
+      // What could not be read is still told, not lost with the shortcut.
+      expect(next.unreadable).toBe(first.unreadable);
+      expect(next.unreadable?.open).toHaveLength(1);
+
+      // History's window is its own answer: never the queue's.
+      const history = await api.feed({ closed: "7d" });
+      expect(parse).toHaveBeenCalledTimes(1);
+      expect(history.open).not.toBe(first.open);
+
+      // A changed feed is read.
+      open = [wireItem(1)];
+      const changed = await api.feed();
+      expect(parse).toHaveBeenCalledTimes(2);
+      expect(changed.open).toHaveLength(1);
+      expect(changed.unreadable).toBeUndefined();
+      expect(changed.open[0]).toBe(first.open[0]);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("an answer that did not read is never the one reused", async () => {
+    let body: unknown = wireFeed([wireItem(1)]);
+    const { api } = harness(() => json(200, body));
+    await api.feed();
+    body = { at: "2026-11-11T08:00:00.000Z", open: "none", closed: [] };
+    await expect(api.feed()).rejects.toThrow(ASK_UNREADABLE_TEXT);
+    // The same unreadable answer again is an error again, not the feed from before.
+    await expect(api.feed()).rejects.toThrow(ASK_UNREADABLE_TEXT);
+    body = wireFeed([wireItem(1)]);
+    expect((await api.feed()).open).toHaveLength(1);
+  });
+
   it("reads a feed of two hundred asks, and the next one without reading them again", async () => {
     // Asks the size the live feed carries: text, a few blocks, a thread of messages.
     const blocks = [
@@ -582,7 +626,7 @@ describe("what the server sent is read through the apps' read schemas", () => {
       ...wireItem(index + 1, blocks),
       messages: [1, 2, 3].map((seq) => wireMessage(blocks, seq)),
     }));
-    const body = JSON.stringify(wireFeed(open));
+    let body = JSON.stringify(wireFeed(open));
     const { api } = harness(
       () => new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
     );
@@ -593,16 +637,29 @@ describe("what the server sent is read through the apps' read schemas", () => {
     };
     const first = await timed();
     expect(first.feed.open).toHaveLength(200);
+    const size = body.length;
+    // A poll with nothing new is the same text again: it is not parsed.
     const polls = [await timed(), await timed(), await timed()];
-    for (const poll of polls) {
-      expect(poll.feed.open.every((entry, index) => entry === first.feed.open[index])).toBe(true);
+    for (const poll of polls) expect(poll.feed.open).toBe(first.feed.open);
+    const same = Math.min(...polls.map((poll) => poll.ms));
+    // A poll where one ask moved parses the JSON and reads that one ask.
+    const moved: Array<number> = [];
+    for (const revision of [1, 2, 3]) {
+      body = JSON.stringify(wireFeed([...open.slice(0, 199), { ...open[199]!, revision }]));
+      const poll = await timed();
+      expect(poll.feed.open.slice(0, 199).every((entry, i) => entry === first.feed.open[i])).toBe(
+        true,
+      );
+      expect(poll.feed.open[199]!.revision).toBe(revision);
+      moved.push(poll.ms);
     }
-    const again = Math.min(...polls.map((poll) => poll.ms));
+    const one = Math.min(...moved);
     // For the record (the numbers are printed, not asserted tightly: machines differ).
     console.info(
-      `ask feed, 200 asks, ${(body.length / 1024).toFixed(0)} KiB: first read ${first.ms.toFixed(1)} ms, unchanged poll ${again.toFixed(1)} ms`,
+      `ask feed, 200 asks, ${(size / 1024).toFixed(0)} KiB: first read ${first.ms.toFixed(1)} ms, one ask changed ${one.toFixed(1)} ms, unchanged poll ${same.toFixed(1)} ms`,
     );
-    // An unchanged poll parses the JSON and compares text: it must be far below a full read.
-    expect(again).toBeLessThan(Math.max(first.ms, 5));
+    // Neither kind of poll may cost what the first read does.
+    expect(one).toBeLessThan(Math.max(first.ms, 5));
+    expect(same).toBeLessThan(Math.max(one, 5));
   });
 });

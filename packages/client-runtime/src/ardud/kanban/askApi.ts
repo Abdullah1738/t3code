@@ -114,6 +114,12 @@ export interface AskApiHost {
 }
 
 interface CallOptions {
+  /**
+   * Shown a good answer's text before it is parsed. Returning true says the
+   * caller already holds what this text reads as: it is not parsed, and the
+   * call hands back null.
+   */
+  readonly known?: (text: string) => boolean;
   readonly body?: unknown;
   /** The page is going away: let the request outlive it. */
   readonly keepalive?: boolean;
@@ -390,6 +396,7 @@ export function createAskApi(host: AskApiHost): AskApi {
       throw new AskApiError(0, "network", "Robob did not answer.");
     }
     const text = await response.text();
+    if (response.ok && options.known?.(text) === true) return null as T;
     let json: unknown = null;
     try {
       json = text === "" ? null : JSON.parse(text);
@@ -422,6 +429,15 @@ export function createAskApi(host: AskApiHost): AskApi {
   // An ask that did not read is remembered the same way, so it is not tried
   // again on every poll.
   let lastItems = new Map<string, KanbanAskFeedItem | AskUnreadable>();
+  // The last feed whole, by its text after the time it was made. A poll that
+  // brings the same asks again is not parsed at all: it is the last feed with
+  // the new time. One per window asked for (the queue's read and History's).
+  const lastFeeds = new Map<string, { readonly rest: string; readonly feed: AskFeedRead }>();
+  const FEED_TIME = /^\{"at":"([^"\\]*)",/;
+  const splitFeed = (text: string): { readonly at: string; readonly rest: string } | null => {
+    const made = FEED_TIME.exec(text);
+    return made === null ? null : { at: made[1]!, rest: text.slice(made[0].length) };
+  };
   const isRead = (item: KanbanAskFeedItem | AskUnreadable): item is KanbanAskFeedItem =>
     "ask" in item;
   const readFeed = (json: unknown): AskFeedRead => {
@@ -458,14 +474,35 @@ export function createAskApi(host: AskApiHost): AskApi {
   };
 
   return {
-    feed: async (input = {}) =>
-      readFeed(
-        await call<unknown>(
-          "GET",
-          `/asks${input.closed ? `?closed=${encodeURIComponent(input.closed)}` : ""}`,
-          input.signal ? { signal: input.signal } : {},
-        ),
-      ),
+    feed: async (input = {}) => {
+      const window = input.closed ?? "";
+      const seen: {
+        parts: { readonly at: string; readonly rest: string } | null;
+        same: AskFeedRead | null;
+      } = { parts: null, same: null };
+      const answer = await call<unknown>(
+        "GET",
+        `/asks${input.closed ? `?closed=${encodeURIComponent(input.closed)}` : ""}`,
+        {
+          ...(input.signal ? { signal: input.signal } : {}),
+          known: (text) => {
+            seen.parts = splitFeed(text);
+            const last = lastFeeds.get(window);
+            if (seen.parts === null || last === undefined || last.rest !== seen.parts.rest) {
+              return false;
+            }
+            seen.same = { ...last.feed, at: seen.parts.at as KanbanAskFeed["at"] };
+            return true;
+          },
+        },
+      );
+      if (seen.same !== null) return seen.same;
+      // A feed that does not read is forgotten here too, so it is never reused.
+      lastFeeds.delete(window);
+      const feed = readFeed(answer);
+      if (seen.parts !== null) lastFeeds.set(window, { rest: seen.parts.rest, feed });
+      return feed;
+    },
     detail: async (cardRef, askId) =>
       readDetail(await call<unknown>("GET", cardPath(cardRef, askId))),
     answer: (cardRef, askId, body, revision, keepalive = false) =>
