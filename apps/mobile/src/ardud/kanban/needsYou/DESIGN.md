@@ -176,13 +176,24 @@ times at most. It does not matter whether the feed itself ever failed, or came b
 answer was still on its way; the read the store makes right after a failure is too soon to
 count, so a dead connection is not hammered. The count is on the answer (`autoRetries` in the shared store), so
 it holds while the answer is on its way; after that the band says it no longer goes by itself.
-Retry by hand always works. Nothing is written to disk, and nothing unsent survives a change
+Retry by hand stays, through the check below. Nothing is written to disk, and nothing unsent survives a change
 of server.
 
-An answer that is out of date is never sent again, by itself or by Retry. When a good read
-shows that the ask of an unsent answer has moved since he gave it (edited, expired, handed to
-the evaluator or put away: `askMovedSince` in the shared store, so the web follows the same
-rule), the answer leaves "Not sent", what he filled in stays as the ask's draft, and the ask
-shows as updated for him to read and answer again. The same check runs before every automatic
-retry. An ask that can't be compared (it no longer reads in this build) waits: nothing goes
-for it by itself.
+An answer that is out of date is never sent again, by itself or by Retry. Every retry, by
+hand or automatic, goes through one check in the shared store (`retryAskSend`, so the web
+follows the same rule) that holds the answer's ask against the feed as last read:
+
+- the ask has moved since he answered (edited, expired, handed to the evaluator, or put away
+  after he answered: `askMovedSince`): the answer leaves "Not sent", what he filled in stays as
+  the ask's draft, and the ask shows as updated for him to read and answer again. A good read
+  of the feed does the same for every unsent answer, and an answer that fails after a read
+  already showed its ask moved is never kept for retry at all;
+- the ask closed: the answer is dropped;
+- the ask can't be compared (it does not read in this build right now): nothing is sent, the
+  answer and the draft stay, and Retry says it can't be sent until the ask can be read.
+
+An ask the feed can't even identify (no card or ask id left to read) could be any ask that
+is missing from that feed. While a feed holds such asks, an ask that read before and is
+absent now keeps its mark, its unsent answer and its tries, unless what little was read of
+the unidentified ones rules it out. It is cleaned up when a feed reads whole and it is not
+there, or when a read of that ask by itself says it closed (asked at most once a minute).
