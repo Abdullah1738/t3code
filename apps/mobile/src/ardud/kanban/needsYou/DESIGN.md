@@ -75,7 +75,11 @@ to zoom, swipe between), the attachment screen (video, audio, PDF, any other fil
 `MessageView`/`Composer` from `Chat.tsx`. On the attachment screen video and audio play in the
 app's own players. Only pictures, PDFs and formats the app can't show go to the system's
 viewer, and that wait has a time limit (20 seconds, more for a large file): then the screen
-says the file hasn't opened and offers "Try again" (`ardud/common/fileViewer.ts`). A video
+says the file hasn't opened and offers "Try again" (`ardud/common/fileViewer.ts`). Before
+that, the wait for the file itself has a limit of its own: the address of a file on the
+server (20 seconds), the text of a file that is read, a file on the phone. At it the request
+is dropped, so what comes late is not shown, and the screen says "The file hasn't loaded"
+with "Try again" (`useAttachmentDocument`). This holds for every kind of file. A video
 has the same limit on every attempt to load it: at the limit the attempt is stopped, the
 player says "The video hasn't loaded" and offers Retry. Every attempt asks the server for a
 fresh address, so Retry works on a screen left open past the hour an address is signed for;
@@ -161,6 +165,15 @@ stays there. The controls follow the same standing so they don't offer what the 
 stop: Retry, a reply and an Undo that writes are offered by `sends`. The toast's Undo for a
 held answer is always offered, because taking it back sends nothing (`toastUndo`,
 `toastUndoAllowed`).
+
+A file is written to the server too, three times over: its upload is created, its bytes are
+sent, and a copy nobody holds any more is deleted. Files for an answer and files on a reply
+under an ask go through the same gate. The upload helper is handed it and asks immediately
+before each of the three (`ardud/common/attachmentWriteGate.ts`), so an upload that was on
+its way when the phone stopped being his sends no bytes and deletes nothing. The field shows
+that file as "Not attached", with Retry for when the phone is his again. A delete the gate
+refuses is not tried again: the file is dropped here and its upload is left for the server,
+which drops one that no answer took.
 
 A call that comes back late acts only for the screen and server that started it
 (`useLateStanding`): nothing at all once the server changed, and no navigation, haptic or
