@@ -128,20 +128,32 @@ session could not be read, and the pairing notice when the phone is not his. The
 ask says the same in place of its buttons. A refusal from the server ("not the owner's
 device") turns the controls off again, whatever the session said before.
 
-Once the session has said owner, that stands while the session can't be read (no connection,
-or a new connection still reading it): `ownerSeen` in the store, kept per server for this run
-of the app and never stored. So he can answer offline and the answer waits as "Not sent". It
-ends with a refusal from the server, a session that says the phone is not his, or one that
-answers signed out; a phone the session never confirmed stays `checking`. The scope tells the
-store what the session says, with or without a screen up (`askScope.ts`).
+There are two standings, and they are kept apart (`useOwnerStanding` gives both).
 
-The same holds for what would go without a control being pressed again. The toast's Undo is
-offered for a held answer whatever the session says, because taking it back sends nothing; an
-Undo that writes (bringing a snoozed ask back) is offered only while the phone is known to be
-his, as it is at that moment, not as it was when he snoozed (`toastUndo`, `toastUndoAllowed`).
-An answer that never reached the server goes again by itself only while the session is known
-to be his and the server has not refused this phone since (`owner` on the scope's host);
-otherwise it waits as "Not sent" with its tries left.
+- **To fill in and queue** (`standing`). Once the session has said owner, that stands while
+  the session can't be read (no connection, or a new connection still reading it): `ownerSeen`
+  in the store, kept per server for this run of the app and never stored. So he can answer
+  offline and the answer waits as "Not sent". It ends with a refusal from the server, a session
+  that says the phone is not his, or one that answers signed out; a phone the session never
+  confirmed stays `checking`. The scope tells the store what the session says, with or without
+  a screen up (`askScope.ts`).
+- **To send** (`sends`). Nothing is written to the server unless ownership is confirmed now:
+  the connection is live, the session check made over that connection has come back saying
+  owner, and the server has not refused this phone since. What an earlier connection's session
+  said never sends anything. Every connection starts its own session check, so after a
+  reconnect a queued answer waits, however many times the feed reads first, and goes once that
+  check says owner. If it says the phone is not his, or signed out, nothing goes: the answer
+  stays "Not sent" and the phone shows as not his.
+
+One gate in the scope holds every write to that rule (`blocked` in `askScope.ts`, read by the
+screens as `writeBlocked`): an answer when its hold ends, a batch, a retry by itself or by
+hand, a reply, a hand-over, a snooze and the Undo that brings a snoozed ask back, and a
+secret. A write the gate stops fails as "Not sent" with the reason and keeps its tries. A
+secret is never queued: it is refused before it is taken from its field, so what he typed
+stays there. The controls follow the same standing so they don't offer what the gate would
+stop: Retry, a reply and an Undo that writes are offered by `sends`. The toast's Undo for a
+held answer is always offered, because taking it back sends nothing (`toastUndo`,
+`toastUndoAllowed`).
 
 A call that comes back late acts only for the screen and server that started it
 (`useLateStanding`): nothing at all once the server changed, and no navigation, haptic or
@@ -223,11 +235,17 @@ from an earlier one, they carry its time.
 The app's connection layer waits longer after every failed attempt, up to five minutes, and
 while it waits there is no live connection to call. The scope does not wait with it. It keeps
 the address and credential it last used over a live connection (in memory, for that server
-only) and, only while the layer is between attempts, sends its calls there. So the feed's own
+only) and, only while the layer is between attempts, reads the feed there. Only reads: a
+write needs a live connection and its session check (see "Whose phone"). So the feed's own
 poll finds the server as soon as it is back; that good read tells the layer to try now, at
-most once in 30 seconds. A credential the server no longer takes is dropped. When the
-connection is live again the feed is read at once, and the session is read again with every
-new connection and whenever the app comes to the front.
+most once in 30 seconds. A credential the server no longer takes is dropped.
+
+What comes back on a reconnect, in order: the connection layer brings up the connection and
+its session together; the board and shell streams follow that session; the scope reads the
+feed at once; and the session check for the new connection, which starts over with every
+connection, comes back by itself. A queued answer goes only after that last step says owner,
+on the read of the feed the scope makes at that moment. The session is also read again
+whenever the app comes to the front.
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached
 the server is kept in memory as "Not sent" and goes again by itself on the next good read of

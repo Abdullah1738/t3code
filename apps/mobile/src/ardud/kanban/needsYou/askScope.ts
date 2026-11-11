@@ -12,6 +12,7 @@
  * unit test: the host says which server is in use and how to reach it.
  */
 import {
+  ASK_NOT_OWNER_DEVICE_TEXT,
   AskApiError,
   createAskApi,
   createAskStateCell,
@@ -25,7 +26,12 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskSecretAnswerInput } from "@t3tools/contracts";
 
-import { ownerStanding, unreachedRetryTracker, type SessionRead } from "./logic";
+import {
+  ownerStanding,
+  ownerStandingBarText,
+  unreachedRetryTracker,
+  type SessionRead,
+} from "./logic";
 
 /**
  * How the app's connection to a server stands. `live`: there is one to call.
@@ -76,11 +82,24 @@ export interface AskScope {
   readonly serial: number;
   /** The one server this scope talks to. Never changes; null is "no server". */
   readonly environmentId: string | null;
+  /**
+   * The server calls. Reads go whenever the server can be reached. Every write
+   * (an answer, a batch, a reply, a hand-over, a snooze or its undo, a secret)
+   * goes through one gate and leaves the phone only when `writeBlocked` is null.
+   */
   readonly api: AskApi;
   readonly cell: AskStateCell;
   readonly asks: AskStore;
   /** False once its server is no longer the one in use. */
   readonly live: () => boolean;
+  /**
+   * Why nothing may be written to the server at this moment, in words to show,
+   * or null when a write may go. A write goes only over a live connection whose
+   * own session check has come back saying this phone is the owner's, with no
+   * refusal from the server since. What the session said on an earlier
+   * connection lets him fill in and queue an answer; it never sends one.
+   */
+  readonly writeBlocked: () => string | null;
 }
 
 export interface AskScopes {
@@ -119,7 +138,35 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
     let kept: AskApiTarget | null = null;
     let keptUsed = false;
     const send = host.fetch ?? fetch;
-    const api = createAskApi({
+    const cell = createAskStateCell();
+    // The one gate for everything that writes. Ownership has to be confirmed
+    // now: for this server, over the connection that is up now. The session
+    // check of a connection starts over with every new connection, so until it
+    // answers "owner" nothing is transmitted, whatever an earlier one said.
+    // The kept address above is therefore only ever used to read.
+    const blocked = (): AskApiError | null => {
+      const id = mine();
+      if (id === null || host.connection(id) !== "live") {
+        return new AskApiError(0, "offline", NOT_CONNECTED);
+      }
+      const refusal = cell.getState().notOwner;
+      const standing = ownerStanding(host.session(id), refusal !== null);
+      if (standing === "owner") return null;
+      return new AskApiError(
+        0,
+        "unconfirmed",
+        standing === "notOwner"
+          ? (refusal?.text ?? ASK_NOT_OWNER_DEVICE_TEXT)
+          : ownerStandingBarText(standing, "answer"),
+      );
+    };
+    const gated =
+      <A extends ReadonlyArray<unknown>, R>(write: (...args: A) => Promise<R>) =>
+      (...args: A): Promise<R> => {
+        const why = blocked();
+        return why === null ? write(...args) : Promise.reject(why);
+      };
+    const calls = createAskApi({
       target: () => {
         const id = mine();
         if (id === null) throw new AskApiError(0, "offline", NOT_CONNECTED);
@@ -142,11 +189,32 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       }) as typeof fetch,
       answerSecrets: async (input) => {
         const id = mine();
-        if (id === null) return { _tag: "offline" };
+        // Asked again at the last step before the socket: a secret never leaves unconfirmed.
+        if (id === null || blocked() !== null) return { _tag: "offline" };
         return host.sendSecrets(id, input);
       },
     });
-    const cell = createAskStateCell();
+    const api: AskApi = {
+      // Reads.
+      feed: calls.feed,
+      detail: calls.detail,
+      message: calls.message,
+      // Writes: each one asks the gate at the moment it would leave.
+      answer: gated(calls.answer),
+      answerBatch: gated(calls.answerBatch),
+      reply: gated(calls.reply),
+      hand: gated(calls.hand),
+      handBatch: gated(calls.handBatch),
+      snooze: gated(calls.snooze),
+      snoozeBatch: gated(calls.snoozeBatch),
+      // A secret's refusal is a value, not a throw, and is said without the request.
+      answerSecrets: async (input, revision) => {
+        const why = blocked();
+        return why === null
+          ? calls.answerSecrets(input, revision)
+          : { _tag: "refused", failure: { message: why.message, stale: false, field: null } };
+      },
+    };
     const asks = createAskStore({
       api,
       cell,
@@ -157,17 +225,10 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
     // sent". Once the feed has been read with success a while after it failed,
     // the server is reachable: the answer goes once more, by itself, while it
     // has tries left (`unreachedRetryTracker`). Sending is the owner's alone, so
-    // it goes by itself only while the session is known to be his and the
-    // server has not refused this phone since: asked at the moment it would go.
-    // "Known to be his" is what the answer controls go by too (`ownerStanding`):
-    // the session says so now, or said so before the connection went and
-    // nothing has said otherwise since.
-    const ownerNow = (): boolean => {
-      const id = mine();
-      if (id === null) return false;
-      const state = cell.getState();
-      return ownerStanding(host.session(id), state.notOwner !== null, state.ownerSeen) === "owner";
-    };
+    // it goes by itself only when a write may go at all (`blocked`): asked at
+    // the moment it would go. After a reconnect the feed can read before the new
+    // connection's session check is back; the answer then waits for that check.
+    const ownerNow = (): boolean => blocked() === null;
     const retries = unreachedRetryTracker();
     let readsSeen = 0;
     let reconnectAt: number | null = null;
@@ -214,6 +275,14 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       if (owner === noted) return;
       noted = owner;
       asks.noteOwnerStanding(owner);
+      // This connection's check says owner. An answer that waited for it goes on
+      // the next good read of the feed, so the feed is read now, not at the next poll.
+      if (
+        owner === true &&
+        Object.values(cell.getState().failed).some((failed) => failed.unreached === true)
+      ) {
+        void asks.refreshAsks();
+      }
     };
     // The connection is back: the feed is read at once, not at the next poll.
     // The session reads itself again with every new connection.
@@ -246,6 +315,7 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       cell,
       asks,
       live: () => mine() !== null,
+      writeBlocked: () => blocked()?.message ?? null,
     };
     closers.set(scope, () => {
       if (closed) return;

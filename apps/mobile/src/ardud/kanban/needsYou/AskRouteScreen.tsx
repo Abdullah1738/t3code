@@ -240,7 +240,7 @@ function OpenAsk(props: {
 }) {
   // The store and the server calls of the server this ask was read from: an
   // answer or a secret started here can go nowhere else.
-  const { asks, api: askApi } = useAskScope();
+  const { asks, api: askApi, writeBlocked } = useAskScope();
   const late = useLateStanding();
   const { entry, item, nowMs } = props;
   const nav = useNeedsYouNav();
@@ -257,7 +257,8 @@ function OpenAsk(props: {
   const marks = useAsk((state) => state.marks);
   const mark = needsYouMarkOf(item, marks);
   const failed = useAsk((state) => state.failed[key]);
-  const { standing } = useOwnerStanding();
+  // `standing` to fill in and queue by, `sends` to send by (see `useOwnerStanding`).
+  const { standing, sends } = useOwnerStanding();
   const previous = useAsk((state) => state.previous[key]);
   const changeView = useAsk((state) => state.changeView);
   const [noteOpen, setNoteOpen] = useState(false);
@@ -395,6 +396,14 @@ function OpenAsk(props: {
     }
     const input = askSecretAnswerInput(entry.cardId, ask, now.body, secrets);
     if (input !== null) {
+      // A secret is never queued, so it goes now or not at all. Asked before it is
+      // taken from the field: what he typed stays there for when it can go.
+      const why = writeBlocked();
+      if (why !== null) {
+        setSecretError(`Not sent. ${why}`);
+        stopped(why);
+        return;
+      }
       void sendSecrets(input, now.label);
       return;
     }
@@ -536,7 +545,9 @@ function OpenAsk(props: {
           <Band
             tone="negative"
             action={
-              readOnly ? undefined : { label: "Retry", onPress: () => asks.retryAskSend(key) }
+              sends === "owner"
+                ? { label: "Retry", onPress: () => asks.retryAskSend(key) }
+                : undefined
             }
           >
             Not sent. {failed.message}

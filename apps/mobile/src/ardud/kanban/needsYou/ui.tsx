@@ -265,14 +265,15 @@ export function AskToastBar(props: {
   const asks = useAsks();
   const toast = useAsk((state) => state.toast);
   const held = useAsk((state) => state.held);
-  // Sending again is an answer: only for a phone known to be his.
-  const { standing } = useOwnerStanding();
-  const canSend = standing === "owner";
+  // Sending again is an answer: only for a phone the connection that is up now has
+  // confirmed as his. What an earlier connection said queues an answer; it sends none.
+  const { sends } = useOwnerStanding();
+  const canSend = sends === "owner";
   const [now, setNow] = useState(Date.now);
   // Taking back a held answer sends nothing and is always his to do. Undoing a
   // snooze writes to the server: only for a phone known to be his, as it is now
   // (the session may have gone unchecked or been refused since the snooze).
-  const undoable = toastUndoAllowed(toastUndo(toast, held?.payload.id ?? null), standing);
+  const undoable = toastUndoAllowed(toastUndo(toast, held?.payload.id ?? null), sends);
   const counting = toast?.undoSendId !== undefined && held?.payload.id === toast.undoSendId;
   useEffect(() => {
     if (!counting) return;

@@ -730,7 +730,11 @@ export function toastUndo(
   return null;
 }
 
-/** Whether Undo is offered: always for a held answer, for a write only to the owner. */
+/**
+ * Whether Undo is offered: always for a held answer, for a write only to the
+ * owner. `standing` is the standing to send by (`sends` of `useOwnerStanding`):
+ * the session of the connection that is up now, not what an earlier one said.
+ */
 export const toastUndoAllowed = (undo: "held" | "write" | null, standing: OwnerStanding): boolean =>
   undo === "held" || (undo === "write" && standing === "owner");
 

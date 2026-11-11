@@ -121,7 +121,7 @@ vi.mock("./askStore", () => ({
   useAskScope: () => ui.scope.current,
   useAsks: () => (ui.scope.current as { asks: unknown }).asks,
   useLateStanding: () => () => "here",
-  useOwnerStanding: () => ({ standing: "owner", recheck: () => undefined }),
+  useOwnerStanding: () => ({ standing: "owner", sends: "owner", recheck: () => undefined }),
   useWatchAsks: () => undefined,
 }));
 vi.mock("./nav", () => ({ useNeedsYouNav: () => ({}) }));

@@ -252,9 +252,16 @@ const NO_SESSION = Atom.make(AsyncResult.initial<AuthSessionState>());
  * A phone the session already confirmed as his stays `owner` while there is no
  * connection to read it again, so he can answer and the answer waits as "Not
  * sent"; a refusal from the server ends that. `recheck` reads the session again.
+ *
+ * Two standings come back. `standing` is the one to fill in and queue by; it
+ * keeps what an earlier connection's session said. `sends` is the one to send
+ * by: only what the session of the connection that is up now has said. Every
+ * control that writes at once (Retry, an Undo that writes, a reply) goes by
+ * `sends`; the scope's own gate holds whatever a control lets through.
  */
 export function useOwnerStanding(): {
   readonly standing: OwnerStanding;
+  readonly sends: OwnerStanding;
   readonly recheck: () => void;
 } {
   const { environmentId } = useAskScope();
@@ -268,7 +275,12 @@ export function useOwnerStanding(): {
   // The scope tells the store what the session says (`askScope.ts`), screen or no screen.
   const seen = useAsk((state) => state.ownerSeen);
   const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);
-  return { standing: ownerStanding(sessionRead(result), refused, seen), recheck };
+  const read = sessionRead(result);
+  return {
+    standing: ownerStanding(read, refused, seen),
+    sends: ownerStanding(read, refused),
+    recheck,
+  };
 }
 
 /**

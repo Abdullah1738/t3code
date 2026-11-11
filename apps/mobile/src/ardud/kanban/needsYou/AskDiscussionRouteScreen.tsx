@@ -117,7 +117,8 @@ export function AskTalk(props: {
   const { asks, api } = useAskScope();
   const late = useLateStanding();
   const { entry } = props;
-  const { standing } = useOwnerStanding();
+  // A reply is sent at once and never queued: it goes by the standing to send by.
+  const { sends: standing } = useOwnerStanding();
   // What was said counts; older versions of the ask sit between, folded away.
   const thread = askThread(entry);
   // The feed cuts big blocks short. "Show full" reads that one message whole,

@@ -531,26 +531,30 @@ describe("an answer that never reached the server", () => {
     await scope.asks.refreshAsks();
     expect(h.standing()).toBe("checking");
     const ask = scope.cell.getState().feed!.open[0]!;
-    h.writesDown.add("A");
+    // The screens would not let him answer; the store is asked all the same.
     scope.asks.answerAsk(ask, "primary");
     await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
-    h.writesDown.delete("A");
-    expect(h.answers("A")).toHaveLength(1);
+    // Its hold ran out and it did not leave the phone.
+    expect(h.answers()).toHaveLength(0);
 
     for (let n = 0; n < 3; n += 1) {
       await aWhile();
       await read(h);
     }
-    expect(h.answers("A")).toHaveLength(1);
-    // The answer is still there, with every try left and Retry by hand for when he is known.
-    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
-    expect(scope.cell.getState().failed[askKey(ask)]?.send.autoRetries).toBeUndefined();
+    expect(h.answers()).toHaveLength(0);
+    // The answer is still there, with every try left, and says why it waits.
+    const waiting = scope.cell.getState().failed[askKey(ask)];
+    expect(waiting?.unreached).toBe(true);
+    expect(waiting?.send.autoRetries).toBeUndefined();
+    expect(waiting?.message).toBe("Checking that this phone is yours…");
 
+    // The session answers owner: the scope reads the feed and the answer goes on that read.
     h.setSession("A", true);
     expect(h.standing()).toBe("owner");
-    await aWhile();
-    await read(h);
-    expect(h.answers("A")).toHaveLength(2);
+    await settle();
+    h.runDeferred();
+    await settle();
+    expect(h.answers("A")).toHaveLength(1);
     expect(scope.cell.getState().failed).toEqual({});
   });
 
@@ -651,17 +655,35 @@ describe("a phone the session confirmed as his, when the connection goes", () =>
     }
     expect(h.answers("A")).toHaveLength(0);
 
-    // The connection is back. The scope reads the feed by itself, and the answer goes
-    // on that read: the session is still on its way, and he was confirmed before.
+    // The connection is back and the scope reads the feed by itself. The new
+    // connection's own session check is still on its way: he was confirmed on
+    // the last connection, which lets him answer and sends nothing.
     h.setConnection("A", "live");
     await settle();
     expect(scope.cell.getState().error).toBeNull();
     await decide(h);
+    expect(h.answers()).toHaveLength(0);
+    // However he presses Retry, and however many good reads come first.
+    scope.asks.retryAskSend(askKey(ask));
+    await settle();
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await scope.asks.refreshAsks();
+      await decide(h);
+    }
+    expect(h.answers()).toHaveLength(0);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(scope.writeBlocked()).toBe("Checking that this phone is yours…");
+
+    // This connection's session says owner: now it goes, without waiting for a poll.
+    h.setSession("A", true);
+    expect(scope.writeBlocked()).toBeNull();
+    await settle();
+    await decide(h);
     expect(h.answers("A")).toHaveLength(1);
     expect(scope.cell.getState().failed).toEqual({});
 
-    // The session reads again and more reads follow: it was sent once, and only once.
-    h.setSession("A", true);
+    // More reads follow: it was sent once, and only once.
     for (let n = 0; n < 3; n += 1) {
       await aWhile();
       await scope.asks.refreshAsks();
@@ -669,6 +691,173 @@ describe("a phone the session confirmed as his, when the connection goes", () =>
     }
     expect(h.answers("A")).toHaveLength(1);
     expect(h.standing()).toBe("owner");
+  });
+
+  /** He was confirmed, went offline, and left an answer waiting as "Not sent". */
+  const queuedOffline = async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.setConnection("A", "down");
+    h.setSession("A", "out");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await decide(h);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    return { h, scope, ask };
+  };
+
+  /** The connection returns and the feed reads, several times, before the session answers. */
+  const reconnects = async (h: ReturnType<typeof harness>) => {
+    h.setConnection("A", "live");
+    await settle();
+    await decide(h);
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await h.scopes.current().asks.refreshAsks();
+      await decide(h);
+    }
+  };
+
+  it("sends nothing at all through a recovery that ends with the phone not his", async () => {
+    const { h, scope, ask } = await queuedOffline();
+    await reconnects(h);
+    expect(h.answers()).toHaveLength(0);
+
+    // The session of the new connection says this phone is not the owner's.
+    h.setSession("A", false);
+    await reconnects(h);
+    scope.asks.retryAskSend(askKey(ask));
+    await settle();
+    await decide(h);
+    expect(h.answers()).toHaveLength(0);
+    expect(h.secretSends).toEqual([]);
+    // The answer shows as not sent, and the phone as not his.
+    expect(scope.cell.getState().failed[askKey(ask)]).toBeDefined();
+    expect(scope.cell.getState().notOwner).not.toBeNull();
+    expect(h.standing()).toBe("notOwner");
+    expect(scope.writeBlocked()).toBe(scope.cell.getState().notOwner?.text);
+  });
+
+  it("sends nothing at all through a recovery that ends signed out", async () => {
+    const { h, scope, ask } = await queuedOffline();
+    await reconnects(h);
+    h.setSession("A", "signedOut");
+    await reconnects(h);
+    scope.asks.retryAskSend(askKey(ask));
+    await settle();
+    await decide(h);
+    expect(h.answers()).toHaveLength(0);
+    expect(scope.cell.getState().failed[askKey(ask)]).toBeDefined();
+    expect(h.standing()).toBe("unchecked");
+    expect(scope.writeBlocked()).toBe("Couldn't check that this phone is yours.");
+  });
+
+  it("an Undo that writes does not go while this connection's session is unread, or says not his", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    await scope.asks.snoozeAsks([ask], "2026-11-12T05:00:00.000Z", "tomorrow 09:00");
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().toast?.undoSnooze).toBeDefined();
+
+    // The connection drops and comes back; its session check is still out.
+    h.setConnection("A", "down");
+    h.setSession("A", "out");
+    h.setConnection("A", "live");
+    await settle();
+    expect(h.standing()).toBe("owner");
+    scope.asks.undoAskSend();
+    await settle();
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().toast?.text).toBe(
+      "Couldn't bring it back. Checking that this phone is yours…",
+    );
+
+    // Snoozing again, bringing one back and handing one over are writes too.
+    await scope.asks.snoozeAsks([ask], "2026-11-12T05:00:00.000Z", "tomorrow 09:00");
+    await scope.asks.snoozeAsks([ask], null, "");
+    await expect(scope.asks.replyOnAsk(ask, [{ _tag: "md", text: "hello" }])).rejects.toThrow();
+    expect(h.answers("A")).toHaveLength(1);
+
+    h.setSession("A", false);
+    await scope.asks.snoozeAsks([ask], null, "");
+    await settle();
+    expect(h.answers("A")).toHaveLength(1);
+  });
+
+  it("a secret does not go while this connection's session is unread, or says not his", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setConnection("A", "down");
+    h.setSession("A", "out");
+    expect(await scope.api.answerSecrets(SECRET_INPUT, 0)).toEqual({
+      _tag: "refused",
+      failure: { message: "Not connected to Robob.", stale: false, field: null },
+    });
+
+    h.setConnection("A", "live");
+    const unread = await scope.api.answerSecrets(SECRET_INPUT, 0);
+    expect(unread).toEqual({
+      _tag: "refused",
+      failure: { message: "Checking that this phone is yours…", stale: false, field: null },
+    });
+    // What it says never carries the request.
+    expect(JSON.stringify(unread)).not.toContain("s3cr3t");
+
+    h.setSession("A", false);
+    expect((await scope.api.answerSecrets(SECRET_INPUT, 0))._tag).toBe("refused");
+    h.setSession("A", "signedOut");
+    expect((await scope.api.answerSecrets(SECRET_INPUT, 0))._tag).toBe("refused");
+    expect(h.secretSends).toEqual([]);
+    expect(h.requests.filter((request) => request.method !== "GET")).toEqual([]);
+
+    // Confirmed on this connection: it goes, once.
+    h.setSession("A", true);
+    expect((await scope.api.answerSecrets(SECRET_INPUT, 0))._tag).toBe("sent");
+    expect(h.secretSends).toEqual(["A"]);
+  });
+
+  it("every call that writes is behind the same gate; reads are not", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setSession("A", "out");
+    const reads = new Set(["feed", "detail", "message"]);
+    const writes = Object.keys(scope.api).filter((name) => !reads.has(name));
+    // A call added to the api later has to be named here as a read, or be gated.
+    expect(writes.toSorted()).toEqual([
+      "answer",
+      "answerBatch",
+      "answerSecrets",
+      "hand",
+      "handBatch",
+      "reply",
+      "snooze",
+      "snoozeBatch",
+    ]);
+    const before = h.requests.length;
+    for (const name of writes) {
+      const call = (scope.api as unknown as Record<string, (...args: Array<unknown>) => unknown>)[
+        name
+      ]!;
+      await Promise.resolve(
+        name === "answerSecrets"
+          ? call(SECRET_INPUT, 0)
+          : name.endsWith("Batch")
+            ? call(name === "answerBatch" ? {} : [], name === "answerBatch" ? [] : {})
+            : call("robob:1", "q1", name === "reply" ? [] : {}, 0),
+      ).catch(() => undefined);
+    }
+    expect(h.requests).toHaveLength(before);
+    expect(h.secretSends).toEqual([]);
+    // Reading goes on.
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before + 1);
+    expect(h.requests.at(-1)?.method).toBe("GET");
   });
 
   it("a refusal from the server ends it, and the session coming back unread does not restore it", async () => {
@@ -795,7 +984,7 @@ describe("while the connection layer waits to try again", () => {
     expect(h.reconnects).toEqual(["A", "A"]);
   });
 
-  it("an answer goes to that server too", async () => {
+  it("the kept address is only read from: an answer waits for a live connection", async () => {
     const h = harness();
     const scope = h.scopes.current();
     await scope.asks.refreshAsks();
@@ -803,9 +992,16 @@ describe("while the connection layer waits to try again", () => {
     h.setConnection("A", "waiting");
     scope.asks.answerAsk(ask, "primary");
     await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
-    expect(h.answers("A")).toHaveLength(1);
-    expect(h.answers("B")).toHaveLength(0);
-    expect(scope.cell.getState().failed).toEqual({});
+    expect(h.answers()).toHaveLength(0);
+    expect(scope.cell.getState().failed[askKey(ask)]).toMatchObject({
+      unreached: true,
+      message: "Not connected to Robob.",
+    });
+    // The read still goes there, and finds the server.
+    const before = h.requests.length;
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before + 1);
+    expect(h.requests.at(-1)?.method).toBe("GET");
   });
 
   it("nothing is asked for when the connection is off, refused or the phone is offline", async () => {
