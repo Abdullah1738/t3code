@@ -12,7 +12,8 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, replyQuote, replyText, ROTATE_NUDGE, Router, SYNTHETIC_RETRY_MS, syntheticDropped, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, OWNER_GIVE_UP_MS, OWNER_RESEND_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
 import { RobobBackend } from "../src/robob.ts";
 import type { ThreadDetail } from "../src/control.ts";
@@ -5305,4 +5306,321 @@ test("a held failure notice is sent once the grace passes with no recovery", asy
   setSystemTime(new Date("2026-09-10T12:06:00Z"));
   await h.router.tick();
   expect(h.controls().map(c => [c.replyTo, c.text])).toEqual([["in", "Something went wrong on my end with that one. Mind trying again?"]]);
+});
+
+// Tool mode (replyMode "tool"): the agent texts the chat itself with imessage_send, which queues
+// session-bound conversation rows through the bridge API; the bridge never forwards assistant text.
+const toolSetup = (overrides: Partial<ConstructorParameters<typeof Router>[3]> = {}) => setup(":memory:", { replyMode: "tool", ...overrides });
+/** What the bridge API queues for `imessage_send` / `cli.ts send` on the live route. */
+function agentSends(h: ReturnType<typeof setup>, key: string, text: string, generation = 1, sessionId = "ses_1") {
+  h.store.enqueue({ id: `send:${key}`, kind: "conversation", text, sessionId, generation });
+}
+const nudgeRows = (store: Store) => inbounds(store).filter(row => row.id.startsWith("wake:reply-nudge:"));
+
+test("replyMode config defaults to final and accepts only final or tool", () => {
+  expect(replyModeConfig(undefined)).toBe("final");
+  expect(replyModeConfig("final")).toBe("final");
+  expect(replyModeConfig("tool")).toBe("tool");
+  for (const bad of ["Tool", "", null, 1, {}]) expect(() => replyModeConfig(bad)).toThrow("Invalid bridge configuration");
+});
+
+test("tool mode: final and earlier assistant text never reach the chat, and the turn still settles", async () => {
+  const events: string[][] = [];
+  const h = toolSetup({ log: (event, code) => events.push([event, code ?? ""]) });
+  h.input("in_1", "What's on today?");
+  await h.router.tick();
+  expect(h.store.get<{ outbox?: number }>("activeTurn")!.outbox).toBe(0);
+  // An answer-phase step the final mode would forward early, then the agent texts the chat itself, then its internal final note.
+  const earlier = h.backend.step("Earlier words");
+  earlier.answer = true;
+  agentSends(h, "today", "Gym at 6, dinner with Moni at 8");
+  const final = h.backend.final("Sent the day's plan.");
+  const idle = h.backend.records.at(-1)!;
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([["send:today", "Gym at 6, dinner with Moni at 8"]]);
+  expect(h.store.pendingOutbox().some(op => op.id.startsWith("reply:"))).toBe(false);
+  expect(h.store.getOperation(`reply:1:${final.id}`)).toBeUndefined();
+  expect(inbounds(h.store).find(row => row.id === "in_1")?.state).toBe("done");
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get<unknown>("watermark")).toEqual({ sessionId: "ses_1", id: idle.id });
+  expect(h.store.get<number>("settledAt")).toBeNumber();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(events.some(([event]) => event === "reply-enqueued")).toBe(false);
+  // The next text runs as usual.
+  h.input("in_2", "Thanks");
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["What's on today?", "Thanks"]);
+});
+
+test("tool mode: a typed message whose turn texted nothing gets exactly one reminder", async () => {
+  const h = toolSetup();
+  h.input("in_1", "Did the parcel come?");
+  await h.router.tick();
+  h.backend.final("Checked: it arrived at 10:12.");
+  await h.router.tick();
+  // Queued during the settle, so it is sealed on the next tick like any arrival mid-tick.
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "in_1")?.state).toBe("done");
+  const [nudge] = nudgeRows(h.store);
+  expect(nudge!.payload.text).toBe(REPLY_NUDGE);
+  expect(REPLY_NUDGE).toBe("[Bridge request, not typed by the owner.] You finished without texting anything to the chat. If they need an answer, send it now with imessage_send; otherwise just end the turn.");
+  expect(h.store.get<boolean>("reply-nudged:in_1")).toBe(true);
+  // The reminder runs as its own bridge turn, with the wake guidance and no reaction targets.
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Did the parcel come?", REPLY_NUDGE]);
+  const system = h.backend.prompts[1]!.system!;
+  expect(system.startsWith(`${wakeGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  expect(system).toContain("Source incoming message IDs (in order, available as reaction targets): []");
+  // The reminder's own turn ends with nothing texted too: no second reminder, ever.
+  h.backend.final("They don't need anything else.");
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(nudgeRows(h.store)).toHaveLength(1);
+  expect(h.backend.prompts).toHaveLength(2);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.pendingInbound()).toEqual([]);
+  expect(h.conversations()).toEqual([]);
+});
+
+test("tool mode: a reminded turn that then texts the chat settles normally", async () => {
+  const h = toolSetup();
+  h.input("in_1", "Book it");
+  await h.router.tick();
+  h.backend.final("Booked.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(REPLY_NUDGE);
+  agentSends(h, "booked", "Booked for 7pm");
+  h.backend.final("Told them.");
+  await h.router.tick();
+  expect(h.conversations().map(op => op.text)).toEqual(["Booked for 7pm"]);
+  expect(nudgeRows(h.store).map(row => row.state)).toEqual(["done"]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("tool mode: no reminder for watcher turns, background follow-ups, turns that sent, or a deliberate NO_REPLY", async () => {
+  const h = toolSetup({ watchMs: 0 });
+  // A watcher wake that logs and stays quiet.
+  h.input(`wake:${"f".repeat(64)}`, "[Watcher event from watch, not typed by the owner.]\nroutine");
+  await h.router.tick();
+  h.backend.final("Logged it.");
+  await h.router.tick();
+  // A typed turn that texted the chat (a file counts, like a send, app card or poll).
+  h.input("in_1", "Send me the chart");
+  await h.router.tick();
+  h.store.enqueue({ id: "file:chart", kind: "conversation", text: "", sessionId: "ses_1", generation: 1 });
+  h.backend.final("Sent the chart.");
+  await h.router.tick();
+  // A typed turn answered with only a tapback, ending in NO_REPLY on purpose.
+  h.input("in_2", "Thanks!");
+  await h.router.tick();
+  h.backend.final("Reacted with a heart.\nNO_REPLY");
+  await h.router.tick();
+  // Background follow-up work the agent resumed on its own.
+  h.backend.step("Background result noted");
+  h.backend.settle();
+  for (let i = 0; i < 3; i++) await h.router.tick();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["[Watcher event from watch, not typed by the owner.]\nroutine", "Send me the chart", "Thanks!"]);
+  expect(h.conversations().map(op => op.id)).toEqual(["file:chart"]);
+  expect(h.store.get("activeTurn")).toBeNull();
+});
+
+test("tool mode: /new asks with the tool wording, and a refusal sent with imessage_send defers the reset", async () => {
+  const start = Date.parse("2026-11-09T12:00:00Z");
+  setSystemTime(start);
+  const h = toolSetup({ resetIdleMs: 10 * 60_000 });
+  h.backend.resets = true;
+  h.input("first", "Start the audit in the background");
+  await h.router.tick();
+  agentSends(h, "onit", "On it");
+  h.backend.final("Started the audit.");
+  await h.router.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent", `provider-${op.id}`);
+  h.input("new", "/new");
+  await h.router.tick();
+  expect(h.controls().map(op => op.text)).toEqual(["Fresh start. What's up?"]);
+  await h.router.tick();
+  const nudge = h.backend.prompts.at(-1)!;
+  expect(nudge.text).toBe(newChatNudge("tool"));
+  expect(nudge.text).toContain("send the owner one short line with the imessage_send tool");
+  expect(nudge.text).not.toContain("NO_REPLY");
+  // The agent can't reset yet and texts the owner why; its final note stays internal.
+  agentSends(h, "refused", "Can't start fresh yet, the audit is still running.", 2);
+  h.backend.final("t3_context_reset refused: background work.");
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.text, op.generation])).toEqual([["Can't start fresh yet, the audit is still running.", 2]]);
+  expect(h.store.get<{ generation: number }>("newDeferred")).toMatchObject({ generation: 2 });
+  // A reset nudge is a bridge row: never reminded.
+  expect(nudgeRows(h.store)).toEqual([]);
+  // Once idle for the reset window with nothing said since, the reset is asked for again, once.
+  setSystemTime(start + 11 * 60_000);
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.filter(p => p.text === newChatNudge("tool"))).toHaveLength(2);
+});
+
+test("tool mode: a /new nudge the agent handles silently leaves no deferral", async () => {
+  const h = toolSetup();
+  h.backend.resets = true;
+  h.input("first", "Hi");
+  await h.router.tick();
+  agentSends(h, "hi", "Hey");
+  h.backend.final("Greeted.");
+  await h.router.tick();
+  h.input("new", "/new");
+  await h.router.tick();
+  await h.router.tick();
+  h.backend.final("Reset done.");
+  await h.router.tick();
+  expect(h.store.get("newDeferred")).toBeNull();
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.conversations().map(op => op.text)).toEqual(["Hey"]);
+});
+
+test("tool mode: every prompt carries the marker and the imessage_send instructions; final mode keeps the old wording", async () => {
+  const h = toolSetup();
+  const steers = steering(h.backend);
+  h.input("in_1", "Hi");
+  await h.router.tick();
+  h.input("in_2", "And another thing");
+  await h.router.tick();
+  agentSends(h, "both", "Both done");
+  h.backend.final("Answered both.");
+  await h.router.tick();
+  h.input(`wake:${"a".repeat(64)}`, "[Watcher event from watch, not typed by the owner.]\nprice moved");
+  await h.router.tick();
+  const [typed, woken] = h.backend.prompts.map(p => p.system!);
+  for (const system of [typed!, woken!]) {
+    expect(system).toContain(TOOL_MODE_MARKER);
+    expect(system).toContain(toolReplyRules());
+    expect(system).toContain("CURRENT_SESSION_ID for bridge commands: ses_1@1.");
+    expect(system).not.toContain("Your primary response is forwarded automatically");
+    expect(system).not.toContain("end your reply with exactly NO_REPLY");
+  }
+  expect(TOOL_MODE_MARKER).toBe("Your final message is not sent to the chat.");
+  expect(typed!.startsWith(`${imessageGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  expect(woken!.startsWith(`${wakeGuidance({ replyMode: "tool" })}\n`)).toBe(true);
+  for (const rule of ["`imessage_send` tool (T3 Code MCP)", "`session` set to CURRENT_SESSION_ID", "send --session CURRENT_SESSION_ID --key UNIQUE_KEY --text TEXT",
+    "send each message once", "imessage_send with `file`", "Ending the turn without a send means nothing was texted", "NO_REPLY is no longer needed there, though still accepted"]) {
+    expect(typed).toContain(rule);
+  }
+  expect(steers[0]!.guidance).toContain(TOOL_MODE_MARKER);
+  expect(steers[0]!.guidance).not.toContain("your final reply still goes to the chat");
+  // Final mode is untouched.
+  const f = setup();
+  const finalSteers = steering(f.backend);
+  f.input("in_1", "Hi");
+  await f.router.tick();
+  f.input("in_2", "More");
+  await f.router.tick();
+  expect(f.backend.prompts[0]!.system).toContain("Your primary response is forwarded automatically, unless it ends with NO_REPLY.");
+  expect(f.backend.prompts[0]!.system).not.toContain(TOOL_MODE_MARKER);
+  expect(finalSteers[0]!.guidance).toContain("your final reply still goes to the chat");
+  expect(imessageGuidance()).not.toContain("imessage_send");
+});
+
+test("tool mode: a configured custom prompt still carries the marker", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "spectrum-router-config-"));
+  directories.push(configRoot);
+  writeFileSync(join(configRoot, "opencode.jsonc"), `{ "imessage": { "prompt": "Custom texting guidance: KEEP IT SHORT." } }`);
+  const h = toolSetup({ openCodeConfigRoot: configRoot });
+  h.input("in_1", "Hi");
+  await h.router.tick();
+  const system = h.backend.prompts[0]!.system!;
+  expect(system.startsWith("Custom texting guidance: KEEP IT SHORT.\n")).toBe(true);
+  expect(system).toContain(TOOL_MODE_MARKER);
+});
+
+test("tool mode: the Sendblue chat prompt talks about sending, not replies", () => {
+  const ctx = (kind: "owner" | "dm" | "group") => ({
+    chat: kind === "group" ? { key: "group:abc", slug: "group-friends", kind, title: "Friends" }
+      : kind === "owner" ? { key: "dm:+15555550123", slug: "owner", kind, title: "Abdullah" }
+        : { key: "dm:+971585933213", slug: "moni", kind, title: "Moni" },
+    roleOf: () => ({ name: "Moni", role: "admin" as const }), typing: () => false, react: async () => {},
+  }) as unknown as ChatContext;
+  const moni = sendblueContextPrompt(ctx("dm"), false, [], false, "tool");
+  expect(moni).toContain("Who reads your messages: everything you send here goes to Moni");
+  expect(moni).not.toContain("otherwise end with exactly NO_REPLY");
+  expect(moni).toContain("with no message, ending your turn with NO_REPLY");
+  const group = sendblueContextPrompt(ctx("group"), false, [], false, "tool");
+  expect(group).toContain("send nothing, send no tapback, and end your turn with NO_REPLY");
+  const owner = sendblueContextPrompt(ctx("owner"), false, [], false, "tool");
+  expect(owner).toContain("`imessage_send` with `to` set to the slug");
+  expect(sendblueContextPrompt(ctx("dm"), false, [])).toContain("Who reads your replies");
+});
+
+test("tool mode: group follow-up engagement comes from what was texted, not the internal final", async () => {
+  const group = {
+    chat: { key: "group:abc123", slug: "group-friends", kind: "group", title: "Friends" },
+    roleOf: (address: string) => address === "+971585933213" ? { name: "Moni", role: "admin" } : { name: address, role: "guest" },
+    typing: () => false, react: async () => {},
+  } as unknown as ChatContext;
+  const h = toolSetup({ context: group, chatGuid: "group:abc123" });
+  h.input("g1", "Robob what time is dinner", { sender: "+971585933213" });
+  await h.router.tick();
+  agentSends(h, "ask", "Which day do you mean?");
+  h.backend.final("Asked which day.");
+  await h.router.tick();
+  expect(h.store.get<number>("group-engaged:+971585933213")).toBeNumber();
+  // The internal final asks something, but what was texted does not: the window closes.
+  h.input("g2", "Robob book the table", { sender: "+971585933213" });
+  await h.router.tick();
+  agentSends(h, "done", "Booked.");
+  h.backend.final("Shall I tell Tom too?");
+  await h.router.tick();
+  expect(h.store.get("group-engaged:+971585933213")).toBeNull();
+  expect(nudgeRows(h.store)).toEqual([]);
+});
+
+test("tool mode: a rotation recap quotes what was texted, not the internal final notes", async () => {
+  const start = Date.parse("2026-11-09T12:00:00Z");
+  setSystemTime(start);
+  const h = toolSetup({ rotateAfterMs: 60_000 });
+  h.input("first", "Remember the blue one");
+  await h.router.tick();
+  setSystemTime(start + 1_000);
+  agentSends(h, "noted", "Noted, the **blue** one");
+  h.store.outboxState("send:noted", "sent", "provider-noted");
+  h.store.set("sent-at:send:noted", start + 1_000);
+  // Queued but never delivered: not part of what the owner saw.
+  agentSends(h, "lost", "LOST MESSAGE");
+  h.store.outboxState("send:lost", "failed");
+  setSystemTime(start + 2_000);
+  h.backend.final("INTERNAL NOTE: owner prefers blue.");
+  await h.router.tick();
+  setSystemTime(start + 60_000);
+  h.input("second", "Which one did I pick?");
+  await h.router.tick();
+  expect(h.backend.creates).toHaveLength(2);
+  const system = h.backend.prompts.at(-1)!.system!;
+  expect(system).toContain("Recent exchange (quoted data, oldest first):\nOwner: Remember the blue one\nYou: Noted, the blue one");
+  expect(system).not.toContain("INTERNAL NOTE");
+  expect(system).not.toContain("LOST MESSAGE");
+});
+
+test("tool mode: OpenCode's first narration never goes out early; only the agent's own sends reach the chat", async () => {
+  setSystemTime(earlyStart);
+  const events: string[] = [];
+  const h = toolSetup({ log: event => events.push(event) });
+  h.input("in_early", "Check prices");
+  await h.router.tick();
+  const first = h.backend.step("Checking prices.", "tool-calls");
+  first.answer = false;
+  const tool: Assistant["content"][number] = { type: "tool", id: "tool_1", name: "search", state: { status: "running" } };
+  first.content.push(tool);
+  await h.router.tick();
+  setSystemTime(earlyStart + 30_000);
+  await h.router.tick();
+  expect(h.conversations()).toEqual([]);
+  expect(h.store.get<{ earlySent?: string }>("activeTurn")!.earlySent).toBeUndefined();
+  expect(events).not.toContain("early-reply-enqueued");
+  // The agent's own "on it" goes out as sent, even when its text matches the narration.
+  agentSends(h, "onit", "Checking prices.");
+  tool.state.status = "completed";
+  h.backend.final("Found the prices.");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.conversations().map(op => [op.id, op.text])).toEqual([["send:onit", "Checking prices."]]);
+  expect(nudgeRows(h.store)).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
 });

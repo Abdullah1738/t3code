@@ -27,6 +27,7 @@ class DeadMountTests(Isolated):
         def no_boat(method, path, *a, **kw):
             raise AssertionError(f"offline test reached boat: {method} {path}")
         self.stack.enter_context(patch.object(api, "call", side_effect=no_boat))
+        self.stack.enter_context(patch.object(api, "get", return_value={'state': 'stopped'}))
 
     def lease_row(self, bid):
         return self.con.execute("SELECT * FROM leases WHERE box_id=?", (bid,)).fetchone()

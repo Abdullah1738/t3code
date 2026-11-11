@@ -92,11 +92,13 @@ def _caller_exclusions(ctx: Context | None, caller_thread: str = "", caller_nati
 @server.tool()
 def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", source: str = "", timeout: int = 30,
                caller_thread: str = "", caller_native: str = "", caller_driver: str = "", caller_agent: str = "",
-               ctx: Context = None) -> str:
+               here: str = "", ctx: Context = None) -> str:
     """Answer a question from past agent sessions, with [n] citations and the sessions listed underneath.
 
     Ask in plain words ("what did we decide about kafka for crpko?", "how did we fix the talabat voucher bug?").
-    cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m. source: codex|hermes|opencode|muse|claude.
+    here: your working directory (not a filter). The answer uses its repository to leave out memories that belong
+    to another project. cwd: only sessions from this project directory. since/until: YYYY-MM-DD or 7d/3w/2m.
+    source: codex|hermes|opencode|muse|claude.
     """
     try:
         recheck = lambda: _caller_exclusions(ctx, caller_thread, caller_native, caller_driver, caller_agent)
@@ -111,6 +113,7 @@ def recall_ask(question: str, cwd: str = "", since: str = "", until: str = "", s
             exclude=list(exclude),
             recheck_exclusions=recheck if exclude else None,
             timeout=max(8, min(int(timeout or 30), 30)),
+            here=here or None,
         ))
     except Exception as e:  # noqa: BLE001
         return _err(e)
@@ -403,6 +406,7 @@ async def api_ask(request: Request) -> Response:
             exclude=list(exclude),
             recheck_exclusions=recheck if exclude else None,
             timeout=max(8, min(float(body.get("timeout") or 30), 30)),
+            here=str(body.get("here") or "")[:2000] or None,
         ))
 
     try:

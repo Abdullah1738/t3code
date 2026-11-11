@@ -212,7 +212,8 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "search":
             import recall_ask as ra
 
-            res = ra.ask(" ".join(a.question), cwd=a.cwd, cwd_only=bool(a.cwd), since=a.since, until=a.until, source=a.source, timeout=a.timeout)
+            res = ra.ask(" ".join(a.question), cwd=a.cwd, cwd_only=bool(a.cwd), since=a.since, until=a.until, source=a.source, timeout=a.timeout,
+                         here=os.environ.get("PWD") or None)
             text = res["answer"]
             if res["sources"]:
                 text += "\n\n" + ra.format_sources(res["sources"])

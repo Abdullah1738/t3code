@@ -223,7 +223,7 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
 
 $100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and the plan's 50
 included saved snapshots are free. `offbox spend` reads the account meter once and shows billing-period spend. Abdullah gets a Telegram
-at every $100. At $750 the cap trips (raised from $500 by Abdullah, 5 Nov 2026): new leases are refused and all boxes stop. Heavy work returns 91.
+at every $100. At $900 the cap trips (raised from $500 to $750 by Abdullah on 5 Nov 2026, then to $900 on 10 Nov 2026): new leases are refused and all boxes stop. Heavy work returns 91.
 
 Create, fork and resume each consume a start. Offbox reserves starts atomically against rolling **25/minute,
 180/hour, 760/day** budgets; `OFFBOX_STARTS_PER_MINUTE`, `OFFBOX_STARTS_PER_HOUR`, `OFFBOX_STARTS_PER_DAY` can lower
@@ -290,7 +290,8 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
 - Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
-- Old output of a run: `offbox logs <run-id>` (works after the box stopped, from boat's 90-day command history).
+- A bg run that settled while nobody followed it gets its log completed from boat's history the next time you run `offbox logs` or `offbox wait`; if that fails, offbox says the output is incomplete.
+- For a run that is still going, plain `offbox logs` shows only what was last pulled: use `offbox logs --follow` or `offbox wait --timeout` to see current output.
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
   Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready). `offbox template

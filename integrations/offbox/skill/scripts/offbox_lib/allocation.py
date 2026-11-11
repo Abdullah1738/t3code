@@ -5,7 +5,7 @@ import contextlib
 import contextvars
 import hashlib
 
-from .common import OffboxError, db, file_lock, now
+from .common import BOX_WEDGED_NOTE, OffboxError, db, file_lock, now
 
 UNANSWERED = ('uncertain', 'reserved', 'http_502', 'http_504', 'http_520', 'http_524')
 
@@ -25,9 +25,10 @@ def recover_resumes(con, key):
     capacity.schema(con)
     rows = con.execute("SELECT l.box_id, s.ts FROM leases l JOIN start_requests s ON s.box_id=l.box_id "
                        "WHERE l.repo_key=? AND l.state IN ('running','stopped') AND s.operation='resume' "
+                       "AND COALESCE(l.note,'') NOT LIKE ? "
                        "AND s.ts>? AND s.outcome IN (?,?,?,?,?,?) "
                        "AND s.id=(SELECT MAX(t.id) FROM start_requests t WHERE t.box_id=l.box_id "
-                       "AND t.operation='resume')", (key, now() - 900, *UNANSWERED)).fetchall()
+                       "AND t.operation='resume')", (key, BOX_WEDGED_NOTE + '%', now() - 900, *UNANSWERED)).fetchall()
     seconds = capacity.setting('OFFBOX_RESUME_PROVISION_SECONDS', 300, minimum=1, maximum=900)
     for row in rows:
         con.execute("INSERT OR IGNORE INTO kv VALUES (?,?,?)", (f"resume_unanswered:{row['box_id']}", '', row['ts']))
@@ -84,7 +85,8 @@ def guard(box_id=None, recover_create=False, reconcile=False):
             pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
                                   "ON k.k='resume_unanswered:' || l.box_id "
                                   "WHERE l.repo_key=? AND l.state IN ('running','stopped') "
-                                  "AND l.box_id<>? LIMIT 1", (key, box_id or "")).fetchone()
+                                  "AND l.box_id<>? AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1",
+                                  (key, box_id or "", BOX_WEDGED_NOTE + '%')).fetchone()
         if (unknown and not recover_create) or (pending and not reconcile):
             raise Unresolved("a previous machine start is unanswered; nothing ran. Reconcile it before retrying")
         yield

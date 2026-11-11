@@ -207,6 +207,32 @@ class WaitLockTests(Isolated):
                          ('running', None))
         self.assertFalse((common.LOGS_DIR / 'run-x.log.takeover').exists())
 
+    def test_history_recovery_error_at_wait_deadline_is_124_with_real_command_id(self):
+        self.con.execute("UPDATE runs SET command_id='c' WHERE run_id='run-x'")
+        self.con.commit()
+        clock = Clock()
+        def exhausted(box, run, timeout=20):
+            clock.t += timeout
+            return None
+        with patch.object(runs, 'time', clock.time), patch.object(api, 'time', clock.time), \
+             patch.object(api, '_key', return_value='offline'), patch.object(runs, 'follow', return_value=None), \
+             patch.object(runs, 'recorded_exit', side_effect=exhausted):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 124, err)
+        self.assertIn('--timeout reached', err)
+        self.assertEqual(self.con.execute("SELECT status FROM runs WHERE run_id='run-x'").fetchone()[0], 'running')
+
+    def test_history_error_before_wait_deadline_stays_infra(self):
+        self.con.execute("UPDATE runs SET command_id='c' WHERE run_id='run-x'")
+        self.con.commit()
+        clock = Clock()
+        with patch.object(runs, 'follow', return_value=None), patch.object(runs, 'recorded_exit', return_value=None), \
+             patch.object(api, 'history_get', side_effect=OffboxError('history unavailable')):
+            rc, out, err = self.cli_wait(['wait', 'run-x', '--timeout', '1'], clock)
+        self.assertEqual(rc, 90, err)
+        self.assertIn('history unavailable', err)
+        self.assertNotIn('--timeout reached', err)
+
     def test_status_answer_after_the_deadline_is_not_accepted(self):
         # boat answers "ended" only after --timeout: the wait ends with 124 and does not return boat's code.
         self.hold_box()
