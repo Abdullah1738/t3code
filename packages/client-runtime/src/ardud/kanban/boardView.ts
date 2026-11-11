@@ -18,9 +18,19 @@ import {
 } from "@t3tools/contracts";
 
 import type { KanbanBoardState } from "./boardState.ts";
-import { TRUTH_IDLE_STUCK_MS, TRUTH_QUIET_MS } from "./cardTruth.ts";
+import { cardTruth, TRUTH_IDLE_STUCK_MS, TRUTH_QUIET_MS } from "./cardTruth.ts";
 import {
-  ACTIVE_STAGES,
+  stuckSummary,
+  TILE_COLUMN_LABELS,
+  TILE_GROUP_LABELS,
+  TILE_GROUP_ORDER,
+  tilePlace,
+  type StuckKind,
+  type TileGroup,
+  type TileLine,
+  type TilePlace,
+} from "./tilePlace.ts";
+import {
   SHIPPED_STAGES,
   STAGE_LABELS,
   modelLetter,
@@ -63,6 +73,11 @@ export interface BoardTileView {
   readonly needsInput: boolean;
   readonly unread: number;
   readonly subtasks: { readonly done: number; readonly total: number } | null;
+  /** Why the card is where it is and what moves it next; null for one that is simply going. */
+  readonly line: TileLine | null;
+  readonly edge: "fail" | "retry" | null;
+  /** Open cards that can't start until this one is done, the whole chain. */
+  readonly unblocks: number;
 }
 
 export interface BoardCardRow {
@@ -79,7 +94,66 @@ export interface BoardHeadRow {
   readonly count: number;
 }
 
-export type BoardRow = BoardCardRow | BoardHeadRow;
+/** How a group inside a column shows: folded, its first few cards, or all of them. */
+export type BoardGroupState = "closed" | "open" | "all";
+
+/** A state group's heading inside a column: "Blocked 785". */
+export interface BoardGroupRow {
+  readonly kind: "group";
+  readonly key: string;
+  /** What `BoardViewParams.groups` is keyed by: "todo:blocked". */
+  readonly id: string;
+  readonly label: string;
+  readonly count: number;
+  /** False in the Stuck lens, where every group is open and can't be folded. */
+  readonly foldable: boolean;
+  readonly open: boolean;
+}
+
+/** "780 more" under a group's first few cards; pressing it shows them all. */
+export interface BoardMoreRow {
+  readonly kind: "more";
+  readonly key: string;
+  readonly id: string;
+  readonly count: number;
+}
+
+/** What a folded group is made of, by reason, shown when it is opened. */
+export interface BoardReasonsRow {
+  readonly kind: "reasons";
+  readonly key: string;
+  readonly items: ReadonlyArray<{ readonly label: string; readonly count: number }>;
+}
+
+/** A plain line in a column: "Nothing stuck here". */
+export interface BoardNoteRow {
+  readonly kind: "note";
+  readonly key: string;
+  readonly text: string;
+}
+
+export type BoardRow =
+  | BoardCardRow
+  | BoardHeadRow
+  | BoardGroupRow
+  | BoardMoreRow
+  | BoardReasonsRow
+  | BoardNoteRow;
+
+/** The numbers above the columns. They count the whole board, whatever the filter. */
+export interface BoardSummary {
+  /** Threads holding a pool slot, out of every pool's slots. */
+  readonly running: number;
+  readonly slots: number;
+  /** To-Do cards nothing keeps from starting. */
+  readonly ready: number;
+  /** To-Do cards held by other cards or setup; on a paused board, cards the pause holds. */
+  readonly blocked: number;
+  readonly paused: boolean;
+  /** Cards parked until their author pushes. */
+  readonly authors: number;
+  readonly needsYou: number;
+}
 
 /** One column's worth of rows, top to bottom. */
 export interface BoardLane {
@@ -94,7 +168,7 @@ export interface BoardLane {
 export interface BoardModel {
   /** Cards passing the filter. */
   readonly total: number;
-  /** To-Do, Working, Needs Review, In Review. Empty unless grouped by stage. */
+  /** To-Do, Working, Reviewing, In review waiting. Empty unless grouped by stage. */
   readonly active: ReadonlyArray<BoardLane>;
   /** Completed, Deployed, Verified. */
   readonly shipped: ReadonlyArray<BoardLane>;
@@ -105,12 +179,29 @@ export interface BoardModel {
   /** Columns of every grouping but Stage. */
   readonly groups: ReadonlyArray<BoardLane>;
   readonly goals: ReadonlyArray<GoalSummary>;
+  readonly summary: BoardSummary;
+  /** Cards passing the filter that need a look, and the lens line that counts them by why. */
+  readonly stuck: { readonly count: number; readonly line: string };
 }
+
+export type BoardLens = "all" | "stuck";
 
 export interface BoardViewParams {
   readonly filter: BoardFilter;
   readonly group: GroupBy;
+  /** "stuck" keeps only cards that need a look; every group is then open. */
+  readonly lens?: BoardLens | undefined;
+  /** Groups the reader opened, folded or expanded, by `BoardGroupRow.id`. The rest keep their default. */
+  readonly groups?: Readonly<Record<string, BoardGroupState>> | undefined;
 }
+
+/** Cards a group shows before "N more". A column with one group shows all of it. */
+export const BOARD_GROUP_PREVIEW = 5;
+
+/** Groups that start folded: what is not going anywhere soon. */
+const FOLDED_GROUPS: ReadonlySet<string> = new Set(["todo:blocked", "todo:parked", "todo:paused"]);
+
+const STAGE_COLUMNS = ["todo", "working", "needs_review", "in_review"] as const;
 
 export interface BoardViewEngine {
   /**
@@ -251,6 +342,8 @@ interface Entry {
   deps: ReadonlyArray<KanbanCard | undefined>;
   view: BoardTileView;
   row: BoardCardRow;
+  place: TilePlace;
+  holds: number;
   /** Ordering inputs that are not shown. */
   waits: boolean;
   needsOwner: boolean;
@@ -275,6 +368,8 @@ const filterKeyOf = (params: BoardViewParams): string =>
     params.filter.models ?? [],
     params.filter.query ?? "",
     params.filter.settled ?? "hide",
+    params.lens ?? "all",
+    params.groups ?? {},
   ]);
 
 const GROUP_STAGE_ORDER = new Map<KanbanStage, number>(
@@ -297,7 +392,7 @@ const SCHEDULE_CLOCK_MS = 60 * 60 * 1000;
 
 export function createBoardView(): BoardViewEngine {
   const entries = new Map<string, Entry>();
-  const heads = new Map<string, BoardHeadRow>();
+  const rows = new Map<string, BoardRow>();
   const texts = new WeakMap<KanbanCard, string>();
   const learned = new Map<string, string>();
   let computed = 0;
@@ -308,6 +403,7 @@ export function createBoardView(): BoardViewEngine {
 
   let boardRef: KanbanBoardState["board"] | null = null;
   let boardKey = "";
+  let kept: ReadonlySet<string> | null = null;
 
   let last: {
     state: KanbanBoardState;
@@ -322,10 +418,12 @@ export function createBoardView(): BoardViewEngine {
       card.activeThreadId === null ? undefined : state.threads.get(card.activeThreadId);
     const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
     const unread = card.discussionId === null ? 0 : (state.unread.get(card.discussionId) ?? 0);
+    const holds = schedule.get(card.id)?.holds ?? 0;
     const known = entries.get(card.id);
     if (
       known !== undefined &&
       known.card === card &&
+      known.holds === holds &&
       known.boardKey === boardKey &&
       known.thread === thread &&
       known.goal === goal &&
@@ -384,6 +482,7 @@ export function createBoardView(): BoardViewEngine {
       };
     }
 
+    const place = tilePlace(card, state, nowMs, kept, cardTruth(card, state, nowMs));
     const pr = card.links.find((link) => link.kind === "pr");
     const finished = card.subtasks.filter((subtask) => subtask.state !== "open").length;
     const view: BoardTileView = {
@@ -404,10 +503,13 @@ export function createBoardView(): BoardViewEngine {
       needsInput: thread?.needsInput ?? false,
       unread,
       subtasks: card.subtasks.length === 0 ? null : { done: finished, total: card.subtasks.length },
+      line: place.line,
+      edge: place.edge,
+      unblocks: holds,
     };
     // A card the server sent again unchanged, or one whose surroundings changed in a
     // way it doesn't show, keeps the view (and the row) it had: its tile doesn't render.
-    const kept = known !== undefined && same(known.view, view) ? known : undefined;
+    const before = known !== undefined && same(known.view, view) ? known : undefined;
     const depIds = blockerIds(card, state.cards);
     const entry: Entry = {
       card,
@@ -419,8 +521,10 @@ export function createBoardView(): BoardViewEngine {
       unread,
       depIds,
       deps: depIds.map((id) => state.cards.get(id)),
-      view: kept?.view ?? view,
-      row: kept?.row ?? { kind: "card", key: card.id, card: view },
+      view: before?.view ?? view,
+      row: before?.row ?? { kind: "card", key: card.id, card: view },
+      place,
+      holds,
       // Like the dispatcher: backlog and the evaluator's steps never start, and a
       // blocker on the card's own work thread doesn't count while that thread can go on.
       waits:
@@ -435,13 +539,15 @@ export function createBoardView(): BoardViewEngine {
     return entry;
   };
 
-  const head = (key: string, label: string, count: number): BoardHeadRow => {
-    const known = heads.get(key);
-    if (known !== undefined && known.label === label && known.count === count) return known;
-    const row: BoardHeadRow = { kind: "head", key, label, count };
-    heads.set(key, row);
+  /** A heading, "N more" or note row: the object it was while its content is the same. */
+  const keepRow = <R extends BoardRow>(row: R): R => {
+    const known = rows.get(row.key);
+    if (known !== undefined && same(known, row)) return known as R;
+    rows.set(row.key, row);
     return row;
   };
+  const head = (key: string, label: string, count: number): BoardHeadRow =>
+    keepRow({ kind: "head", key, label, count });
 
   /** What a search reads that is not on the feed's card: its goal, its threads, and the full text once learned. */
   const aroundText = (card: KanbanCard, state: KanbanBoardState): string => {
@@ -474,6 +580,7 @@ export function createBoardView(): BoardViewEngine {
     if (state.board !== boardRef) {
       boardRef = state.board;
       boardKey = boardKeyOf(state);
+      kept = state.board.pause == null ? null : new Set<string>(state.board.pause.keep);
     }
     const bucket = Math.floor(nowMs / SCHEDULE_CLOCK_MS);
     if (state.cards !== scheduleCards || bucket !== scheduleBucket) {
@@ -493,6 +600,11 @@ export function createBoardView(): BoardViewEngine {
     const settled = query !== null && chosen === "hide" ? "include" : chosen;
     let validUntil = (bucket + 1) * SCHEDULE_CLOCK_MS;
     const visible: Entry[] = [];
+    const slotThreads = new Set<string>();
+    let ready = 0;
+    let blocked = 0;
+    let authors = 0;
+    let needsYou = 0;
     const goalCounts = new Map<string, { progress: Progress; needsOwner: number }>();
     for (const card of state.cards.values()) {
       const isSettled = card.settledAt !== null;
@@ -505,6 +617,18 @@ export function createBoardView(): BoardViewEngine {
       // cleared search shows it again without building anything.
       const entry = shown || !isSettled ? entryFor(card, state, nowMs) : null;
       if (entry !== null && entry.validUntil < validUntil) validUntil = entry.validUntil;
+      if (entry !== null && !isSettled) {
+        if (card.activeThreadId !== null && card.activePool !== null) {
+          slotThreads.add(card.activeThreadId);
+        }
+        const { column, group } = entry.place;
+        if (column === "todo" && (group === "ready" || group === "through")) ready += 1;
+        if (kept === null ? column === "todo" && group === "blocked" : group === "paused") {
+          blocked += 1;
+        }
+        if (group === "author") authors += 1;
+        if (entry.needsOwner) needsYou += 1;
+      }
       if (card.goalId !== null) {
         let counts = goalCounts.get(card.goalId);
         if (counts === undefined) {
@@ -537,15 +661,14 @@ export function createBoardView(): BoardViewEngine {
     const orderFor = (stage: KanbanStage) =>
       stage === "todo" ? todoOrder : stage === "needs_review" ? oldestFirst : byPick;
 
-    const lane = (
+    const laneOf = (
       key: string,
       label: string,
       summary: string | null,
-      list: ReadonlyArray<Entry>,
+      rows: ReadonlyArray<BoardRow>,
       count: number,
       before: BoardLane | undefined,
     ): BoardLane => {
-      const rows = list.map((entry) => entry.row);
       if (
         before !== undefined &&
         before.key === key &&
@@ -558,6 +681,22 @@ export function createBoardView(): BoardViewEngine {
       }
       return { key, label, summary, count, rows };
     };
+    const lane = (
+      key: string,
+      label: string,
+      summary: string | null,
+      list: ReadonlyArray<Entry>,
+      count: number,
+      before: BoardLane | undefined,
+    ): BoardLane =>
+      laneOf(
+        key,
+        label,
+        summary,
+        list.map((entry) => entry.row),
+        count,
+        before,
+      );
     const keepList = <T>(before: ReadonlyArray<T> | undefined, next: ReadonlyArray<T>) =>
       before !== undefined && sameItems(before, next) ? before : next;
 
@@ -594,18 +733,102 @@ export function createBoardView(): BoardViewEngine {
       .sort((a, b) => a.firstAskAt.localeCompare(b.firstAskAt) || a.card.number - b.card.number);
     const owner = lane(
       "needs_owner",
-      STAGE_LABELS.needs_owner,
+      TILE_COLUMN_LABELS.needs_owner,
       null,
       [...held, ...asking],
       asking.length + held.filter((entry) => entry.needsOwner).length,
       previous?.owner,
     );
 
-    if (params.group === "stage") {
-      active = keepList(
-        previous?.active,
-        ACTIVE_STAGES.map((stage) => stageLane(stage, orderFor(stage), previous?.active)),
+    const stuckOnly = params.lens === "stuck";
+    const stuckCounts = new Map<StuckKind, number>();
+    let stuckCount = 0;
+    for (const entry of visible) {
+      const kind = entry.place.stuck;
+      if (kind === null) continue;
+      stuckCount += 1;
+      stuckCounts.set(kind, (stuckCounts.get(kind) ?? 0) + 1);
+    }
+
+    /** One column grouped by what its cards are doing. */
+    const stateLane = (column: (typeof STAGE_COLUMNS)[number]): BoardLane => {
+      const byGroup = new Map<TileGroup, Entry[]>();
+      let count = 0;
+      for (const entry of visible) {
+        if (entry.place.column !== column) continue;
+        if (stuckOnly && entry.place.stuck === null) continue;
+        count += 1;
+        const list = byGroup.get(entry.place.group);
+        if (list === undefined) byGroup.set(entry.place.group, [entry]);
+        else list.push(entry);
+      }
+      const made: BoardRow[] = [];
+      const alone = byGroup.size === 1;
+      for (const group of TILE_GROUP_ORDER) {
+        const list = byGroup.get(group);
+        if (list === undefined) continue;
+        // To-Do and Working go the way the dispatcher picks; reviews and waits oldest first.
+        list.sort(column === "in_review" || group === "next" ? oldestFirst : byPick);
+        const id = `${column}:${group}`;
+        const chosen = params.groups?.[id];
+        const shown: BoardGroupState = stuckOnly
+          ? "all"
+          : (chosen ?? (FOLDED_GROUPS.has(id) ? "closed" : "open"));
+        made.push(
+          keepRow({
+            kind: "group",
+            key: `group:${id}`,
+            id,
+            label: TILE_GROUP_LABELS[group],
+            count: list.length,
+            foldable: !stuckOnly,
+            open: shown !== "closed",
+          }),
+        );
+        if (shown === "closed") continue;
+        const reasons = new Map<string, number>();
+        if (!stuckOnly && FOLDED_GROUPS.has(id)) {
+          for (const entry of list) {
+            const reason = entry.place.reason ?? TILE_GROUP_LABELS[group];
+            reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+          }
+        }
+        // One reason would only repeat the heading's count.
+        if (reasons.size > 1) {
+          made.push(
+            keepRow({
+              kind: "reasons",
+              key: `reasons:${id}`,
+              items: [...reasons]
+                .sort(([a, x], [b, y]) => y - x || a.localeCompare(b))
+                .map(([label, total]) => ({ label, count: total })),
+            }),
+          );
+        }
+        const shownCount =
+          shown === "all" || alone ? list.length : Math.min(list.length, BOARD_GROUP_PREVIEW);
+        for (let index = 0; index < shownCount; index += 1) made.push(list[index]!.row);
+        if (shownCount < list.length) {
+          made.push(
+            keepRow({ kind: "more", key: `more:${id}`, id, count: list.length - shownCount }),
+          );
+        }
+      }
+      if (stuckOnly && made.length === 0) {
+        made.push(keepRow({ kind: "note", key: `note:${column}`, text: "Nothing stuck here" }));
+      }
+      return laneOf(
+        column,
+        TILE_COLUMN_LABELS[column],
+        null,
+        made,
+        count,
+        previous?.active.find((entry) => entry.key === column),
       );
+    };
+
+    if (params.group === "stage") {
+      active = keepList(previous?.active, STAGE_COLUMNS.map(stateLane));
       shipped = keepList(
         previous?.shipped,
         SHIPPED_STAGES.map((stage) => stageLane(stage, newestFirst, previous?.shipped)),
@@ -694,6 +917,22 @@ export function createBoardView(): BoardViewEngine {
       });
     const goals = keepList(previous?.goals, goalList);
 
+    let slots = 0;
+    for (const pool of state.pools) slots += pool.slots;
+    const nextSummary: BoardSummary = {
+      running: slotThreads.size,
+      slots,
+      ready,
+      blocked,
+      paused: kept !== null,
+      authors,
+      needsYou,
+    };
+    const summary =
+      previous !== null && same(previous.summary, nextSummary) ? previous.summary : nextSummary;
+    const nextStuck = { count: stuckCount, line: stuckSummary(stuckCounts) };
+    const stuck = previous !== null && same(previous.stuck, nextStuck) ? previous.stuck : nextStuck;
+
     const model: BoardModel =
       previous !== null &&
       previous.total === visible.length &&
@@ -702,9 +941,21 @@ export function createBoardView(): BoardViewEngine {
       previous.shippedRows === shippedRows &&
       previous.owner === owner &&
       previous.groups === groups &&
-      previous.goals === goals
+      previous.goals === goals &&
+      previous.summary === summary &&
+      previous.stuck === stuck
         ? previous
-        : { total: visible.length, active, shipped, shippedRows, owner, groups, goals };
+        : {
+            total: visible.length,
+            active,
+            shipped,
+            shippedRows,
+            owner,
+            groups,
+            goals,
+            summary,
+            stuck,
+          };
     return { model, validUntil };
   };
 

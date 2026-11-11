@@ -24,6 +24,7 @@ export const BOARD_VIEW_LABELS: Record<BoardView, string> = {
 };
 
 const GROUPS: ReadonlyArray<GroupBy> = ["stage", "goal", "similar", "project", "model"];
+const LENSES = ["stuck"] as const;
 
 export interface BoardSearch {
   readonly view?: BoardView;
@@ -33,6 +34,8 @@ export interface BoardSearch {
   /** Goal page under the Goals view. */
   readonly goal?: string;
   readonly group?: GroupBy;
+  /** "stuck" shows only the cards that need a look. */
+  readonly lens?: (typeof LENSES)[number];
 }
 
 function text(value: unknown): string | undefined {
@@ -51,11 +54,13 @@ export function parseBoardSearch(raw: Record<string, unknown>): BoardSearch {
   const discussion = text(raw.discussion);
   const goal = text(raw.goal);
   const group = oneOf(raw.group, GROUPS);
+  const lens = oneOf(raw.lens, LENSES);
   return {
     ...(view && view !== "board" ? { view } : {}),
     ...(card ? { card } : {}),
     ...(discussion ? { discussion } : {}),
     ...(goal ? { goal } : {}),
     ...(group && group !== "stage" ? { group } : {}),
+    ...(lens ? { lens } : {}),
   };
 }

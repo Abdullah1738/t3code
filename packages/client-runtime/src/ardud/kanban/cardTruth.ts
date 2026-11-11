@@ -227,7 +227,10 @@ function fromGuess(
 }
 
 /** Every unfinished card in `blockedBy`, lowest number first. */
-function openBlockers(card: KanbanCard, state: KanbanBoardState): ReadonlyArray<KanbanCard> {
+export function cardOpenBlockers(
+  card: KanbanCard,
+  state: KanbanBoardState,
+): ReadonlyArray<KanbanCard> {
   return card.blockedBy
     .flatMap((id) => {
       const blocker = state.cards.get(id);
@@ -392,7 +395,7 @@ export function cardTruth(
       );
     }
     if (kanbanHeldUpBy(card, state.cards) !== undefined) {
-      const blockers = openBlockers(card, state);
+      const blockers = cardOpenBlockers(card, state);
       return base(
         "blocked",
         blockers.length === 0

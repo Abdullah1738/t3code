@@ -1,7 +1,8 @@
 import { LegendList } from "@legendapp/list/react";
+import { ChevronRightIcon } from "lucide-react";
 import { memo } from "react";
 
-import type { BoardRow } from "@t3tools/client-runtime/ardud/kanban";
+import type { BoardGroupState, BoardRow } from "@t3tools/client-runtime/ardud/kanban";
 
 import { cn } from "../../lib/utils";
 import { CardTile } from "./CardTile";
@@ -17,13 +18,14 @@ export const VIRTUAL_ROWS_MIN = 40;
 
 /** How far past the viewport rows stay mounted, so a fast scroll doesn't show gaps. */
 const DRAW_DISTANCE_PX = 700;
-const ROW_GAP_PX = 8;
 
 export type BoardRowVariant = "tile" | "raised" | "staged" | "shipped";
 
-/** A phone gets one card per row; a portrait iPad two or three (17rem cards, 8px gaps). */
-export const listColumns = (width: number | null) =>
-  width === null ? 1 : Math.max(1, Math.floor((width + ROW_GAP_PX) / (272 + ROW_GAP_PX)));
+/** Opens, folds or expands a state group; `id` is the group row's. */
+export type OnBoardGroup = (id: string, state: BoardGroupState) => void;
+
+const FOCUS =
+  "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
 
 export function LaneHeader(props: { label: string; count: number; tone?: "warn" }) {
   return (
@@ -34,7 +36,7 @@ export function LaneHeader(props: { label: string; count: number; tone?: "warn" 
       )}
     >
       <span className="font-medium">{props.label}</span>
-      <span className="tabular-nums">{props.count}</span>
+      <span className="tabular-nums">{props.count.toLocaleString("en-US")}</span>
     </div>
   );
 }
@@ -52,7 +54,8 @@ const ShippedRow = memo(function ShippedRow(props: {
       onClick={() => props.onOpen(props.id)}
       aria-current={props.selected ? "true" : undefined}
       className={cn(
-        "grid w-full grid-cols-[12px_1fr] items-start gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:py-2 pointer-coarse:text-sm",
+        "grid w-full grid-cols-[12px_1fr] items-start gap-1.75 rounded-lg bg-(--m-surface) px-1.5 py-1.25 text-left text-xs text-(--m-muted) hover:bg-(--m-active) hover:text-(--m-text) pointer-coarse:min-h-11 pointer-coarse:py-2 pointer-coarse:text-sm",
+        FOCUS,
         props.selected && "text-(--m-text) ring-2 ring-inset ring-(--m-text)",
       )}
     >
@@ -64,54 +67,123 @@ const ShippedRow = memo(function ShippedRow(props: {
 
 const RowView = memo(function RowView(props: {
   row: BoardRow;
+  /** The lane's first row: a group heading there needs no space above it. */
+  first: boolean;
   variant: BoardRowVariant;
   selected: boolean;
   onOpenCard: (cardId: string) => void;
+  onGroup: OnBoardGroup | undefined;
 }) {
-  const { row } = props;
-  if (row.kind === "head") return <LaneHeader label={row.label} count={row.count} />;
-  if (props.variant === "shipped") {
-    return (
-      <ShippedRow
-        id={row.card.id}
-        title={row.card.title}
-        stage={row.card.stage}
-        selected={props.selected}
-        onOpen={props.onOpenCard}
-      />
-    );
+  const { row, onGroup } = props;
+  switch (row.kind) {
+    case "head":
+      return <LaneHeader label={row.label} count={row.count} />;
+    case "group": {
+      const inner = (
+        <>
+          {row.foldable ? (
+            <ChevronRightIcon
+              aria-hidden
+              className={cn(
+                "size-3.5 shrink-0 transition-transform duration-150 motion-reduce:transition-none",
+                row.open && "rotate-90",
+              )}
+            />
+          ) : null}
+          <span className="min-w-0 leading-tight wrap-break-word">{row.label}</span>
+          <span className="ms-auto tabular-nums">{row.count.toLocaleString("en-US")}</span>
+        </>
+      );
+      const layout = cn(
+        "flex min-h-7 w-full items-center gap-1.5 rounded-lg px-1 py-1 text-xs text-(--m-muted) pointer-coarse:min-h-11 pointer-coarse:text-sm",
+        !props.first && "mt-1.5",
+      );
+      return row.foldable && onGroup ? (
+        <button
+          type="button"
+          aria-expanded={row.open}
+          onClick={() => onGroup(row.id, row.open ? "closed" : "open")}
+          className={cn(layout, "text-left hover:text-(--m-text)", FOCUS)}
+        >
+          {inner}
+        </button>
+      ) : (
+        <div className={layout}>{inner}</div>
+      );
+    }
+    case "more":
+      return (
+        <button
+          type="button"
+          onClick={() => onGroup?.(row.id, "all")}
+          className={cn(
+            "flex h-7 w-full items-center rounded-lg px-1 text-left text-xs text-(--m-muted) tabular-nums hover:text-(--m-text) pointer-coarse:h-11 pointer-coarse:text-sm",
+            FOCUS,
+          )}
+        >
+          {row.count.toLocaleString("en-US")} more
+        </button>
+      );
+    case "reasons":
+      return (
+        <ul className="flex flex-col gap-1.5 rounded-xl bg-(--m-surface) px-2.75 py-2.25 text-xs pointer-coarse:text-sm">
+          {row.items.map((item) => (
+            <li key={item.label} className="flex items-baseline justify-between gap-3">
+              <span className="min-w-0 wrap-break-word">{item.label}</span>
+              <span className="shrink-0 text-(--m-muted) tabular-nums">
+                {item.count.toLocaleString("en-US")}
+              </span>
+            </li>
+          ))}
+        </ul>
+      );
+    case "note":
+      return (
+        <p className="px-1 py-1 text-xs text-(--m-muted) pointer-coarse:text-sm">{row.text}</p>
+      );
+    case "card":
+      if (props.variant === "shipped") {
+        return (
+          <ShippedRow
+            id={row.card.id}
+            title={row.card.title}
+            stage={row.card.stage}
+            selected={props.selected}
+            onOpen={props.onOpenCard}
+          />
+        );
+      }
+      return (
+        <CardTile
+          card={row.card}
+          raised={props.variant === "raised"}
+          showStage={props.variant === "staged"}
+          selected={props.selected}
+          onOpen={props.onOpenCard}
+        />
+      );
   }
-  return (
-    <CardTile
-      card={row.card}
-      raised={props.variant === "raised"}
-      showStage={props.variant === "staged"}
-      selected={props.selected}
-      onOpen={props.onOpenCard}
-    />
-  );
 });
 
 const rowKey = (row: BoardRow) => row.key;
 const rowType = (row: BoardRow) => row.kind;
 
 /**
- * A lane's rows in their own scroller. `header` scrolls with the rows (the phone
- * list's pinned block and stage tabs); `columns` lays cards out as a grid.
+ * A lane's rows in their own scroller. `header` scrolls away with the rows (the
+ * phone list's column switcher).
  */
 export const BoardRows = memo(function BoardRows(props: {
   rows: ReadonlyArray<BoardRow>;
   variant?: BoardRowVariant | undefined;
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
+  onGroup?: OnBoardGroup | undefined;
   className?: string | undefined;
   header?: React.ReactNode;
-  columns?: number | undefined;
   /** Shown instead of rows when the lane has none. */
   empty?: React.ReactNode;
 }) {
   const variant = props.variant ?? "tile";
-  const columns = props.columns ?? 1;
   const dense = variant === "shipped";
   const selected = props.selectedCardId;
 
@@ -119,7 +191,7 @@ export const BoardRows = memo(function BoardRows(props: {
     return (
       <div
         className={cn(
-          "flex min-h-0 flex-col overflow-y-auto overflow-x-hidden",
+          "flex min-h-0 flex-col overflow-x-hidden overflow-y-auto",
           dense ? "gap-1" : "gap-2",
           HIDE_SCROLLBAR,
           props.className,
@@ -127,32 +199,17 @@ export const BoardRows = memo(function BoardRows(props: {
       >
         {props.header}
         {props.rows.length === 0 ? props.empty : null}
-        {columns > 1 ? (
-          <div
-            className="grid gap-2"
-            style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
-          >
-            {props.rows.map((row) => (
-              <RowView
-                key={row.key}
-                row={row}
-                variant={variant}
-                selected={row.kind === "card" && row.card.id === selected}
-                onOpenCard={props.onOpenCard}
-              />
-            ))}
-          </div>
-        ) : (
-          props.rows.map((row) => (
-            <RowView
-              key={row.key}
-              row={row}
-              variant={variant}
-              selected={row.kind === "card" && row.card.id === selected}
-              onOpenCard={props.onOpenCard}
-            />
-          ))
-        )}
+        {props.rows.map((row, index) => (
+          <RowView
+            key={row.key}
+            row={row}
+            first={index === 0}
+            variant={variant}
+            selected={row.kind === "card" && row.card.id === selected}
+            onOpenCard={props.onOpenCard}
+            onGroup={props.onGroup}
+          />
+        ))}
       </div>
     );
   }
@@ -165,17 +222,17 @@ export const BoardRows = memo(function BoardRows(props: {
       extraData={selected}
       estimatedItemSize={dense ? 36 : 104}
       drawDistance={DRAW_DISTANCE_PX}
-      numColumns={columns}
-      {...(columns > 1 ? { columnWrapperStyle: { columnGap: ROW_GAP_PX } } : {})}
       {...(props.header ? { ListHeaderComponent: <>{props.header}</> } : {})}
       className={cn("min-h-0 overflow-x-hidden", HIDE_SCROLLBAR, props.className)}
-      renderItem={({ item }) => (
+      renderItem={({ item, index }) => (
         <div className={dense ? "pb-1" : "pb-2"}>
           <RowView
             row={item}
+            first={index === 0}
             variant={variant}
             selected={item.kind === "card" && item.card.id === selected}
             onOpenCard={props.onOpenCard}
+            onGroup={props.onGroup}
           />
         </div>
       )}

@@ -12,6 +12,8 @@ import {
   sanitizeBoardFilterPrefs,
   type BoardFilter,
   type BoardFilterPrefs,
+  type BoardGroupState,
+  type BoardLens,
   type BoardModel,
   type GroupBy,
   type KanbanBoardState,
@@ -128,10 +130,15 @@ export function BoardPage(props: {
   const pause = state ? pauseBanner(state.board, state.cards) : null;
   const stepCard = (card: string) => go({ card }, { replace: true });
   const group = search.group ?? "stage";
+  const lens: BoardLens = group === "stage" && search.lens === "stuck" ? "stuck" : "all";
+  // Which state groups the reader opened, folded or expanded; the rest keep their default.
+  const [groups, setGroups] = useState<Readonly<Record<string, BoardGroupState>>>({});
+  const setGroup = (id: string, next: BoardGroupState) =>
+    setGroups((current) => ({ ...current, [id]: next }));
   // Derived once per board state by the board's own cache; an unchanged board gives the same object.
   const model =
     view === "board" && state && filter
-      ? boardViewFor(boardId).model(state, boardClock, { filter, group })
+      ? boardViewFor(boardId).model(state, boardClock, { filter, group, lens, groups })
       : null;
   const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
 
@@ -259,6 +266,8 @@ export function BoardPage(props: {
                   onPrefs={setFilters}
                   nowMs={nowMs}
                   model={model}
+                  lens={lens}
+                  onGroup={setGroup}
                   go={go}
                   openCard={openCard}
                   openGoal={openGoal}
@@ -293,6 +302,8 @@ function BoardBody(props: {
   onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
   model: BoardModel | null;
+  lens: BoardLens;
+  onGroup: (id: string, state: BoardGroupState) => void;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
@@ -307,6 +318,8 @@ function BoardBody(props: {
             boardId={props.boardId}
             model={props.model}
             group={search.group ?? "stage"}
+            lens={props.lens}
+            onGroup={props.onGroup}
             filter={filter}
             onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
             selectedCardId={search.card}

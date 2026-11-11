@@ -20,6 +20,7 @@ export * from "./transport.ts";
 export * from "./viewModel.ts";
 export * from "./waitGuess.ts";
 export * from "./threads.ts";
+export * from "./tilePlace.ts";
 
 export {
   paintActionValue,

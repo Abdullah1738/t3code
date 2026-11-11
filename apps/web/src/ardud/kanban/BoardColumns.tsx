@@ -1,3 +1,5 @@
+import { Link } from "@tanstack/react-router";
+import { ArrowRightIcon } from "lucide-react";
 import { useState } from "react";
 import * as Schema from "effect/Schema";
 
@@ -7,6 +9,7 @@ import {
   type BoardColumnKey,
   type BoardFilter,
   type BoardLane,
+  type BoardLens,
   type BoardModel,
   type BoardRow,
   type GroupBy,
@@ -21,13 +24,16 @@ import {
   BoardRows,
   HIDE_SCROLLBAR,
   LaneHeader,
-  listColumns,
   VIRTUAL_ROWS_MIN,
   type BoardRowVariant,
+  type OnBoardGroup,
 } from "./BoardRows";
 import { ColumnResizeHandle, COLUMN_WIDTH_PROPERTY } from "./ColumnResizeHandle";
 import { GoalBar, Glyph, stageGlyph } from "./parts";
 import { useBoardColumnPrefs } from "./useBoardColumnPrefs";
+
+const FOCUS =
+  "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
 
 export function BoardColumns(props: {
   boardId: string;
@@ -35,18 +41,27 @@ export function BoardColumns(props: {
   model: BoardModel;
   group: GroupBy;
   filter: BoardFilter;
+  lens: BoardLens;
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
   onOpenGoal: (goalId: string) => void;
   onClearFilters: () => void;
+  /** Opens, folds or expands a state group inside a column. */
+  onGroup: OnBoardGroup;
 }) {
   // The board's own width decides, not the screen's: an iPad with the sidebar open
   // is a wide screen with a narrow board.
   const [width, setWidth] = useState<number | null>(null);
-  const narrowScreen = useMediaQuery("max-md");
+  const narrowScreen = useMediaQuery("max-sm");
+  const mediumScreen = useMediaQuery("max-lg");
   const coarse = useMediaQuery({ pointer: "coarse" });
-  const gridMinWidth = coarse ? STAGE_GRID_MIN_WIDTH_COARSE : STAGE_GRID_MIN_WIDTH_FINE;
-  const narrow = width === null ? narrowScreen : width < gridMinWidth;
+  // A phone shows one column at a time. Between that and the full grid (a tablet, a
+  // desktop with a narrow board) the columns keep a readable width and scroll sideways.
+  const phone = width === null ? narrowScreen : width < PHONE_MAX_WIDTH;
+  const compact =
+    width === null
+      ? mediumScreen
+      : width < (coarse ? STAGE_GRID_MIN_WIDTH_COARSE : STAGE_GRID_MIN_WIDTH_FINE);
   // Shipped opens by default only on a wide board; a saved choice always wins.
   const wide = width !== null && width >= SHIPPED_OPEN_MIN_WIDTH;
   const measure = (element: HTMLDivElement) =>
@@ -63,14 +78,17 @@ export function BoardColumns(props: {
 
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
-      {shownGoals.length > 0 ? (
+      {shownGoals.length > 0 && !phone ? (
         <div className={cn("flex shrink-0 gap-2.5 overflow-x-auto pe-5", HIDE_SCROLLBAR)}>
           {shownGoals.map((entry) => (
             <button
               key={entry.goal.id}
               type="button"
               onClick={() => props.onOpenGoal(entry.goal.id)}
-              className="grid min-w-56 flex-1 grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl bg-(--m-surface) px-3.5 py-2.5 text-left text-sm outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:py-3.5 pointer-coarse:text-base"
+              className={cn(
+                "grid min-w-56 flex-1 grid-cols-[auto_1fr_auto] items-center gap-3 rounded-xl bg-(--m-surface) px-3.5 py-2.5 text-left text-sm hover:bg-(--m-active) pointer-coarse:py-3.5 pointer-coarse:text-base",
+                FOCUS,
+              )}
             >
               <span className="truncate font-medium">{entry.goal.name}</span>
               <GoalBar progress={entry.progress} />
@@ -82,11 +100,10 @@ export function BoardColumns(props: {
         </div>
       ) : null}
       {props.group === "stage" ? (
-        narrow ? (
-          // The list's own width, less its right margin.
-          <StageList {...props} columns={listColumns(width === null ? null : width - 16)} />
+        phone ? (
+          <StageList {...props} />
         ) : (
-          <StageGrid {...props} wide={wide} />
+          <StageGrid {...props} wide={wide} compact={compact} />
         )
       ) : (
         <GroupGrid {...props} />
@@ -97,20 +114,23 @@ export function BoardColumns(props: {
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
 
-// The stage grid's narrowest widths: two work columns, the review stack, the folded
-// shipped strip, Needs Owner with its right margin, and the gaps. Touch sizes are wider.
-const STAGE_GRID_MIN_WIDTH_FINE = 2 * 208 + 176 + 56 + 256 + 20 + 4 * 10; // 964
-const STAGE_GRID_MIN_WIDTH_COARSE = 2 * 224 + 208 + 56 + 272 + 20 + 4 * 10; // 1044
-const SHIPPED_OPEN_MIN_WIDTH = 1400;
-const REVIEW_STAGES = ["needs_review", "in_review"] as const;
+/** Below this the board is a phone's: one column at a time. */
+const PHONE_MAX_WIDTH = 640;
+// The widths at which every column fits beside Needs you without scrolling: four state
+// columns, the folded shipped strip, Needs you with its right margin, and the gaps.
+// Narrower than this, Needs you moves into the sideways scroller with the rest.
+const STAGE_GRID_MIN_WIDTH_FINE = 4 * 184 + 56 + 256 + 20 + 5 * 10; // 1118
+const STAGE_GRID_MIN_WIDTH_COARSE = 4 * 208 + 56 + 272 + 20 + 5 * 10; // 1230
+const SHIPPED_OPEN_MIN_WIDTH = 1500;
+const STATE_COLUMNS = ["todo", "working", "needs_review", "in_review"] as const;
 const SHIPPED_KEY = "t3code:kanban:board:shipped";
 const SHIPPED_SCHEMA = Schema.NullOr(Schema.Literals(["open", "folded"]));
 
-function StageGrid(props: ColumnsProps & { wide: boolean }) {
+function StageGrid(props: ColumnsProps & { wide: boolean; compact: boolean }) {
   const board = props.model;
   const [prefs, updatePrefs] = useBoardColumnPrefs(props.boardId);
   const [shipped, setShipped] = useLocalStorage(SHIPPED_KEY, null, SHIPPED_SCHEMA);
-  // Stage keys come from the model; the columns here are always BoardColumnKeys.
+  // Lane keys come from the model; the columns here are always BoardColumnKeys.
   const widthOf = (key: string) => prefs.widths[key as BoardColumnKey] ?? null;
   const setWidth = (key: string, width: number) =>
     updatePrefs((current) => ({
@@ -135,135 +155,117 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
 
   const shippedHidden = hidden("shipped");
   const ownerHidden = hidden("needs_owner");
-  const stageLane = (stage: KanbanStage) => board.active.find((lane) => lane.key === stage);
 
-  // Work columns take the spare width; the review stack shares one column. A saved drag
-  // width still wins over the layout's default for that column.
-  const workColumn = (stage: KanbanStage) => {
-    const lane = stageLane(stage);
+  // Columns share the spare width; a saved drag width wins over the layout's default.
+  const stateColumn = (key: (typeof STATE_COLUMNS)[number]) => {
+    const lane = board.active.find((entry) => entry.key === key);
     if (!lane) return null;
-    if (hidden(stage)) {
+    if (hidden(key)) {
       return (
         <HiddenColumnRail
-          key={stage}
+          key={key}
           label={lane.label}
           count={lane.count}
-          onShow={() => toggle(stage)}
+          onShow={() => toggle(key)}
         />
       );
     }
-    const saved = widthOf(stage);
+    const saved = widthOf(key);
     return (
       <Column
-        key={stage}
+        key={key}
         lane={lane}
-        stage={stage}
+        stage={key}
         selectedCardId={props.selectedCardId}
         onOpenCard={props.onOpenCard}
-        className={saved === null ? "min-w-52 flex-[1.4] pointer-coarse:min-w-56" : "shrink-0"}
+        onGroup={props.onGroup}
+        className={
+          saved !== null
+            ? "shrink-0"
+            : props.compact
+              ? "min-w-62 flex-1"
+              : "min-w-46 flex-1 pointer-coarse:min-w-52"
+        }
         style={columnStyle(saved)}
         handle={
           <ColumnResizeHandle
-            columnKey={stage}
+            columnKey={key}
             label={lane.label}
             edge="right"
             width={saved}
-            onCommit={(width) => setWidth(stage, width)}
-            onReset={() => resetWidth(stage)}
+            onCommit={(width) => setWidth(key, width)}
+            onReset={() => resetWidth(key)}
           />
         }
       />
     );
   };
 
-  // A hidden review stage is restored from inside the shared stack, so it never adds a
-  // rail beside the stack and never widens the row.
-  const reviewRestore = (stage: KanbanStage) => {
-    const lane = stageLane(stage);
-    if (!lane || !hidden(stage)) return null;
-    return (
-      <button
-        type="button"
-        onClick={() => toggle(stage)}
-        aria-label={`Show ${lane.label} (${lane.count})`}
-        className="flex min-w-0 items-center justify-between gap-2 rounded-lg bg-(--m-surface) px-2 py-1 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 pointer-coarse:text-sm"
-      >
-        <span className="min-w-0 truncate font-medium">{lane.label}</span>
-        <span className="shrink-0 tabular-nums">{lane.count} hidden · show</span>
-      </button>
-    );
-  };
-
-  const reviewColumn = (stage: KanbanStage) => {
-    const lane = stageLane(stage);
-    if (!lane || hidden(stage)) return null;
-    return (
-      <Column
-        key={stage}
-        lane={lane}
-        stage={stage}
-        selectedCardId={props.selectedCardId}
-        onOpenCard={props.onOpenCard}
-        className="min-h-0 shrink"
-      />
-    );
-  };
-
-  const reviewStages = REVIEW_STAGES.filter((stage) => !hidden(stage));
-  // Both review stages share one column, so the stack takes the wider saved width.
-  const reviewSaved = reviewStages.reduce<number | null>((widest, stage) => {
-    const saved = widthOf(stage);
-    return saved === null ? widest : Math.max(widest ?? 0, saved);
-  }, null);
-  const setReviewWidth = (width: number) =>
-    updatePrefs((current) => ({
-      ...current,
-      widths: { ...current.widths, needs_review: width, in_review: width },
-    }));
-  const resetReviewWidth = () =>
-    updatePrefs((current) => {
-      const widths = { ...current.widths };
-      for (const stage of REVIEW_STAGES) delete widths[stage];
-      return { ...current, widths };
-    });
   const ownerVirtual = board.owner.rows.length > VIRTUAL_ROWS_MIN;
+  const owner = ownerHidden ? (
+    <HiddenColumnRail
+      label={board.owner.label}
+      count={board.owner.count}
+      onShow={() => toggle("needs_owner")}
+      className={props.compact ? undefined : "me-5 mb-4"}
+    />
+  ) : (
+    // A column like the others: header on the same line, its cards in a tinted well
+    // that grows with them, so an empty Needs you isn't a full-height band.
+    <section
+      aria-label={board.owner.label}
+      data-column="needs_owner"
+      className={cn(
+        "relative flex min-h-0 shrink-0 flex-col gap-2",
+        !props.compact && "me-5 mb-4",
+        widthOf("needs_owner") === null ? "w-64 pointer-coarse:w-68" : "",
+      )}
+      style={columnStyle(widthOf("needs_owner"))}
+    >
+      <ColumnResizeHandle
+        columnKey="needs_owner"
+        label={board.owner.label}
+        edge="left"
+        width={widthOf("needs_owner")}
+        onCommit={(width) => setWidth("needs_owner", width)}
+        onReset={() => resetWidth("needs_owner")}
+      />
+      <NeedsYouLink boardId={props.boardId} label={board.owner.label} count={board.owner.count} />
+      {/* A long list has no height of its own once only part of it is mounted,
+          so the well then fills the column. */}
+      <div
+        className={cn(
+          "flex min-h-0 flex-col rounded-xl bg-(--m-warnband) p-2",
+          ownerVirtual && "flex-1",
+        )}
+      >
+        <BoardRows
+          rows={board.owner.rows}
+          variant="raised"
+          selectedCardId={props.selectedCardId}
+          onOpenCard={props.onOpenCard}
+          className={ownerVirtual ? "flex-1" : undefined}
+          empty={
+            <p className="px-1.5 py-1 text-xs text-(--m-muted) pointer-coarse:text-sm">
+              Nothing waiting on you
+            </p>
+          }
+        />
+      </div>
+    </section>
+  );
+
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
-      {/* Needs Owner stays outside the scroller so it never slides off a narrow screen. */}
+      {/* On a wide board Needs you stays outside the scroller so it never slides away. */}
       <div
-        className={cn("flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto", HIDE_SCROLLBAR)}
-      >
-        {workColumn("todo")}
-        {workColumn("working")}
-        {reviewStages.length === 0 ? (
-          // Both review stages hidden: no stack, no resize handle, just the two restore controls.
-          <div className="flex w-44 shrink-0 flex-col gap-2 pointer-coarse:w-52">
-            {reviewRestore("needs_review")}
-            {reviewRestore("in_review")}
-          </div>
-        ) : (
-          <div
-            data-review-stack
-            className={cn(
-              "relative flex min-h-0 flex-col gap-3",
-              reviewSaved === null ? "min-w-44 flex-1 pointer-coarse:min-w-52" : "shrink-0",
-            )}
-            style={columnStyle(reviewSaved)}
-          >
-            <ColumnResizeHandle
-              columnKey="needs_review"
-              label="Review"
-              edge="right"
-              width={reviewSaved}
-              onCommit={setReviewWidth}
-              onReset={resetReviewWidth}
-            />
-            {reviewRestore("needs_review")}
-            {reviewColumn("needs_review")}
-            {reviewRestore("in_review")}
-            {reviewColumn("in_review")}
-          </div>
+        className={cn(
+          "flex min-h-0 min-w-0 flex-[3.6] gap-2.5 overflow-x-auto",
+          props.compact && "pe-5 pb-4",
+          HIDE_SCROLLBAR,
         )}
+      >
+        {STATE_COLUMNS.map(stateColumn)}
         {shippedHidden ? (
           <HiddenColumnRail label="Shipped" count={shippedCount} onShow={() => toggle("shipped")} />
         ) : shippedOpen ? (
@@ -287,59 +289,31 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
         ) : (
           <FoldedShipped lanes={board.shipped} onOpen={() => setShipped("open")} />
         )}
+        {props.compact ? owner : null}
       </div>
-      {/* A column like the others: header on the same line, its cards in a tinted well
-          that grows with them, so an empty Needs Owner isn't a full-height band. */}
-      {ownerHidden ? (
-        <HiddenColumnRail
-          label={board.owner.label}
-          count={board.owner.count}
-          onShow={() => toggle("needs_owner")}
-          className="me-5 mb-4"
-        />
-      ) : (
-        <section
-          aria-label={board.owner.label}
-          data-column="needs_owner"
-          className={cn(
-            "relative me-5 mb-4 flex min-h-0 shrink-0 flex-col gap-2",
-            widthOf("needs_owner") === null ? "w-64 pointer-coarse:w-68" : "",
-          )}
-          style={columnStyle(widthOf("needs_owner"))}
-        >
-          <ColumnResizeHandle
-            columnKey="needs_owner"
-            label={board.owner.label}
-            edge="left"
-            width={widthOf("needs_owner")}
-            onCommit={(width) => setWidth("needs_owner", width)}
-            onReset={() => resetWidth("needs_owner")}
-          />
-          <LaneHeader label={board.owner.label} count={board.owner.count} tone="warn" />
-          {/* A long list has no height of its own once only part of it is mounted,
-              so the well then fills the column. */}
-          <div
-            className={cn(
-              "flex min-h-0 flex-col rounded-xl bg-(--m-warnband) p-2",
-              ownerVirtual && "flex-1",
-            )}
-          >
-            <BoardRows
-              rows={board.owner.rows}
-              variant="raised"
-              selectedCardId={props.selectedCardId}
-              onOpenCard={props.onOpenCard}
-              className={ownerVirtual ? "flex-1" : undefined}
-              empty={
-                <p className="px-1.5 py-1 text-xs text-(--m-muted) pointer-coarse:text-sm">
-                  Nothing waiting on you
-                </p>
-              }
-            />
-          </div>
-        </section>
-      )}
+      {props.compact ? null : owner}
     </div>
+  );
+}
+
+/** The Needs you column's heading: the count, and the way to the page that answers them. */
+function NeedsYouLink(props: { boardId: string; label: string; count: number }) {
+  return (
+    <Link
+      to="/needs-you"
+      search={{ board: props.boardId }}
+      aria-label={`${props.label}: ${props.count}. Open Needs you for this board`}
+      className={cn(
+        "flex h-6 shrink-0 items-center justify-between rounded-md px-1 text-xs text-(--m-warning) hover:bg-(--m-warnband) pointer-coarse:h-8 pointer-coarse:text-sm",
+        FOCUS,
+      )}
+    >
+      <span className="font-medium">{props.label}</span>
+      <span className="flex items-center gap-1 tabular-nums">
+        {props.count.toLocaleString("en-US")}
+        <ArrowRightIcon aria-hidden className="size-3" />
+      </span>
+    </Link>
   );
 }
 
@@ -351,7 +325,10 @@ function FoldedShipped(props: { lanes: ReadonlyArray<BoardLane>; onOpen: () => v
       aria-expanded={false}
       aria-label="Show shipped cards"
       onClick={props.onOpen}
-      className="flex w-14 shrink-0 flex-col items-center gap-4 rounded-xl bg-(--m-surface) py-3 outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      className={cn(
+        "flex w-14 shrink-0 flex-col items-center gap-4 rounded-xl bg-(--m-surface) py-3 hover:bg-(--m-active)",
+        FOCUS,
+      )}
     >
       {props.lanes.map((lane) => (
         <span
@@ -371,7 +348,7 @@ function HiddenColumnRail(props: {
   label: string;
   count: number;
   onShow: () => void;
-  className?: string;
+  className?: string | undefined;
 }) {
   return (
     <button
@@ -379,7 +356,8 @@ function HiddenColumnRail(props: {
       onClick={props.onShow}
       aria-label={`Show ${props.label} (${props.count})`}
       className={cn(
-        "flex h-full min-h-24 w-8 shrink-0 flex-col items-center gap-2 rounded-xl bg-(--m-surface) py-3 text-xs text-(--m-muted) outline-none hover:bg-(--m-active) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)",
+        "flex h-full min-h-24 w-8 shrink-0 flex-col items-center gap-2 rounded-xl bg-(--m-surface) py-3 text-xs text-(--m-muted) hover:bg-(--m-active) hover:text-(--m-text)",
+        FOCUS,
         props.className,
       )}
     >
@@ -399,6 +377,7 @@ function Column(props: {
   variant?: BoardRowVariant;
   selectedCardId: string | undefined;
   onOpenCard: (cardId: string) => void;
+  onGroup?: OnBoardGroup;
   className?: string;
   style?: React.CSSProperties | undefined;
   handle?: React.ReactNode;
@@ -421,6 +400,7 @@ function Column(props: {
         variant={props.variant}
         selectedCardId={props.selectedCardId}
         onOpenCard={props.onOpenCard}
+        onGroup={props.onGroup}
         className="flex-1 pb-3"
       />
     </section>
@@ -450,7 +430,10 @@ function ShippedColumn(props: {
           aria-expanded={true}
           aria-label="Fold shipped cards"
           onClick={props.onFold}
-          className="inline-flex h-5 items-center rounded-full px-2 font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-3.5"
+          className={cn(
+            "inline-flex h-5 items-center rounded-full px-2 font-medium text-(--m-text) hover:bg-(--m-active) pointer-coarse:h-11 pointer-coarse:px-3.5",
+            FOCUS,
+          )}
         >
           Fold
         </button>
@@ -478,7 +461,10 @@ function NoCardsMatch(props: { searching: boolean; onClear: () => void }) {
       <button
         type="button"
         onClick={props.onClear}
-        className="h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+        className={cn(
+          "h-8 rounded-full bg-(--m-chip) px-3.5 text-sm font-medium hover:bg-(--m-active) pointer-coarse:h-11",
+          FOCUS,
+        )}
       >
         Clear filters
       </button>
@@ -525,70 +511,90 @@ function GroupGrid(props: ColumnsProps) {
   );
 }
 
-/** Phone layout: Needs Owner pinned on top, then one stage at a time. */
-function StageList(props: ColumnsProps & { columns: number }) {
+/** What the phone's column switcher calls each column: short enough for four to fit. */
+const SHORT_LABELS: Record<string, string> = {
+  todo: "To-Do",
+  working: "Working",
+  needs_review: "Review",
+  in_review: "Waiting",
+  needs_owner: "Needs you",
+};
+
+/** Phone layout: one column at a time, picked from a switcher that scrolls away with the cards. */
+function StageList(props: ColumnsProps) {
   const board = props.model;
-  const lanes = [...board.active, ...board.shipped];
+  const lanes = [...board.active, board.owner, ...board.shipped];
   const firstFull = lanes.find((lane) => lane.count > 0)?.key ?? "todo";
   const [picked, setPicked] = useState<string | null>(null);
-  const stage = picked ?? firstFull;
-  const current = lanes.find((lane) => lane.key === stage) ?? lanes[0];
+  const key = picked ?? firstFull;
+  const current = lanes.find((lane) => lane.key === key) ?? lanes[0];
+  const stuck = props.lens === "stuck";
 
-  // The pinned block and the tabs scroll away with the cards: they are the list's header.
-  const header = (
-    <div className="flex flex-col gap-3 pb-1">
-      {board.owner.rows.length > 0 ? (
-        <div className="flex flex-col gap-2 rounded-2xl bg-(--m-warnband) p-2.5">
-          <LaneHeader label={board.owner.label} count={board.owner.count} tone="warn" />
-          <BoardRows
-            rows={board.owner.rows}
-            variant="raised"
-            selectedCardId={undefined}
-            onOpenCard={props.onOpenCard}
-            columns={props.columns}
-            // A pinned block longer than a screen scrolls inside itself.
-            className={board.owner.rows.length > VIRTUAL_ROWS_MIN ? "h-[60dvh]" : undefined}
-          />
-        </div>
-      ) : null}
+  if (stuck) {
+    // Few cards, and the point is to see them all: every column, one under the other.
+    return (
       <div
-        role="tablist"
-        aria-label="Stage"
-        className={cn("flex shrink-0 gap-1 overflow-x-auto", HIDE_SCROLLBAR)}
+        className={cn(
+          "flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pe-4 pb-4",
+          HIDE_SCROLLBAR,
+        )}
       >
-        {lanes.map((lane) => {
-          const selected = lane.key === stage;
-          return (
-            <button
-              key={lane.key}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              onClick={() => setPicked(lane.key)}
-              className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
-                selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
-              )}
-            >
-              {lane.label}
-              <span className="tabular-nums opacity-70">{lane.count}</span>
-            </button>
-          );
-        })}
+        {board.active.map((lane) => (
+          <section key={lane.key} aria-label={lane.label} className="flex flex-col gap-2">
+            <LaneHeader label={lane.label} count={lane.count} />
+            <BoardRows
+              rows={lane.rows}
+              selectedCardId={undefined}
+              onOpenCard={props.onOpenCard}
+              className="max-h-[70dvh]"
+            />
+          </section>
+        ))}
       </div>
+    );
+  }
+
+  const header = (
+    <div
+      role="tablist"
+      aria-label="Column"
+      className={cn("flex shrink-0 gap-1 overflow-x-auto pb-3", HIDE_SCROLLBAR)}
+    >
+      {lanes.map((lane) => {
+        const selected = lane.key === key;
+        return (
+          <button
+            key={lane.key}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            onClick={() => setPicked(lane.key)}
+            className={cn(
+              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
+              FOCUS,
+              selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
+            )}
+          >
+            {SHORT_LABELS[lane.key] ?? lane.label}
+            <span className="tabular-nums opacity-70">{lane.count.toLocaleString("en-US")}</span>
+          </button>
+        );
+      })}
     </div>
   );
 
   return (
     <div className="flex min-h-0 flex-1 flex-col pe-4">
       <BoardRows
-        key={stage}
+        key={key}
         rows={current?.rows ?? []}
+        variant={key === "needs_owner" ? "raised" : undefined}
         selectedCardId={undefined}
         onOpenCard={props.onOpenCard}
-        columns={props.columns}
+        onGroup={props.onGroup}
         header={header}
         className="flex-1 pb-4"
+        empty={<p className="px-1 py-1 text-sm text-(--m-muted)">Nothing here</p>}
       />
     </div>
   );

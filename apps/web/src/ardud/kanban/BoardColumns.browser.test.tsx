@@ -186,6 +186,8 @@ async function render(state = boardState()) {
         boardId={BOARD_ID}
         model={createBoardView().model(state, NOW, { filter: {}, group: "stage" })}
         group="stage"
+        lens="all"
+        onGroup={() => {}}
         filter={{}}
         selectedCardId={undefined}
         onOpenCard={() => {}}
@@ -367,6 +369,8 @@ describe("group columns", () => {
           boardId={BOARD_ID}
           model={createBoardView().model(withProjects, NOW, { filter: {}, group: "project" })}
           group="project"
+          lens="all"
+          onGroup={() => {}}
           filter={{}}
           selectedCardId={undefined}
           onOpenCard={() => {}}

@@ -11,6 +11,7 @@ import {
   type BoardModel,
   type BoardViewParams,
 } from "./boardView.ts";
+import { TILE_GROUP_ORDER } from "./tilePlace.ts";
 import { cardSteps, cardView, groupCards, stageBoard, type BoardFilter } from "./viewModel.ts";
 
 const NOW = Date.parse("2026-10-25T12:00:00.000Z");
@@ -114,7 +115,13 @@ function stateOf(cards: KanbanCard[], threads: KanbanThreadState[] = []): Kanban
 const withCard = (state: KanbanBoardState, next: KanbanCard) =>
   applyKanbanChange(state, { _tag: "card", card: next } as never);
 
-const STAGE: BoardViewParams = { filter: {}, group: "stage" };
+/** Every state group shown in full, so a lane's rows hold all of its cards. */
+const ALL_OPEN = Object.fromEntries(
+  ["todo", "working", "needs_review", "in_review"].flatMap((column) =>
+    TILE_GROUP_ORDER.map((group) => [`${column}:${group}`, "all" as const]),
+  ),
+);
+const STAGE: BoardViewParams = { filter: {}, group: "stage", groups: ALL_OPEN };
 const idsOf = (lane: BoardLane) =>
   lane.rows.flatMap((row) => (row.kind === "card" ? [row.card.id] : []));
 
@@ -225,7 +232,7 @@ function randomBoard(seed: number, count: number) {
 }
 
 describe("createBoardView", () => {
-  it("lists every stage in the order the old view model gave it", () => {
+  it("holds the cards the old view model listed, To-Do's startable ones in the same order", () => {
     const { state } = randomBoard(11, 240);
     const filters: BoardFilter[] = [
       {},
@@ -238,7 +245,11 @@ describe("createBoardView", () => {
       { query: "#12" },
     ];
     for (const filter of filters) {
-      const built = createBoardView().model(state, NOW, { filter, group: "stage" });
+      const built = createBoardView().model(state, NOW, {
+        filter,
+        group: "stage",
+        groups: ALL_OPEN,
+      });
       // A search looks through settled cards too; the old view model needs to be told.
       const old = stageBoard(
         state,
@@ -246,9 +257,32 @@ describe("createBoardView", () => {
         filter.query && filter.settled === undefined ? { ...filter, settled: "include" } : filter,
       );
       expect(built.total).toBe(old.total);
-      expect(built.active.map((lane) => [lane.key, idsOf(lane)])).toEqual(
-        old.active.map((column) => [column.stage, column.cards.map((view) => view.id)]),
+      const oldIds = (stage: string) =>
+        old.active.find((column) => column.stage === stage)!.cards.map((view) => view.id);
+      const [todo, working, reviewing, waiting] = built.active;
+      expect(built.active.map((lane) => lane.label)).toEqual([
+        "To-Do",
+        "Working",
+        "Reviewing",
+        "In review, waiting",
+      ]);
+      expect(idsOf(todo!).toSorted()).toEqual(oldIds("todo").toSorted());
+      expect(idsOf(working!).toSorted()).toEqual(oldIds("working").toSorted());
+      // The two review stages are split by what the card is doing, not by stage.
+      expect([...idsOf(reviewing!), ...idsOf(waiting!)].toSorted()).toEqual(
+        [...oldIds("needs_review"), ...oldIds("in_review")].toSorted(),
       );
+      expect(todo!.count).toBe(oldIds("todo").length);
+      // Ready cards lead To-Do in the dispatcher's pick order, as before.
+      const ready = todo!.rows.findIndex((row) => row.kind === "group" && row.id === "todo:ready");
+      if (ready >= 0) {
+        const group = todo!.rows[ready]!;
+        const count = group.kind === "group" ? group.count : 0;
+        const ids = todo!.rows
+          .slice(ready + 1, ready + 1 + count)
+          .map((row) => (row.kind === "card" ? row.card.id : ""));
+        expect(ids).toEqual(oldIds("todo").filter((id) => ids.includes(id)));
+      }
       expect(built.shipped.map((lane) => [lane.key, idsOf(lane)])).toEqual(
         old.shipped.map((column) => [column.stage, column.cards.map((view) => view.id)]),
       );
@@ -262,6 +296,7 @@ describe("createBoardView", () => {
     const built = createBoardView().model(state, NOW, {
       filter: { settled: "include" },
       group: "stage",
+      groups: ALL_OPEN,
     });
     const rows = [...built.active, ...built.shipped].flatMap((lane) => lane.rows);
     expect(rows.length).toBeGreaterThan(100);
@@ -345,9 +380,13 @@ describe("createBoardView", () => {
     const built = engine.computed();
     expect(engine.model(state, NOW, STAGE)).toBe(first);
     // A new filter object with the same content, and a clock that crossed nothing.
-    expect(engine.model(state, NOW + 1000, { filter: { settled: "hide" }, group: "stage" })).toBe(
-      first,
-    );
+    expect(
+      engine.model(state, NOW + 1000, {
+        filter: { settled: "hide" },
+        group: "stage",
+        groups: { ...ALL_OPEN },
+      }),
+    ).toBe(first);
     expect(engine.computed()).toBe(built);
   });
 
@@ -461,7 +500,7 @@ describe("createBoardView", () => {
     } as never);
     const second = engine.model(quiet, NOW, STAGE);
     expect(engine.computed()).toBe(built + 1);
-    const working = second.active[1]!.rows[0];
+    const working = second.active[1]!.rows.find((row) => row.kind === "card");
     expect(working?.kind === "card" && working.card.needsInput).toBe(true);
     expect(second.active[0]).toBe(first.active[0]);
 
@@ -580,7 +619,7 @@ describe("createBoardView", () => {
 describe("boardSteps", () => {
   it("steps through a lane like cardSteps", () => {
     const { state } = randomBoard(41, 150);
-    for (const group of ["stage", "goal", "model"] as const) {
+    for (const group of ["goal", "model"] as const) {
       const built = createBoardView().model(state, NOW, { filter: {}, group });
       for (const entry of [...state.cards.values()].slice(0, 60)) {
         expect(boardSteps(built, group, entry.id)).toEqual(
@@ -588,6 +627,31 @@ describe("boardSteps", () => {
         );
       }
     }
+  });
+});
+
+describe("stepping on the stage board", () => {
+  it("steps through the cards a column shows, across its groups", () => {
+    const cards = [
+      card(1),
+      card(2, { blockedBy: ["card-1"] as never }),
+      card(3),
+      card(4, { stage: "working" }),
+    ];
+    const state = stateOf(cards);
+    const open = createBoardView().model(state, NOW, STAGE);
+    expect(boardSteps(open, "stage", "card-3")).toEqual({
+      previous: "card-1",
+      next: "card-2",
+      afterSettle: null,
+    });
+    // Blocked is folded by default: its cards are not steps until it is opened.
+    const folded = createBoardView().model(state, NOW, { filter: {}, group: "stage" });
+    expect(boardSteps(folded, "stage", "card-3")).toEqual({
+      previous: "card-1",
+      next: null,
+      afterSettle: null,
+    });
   });
 });
 
@@ -639,7 +703,7 @@ describe("board search", () => {
     },
   ]);
   const found = (query: string, engine = createBoardView()) => {
-    const built = engine.model(state, NOW, { filter: { query }, group: "stage" });
+    const built = engine.model(state, NOW, { filter: { query }, group: "stage", groups: ALL_OPEN });
     return [...built.active, ...built.shipped].flatMap(idsOf).sort();
   };
 
