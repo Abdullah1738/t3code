@@ -58,6 +58,7 @@ import {
   useAsk,
   useAskScope,
   useAskSecretsHeld,
+  useAskWhereabouts,
   useLateStanding,
   useOwnerStanding,
   useWatchAsks,
@@ -69,6 +70,7 @@ import {
   askStatePills,
   askTurn,
   type AskTurn,
+  missingAskWords,
   type NeedsYouAskParams,
   ownerStandingBarText,
   type OwnerStanding,
@@ -125,9 +127,18 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
     />
   );
 
+  // Not among the open asks once they are read: closed, or never there. It is asked for by
+  // itself, so "closed" is said only of an ask known to have closed.
+  const absent = key !== null && queue.read && entry === undefined && unreadable === undefined;
+  const whereabouts = useAskWhereabouts(key, absent);
+
   if (key === null || entry === undefined || item === undefined) {
     // Not in the open asks: still loading, unreachable, or answered and gone.
-    const loading = !queue.read && (queue.status === "idle" || queue.status === "loading");
+    const loading =
+      (!queue.read && (queue.status === "idle" || queue.status === "loading")) ||
+      (absent && whereabouts.where === "looking");
+    const missing =
+      absent && whereabouts.where !== "looking" ? missingAskWords(whereabouts.where) : null;
     return (
       <Screen title="Ask" onBack={nav.back}>
         <View className="flex-1 gap-3 px-4 pt-4">
@@ -149,17 +160,27 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
                     ? "This link opens no ask"
                     : unreadable
                       ? "This ask can't be shown in this version of Robob"
-                      : "This ask is closed"}
+                      : (missing?.title ?? "This ask can't be opened")}
                 </Text>
                 <Text className="text-base text-foreground-muted">
                   {key === null
                     ? "It names no card or ask."
                     : unreadable
                       ? "It is still open. Open its card to read it there."
-                      : "It was answered, taken back by its agent, or is on its way."}
+                      : (missing?.detail ?? "It is not among the open asks.")}
                 </Text>
               </View>
               <View className="flex-row flex-wrap gap-2">
+                {missing?.retry ? (
+                  <BarButton
+                    tone="primary"
+                    label="Check again"
+                    onPress={() => {
+                      whereabouts.retry();
+                      void asks.refreshAsks();
+                    }}
+                  />
+                ) : null}
                 {unreadable && unreadable.boardId !== null && unreadable.cardId !== null ? (
                   <BarButton
                     tone="primary"

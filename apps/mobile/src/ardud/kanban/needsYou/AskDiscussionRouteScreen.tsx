@@ -16,8 +16,20 @@ import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { Composer, MessageView } from "../Chat";
 import { messageReadWhole } from "../logic";
-import { useAskScope, useLateStanding, useOwnerStanding, useWatchAsks } from "./askStore";
-import { askKeyFromParams, askTurn, ownerStandingBarText, type NeedsYouAskParams } from "./logic";
+import {
+  useAskScope,
+  useAskWhereabouts,
+  useLateStanding,
+  useOwnerStanding,
+  useWatchAsks,
+} from "./askStore";
+import {
+  askKeyFromParams,
+  askTurn,
+  missingAskWords,
+  ownerStandingBarText,
+  type NeedsYouAskParams,
+} from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
 import { OwnerBand, OfflineBand } from "./ui";
@@ -40,12 +52,22 @@ export function AskDiscussionRouteScreen({
   const key = askKeyFromParams(route.params);
   const entry = key === null ? undefined : queue.entries.get(key);
   const item = key === null ? undefined : queue.items.get(key);
+  // "Closed" only of an ask known to have closed; one that never was can't be found.
+  const absent = key !== null && queue.read && entry === undefined;
+  const whereabouts = useAskWhereabouts(key, absent);
   if (entry === undefined || item === undefined) {
+    const missing =
+      absent && whereabouts.where !== "looking" ? missingAskWords(whereabouts.where) : null;
     return (
       <Screen title="Discussion" onBack={nav.back}>
         <View className="gap-2 px-4 pt-4">
-          {queue.read ? (
-            <Text className="text-base text-foreground-muted">This ask is closed.</Text>
+          {missing !== null ? (
+            <>
+              <Text className="text-base text-foreground">{missing.title}.</Text>
+              <Text className="text-sm text-foreground-muted">{missing.detail}</Text>
+            </>
+          ) : key === null && queue.read ? (
+            <Text className="text-base text-foreground-muted">This link opens no ask.</Text>
           ) : (
             <LoadingLine />
           )}

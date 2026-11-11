@@ -623,6 +623,66 @@ export function inputAccessibilityState<T extends object>(
   return { ...(state as T), disabled: editable === false };
 }
 
+/**
+ * What is known of an ask a link names that is not among the open asks.
+ *
+ * - `looking`: it is being read by itself.
+ * - `closed`: known to have closed: he answered it here, History holds it, or
+ *   the server says so.
+ * - `open`: the server says it is open; the queue this phone read is behind.
+ * - `notFound`: the server has no such ask (or no such card).
+ * - `unknown`: the server could not be asked.
+ */
+export type AskWhereabouts = "looking" | "closed" | "open" | "notFound" | "unknown";
+
+/**
+ * What a read of one ask by itself says. Only "closed" is said of an ask that
+ * closed: a link to an ask that never was is "not found", and a read that
+ * failed says nothing either way.
+ */
+export function askWhereabouts(
+  read: { readonly closedAt: string | null } | { readonly status: number },
+): Exclude<AskWhereabouts, "looking"> {
+  if ("closedAt" in read) return read.closedAt === null ? "open" : "closed";
+  return read.status === 404 ? "notFound" : "unknown";
+}
+
+/** The words for an ask that can't be opened, by what is known of it. */
+export function missingAskWords(where: Exclude<AskWhereabouts, "looking">): {
+  readonly title: string;
+  readonly detail: string;
+  /** Reading again may help. */
+  readonly retry: boolean;
+} {
+  switch (where) {
+    case "closed":
+      return {
+        title: "This ask is closed",
+        detail: "It was answered, taken back by its agent, or is on its way.",
+        retry: false,
+      };
+    case "notFound":
+      return {
+        title: "This ask can't be found",
+        detail:
+          "There is no ask like this on that card. The link may be mistyped or from another server.",
+        retry: false,
+      };
+    case "open":
+      return {
+        title: "This ask isn't in the queue yet",
+        detail: "It is open, but not among the asks this phone last read.",
+        retry: true,
+      };
+    case "unknown":
+      return {
+        title: "Couldn't check this ask",
+        detail: "It is not among the open asks, and Robob couldn't be asked whether it closed.",
+        retry: true,
+      };
+  }
+}
+
 /** The Needs-you screens that draw the toast (`AskToastBar`), by route name. */
 export const ASK_TOAST_ROUTES: ReadonlySet<string> = new Set([
   "NeedsYou",

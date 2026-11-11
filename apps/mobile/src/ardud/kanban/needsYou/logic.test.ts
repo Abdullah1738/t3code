@@ -32,10 +32,12 @@ import {
   rankOrder,
   stepWebLink,
   lateStanding,
+  askWhereabouts,
   bottomInsetFor,
   homeRowCount,
   inputAccessibilityState,
   leaveAfterAnswer,
+  missingAskWords,
   ownerStanding,
   queueSubtitle,
   toastUndo,
@@ -661,5 +663,36 @@ describe("a field that takes no input, for assistive tech", () => {
 
   it("keeps what else the field says of itself", () => {
     expect(inputAccessibilityState(false, { busy: true })).toEqual({ busy: true, disabled: true });
+  });
+});
+
+describe("an ask a link names that is not among the open asks", () => {
+  it("is closed only when the server says it closed", () => {
+    expect(askWhereabouts({ closedAt: "2026-11-11T09:00:00.000Z" })).toBe("closed");
+    expect(missingAskWords("closed").title).toBe("This ask is closed");
+  });
+
+  it("can't be found when the server has no such ask or card", () => {
+    expect(askWhereabouts({ status: 404 })).toBe("notFound");
+    const words = missingAskWords("notFound");
+    expect(words.title).toBe("This ask can't be found");
+    expect(`${words.title} ${words.detail}`).not.toMatch(/closed|answered/i);
+    expect(words.retry).toBe(false);
+  });
+
+  it("says nothing either way when the server could not be asked", () => {
+    for (const status of [0, 401, 403, 500, 200]) {
+      expect(askWhereabouts({ status })).toBe("unknown");
+    }
+    const words = missingAskWords("unknown");
+    expect(words.title).toBe("Couldn't check this ask");
+    expect(words.title).not.toMatch(/closed|found/i);
+    expect(words.retry).toBe(true);
+  });
+
+  it("an ask the server says is open is not called closed: the queue is behind", () => {
+    expect(askWhereabouts({ closedAt: null })).toBe("open");
+    expect(missingAskWords("open").title).not.toMatch(/closed|found/i);
+    expect(missingAskWords("open").retry).toBe(true);
   });
 });

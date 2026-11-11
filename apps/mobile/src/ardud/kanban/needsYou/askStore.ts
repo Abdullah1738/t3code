@@ -14,6 +14,7 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   AskApiError,
   askHistoryFigures,
+  askKey,
   askQueueFigures,
   type AskFigures,
   type AskSecretSendResult,
@@ -29,7 +30,7 @@ import type { AuthSessionState, EnvironmentId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { useNavigation } from "@react-navigation/native";
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { AppState } from "react-native";
 
 import { environmentCatalog } from "../../../connection/catalog";
@@ -40,8 +41,11 @@ import { pairedEnvironmentIdAtom } from "../../common/environment";
 import { kanbanClient } from "../kanbanStore";
 import { createAskScopes, type AskConnection, type AskScope } from "./askScope";
 import {
+  askParamsFromKey,
+  askWhereabouts,
   lateStanding,
   ownerStanding,
+  type AskWhereabouts,
   type LateStanding,
   type OwnerStanding,
   type SessionRead,
@@ -265,6 +269,64 @@ export function useOwnerStanding(): {
   const seen = useAsk((state) => state.ownerSeen);
   const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);
   return { standing: ownerStanding(sessionRead(result), refused, seen), recheck };
+}
+
+/**
+ * What is known of an ask that is not among the open ones (`missing`), so a
+ * screen says "closed" only of an ask known to have closed. What this phone
+ * holds answers first: an ask he answered here, or one History has read. If
+ * neither, the ask is read by itself from the server it would have come from.
+ * `retry` reads it again.
+ */
+export function useAskWhereabouts(
+  key: string | null,
+  missing: boolean,
+): { readonly where: AskWhereabouts; readonly retry: () => void } {
+  const { api, asks } = useAskScope();
+  const answeredHere = useAsk(
+    (state) =>
+      key !== null &&
+      (state.sent.some((send) => send.refs.some((ref) => ref.key === key)) ||
+        state.held?.payload.refs.some((ref) => ref.key === key) === true),
+  );
+  const inHistory = useAsk(
+    (state) => key !== null && state.closed?.some((entry) => askKey(entry) === key) === true,
+  );
+  const known = answeredHere || inHistory;
+  const [attempt, setAttempt] = useState(0);
+  const [found, setFound] = useState<{
+    readonly key: string;
+    readonly attempt: number;
+    readonly where: Exclude<AskWhereabouts, "looking">;
+  } | null>(null);
+  useEffect(() => {
+    if (!missing || known || key === null) return;
+    const params = askParamsFromKey(key);
+    if (params === null) return;
+    let current = true;
+    const settle = (where: Exclude<AskWhereabouts, "looking">) => {
+      if (!current) return;
+      setFound({ key, attempt, where });
+      // Open after all: the queue is behind, so it is read again.
+      if (where === "open") void asks.refreshAsks();
+    };
+    // The server takes a card's id where it takes its reference.
+    api.detail(params.cardId, params.askId).then(
+      (detail) => settle(askWhereabouts({ closedAt: detail.ask.closedAt })),
+      (error: unknown) =>
+        settle(askWhereabouts({ status: error instanceof AskApiError ? error.status : 0 })),
+    );
+    return () => {
+      current = false;
+    };
+  }, [api, asks, key, missing, known, attempt]);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  const where: AskWhereabouts = known
+    ? "closed"
+    : found !== null && found.key === key && found.attempt === attempt
+      ? found.where
+      : "looking";
+  return { where, retry };
 }
 
 /** Keeps the feed current while a screen shows it. `fast`: the queue or an ask is open. */
