@@ -114,9 +114,12 @@ export function AskDiscussion(props: {
     <section aria-label="Discussion" data-ny-discussion className="flex min-w-0 flex-col gap-3">
       <h3 className="flex items-baseline gap-2 text-base font-semibold">
         Discussion
-        <span className="text-sm font-normal text-(--m-muted) tabular-nums">
-          {messages.length > 0 ? messages.length : "no messages yet"}
-        </span>
+        {/* With only an earlier version below, neither a count nor "no messages yet" is true. */}
+        {messages.length > 0 || thread.length === 0 ? (
+          <span className="text-sm font-normal text-(--m-muted) tabular-nums">
+            {messages.length > 0 ? messages.length : "no messages yet"}
+          </span>
+        ) : null}
       </h3>
       {talk}
       {composer}

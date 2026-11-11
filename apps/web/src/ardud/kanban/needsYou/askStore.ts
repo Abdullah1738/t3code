@@ -182,6 +182,8 @@ export const dismissAskToast = () => {
 
 let inFlight: Promise<void> | null = null;
 let again = false;
+/** History asked for its asks and has none yet: the next good read of the feed asks again. */
+let closedOwed = false;
 /** The ask the page has open: changes on it need no "new" mark. */
 let focusedKey: string | null = null;
 export const noteAskFocus = (key: string | null) => {
@@ -242,12 +244,18 @@ export function refreshAsks(): Promise<void> {
   if (get().feed === null) set({ status: "loading" });
   inFlight = askApi
     .feed()
-    .then(mergeFeed, (error: unknown) => {
-      set({
-        status: get().feed === null ? "error" : "ready",
-        error: error instanceof Error ? error.message : "Couldn't load asks.",
-      });
-    })
+    .then(
+      (feed) => {
+        mergeFeed(feed);
+        if (closedOwed) void loadClosedAsks();
+      },
+      (error: unknown) => {
+        set({
+          status: get().feed === null ? "error" : "ready",
+          error: error instanceof Error ? error.message : "Couldn't load asks.",
+        });
+      },
+    )
     .finally(() => {
       inFlight = null;
       if (again) {
@@ -264,10 +272,15 @@ export async function loadClosedAsks(): Promise<void> {
   set({ closedStatus: get().closed === null ? "loading" : "ready" });
   try {
     const feed = await askApi.feed({ closed: "7d" });
+    closedOwed = false;
     mergeFeed(feed);
     set({ closed: feed.closed, closedStatus: "ready" });
-  } catch {
-    set({ closedStatus: get().closed === null ? "error" : "ready" });
+  } catch (error) {
+    const none = get().closed === null;
+    closedOwed = none;
+    // A reload lands on History before the connection is up: that is still loading, not a failure.
+    const early = error instanceof AskApiError && error.code === "offline";
+    set({ closedStatus: none ? (early ? "idle" : "error") : "ready" });
   }
 }
 

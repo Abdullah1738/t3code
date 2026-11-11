@@ -198,7 +198,9 @@ export function Layer(props: {
       modal={offset > 0 ? "trap-focus" : true}
     >
       <Dialog.Portal>
+        {/* The page sits inside the app's own dialog tree, where a backdrop is left out unless forced. */}
         <Dialog.Backdrop
+          forceRender
           className={cn(
             "fixed inset-x-0 top-0 bg-black/25 transition-opacity duration-200 data-ending-style:opacity-0 data-starting-style:opacity-0 motion-reduce:transition-none",
             side === "center" ? "z-50" : "z-(--z-sheet)",

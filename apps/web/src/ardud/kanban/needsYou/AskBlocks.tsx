@@ -370,7 +370,8 @@ function Block(props: {
       if (kind === "video") {
         const mediaIndex = props.media.indexOf.get(props.index);
         return (
-          <figure className="flex flex-col gap-1.5">
+          // No wider than the demo's player: in a wide column it would be mostly black bars.
+          <figure className="flex max-w-[560px] flex-col gap-1.5">
             {url === null ? (
               <Bar className="aspect-video w-full rounded-xl" />
             ) : (
@@ -402,7 +403,7 @@ function Block(props: {
       }
       if (kind === "audio") {
         return (
-          <figure className="flex flex-col gap-1.5">
+          <figure className="flex max-w-[560px] flex-col gap-1.5">
             {url === null ? (
               <Bar className="h-12 rounded-full" />
             ) : (
