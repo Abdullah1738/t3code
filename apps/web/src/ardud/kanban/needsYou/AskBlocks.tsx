@@ -44,6 +44,8 @@ export interface AskMedia {
   readonly urlOf: ReadonlyMap<number, string | null>;
   /** Text blocks that are the caption of the picture or video before them. */
   readonly captions: ReadonlySet<number>;
+  /** Files held here and not on the server, by block index. */
+  readonly fileOf?: ReadonlyMap<number, Blob>;
 }
 
 const shortCaption = (block: KanbanAskBlock | undefined): string | null =>
@@ -65,9 +67,23 @@ export function useAskMedia(ask: KanbanOwnerAsk): AskMedia {
       mimeType: attachment.mimeType,
     })),
   );
-  const urlOf = new Map<number, string | null>(
-    attachments.map(({ index }, position) => [index, urls[position] ?? null]),
+  return askMediaOf(
+    blocks,
+    new Map<number, string | null>(
+      attachments.map(({ index }, position) => [index, urls[position] ?? null]),
+    ),
   );
+}
+
+/**
+ * The same, from URLs already in hand. `fileOf` is for files that are not on
+ * the server (the reference page's samples): they open from the Blob itself.
+ */
+export function askMediaOf(
+  blocks: ReadonlyArray<KanbanAskBlock>,
+  urlOf: ReadonlyMap<number, string | null>,
+  fileOf?: ReadonlyMap<number, Blob>,
+): AskMedia {
   const items: Array<AskMediaItem> = [];
   const indexOf = new Map<number, number>();
   const captions = new Set<number>();
@@ -101,7 +117,7 @@ export function useAskMedia(ask: KanbanOwnerAsk): AskMedia {
       src: urlOf.get(index) ?? null,
     });
   });
-  return { items, indexOf, urlOf, captions };
+  return { items, indexOf, urlOf, captions, ...(fileOf ? { fileOf } : {}) };
 }
 
 /** One picture of the ask as a thumbnail that opens the viewer. */
@@ -164,15 +180,83 @@ const FILE_ICONS: Partial<Record<FilePreviewKind, typeof FileIcon>> = {
   audio: MusicIcon,
 };
 
-function FileCard(props: { attachment: Attachment; kind: FilePreviewKind }) {
+/** Whether this browser draws a PDF in the page; a phone browser may only offer to open it. */
+const drawsPdf = (): boolean => typeof navigator !== "undefined" && navigator.pdfViewerEnabled;
+
+/**
+ * The first page of a PDF, drawn by the browser's own viewer with its chrome
+ * off. It is a picture of the page: a click anywhere opens the whole document.
+ */
+function PdfPage(props: {
+  attachment: Attachment;
+  /** A file held here: shown from its own URL, not fetched. */
+  localUrl: string | null;
+  onOpen: () => void;
+}) {
+  const { attachment } = props;
+  const environmentId = usePrimaryEnvironmentId();
+  // The viewer needs the file served inline; the block's own URL is a download.
+  const [remote] = useAssetUrls(
+    environmentId ?? ("" as EnvironmentId),
+    props.localUrl === null && environmentId !== null
+      ? [
+          {
+            _tag: "attachment" as const,
+            attachmentId: attachment.id,
+            fileName: attachment.name,
+            mimeType: attachment.mimeType,
+            disposition: "inline" as const,
+          },
+        ]
+      : [],
+  );
+  const url = props.localUrl ?? remote ?? null;
+  return (
+    <div className="relative h-72 overflow-hidden rounded-xl bg-(--m-surface) ring-1 ring-(--m-rule)">
+      {url === null ? (
+        <Bar className="size-full rounded-none" />
+      ) : (
+        <embed
+          aria-hidden
+          tabIndex={-1}
+          src={`${url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
+          type="application/pdf"
+          className="pointer-events-none size-full"
+        />
+      )}
+      <button
+        type="button"
+        aria-label={`Open ${attachment.name}`}
+        onClick={props.onOpen}
+        className="absolute inset-0 cursor-zoom-in rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+      />
+    </div>
+  );
+}
+
+function FileCard(props: {
+  attachment: Attachment;
+  kind: FilePreviewKind;
+  /** A file held here and not on the server, with the URL it is shown from. */
+  file?: Blob | undefined;
+  fileUrl?: string | null;
+}) {
   const { attachment, kind } = props;
   const environmentId = usePrimaryEnvironmentId();
   const [open, setOpen] = useState(false);
   const Icon = /\.(csv|tsv|xlsx?)$/i.test(attachment.name)
     ? FileSpreadsheetIcon
     : (FILE_ICONS[kind] ?? FileIcon);
+  const local = props.file !== undefined;
   return (
-    <>
+    <div className="flex min-w-0 flex-col gap-2">
+      {kind === "pdf" && drawsPdf() ? (
+        <PdfPage
+          attachment={attachment}
+          localUrl={local ? (props.fileUrl ?? null) : null}
+          onOpen={() => setOpen(true)}
+        />
+      ) : null}
       <div className="flex min-w-0 items-center gap-3 rounded-xl py-2 ps-3.5 pe-2 ring-1 ring-(--m-rule)">
         <Icon aria-hidden className="size-5 shrink-0 text-(--m-muted)" />
         <div className="min-w-0 flex-1">
@@ -182,7 +266,7 @@ function FileCard(props: { attachment: Attachment; kind: FilePreviewKind }) {
             {kind === "unsupported" ? " · no preview" : ""}
           </p>
         </div>
-        <Btn size="sm" disabled={environmentId === null} onClick={() => setOpen(true)}>
+        <Btn size="sm" disabled={!local && environmentId === null} onClick={() => setOpen(true)}>
           <Maximize2Icon aria-hidden />
           Open
         </Btn>
@@ -197,17 +281,19 @@ function FileCard(props: { attachment: Attachment; kind: FilePreviewKind }) {
         bare
         bodyClassName="flex min-h-0 flex-col overflow-hidden rounded-2xl p-0"
       >
-        {open && environmentId !== null ? (
+        {open && (local || environmentId !== null) ? (
           <AttachmentFilePreview
             name={attachment.name}
             mimeType={attachment.mimeType}
             sizeBytes={attachment.sizeBytes}
-            asset={{ environmentId, attachmentId: attachment.id }}
+            {...(props.file !== undefined
+              ? { file: props.file }
+              : { asset: { environmentId: environmentId!, attachmentId: attachment.id } })}
             onClose={() => setOpen(false)}
           />
         ) : null}
       </Layer>
-    </>
+    </div>
   );
 }
 
@@ -335,7 +421,14 @@ function Block(props: {
           </figure>
         );
       }
-      return <FileCard attachment={block.attachment} kind={kind} />;
+      return (
+        <FileCard
+          attachment={block.attachment}
+          kind={kind}
+          file={props.media.fileOf?.get(props.index)}
+          fileUrl={url}
+        />
+      );
     }
     default:
       return null;
