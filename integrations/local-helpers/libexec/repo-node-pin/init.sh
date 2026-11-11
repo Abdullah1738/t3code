@@ -82,11 +82,12 @@ if [ "${_repo_node_hooked:-}" != 1 ]; then
                     *' DEBUG')
                         _repo_node_zsh_debug=${_repo_node_zsh_traps##*trap -- }
                         _repo_node_zsh_debug=${_repo_node_zsh_debug% DEBUG}
-                        _repo_node_previous_debug() { eval "eval $_repo_node_zsh_debug"; } ;;
+                        # zsh ignores a string trap's ordinary command status, unlike a function trap's return.
+                        _repo_node_previous_debug() { eval "eval $_repo_node_zsh_debug"; :; } ;;
                     *) _repo_node_previous_debug() { :; } ;;
                 esac
             fi
-            TRAPDEBUG() { _repo_node_previous_debug "$@"; _repo_node_refresh; }
+            TRAPDEBUG() { _repo_node_previous_debug "$@" || return $?; _repo_node_refresh; }
         fi
     elif [ -n "${BASH_VERSION:-}" ]; then
         # Bash can restore a caller's DEBUG trap when a sourced file returns.

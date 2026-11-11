@@ -198,6 +198,30 @@ class SelectionTest(unittest.TestCase):
                     if 'echo' in action:
                         self.assertTrue(r.stderr.rstrip().endswith('existing-debug'), r.stderr)
 
+    def test_previous_zsh_debug_outcomes_match_baseline(self):
+        body = 'echo before; echo guarded; echo after'
+        for status in [0, 1, 2, 7]:
+            for strict in ['', 'set -e; ']:
+                for shape in ['function', 'string-command', 'string-return']:
+                    # A top-level return0 in a string trap ends the baseline shell, rather than blocking a command.
+                    if shape == 'string-return' and status == 0:
+                        continue
+                    command = f'return {status}' if shape != 'string-command' else f'(exit {status})'
+                    action = f'if [[ "$ZSH_DEBUG_CMD" == "echo guarded" ]]; then {command}; fi'
+                    if shape == 'function':
+                        before = strict + 'TRAPDEBUG() { ' + action + '; return 0; }'
+                    else:
+                        before = strict + 'trap ' + shlex.quote(action) + ' DEBUG'
+                    with self.subTest(status=status, strict=strict, shape=shape):
+                        baseline = subprocess.run(['/bin/zsh', '-c', before + '\n' + body], cwd=self.plain,
+                                                  env=self.env, text=True, capture_output=True, timeout=10)
+                        actual = self.run_shell(body, '/bin/zsh', self.plain, before=before)
+                        self.assertEqual((actual.returncode, actual.stdout, actual.stderr),
+                                         (baseline.returncode, baseline.stdout, baseline.stderr))
+                        if status and shape in ['function', 'string-return']:
+                            self.assertEqual(actual.returncode, status)
+                            self.assertEqual(actual.stdout, 'before\n')
+
     def test_shell_quote_handles_repo_text(self):
         self.pkg(engines={'node': "$(touch /tmp/not-executed); 'bad\nvalue"})
         r = self.run_shell('node -v')
@@ -294,6 +318,29 @@ class InstallPlanTest(unittest.TestCase):
             self.assertEqual(installer.updated(shell), shell)
             self.assertEqual((home / '.zshrc').read_text(), original)
             self.assertEqual(len(changes), 9)
+
+    def test_preview_never_includes_unchanged_sentinel_secrets(self):
+        sentinel = 'SENTINEL_CREDENTIAL_MUST_NOT_LEAVE_SHELL_FILE'
+        secret_line = 'export API_CREDENTIAL=' + sentinel
+        cases = [secret_line + '\n', secret_line, secret_line + '\n\n',
+                 secret_line + '\n# >>> repo-node-pin (managed by local-helpers) >>>\nold setup\n# <<< repo-node-pin <<<\n' + secret_line + '\n']
+        for original in cases:
+            for flags in [[], ['--check']]:
+                with self.subTest(original=original, flags=flags), tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    names = ['.zshenv', '.zprofile', '.zshrc', '.bash_profile', '.bashrc']
+                    for name in names:
+                        (home / name).write_text(original)
+                    env = dict(os.environ, HOME=str(home), PYTHONDONTWRITEBYTECODE='1')
+                    result = subprocess.run(['/usr/bin/python3', str(HERE / 'install-node-pin.py'), *flags],
+                                            env=env, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 1 if flags else 0, result.stderr)
+                    self.assertNotIn(sentinel, result.stdout + result.stderr)
+                    self.assertNotIn('API_CREDENTIAL', result.stdout + result.stderr)
+                    self.assertIn('+[ ! -r "$HOME/.local/libexec/repo-node-pin/init.sh" ]', result.stdout)
+                    self.assertIn('init.sh', result.stdout)
+                    for name in names:
+                        self.assertEqual((home / name).read_text(), original)
 
     def test_existing_bash_login_entry_is_preserved(self):
         spec = importlib.util.spec_from_file_location('installer', HERE / 'install-node-pin.py')

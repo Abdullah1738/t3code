@@ -71,8 +71,8 @@ def main():
         if old == new and dst.exists() and dst.stat().st_mode & 0o777 == mode:
             continue
         drift = True
-        print(''.join(difflib.unified_diff(old.decode().splitlines(True), new.decode().splitlines(True),
-                                         fromfile=str(dst), tofile=str(dst) + ' (after)')), end='')
+        print('\n'.join(difflib.unified_diff(old.decode().splitlines(), new.decode().splitlines(),
+                                           fromfile=str(dst), tofile=str(dst) + ' (after)', n=0, lineterm='')))
         if args.install:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
