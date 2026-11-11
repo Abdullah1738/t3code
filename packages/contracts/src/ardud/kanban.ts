@@ -263,13 +263,15 @@ export const KanbanAskDraft = Schema.Struct({
 });
 export type KanbanAskDraft = typeof KanbanAskDraft.Type;
 
-/** What will be done, where, the proof it is ready, and how to undo it. */
+/** What will be done, where, the proof it is ready, how to undo it, and what happens after. */
 export const KanbanAskAction = Schema.Struct({
   summary: Schema.String,
   command: Schema.optional(Schema.String),
   target: Schema.optional(Schema.String),
   evidence: Schema.optional(Schema.Array(Schema.String)),
   undo: Schema.optional(Schema.String),
+  /** What the asker does once it is done, e.g. "Post the before and after on the Linear ticket". */
+  then: Schema.optional(Schema.String),
 });
 export type KanbanAskAction = typeof KanbanAskAction.Type;
 

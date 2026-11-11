@@ -606,3 +606,59 @@ it.effect("what a thread does through the board tools is its own, never the owne
     );
   }).pipe(Effect.provide(testLayer())),
 );
+
+it.effect("an action says what happens after it, and an old client reads it in the message", () =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Run the migration?",
+      action: {
+        summary: "Run migration 42 on staging",
+        undo: "Run the down migration",
+        then: "Post the before and after on the Linear ticket",
+      },
+    });
+    assert.isFalse(asked.isError, asked.text);
+    const stored = (yield* kanban.card(card.id)).card.asks[0]!;
+    assert.strictEqual(stored.action?.then, "Post the before and after on the Linear ticket");
+    const discussion = yield* kanban.cardDiscussion(card.id);
+    const posted = yield* kanban.message(discussion.id, stored.seq!);
+    const text = posted.blocks.flatMap((block) => (block._tag === "md" ? [block.text] : []));
+    assert.include(
+      text.join("\n"),
+      "- Undo: Run the down migration\n- Then: Post the before and after on the Linear ticket",
+    );
+
+    // card_ask_change replaces it with the rest of the action, and it is held to its size.
+    const changed = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: { summary: "Run migration 42 on staging", then: "Tell the on-call it is done" },
+      revisionNote: "Different follow-up",
+    });
+    assert.isFalse(changed.isError, changed.text);
+    const after = (yield* kanban.card(card.id)).card.asks[0]!;
+    assert.deepStrictEqual(after.action, {
+      summary: "Run migration 42 on staging",
+      then: "Tell the on-call it is done",
+    });
+    const long = yield* call(evaluator, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      action: { summary: "Run migration 42 on staging", then: "x".repeat(2_001) },
+    });
+    assert.isTrue(long.isError);
+    assert.include(long.text, "action then");
+    // An ask without it reads as before.
+    const plain = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Restart the worker?",
+      action: { summary: "Restart the worker" },
+    });
+    assert.isFalse(plain.isError, plain.text);
+    const second = (yield* kanban.card(card.id)).card.asks[1]!;
+    assert.notProperty(second.action!, "then");
+  }).pipe(Effect.provide(testLayer())),
+);
+

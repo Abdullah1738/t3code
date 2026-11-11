@@ -121,6 +121,7 @@ export const ASK_LIMITS = {
   evidence: 10,
   evidenceLine: 1_000,
   undo: 2_000,
+  then: 2_000,
   changeLabel: 200,
   changeText: 20_000,
   /** Texts one ask replaces. */
@@ -276,6 +277,7 @@ export interface AskFieldsInput {
         readonly target?: string | undefined;
         readonly evidence?: ReadonlyArray<string> | undefined;
         readonly undo?: string | undefined;
+        readonly then?: string | undefined;
       }
     | undefined;
   /** One text being replaced; the same as a one-item `changes`. */
@@ -318,6 +320,7 @@ export const askTextFields = (
   ["action target", input.action?.target],
   ...(input.action?.evidence ?? []).map((line) => ["action evidence", line] as const),
   ["action undo", input.action?.undo],
+  ["action then", input.action?.then],
   ...[...(input.change ? [input.change] : []), ...(input.changes ?? [])].flatMap((change) => [
     ["change label", change.label] as const,
     ["change before", change.before] as const,
@@ -1059,6 +1062,8 @@ export const askFields = (
     if (isProblem(target)) return target;
     const undo = line("action undo", input.action.undo, ASK_LIMITS.undo);
     if (isProblem(undo)) return undo;
+    const then = line("action then", input.action.then, ASK_LIMITS.then);
+    if (isProblem(then)) return then;
     const evidence = (input.action.evidence ?? [])
       .map((entry) => entry.trim())
       .filter((entry) => entry !== "");
@@ -1075,6 +1080,7 @@ export const askFields = (
       target,
       evidence: evidence.length > 0 ? evidence : undefined,
       undo,
+      then,
     });
   }
 
@@ -1475,6 +1481,7 @@ export const askDetail = (ask: KanbanOwnerAsk): string => {
         ask.action.command ? `- Command: \`${ask.action.command}\`` : null,
         ...(ask.action.evidence ?? []).map((entry) => `- Evidence: ${entry}`),
         ask.action.undo ? `- Undo: ${ask.action.undo}` : null,
+        ask.action.then ? `- Then: ${ask.action.then}` : null,
       ]
         .filter((entry) => entry !== null)
         .join("\n"),
