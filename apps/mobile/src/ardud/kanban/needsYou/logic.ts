@@ -731,6 +731,30 @@ export function toastUndo(
 }
 
 /**
+ * What the band under an ask says of an answer that was not sent. An answer
+ * that never reached the server waits to go again, and says when: once Robob is
+ * back, or by Retry when it no longer goes by itself. When the session has
+ * answered and this phone may not send (`sends` is `notOwner`, or `unchecked`
+ * for a session that is signed out or could not be read), it will not go from
+ * here, so the band says that and not that it goes again.
+ */
+export function notSentText(
+  failed: { readonly message: string; readonly unreached?: boolean },
+  sends: OwnerStanding,
+  goesByItself: boolean,
+): string {
+  if (failed.unreached !== true) return `Not sent. ${failed.message}`;
+  if (sends === "notOwner" || sends === "unchecked") {
+    return `Not sent. ${ownerStandingBarText(sends, "answer")} Your answer is kept.`;
+  }
+  return `Not sent. ${failed.message} ${
+    goesByItself
+      ? "Your answer is kept and goes again once Robob is back."
+      : "Your answer is kept. It no longer goes by itself: retry when Robob is back."
+  }`;
+}
+
+/**
  * Whether Undo is offered: always for a held answer, for a write only to the
  * owner. `standing` is the standing to send by (`sends` of `useOwnerStanding`):
  * the session of the connection that is up now, not what an earlier one said.

@@ -28,6 +28,7 @@ import {
   isLoadablePicture,
   moveRank,
   needsYouItemsByKey,
+  notSentText,
   queueRows,
   rankOrder,
   stepWebLink,
@@ -694,5 +695,37 @@ describe("an ask a link names that is not among the open asks", () => {
     expect(askWhereabouts({ closedAt: null })).toBe("open");
     expect(missingAskWords("open").title).not.toMatch(/closed|found/i);
     expect(missingAskWords("open").retry).toBe(true);
+  });
+});
+
+describe("what the band says of an answer that was not sent", () => {
+  const waiting = { message: "Not connected to Robob.", unreached: true };
+
+  it("an answer that waits says when it goes again", () => {
+    expect(notSentText(waiting, "owner", true)).toBe(
+      "Not sent. Not connected to Robob. Your answer is kept and goes again once Robob is back.",
+    );
+    expect(notSentText(waiting, "checking", true)).toBe(
+      "Not sent. Not connected to Robob. Your answer is kept and goes again once Robob is back.",
+    );
+    expect(notSentText(waiting, "owner", false)).toBe(
+      "Not sent. Not connected to Robob. Your answer is kept. It no longer goes by itself: retry when Robob is back.",
+    );
+  });
+
+  it("on a phone that turned out not to be his it says so, and never that it goes again", () => {
+    const text = notSentText(waiting, "notOwner", true);
+    expect(text).toBe("Not sent. This phone can read asks, not answer them. Your answer is kept.");
+    expect(text).not.toContain("goes again");
+  });
+
+  it("the same when the session is signed out or could not be read", () => {
+    expect(notSentText(waiting, "unchecked", true)).toBe(
+      "Not sent. Couldn't check that this phone is yours. Your answer is kept.",
+    );
+  });
+
+  it("an answer the server refused keeps the server's reason", () => {
+    expect(notSentText({ message: "Pick one." }, "notOwner", false)).toBe("Not sent. Pick one.");
   });
 });

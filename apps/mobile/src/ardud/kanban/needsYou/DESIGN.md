@@ -143,7 +143,8 @@ There are two standings, and they are kept apart (`useOwnerStanding` gives both)
   said never sends anything. Every connection starts its own session check, so after a
   reconnect a queued answer waits, however many times the feed reads first, and goes once that
   check says owner. If it says the phone is not his, or signed out, nothing goes: the answer
-  stays "Not sent" and the phone shows as not his.
+  stays "Not sent", its band says this phone can read asks and not answer them (not that the
+  answer goes again), and the phone shows as not his (`notSentText`).
 
 One gate in the scope holds every write to that rule (`blocked` in `askScope.ts`, read by the
 screens as `writeBlocked`): an answer when its hold ends, a batch, a retry by itself or by

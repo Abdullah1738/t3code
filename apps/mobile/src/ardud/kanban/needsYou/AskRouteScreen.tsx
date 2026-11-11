@@ -71,6 +71,7 @@ import {
   askTurn,
   type AskTurn,
   missingAskWords,
+  notSentText,
   type NeedsYouAskParams,
   ownerStandingBarText,
   type OwnerStanding,
@@ -550,12 +551,7 @@ function OpenAsk(props: {
                 : undefined
             }
           >
-            Not sent. {failed.message}
-            {failed.unreached
-              ? askAutoRetryOwed({ failed: { [key]: failed } })
-                ? " Your answer is kept and goes again once Robob is back."
-                : " Your answer is kept. It no longer goes by itself: retry when Robob is back."
-              : ""}
+            {notSentText(failed, sends, askAutoRetryOwed({ failed: { [key]: failed } }))}
           </Band>
         ) : null}
         {secretError ? <Band tone="negative">{secretError}</Band> : null}
