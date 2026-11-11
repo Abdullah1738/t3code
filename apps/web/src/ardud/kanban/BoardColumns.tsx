@@ -29,7 +29,8 @@ import {
   type OnBoardGroup,
 } from "./BoardRows";
 import { ColumnResizeHandle, COLUMN_WIDTH_PROPERTY } from "./ColumnResizeHandle";
-import { GoalBar, Glyph, stageGlyph } from "./parts";
+import { BoardSummaryStrip } from "./BoardSummaryStrip";
+import { GoalBar, Glyph, Seg, stageGlyph } from "./parts";
 import { useBoardColumnPrefs } from "./useBoardColumnPrefs";
 
 const FOCUS =
@@ -48,6 +49,9 @@ export function BoardColumns(props: {
   onClearFilters: () => void;
   /** Opens, folds or expands a state group inside a column. */
   onGroup: OnBoardGroup;
+  onLens: (lens: BoardLens) => void;
+  /** The paused-board banner: pinned above the numbers, or scrolling away with them on a phone. */
+  lead?: React.ReactNode;
 }) {
   // The board's own width decides, not the screen's: an iPad with the sidebar open
   // is a wide screen with a narrow board.
@@ -70,14 +74,51 @@ export function BoardColumns(props: {
     });
   const { model, filter } = props;
   if (model.total === 0) {
-    return <NoCardsMatch searching={(filter.query ?? "") !== ""} onClear={props.onClearFilters} />;
+    return (
+      <div className="flex min-h-0 flex-col gap-3.5">
+        {props.lead ? <div className="flex flex-col pe-5 max-sm:pe-4">{props.lead}</div> : null}
+        <NoCardsMatch searching={(filter.query ?? "") !== ""} onClear={props.onClearFilters} />
+      </div>
+    );
   }
   const picked = filter.goalIds ?? [];
   const shownGoals =
     picked.length > 0 ? model.goals.filter((entry) => picked.includes(entry.goal.id)) : model.goals;
 
+  // All / Stuck sits above the columns at every width: the page header is full by a tablet's.
+  const lens =
+    props.group === "stage" ? (
+      <div className="flex shrink-0 flex-wrap items-center gap-x-3.5 gap-y-2">
+        <Seg
+          label="Lens"
+          value={props.lens}
+          options={lensOptions(model.stuck.count)}
+          onChange={props.onLens}
+        />
+        {props.lens === "stuck" ? (
+          <p className="min-w-0 text-sm text-(--m-text) pointer-coarse:text-base">
+            {model.stuck.line}
+          </p>
+        ) : null}
+      </div>
+    ) : null;
+  // On a phone the numbers scroll away with the cards; everywhere else they stay put.
+  const top = (
+    <>
+      {props.lead}
+      <BoardSummaryStrip boardId={props.boardId} summary={model.summary} phone={phone} />
+      {lens}
+    </>
+  );
+  const scrollsAway = phone && props.group === "stage";
+
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
+      {scrollsAway ? null : (
+        <div className={cn("flex shrink-0 flex-col gap-3", phone ? "pe-4" : "pe-5")}>
+          {phone ? props.lead : top}
+        </div>
+      )}
       {shownGoals.length > 0 && !phone ? (
         <div className={cn("flex shrink-0 gap-2.5 overflow-x-auto pe-5", HIDE_SCROLLBAR)}>
           {shownGoals.map((entry) => (
@@ -101,7 +142,7 @@ export function BoardColumns(props: {
       ) : null}
       {props.group === "stage" ? (
         phone ? (
-          <StageList {...props} />
+          <StageList {...props} top={top} />
         ) : (
           <StageGrid {...props} wide={wide} compact={compact} />
         )
@@ -113,6 +154,12 @@ export function BoardColumns(props: {
 }
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
+
+/** "All" and "Stuck 54": the count is on the switch, so the lens never has to be tried to be read. */
+const lensOptions = (stuck: number): ReadonlyArray<{ value: BoardLens; label: string }> => [
+  { value: "all", label: "All" },
+  { value: "stuck", label: `Stuck ${stuck.toLocaleString("en-US")}` },
+];
 
 /** Below this the board is a phone's: one column at a time. */
 const PHONE_MAX_WIDTH = 640;
@@ -521,7 +568,7 @@ const SHORT_LABELS: Record<string, string> = {
 };
 
 /** Phone layout: one column at a time, picked from a switcher that scrolls away with the cards. */
-function StageList(props: ColumnsProps) {
+function StageList(props: ColumnsProps & { top: React.ReactNode }) {
   const board = props.model;
   const lanes = [...board.active, board.owner, ...board.shipped];
   const firstFull = lanes.find((lane) => lane.count > 0)?.key ?? "todo";
@@ -539,6 +586,7 @@ function StageList(props: ColumnsProps) {
           HIDE_SCROLLBAR,
         )}
       >
+        <div className="flex shrink-0 flex-col gap-3">{props.top}</div>
         {board.active.map((lane) => (
           <section key={lane.key} aria-label={lane.label} className="flex flex-col gap-2">
             <LaneHeader label={lane.label} count={lane.count} />
@@ -555,31 +603,34 @@ function StageList(props: ColumnsProps) {
   }
 
   const header = (
-    <div
-      role="tablist"
-      aria-label="Column"
-      className={cn("flex shrink-0 gap-1 overflow-x-auto pb-3", HIDE_SCROLLBAR)}
-    >
-      {lanes.map((lane) => {
-        const selected = lane.key === key;
-        return (
-          <button
-            key={lane.key}
-            type="button"
-            role="tab"
-            aria-selected={selected}
-            onClick={() => setPicked(lane.key)}
-            className={cn(
-              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
-              FOCUS,
-              selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
-            )}
-          >
-            {SHORT_LABELS[lane.key] ?? lane.label}
-            <span className="tabular-nums opacity-70">{lane.count.toLocaleString("en-US")}</span>
-          </button>
-        );
-      })}
+    <div className="flex flex-col gap-3 pb-3">
+      {props.top}
+      <div
+        role="tablist"
+        aria-label="Column"
+        className={cn("flex shrink-0 gap-1 overflow-x-auto", HIDE_SCROLLBAR)}
+      >
+        {lanes.map((lane) => {
+          const selected = lane.key === key;
+          return (
+            <button
+              key={lane.key}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              onClick={() => setPicked(lane.key)}
+              className={cn(
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
+                FOCUS,
+                selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
+              )}
+            >
+              {SHORT_LABELS[lane.key] ?? lane.label}
+              <span className="tabular-nums opacity-70">{lane.count.toLocaleString("en-US")}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 

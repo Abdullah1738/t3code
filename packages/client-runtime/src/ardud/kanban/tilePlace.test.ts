@@ -272,6 +272,22 @@ describe("tilePlace", () => {
     ]);
     expect(failed.stuck).toBe("failed");
 
+    // A reason that opens with the word is not prefixed with it again.
+    const twice = placed(
+      card(4, {
+        stage: "working",
+        stalled: {
+          reason: "failed twice: worker stopped with no result",
+          at: ago(3 * HOUR),
+          by: SYSTEM,
+        } as never,
+      }),
+    );
+    expect(say(twice)).toEqual([
+      "Failed twice: worker stopped with no result",
+      "Needs a look: restart it or reroute it",
+    ]);
+
     const idle = placed(
       card(3, { stage: "working", activeThreadId: "t3" as never, activeRole: "work" }),
       [],
@@ -633,6 +649,8 @@ describe("the stage board's groups", () => {
       paused: false,
       authors: 2,
       needsYou: 1,
+      open: 23,
+      through: 23,
     };
     const engine = createBoardView();
     expect(engine.model(board(), NOW, STAGE).summary).toEqual(expected);
@@ -663,7 +681,13 @@ describe("the stage board's groups", () => {
       "Held by the pause 14 (folded)",
     ]);
     expect(rowsOf(built.active[3]!)).toEqual(["Held by the pause 3", "#60", "#61", "#62"]);
-    expect(built.summary).toMatchObject({ ready: 2, blocked: 18, paused: true });
+    expect(built.summary).toMatchObject({
+      ready: 2,
+      blocked: 18,
+      paused: true,
+      open: 23,
+      through: 2,
+    });
     expect(built.stuck.count).toBe(0);
   });
 });

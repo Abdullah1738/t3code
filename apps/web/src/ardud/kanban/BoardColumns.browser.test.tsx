@@ -188,6 +188,7 @@ async function render(state = boardState()) {
         group="stage"
         lens="all"
         onGroup={() => {}}
+        onLens={() => {}}
         filter={{}}
         selectedCardId={undefined}
         onOpenCard={() => {}}
@@ -371,6 +372,7 @@ describe("group columns", () => {
           group="project"
           lens="all"
           onGroup={() => {}}
+          onLens={() => {}}
           filter={{}}
           selectedCardId={undefined}
           onOpenCard={() => {}}

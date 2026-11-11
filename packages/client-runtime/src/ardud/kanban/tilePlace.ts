@@ -425,12 +425,16 @@ export function tilePlace(
     case "failed": {
       const stalled = card.stalled!;
       const failed = stalled.by._tag === "system";
+      const word = failed ? "Failed" : "Flagged";
+      // A reason that already opens with the word ("Failed twice: ...") is the whole line.
+      const reason = stalled.reason.trim();
+      const says = reason.toLowerCase().startsWith(word.toLowerCase());
       const shown = line(
         "stop",
         "negative",
-        failed ? "Failed" : "Flagged",
+        says ? reason.charAt(0).toUpperCase() + reason.slice(1) : word,
         failed ? "Needs a look: restart it or reroute it" : "Needs a look",
-        { rest: stalled.reason },
+        { rest: says ? null : reason },
       );
       if (stage === "working") {
         return place(column, "failed", shown, {

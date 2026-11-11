@@ -153,6 +153,9 @@ export interface BoardSummary {
   /** Cards parked until their author pushes. */
   readonly authors: number;
   readonly needsYou: number;
+  /** Cards not yet shipped, and how many of them a pause lets through (all of them when not paused). */
+  readonly open: number;
+  readonly through: number;
 }
 
 /** One column's worth of rows, top to bottom. */
@@ -605,6 +608,8 @@ export function createBoardView(): BoardViewEngine {
     let blocked = 0;
     let authors = 0;
     let needsYou = 0;
+    let open = 0;
+    let through = 0;
     const goalCounts = new Map<string, { progress: Progress; needsOwner: number }>();
     for (const card of state.cards.values()) {
       const isSettled = card.settledAt !== null;
@@ -628,6 +633,10 @@ export function createBoardView(): BoardViewEngine {
         }
         if (group === "author") authors += 1;
         if (entry.needsOwner) needsYou += 1;
+        if (!KANBAN_DONE_STAGES.has(card.stage)) {
+          open += 1;
+          if (kept === null || kept.has(card.id)) through += 1;
+        }
       }
       if (card.goalId !== null) {
         let counts = goalCounts.get(card.goalId);
@@ -927,6 +936,8 @@ export function createBoardView(): BoardViewEngine {
       paused: kept !== null,
       authors,
       needsYou,
+      open,
+      through,
     };
     const summary =
       previous !== null && same(previous.summary, nextSummary) ? previous.summary : nextSummary;

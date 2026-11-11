@@ -1,5 +1,6 @@
+import { useNavigate } from "@tanstack/react-router";
 import { ArchiveIcon, ChevronDownIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
-import { KANBAN_WS_METHODS } from "@t3tools/contracts";
+import { KANBAN_WS_METHODS, type KanbanBoard } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useState } from "react";
 
@@ -8,7 +9,6 @@ import {
   boardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
-  pauseBanner,
   sanitizeBoardFilterPrefs,
   type BoardFilter,
   type BoardFilterPrefs,
@@ -29,6 +29,7 @@ import {
   MenuRadioItem,
   MenuTrigger,
 } from "../../components/ui/menu";
+import { requestConfirmDialog } from "../../confirmDialog";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { BoardFilterMenu } from "./BoardFilterMenu";
 import { SidebarInset } from "../../components/ui/sidebar";
@@ -54,6 +55,7 @@ import {
   kanban,
   kanbanErrorMessage,
   runAction,
+  useBoards,
   useBoardState,
   useFeed,
   useKanbanPermission,
@@ -127,7 +129,7 @@ export function BoardPage(props: {
   // a stale ?card= for a card this board doesn't have leaves the page usable.
   const drawerOpen = search.card !== undefined && state?.cards.has(search.card) === true;
   const setup = state ? setupBanner(state.board) : null;
-  const pause = state ? pauseBanner(state.board, state.cards) : null;
+  const pause = state?.board.pause ?? null;
   const stepCard = (card: string) => go({ card }, { replace: true });
   const group = search.group ?? "stage";
   const lens: BoardLens = group === "stage" && search.lens === "stuck" ? "stuck" : "all";
@@ -141,6 +143,29 @@ export function BoardPage(props: {
       ? boardViewFor(boardId).model(state, boardClock, { filter, group, lens, groups })
       : null;
   const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
+  const setLens = (next: BoardLens) => go({ lens: next === "stuck" ? "stuck" : undefined });
+  const liftPause = async () => {
+    const held = model ? model.summary.open - model.summary.through : 0;
+    const message =
+      held > 0
+        ? `Lift the pause? ${held.toLocaleString("en-US")} held ${held === 1 ? "card" : "cards"} can start again.`
+        : "Lift the pause? Held cards can start again.";
+    const confirmed = (await requestConfirmDialog(message)) ?? window.confirm(message);
+    if (!confirmed) return;
+    await runAction("Couldn't lift the pause", () => kanban.liftPause(boardId));
+  };
+
+  // The board view places the banner itself: above its numbers, scrolling away on a phone.
+  const pauseBanner = pause ? (
+    <PauseBanner
+      at={pause.at}
+      by={pause.by}
+      reason={pause.reason}
+      flow={model?.summary.paused ? model.summary : null}
+      canLift={canLiftPause}
+      onLift={() => void liftPause()}
+    />
+  ) : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -153,16 +178,7 @@ export function BoardPage(props: {
         >
           <WorkspaceBreadcrumb ariaLabel="Board" className="min-w-0 shrink overflow-hidden">
             <WorkspaceBreadcrumbItem className="min-w-0 shrink">
-              <button
-                type="button"
-                onClick={() => onSearch({})}
-                className="max-w-full min-w-0 rounded font-semibold text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  {state ? <BoardIcon board={state.board} className="text-(--m-muted)" /> : null}
-                  <WorkspaceBreadcrumbText>{state?.board.name ?? "Board"}</WorkspaceBreadcrumbText>
-                </span>
-              </button>
+              <BoardSwitcher boardId={boardId} board={state?.board} onHome={() => onSearch({})} />
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator className="max-md:hidden" />
             <WorkspaceBreadcrumbItem current className="max-md:hidden">
@@ -231,14 +247,8 @@ export function BoardPage(props: {
                     }
                   />
                 ) : null}
-                {pause ? (
-                  <PauseBanner
-                    label={pause.label}
-                    canLift={canLiftPause}
-                    onLift={() =>
-                      void runAction("Couldn't lift the pause", () => kanban.liftPause(boardId))
-                    }
-                  />
+                {pauseBanner && view !== "board" ? (
+                  <div className="me-5 mb-3 flex flex-col max-sm:me-4">{pauseBanner}</div>
                 ) : null}
                 {feed.failure ? (
                   <div
@@ -267,6 +277,8 @@ export function BoardPage(props: {
                   nowMs={nowMs}
                   model={model}
                   lens={lens}
+                  onLens={setLens}
+                  lead={pauseBanner}
                   onGroup={setGroup}
                   go={go}
                   openCard={openCard}
@@ -303,6 +315,8 @@ function BoardBody(props: {
   nowMs: number;
   model: BoardModel | null;
   lens: BoardLens;
+  onLens: (lens: BoardLens) => void;
+  lead: React.ReactNode;
   onGroup: (id: string, state: BoardGroupState) => void;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
@@ -319,6 +333,8 @@ function BoardBody(props: {
             model={props.model}
             group={search.group ?? "stage"}
             lens={props.lens}
+            onLens={props.onLens}
+            lead={props.lead}
             onGroup={props.onGroup}
             filter={filter}
             onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
@@ -470,6 +486,73 @@ function BoardControls(props: {
       <span className="flex-1" />
       <QueryField value={props.query} onChange={props.onQuery} />
     </div>
+  );
+}
+
+const BOARD_NAME =
+  "max-w-full min-w-0 rounded font-semibold text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
+
+/**
+ * The board's name in the header. With more than one board it opens the list of
+ * them: the open board goes back to its columns, another opens on All.
+ */
+function BoardSwitcher(props: {
+  boardId: string;
+  board: KanbanBoard | undefined;
+  onHome: () => void;
+}) {
+  const navigate = useNavigate();
+  const boards = (useBoards() ?? []).filter(
+    (entry) => entry.board.archivedAt === null || entry.board.id === props.boardId,
+  );
+  const name = (
+    <span className="flex min-w-0 items-center gap-2">
+      {props.board ? <BoardIcon board={props.board} className="text-(--m-muted)" /> : null}
+      <WorkspaceBreadcrumbText>{props.board?.name ?? "Board"}</WorkspaceBreadcrumbText>
+    </span>
+  );
+  if (boards.length < 2) {
+    return (
+      <button type="button" onClick={props.onHome} className={BOARD_NAME}>
+        {name}
+      </button>
+    );
+  }
+  const open = (boardId: string) => {
+    if (boardId === props.boardId) props.onHome();
+    else void navigate({ to: "/boards/$boardId", params: { boardId }, search: {} });
+  };
+  return (
+    <Menu>
+      <MenuTrigger
+        render={<button type="button" aria-label="Switch board" className={BOARD_NAME} />}
+      >
+        <span className="flex min-w-0 items-center gap-1">
+          {name}
+          <ChevronDownIcon className="size-3.5 shrink-0 text-(--m-muted)" aria-hidden />
+        </span>
+      </MenuTrigger>
+      <MenuPopup align="start" side="bottom">
+        <MenuRadioGroup value={props.boardId} onValueChange={(value) => open(String(value))}>
+          {boards.map((entry) => (
+            <MenuRadioItem key={entry.board.id} value={entry.board.id}>
+              <span className="flex min-w-0 flex-1 items-center gap-2">
+                <BoardIcon board={entry.board} className="text-(--m-muted)" />
+                <span className="min-w-0 truncate">{entry.board.name}</span>
+                {entry.needsOwner > 0 ? (
+                  <span
+                    className="ms-auto ps-3 text-xs text-(--m-warning) tabular-nums"
+                    aria-label={`${entry.needsOwner} need you`}
+                  >
+                    {entry.needsOwner.toLocaleString("en-US")}
+                  </span>
+                ) : null}
+              </span>
+            </MenuRadioItem>
+          ))}
+        </MenuRadioGroup>
+      </MenuPopup>
+    </Menu>
   );
 }
 
