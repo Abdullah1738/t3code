@@ -67,6 +67,7 @@ export * from "./worktreeSetup.ts";
 // ardud fork
 export * from "./ardud/kanban.ts";
 export * from "./ardud/kanbanRpc.ts";
+export * from "./ardud/kanbanAskGuide.ts";
 export * from "./ardud/ownerStanding.ts";
 export * from "./ardud/contextReset.ts";
 export * from "./ardud/imessageSend.ts";

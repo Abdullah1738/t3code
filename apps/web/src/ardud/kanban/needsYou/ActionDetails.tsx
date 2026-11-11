@@ -44,6 +44,16 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
       </span>,
     ]);
   }
+  // What its agent does right after a yes. Read loosely: older servers do not send it.
+  const then = (action as { readonly then?: unknown }).then;
+  if (typeof then === "string" && then.trim() !== "") {
+    rows.push([
+      "Then",
+      <span key="then" className="[overflow-wrap:anywhere]">
+        {then}
+      </span>,
+    ]);
+  }
   return (
     <section aria-label="What this runs" className="rounded-2xl bg-(--m-surface) p-4">
       {action.command ? (
