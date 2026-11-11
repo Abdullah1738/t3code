@@ -92,6 +92,212 @@ with socket.socket() as s:
     set -- "${@:1:$command_index}" --server-endpoint "localhost:$port" "${@:$((command_index+1))}"
   fi
 fi
-# Quint 0.33.1 owns its spawned Apalache PID and terminates it on exit/signals.
-# exec preserves that cleanup and never touches an externally supplied server.
+if (( command_index )) && [[ "${argv[command_index]}" == verify ]]; then
+  if [[ "${QUINT_ALLOW_VULNERABLE_APALACHE:-}" == 1 ]]; then
+    print -u2 -r -- "quint wrapper: QUINT_ALLOW_VULNERABLE_APALACHE=1: bypassing the patched backend guard; Quint may launch/download stock Apalache."
+  else
+    exec python3 - "$quint_bin" "$@" <<'PYTHON_GUARD'
+import hashlib
+import os
+from pathlib import Path
+import re
+import selectors
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+ARCHIVE_SHA = 'b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f'
+JAR_SHA = 'cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593'
+PROPERTY = '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true'
+FALLBACK = re.compile(rb'Downloading Apalache|Launching Apalache server|Started Apalache server on pid=|No running Apalache server found, launching|QUINT_BACKEND_LAUNCH_BLOCKED', re.I)
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def sha(file):
+    h = hashlib.sha256()
+    with file.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def stop(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def guarded(cli, args):
+    # QUINT_HOME only changes the cache root; the sentinel also blocks fallback
+    # after a reflection rejection, even when Quint suppresses its own logging.
+    with tempfile.TemporaryDirectory(prefix='quint-guard-') as temp:
+        root = Path(temp)
+        archive = Path(os.environ.get('QUINT_APALACHE_ARCHIVE', str(Path.home() / '.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz')))
+        if not archive.is_file():
+            fail(f'pinned patched Apalache archive missing: {archive}; install the reviewed #787 archive (or set QUINT_APALACHE_ARCHIVE). No backend will be downloaded.')
+        local_archive = root / 'dist.tgz'
+        shutil.copyfile(archive, local_archive)
+        if sha(local_archive) != ARCHIVE_SHA:
+            fail(f'patched Apalache archive sha256 mismatch: {archive}')
+        with tarfile.open(local_archive) as bundle:
+            members = bundle.getmembers()
+            # #787's archive has only directories and regular files. Never
+            # extract paths or links that could escape this private directory.
+            for member in members:
+                parts = Path(member.name).parts
+                if not parts or parts[0] != 'apalache' or '..' in parts or not (member.isfile() or member.isdir()):
+                    fail('unexpected path or file type in patched Apalache archive')
+            bundle.extractall(root, members=members)
+        dist = root / 'apalache'
+        jar = dist / 'lib/apalache.jar'
+        if not jar.is_file() or sha(jar) != JAR_SHA:
+            fail('patched Apalache jar sha256 mismatch')
+        home = root / 'quint-home'
+        fenced = home / 'apalache-dist-0.62.4/apalache'
+        (fenced / 'bin').mkdir(parents=True)
+        (fenced / 'lib').mkdir()
+        (fenced / 'lib/apalache.jar').symlink_to(jar)
+        marker = root / 'fallback-attempted'
+        sentinel = fenced / 'bin/apalache-mc'
+        sentinel.write_text('#!/bin/sh\n: > "$QUINT_GUARD_MARKER"\necho "QUINT_BACKEND_LAUNCH_BLOCKED: Quint tried to start its own backend" >&2\nexit 1\n')
+        sentinel.chmod(0o700)
+        env = dict(os.environ, QUINT_HOME=str(home), QUINT_GUARD_MARKER=str(marker), APALACHE_JAR=str(jar), TMPDIR=str(root))
+        for name in ('JVM_ARGS', 'JVM_GC_ARGS', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+            raw_options = env.get(name, '')
+            # HotSpot does not interpret shell backslash escapes and accepts
+            # extra whitespace separators. Refuse ambiguous spellings before
+            # using shlex for the shared quote/word rules.
+            if '\\' in raw_options or any(c.isspace() and c not in ' \t\r\n' for c in raw_options):
+                fail(f'{name} contains ambiguous JVM escapes or separators; remove them')
+            try:
+                options = shlex.split(raw_options)
+            except ValueError:
+                fail(f'{name} contains invalid quoting')
+            # HotSpot strips embedded quotes in its environment options, so a
+            # raw string check would miss e.g. pre22_gen"code"=false.
+            # JVM_ARGS/GC_ARGS are expanded by Apalache's shell launcher,
+            # whereas the JVM parses *_JAVA_OPTIONS itself. Check both views;
+            # accepting a reserved override in either interpretation is unsafe.
+            for option in options + raw_options.split():
+                key, separator, value = option.partition('=')
+                if key == '-Dcom.google.protobuf.use_unsafe_pre22_gencode' or (key == '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode' and (not separator or value != 'true')):
+                    fail(f'{name} contains an unsafe protobuf override; remove it')
+        env['JVM_ARGS'] = env.get('JVM_ARGS', '') + ' ' + PROPERTY
+        # Preserve explicit local ports, but never trust an external/unpinned
+        # server. Canonical options come last so no alternate version is fetched.
+        split = args.index('--') if '--' in args else len(args)
+        before, after = args[:split], args[split:]
+        endpoint = None
+        version_indices = set()
+        for i, arg in enumerate(before):
+            key, equal, value = arg.partition('=')
+            if key in ('--no-server-endpoint', '--no-serverEndpoint', '--no-apalache-version', '--no-apalacheVersion'):
+                fail(f'{key} is incompatible with the guarded backend')
+            if key in ('--server-endpoint', '--serverEndpoint', '--apalache-version', '--apalacheVersion'):
+                value = value if equal else (before[i+1] if i+1 < len(before) else '')
+                if key in ('--apalache-version', '--apalacheVersion'):
+                    if value != '0.62.4':
+                        fail('guarded verify requires --apalache-version 0.62.4')
+                    version_indices.add(i)
+                    if not equal:
+                        version_indices.add(i + 1)
+                else:
+                    match = re.fullmatch(r'(localhost|127\.0\.0\.1):([0-9]+)', value)
+                    if not match or not 0 < int(match[2]) < 65536:
+                        fail('guarded --server-endpoint must be localhost:<port> or 127.0.0.1:<port> with a free port')
+                    endpoint = int(match[2])
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1', endpoint or 0))
+            port = reservation.getsockname()[1]
+        # Yargs combines duplicate string options into arrays, including aliases.
+        # Remove accepted user spellings before adding one pinned version.
+        before = [arg for i, arg in enumerate(before) if i not in version_indices]
+        args = before + ['--apalache-version=0.62.4'] + after
+        server = client = None
+        interrupted = []
+        def interrupt(signum, frame):
+            # Do not raise between Popen creating a child and returning its PID.
+            # Defer the exception until the child is stored for cleanup.
+            interrupted.append(signum)
+        def check_interrupted():
+            if interrupted:
+                raise KeyboardInterrupt
+        old_handlers = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            server = subprocess.Popen([str(dist / 'bin/apalache-mc'), 'server', f'--port={port}'], env=env)
+            check_interrupted()
+            deadline = time.monotonic() + 30
+            while True:
+                check_interrupted()
+                if server.poll() is not None:
+                    fail('patched Apalache exited before listening')
+                # A successful TCP connect alone could belong to a competing
+                # process that won the port race. Require our exact PID to own it.
+                listening = subprocess.run(['lsof', '-nP', '-a', '-p', str(server.pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-t'], capture_output=True, text=True)
+                if str(server.pid) in listening.stdout.split():
+                    break
+                if time.monotonic() >= deadline:
+                    fail('patched Apalache did not listen within 30s')
+                time.sleep(.05)
+            client = subprocess.Popen([cli, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            check_interrupted()
+            selector = selectors.DefaultSelector()
+            for stream, target in ((client.stdout, sys.stdout.buffer), (client.stderr, sys.stderr.buffer)):
+                selector.register(stream, selectors.EVENT_READ, target)
+            tails = {client.stdout: b'', client.stderr: b''}
+            unsafe = False
+            while selector.get_map():
+                check_interrupted()
+                for key, _ in selector.select(timeout=.1):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    key.data.write(data)
+                    key.data.flush()
+                    combined = tails[key.fileobj] + data
+                    unsafe |= bool(FALLBACK.search(combined))
+                    tails[key.fileobj] = combined[-256:]
+                if unsafe or marker.exists():
+                    stop(client)
+                    fail('Quint attempted to download or launch its own Apalache backend; verify refused')
+            while client.poll() is None:
+                check_interrupted()
+                time.sleep(.05)
+            code = client.returncode
+            if marker.exists():
+                fail('Quint attempted to launch its own Apalache backend; verify refused')
+            return code if code >= 0 else 128 - code
+        except KeyboardInterrupt:
+            return 128 + (interrupted[-1] if interrupted else signal.SIGINT)
+        finally:
+            for sig in old_handlers:
+                signal.signal(sig, signal.SIG_IGN)
+            stop(client)
+            stop(server)
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
+
+
+try:
+    sys.exit(guarded(sys.argv[1], sys.argv[2:]))
+except (RuntimeError, OSError, tarfile.TarError) as error:
+    print(f'quint wrapper: {error}', file=sys.stderr)
+    sys.exit(1)
+PYTHON_GUARD
+  fi
+fi
 exec "$quint_bin" "$@"

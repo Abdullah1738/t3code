@@ -76,22 +76,28 @@ Install a missing JDK with `brew install openjdk`. It finds the real CLI via
 `~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
 on short agent PATHs. Missing CLI: `npm i -g @informalsystems/quint@0.33.1`.
 
-Verify without `--server-endpoint` gets a free localhost port, so concurrent
-cards avoid the shared 8822 default, including with options before `verify`.
-Both `--server-endpoint host:port` and `--server-endpoint=host:port` (also
-the camel-case `--serverEndpoint` alias) are preserved. Other commands pass through.
-The wrapper execs Quint: 0.33.1 already terminates its own Apalache child on
-exit/signals, and leaves an existing server alone. Port allocation releases
-the socket before Quint binds it; a competing process can still win that race.
+Verify without `--server-endpoint` gets a free local port. Explicit endpoints
+must name a free `localhost:<port>` or `127.0.0.1:<port>`; the wrapper starts its
+own server there and never attaches to an existing server. Other commands pass
+through. `QUINT_APALACHE_ARCHIVE` selects the reviewed archive (default
+`~/.local/share/apalache-patched/apalache-0.62.4-grpc-1.75.0.tgz`); a missing or
+mismatched archive/JAR fails before starting Java. Each verify uses a private
+temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
+the pinned JAR available to TLC. Quint-side launch/download attempts fail even
+if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
+completion or signals. Port ownership is checked with `lsof` before Quint runs.
 
-Use `command -v quint` to confirm the wrapper is selected: some agent PATHs
-put nvm before `~/.local/bin`, which bypasses it. Until PATH precedence is
-changed with owner approval, call `~/.local/bin/quint` explicitly (or this
-checkout's `bin/quint` before installation). Installation and any agent
-configuration changes need approval. This wrapper leaves the Apalache cache
-and JVM options intact. The shared 0.62.4 launcher currently refuses vulnerable
-protobuf reflection code; real verification waits for #787's patched backend
-and #675's pin/guard. Do not disable that guard or replace the shared cache.
+CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
+The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides and ambiguous backslash/whitespace spellings are refused.
+Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet peers can reach it for the run's duration. The Mac firewall was disabled (block-all disabled, stealth off) on 12 Nov; a loopback source patch is a separate follow-up.
+`QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
+Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.
+
+Use `command -v quint` to confirm the wrapper is selected: harness PATHs put
+nvm before `~/.local/bin`. Until approved PATH changes and installation, call
+the checkout's `integrations/local-helpers/bin/quint` explicitly. The shared
+`~/.quint` cache is untouched. Offbox has no installed wrapper or pinned
+archive from this change; shipping both and fixing PATH is a separate task.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads
