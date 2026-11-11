@@ -96,12 +96,10 @@ const asEvaluator = <A, R>(
       : run(service, caller),
   );
 
-// An unlinked subagent isn't an outside orchestrator if a card thread started it.
-const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (
-  caller: Caller,
-) {
+const ancestorThreadIds = Effect.fn("KanbanTools.ancestorThreadIds")(function* (caller: Caller) {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const seen = new Set<string>();
+  const ancestors: Array<Caller["threadId"]> = [];
   let id = caller.threadId;
   while (true) {
     if (seen.has(id)) return yield* refuse("Cannot verify the calling thread's ancestry.");
@@ -118,18 +116,39 @@ const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(functio
     if (shell === null || shell.deletedAt !== null) {
       return yield* refuse("Cannot verify the calling thread's ancestry.");
     }
-    if (shell.lineage.parentThreadId === null) return [...seen];
+    if (shell.lineage.parentThreadId === null) return ancestors;
     id = shell.lineage.parentThreadId;
+    ancestors.push(id);
   }
 });
+
+// An unlinked subagent isn't an outside orchestrator if a card thread started it.
+const pauseCallerAncestry = Effect.fn("KanbanTools.pauseCallerAncestry")(function* (
+  caller: Caller,
+) {
+  return [caller.threadId, ...(yield* ancestorThreadIds(caller))];
+});
+
+const missingBoard = "Pass boardId: this thread and its parents are not on a board.";
 
 const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   service: KanbanService["Service"],
   caller: Caller,
   explicit?: string,
+  inheritAncestorBoard = false,
 ) {
   const boards = yield* service.boards;
-  const wanted = explicit?.trim() || caller.link?.boardId;
+  let wanted: string | undefined = explicit?.trim() || caller.link?.boardId;
+  if (!wanted && caller.link === null && inheritAncestorBoard) {
+    // Board context does not grant the ancestor's role or card ownership.
+    wanted = yield* Effect.gen(function* () {
+      for (const ancestor of yield* ancestorThreadIds(caller)) {
+        const link = yield* service.caller(ancestor);
+        if (link?.boardId) return link.boardId;
+      }
+      return undefined;
+    }).pipe(Effect.catch(() => Effect.succeed(undefined)));
+  }
   if (wanted) {
     const board = boards.find((candidate) => candidate.id === wanted || candidate.slug === wanted);
     if (board) return board;
@@ -137,7 +156,7 @@ const boardFor = Effect.fn("KanbanTools.boardFor")(function* (
   }
   const open = boards.filter((board) => board.archivedAt === null);
   if (open.length === 1 && open[0]) return open[0];
-  return yield* invalid("Pass boardId: this thread is not on a board.");
+  return yield* invalid(missingBoard);
 });
 
 /**
@@ -179,12 +198,22 @@ const cardFor = Effect.fn("KanbanTools.cardFor")(function* (
   caller: Caller,
   ref: string | undefined,
   boardId?: string,
+  inheritAncestorBoard = false,
 ) {
   const trimmed = ref?.trim();
   if (!trimmed) return yield* defaultCard(service, caller);
   const number = Number.parseInt(trimmed.replace(/^#/, ""), 10);
   if (!Number.isNaN(number) && /^#?\d+$/.test(trimmed)) {
-    const board = yield* boardFor(service, caller, boardId);
+    const board = yield* boardFor(service, caller, boardId, inheritAncestorBoard).pipe(
+      Effect.catchTags({
+        OrchestratorMcpFailure: (error) =>
+          error.message === missingBoard
+            ? invalid(
+                `Pass boardId: this thread and its parents are not on a board (card #${number} needs a board)`,
+              )
+            : Effect.fail(error),
+      }),
+    );
     const card = yield* service.cardByNumber(board.id, number);
     if (!card) return yield* invalid(`No card #${number} on ${board.name}.`);
     return card;
@@ -264,10 +293,11 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   caller: Caller,
   explicit: string | undefined,
   cardRef?: string | undefined,
+  boardId?: string,
 ) {
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (cardRef?.trim()) {
-    const card = yield* cardFor(service, caller, cardRef);
+    const card = yield* cardFor(service, caller, cardRef, boardId, true);
     return yield* service.cardDiscussion(card.id);
   }
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
@@ -294,11 +324,12 @@ const postTargetFor = Effect.fn("KanbanTools.postTargetFor")(function* (
   caller: Caller,
   explicit: string | undefined,
   cardRef: string | undefined,
+  boardId?: string,
 ) {
   if (explicit?.trim())
     return { kind: "discussion" as const, id: KanbanDiscussionId.make(explicit.trim()) };
   if (cardRef?.trim()) {
-    const card = yield* cardFor(service, caller, cardRef);
+    const card = yield* cardFor(service, caller, cardRef, boardId, true);
     yield* ownCard(caller, card);
     return { kind: "card" as const, id: card.id };
   }
@@ -325,7 +356,8 @@ const cardIds = (
   refs: ReadonlyArray<string> | undefined,
 ): Effect.Effect<
   ReadonlyArray<KanbanCard["id"]> | undefined,
-  KanbanError | OrchestratorMcpFailure
+  KanbanError | OrchestratorMcpFailure,
+  ThreadManagementService.ThreadManagementService
 > =>
   refs === undefined
     ? Effect.void.pipe(Effect.as(undefined))
@@ -364,7 +396,7 @@ const handlers = {
   board_get: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller, input.boardId);
+        const board = yield* boardFor(service, caller, input.boardId, true);
         const limit = Math.min(
           input.limit ?? BoardReplies.BOARD_PAGE_LIMIT,
           BoardReplies.BOARD_PAGE_MAX,
@@ -389,7 +421,7 @@ const handlers = {
   card_search: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller, input.boardId);
+        const board = yield* boardFor(service, caller, input.boardId, true);
         const cards = yield* service.cards(board.id);
         const found = cards
           .filter(
@@ -423,7 +455,7 @@ const handlers = {
   card_get: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const card = yield* cardFor(service, caller, input.card);
+        const card = yield* cardFor(service, caller, input.card, input.boardId, true);
         const detail = yield* service.card(card.id);
         return { card: detail.card, events: detail.events, threads: detail.threads };
       }),
@@ -572,7 +604,13 @@ const handlers = {
         if (problem) return yield* invalid(problem);
         const blocks = blocksOf(input);
         if (blocks.length === 0) return yield* invalid("Pass text or blocks.");
-        const target = yield* postTargetFor(service, caller, input.discussionId, input.card);
+        const target = yield* postTargetFor(
+          service,
+          caller,
+          input.discussionId,
+          input.card,
+          input.boardId,
+        );
         return {
           message: yield* target.kind === "card"
             ? service.postToCard(target.id, caller.actor, blocks)
@@ -585,7 +623,13 @@ const handlers = {
   discussion_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const discussion = yield* discussionFor(service, caller, input.discussionId, input.card);
+        const discussion = yield* discussionFor(
+          service,
+          caller,
+          input.discussionId,
+          input.card,
+          input.boardId,
+        );
         let messages: ReadonlyArray<KanbanMessage>;
         let note: string | undefined;
         if (input.seq !== undefined) {
@@ -634,7 +678,7 @@ const handlers = {
   wiki_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
-        const board = yield* boardFor(service, caller);
+        const board = yield* boardFor(service, caller, input.boardId, true);
         const pages = yield* service.wiki(board.id);
         return { pages: input.slug ? pages.filter((page) => page.slug === input.slug) : pages };
       }),
