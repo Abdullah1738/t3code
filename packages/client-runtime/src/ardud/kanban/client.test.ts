@@ -12,7 +12,7 @@ import {
 } from "@t3tools/contracts";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import * as Schema from "effect/Schema";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { createKanbanClient } from "./client.ts";
 import { KanbanOfflineError, type KanbanRequestTag, type KanbanTransport } from "./transport.ts";
@@ -148,6 +148,11 @@ const vote = {
   choice: ["a"],
   at: "2026-10-25T11:05:00.000Z",
 } as never;
+
+// Building a board client turns the reading of unknown blocks on for the whole
+// process. Each test here starts from the server's strict reading again, so
+// none of them depends on a client an earlier test built.
+afterEach(() => tolerateUnknownKanbanBlocks(false));
 
 describe("createKanbanClient", () => {
   it("lets the app read a message that carries a block of a kind its build doesn't know", () => {

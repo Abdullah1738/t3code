@@ -1,4 +1,9 @@
-import type { KanbanAskFeed, KanbanAskFeedItem, KanbanOwnerAsk } from "@t3tools/contracts";
+import {
+  KANBAN_UNKNOWN_BLOCK_TEXT,
+  type KanbanAskFeed,
+  type KanbanAskFeedItem,
+  type KanbanOwnerAsk,
+} from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { AskApiError, type AskApi } from "./askApi.ts";
@@ -671,5 +676,98 @@ describe("batches, hand-over and snooze", () => {
     expect(state.hidden[askKey(ask)]).toBeDefined();
     expect(state.sent[0]).toMatchObject({ state: "sent", body: { verdict: "answered" } });
     expect(h.named("answer")).toHaveLength(0);
+  });
+});
+
+describe("what was read is never sent back", () => {
+  // A block the app read may be a stand-in for one it doesn't know: sent back,
+  // it would replace the real block with a line of text. Everything the page
+  // sends is built new from what he typed or picked, and this pins it: a
+  // change that starts passing read blocks along trips here.
+  const STAND_IN = { _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT };
+  const read = (number: number, ask: Partial<KanbanOwnerAsk> = {}) =>
+    entry(
+      number,
+      {
+        blocks: [{ _tag: "md", text: "READ-ASK-BLOCK" }, STAND_IN],
+        ...ask,
+      } as Partial<KanbanOwnerAsk>,
+      {
+        discussionId: "d1",
+        messages: [
+          {
+            discussionId: "d1",
+            seq: 1,
+            author: { _tag: "thread", threadId: "t1" },
+            authorName: "Worker",
+            blocks: [{ _tag: "md", text: "READ-MESSAGE-BLOCK" }, STAND_IN],
+            answers: [],
+            createdAt: "2026-11-11T08:00:00.000Z",
+            askId: "q1",
+          },
+        ] as never,
+      } as Partial<KanbanAskFeedItem>,
+    );
+
+  it("an answer, a draft edit, a reply, a batch, hand-over and snooze carry only what he gave", async () => {
+    const h = harness();
+    const approval = read(1);
+    const draft = read(2, {
+      kind: "draft",
+      draft: { text: "READ-DRAFT", format: "markdown" },
+      respond: { verdict: {}, edit: "draft" },
+    } as Partial<KanbanOwnerAsk>);
+    const handed = read(3);
+    const snoozed = read(4);
+    const batched = [read(5), read(6)];
+    h.setFeed([approval, draft, handed, snoozed, ...batched]);
+    await h.store.refreshAsks();
+
+    // An answer with a note.
+    h.store.patchAskForm(approval, { note: "his note" });
+    expect(h.store.answerAsk(approval, "primary").ok).toBe(true);
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    // The draft, edited: his text goes, as text.
+    h.store.patchAskForm(draft, { draft: "his own draft" });
+    expect(h.store.answerAsk(draft, "primary").ok).toBe(true);
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    // A reply: the blocks the composer built, and nothing of the ask.
+    const typed = [{ _tag: "md" as const, text: "his reply" }];
+    await h.store.replyOnAsk(approval, typed);
+    // One answer for several, a hand-over and a snooze.
+    h.store.answerAskBatch(batched, askKey(batched[0]!), { verdict: "approved" }, "Approved", "2");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.store.handAsks([handed], askKey(handed), "his words for the evaluator");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await h.store.snoozeAsks([snoozed], "2026-11-12T05:00:00.000Z", "tomorrow 09:00");
+    await settle();
+
+    const writes = h.calls.filter((call) => call.name !== "feed" && call.name !== "detail");
+    expect(writes.map((call) => call.name).toSorted()).toEqual([
+      "answer",
+      "answer",
+      "answerBatch",
+      "hand",
+      "reply",
+      "snooze",
+    ]);
+    const sent = JSON.stringify(writes);
+    for (const readText of [
+      KANBAN_UNKNOWN_BLOCK_TEXT,
+      "READ-ASK-BLOCK",
+      "READ-MESSAGE-BLOCK",
+      "READ-DRAFT",
+    ]) {
+      expect(sent).not.toContain(readText);
+    }
+    // What he gave is what went.
+    expect(sent).toContain("his note");
+    expect(sent).toContain("his own draft");
+    expect(sent).toContain("his words for the evaluator");
+    // Blocks go in a reply only, and they are the ones he typed.
+    for (const call of writes) {
+      if (call.name === "reply") expect(call.args[2]).toEqual(typed);
+      else expect(JSON.stringify(call.args)).not.toContain('"blocks"');
+    }
   });
 });
