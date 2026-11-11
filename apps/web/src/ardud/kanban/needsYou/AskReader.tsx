@@ -554,7 +554,7 @@ export function AskReader(props: {
                         media={media}
                         index={index}
                         onOpen={setViewing}
-                        className="h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
+                        className="aspect-[4/3] max-h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
                       />
                     )}
                   />

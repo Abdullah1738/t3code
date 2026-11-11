@@ -483,7 +483,8 @@ export function AskBlocks(props: {
                 <figure key={index} className="flex max-w-full min-w-0 flex-col gap-1.5">
                   <BlockPicture media={media} index={index} onOpen={props.onOpenMedia} />
                   {item?.caption ? (
-                    <figcaption className="max-w-72 text-xs text-(--m-muted) [overflow-wrap:anywhere]">
+                    // As wide as its picture and no wider, so a long caption doesn't push the next picture away.
+                    <figcaption className="w-0 min-w-full text-xs text-(--m-muted) [overflow-wrap:anywhere]">
                       {item.caption}
                     </figcaption>
                   ) : null}

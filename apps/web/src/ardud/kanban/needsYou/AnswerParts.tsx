@@ -138,7 +138,7 @@ export function OptionList(props: {
         className={cn(
           "grid gap-2",
           pictures && "@md:grid-cols-2",
-          pictures && choose.options.length % 3 === 0 && "@3xl:grid-cols-3",
+          pictures && choose.options.length % 3 === 0 && "@lg:grid-cols-3",
         )}
       >
         {choose.options.map((option, index) => {
@@ -156,7 +156,8 @@ export function OptionList(props: {
               data-ny-option={index}
               onClick={() => toggle(option.id)}
               className={cn(
-                "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
+                // No key cap on a touch screen, so one column fewer there.
+                "grid grid-cols-[auto_minmax(0,1fr)_auto] content-start items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent) pointer-coarse:grid-cols-[minmax(0,1fr)_auto]",
                 checked
                   ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
                   : "ring-(--ny-edge) hover:bg-(--m-surface)",
@@ -164,25 +165,31 @@ export function OptionList(props: {
               )}
             >
               {pictures && option.block !== undefined ? (
-                <span className="col-span-3 mb-1.5 block overflow-hidden rounded-lg">
+                <span className="col-span-3 mb-1.5 block overflow-hidden rounded-lg pointer-coarse:col-span-2">
                   {props.renderBlock!(option.block)}
                 </span>
               ) : null}
               <Key className="mt-0.5">{index + 1}</Key>
               <span className="font-medium [overflow-wrap:anywhere]">{option.label}</span>
               <span className="flex items-center gap-2">
-                {option.recommended ? <Pill tone="accent">Recommended</Pill> : null}
+                {option.recommended && !pictures ? <Pill tone="accent">Recommended</Pill> : null}
                 {checked ? (
                   <CheckIcon aria-hidden className="size-4 text-(--m-accent-text)" />
                 ) : null}
               </span>
+              {/* Under a picture the tile is narrow: the mark gets a line of its own, so the label stays whole. */}
+              {option.recommended && pictures ? (
+                <span className="col-span-2 col-start-2 pointer-coarse:col-start-1">
+                  <Pill tone="accent">Recommended</Pill>
+                </span>
+              ) : null}
               {option.detail ? (
-                <span className="col-span-2 col-start-2 text-sm text-(--m-muted) [overflow-wrap:anywhere] pointer-coarse:col-span-3 pointer-coarse:col-start-1">
+                <span className="col-span-2 col-start-2 text-sm text-(--m-muted) [overflow-wrap:anywhere] pointer-coarse:col-start-1">
                   {option.detail}
                 </span>
               ) : null}
               {checked && option.consequence ? (
-                <span className="col-span-2 col-start-2 flex gap-1.5 text-sm [overflow-wrap:anywhere] pointer-coarse:col-span-3 pointer-coarse:col-start-1">
+                <span className="col-span-2 col-start-2 flex gap-1.5 text-sm [overflow-wrap:anywhere] pointer-coarse:col-start-1">
                   <CornerDownRightIcon
                     aria-hidden
                     className="mt-0.5 size-3.5 shrink-0 text-(--m-muted)"
@@ -197,6 +204,8 @@ export function OptionList(props: {
           <div
             className={cn(
               "relative grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-2 rounded-xl px-3.5 py-3 ring-1 ring-inset",
+              // Among picture tiles it is a row of its own, not a tall empty tile.
+              pictures && "col-span-full",
               own
                 ? "bg-(--m-band) ring-2 ring-(--m-accent)"
                 : "ring-(--ny-edge) hover:bg-(--m-surface)",
@@ -207,6 +216,7 @@ export function OptionList(props: {
               type="button"
               role="radio"
               aria-checked={own}
+              tabIndex={tabStop(choose.options.length)}
               data-ny-option={choose.options.length}
               disabled={props.disabled}
               onClick={() => {
@@ -216,7 +226,6 @@ export function OptionList(props: {
                 } else {
                   setOwnOpen(true);
                   patchAskForm(entry, { optionIds: [] });
-              tabIndex={tabStop(choose.options.length)}
                 }
               }}
               className={cn(
