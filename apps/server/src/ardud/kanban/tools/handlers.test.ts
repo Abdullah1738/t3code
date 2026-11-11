@@ -588,8 +588,89 @@ it.effect("discussion_post repeated returns the same message", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a work thread reads another card's discussion but cannot post to that card", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const own = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+    const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+    const discussion = yield* kanban.cardDiscussion(other.id);
+    const scribe: KanbanActor = { _tag: "system", component: "test" };
+    yield* kanban.post(discussion.id, scribe, [{ _tag: "md", text: "Earlier message" }]);
+    const latest = yield* kanban.post(discussion.id, scribe, [
+      { _tag: "md", text: "Read this message" },
+    ]);
+    const cardRefs = [`#${other.number}`, String(other.number), other.id];
+
+    for (const target of [...cardRefs.map((card) => ({ card })), { discussionId: discussion.id }]) {
+      const read = yield* call(thread, "discussion_read", { ...target, afterSeq: 1 });
+      assert.isFalse(read.isError, read.text);
+      assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
+      assert.deepStrictEqual(read.structured.messages, [latest]);
+    }
+
+    for (const card of cardRefs) {
+      const posted = yield* call(thread, "discussion_post", { card, text: "Not mine" });
+      assert.isTrue(posted.isError);
+      assert.include(
+        posted.text,
+        `This thread works on other cards; it can't change card #${other.number}.`,
+      );
+    }
+    assert.lengthOf(yield* kanban.messages(discussion.id), 2);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("discussion_read resolves card numbers on the caller's board", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "toy",
+      name: "Toy",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const own = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const thread = (yield* kanban.card(own.id)).card.activeThreadId!;
+    const otherBoard = yield* kanban.ensureBoard({
+      slug: "elsewhere",
+      name: "Elsewhere",
+      defaultProjectId: null,
+    });
+    yield* kanban.createCard(otherBoard.id, { prompt: "C", title: "C" }, owner);
+    const elsewhere = yield* kanban.createCard(otherBoard.id, { prompt: "D", title: "D" }, owner);
+    const other = yield* kanban.createCard(board.id, { prompt: "B", title: "B" }, owner);
+    assert.strictEqual(other.number, elsewhere.number);
+    const discussion = yield* kanban.cardDiscussion(other.id);
+
+    for (const card of [`#${other.number}`, String(other.number)]) {
+      const read = yield* call(thread, "discussion_read", { card });
+      assert.isFalse(read.isError, read.text);
+      assert.strictEqual((read.structured.discussion as { id: string }).id, discussion.id);
+    }
+    const onlyElsewhere = yield* kanban.createCard(
+      otherBoard.id,
+      { prompt: "E", title: "E" },
+      owner,
+    );
+    const missing = yield* call(thread, "discussion_read", { card: `#${onlyElsewhere.number}` });
+    assert.isTrue(missing.isError);
+    assert.include(missing.text, `No card #${onlyElsewhere.number} on Toy.`);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect(
-  "a thread with several cards picks a card's discussion, but only of its own cards",
+  "a thread with several cards must pick a discussion and can post only to cards it still works on",
   () => {
     const { running, layer } = fakeThreads();
     return Effect.gen(function* () {

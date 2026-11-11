@@ -268,7 +268,6 @@ const discussionFor = Effect.fn("KanbanTools.discussionFor")(function* (
   if (explicit?.trim()) return yield* service.discussion(KanbanDiscussionId.make(explicit.trim()));
   if (cardRef?.trim()) {
     const card = yield* cardFor(service, caller, cardRef);
-    yield* ownCard(caller, card);
     return yield* service.cardDiscussion(card.id);
   }
   if (caller.link?.discussionId) return yield* service.discussion(caller.link.discussionId);
