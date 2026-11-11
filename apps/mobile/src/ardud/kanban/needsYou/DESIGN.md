@@ -60,7 +60,9 @@ Retry or View.
 Reused from the boards: `AppBar`, `ChoiceRow`, `Group`/`Row`, `SearchField`, `MarkdownText`,
 `SegmentedControl`, `ThemedSwitch`, the system date picker, `FilePreviewModal` (pictures, pinch
 to zoom, swipe between), the attachment screen (video, audio, PDF, any other file), and
-`MessageView`/`Composer` from `Chat.tsx`.
+`MessageView`/`Composer` from `Chat.tsx`. A message under an ask is shown outside its
+discussion's feed: "Show full" reads it whole over the ask's own server calls, and a pick in
+it is read-only.
 
 ## Rules
 
@@ -75,6 +77,14 @@ to zoom, swipe between), the attachment screen (video, audio, PDF, any other fil
 - A band says what happened and what he can do. A refusal is shown in the server's words.
 - Not his device: a band at the top says so, everything stays readable, every control that
   would send is disabled and the bar says why.
+- An answer that can't be changed (not his device, expired, with the evaluator, on its way)
+  takes no input anywhere: fields, options, steps, the reason for a no, the note, the draft,
+  uploads and a custom field's page. A field row drops any write while it is disabled.
+- One store per server. A screen keeps the store of the server it rendered with
+  (`useAskScope`), so an answer, a retry or a secret goes to that server or nowhere. When the
+  server changes, secrets on screen are cleared first, then the held answer and every unsent
+  one are dropped, and the ask, batch and discussion screens start over (keyed on the
+  scope's `serial`).
 - Haptics, iOS only: a selection tick on a pick or toggle, success when an answer leaves,
   a warning when something stops it, an error when a send fails.
 - VoiceOver: a row is one label (title, where, state, age); a band that reports a failure is
@@ -90,12 +100,22 @@ by itself; he types it again.
 
 ## Pages inside an ask
 
-An `html` block is loaded from a string into a private WebView (`incognito`, no cookies, no
-storage, no file access). It can say how tall it is and hand back a value for a custom field;
-it is given the theme and nothing else. Any link it follows opens outside the app.
+An `html` block is text an agent wrote, loaded from a string into a private WebView
+(`incognito`, no cookies, no cache, no storage, no file access, no base address). It can say
+how tall it is and hand back a value for a custom field; it is given the theme and nothing
+else. It goes nowhere by itself (`ardud/common/pageNavigation.ts`): its own document and
+frames load, a web address in a frame loads in that frame, and everything else is refused,
+the app's own scheme first of all. A web link the page follows is shown under it
+(`PageLinkOffer`, "Open example.com") and opens only on his tap. The origin whitelist stays
+`*`: the WebView library opens anything outside the whitelist by itself. The board
+discussion's page (`Chat.tsx`) follows the same rule. A task step's link is a link only when
+it is a web address.
 
 ## Offline
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached
-the server is kept in memory as "Not sent", goes again by itself when the feed reads again
-(at most three rounds), and can always be retried by hand. Nothing is written to disk.
+the server is kept in memory as "Not sent" and goes again by itself each time the feed comes
+back, three times at most. The count is on the answer (`autoRetries` in the shared store), so
+it holds while the answer is on its way; after that the band says it no longer goes by itself.
+Retry by hand always works. Nothing is written to disk, and nothing unsent survives a change
+of server.

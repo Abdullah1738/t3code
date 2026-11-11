@@ -349,7 +349,7 @@ function OpenAsk(props: {
   };
   const primary = () => send(form.refusing ? "refuse" : "primary");
   const refuse = () => {
-    if (locked || refusal === null) return;
+    if (frozen || refusal === null) return;
     if (refusal.why === "none" || form.refusing) return send("refuse");
     asks.patchAskForm(entry, { refusing: true });
     toAnswer();
@@ -757,7 +757,7 @@ function AskBar(props: {
         </>
       ) : props.refusing ? (
         <>
-          <BarButton label="Back" onPress={props.onBack} />
+          <BarButton label="Back" disabled={props.busy} onPress={props.onBack} />
           <BarButton
             grow
             tone="primary"
