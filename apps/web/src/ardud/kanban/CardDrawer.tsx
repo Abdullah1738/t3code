@@ -212,7 +212,7 @@ export function CardDrawer(props: {
         className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[540px] flex-col bg-(--m-raised) px-5.5 pt-4 shadow-xl ring-1 ring-(--m-rule) outline-none"
       >
         {/* Header scrolls and shrinks first on short windows, so the tabs and tab content stay in the drawer. */}
-        <div className="flex min-h-0 shrink flex-col overflow-y-auto">
+        <div className="flex min-h-0 shrink flex-col overflow-y-auto overscroll-contain">
           <div className="flex items-center gap-2.5 text-sm text-(--m-muted)">
             <Pri priority={card.priority} />
             <span className="tabular-nums">#{card.number}</span>
@@ -281,7 +281,7 @@ export function CardDrawer(props: {
               type="button"
               onClick={props.onClose}
               aria-label="Close"
-              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
+              className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:size-11"
             >
               <XIcon className="size-4" />
             </button>
@@ -294,7 +294,7 @@ export function CardDrawer(props: {
           ) : !loaded && !detailFeed.failure ? (
             <div
               role="status"
-              aria-label="Loading the description"
+              aria-label="Loading the description…"
               className="mt-1 flex flex-col gap-2"
             >
               <span className="h-3 w-4/5 rounded-full bg-(--m-chip)" />
@@ -448,7 +448,7 @@ function Details(props: {
   const history = cardHistory(props.events);
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto py-4">
+    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-4">
       <dl className="grid grid-cols-[112px_1fr] items-center gap-x-4 gap-y-3 text-sm">
         <Fact label="Stage">
           <Menu>
@@ -889,7 +889,7 @@ function StepButton(props: {
             disabled={target === null}
             onClick={() => target !== null && props.onStep(target)}
             aria-label={props.label}
-            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40"
+            className="grid size-7.5 place-items-center rounded-full text-(--m-muted) outline-none hover:bg-(--m-chip) hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:pointer-events-none disabled:opacity-40 pointer-coarse:size-11"
           />
         }
       >

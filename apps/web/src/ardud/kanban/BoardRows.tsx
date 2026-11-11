@@ -35,7 +35,7 @@ export function LaneHeader(props: { label: string; count: number; tone?: "warn" 
         props.tone === "warn" ? "text-(--m-warning)" : "text-(--m-muted)",
       )}
     >
-      <span className="font-medium">{props.label}</span>
+      <h2 className="font-medium">{props.label}</h2>
       <span className="tabular-nums">{props.count.toLocaleString("en-US")}</span>
     </div>
   );
@@ -115,6 +115,7 @@ const RowView = memo(function RowView(props: {
       return (
         <button
           type="button"
+          aria-label={`Show ${row.count.toLocaleString("en-US")} more`}
           onClick={() => onGroup?.(row.id, "all")}
           className={cn(
             "flex h-7 w-full items-center rounded-lg px-1 text-left text-xs text-(--m-muted) tabular-nums hover:text-(--m-text) pointer-coarse:h-11 pointer-coarse:text-sm",

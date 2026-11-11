@@ -200,7 +200,7 @@ export function BoardLoading() {
   return (
     <div aria-busy className="flex min-h-0 flex-1 flex-col gap-3.5 pe-5 max-sm:pe-4">
       <p role="status" className="sr-only">
-        Loading the board
+        Loading the board…
       </p>
       <span aria-hidden className="block h-19 shrink-0 rounded-xl bg-(--m-surface)" />
       <div aria-hidden className="flex min-h-0 flex-1 gap-2.5 overflow-hidden">
@@ -420,7 +420,7 @@ function NeedsYouLink(props: { boardId: string; label: string; count: number }) 
         FOCUS,
       )}
     >
-      <span className="font-medium">{props.label}</span>
+      <h2 className="font-medium">{props.label}</h2>
       <span className="flex items-center gap-1 tabular-nums">
         {props.count.toLocaleString("en-US")}
         <ArrowRightIcon aria-hidden className="size-3" />
@@ -536,7 +536,7 @@ function ShippedColumn(props: {
     >
       {props.handle}
       <div className="flex h-6 shrink-0 items-center justify-between px-1 text-xs text-(--m-muted) pointer-coarse:h-11 pointer-coarse:text-sm">
-        <span className="font-medium">Shipped</span>
+        <h2 className="font-medium">Shipped</h2>
         <button
           type="button"
           aria-expanded={true}
@@ -671,7 +671,7 @@ function StageList(props: ColumnsProps & { top: React.ReactNode }) {
     <div className="flex flex-col gap-3 pb-3">
       {props.top}
       <div
-        role="tablist"
+        role="group"
         aria-label="Column"
         className={cn("flex shrink-0 gap-1 overflow-x-auto", HIDE_SCROLLBAR)}
       >
@@ -681,13 +681,14 @@ function StageList(props: ColumnsProps & { top: React.ReactNode }) {
             <button
               key={lane.key}
               type="button"
-              role="tab"
-              aria-selected={selected}
+              aria-pressed={selected}
               onClick={() => setPicked(lane.key)}
               className={cn(
                 "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium whitespace-nowrap pointer-coarse:h-11 pointer-coarse:px-4 pointer-coarse:text-base",
                 FOCUS,
-                selected ? "bg-(--m-text) text-(--m-ground)" : "bg-(--m-chip) text-(--m-muted)",
+                selected
+                  ? "bg-(--m-text) text-(--m-ground)"
+                  : "bg-(--m-chip) text-(--m-muted) hover:text-(--m-text)",
               )}
             >
               {SHORT_LABELS[lane.key] ?? lane.label}

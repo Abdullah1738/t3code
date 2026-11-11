@@ -193,7 +193,7 @@ export function Seg<T extends string>(props: {
     <div
       role="group"
       aria-label={props.label}
-      className="inline-flex min-w-0 shrink gap-0.5 overflow-x-auto rounded-full bg-(--m-chip) p-0.75 [scrollbar-width:none]"
+      className="inline-flex min-w-0 shrink gap-0.5 overflow-x-auto rounded-full bg-(--m-chip) p-0.75 [scrollbar-width:none] pointer-coarse:p-1"
     >
       {props.options.map((option) => {
         const pressed = option.value === props.value;
@@ -204,7 +204,8 @@ export function Seg<T extends string>(props: {
             aria-pressed={pressed}
             onClick={() => props.onChange(option.value)}
             className={cn(
-              "inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) focus-visible:ring-inset pointer-coarse:h-9 pointer-coarse:px-3.5 pointer-coarse:text-base",
+              // On touch the pill stays 36 px tall and its hit area fills the track's 44.
+              "relative inline-flex h-6.5 shrink-0 items-center rounded-full px-2.75 text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-(--m-accent) focus-visible:ring-inset pointer-coarse:h-9 pointer-coarse:px-3.5 pointer-coarse:text-base pointer-coarse:after:absolute pointer-coarse:after:inset-x-0 pointer-coarse:after:-inset-y-1",
               pressed
                 ? "bg-(--m-raised) text-(--m-text)"
                 : "text-(--m-muted) hover:text-(--m-text)",

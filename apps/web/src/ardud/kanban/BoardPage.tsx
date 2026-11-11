@@ -573,7 +573,7 @@ function BoardViewControls(
 }
 
 const BOARD_NAME =
-  "max-w-full min-w-0 rounded font-semibold text-(--m-text) outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)";
+  "-mx-1.5 inline-flex min-h-7 max-w-full min-w-0 items-center rounded-lg px-1.5 font-semibold text-(--m-text) outline-none hover:bg-(--m-chip) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11";
 
 /**
  * The board's name in the header. With more than one board it opens the list of
@@ -594,11 +594,14 @@ function BoardSwitcher(props: {
       <WorkspaceBreadcrumbText>{props.board?.name ?? "Board"}</WorkspaceBreadcrumbText>
     </span>
   );
+  // The board's name is the screen's title: the heading holds the control, as a disclosure's does.
   if (boards.length < 2) {
     return (
-      <button type="button" onClick={props.onHome} className={BOARD_NAME}>
-        {name}
-      </button>
+      <h1 className="flex max-w-full min-w-0">
+        <button type="button" onClick={props.onHome} className={BOARD_NAME}>
+          {name}
+        </button>
+      </h1>
     );
   }
   const open = (boardId: string) => {
@@ -607,14 +610,22 @@ function BoardSwitcher(props: {
   };
   return (
     <Menu>
-      <MenuTrigger
-        render={<button type="button" aria-label="Switch board" className={BOARD_NAME} />}
-      >
-        <span className="flex min-w-0 items-center gap-1">
-          {name}
-          <ChevronDownIcon className="size-3.5 shrink-0 text-(--m-muted)" aria-hidden />
-        </span>
-      </MenuTrigger>
+      <h1 className="flex max-w-full min-w-0">
+        <MenuTrigger
+          render={
+            <button
+              type="button"
+              aria-label={`${props.board?.name ?? "Board"}, switch board`}
+              className={BOARD_NAME}
+            />
+          }
+        >
+          <span className="flex min-w-0 items-center gap-1">
+            {name}
+            <ChevronDownIcon className="size-3.5 shrink-0 text-(--m-muted)" aria-hidden />
+          </span>
+        </MenuTrigger>
+      </h1>
       <MenuPopup align="start" side="bottom">
         <MenuRadioGroup value={props.boardId} onValueChange={(value) => open(String(value))}>
           {boards.map((entry) => (
@@ -654,7 +665,7 @@ function QueryField(props: { value: string; onChange: (value: string) => void })
     );
   }
   return (
-    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1 pointer-coarse:h-11 pointer-coarse:w-64">
+    <div className="flex h-8 w-56 min-w-0 shrink items-center gap-2 rounded-full bg-(--m-chip) ps-3 pe-1 focus-within:ring-2 focus-within:ring-(--m-accent) focus-within:ring-inset pointer-coarse:h-11 pointer-coarse:w-64">
       <SearchIcon className="size-4 shrink-0 text-(--m-muted)" aria-hidden />
       <input
         autoFocus
