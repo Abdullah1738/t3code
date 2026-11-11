@@ -351,6 +351,7 @@ export function AskReader(props: {
       entry={entry}
       item={item}
       turn={turn}
+      twoUp={layout === "tablet"}
       onOpenCard={props.onOpenCard}
       handOver={
         canTalk && !response.ack && response.task === null && ask.to !== "evaluator" ? (
@@ -918,6 +919,8 @@ function AskFacts(props: {
   entry: KanbanAskFeedItem;
   item: NeedsYouItem;
   turn: AskTurn;
+  /** Under the ask at tablet width: two abreast, no rules between. */
+  twoUp: boolean;
   onOpenCard: () => void;
   handOver: ReactNode;
 }) {
@@ -935,7 +938,15 @@ function AskFacts(props: {
     facts.push(["Edited", entry.revision === 1 ? "Once" : `${entry.revision} times`]);
   }
   return (
-    <aside aria-label="About this ask" className="flex min-w-0 flex-col gap-4 text-sm">
+    <aside
+      aria-label="About this ask"
+      className={cn(
+        "min-w-0 text-sm",
+        props.twoUp
+          ? "grid grid-cols-2 gap-x-6 gap-y-5 *:border-t-0 *:pt-0"
+          : "flex flex-col gap-4",
+      )}
+    >
       <div>
         <Label className="mb-2">Card</Label>
         <button

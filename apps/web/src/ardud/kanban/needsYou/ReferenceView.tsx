@@ -361,7 +361,9 @@ export function ReferenceView(props: {
 
           <aside
             aria-label="What agents are told"
-            className="min-w-0 rounded-2xl bg-(--m-surface) p-4 @5xl:sticky @5xl:top-0"
+            // Beside the parts it stays in view and scrolls by itself when it is taller than the window;
+            // in one column it comes first, before the parts.
+            className="order-first min-w-0 rounded-2xl bg-(--m-surface) p-4 @5xl:sticky @5xl:top-0 @5xl:order-none @5xl:max-h-[calc(100dvh-7.5rem)] @5xl:overflow-y-auto @5xl:overscroll-contain"
           >
             <Label className="mb-2.5">
               What agents are told, in the <span translate="no">card_ask</span> tool description
