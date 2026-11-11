@@ -598,7 +598,7 @@ it.live(
           ],
         });
         const reads = { perThread: 0, batches: [] as Array<number> };
-        const counted = Layer.mock(ThreadManagement.ThreadManagementService)({
+        const makeCounted = () => Layer.mock(ThreadManagement.ThreadManagementService)({
           streamStoredEventsFrom: fixture.orchestrator.streamStoredEventsFrom,
           readShellSnapshot: fixture.orchestrator.readShellSnapshot,
           getThreadShell: (threadId) =>
@@ -612,6 +612,7 @@ it.live(
               return fixture.orchestrator.getShellSnapshot(options);
             }),
         });
+        let counted = makeCounted();
         const resume = (batched: boolean) =>
           subscribeOrchestrationV2Shell({
             afterSequence: fixture.cursor,
@@ -651,7 +652,12 @@ it.live(
           ],
         );
         reads.batches = [];
-        // ROBOB_SHELL_STREAM_BATCH_READS=0: one reader transaction per thread, same items.
+        // ardud: another subscriber resuming over the same events shares those reads.
+        assert.deepEqual(yield* resume(true), batched);
+        assert.deepEqual(reads, { perThread: 0, batches: [] });
+        // ROBOB_SHELL_STREAM_BATCH_READS=0: one reader transaction per thread, same items
+        // (a fresh service, so nothing is shared yet).
+        counted = makeCounted();
         assert.deepEqual(yield* resume(false), batched);
         assert.deepEqual(reads, { perThread: 3, batches: [] });
       }).pipe(Effect.provide(fileReplayLayer(path.join(dir, "state.sqlite"))));
