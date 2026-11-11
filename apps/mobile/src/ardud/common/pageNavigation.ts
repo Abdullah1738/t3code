@@ -23,8 +23,41 @@ const REFUSE: PageNavigation = { _tag: "refuse" };
 const schemeOf = (url: string): string | null =>
   /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase() ?? null;
 
-/** A web address and nothing else: `http://` or `https://` with a host. */
-export const isWebAddress = (url: string): boolean => /^https?:\/\/[^/?#\s]+/i.test(url.trim());
+/** A web address he can be shown and sent to: what it opens and the site it names are one thing. */
+export interface WebLink {
+  /** The address as the parser wrote it back. This, and nothing else, is what opens. */
+  readonly url: string;
+  /** The site it leads to, without a leading "www.": "example.com". */
+  readonly host: string;
+}
+
+// A backslash, a control character or a space: each is read differently by
+// different parsers, which is how a link names one site and opens another.
+// oxlint-disable-next-line no-control-regex -- Control characters are exactly what this looks for.
+const UNSAFE_IN_LINK = /[\\\u0000-\u0020\u007f]/;
+
+/**
+ * Reads a link as a web address, once, with the platform's standard URL
+ * parser. The label and the address that opens both come from that one
+ * reading, so they can't differ. Refused: anything that is not `http://` or
+ * `https://` with a host, an address that carries a user name or password
+ * (`https://trusted.example@evil.example/`), and one with a backslash, a
+ * space or a control character in it.
+ */
+export function parseWebLink(raw: string | undefined): WebLink | null {
+  if (raw === undefined) return null;
+  const text = raw.trim();
+  if (!/^https?:\/\//i.test(text) || UNSAFE_IN_LINK.test(text)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username !== "" || parsed.password !== "" || parsed.hostname === "") return null;
+  return { url: parsed.href, host: parsed.hostname.replace(/^www\./i, "") };
+}
 
 export function pageNavigation(request: {
   readonly url: string;
@@ -37,15 +70,11 @@ export function pageNavigation(request: {
   if (url === "about:blank" || url === "about:srcdoc") return LOAD;
   const scheme = schemeOf(url);
   if (scheme === "data") return top ? REFUSE : LOAD;
-  if ((scheme === "http" || scheme === "https") && isWebAddress(url)) {
-    return top ? { _tag: "offer", url } : LOAD;
+  if (scheme === "http" || scheme === "https") {
+    const link = parseWebLink(url);
+    if (link === null) return REFUSE;
+    // What is offered is the address as the parser read it, the one that will open.
+    return top ? { _tag: "offer", url: link.url } : LOAD;
   }
   return REFUSE;
-}
-
-/** The site a link leads to, for the line that offers it: "example.com". */
-export function pageLinkHost(url: string): string {
-  const host = /^https?:\/\/([^/?#\s]+)/i.exec(url.trim())?.[1] ?? "";
-  // Never the part before an "@": that is where a link hides its real site.
-  return host.slice(host.lastIndexOf("@") + 1).replace(/^www\./i, "");
 }

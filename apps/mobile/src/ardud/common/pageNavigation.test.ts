@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { isWebAddress, pageLinkHost, pageNavigation } from "./pageNavigation";
+import { pageNavigation, parseWebLink } from "./pageNavigation";
 
 const top = (url: string) => pageNavigation({ url, isTopFrame: true })._tag;
 const frame = (url: string) => pageNavigation({ url, isTopFrame: false })._tag;
@@ -58,16 +58,53 @@ describe("where a page inside the app may go", () => {
   });
 
   it("takes only a real web address for one", () => {
-    expect(isWebAddress("https://example.com")).toBe(true);
-    expect(isWebAddress("https:")).toBe(false);
-    expect(isWebAddress("https:///nohost")).toBe(false);
+    expect(parseWebLink("https://example.com")).toEqual({
+      url: "https://example.com/",
+      host: "example.com",
+    });
+    expect(parseWebLink("https:")).toBeNull();
+    expect(parseWebLink("https:///")).toBeNull();
+    expect(parseWebLink("https:example.com")).toBeNull();
+    expect(parseWebLink("robob://x")).toBeNull();
+    expect(parseWebLink(undefined)).toBeNull();
     expect(top("https:robob://x")).toBe("refuse");
-    expect(top("https:///nohost")).toBe("refuse");
   });
 
-  it("names the site a link really leads to", () => {
-    expect(pageLinkHost("https://www.example.com/path")).toBe("example.com");
-    expect(pageLinkHost("https://apple.com@evil.test/login")).toBe("evil.test");
-    expect(pageLinkHost("robob://x")).toBe("");
+  it("names the site the address really opens, from one reading of it", () => {
+    expect(parseWebLink("  HTTPS://WWW.Example.COM/Path?q=1#top ")).toEqual({
+      url: "https://www.example.com/Path?q=1#top",
+      host: "example.com",
+    });
+    // What is offered for a page's link is that same reading.
+    expect(pageNavigation({ url: "HTTPS://Example.com", isTopFrame: true })).toEqual({
+      _tag: "offer",
+      url: "https://example.com/",
+    });
+    // A name in another script is shown as the parser resolves it, not as it was drawn.
+    expect(parseWebLink("https://\u0430pple.com/")?.host).toBe("xn--pple-43d.com");
+  });
+
+  it("refuses an address that names one site and opens another", () => {
+    for (const url of [
+      // A standard parser reads the backslash as a slash: the site is evil.example.
+      "https://evil.example\\@trusted.example/",
+      "https://trusted.example\\.evil.example/",
+      "https:\\\\evil.example/",
+      // A user name or password before the site.
+      "https://trusted.example@evil.example/",
+      "https://trusted.example:443@evil.example/login",
+      "https://user:pw@example.com/",
+      "https://trusted.example%2f@evil.example/",
+      // Control characters and spaces a parser strips or splits on.
+      "https://trusted.example\t.evil.example/",
+      "https://exam\nple.com/",
+      "https://example.com/\u0000",
+      "https://example.com/a b",
+      "https://example.com/\u007f",
+    ]) {
+      expect(parseWebLink(url), JSON.stringify(url)).toBeNull();
+      expect(top(url), JSON.stringify(url)).toBe("refuse");
+      expect(frame(url), JSON.stringify(url)).toBe("refuse");
+    }
   });
 });

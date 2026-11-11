@@ -4,7 +4,7 @@
  * marks a row shows, the queue as list rows, the bridge to a page inside an
  * ask, and when an answer made offline goes again. Pure.
  */
-import { isWebAddress, pageLinkHost } from "../../common/pageNavigation";
+import { parseWebLink, type WebLink } from "../../common/pageNavigation";
 import {
   askAge,
   askOutcome,
@@ -152,12 +152,8 @@ export function askFacts(
  * site it really leads to. Anything else an agent put there (the app's own
  * scheme, a phone number, another app) is not a link here and opens nothing.
  */
-export function stepWebLink(
-  link: string | undefined,
-): { readonly url: string; readonly host: string } | null {
-  if (link === undefined || !isWebAddress(link)) return null;
-  const host = pageLinkHost(link);
-  return host === "" ? null : { url: link.trim(), host };
+export function stepWebLink(link: string | undefined): WebLink | null {
+  return parseWebLink(link);
 }
 
 /** What a file field takes, in words: "PDF or images", not "application/pdf, image/*". */

@@ -219,8 +219,9 @@ describe("one ask", () => {
     expect(stepWebLink("robob://needs-you/history")).toBeNull();
     expect(stepWebLink("tel:+15550100")).toBeNull();
     expect(stepWebLink(undefined)).toBeNull();
-    // The site named is the one the link really leads to.
-    expect(stepWebLink("https://apple.com@evil.test/x")?.host).toBe("evil.test");
+    // A link that could name one site and open another is not a link at all.
+    expect(stepWebLink("https://apple.com@evil.test/x")).toBeNull();
+    expect(stepWebLink("https://evil.example\\@trusted.example/")).toBeNull();
     expect(acceptsInWords(["application/pdf", "image/*"])).toBe("PDF or images");
     expect(acceptsInWords([".csv"])).toBe("CSV");
     expect(acceptsOnlyMedia(["image/*", "video/mp4"])).toBe(true);
