@@ -48,6 +48,23 @@ const PER_MEGABYTE_MS = 4_000;
 const MAX_MS = 120_000;
 
 /**
+ * How long the address of a file on the server is waited for. It is one small
+ * request, whatever the file's size.
+ */
+export const FILE_ADDRESS_TIME_LIMIT_MS = BASE_MS;
+
+/** What the screen says when a file's address or contents did not come in time. */
+export const FILE_LOAD_STALLED_TEXT =
+  "Loading is taking too long. Try again, or check the connection to Robob.";
+
+/** The same for a file that is on the phone. */
+export const LOCAL_FILE_LOAD_STALLED_TEXT = "Loading is taking too long. Try again.";
+
+/** Whether an attachment's error is a wait that ran out, not a file that can't be had. */
+export const fileLoadStalled = (error: string | null): boolean =>
+  error === FILE_LOAD_STALLED_TEXT || error === LOCAL_FILE_LOAD_STALLED_TEXT;
+
+/**
  * How long to wait for the system's viewer before saying it did not open. The
  * file is fetched first, so a large one is given longer: 20 seconds, plus 4
  * for every megabyte, two minutes at most.

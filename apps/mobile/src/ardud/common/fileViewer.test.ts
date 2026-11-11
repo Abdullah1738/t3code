@@ -4,8 +4,12 @@ import { EnvironmentId } from "@t3tools/contracts";
 
 import {
   attachmentVideoKey,
+  FILE_ADDRESS_TIME_LIMIT_MS,
+  FILE_LOAD_STALLED_TEXT,
+  fileLoadStalled,
   fileViewerStall,
   fileViewerTimeLimitMs,
+  LOCAL_FILE_LOAD_STALLED_TEXT,
   systemViewerKind,
 } from "./fileViewer";
 import { attachmentVideoPreviewSource, mediaVideoThumbnailKey } from "../../lib/videoPreviewSource";
@@ -106,5 +110,18 @@ describe("what a video attachment's player and still frame are kept under", () =
     expect(nowhere).not.toBe(
       attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: null }),
     );
+  });
+});
+
+describe("the wait for a file itself", () => {
+  it("the address of a file on the server is waited for twenty seconds, whatever its size", () => {
+    expect(FILE_ADDRESS_TIME_LIMIT_MS).toBe(20_000);
+  });
+
+  it("a wait that ran out is told apart from a file that can't be had", () => {
+    expect(fileLoadStalled(FILE_LOAD_STALLED_TEXT)).toBe(true);
+    expect(fileLoadStalled(LOCAL_FILE_LOAD_STALLED_TEXT)).toBe(true);
+    expect(fileLoadStalled("Reconnect to this environment and try again.")).toBe(false);
+    expect(fileLoadStalled(null)).toBe(false);
   });
 });

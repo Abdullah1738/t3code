@@ -33,6 +33,7 @@ import { WorkspaceFileWebPreview } from "./WorkspaceFileWebPreview";
 import { AttachmentVideoPreview } from "../../ardud/common/AttachmentVideoPreview";
 import {
   attachmentVideoKey,
+  fileLoadStalled,
   fileViewerStall,
   fileViewerTimeLimitMs,
   systemViewerKind,
@@ -74,7 +75,8 @@ function AttachmentDocumentBody(props: {
     return (
       <View className="flex-1 items-center justify-center bg-sheet px-6">
         <EmptyState
-          title="File unavailable"
+          // ardud: a wait that ran out is not a file that can't be had
+          title={fileLoadStalled(document.error) ? "The file hasn't loaded" : "File unavailable"}
           detail={document.error}
           actionLabel="Try again"
           onAction={document.retry}
@@ -232,14 +234,13 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
   );
   // ardud: a new attempt presents the viewer afresh, dropping one that never came up
   const [nativeAttempt, setNativeAttempt] = useState(0);
-  const waitingOnViewer = nativeViewer === "pending" || nativeViewer === "open";
+  // The wait for the file itself (`pending`) has its own limit in `useAttachmentDocument`.
+  const waitingOnViewer = nativeViewer === "open";
   const onStall = fileViewerStall(Platform.OS, nativeKind);
   useEffect(() => {
     if (!waitingOnViewer || onStall === "none") return;
     const timer = setTimeout(() => {
-      setNativeViewer((current) =>
-        current === "pending" || current === "open" ? "stalled" : current,
-      );
+      setNativeViewer((current) => (current === "open" ? "stalled" : current));
       if (onStall === "closeAndSay") setNativeOpen(false);
     }, fileViewerTimeLimitMs(sizeBytes));
     return () => clearTimeout(timer);
