@@ -489,6 +489,7 @@ export function NeedsYouPage(props: {
                 layout={layout}
                 onBack={() => setView("queue")}
                 onOpenAsk={(key) => focusOn(key, false)}
+                onOpenCard={openCard}
               />
             ) : focused?._tag === "ask" ? (
               <AskReader
