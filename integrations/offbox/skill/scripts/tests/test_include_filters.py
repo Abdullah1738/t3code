@@ -29,6 +29,11 @@ CASES = {
         "tmp/", "tmp/cards/", "tmp/cards/x/", "tmp/cards/x/f.tar", "tmp/cards/y/", "tmp/cards/y/b.sh",
     }),
 }
+EXCLUDED_ANCESTORS = tuple(dict.fromkeys(
+    prefix + pattern.rstrip("/").replace("*", "fixture")
+    for pattern in ssh_sync.SECRET_EXCLUDES + ssh_sync.HEAVY_EXCLUDES
+    for prefix in ("", "foo/")
+))
 
 
 def write(root, rel, text="synthetic\n"):
@@ -84,6 +89,91 @@ def sent(root, includes=None, *, filters=None, dest=None, dry_run=True, delete=F
     cmd += filters if filters is not None else ssh_sync.push_filters(root, False, includes)
     result = subprocess.run(cmd + [f"{root}/", f"{dest}/"], capture_output=True, text=True, check=True)
     return set(result.stdout.splitlines()) - {"./"}
+
+
+@pytest.fixture
+def unignored_repo(tmp_path, monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    root = tmp_path / "unignored"
+    root.mkdir()
+    git(root, "init", "-q", "--template=")
+    return root
+
+
+@pytest.mark.parametrize("ancestor", EXCLUDED_ANCESTORS)
+def test_tracked_excluded_ancestor_refuses_before_box_work(unignored_repo, ancestor):
+    root = unignored_repo
+    directory = ancestor
+    included = f"{directory}/request.txt"
+    for rel in (included, f"{directory}/tracked-readme.txt", f"{directory}/unrequested-secret.txt"):
+        write(root, rel)
+    git(root, "add", f"{directory}/tracked-readme.txt")
+    # Real rsync establishes the baseline: opening this directory must not expose its other children.
+    before = sent(root)
+    assert not any(p.startswith(directory + "/") for p in before)
+    with pytest.raises(OffboxError) as refused:
+        sent(root, [included])
+    assert refused.value.code == 2
+    assert repr(included) in str(refused.value)
+    assert repr(directory) in str(refused.value)
+    assert "can't send only the named path there" in str(refused.value)
+    args = cli.build_parser().parse_args(["run", "--include", included, "--", "echo", "ok"])
+    with patch("offbox_lib.localfirst.decide", return_value="test"), \
+            patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+            patch.object(cli, "log"), patch.object(cli, "say"), \
+            patch("offbox_lib.fallback.run_local") as fallback, \
+            patch("offbox_lib.fallback.note_infra_failure") as infra:
+        assert cli.cmd_run(args, {"repo_root": str(root)}) == 2
+    database.assert_not_called()
+    acquire.assert_not_called()
+    fallback.assert_not_called()
+    infra.assert_not_called()
+
+
+@pytest.mark.parametrize("ancestor", EXCLUDED_ANCESTORS)
+@pytest.mark.parametrize("overlap", ("none", "directory-first", "file-first"))
+def test_explicit_excluded_directory_still_sends_its_subtree(unignored_repo, ancestor, overlap):
+    root = unignored_repo
+    directory = ancestor
+    requested = {f"{directory}/request.txt", f"{directory}/tracked-readme.txt"}
+    for rel in requested | {"foo/unrequested.txt"}:
+        write(root, rel)
+    git(root, "add", f"{directory}/tracked-readme.txt")
+    before = sent(root)
+    includes = [directory]
+    if overlap == "directory-first":
+        includes.append(f"{directory}/request.txt")
+    elif overlap == "file-first":
+        includes.insert(0, f"{directory}/request.txt")
+    after = sent(root, includes)
+    assert {p for p in after - before if not p.endswith("/")} == requested
+
+
+@pytest.mark.parametrize("ancestor", EXCLUDED_ANCESTORS)
+def test_untracked_excluded_ancestor_sends_only_named_file(unignored_repo, ancestor):
+    root = unignored_repo
+    directory = ancestor
+    included = f"{directory}/request.txt"
+    for rel in (included, f"{directory}/unrequested-secret.txt"):
+        write(root, rel)
+    before = sent(root)
+    after = sent(root, [included])
+    assert {p for p in after - before if not p.endswith("/")} == {included}
+
+
+@pytest.mark.parametrize("template", ssh_sync.SAFE_ENV_TEMPLATES)
+def test_tracked_safe_template_directory_preserves_baseline(unignored_repo, template):
+    root = unignored_repo
+    directory = f"foo/{template}/nested"
+    included = f"{directory}/request.txt"
+    for rel in (included, f"{directory}/tracked-readme.txt", f"{directory}/normal-sibling.txt"):
+        write(root, rel)
+    git(root, "add", f"{directory}/tracked-readme.txt")
+    assert sent(root, [included]) == sent(root)
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -226,7 +316,7 @@ def test_tracked_file_in_ignored_ancestor_refuses_before_box_work(repo, tracked,
     assert repr(top) in str(refused.value)
     assert "can't send only the named path there" in str(refused.value)
     assert "argv" in str(refused.value) and "--step" in str(refused.value)
-    assert "move it out of the ignored directory" in str(refused.value)
+    assert "move it out of the excluded directory" in str(refused.value)
     args = cli.build_parser().parse_args(["run", "--include", includes[0], "--", "echo", "ok"])
     with patch("offbox_lib.localfirst.decide", return_value="test"), \
             patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
@@ -287,3 +377,21 @@ Path('scratch.txt').write_text('synthetic')
     assert {p for p in result.stdout.splitlines() if p.startswith("tmp/")} == {
         "tmp/", "tmp/card-x/", "tmp/card-x/proof.py",
     }
+
+
+@pytest.mark.parametrize("directory_first", (False, True))
+def test_whole_ignored_directory_with_redundant_child_include(repo, directory_first):
+    write(repo, "tmp/tracked.txt")
+    git(repo, "add", "-f", "tmp/tracked.txt")
+    includes = ["tmp", "tmp/cards/x/f.tar"] if directory_first else ["tmp/cards/x/f.tar", "tmp"]
+    assert sent(repo, includes) == sent(repo, ["tmp"])
+
+
+@pytest.mark.parametrize("directory_first", (False, True))
+def test_parent_include_authorizes_excluded_descendant_with_tracked_files(unignored_repo, directory_first):
+    root = unignored_repo
+    for rel in ("foo/.aws/request.txt", "foo/.aws/other.txt", "foo/tracked-readme.txt"):
+        write(root, rel)
+    git(root, "add", "foo/tracked-readme.txt", "foo/.aws/other.txt")
+    includes = ["foo", "foo/.aws/request.txt"] if directory_first else ["foo/.aws/request.txt", "foo"]
+    assert sent(root, includes) == sent(root, ["foo"])

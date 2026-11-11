@@ -283,6 +283,9 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
                 for i in range(1, len(parts)):
                     guarded.discard("/".join(parts[:i]))
     for anc in sorted(ancestors - guarded):
+        # A whole-directory include already authorizes these siblings, even with redundant child includes.
+        if any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes):
+            continue
         inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
         try:
             # Bypass the index to see ignored dirs with tracked descendants. No trailing slash: tmp/*
@@ -293,10 +296,15 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             raise _include_refused(inc) from e
         if p.returncode not in (0, 1):
             raise _include_refused(inc)
-        if p.returncode == 0:
-            raise OffboxError(f"cannot sync --include {inc!r}: ignored ancestor {anc!r} contains tracked files; "
+        # Check this directory's own name so safe env template parents don't look excluded again.
+        excluded = _offbox_skips(anc.rsplit("/", 1)[-1]) or any(
+            anc == pat or anc.endswith("/" + pat)
+            for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
+        )
+        if p.returncode == 0 or excluded:
+            raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
                               "offbox can't send only the named path there. Pass the script inline in argv or "
-                              "with --step, or move it out of the ignored directory", code=2)
+                              "with --step, or move it out of the excluded directory", code=2)
     # Opening an ignored ancestor bypasses its ignore rule. Close its other children after all includes,
     # so rsync never walks unrelated scratch trees; tracked ancestors retain the normal sync behavior.
     for anc in sorted(guarded, key=lambda a: (-a.count("/"), a)):
