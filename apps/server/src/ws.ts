@@ -3374,7 +3374,10 @@ export const layer = Layer.unwrap(
         );
         const clientOrigin = readClientConnectionOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
-        yield* sessions.recordClientConnection(session.sessionId, clientOrigin);
+        // ardud: this metadata UPDATE waits for the state writer, which was held for
+        // up to 267 s on 11 Nov. Awaiting it here held the upgrade, so phone and web
+        // clients timed out and reconnected in a loop. Record it off the upgrade path.
+        yield* Effect.forkDetach(sessions.recordClientConnection(session.sessionId, clientOrigin));
         yield* analytics.record("client.connected", clientAnalyticsProps);
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
@@ -3466,7 +3469,10 @@ export const layer = Layer.unwrap(
           ),
         );
         return yield* Effect.acquireUseRelease(
-          sessions.markConnected(session.sessionId),
+          // ardud: markConnected writes lastConnectedAt on the state writer when the
+          // session was idle. Run it beside the upgrade; the release waits for it so
+          // the connected count still goes up before it goes down.
+          Effect.forkDetach(sessions.markConnected(session.sessionId)),
           () =>
             Effect.raceFirst(
               rpcWebSocketHttpEffect,
@@ -3478,7 +3484,10 @@ export const layer = Layer.unwrap(
                 }),
               ),
             ),
-          () => sessions.markDisconnected(session.sessionId),
+          (connected) =>
+            Fiber.await(connected).pipe(
+              Effect.andThen(sessions.markDisconnected(session.sessionId)),
+            ),
         );
       }).pipe(
         Effect.catchTags({
