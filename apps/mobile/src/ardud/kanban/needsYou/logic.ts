@@ -574,3 +574,24 @@ export function unreachedRetryTracker(
     },
   };
 }
+
+/**
+ * Where a screen stands when a call it started comes back. The server may have
+ * changed and he may have left or opened something on top while it was away.
+ *
+ * - `here`: its own server is still in use and it is the screen in front.
+ * - `away`: its own server is still in use, but the screen is closed or
+ *   covered. The store may be told the result; nothing navigates, buzzes,
+ *   scrolls or speaks.
+ * - `gone`: its server is no longer the one in use. Nothing happens at all.
+ */
+export type LateStanding = "here" | "away" | "gone";
+
+export function lateStanding(now: {
+  readonly live: boolean;
+  readonly mounted: boolean;
+  readonly focused: boolean;
+}): LateStanding {
+  if (!now.live) return "gone";
+  return now.mounted && now.focused ? "here" : "away";
+}

@@ -16,7 +16,7 @@ import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { Composer, MessageView } from "../Chat";
 import { messageReadWhole } from "../logic";
-import { useAsk, useAskScope, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAskScope, useLateStanding, useOwnerStanding, useWatchAsks } from "./askStore";
 import { askKeyFromParams, askTurn, type NeedsYouAskParams } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -88,6 +88,7 @@ function Talk(props: {
   readonly onOpenCard: (cardId: string) => void;
 }) {
   const { asks, api } = useAskScope();
+  const late = useLateStanding();
   const { entry } = props;
   const readOnly = useAsk((state) => state.notOwner !== null);
   // What was said counts; older versions of the ask sit between, folded away.
@@ -99,6 +100,8 @@ function Talk(props: {
     const message = thread.find((item) => item.message.seq === seq)?.message;
     if (message === undefined) return;
     const full = await api.message(message.discussionId, seq);
+    // Read from a server that is no longer in use: it is not shown.
+    if (late() === "gone") return;
     setWhole((current) => ({ ...current, [seq]: full }));
   };
   // A reply over a limit is told here, beside the composer that still holds it.

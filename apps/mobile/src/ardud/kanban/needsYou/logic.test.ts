@@ -32,6 +32,7 @@ import {
   rankOrder,
   readAskHtmlMessage,
   stepWebLink,
+  lateStanding,
   unreachedRetryTracker,
 } from "./logic";
 
@@ -424,5 +425,22 @@ describe("answers that never reached the server", () => {
     expect(tracker.next(state(2, [send(1, 3), send(9, 2)]), 10_500).size).toBe(0);
     expect(tracker.next(state(3, [send(1, 3), send(9, 2)]), 12_000).size).toBe(0);
     expect([...tracker.next(state(4, [send(1, 3), send(9, 2)]), 60_000)]).toEqual([9]);
+  });
+});
+
+describe("a result that comes back late", () => {
+  it("acts on screen only for the screen in front, on the server it was sent to", () => {
+    expect(lateStanding({ live: true, mounted: true, focused: true })).toBe("here");
+  });
+
+  it("only tells the store when the screen was left or covered", () => {
+    expect(lateStanding({ live: true, mounted: false, focused: false })).toBe("away");
+    expect(lateStanding({ live: true, mounted: true, focused: false })).toBe("away");
+    expect(lateStanding({ live: true, mounted: false, focused: true })).toBe("away");
+  });
+
+  it("does nothing once the server changed, even on a screen still in front", () => {
+    expect(lateStanding({ live: false, mounted: true, focused: true })).toBe("gone");
+    expect(lateStanding({ live: false, mounted: false, focused: false })).toBe("gone");
   });
 });

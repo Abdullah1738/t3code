@@ -599,8 +599,8 @@ function FileControl(props: {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
         const id = stored !== undefined && "id" in stored ? stored.id : undefined;
         if (stored === undefined || id === undefined) throw new Error("Upload cancelled.");
-        if (controller.signal.aborted || !live.current || lockedNow.current) {
-          // Removed, left or locked while uploading: the server copy has no owner, so drop it.
+        if (controller.signal.aborted || !live.current || lockedNow.current || !scope.live()) {
+          // Removed, left, locked or the server changed while uploading: the server copy has no owner, so drop it.
           void releasePendingAttachmentUploads(environment, [id]);
           if (live.current) drop();
           return;
@@ -644,7 +644,8 @@ function FileControl(props: {
         : await pickComposerMedia({ existingCount, maxVideoBytes: maxFileBytes });
     const picked: ReadonlyArray<DraftComposerAttachment> =
       "files" in result ? result.files : result.attachments;
-    if (!live.current) {
+    if (!live.current || lockedNow.current || !scope.live()) {
+      // Left, locked or the server changed while the picker was open: nothing is uploaded.
       void releaseUnusedComposerAttachmentFiles(picked);
       return;
     }

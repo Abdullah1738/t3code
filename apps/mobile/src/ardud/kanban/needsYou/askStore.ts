@@ -25,7 +25,8 @@ import {
 import type { AuthSessionState, EnvironmentId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
-import { useEffect, useSyncExternalStore } from "react";
+import { useNavigation } from "@react-navigation/native";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { AppState } from "react-native";
 
 import { appAtomRegistry } from "../../../state/atom-registry";
@@ -34,6 +35,7 @@ import { environmentSession } from "../../../state/session";
 import { pairedEnvironmentIdAtom } from "../../common/environment";
 import { kanbanClient } from "../kanbanStore";
 import { createAskScopes, type AskScope } from "./askScope";
+import { lateStanding, type LateStanding } from "./logic";
 
 const askScopes = createAskScopes({
   paired: () => appAtomRegistry.get(pairedEnvironmentIdAtom),
@@ -123,6 +125,32 @@ export function useAsk<T>(select: (state: AskState) => T): T {
  */
 export function useAskSecretsHeld(drop: () => void): void {
   useEffect(() => askScopes.holdSecrets(drop), [drop]);
+}
+
+/**
+ * For a screen that waits on a call: read it when the call comes back, before
+ * anything is done with the result. It answers for the server and the screen
+ * that started the call, not for whatever is in use or in front by then.
+ */
+export function useLateStanding(): () => LateStanding {
+  const scope = useAskScope();
+  const navigation = useNavigation();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  return useCallback(
+    () =>
+      lateStanding({
+        live: scope.live(),
+        mounted: mounted.current,
+        focused: navigation.isFocused(),
+      }),
+    [scope, navigation],
+  );
 }
 
 const NO_SESSION = Atom.make(AsyncResult.initial<AuthSessionState>());

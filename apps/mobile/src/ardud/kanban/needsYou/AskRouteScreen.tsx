@@ -53,7 +53,14 @@ import {
 import { AskBlocks, AskMediaViewer, BlockPicture, useAskMedia } from "./AskBlocks";
 import { FieldRow } from "./AskFields";
 import { ActionDetails, AskFacts, ChangeViewer, DiffText, DraftPart } from "./AskParts";
-import { useAsk, useAskScope, useAskSecretsHeld, useOwnerStanding, useWatchAsks } from "./askStore";
+import {
+  useAsk,
+  useAskScope,
+  useAskSecretsHeld,
+  useLateStanding,
+  useOwnerStanding,
+  useWatchAsks,
+} from "./askStore";
 import {
   askKeyFromParams,
   askNeighbours,
@@ -193,6 +200,7 @@ function OpenAsk(props: {
   // The store and the server calls of the server this ask was read from: an
   // answer or a secret started here can go nowhere else.
   const { asks, api: askApi } = useAskScope();
+  const late = useLateStanding();
   const { entry, item, nowMs } = props;
   const nav = useNeedsYouNav();
   const key = askKey(entry);
@@ -291,10 +299,15 @@ function OpenAsk(props: {
       { ...input, cardId: entry.cardId },
       kanbanAskRevision(ask),
     );
+    // He may have left, opened something on top, or changed server while it was away.
+    const standing = late();
+    // The server it went to is no longer in use: nothing of it is on screen to act on.
+    if (standing === "gone") return;
     setSecretBusy(false);
     if (outcome._tag === "sent") {
       asks.noteAskAnswered(entry, input.answer, label);
-      leave();
+      // Only the ask in front goes back: from anywhere else it would close another screen.
+      if (standing === "here") leave();
       return;
     }
     if (outcome._tag === "interrupted") return;
@@ -306,7 +319,9 @@ function OpenAsk(props: {
     }
     setSecretError(failure.message);
     if (failure.stale) asks.noteAskStale(entry);
-    stopped(failure.message);
+    if (standing === "here") stopped(failure.message);
+    // He is elsewhere: say it where he is, since the ask's own line is out of sight.
+    else asks.showAskToast({ text: `Answer not sent. ${failure.message}` }, 9_000);
   };
   // Words alone never close a pick he has to make: they go to its agent as a reply and the ask stays open.
   const sendWordsAsReply = (words: string) => {
