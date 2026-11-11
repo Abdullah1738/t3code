@@ -1,0 +1,11 @@
+[Unit]
+Description=offbox: arm a short RTC wake alarm at every shutdown
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/offbox-rtcwake 180
+
+[Install]
+WantedBy=multi-user.target

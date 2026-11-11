@@ -1,0 +1,43 @@
+#!/bin/bash
+# offbox-emergency: runs when systemd lands in emergency or rescue mode. Nobody can type the root password
+# on a console, so: bring up the network and sshd by hand (the normal units are not available in this mode),
+# wait a few minutes, restart. `touch /run/offbox/hold` over SSH keeps the machine here.
+# After three emergency boots in a row the wait becomes an hour.
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+say "emergency: system is in emergency/rescue mode; starting network + sshd, restart follows"
+mount -o remount,rw / 2>/dev/null || true
+n=$(( $(cat "$STATE/emergency-count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$STATE/emergency-count" 2>/dev/null || true
+{ date -u; systemctl --failed --no-pager 2>&1; journalctl -b -p err --no-pager 2>&1 | tail -80; } > "$STATE/emergency-last.txt" 2>/dev/null || true
+
+# network: networkd has no dependency on the targets that failed; fall back to plain dhcpcd.
+systemctl start --no-block systemd-networkd.service systemd-resolved.service 2>/dev/null
+sleep "$(cfgval emergency_net_wait 15)"
+if ! ip -4 route show default 2>/dev/null | grep -q default; then
+  for l in /sys/class/net/e*; do
+    [ -e "$l" ] || continue
+    ip link set "${l##*/}" up 2>/dev/null
+    command -v dhcpcd >/dev/null && dhcpcd -4 -b -q "${l##*/}" 2>/dev/null
+  done
+fi
+# sshd, started directly
+if ! ss -ltn 2>/dev/null | grep -q ':22 '; then
+  mkdir -p /run/sshd
+  /usr/sbin/sshd -o PidFile=/run/offbox-emergency-sshd.pid 2>/dev/null
+fi
+# tailscale, started directly
+if command -v tailscaled >/dev/null && ! pgrep -x tailscaled >/dev/null; then
+  mkdir -p /run/tailscale
+  (setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock >/dev/null 2>&1 &)
+fi
+say "emergency: ssh up on $(hostname -I 2>/dev/null | tr ' ' ,); emergency boot $n in a row"
+
+if [ "$n" -ge 3 ]; then hold=$(cfgval emergency_long_hold_seconds 3600); else hold=$(cfgval emergency_hold_seconds 600); fi
+end=$(( $(date +%s) + hold ))
+while [ "$(date +%s)" -lt "$end" ] || [ -e "$RUN/hold" ]; do sleep 5; done
+say "emergency: restarting after ${hold}s"
+sync
+systemctl reboot 2>/dev/null || reboot -f
+sleep 60
+reboot -f

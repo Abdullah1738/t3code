@@ -1,0 +1,142 @@
+#!/bin/bash
+# offbox-kernel-trial: a new kernel is booted once, and only becomes the default after a healthy boot.
+#
+#   arm VERSION      called by the kernel postinst hook: the next boot tries VERSION once
+#   promote [VER]    make VER (default: the running kernel) the known-good default
+#   check healthy|unhealthy   called by offbox-boot-health; exit 10 = reboot back to the good kernel
+#   status
+#
+# The default GRUB entry is always the known-good kernel (GRUB_DEFAULT=saved). The one-shot flag for the trial
+# lives in EFI/offbox/grubenv on both ESPs, because GRUB cannot write to the mdraid /boot and so the usual
+# grub-reboot would never clear itself. /etc/grub.d/01_offbox_trial reads and clears it.
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+GRUBCFG=/boot/grub/grub.cfg
+
+entry_id() {
+  local ver=$1 id sub
+  id=$(sed -n "s/.*\$menuentry_id_option '\(gnulinux-$ver-advanced-[^']*\)'.*/\1/p" "$GRUBCFG" 2>/dev/null | head -1)
+  [ -n "$id" ] || return 1
+  sub=$(sed -n "s/^submenu .*\$menuentry_id_option '\([^']*\)'.*/\1/p" "$GRUBCFG" | head -1)
+  if [ -n "$sub" ]; then echo "$sub>$id"; else echo "$id"; fi
+}
+
+_env() { # _env set|unset|get ARG MNT
+  local op=$1 arg=$2 f=$3/EFI/offbox/grubenv
+  mkdir -p "$3/EFI/offbox"
+  [ -s "$f" ] || grub-editenv "$f" create
+  case $op in
+    set) grub-editenv "$f" set "$arg" ;;
+    unset) grub-editenv "$f" unset "$arg" ;;
+    get) grub-editenv "$f" list | sed -n "s/^$arg=//p" ;;
+  esac
+}
+env_all() { # env_all set|unset ARG: on every ESP
+  local d rc=0
+  for d in $(esp_parts); do with_esp "$d" _env "$1" "$2" || rc=1; done
+  return $rc
+}
+env_pending() { # number of ESPs that still carry the trial flag
+  local d n=0
+  for d in $(esp_parts); do
+    [ -n "$(with_esp "$d" _env get offbox_trial)" ] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+keep_installed() {
+  # apt may autoremove old kernels; the known-good one must stay.
+  local re
+  re=$(printf '%s' "$1" | sed 's/[.+]/\\\\&/g')
+  cat > /etc/apt/apt.conf.d/02offbox-keep-kernel <<E
+// written by offbox-kernel-trial: never autoremove the known-good kernel
+APT::NeverAutoRemove { "^linux-.*-$re\$"; };
+E
+}
+
+promote() {
+  local ver=$1 id
+  id=$(entry_id "$ver") || { say "kernel-trial: no GRUB entry for $ver, default unchanged"; return 1; }
+  grub-set-default "$id" || return 1
+  echo "$ver" > "$STATE/kernel-good"
+  keep_installed "$ver"
+  rm -f "$STATE/kernel-trial" "$STATE/kernel-trial-attempts"
+  env_all unset offbox_trial
+  say "kernel-trial: $ver is now the default kernel"
+}
+
+arm() {
+  local ver=$1 good id
+  good=$(cat "$STATE/kernel-good" 2>/dev/null)
+  if [ -z "$good" ]; then say "kernel-trial: no known-good kernel recorded yet, not arming $ver"; return 0; fi
+  [ "$ver" = "$good" ] && return 0
+  if grep -qxF "$ver" "$STATE/kernel-bad" 2>/dev/null; then say "kernel-trial: $ver failed before, not trying again"; return 0; fi
+  if dpkg --compare-versions "$ver" le "$good"; then say "kernel-trial: $ver is not newer than $good, ignoring"; return 0; fi
+  if [ ! -e "/boot/vmlinuz-$ver" ] || [ ! -e "/boot/initrd.img-$ver" ]; then
+    say "kernel-trial: $ver has no kernel or initrd in /boot, ignoring"; return 0
+  fi
+  # Keep the default on the good kernel whatever update-grub just did.
+  id=$(entry_id "$good") && grub-set-default "$id"
+  id=$(entry_id "$ver") || { say "kernel-trial: no GRUB entry for $ver"; return 0; }
+  if env_all set "offbox_trial=$id"; then
+    echo "$ver" > "$STATE/kernel-trial"
+    say "kernel-trial: $ver will be tried once at the next boot (default stays $good)"
+  else
+    say "kernel-trial: could not write the trial flag to every ESP"
+  fi
+}
+
+check() {
+  local health=$1 trial booted attempts
+  trial=$(cat "$STATE/kernel-trial" 2>/dev/null)
+  booted=$(booted_kernel)
+  if [ -z "$trial" ]; then
+    if [ "$health" = healthy ] && [ ! -s "$STATE/kernel-good" ]; then promote "$booted"; fi
+    return 0
+  fi
+  if [ "$booted" = "$trial" ]; then
+    if [ "$health" = healthy ]; then promote "$trial"; return 0; fi
+    echo "$trial" >> "$STATE/kernel-bad"
+    rm -f "$STATE/kernel-trial" "$STATE/kernel-trial-attempts"
+    env_all unset offbox_trial
+    say "kernel-trial: $trial booted but is unhealthy; marked bad, going back to $(cat "$STATE/kernel-good" 2>/dev/null)"
+    return 10
+  fi
+  # Running another kernel while a trial is pending.
+  if [ "$(env_pending)" -ge "$(esp_parts | wc -l)" ]; then return 0; fi   # not tried yet
+  attempts=$(( $(cat "$STATE/kernel-trial-attempts" 2>/dev/null || echo 0) + 1 ))
+  if [ -e "$STATE/kernel-trial-booted" ] && [ "$attempts" -lt 2 ]; then
+    # It did reach userspace but the machine restarted before the health check: that is not a verdict.
+    echo "$attempts" > "$STATE/kernel-trial-attempts"
+    rm -f "$STATE/kernel-trial" "$STATE/kernel-trial-booted"
+    arm "$trial"
+    say "kernel-trial: $trial booted but was restarted before its health check; one more try at the next boot"
+  else
+    echo "$trial" >> "$STATE/kernel-bad"
+    rm -f "$STATE/kernel-trial" "$STATE/kernel-trial-attempts" "$STATE/kernel-trial-booted"
+    env_all unset offbox_trial
+    say "kernel-trial: $trial was tried and did not come up; marked bad, staying on $booted"
+  fi
+  return 0
+}
+
+case ${1:-status} in
+  arm) [ -n "${2:-}" ] || exit 2; arm "$2" ;;
+  booted)
+    # called early in every boot: note that a kernel on trial got as far as userspace
+    if [ -s "$STATE/kernel-trial" ] && [ "$(booted_kernel)" = "$(cat "$STATE/kernel-trial")" ]; then
+      touch "$STATE/kernel-trial-booted"
+    fi
+    ;;
+  promote) promote "${2:-$(booted_kernel)}" ;;
+  check) check "${2:-healthy}" ;;
+  status)
+    echo "booted=$(booted_kernel)"
+    echo "good=$(cat "$STATE/kernel-good" 2>/dev/null)"
+    echo "trial=$(cat "$STATE/kernel-trial" 2>/dev/null)"
+    echo "trial_flag_on_esps=$(env_pending)"
+    echo "bad=$(cat "$STATE/kernel-bad" 2>/dev/null | tr '\n' ' ')"
+    echo "grub_default=$(grub-editenv /boot/grub/grubenv list 2>/dev/null | sed -n 's/^saved_entry=//p')"
+    ;;
+  *) echo "usage: offbox-kernel-trial arm VERSION | promote [VERSION] | check healthy|unhealthy | status" >&2; exit 2 ;;
+esac

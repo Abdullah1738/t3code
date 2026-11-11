@@ -1,0 +1,27 @@
+#!/bin/sh
+# offbox: one-shot kernel trial (see /usr/local/sbin/offbox-kernel-trial). Emitted right after 00_header, so
+# it overrides the saved default for exactly one boot. The flag is on the ESP because GRUB can write to FAT
+# but not to the mdraid /boot.
+cat <<'EOF_GRUB'
+### offbox kernel trial ###
+set offbox_esp=
+regexp --set=1:offbox_esp '^\(([^)]+)\)' "$cmdpath"
+if [ -z "$offbox_esp" ]; then
+  search --no-floppy --file --set=offbox_esp /EFI/offbox/grubenv
+elif [ ! -e "($offbox_esp)/EFI/offbox/grubenv" ]; then
+  search --no-floppy --file --set=offbox_esp /EFI/offbox/grubenv
+fi
+if [ -n "$offbox_esp" ]; then
+  if [ -e "($offbox_esp)/EFI/offbox/grubenv" ]; then
+    set offbox_trial=
+    load_env -f "($offbox_esp)/EFI/offbox/grubenv" offbox_trial
+    if [ -n "$offbox_trial" ]; then
+      set default="$offbox_trial"
+      set offbox_trial=
+      save_env -f "($offbox_esp)/EFI/offbox/grubenv" offbox_trial
+      echo "offbox: trying kernel entry $default once"
+    fi
+  fi
+fi
+### end offbox kernel trial ###
+EOF_GRUB

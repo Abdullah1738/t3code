@@ -1,0 +1,65 @@
+#!/bin/bash
+# offbox-boot-health: a few minutes after every boot, decide whether this boot is healthy.
+# Healthy  -> a kernel on trial becomes the default; the emergency counter is cleared; the ESPs are synced.
+# Unhealthy while a new kernel is on trial -> restart into the known-good kernel.
+# Unhealthy on the known-good kernel -> logged only (restarting would not help).
+# Extra units to require can be listed in /etc/offbox/health.d/*.units (one unit per line).
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+problems=()
+bad() { problems+=("$1"); }
+
+findmnt -n -o OPTIONS / | tr , '\n' | grep -qx rw || bad root-not-writable
+state=$(systemctl is-system-running 2>/dev/null)
+case $state in running | degraded | starting | initializing) ;; *) bad "system-state-$state" ;; esac
+systemctl is-active -q ssh.service || systemctl is-active -q ssh.socket || bad sshd-not-running
+mountpoint -q /boot || bad boot-not-mounted
+
+have_eth=0
+for n in /sys/class/net/e*; do [ -e "$n" ] && have_eth=1; done
+if [ "$have_eth" = 0 ]; then
+  bad no-ethernet-interface
+else
+  carrier=0
+  for _ in $(seq 1 "$(cfgval health_carrier_tries 12)"); do
+    for n in /sys/class/net/e*; do [ "$(cat "$n/carrier" 2>/dev/null)" = 1 ] && carrier=1; done
+    [ "$carrier" = 1 ] && break
+    sleep 5
+  done
+  # Only a link that worked under the last good kernel counts against this boot (a pulled cable is not a kernel fault).
+  if [ "$carrier" = 0 ] && [ "$(cat "$STATE/net-baseline" 2>/dev/null)" = carrier ]; then bad ethernet-link-lost; fi
+fi
+if [ -e /etc/zfs/zpool.cache ] && command -v zpool >/dev/null; then
+  zpool list -H -o name 2>/dev/null | grep -qx offbox || bad zfs-pool-not-imported
+fi
+for f in /etc/offbox/health.d/*.units; do
+  [ -e "$f" ] || continue
+  while read -r u; do
+    case $u in '' | '#'*) continue ;; esac
+    systemctl is-active -q "$u" || bad "unit-$u"
+  done < "$f"
+done
+
+kernel=$(booted_kernel)
+if [ ${#problems[@]} -eq 0 ]; then
+  verdict=healthy
+  [ "${carrier:-0}" = 1 ] && echo carrier > "$STATE/net-baseline"
+  rm -f "$STATE/emergency-count"
+else
+  verdict=unhealthy
+fi
+printf '{"time":"%s","kernel":"%s","verdict":"%s","problems":"%s"}\n' "$(date -u +%FT%TZ)" "$kernel" "$verdict" "${problems[*]}" > "$STATE/health.json"
+say "boot-health: $verdict kernel=$kernel ${problems[*]}"
+
+/usr/local/sbin/offbox-kernel-trial check "$verdict"
+rc=$?
+[ "$verdict" = healthy ] && /usr/local/sbin/offbox-esp-sync || true
+if [ "$rc" = 10 ]; then
+  if [ -e "$RUN/hold" ]; then
+    say "boot-health: would restart into the good kernel, but $RUN/hold exists"
+  else
+    say "boot-health: restarting into the known-good kernel"
+    systemctl reboot
+  fi
+fi
+exit 0

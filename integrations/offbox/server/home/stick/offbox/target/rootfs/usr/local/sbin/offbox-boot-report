@@ -1,0 +1,93 @@
+#!/bin/bash
+# offbox-boot-report: on every boot of the installed system.
+#   - writes a short report to /var/lib/offbox/boot-report.txt
+#   - if the installer stick is still plugged in: appends that report to its log volume, so the stick tells
+#     the story even when the network never came up
+#   - if the stick carries a fresh marker file (REINSTALL-OS / WIPE-EVERYTHING): tells the firmware to boot
+#     the stick next and restarts, so a reinstall needs no keyboard
+#   - deletes a marker that was already acted on but is still on the stick
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+why=${1:-boot}
+if [ "$why" = boot ]; then
+  /usr/local/sbin/offbox-kernel-trial booted
+  for _ in $(seq 1 "$(cfgval report_net_tries 18)"); do
+    ip -4 route show default 2>/dev/null | grep -q default && break
+    sleep 5
+  done
+fi
+REPORT=$STATE/boot-report.txt
+{
+  echo "== offbox-server $why report $(date -u +%FT%TZ)"
+  /usr/local/sbin/offbox-status 2>&1
+  echo "-- efibootmgr"; efibootmgr 2>&1 | head -20
+  echo "-- mdstat"; cat /proc/mdstat
+  echo "-- failed units"; systemctl --failed --no-pager --no-legend 2>&1 | head -20
+  echo "-- last boot errors"; journalctl -b -p err --no-pager 2>&1 | tail -30
+} > "$REPORT" 2>&1
+
+read -r bootp logp < <(stick_parts)
+[ "$bootp" = - ] && [ "$logp" = - ] && exit 0
+consumed=$(cat /boot/efi/EFI/offbox/consumed 2>/dev/null)
+fresh=
+mnt=$RUN/stick
+mkdir -p "$mnt"
+identity() { # same format as plan.py marker_identity
+  local kind=$1 p=$2
+  echo "$kind:$(stat -c %s "$p"):$(stat -c %Y "$p"):$(head -c 1048576 "$p" | sha256sum | cut -c1-16)"
+}
+for part in "$logp" "$bootp"; do
+  [ "$part" = - ] && continue
+  mount -t vfat -o rw,flush,quiet,umask=077,tz=UTC "$part" "$mnt" 2>/dev/null || mount -t vfat -o ro,tz=UTC "$part" "$mnt" 2>/dev/null || continue
+  if [ "$part" = "$logp" ]; then
+    mkdir -p "$mnt/installed"
+    cp "$REPORT" "$mnt/installed/$why-$(date -u +%Y%m%dT%H%M%SZ).txt" 2>/dev/null
+    echo "$(date -u +%Y%m%dT%H%M%SZ) installed-system $why host=$(hostname) ip=$(hostname -I | tr ' ' ,) tailscale=$(tailscale ip -4 2>/dev/null | head -1) kernel=$(uname -r)" >> "$mnt/stage.log" 2>/dev/null
+    rm -f "$mnt/fail-count" 2>/dev/null
+  fi
+  for f in "$mnt"/*; do
+    [ -f "$f" ] || continue
+    case $(basename "$f" | tr 'A-Z' 'a-z') in
+      wipe-everything | wipe-everything.txt) kind=wipe ;;
+      reinstall-os | reinstall-os.txt) kind=reinstall ;;
+      *) continue ;;
+    esac
+    id=$(identity "$kind" "$f")
+    if printf '%s\n' "$consumed" | grep -qxF "$id"; then
+      rm -f "$f" 2>/dev/null && say "boot-report: removed the already-used marker $(basename "$f") from the stick"
+    elif grep -qxF "$id" "$STATE/stick-marker-tried" 2>/dev/null; then
+      # The machine was already sent to the stick for this marker and the installer sent it back.
+      say "boot-report: marker $(basename "$f") was already handed to the installer once; not doing it again"
+    else
+      echo "$id" >> "$STATE/stick-marker-tried"
+      fresh="$fresh $(basename "$f")"
+    fi
+  done
+  sync
+  umount "$mnt" 2>/dev/null
+done
+
+if [ -n "$fresh" ] && [ "$why" = boot ]; then
+  say "boot-report: marker file(s)$fresh on the stick: booting the stick next so the installer can act on it"
+  disk=/dev/$(lsblk -no PKNAME "${bootp/#-/$logp}" | head -1)
+  sig=$(blkid -o value -s PTUUID "$disk" 2>/dev/null)
+  num=
+  [ -n "$sig" ] && num=$(efibootmgr -v 2>/dev/null | grep -i "MBR,0x$sig" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | head -1)
+  if [ -z "$num" ]; then
+    order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p')
+    efibootmgr -c -d "$disk" -p 1 -L offbox-stick -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1
+    num=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\? offbox-stick.*/\1/p' | head -1)
+    [ -n "$order" ] && efibootmgr -o "$order" >/dev/null 2>&1   # keep the disks first for normal boots
+  fi
+  if [ -n "$num" ] && efibootmgr -n "$num" >/dev/null 2>&1; then
+    if [ -e "$RUN/hold" ]; then
+      say "boot-report: next boot is the stick (Boot$num); not restarting because $RUN/hold exists"
+    else
+      sleep "$(cfgval marker_reboot_delay 20)"
+      systemctl reboot
+    fi
+  else
+    say "boot-report: could not point the firmware at the stick; marker not acted on"
+  fi
+fi
+exit 0

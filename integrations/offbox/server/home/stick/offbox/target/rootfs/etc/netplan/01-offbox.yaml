@@ -1,0 +1,13 @@
+# offbox: DHCP on every wired interface, matched by name pattern so a renamed or replaced NIC still works.
+# optional: the boot never waits for the network.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    offbox-wired:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp6: true
+      optional: true
+      dhcp-identifier: mac

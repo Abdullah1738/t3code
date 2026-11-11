@@ -1,0 +1,6 @@
+[Unit]
+Description=offbox: keep an RTC wake alarm armed (backstop for a real power-off)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/offbox-rtcwake 900

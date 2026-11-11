@@ -1,0 +1,14 @@
+[Unit]
+Description=offbox: make sure a hardware watchdog driver is loaded
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# sp5100_tco is the AMD chipset watchdog on the real board; the others cover VMs. softdog is the last resort.
+ExecStart=/bin/sh -c 'for m in sp5100_tco i6300esb iTCO_wdt softdog; do [ -e /dev/watchdog0 ] && break; modprobe -q $m; sleep 1; done; exit 0'
+
+[Install]
+WantedBy=sysinit.target

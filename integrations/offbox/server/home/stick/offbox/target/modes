@@ -1,0 +1,13 @@
+# path (under the target root) and mode. FAT keeps no permissions, so late.sh applies these after copying.
+usr/local/lib/offbox/lib.sh 0644
+usr/local/sbin/offbox-kernel-trial 0755
+usr/local/sbin/offbox-boot-health 0755
+usr/local/sbin/offbox-esp-sync 0755
+usr/local/sbin/offbox-rtcwake 0755
+usr/local/sbin/offbox-emergency 0755
+usr/local/sbin/offbox-tailscale-join 0755
+usr/local/sbin/offbox-status 0755
+usr/local/sbin/offbox-boot-report 0755
+etc/grub.d/01_offbox_trial 0755
+etc/kernel/postinst.d/zzz-offbox-kernel-trial 0755
+etc/netplan/01-offbox.yaml 0600

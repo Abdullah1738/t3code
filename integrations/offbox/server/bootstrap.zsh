@@ -6,9 +6,15 @@
 #   client  store the API token in Keychain (offbox-server-api/ardud), write offbox's server.json and the
 #           root ssh config used by offbox-person-backup
 # Default: all steps in order. Key: ~/.ssh/offbox_server (the one given to Hetzner at order time).
+#
+# Home server (installed by the USB stick, see home/README.md): the stick already did `os` and `ts`, so run
+#   bootstrap.zsh <tailnet-ip> home
+# which checks that the box is the stick-installed server and on the tailnet, then runs `host` and `client`.
+# `host` and `client` also work on their own with the tailnet IP.
 set -euo pipefail
 IP=$1; shift
 STEPS=(${@:-os ts host client})
+if [[ ${STEPS[1]} == home ]]; then STEPS=(homecheck host client ${STEPS[2,-1]}); fi
 HERE=${0:A:h}
 KEY=$HOME/.ssh/offbox_server
 STATE=$HOME/.local/share/offbox
@@ -50,6 +56,15 @@ EOF
       ssh-keygen -R $IP -f $KH >/dev/null 2>&1 || true
       wait_ssh
       r 'cat /etc/os-release | head -2; lsblk -o NAME,SIZE,TYPE,MOUNTPOINT'
+      ;;
+    homecheck)
+      r 'test -s /etc/offbox/installed' || { print -u2 "$IP is not a stick-installed offbox server (/etc/offbox/installed missing)"; exit 1; }
+      r 'offbox-status | head -6'
+      [[ -n $(r 'tailscale ip -4 2>/dev/null | head -1') ]] ||
+        { print -u2 "the server is not on the tailnet yet (see: journalctl -u offbox-tailscale-join); boatd listens only there"; exit 1; }
+      r 'grep -Eq "\[U_\]|\[_U\]" /proc/mdstat' && print -u2 "warning: an mdraid array is degraded (cat /proc/mdstat)"
+      [[ $(r 'lsblk -lno PARTLABEL | grep -cx offbox-zfs') == 2 ]] ||
+        { print -u2 "expected two offbox-zfs partitions on the server"; exit 1; }
       ;;
     ts)
       [[ -s ${TS_AUTHKEY_FILE:-} ]] || { print -u2 "set TS_AUTHKEY_FILE to a file holding a one-off auth key"; exit 1; }

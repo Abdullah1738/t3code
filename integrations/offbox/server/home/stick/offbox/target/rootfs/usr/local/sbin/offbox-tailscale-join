@@ -1,0 +1,33 @@
+#!/bin/bash
+# offbox-tailscale-join: get this machine onto the tailnet and keep trying until it is there.
+# Uses the state the installer left (already joined, or carried over from the previous install); otherwise the
+# auth key from the stick (/etc/offbox/tailscale-authkey). The key file is deleted once the node is up.
+# shellcheck source=../lib/offbox/lib.sh
+. /usr/local/lib/offbox/lib.sh
+KEY=/etc/offbox/tailscale-authkey
+command -v tailscale >/dev/null || { say "tailscale-join: tailscale is not installed"; exit 0; }
+HOST=$(cfgval ts_hostname "$(hostname)")
+state() { tailscale status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*\)".*/\1/p' | head -1; }
+systemctl is-active -q tailscaled || systemctl start tailscaled
+s=$(state)
+if [ "$s" = Running ]; then
+  if [ -e "$KEY" ]; then shred -u "$KEY" 2>/dev/null || rm -f "$KEY"; fi
+  if [ ! -e "$STATE/tailscale-joined" ]; then
+    tailscale ip -4 2>/dev/null | head -1 > "$STATE/tailscale-joined"
+    say "tailscale-join: on the tailnet as $HOST, $(cat "$STATE/tailscale-joined")"
+    /usr/local/sbin/offbox-boot-report tailscale >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+rm -f "$STATE/tailscale-joined"
+if [ -s "$KEY" ]; then
+  if tailscale up --auth-key="file:$KEY" --hostname="$HOST" --ssh=false --accept-dns=false --timeout=45s 2>"$RUN/tailscale-join.err"; then
+    say "tailscale-join: joined as $HOST"
+  else
+    say "tailscale-join: not joined yet (state=$s): $(tail -1 "$RUN/tailscale-join.err" | cut -c1-160)"
+  fi
+else
+  tailscale up --hostname="$HOST" --ssh=false --accept-dns=false --timeout=20s 2>/dev/null ||
+    say "tailscale-join: state=$s and no auth key on this machine: LAN only until a key is supplied"
+fi
+exit 0

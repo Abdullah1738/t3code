@@ -1,0 +1,74 @@
+#cloud-config
+# offbox home server: zero-touch install. All logic lives in /cdrom/offbox/installer/ on this stick.
+# This file is static; early.sh fills in the storage section after it has looked at the disks.
+
+# Live installer session: start the stick logger, SSH key, mDNS and Tailscale before subiquity runs.
+bootcmd:
+  - [sh, -c, "sh /cdrom/offbox/installer/live-setup.sh start || true"]
+
+autoinstall:
+  version: 1
+  interactive-sections: []
+  refresh-installer:
+    update: false
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+  source:
+    id: ubuntu-server
+    search_drivers: false
+  kernel:
+    flavor: hwe
+  # The installer should not make the disks bootable for the firmware before late.sh has finished the system.
+  # These two are honoured by the grub package's own configure step only. The installer then calls
+  # grub-multi-install without arguments, which registers boot entries and writes the removable path anyway;
+  # early.sh/late.sh handle that (BootNext pinned to the stick, entries and path removed at late-start).
+  debconf-selections: |
+    grub-efi-amd64 grub2/update_nvram boolean false
+    grub-efi-amd64 grub2/force_efi_extra_removable boolean false
+  # Install only what is on the stick: the same bytes the VM tests installed, with or without a network.
+  # 127.0.0.1:9 is unusable on purpose, so subiquity takes the offline path. late.sh writes the real sources.
+  apt:
+    geoip: false
+    fallback: offline-install
+    mirror-selection:
+      primary:
+        - uri: "http://127.0.0.1:9/ubuntu"
+  # Placeholder that can never match a disk. early.sh replaces it; if that ever fails the install stops
+  # here instead of picking a disk by itself.
+  storage:
+    config:
+      - type: disk
+        id: placeholder
+        match:
+          serial: OFFBOX-PLACEHOLDER-EARLY-SH-DID-NOT-RUN
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys: []
+  codecs:
+    install: false
+  drivers:
+    install: false
+  oem:
+    install: false
+  snaps: []
+  packages:
+    - zfsutils-linux
+    - nvme-cli
+    - efibootmgr
+  updates: security
+  shutdown: reboot
+  early-commands:
+    - bash /cdrom/offbox/installer/early.sh
+  late-commands:
+    - bash /cdrom/offbox/installer/late.sh
+  error-commands:
+    - bash /cdrom/offbox/installer/error.sh
+  # No identity section: root is set up by late.sh (key-only SSH, console password hash from the stick).
+  user-data:
+    hostname: offbox-server
+    disable_root: false
+    ssh_pwauth: false
+    users: []

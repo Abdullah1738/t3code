@@ -1,0 +1,8 @@
+// offbox: security updates install by themselves; the machine is never restarted by apt.
+// New kernels are tried by offbox-kernel-trial at the next boot.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Dpkg::Options { "--force-confdef"; "--force-confold"; };

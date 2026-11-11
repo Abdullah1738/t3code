@@ -1,0 +1,2 @@
+Files named *.units here list systemd units (one per line) that offbox-boot-health requires to be active
+before it calls a boot healthy, e.g. boatd.units containing "boatd.service" and "incus.service".
