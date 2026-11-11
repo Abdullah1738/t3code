@@ -5,6 +5,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   askViews,
   cardView,
+  drawerCard,
   modelName,
   modelVariant,
   STAGE_LABELS,
@@ -34,6 +35,7 @@ import { cn } from "../../lib/utils";
 import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { boardViewFor } from "./useBoardClock";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
 import { PrGlyph } from "./CardTile";
@@ -86,8 +88,18 @@ export function CardDrawer(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const { boardId, state } = props;
-  const card = state.cards.get(props.cardId);
+  const feedCard = state.cards.get(props.cardId);
   const detail = useCardDetail(boardId, props.cardId);
+  // The feed's copy has no description or prompt and trims long texts; the card read
+  // on its own has them. Until it arrives the drawer shows a placeholder, not "empty".
+  const shown = feedCard === undefined ? null : drawerCard(feedCard, detail?.card);
+  const card = shown?.card;
+  const loaded = shown?.loaded ?? false;
+  const fullCard = detail?.card;
+  useEffect(() => {
+    // Search can read this card's description from now on.
+    if (fullCard !== undefined) boardViewFor(boardId).learn(fullCard);
+  }, [boardId, fullCard]);
   const detailFeed = useFeed(kanban.card(boardId, props.cardId));
   const nowMs = useNowMs();
   const [tab, setTab] = useState<DrawerTab>("details");
@@ -234,13 +246,13 @@ export function CardDrawer(props: {
                 onClick={() => {
                   // Read before settling: once settled, the card leaves the Verified list.
                   const after = props.steps?.afterSettle ?? null;
-                  void runAction("Couldn't settle the card", () =>
-                    kanban.settleCard(card.id),
-                  ).then((ok) => {
-                    if (!ok) return;
-                    if (after !== null) props.onStepCard(after);
-                    else props.onClose();
-                  });
+                  void runAction("Couldn't settle the card", () => kanban.settleCard(card.id)).then(
+                    (ok) => {
+                      if (!ok) return;
+                      if (after !== null) props.onStepCard(after);
+                      else props.onClose();
+                    },
+                  );
                 }}
                 className="h-7.5 rounded-full bg-(--m-chip) px-3 text-sm font-medium text-(--m-text) outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent)"
               >
@@ -261,6 +273,15 @@ export function CardDrawer(props: {
           </h2>
           {card.description ? (
             <CardDescription key={card.description} text={card.description} />
+          ) : !loaded && !detailFeed.failure ? (
+            <div
+              role="status"
+              aria-label="Loading the description"
+              className="mt-1 flex flex-col gap-2"
+            >
+              <span className="h-3 w-4/5 rounded-full bg-(--m-chip)" />
+              <span className="h-3 w-3/5 rounded-full bg-(--m-chip)" />
+            </div>
           ) : null}
           <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
             <Chip>
@@ -293,7 +314,7 @@ export function CardDrawer(props: {
         {detailFeed.failure ? (
           <p role="status" className="mt-2 flex items-center gap-3 text-sm text-(--m-muted)">
             <span className="min-w-0 flex-1 truncate">
-              Couldn't load threads and comments. {kanbanErrorMessage(detailFeed.failure.error)}
+              Couldn't load the full card. {kanbanErrorMessage(detailFeed.failure.error)}
             </span>
             <button
               type="button"

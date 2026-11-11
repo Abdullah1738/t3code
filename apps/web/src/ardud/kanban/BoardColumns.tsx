@@ -55,7 +55,7 @@ export function BoardColumns(props: {
     });
   const { model, filter } = props;
   if (model.total === 0) {
-    return <NoCardsMatch onClear={props.onClearFilters} />;
+    return <NoCardsMatch searching={(filter.query ?? "") !== ""} onClear={props.onClearFilters} />;
   }
   const picked = filter.goalIds ?? [];
   const shownGoals =
@@ -126,7 +126,12 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
   const toggle = (key: string) =>
     updatePrefs((current) => toggleColumn(current, key as BoardColumnKey));
   const hidden = (key: string) => prefs.hidden.includes(key as BoardColumnKey);
-  const shippedOpen = shipped === null ? props.wide : shipped === "open";
+  const shippedCount = board.shipped.reduce((sum, lane) => sum + lane.count, 0);
+  // A search that found shipped cards shows them, whatever the fold: a card looked up
+  // by number is often one that shipped.
+  const searching = (props.filter.query ?? "") !== "";
+  const shippedOpen =
+    searching && shippedCount > 0 ? true : shipped === null ? props.wide : shipped === "open";
 
   const shippedHidden = hidden("shipped");
   const ownerHidden = hidden("needs_owner");
@@ -221,7 +226,6 @@ function StageGrid(props: ColumnsProps & { wide: boolean }) {
       for (const stage of REVIEW_STAGES) delete widths[stage];
       return { ...current, widths };
     });
-  const shippedCount = board.shipped.reduce((sum, lane) => sum + lane.count, 0);
   const ownerVirtual = board.owner.rows.length > VIRTUAL_ROWS_MIN;
   return (
     <div className="flex min-h-0 flex-1 gap-2.5">
@@ -462,10 +466,15 @@ function ShippedColumn(props: {
   );
 }
 
-function NoCardsMatch(props: { onClear: () => void }) {
+function NoCardsMatch(props: { searching: boolean; onClear: () => void }) {
   return (
     <div className="flex flex-col items-start gap-3 pe-5">
-      <p className="text-(--m-muted)">No cards match these filters.</p>
+      <p className="text-(--m-muted)">
+        {props.searching
+          ? // The board feed carries no descriptions: only an opened card's is on this device.
+            "No cards match. Descriptions are searched only on cards you have opened."
+          : "No cards match these filters."}
+      </p>
       <button
         type="button"
         onClick={props.onClear}

@@ -120,6 +120,11 @@ export interface BoardViewEngine {
    * object it was before.
    */
   readonly model: (state: KanbanBoardState, nowMs: number, params: BoardViewParams) => BoardModel;
+  /**
+   * A card read in full (a drawer opened it). The board feed carries no description
+   * or prompt, so search can only read those for cards the client has learned.
+   */
+  readonly learn: (card: KanbanCard) => void;
   /** Per-card views built since the engine was made; for tests and measurements. */
   readonly computed: () => number;
 }
@@ -294,6 +299,7 @@ export function createBoardView(): BoardViewEngine {
   const entries = new Map<string, Entry>();
   const heads = new Map<string, BoardHeadRow>();
   const texts = new WeakMap<KanbanCard, string>();
+  const learned = new Map<string, string>();
   let computed = 0;
 
   let scheduleCards: ReadonlyMap<string, KanbanCard> | null = null;
@@ -437,6 +443,19 @@ export function createBoardView(): BoardViewEngine {
     return row;
   };
 
+  /** What a search reads that is not on the feed's card: its goal, its threads, and the full text once learned. */
+  const aroundText = (card: KanbanCard, state: KanbanBoardState): string => {
+    const parts: string[] = [];
+    const goal = card.goalId === null ? undefined : state.goals.get(card.goalId);
+    if (goal !== undefined) parts.push(goal.name);
+    for (const id of [card.activeThreadId, card.workThreadId, card.reviewThreadId]) {
+      const thread = id === null ? undefined : state.threads.get(id);
+      if (thread !== undefined) parts.push(thread.title);
+    }
+    const full = learned.get(card.id);
+    return `${parts.join("\n").toLowerCase()}\n${full ?? ""}`;
+  };
+
   const textOf = (card: KanbanCard): string => {
     let text = texts.get(card);
     if (text === undefined) {
@@ -467,8 +486,11 @@ export function createBoardView(): BoardViewEngine {
     }
 
     const { filter } = params;
-    const settled = filter.settled ?? "hide";
     const query = prepareQuery(filter.query ?? "");
+    // A search looks through settled cards too: a card looked up by number or title is
+    // often one that shipped long ago.
+    const chosen = filter.settled ?? "hide";
+    const settled = query !== null && chosen === "hide" ? "include" : chosen;
     let validUntil = (bucket + 1) * SCHEDULE_CLOCK_MS;
     const visible: Entry[] = [];
     const goalCounts = new Map<string, { progress: Progress; needsOwner: number }>();
@@ -478,7 +500,7 @@ export function createBoardView(): BoardViewEngine {
         !(settled === "hide" && isSettled) &&
         !(settled === "only" && !isSettled) &&
         matchesFacets(card, filter) &&
-        (query === null || queryMatches(query, card, textOf(card)));
+        (query === null || queryMatches(query, card, textOf(card), () => aroundText(card, state)));
       // An open card keeps its view warm whatever the filter: goals count it, and a
       // cleared search shows it again without building anything.
       const entry = shown || !isSettled ? entryFor(card, state, nowMs) : null;
@@ -702,6 +724,13 @@ export function createBoardView(): BoardViewEngine {
       last = { state, filterKey, at: nowMs, validUntil: built.validUntil, model: built.model };
       return built.model;
     },
+    learn(card) {
+      const text = `${card.description}\n${card.prompt}`.toLowerCase();
+      if (learned.get(card.id) === text) return;
+      learned.set(card.id, text);
+      // The next model call searches again.
+      last = null;
+    },
     computed: () => computed,
   };
 }
@@ -725,7 +754,12 @@ function matchesFacets(card: KanbanCard, filter: BoardFilter): boolean {
   return true;
 }
 
-/** Everything of a card a search reads, lower-cased once per card. */
+/**
+ * Everything on a card a search reads, lower-cased once per card: its number, title,
+ * links (label and URL, so a PR number or repo finds it), projects, what it waits on
+ * and why it is flagged, its open asks and its plan. The description and prompt are
+ * here too, but the board feed sends them empty: see `learn`.
+ */
 export function cardSearchText(card: KanbanCard): string {
   return [
     `#${card.number}`,
@@ -733,6 +767,12 @@ export function cardSearchText(card: KanbanCard): string {
     card.description,
     card.prompt,
     ...card.links.flatMap((link) => [link.label ?? "", link.url]),
+    ...card.projects,
+    card.question ?? "",
+    card.stalled?.reason ?? "",
+    card.wait?.note ?? "",
+    ...card.asks.flatMap((ask) => (ask.closedAt === null ? [ask.text] : [])),
+    ...card.subtasks.map((subtask) => subtask.text),
   ]
     .join("\n")
     .toLowerCase();
@@ -753,9 +793,20 @@ function prepareQuery(query: string): PreparedQuery | null {
   };
 }
 
-function queryMatches(query: PreparedQuery, card: KanbanCard, text: string): boolean {
+function queryMatches(
+  query: PreparedQuery,
+  card: KanbanCard,
+  text: string,
+  around: () => string,
+): boolean {
   if (query.number !== null && String(card.number).startsWith(query.number)) return true;
-  return query.words.every((word) => text.includes(word));
+  let more: string | null = null;
+  // Every word, each in the card's own text or in what surrounds it.
+  return query.words.every((word) => {
+    if (text.includes(word)) return true;
+    more ??= around();
+    return more.includes(word);
+  });
 }
 
 /**

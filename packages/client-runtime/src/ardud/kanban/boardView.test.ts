@@ -239,7 +239,12 @@ describe("createBoardView", () => {
     ];
     for (const filter of filters) {
       const built = createBoardView().model(state, NOW, { filter, group: "stage" });
-      const old = stageBoard(state, NOW, filter);
+      // A search looks through settled cards too; the old view model needs to be told.
+      const old = stageBoard(
+        state,
+        NOW,
+        filter.query && filter.settled === undefined ? { ...filter, settled: "include" } : filter,
+      );
       expect(built.total).toBe(old.total);
       expect(built.active.map((lane) => [lane.key, idsOf(lane)])).toEqual(
         old.active.map((column) => [column.stage, column.cards.map((view) => view.id)]),
@@ -583,5 +588,118 @@ describe("boardSteps", () => {
         );
       }
     }
+  });
+});
+
+describe("board search", () => {
+  const threadId = "thread-9" as never;
+  const cards = [
+    card(1, { title: "Rotate the signing key" }),
+    card(2, {
+      title: "Ledger drift",
+      links: [
+        {
+          kind: "pr",
+          url: "https://github.com/example-org/ledger/pull/512",
+          label: "ledger#512",
+          state: "open",
+        },
+      ] as never,
+    }),
+    card(3, {
+      title: "Working card",
+      stage: "working",
+      activeThreadId: threadId,
+      workThreadId: threadId,
+      activeRole: "work",
+    }),
+    card(4, { title: "Has a goal", goalId: "goal-b" as never }),
+    card(5, { title: "Asks", asks: [ask("a5", { text: "Which tamarind queue?" })] }),
+    card(6, {
+      title: "Planned",
+      subtasks: [
+        { id: "s1", text: "Backfill the zeppelin table", step: 1, state: "open" },
+      ] as never,
+    }),
+    card(7, { title: "Parked", projects: ["wallet"] }),
+    card(8, {
+      title: "Shipped long ago",
+      stage: "verified",
+      settledAt: "2026-10-20T00:00:00.000Z",
+    }),
+    card(120, { title: "Another" }),
+  ];
+  const state = stateOf(cards, [
+    {
+      threadId,
+      title: "Marzipan migration worker",
+      running: true,
+      needsInput: false,
+      lastActivityAt: null,
+    },
+  ]);
+  const found = (query: string, engine = createBoardView()) => {
+    const built = engine.model(state, NOW, { filter: { query }, group: "stage" });
+    return [...built.active, ...built.shipped].flatMap(idsOf).sort();
+  };
+
+  it("finds a card by its number, with or without the hash", () => {
+    expect(found("#2")).toEqual(["card-2"]);
+    expect(found("#12")).toEqual(["card-120"]);
+    // A bare number is also a word: it finds the pull request numbered 512.
+    expect(found("12")).toEqual(["card-120", "card-2"]);
+    expect(found("#1")).toEqual(["card-1", "card-120"]);
+  });
+
+  it("finds a card by its title, every word in any order", () => {
+    expect(found("key rotate")).toEqual(["card-1"]);
+    expect(found("key ledger")).toEqual([]);
+  });
+
+  it("finds a card by its pull request, label or URL", () => {
+    expect(found("ledger#512")).toEqual(["card-2"]);
+    expect(found("pull/512")).toEqual(["card-2"]);
+    expect(found("example-org")).toEqual(["card-2"]);
+  });
+
+  it("finds a card by the title of a thread on it", () => {
+    expect(found("marzipan")).toEqual(["card-3"]);
+    expect(found("working marzipan")).toEqual(["card-3"]);
+  });
+
+  it("finds a card by its goal, project, open ask and plan", () => {
+    expect(found("ledger")).toEqual(["card-2", "card-4"]);
+    expect(found("wallet")).toEqual(["card-7"]);
+    expect(found("tamarind")).toEqual(["card-5"]);
+    expect(found("zeppelin")).toEqual(["card-6"]);
+  });
+
+  it("looks through settled cards while searching, and hides them again after", () => {
+    const engine = createBoardView();
+    expect(found("shipped long", engine)).toEqual(["card-8"]);
+    expect(found("#8", engine)).toEqual(["card-8"]);
+    const cleared = engine.model(state, NOW, STAGE);
+    expect(cleared.shipped.flatMap(idsOf)).toEqual([]);
+    // Only settled cards when that is what the filter asks for.
+    const only = engine.model(state, NOW, {
+      filter: { query: "card", settled: "only" },
+      group: "stage",
+    });
+    expect(only.total).toBe(0);
+  });
+
+  it("reads a description only for cards the client has loaded in full", () => {
+    const engine = createBoardView();
+    // The feed sends descriptions empty: nothing to find yet.
+    expect(found("obsidian", engine)).toEqual([]);
+    engine.learn({ ...cards[0]!, description: "Replace the obsidian HSM key", prompt: "Halcyon" });
+    expect(found("obsidian", engine)).toEqual(["card-1"]);
+    expect(found("rotate halcyon", engine)).toEqual(["card-1"]);
+    // Learning the same text again changes nothing.
+    const before = engine.model(state, NOW, { filter: { query: "obsidian" }, group: "stage" });
+    engine.learn({ ...cards[0]!, description: "Replace the obsidian HSM key", prompt: "Halcyon" });
+    expect(engine.model(state, NOW, { filter: { query: "obsidian" }, group: "stage" })).toBe(
+      before,
+    );
   });
 });
