@@ -7,7 +7,9 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -191,7 +193,7 @@ def _soft_partial(stderr: str) -> list[str] | None:
 
 def _include_refused(inc: str) -> OffboxError:
     return OffboxError(f"cannot sync --include {inc!r}: offbox couldn't tell what else sits beside it, "
-                       "so it won't send it (git inspection failed)", code=2)
+                       "so it won't send it (local filter inspection failed)", code=2)
 
 
 def _ignored_include_tops(root: Path, includes: list[str] | None) -> list[str]:
@@ -246,6 +248,37 @@ def _reclaim(box_id: str, remote_dir: str) -> bool:
     return p.returncode == 0
 
 
+def _visible_include_ancestors(root: Path, ancestors: set[str], inc: str) -> set[str]:
+    # Rsync's inherited merge rules differ from Git's. Probe only a synthetic ancestor tree, never
+    # the checkout's subtrees, so checking an include cannot walk unrelated scratch or copy its files.
+    try:
+        with tempfile.TemporaryDirectory(prefix="offbox-include-filters-") as tmp:
+            source, dest = Path(tmp) / "source", Path(tmp) / "dest"
+            source.mkdir()
+            dest.mkdir()
+            for anc in ancestors:
+                (source / anc).mkdir(parents=True, exist_ok=True)
+            paths = {""} | {str(p.relative_to(source)) for p in source.rglob("*")}
+            for rel in paths:
+                ignore = root / rel / ".gitignore"
+                try:
+                    ignore.lstat()
+                except FileNotFoundError:
+                    continue
+                shutil.copyfile(ignore, source / rel / ".gitignore")
+            cmd = [RSYNC, "-r", "--dry-run", "-8", "--out-format=%n"]
+            cmd += push_filters(root, False)
+            result = subprocess.run(cmd + [f"{source}/", f"{dest}/"], capture_output=True, timeout=20)
+            if result.returncode != 0:
+                raise _include_refused(inc)
+            # Rsync escapes control bytes and literal escape-like names even with -8. Decode once,
+            # after splitting output records, so embedded newlines never become record separators.
+            return {os.fsdecode(re.sub(rb"\\#([0-7]{3})", lambda m: bytes([int(m[1], 8)]), name[:-1]))
+                    for name in result.stdout.split(b"\n") if name.endswith(b"/")}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise _include_refused(inc) from e
+
+
 def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
@@ -282,10 +315,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
                 parts = os.fsdecode(raw).split("/")
                 for i in range(1, len(parts)):
                     guarded.discard("/".join(parts[:i]))
-    for anc in sorted(ancestors - guarded):
-        # A whole-directory include already authorizes these siblings, even with redundant child includes.
-        if any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes):
-            continue
+    # A whole-directory include already authorizes these siblings, even with redundant child includes.
+    unchecked = {anc for anc in ancestors - guarded
+                 if not any(anc == i.strip("/") or anc.startswith(i.strip("/") + "/") for i in includes)}
+    visible = _visible_include_ancestors(root, unchecked, includes[0]) if unchecked else set()
+    for anc in sorted(unchecked):
         inc = next(i for i in includes if i.strip("/").startswith(anc + "/"))
         try:
             # Bypass the index to see ignored dirs with tracked descendants. No trailing slash: tmp/*
@@ -301,7 +335,7 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
             anc == pat or anc.endswith("/" + pat)
             for pat in SECRET_EXCLUDES + HEAVY_EXCLUDES if "/" in pat.rstrip("/")
         )
-        if p.returncode == 0 or excluded:
+        if p.returncode == 0 or excluded or anc not in visible:
             raise OffboxError(f"cannot sync --include {inc!r}: excluded ancestor {anc!r} contains tracked files; "
                               "offbox can't send only the named path there. Pass the script inline in argv or "
                               "with --step, or move it out of the excluded directory", code=2)

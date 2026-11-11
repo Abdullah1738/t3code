@@ -208,7 +208,7 @@ def test_git_inspection_failure_refuses_before_rsync(repo, command, failure):
     real_run = subprocess.run
 
     def fail(cmd, **kwargs):
-        assert cmd[0] != ssh_sync.RSYNC, "no transfer may start after an inspection failure"
+        assert cmd[0] != ssh_sync.RSYNC or "--dry-run" in cmd, "no transfer may start during inspection"
         if cmd[0] == "git" and (command in cmd or command == "tracked-check-ignore" and "--no-index" in cmd):
             if failure == "oserror":
                 raise OSError("synthetic git failure")
@@ -395,3 +395,113 @@ def test_parent_include_authorizes_excluded_descendant_with_tracked_files(unigno
     git(root, "add", "foo/tracked-readme.txt", "foo/.aws/other.txt")
     includes = ["foo", "foo/.aws/request.txt"] if directory_first else ["foo/.aws/request.txt", "foo"]
     assert sent(root, includes) == sent(root, ["foo"])
+
+
+RSYNC_IGNORE_CASES = (
+    (".gitignore", "tmp/*\n", "src/tmp/cards", True),
+    (".gitignore", "/tmp/*\n", "src/tmp/cards", False),
+    ("src/.gitignore", "tmp/*\n", "src/deep/tmp/cards", True),
+    ("src/.gitignore", "/tmp/*\n", "src/tmp/cards", True),
+    ("src/.gitignore", "/tmp/*\n", "src/deep/tmp/cards", False),
+    (".git/info/exclude", "tmp/*\n", "src/tmp/cards", True),
+    (".git/info/exclude", "/tmp/*\n", "src/tmp/cards", False),
+    (".gitignore", "**/tmp/*\n", "src/tmp/cards", True),
+    (".gitignore", "tmp/\n!tmp/\n", "src/tmp/cards", True),
+)
+
+
+@pytest.mark.parametrize("ignore_file,rule,directory,excluded", RSYNC_IGNORE_CASES)
+def test_effective_rsync_ignore_full_push(unignored_repo, ignore_file, rule, directory, excluded):
+    root = unignored_repo
+    write(root, ignore_file, rule)
+    included = f"{directory}/request.txt"
+    tracked = f"{directory}/tracked.txt"
+    unrequested = f"{directory}/unrequested-secret.txt"
+    for rel in (included, tracked, unrequested):
+        write(root, rel)
+    git(root, "add", "-f", tracked)
+    dest = root.parent / "remote"
+    real_run = subprocess.run
+
+    def local_transport(cmd, **kwargs):
+        if cmd[0] == ssh_sync.RSYNC:
+            cmd = [str(part).removeprefix("testbox:") for part in cmd]
+        return real_run(cmd, **kwargs)
+
+    with patch.object(ssh_sync.subprocess, "run", side_effect=local_transport), \
+            patch.object(ssh_sync, "log"), patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh")):
+        baseline = ssh_sync.push("testbox", root, str(dest))
+        assert (dest / tracked).exists()
+        assert (dest / unrequested).exists() is not excluded
+        if excluded:
+            assert baseline["tracked_ignored"] == 1
+            with pytest.raises(OffboxError) as refused:
+                ssh_sync.push("testbox", root, str(dest), includes=[included])
+            assert refused.value.code == 2
+            assert included in str(refused.value)
+            assert not (dest / included).exists()
+            assert not (dest / unrequested).exists()
+            args = cli.build_parser().parse_args(["run", "--include", included, "--", "echo", "ok"])
+            with patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+                    pytest.raises(OffboxError) as refused:
+                runs.run_remote(args, {"repo_root": str(root)})
+            assert refused.value.code == 2
+            database.assert_not_called()
+            acquire.assert_not_called()
+        else:
+            ssh_sync.push("testbox", root, str(dest), includes=[included])
+            assert (dest / included).exists()
+            assert (dest / unrequested).exists()
+
+
+@pytest.mark.parametrize("failure", ("oserror", "timeout", "rc23", "ignore-read"))
+def test_effective_filter_probe_fails_closed_before_allocation(unignored_repo, failure):
+    root = unignored_repo
+    write(root, "src/tracked.txt")
+    write(root, "src/request.txt")
+    write(root, ".gitignore", "")
+    git(root, "add", "src/tracked.txt")
+    args = cli.build_parser().parse_args(["run", "--include", "src/request.txt", "--", "echo", "ok"])
+    real_run = subprocess.run
+    real_copy = ssh_sync.shutil.copyfile
+
+    def fail(cmd, **kwargs):
+        if cmd[0] == ssh_sync.RSYNC:
+            assert "--dry-run" in cmd and not any("testbox:" in str(p) for p in cmd)
+            if failure == "oserror":
+                raise OSError("synthetic rsync failure")
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            if failure == "rc23":
+                return subprocess.CompletedProcess(cmd, 23, b"", b"synthetic rsync failure")
+        return real_run(cmd, **kwargs)
+
+    def copy(source, dest):
+        if failure == "ignore-read":
+            raise PermissionError("synthetic unreadable ignore file")
+        return real_copy(source, dest)
+
+    with patch.object(ssh_sync.subprocess, "run", side_effect=fail), \
+            patch.object(ssh_sync.shutil, "copyfile", side_effect=copy), \
+            patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+            pytest.raises(OffboxError) as refused:
+        runs.run_remote(args, {"repo_root": str(root)})
+    assert refused.value.code == 2
+    assert "src/request.txt" in str(refused.value)
+    assert "couldn't tell what else sits beside it" in str(refused.value)
+    database.assert_not_called()
+    acquire.assert_not_called()
+
+
+@pytest.mark.parametrize("name", (
+    "line\nname", "carriage\rname", "tab\tname", "backslash\\name",
+    "escape\\#012name", "escape\\#134name", "café", "space name",
+))
+def test_effective_filter_probe_preserves_filename_bytes(unignored_repo, name):
+    root = unignored_repo
+    directory = f"src/{name}"
+    write(root, f"{directory}/tracked.txt")
+    write(root, f"{directory}/request.txt")
+    git(root, "add", f"{directory}/tracked.txt")
+    assert directory in ssh_sync._visible_include_ancestors(root, {directory}, f"{directory}/request.txt")
+    assert ssh_sync.push_filters(root, False, [f"{directory}/request.txt"])
