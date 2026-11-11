@@ -7,6 +7,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  ASK_FEEDS_KEPT,
   ASK_UNREADABLE_TEXT,
   AskApiError,
   askUnreadableCard,
@@ -591,6 +592,29 @@ describe("what the server sent is read through the apps' read schemas", () => {
       expect(changed.open).toHaveLength(1);
       expect(changed.unreadable).toBeUndefined();
       expect(changed.open[0]).toBe(first.open[0]);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("keeps a feed whole for a few windows only: the one used longest ago is dropped", async () => {
+    const { api } = harness(() => json(200, wireFeed([wireItem(1)])));
+    const windows = Array.from({ length: ASK_FEEDS_KEPT + 2 }, (_, index) => `${index + 1}d`);
+    for (const closed of windows) await api.feed({ closed });
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      // The last ones asked for are still kept: the same text again is not parsed.
+      for (const closed of windows.slice(-ASK_FEEDS_KEPT)) await api.feed({ closed });
+      expect(parse).not.toHaveBeenCalled();
+      // The first two were dropped to make room: they are read again, and nothing breaks.
+      const again = await api.feed({ closed: windows[0]! });
+      expect(parse).toHaveBeenCalledTimes(1);
+      expect(again.open).toHaveLength(1);
+      // Reading it again took the place of the one used longest ago, not of a recent one.
+      await api.feed({ closed: windows.at(-1)! });
+      expect(parse).toHaveBeenCalledTimes(1);
+      await api.feed({ closed: windows[2]! });
+      expect(parse).toHaveBeenCalledTimes(2);
     } finally {
       parse.mockRestore();
     }

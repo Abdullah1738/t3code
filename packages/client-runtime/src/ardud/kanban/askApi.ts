@@ -309,6 +309,13 @@ export interface AskApi {
   readonly message: (discussionId: string, seq: number) => Promise<KanbanMessage>;
 }
 
+/**
+ * How many feeds are kept whole for the unchanged-poll shortcut, one per
+ * `closed` window asked for. Two are asked for today; the bound keeps it from
+ * growing if more are ever added.
+ */
+export const ASK_FEEDS_KEPT = 4;
+
 /** Said when a read came back as JSON this build can't take in. */
 export const ASK_UNREADABLE_TEXT =
   "Robob sent asks this app can't read. The app may be older than Robob: update it and try again.";
@@ -431,8 +438,21 @@ export function createAskApi(host: AskApiHost): AskApi {
   let lastItems = new Map<string, KanbanAskFeedItem | AskUnreadable>();
   // The last feed whole, by its text after the time it was made. A poll that
   // brings the same asks again is not parsed at all: it is the last feed with
-  // the new time. One per window asked for (the queue's read and History's).
+  // the new time. One per window asked for (the queue's read and History's),
+  // and never more than `ASK_FEEDS_KEPT`: the window used longest ago goes first.
   const lastFeeds = new Map<string, { readonly rest: string; readonly feed: AskFeedRead }>();
+  const keepFeed = (
+    window: string,
+    last: { readonly rest: string; readonly feed: AskFeedRead },
+  ) => {
+    // Set again at the end, so the map's order is the order of use.
+    lastFeeds.delete(window);
+    lastFeeds.set(window, last);
+    for (const oldest of Array.from(lastFeeds.keys())) {
+      if (lastFeeds.size <= ASK_FEEDS_KEPT) break;
+      lastFeeds.delete(oldest);
+    }
+  };
   const FEED_TIME = /^\{"at":"([^"\\]*)",/;
   const splitFeed = (text: string): { readonly at: string; readonly rest: string } | null => {
     const made = FEED_TIME.exec(text);
@@ -492,6 +512,7 @@ export function createAskApi(host: AskApiHost): AskApi {
               return false;
             }
             seen.same = { ...last.feed, at: seen.parts.at as KanbanAskFeed["at"] };
+            keepFeed(window, last);
             return true;
           },
         },
@@ -500,7 +521,7 @@ export function createAskApi(host: AskApiHost): AskApi {
       // A feed that does not read is forgotten here too, so it is never reused.
       lastFeeds.delete(window);
       const feed = readFeed(answer);
-      if (seen.parts !== null) lastFeeds.set(window, { rest: seen.parts.rest, feed });
+      if (seen.parts !== null) keepFeed(window, { rest: seen.parts.rest, feed });
       return feed;
     },
     detail: async (cardRef, askId) =>
