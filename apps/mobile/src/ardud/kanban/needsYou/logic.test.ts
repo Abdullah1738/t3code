@@ -214,8 +214,12 @@ describe("one ask", () => {
   it("names a link's site and what a file field takes", () => {
     expect(stepWebLink("https://www.appstoreconnect.apple.com/agreements")).toEqual({
       url: "https://www.appstoreconnect.apple.com/agreements",
-      host: "appstoreconnect.apple.com",
+      host: "www.appstoreconnect.apple.com",
     });
+    // The site is named whole, with a port that is not the usual one.
+    expect(stepWebLink("https://staging.example.com:8443/review")?.host).toBe(
+      "staging.example.com:8443",
+    );
     // Only a web address is a link: nothing else an agent writes there can be opened.
     expect(stepWebLink("not a link")).toBeNull();
     expect(stepWebLink("robob://needs-you/history")).toBeNull();

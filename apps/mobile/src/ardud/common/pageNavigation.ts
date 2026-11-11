@@ -32,7 +32,12 @@ const schemeOf = (url: string): string | null =>
 export interface WebLink {
   /** The address as the parser wrote it back. This, and nothing else, is what opens. */
   readonly url: string;
-  /** The site it leads to, without a leading "www.": "example.com". */
+  /**
+   * The site it leads to, whole, as the parser wrote it: every label of the
+   * host, and the port when it is not the scheme's own ("example.com",
+   * "www.example.com:8443"). Shown whole wherever it is shown: the end of a
+   * host is what says whose site it is, so it is never cut off.
+   */
   readonly host: string;
 }
 
@@ -61,7 +66,9 @@ export function parseWebLink(raw: string | undefined): WebLink | null {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   if (parsed.username !== "" || parsed.password !== "" || parsed.hostname === "") return null;
-  return { url: parsed.href, host: parsed.hostname.replace(/^www\./i, "") };
+  // The parser leaves the port empty when it is the scheme's default.
+  const host = parsed.port === "" ? parsed.hostname : `${parsed.hostname}:${parsed.port}`;
+  return { url: parsed.href, host };
 }
 
 export function pageNavigation(request: {

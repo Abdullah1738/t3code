@@ -131,6 +131,11 @@ carries a token the page cannot read, and the app drops anything without it. A t
 never loads: it is shown under the page (`PageLinkOffer`, "Open example.com") and opens only
 on his tap there. The page is given the theme and nothing else.
 
+Wherever a site is named before it opens (that row, and a task step's link), the name is the
+whole host as the parser read it, plus the port when it is not the scheme's own, on as many
+lines as it takes. It is never cut to one line: the end of a host says whose site it is, and
+a long name with a trusted start would otherwise hide it. "www." is not taken off either.
+
 The app's own answer to a navigation (`ardud/common/pageNavigation.ts`) stays as the second
 layer: the shell and frames of the page's own text load, a web address for the WebView itself
 is offered, and everything else is refused, the app's own scheme first of all. The origin

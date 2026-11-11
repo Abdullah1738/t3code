@@ -73,7 +73,7 @@ describe("where a page inside the app may go", () => {
   it("names the site the address really opens, from one reading of it", () => {
     expect(parseWebLink("  HTTPS://WWW.Example.COM/Path?q=1#top ")).toEqual({
       url: "https://www.example.com/Path?q=1#top",
-      host: "example.com",
+      host: "www.example.com",
     });
     // What is offered for a page's link is that same reading.
     expect(pageNavigation({ url: "HTTPS://Example.com", isTopFrame: true })).toEqual({
@@ -82,6 +82,29 @@ describe("where a page inside the app may go", () => {
     });
     // A name in another script is shown as the parser resolves it, not as it was drawn.
     expect(parseWebLink("https://\u0430pple.com/")?.host).toBe("xn--pple-43d.com");
+  });
+
+  it("names the whole site: every label of the host, and a port that is not the usual one", () => {
+    // A long name is not cut: its end is what says whose site it is.
+    const long = `trusted.example.${"account-security-check.".repeat(6)}attacker.test`;
+    expect(parseWebLink(`https://${long}/login`)?.host).toBe(long);
+    expect(parseWebLink(`https://${long}/login`)?.host.endsWith(".attacker.test")).toBe(true);
+    // Nothing is taken off the front either: "www." is part of the name.
+    expect(parseWebLink("https://www.example.com/")?.host).toBe("www.example.com");
+    // A port the scheme does not imply is part of where it leads.
+    expect(parseWebLink("https://example.com:8443/x")?.host).toBe("example.com:8443");
+    expect(parseWebLink("http://example.com:8080")?.host).toBe("example.com:8080");
+    expect(parseWebLink("https://example.com:80/")?.host).toBe("example.com:80");
+    expect(parseWebLink("http://example.com:443/")?.host).toBe("example.com:443");
+    // The scheme's own port says nothing more, and the parser drops it.
+    expect(parseWebLink("https://example.com:443/x")).toEqual({
+      url: "https://example.com/x",
+      host: "example.com",
+    });
+    expect(parseWebLink("http://example.com:80/")?.host).toBe("example.com");
+    // A number for a site is shown as the number it is, with its port.
+    expect(parseWebLink("http://192.168.1.10:3000/")?.host).toBe("192.168.1.10:3000");
+    expect(parseWebLink("http://[::1]:3000/")?.host).toBe("[::1]:3000");
   });
 
   it("refuses an address that names one site and opens another", () => {

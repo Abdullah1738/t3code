@@ -307,7 +307,7 @@ export function TaskSteps(props: {
                 accessibilityRole="link"
                 accessibilityLabel={`Open ${link.host}`}
                 onPress={() => void tryOpenExternalUrl(link.url, "markdown-link")}
-                className="ml-[34px] min-h-11 flex-row items-center gap-1.5 self-start"
+                className="ml-[34px] min-h-11 max-w-full flex-row items-center gap-1.5 self-start py-1.5"
               >
                 <SymbolView
                   name="arrow.up.right"
@@ -315,7 +315,10 @@ export function TaskSteps(props: {
                   tintColorClassName="accent-primary-text"
                   type="monochrome"
                 />
-                <Text className="text-sm font-t3-medium text-primary-text">Open {link.host}</Text>
+                {/* The whole host, wrapped if it is long: never cut at its end. */}
+                <Text className="min-w-0 shrink text-sm font-t3-medium text-primary-text">
+                  Open {link.host}
+                </Text>
               </Pressable>
             ) : step.link ? (
               // Not a web address: shown as it is written, and it opens nothing.

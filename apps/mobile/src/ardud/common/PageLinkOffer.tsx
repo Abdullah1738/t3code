@@ -27,17 +27,19 @@ export function PageLinkOffer(props: { readonly url: string; readonly onDone: ()
           props.onDone();
           void tryOpenExternalUrl(link.url, "html-render");
         }}
-        className="min-h-11 min-w-0 flex-1 flex-row items-center gap-2 px-3.5 py-2 active:opacity-70"
+        className="min-h-11 min-w-0 flex-1 flex-row items-start gap-2 px-3.5 py-3 active:opacity-70"
       >
-        <SymbolView
-          name="arrow.up.right"
-          size={12}
-          tintColorClassName="accent-primary-text"
-          type="monochrome"
-        />
-        <Text numberOfLines={1} className="min-w-0 flex-1 text-sm font-t3-medium text-primary-text">
-          Open {host}
-        </Text>
+        {/* As tall as one line of the label, so the arrow sits on its first line. */}
+        <View className="h-5 justify-center">
+          <SymbolView
+            name="arrow.up.right"
+            size={12}
+            tintColorClassName="accent-primary-text"
+            type="monochrome"
+          />
+        </View>
+        {/* The whole host, on as many lines as it takes: its end says whose site it is. */}
+        <Text className="min-w-0 flex-1 text-sm font-t3-medium text-primary-text">Open {host}</Text>
       </Pressable>
       <Pressable
         accessibilityRole="button"
