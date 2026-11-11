@@ -298,6 +298,20 @@ describe("what a screen still holds after the server changed", () => {
     expect(order).toHaveLength(3);
   });
 
+  it("every screen that holds a secret is cleared, the sample page's too", () => {
+    const h = harness();
+    // An ask with a secret field, and the reference page's sample secret under it.
+    const held = { ask: "s3cr3t", sample: "hunter2" };
+    h.scopes.holdSecrets(() => {
+      held.ask = "";
+    });
+    h.scopes.holdSecrets(() => {
+      held.sample = "";
+    });
+    h.pair("B");
+    expect(held).toEqual({ ask: "", sample: "" });
+  });
+
   it("the same server signalled again changes nothing", async () => {
     const h = harness();
     const a = h.scopes.current();

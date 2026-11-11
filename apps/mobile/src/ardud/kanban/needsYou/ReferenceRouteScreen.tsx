@@ -21,7 +21,7 @@ import {
   type AskReferenceMatch,
 } from "@t3tools/client-runtime/ardud/kanban";
 import { kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../../components/ui/AppText";
@@ -31,7 +31,7 @@ import { OptionList, TaskSteps } from "./AnswerParts";
 import { AskHtml } from "./AskBlocks";
 import { FieldRow } from "./AskFields";
 import { ActionDetails, ChangeViewer, DraftPart } from "./AskParts";
-import { useAsk } from "./askStore";
+import { useAsk, useAskScope, useAskSecretsHeld } from "./askStore";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
 import { BarButton, Label } from "./ui";
@@ -114,6 +114,9 @@ function FillSample() {
   const form = useSampleForm(SAMPLE_FILL);
   // A sample secret lives here only, like a real one lives in its reader only.
   const [secret, setSecret] = useState("");
+  // Typed for a sample, but held like a real one: cleared first when the server changes.
+  const dropSecret = useCallback(() => setSecret(""), []);
+  useAskSecretsHeld(dropSecret);
   return (
     <View className="gap-4">
       {kanbanAskResponse(SAMPLE_FILL.ask).fields.map((entry) => (
@@ -180,6 +183,12 @@ function SeeOne(props: {
 }
 
 export function ReferenceRouteScreen() {
+  // A new server starts the page over: what was typed into its samples goes with the old one.
+  const { serial } = useAskScope();
+  return <Reference key={serial} />;
+}
+
+function Reference() {
   const nav = useNeedsYouNav();
   const bottomInset = useBottomInset();
   const open = useAsk((state) => state.feed?.open);
