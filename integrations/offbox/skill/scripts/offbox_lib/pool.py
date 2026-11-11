@@ -5,16 +5,19 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import sqlite3
+import traceback
 import time
 
 from . import capacity
-from .common import (DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
-                     now, say)
+from .common import (DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
+                     now, say, busy, db_retry, local_error, log, write)
 from .identity import remote_dir_for
 
 WAIT_DEFAULT_S = 600
 WAIT_MAX_S = 1200
 PROGRESS_EVERY_S = 60
+POLL_BUSY_MS = 100
 # A create slot is claimed under the pool lock and the box is made after it. A slot whose process died is dropped at
 # once; the age bound only covers a reused pid (a recipe bring-up can take ~30 min).
 PENDING_MAX_S = 3600
@@ -82,8 +85,8 @@ def _pending(con, key) -> int:
         if now() - r["created_at"] < PENDING_MAX_S and _alive(r["pid"]):
             n += 1
         else:
-            con.execute("DELETE FROM pool_pending WHERE token=?", (r["token"],))
-            con.commit()
+            with write(con):
+                con.execute("DELETE FROM pool_pending WHERE token=?", (r["token"],))
     return n
 
 
@@ -160,12 +163,60 @@ def candidates(con, key, size, source, me=None):
     return out, not full
 
 
+class _QueuePoll:
+    def __init__(self, con, wait, run_id):
+        self.con, self.run_id = con, run_id
+        self.deadline = time.monotonic() + wait
+
+    def call(self, operation):
+        # Only DB polling/selection uses this budget, never a machine start or a remote command.
+        timeout = self.con.execute('PRAGMA busy_timeout').fetchone()[0]
+        try:
+            while True:
+                self.con.execute(f'PRAGMA busy_timeout={POLL_BUSY_MS}')
+                try:
+                    return operation()
+                except sqlite3.OperationalError as error:
+                    if not busy(error):
+                        raise
+                    self.con.rollback()
+                    log(f"pool queue {self.run_id or '-'} poll failed:\n" + traceback.format_exc())
+                    left = self.deadline - time.monotonic()
+                    if left <= 0:
+                        raise local_error(error, run_id=self.run_id) from error
+                    say(f"{self.run_id or 'pool queue'}: local state DB busy; still queued, retrying next poll")
+                    time.sleep(min(2, left))
+                    if time.monotonic() >= self.deadline:
+                        raise local_error(error, run_id=self.run_id) from error
+        finally:
+            self.con.execute(f'PRAGMA busy_timeout={timeout}')
+
+
+def _clear_queue_rows(con, me, run_id):
+    def clear():
+        with write(con):
+            con.execute('DELETE FROM pool_pending WHERE pool_key=? AND pid=?', (me['repo_key'], os.getpid()))
+            # A parallel run by the same owner may have claimed this checkout meanwhile.
+            con.execute("DELETE FROM pool_callers WHERE owner=? AND repo_root=? AND NOT EXISTS "
+                        "(SELECT 1 FROM runs WHERE owner=? AND repo_root=? AND run_id<>? "
+                        "AND box_id IS NOT NULL AND status IN ('starting','running'))",
+                        (me['owner'], me['repo_root'], me['owner'], me['repo_root'], run_id or ''))
+    db_retry(clear)
+
+
 def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None):
     from . import allocation
     con = db()
     try:
         with allocation.scope(me['repo_key']):
             return _acquire(con, me, size, template, base, fresh, run_id)
+    except (sqlite3.Error, OffboxError) as error:
+        if isinstance(error, sqlite3.Error) or error.code == EXIT_LOCAL:
+            log(f"pool queue {run_id or '-'} failed:\n" + traceback.format_exc())
+            _clear_queue_rows(con, me, run_id)
+            if isinstance(error, sqlite3.Error):
+                raise local_error(error, run_id=run_id) from error
+        raise
     finally:
         con.close()
 
@@ -176,17 +227,18 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
     require_proven(me, "run")
     lease.cap_check()
-    capacity.schema(con)
-    key = me["repo_key"]
-    allocation.recover_resumes(con, key)
-    source = ("fresh" if fresh else f"base:{base if ':' in base else key+':'+base}" if base else
-              f"template:{template}" if template else None)
     wait = wait_seconds()
     allocation_left = outage.allocation_left()
     if allocation_left is not None:
         wait = min(wait, allocation_left)
-    started = time.monotonic()
-    deadline = started + wait
+    poll = _QueuePoll(con, wait, run_id)
+    poll.call(lambda: capacity.schema(con))
+    key = me["repo_key"]
+    poll.call(lambda: allocation.recover_resumes(con, key))
+    source = ("fresh" if fresh else f"base:{base if ':' in base else key+':'+base}" if base else
+              f"template:{template}" if template else None)
+    started = poll.deadline - wait
+    deadline = poll.deadline
     said, last_error = False, None
     next_refresh = 0
     next_progress = 0
@@ -255,86 +307,95 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             # The pool lock covers only the choice: a box (its box lock taken without waiting) or a create slot.
             # The resume or create runs after it is released, so one slow boat call never holds up other callers
             # (31 Oct: a 900 s resume under this lock failed every other edge-api run with exit 90).
-            row = guard = token = None
-            with _pool_lock(key, deadline, wait):
-                rows, can_create = candidates(con, key, size, source, me)
-                if create_first:
-                    # Retain unanswered markers on excluded boxes, without letting them block a replacement.
-                    siblings, _ = candidates(con, key, None, None, me)
-                    for sibling in siblings:
-                        pending_sibling = con.execute("SELECT 1 FROM kv WHERE k=?",
-                                                     (f"resume_unanswered:{sibling['box_id']}",)).fetchone()
-                        if sibling['state'] == 'stopped' or pending_sibling:
-                            con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
-                                        ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
-                    con.commit()
-                    rows, can_create = [], True
-                pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
-                                      "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
-                                      "AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
-                if pending:
-                    raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
-                                                 "retry once it has been checked; nothing ran")
-                if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
-                    # Replaying the retained key resolves the old allocation; it is not a new pool slot.
-                    rows, can_create = [], True
-                if source and not rows and not can_create and not _source_member(con, key, source):
-                    busy, cap, _ = queue_state(con, key, run_id)
-                    raise OffboxError(
-                        f"this run needs a new {key} pool box ({source}), but the pool is full "
-                        f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
-                        "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
-                        "offbox list --all, then offbox release <id> --delete.", code=2)
-                for r in rows:
-                    if r["box_id"] in tried:
-                        continue
-                    if r['state'] != 'running':
-                        # After a failed resume, try every eligible stopped box before creating a new one.
-                        if stopped_tries == 1 and not stopped_failed:
-                            continue
-                        # boat has no machines of the size this box would resume at: not a try, nothing to wait on.
-                        fit_size = lease.resume_size(con, r, size)
-                        if lease.supply_size(fit_size, size or "large") is None:
-                            last_error = api.SupplyOut(fit_size, r["box_id"],
-                                                       f"supply for size {fit_size} is over", tried=False)
-                            continue
-                        try:
-                            capacity.check(con)
-                        except capacity.CapacityError as e:
-                            if capacity_outage is not None:
-                                raise
-                            start_limit = e
-                            last_error = e
-                            continue
-                    g = file_lock("box-"+r["box_id"], timeout=0)
-                    try:
-                        g.__enter__()
-                    except OffboxError:
-                        continue
-                    if lease.active_runs(con, r["box_id"]):
-                        g.__exit__(None, None, None)
-                        continue
-                    row, guard = r, g
-                    # Counted as a member from now on, so a creator can't overfill the pool while this resumes.
-                    con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (r["box_id"], key))
-                    con.commit()
-                    break
-                if outage.allocation_left() == 0:
+            def select():
+                nonlocal last_error, start_limit
+                row = guard = token = None
+                try:
+                    with _pool_lock(key, deadline, wait):
+                        rows, can_create = candidates(con, key, size, source, me)
+                        if create_first:
+                            # Retain unanswered markers on excluded boxes, without letting them block a replacement.
+                            siblings, _ = candidates(con, key, None, None, me)
+                            for sibling in siblings:
+                                pending_sibling = con.execute("SELECT 1 FROM kv WHERE k=?",
+                                                             (f"resume_unanswered:{sibling['box_id']}",)).fetchone()
+                                if sibling['state'] == 'stopped' or pending_sibling:
+                                    con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
+                                                ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
+                            con.commit()
+                            rows, can_create = [], True
+                        pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
+                                              "ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? "
+                                              "AND l.state IN ('running','stopped') LIMIT 1", (key,)).fetchone()
+                        if pending:
+                            raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
+                                                         "retry once it has been checked; nothing ran")
+                        if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
+                            # Replaying the retained key resolves the old allocation; it is not a new pool slot.
+                            rows, can_create = [], True
+                        if source and not rows and not can_create and not _source_member(con, key, source):
+                            busy, cap, _ = queue_state(con, key, run_id)
+                            raise OffboxError(
+                                f"this run needs a new {key} pool box ({source}), but the pool is full "
+                                f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
+                                "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
+                                "offbox list --all, then offbox release <id> --delete.", code=2)
+                        for r in rows:
+                            if r["box_id"] in tried:
+                                continue
+                            if r['state'] != 'running':
+                                # After a failed resume, try every eligible stopped box before creating a new one.
+                                if stopped_tries == 1 and not stopped_failed:
+                                    continue
+                                # boat has no machines of the size this box would resume at: not a try, nothing to wait on.
+                                fit_size = lease.resume_size(con, r, size)
+                                if lease.supply_size(fit_size, size or "large") is None:
+                                    last_error = api.SupplyOut(fit_size, r["box_id"],
+                                                               f"supply for size {fit_size} is over", tried=False)
+                                    continue
+                                try:
+                                    capacity.check(con)
+                                except capacity.CapacityError as e:
+                                    if capacity_outage is not None:
+                                        raise
+                                    start_limit = e
+                                    last_error = e
+                                    continue
+                            g = file_lock("box-"+r["box_id"], timeout=0)
+                            try:
+                                g.__enter__()
+                            except OffboxError:
+                                continue
+                            guard = g
+                            if lease.active_runs(con, r["box_id"]):
+                                guard.__exit__(None, None, None)
+                                guard = None
+                                continue
+                            row = r
+                            # Counted as a member from now on, so a creator can't overfill the pool while this resumes.
+                            con.execute("INSERT OR REPLACE INTO pool_members VALUES (?,?)", (r["box_id"], key))
+                            con.commit()
+                            break
+                        if outage.allocation_left() == 0:
+                            raise PoolBusyError("allocation wait expired; nothing ran")
+                        if row is None and can_create:
+                            try:
+                                capacity.check(con)
+                                token = new_id("create")
+                                con.execute("INSERT INTO pool_pending VALUES (?,?,?,?,?)",
+                                            (token, key, os.getpid(), now(), source))
+                                con.commit()
+                            except capacity.CapacityError as e:
+                                if capacity_outage is not None:
+                                    raise
+                                start_limit = e
+                                last_error = e
+                    return row, guard, token, can_create
+                except BaseException:
                     if guard is not None:
                         guard.__exit__(None, None, None)
-                    raise PoolBusyError("allocation wait expired; nothing ran")
-                if row is None and can_create:
-                    try:
-                        capacity.check(con)
-                        token = new_id("create")
-                        con.execute("INSERT INTO pool_pending VALUES (?,?,?,?,?)",
-                                    (token, key, os.getpid(), now(), source))
-                        con.commit()
-                    except capacity.CapacityError as e:
-                        if capacity_outage is not None:
-                            raise
-                        start_limit = e
-                        last_error = e
+                    raise
+            row, guard, token, can_create = poll.call(select)
             if row is not None:
                 tried.add(row["box_id"])
                 try:
@@ -467,14 +528,14 @@ def _acquire(con, me, size, template, base, fresh, run_id):
         if t >= deadline:
             if last_error:
                 raise last_error
-            busy, cap, waiting = queue_state(con, key, run_id)
+            busy, cap, waiting = poll.call(lambda: queue_state(con, key, run_id))
             raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} boxes stayed busy for "
                                 f"{int(t-started)}s; remote queue timed out. Nothing ran (exit {EXIT_BUSY}, not an "
                                 f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})")
         if isinstance(last_error, api.BoatAtCapacity):
             raise last_error
         if t >= next_progress:
-            busy, cap, waiting = queue_state(con, key, run_id)
+            busy, cap, waiting = poll.call(lambda: queue_state(con, key, run_id))
             if not said:
                 say(f"queued for a {key} pool box: {busy}/{cap} busy, {waiting} other caller(s) waiting; "
                     f"will wait up to {wait}s" + (f" ({last_error})" if last_error else "") +

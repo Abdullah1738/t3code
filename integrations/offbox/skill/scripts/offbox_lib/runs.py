@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import traceback
 import time
 from pathlib import Path
 
@@ -1302,6 +1303,7 @@ def run_remote(a, me: dict) -> int:
             finish(rn.run_id, 130, 'killed')
         raise
     except sqlite3.Error as error:
+        log("remote runner local state failure:\n" + traceback.format_exc())
         if rn.remote_code is not None:
             finish(rn.run_id, rn.remote_code)
             state_warning(rn.run_id, rn.remote_code, error)
@@ -1343,7 +1345,10 @@ def _run_remote(a, rn) -> int:
             rn.start()
         except OffboxError as e:
             if not rn.started:
-                finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
+                if e.code == EXIT_LOCAL:
+                    finish(rn.run_id, EXIT_LOCAL, "local_error")
+                else:
+                    finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
             rn.record(error=str(e)[:500])
             raise
         if a.bg:
