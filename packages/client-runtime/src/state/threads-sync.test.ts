@@ -52,6 +52,7 @@ import {
   type ThreadSnapshotLoadResult,
 } from "./threads.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
+import { THREAD_NOT_FOUND_GRACE_MS, threadNotFoundRetryDelayMs } from "./threadRetention.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -119,6 +120,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     readonly latestLocalTurnOrdinal?: number | null;
   };
   readonly httpSnapshot?: ThreadSnapshotLoadResult;
+  /** Per-call loader result (1-based call number); overrides httpSnapshot. */
+  readonly httpSnapshots?: (call: number) => ThreadSnapshotLoadResult;
+  readonly presence?: Stream.Stream<boolean>;
   readonly completionMarker?: boolean;
   readonly resumeCache?: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]>;
   readonly loadCached?: ReturnType<Persistence.EnvironmentCacheStore["Service"]["loadThread"]>;
@@ -176,11 +180,12 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   );
   const snapshotLoader = ThreadSnapshotLoader.ThreadSnapshotLoader.of({
     load: (_prepared, threadId) =>
-      Ref.update(loaderCalls, (count) => count + 1).pipe(
-        Effect.as(
+      Ref.updateAndGet(loaderCalls, (count) => count + 1).pipe(
+        Effect.map((call) =>
           threadId === THREAD_ID
-            ? (options?.httpSnapshot ??
-                ({ _tag: "unavailable" } satisfies ThreadSnapshotLoadResult))
+            ? (options?.httpSnapshots?.(call) ??
+              options?.httpSnapshot ??
+              ({ _tag: "unavailable" } satisfies ThreadSnapshotLoadResult))
             : ({ _tag: "unavailable" } satisfies ThreadSnapshotLoadResult),
         ),
       ),
@@ -232,7 +237,11 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     clearVcsRefs: () => Effect.void,
     clear: () => Effect.void,
   });
-  let makeThreadState = makeEnvironmentThreadState(THREAD_ID, options?.resumeCache).pipe(
+  let makeThreadState = makeEnvironmentThreadState(
+    THREAD_ID,
+    options?.resumeCache,
+    options?.presence === undefined ? undefined : { presence: options.presence },
+  ).pipe(
     Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
     Effect.provideService(Persistence.EnvironmentCacheStore, cache),
     Effect.provideService(ThreadSnapshotLoader.ThreadSnapshotLoader, snapshotLoader),
@@ -2172,36 +2181,213 @@ describe("EnvironmentThreads", () => {
     }),
   );
 
-  it.effect("marks a cold definitive HTTP miss deleted without socket subscribe or retry", () =>
+  it.effect("loads a thread that was missing for a moment (creation race)", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
+        httpSnapshots: (call) =>
+          call <= 2
+            ? { _tag: "missing" }
+            : {
+                _tag: "present",
+                snapshot: { snapshotSequence: 4, projection: BASE_PROJECTION },
+              },
+      });
+      const statuses: Array<EnvironmentThreadState["status"]> = [];
+      let state = yield* Ref.get(harness.latest);
+      for (let step = 0; step < 40 && state.status !== "live"; step += 1) {
+        yield* TestClock.adjust("250 millis");
+        for (let attempt = 0; attempt < 5; attempt += 1) yield* Effect.yieldNow;
+        state = yield* Ref.get(harness.latest);
+        statuses.push(state.status);
+      }
+
+      expect(state.status).toBe("live");
+      expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+      expect(statuses).not.toContain("deleted");
+      expect(statuses).not.toContain("not-found");
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(3);
+      expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(4);
+    }),
+  );
+
+  const advance = (duration: Parameters<typeof TestClock.adjust>[0], times = 1) =>
+    Effect.gen(function* () {
+      for (let step = 0; step < times; step += 1) {
+        yield* TestClock.adjust(duration);
+        for (let attempt = 0; attempt < 5; attempt += 1) yield* Effect.yieldNow;
+      }
+    });
+
+  it.effect(
+    "shows not-found (not deleted) after the grace window, then loads when the shell lists it",
+    () =>
+      Effect.gen(function* () {
+        let serverHasThread = false;
+        const presence = yield* SubscriptionRef.make(false);
+        const harness = yield* makeHarness({
+          presence: SubscriptionRef.changes(presence),
+          httpSnapshots: () =>
+            serverHasThread
+              ? {
+                  _tag: "present",
+                  snapshot: { snapshotSequence: 5, projection: BASE_PROJECTION },
+                }
+              : { _tag: "missing" },
+        });
+
+        yield* advance("1 second", 20);
+        const missed = yield* Ref.get(harness.latest);
+        expect(missed.status).toBe("not-found");
+        expect(Option.isNone(missed.data)).toBe(true);
+        expect(yield* Ref.get(harness.removedThreads)).toEqual([]);
+        expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
+        const callsAtMiss = yield* Ref.get(harness.loaderCalls);
+        expect(callsAtMiss).toBeGreaterThan(2);
+
+        // Parked: no polling while not-found.
+        yield* advance("30 seconds");
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(callsAtMiss);
+
+        serverHasThread = true;
+        yield* SubscriptionRef.set(presence, true);
+        const state = yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+        expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(callsAtMiss + 1);
+        expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      }),
+  );
+
+  it.effect("does not reload when the shell already listed a thread the server cannot find", () =>
+    Effect.gen(function* () {
+      const presence = yield* SubscriptionRef.make(true);
+      const harness = yield* makeHarness({
+        presence: SubscriptionRef.changes(presence),
         httpSnapshot: { _tag: "missing" },
       });
+      yield* advance("1 second", 20);
+      expect((yield* Ref.get(harness.latest)).status).toBe("not-found");
+      const callsAtMiss = yield* Ref.get(harness.loaderCalls);
+      yield* SubscriptionRef.set(presence, true);
+      yield* advance("5 seconds");
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(callsAtMiss);
+    }),
+  );
 
+  // The loader call that parks: the first miss at or past the grace window.
+  const finalGraceCall = (() => {
+    let elapsed = 0;
+    let call = 1;
+    while (elapsed < THREAD_NOT_FOUND_GRACE_MS) {
+      elapsed += threadNotFoundRetryDelayMs(call);
+      call += 1;
+    }
+    return call;
+  })();
+
+  it.effect(
+    "loads a thread the shell lists right after the last read of the grace window missed it",
+    () =>
+      Effect.gen(function* () {
+        // 11 Nov 2026 review: the final read misses, creation commits and the
+        // shell lists the thread before the miss parks. Presence was only
+        // watched after parking, and an initial "present" was dropped, so the
+        // thread stayed not-found until a manual retry.
+        let serverHasThread = false;
+        const presence = yield* Queue.unbounded<boolean>();
+        Queue.offerUnsafe(presence, false);
+        const harness = yield* makeHarness({
+          presence: Stream.fromQueue(presence),
+          httpSnapshots: (call) => {
+            if (serverHasThread) {
+              return {
+                _tag: "present",
+                snapshot: { snapshotSequence: 7, projection: BASE_PROJECTION },
+              };
+            }
+            if (call === finalGraceCall) {
+              serverHasThread = true;
+              Queue.offerUnsafe(presence, true);
+            }
+            return { _tag: "missing" };
+          },
+        });
+        yield* advance("1 second", 20);
+        const state = yield* Ref.get(harness.latest);
+        expect(state.status).toBe("live");
+        expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+        expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+      }),
+  );
+
+  it.effect("a shell that keeps listing a missing thread costs one retry, not a loop", () =>
+    Effect.gen(function* () {
+      const presence = yield* SubscriptionRef.make(true);
+      const harness = yield* makeHarness({
+        presence: SubscriptionRef.changes(presence),
+        httpSnapshot: { _tag: "missing" },
+      });
+      yield* advance("1 second", 20);
+      expect((yield* Ref.get(harness.latest)).status).toBe("not-found");
+      // One read past the grace window for the already-present thread, then parked.
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+      yield* advance("10 seconds", 6);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(finalGraceCall + 1);
+      // A new absent -> present transition is a new generation: one more read.
+      yield* SubscriptionRef.set(presence, false);
+      yield* SubscriptionRef.set(presence, true);
+      yield* advance("1 second");
+      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThan(finalGraceCall + 1);
+    }),
+  );
+
+  it.effect("reopening after a miss loads again instead of resuming a stale state", () =>
+    Effect.gen(function* () {
+      const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+        snapshot: undefined,
+        owner: undefined,
+      };
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* makeHarness({ httpSnapshot: { _tag: "missing" }, resumeCache });
+          yield* advance("1 second", 20);
+          expect((yield* Ref.get(first.latest)).status).toBe("not-found");
+          expect(yield* Ref.get(first.removedThreads)).toEqual([]);
+        }),
+      );
+      expect(resumeCache.snapshot?.state.status).toBe("not-found");
+
+      const reopened = yield* makeHarness({
+        resumeCache,
+        httpSnapshot: {
+          _tag: "present",
+          snapshot: { snapshotSequence: 6, projection: BASE_PROJECTION },
+        },
+      });
+      const state = yield* awaitThreadState(reopened.observed, (value) => value.status === "live");
+      expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+      expect(yield* Ref.get(reopened.loaderCalls)).toBe(1);
+    }),
+  );
+
+  it.effect("a thread.deleted event still marks the thread deleted and stays parked", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ httpSnapshot: { _tag: "unavailable" } });
+      yield* Queue.offer(harness.inputs, snapshot(BASE_PROJECTION, 2));
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Queue.offer(harness.inputs, deleted(3));
       const state = yield* awaitThreadState(
         harness.observed,
         (value) => value.status === "deleted",
       );
-
       expect(Option.isNone(state.data)).toBe(true);
-      expect(Option.isNone(state.error)).toBe(true);
-      expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThanOrEqual(1);
       expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
-      expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
 
-      yield* TestClock.adjust("1 second");
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        yield* Effect.yieldNow;
-      }
       yield* harness.replaceSession;
-      yield* Queue.offer(harness.wakeups, "application-active");
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        yield* Effect.yieldNow;
-      }
-      expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
-      expect(yield* Ref.get(harness.retryCount)).toBe(0);
-      expect(yield* Ref.get(harness.loaderCalls)).toBe(1);
+      yield* advance("1 second");
       expect((yield* Ref.get(harness.latest)).status).toBe("deleted");
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
     }),
   );
 

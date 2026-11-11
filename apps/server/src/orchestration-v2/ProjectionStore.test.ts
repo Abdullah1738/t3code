@@ -2206,6 +2206,44 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(recovery?.restartCancelledBackgroundWork, work);
     }),
   );
+  it.effect("recentRunLimit keeps unfinished runs plus the newest N", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("recent-run-limit");
+      const first = (yield* store.getThreadProjection(threadId)).runs[0]!;
+      const now = yield* DateTime.now;
+      yield* store.apply({
+        id: EventId.make("event:recent-run-limit:1-waiting"),
+        type: "run.updated",
+        threadId,
+        occurredAt: now,
+        payload: { ...first, status: "waiting" as const, completedAt: null },
+      });
+      for (const ordinal of [2, 3, 4, 5]) {
+        yield* store.apply({
+          id: EventId.make(`event:recent-run-limit:${ordinal}`),
+          type: "run.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...first,
+            id: RunId.make(`run:recent-run-limit:${ordinal}`),
+            ordinal,
+            status: "completed" as const,
+            completedAt: now,
+          },
+        });
+      }
+      const ordinals = (filter: ProjectionStore.ProjectionRecordFilter) =>
+        store
+          .getThreadRecords(threadId, ["runs"], filter)
+          .pipe(Effect.map(({ runs }) => runs.map((run) => run.ordinal)));
+      // The unfinished first run stays; of the finished ones only the newest two.
+      assert.deepEqual(yield* ordinals({ recentRunLimit: 2 }), [1, 4, 5]);
+      assert.deepEqual(yield* ordinals({ recentRunLimit: 10 }), [1, 2, 3, 4, 5]);
+      assert.deepEqual(yield* ordinals({}), [1, 2, 3, 4, 5]);
+    }),
+  );
   it.effect(
     "command reads skip finished leaf nodes of finished runs",
     () => commandReadsSkipSettledLeafNodes,

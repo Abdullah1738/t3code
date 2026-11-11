@@ -175,6 +175,7 @@ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
 import type { OrchestrationEventStoreError } from "./persistence/Errors.ts";
+import { readThreadShellsShared } from "./ardud/perf/sharedThreadShellReads.ts";
 import { ShellResumeLimits, Switches } from "./ardud/perf/speedups.ts";
 import { shellPageNextAfter, shellPageRead, shellPageSize } from "./ardud/perf/shellPages.ts";
 import { userFacingDispatchErrorMessage } from "./orchestration-v2/UserFacingErrors.ts";
@@ -1102,14 +1103,20 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       // per thread. A resume replays hundreds of threads; on a busy server each
       // transaction queued for a reader slot (a 125-thread catch-up took 16.7 s and a
       // 450-event foreground resume 12-28 s under a loaded reader pool, 10 Nov 2026).
-      const changedThreadIds = coalesced.flatMap((stored) =>
-        "aggregateKind" in stored ? [] : [stored.event.threadId],
-      );
-      const batchedShells =
-        (yield* Switches).shellBatchedStreamReads &&
-        changedThreadIds.length >= SHELL_STREAM_BATCH_READ_MIN_THREADS
-          ? yield* readThreadShells(changedThreadIds)
-          : undefined;
+      // ardud: every shell subscriber projects the same events; share one read per
+      // (thread, sequence) across them (sharedThreadShellReads.ts).
+      const shells = yield* readThreadShellsShared({
+        owner: threadManagement,
+        wanted: coalesced.flatMap((stored) =>
+          "aggregateKind" in stored
+            ? []
+            : [{ threadId: stored.event.threadId, sequence: stored.sequence }],
+        ),
+        readMany: readThreadShells,
+        readOne: threadManagement.getThreadShell,
+        batch: (yield* Switches).shellBatchedStreamReads,
+        batchMinThreads: SHELL_STREAM_BATCH_READ_MIN_THREADS,
+      });
       const items = yield* Effect.forEach(
         coalesced,
         (stored) =>
@@ -1117,10 +1124,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             if ("aggregateKind" in stored) {
               return yield* projectItem(stored);
             }
-            const shell =
-              batchedShells === undefined
-                ? yield* threadManagement.getThreadShell(stored.event.threadId)
-                : (batchedShells.get(stored.event.threadId) ?? null);
+            const shell = shells.get(stored.event.threadId) ?? null;
             return shellStreamItemFromThreadShell({ stored, shell });
           }),
         { concurrency: 8 },
@@ -1869,6 +1873,19 @@ export const layerWsRpc = (
       const loadServerConfig = Effect.fn("ws.loadServerConfig")(function* (options: {
         readonly usageLimitsCommand: boolean;
       }) {
+        // ardud: the three host discoveries each have a 5 s budget and used to run one
+        // after another, inside the client's 15 s connection-setup budget. Start them
+        // together, before the other reads.
+        const discovery = yield* Effect.all(
+          {
+            availableEditors: resolveAvailableEditorsForConfig(
+              externalLauncher.resolveAvailableEditors(),
+            ),
+            remoteOpenTargets: resolveAvailableEditorsForConfig(remoteOpenTargets.resolveTargets()),
+            directEndpoints: resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          },
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const currentProviders = yield* providerRegistry.getProviders;
         const providers = options.usageLimitsCommand
@@ -1880,8 +1897,9 @@ export const layerWsRpc = (
         const environment = yield* serverEnvironment.getDescriptor;
         const auth = yield* serverAuth.getDescriptor();
         const scratchWorkspaceRoot = yield* managedFolders.scratchRoot;
+        const discovered = yield* Fiber.join(discovery);
         const editorConfig = yield* resolveEditorConfig(
-          yield* resolveAvailableEditorsForConfig(externalLauncher.resolveAvailableEditors()),
+          discovered.availableEditors,
           resolveFileManagerRevealKindForConfig(externalLauncher.resolveFileManagerRevealKind()),
         );
 
@@ -1894,10 +1912,8 @@ export const layerWsRpc = (
           issues: keybindingsConfig.issues,
           providers,
           ...editorConfig,
-          remoteOpenTargets: yield* resolveAvailableEditorsForConfig(
-            remoteOpenTargets.resolveTargets(),
-          ),
-          directEndpoints: yield* resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          remoteOpenTargets: discovered.remoteOpenTargets,
+          directEndpoints: discovered.directEndpoints,
           observability: {
             logsDirectoryPath: config.logsDir,
             localTracingEnabled: true,
@@ -3374,7 +3390,10 @@ export const layer = Layer.unwrap(
         );
         const clientOrigin = readClientConnectionOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
-        yield* sessions.recordClientConnection(session.sessionId, clientOrigin);
+        // ardud: this metadata UPDATE waits for the state writer, which was held for
+        // up to 267 s on 11 Nov. Awaiting it here held the upgrade, so phone and web
+        // clients timed out and reconnected in a loop. Record it off the upgrade path.
+        yield* Effect.forkDetach(sessions.recordClientConnection(session.sessionId, clientOrigin));
         yield* analytics.record("client.connected", clientAnalyticsProps);
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
@@ -3466,7 +3485,10 @@ export const layer = Layer.unwrap(
           ),
         );
         return yield* Effect.acquireUseRelease(
-          sessions.markConnected(session.sessionId),
+          // ardud: markConnected writes lastConnectedAt on the state writer when the
+          // session was idle. Run it beside the upgrade; the release waits for it so
+          // the connected count still goes up before it goes down.
+          Effect.forkDetach(sessions.markConnected(session.sessionId)),
           () =>
             Effect.raceFirst(
               rpcWebSocketHttpEffect,
@@ -3478,7 +3500,10 @@ export const layer = Layer.unwrap(
                 }),
               ),
             ),
-          () => sessions.markDisconnected(session.sessionId),
+          (connected) =>
+            Fiber.await(connected).pipe(
+              Effect.andThen(sessions.markDisconnected(session.sessionId)),
+            ),
         );
       }).pipe(
         Effect.catchTags({

@@ -6,6 +6,7 @@ export type ByIdRouteState =
   | "ready"
   | "archived"
   | "deleted"
+  | "not-found"
   | "no-access"
   | "unavailable";
 
@@ -20,6 +21,8 @@ export function resolveByIdRouteState(input: {
   if (input.status === "no-access") return "no-access";
   if (input.deleted || input.status === "deleted") return "deleted";
   if (input.exists) return input.archived ? "archived" : "ready";
+  // An HTTP miss after the grace window. Not a confirmed delete.
+  if (input.status === "not-found") return "not-found";
   if (input.error || input.timedOut) return "unavailable";
   return "loading";
 }
@@ -38,6 +41,7 @@ export function ThreadRouteState({
     ready: "Thread",
     archived: "Archived",
     deleted: "Thread deleted",
+    "not-found": "Thread not found",
     "no-access": "No access to this thread",
     unavailable: "Thread unavailable",
   }[state];
@@ -56,7 +60,10 @@ export function ThreadRouteState({
         </div>
       ) : null}
       <div className="flex gap-2">
-        {state === "loading" || state === "unavailable" ? (
+        {state === "loading" ||
+        state === "unavailable" ||
+        state === "not-found" ||
+        state === "deleted" ? (
           <Button variant="outline" onClick={retry}>
             Retry
           </Button>

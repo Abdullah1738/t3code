@@ -92,6 +92,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -215,6 +216,10 @@ const CODEX_ASSISTANT_DELTA_FLUSH_INTERVAL_MS = 50;
 // Each plan flush stores the whole plan three times (node, plan, turn item), so
 // flush at the cadence clients already see for assistant text.
 const CODEX_PLAN_DELTA_FLUSH_INTERVAL_MS = 400;
+// Stopping a turn whose turn/start reply was abandoned: up to ~10s for a
+// queued turn to start before Codex accepts turn/interrupt for it.
+const ABANDONED_TURN_INTERRUPT_ATTEMPTS = 20;
+const ABANDONED_TURN_INTERRUPT_SPACING = "500 millis";
 const CodexBackgroundTerminalTerminateResponse = Schema.Struct({
   terminated: Schema.Boolean,
 });
@@ -6495,6 +6500,66 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           );
         });
 
+        /**
+         * Stops a native turn whose turn/start the caller stopped waiting for.
+         * Codex starts the turn even when the run that asked for it was
+         * interrupted while the request was in flight, and nothing adopts it
+         * (pendingRootTurns is cleared), so without this the turn keeps working
+         * out of sight: it can claim board cards, push branches, and keeps the
+         * native thread (and its MCP servers) loaded after Robob unsubscribes.
+         */
+        const interruptAbandonedNativeTurn = (nativeThreadId: string, nativeTurnId: string) =>
+          client.request("turn/interrupt", { threadId: nativeThreadId, turnId: nativeTurnId }).pipe(
+            // A queued turn (startedAt null) cannot be interrupted until Codex
+            // reports turn/started, so retry for a bounded while.
+            Effect.retry({
+              times: ABANDONED_TURN_INTERRUPT_ATTEMPTS,
+              schedule: Schedule.spaced(ABANDONED_TURN_INTERRUPT_SPACING),
+            }),
+            Effect.andThen(
+              Effect.logInfo("orchestration-v2.codex-abandoned-turn-interrupted", {
+                providerSessionId: input.providerSessionId,
+                nativeThreadId,
+                nativeTurnId,
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.codex-abandoned-turn-interrupt-failed", {
+                providerSessionId: input.providerSessionId,
+                nativeThreadId,
+                nativeTurnId,
+                cause,
+              }),
+            ),
+          );
+
+        /**
+         * Sends turn/start so that a caller interrupted mid-request (a Stop that
+         * lands before Codex replies) still learns the native turn id and stops
+         * that turn. Mirrors ownNativeAllocation for thread/start and resume.
+         */
+        const ownNativeTurnStart = (
+          nativeThreadId: string,
+          params: CodexTurnStartParamsWithCollaborationMode,
+        ) =>
+          Effect.acquireUseRelease(
+            client.request("turn/start", params).pipe(Effect.interruptible, Effect.forkIn(scope)),
+            (fiber) => Fiber.join(fiber),
+            (fiber, exit) =>
+              Exit.isSuccess(exit)
+                ? Effect.void
+                : Fiber.await(fiber).pipe(
+                    Effect.flatMap((result) =>
+                      Exit.isSuccess(result)
+                        ? interruptAbandonedNativeTurn(nativeThreadId, result.value.turn.id)
+                        : Effect.void,
+                    ),
+                    Effect.interruptible,
+                    Effect.forkIn(scope),
+                    Effect.asVoid,
+                  ),
+          );
+
         const startNativeTurn = Effect.fn("CodexAdapterV2.startNativeTurn")(
           function* (
             turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
@@ -6525,7 +6590,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               else next.delete(threadId);
               return next;
             });
-            const started = yield* client.request("turn/start", turnStartParams);
+            const started = yield* ownNativeTurnStart(threadId, turnStartParams);
             yield* registerRootTurn({
               turnInput,
               nativeTurnId: started.turn.id,

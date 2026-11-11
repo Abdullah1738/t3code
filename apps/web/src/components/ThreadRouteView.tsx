@@ -96,9 +96,13 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const retry = () => {
     setTimedOutKey(null);
     setRetryAttempt((attempt) => attempt + 1);
+    // reload, not refresh: a refresh resumes the retained state and would
+    // park again on a deleted thread instead of asking the server.
     if (target.kind === "server")
-      appAtomRegistry.refresh(
-        environmentThreads.stateAtom(target.threadRef.environmentId, target.threadRef.threadId),
+      environmentThreads.reload(
+        appAtomRegistry,
+        target.threadRef.environmentId,
+        target.threadRef.threadId,
       );
   };
   const draftThread = useComposerDraftStore((store) =>

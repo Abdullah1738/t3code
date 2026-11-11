@@ -173,6 +173,7 @@ const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<s
   return out;
 };
 
+const THREAD_DETAIL_RECENT_RUNS = 5;
 const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
 
 const errorResponse = (error: ControlError) => {
@@ -628,10 +629,13 @@ const makeRoutes = Effect.gen(function* () {
       }),
     );
 
-  const readRecords = (threadId: string) =>
+  const readRecords = (threadId: string, options?: { readonly recentRunLimit?: number }) =>
     threads
       .getThreadRecords(ThreadId.make(threadId), ["runs", "runtimeRequests", "turnItems"], {
         turnItemTypes: ["approval_request", "user_input_request"],
+        ...(options?.recentRunLimit === undefined
+          ? {}
+          : { recentRunLimit: options.recentRunLimit }),
       })
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
@@ -674,7 +678,10 @@ const makeRoutes = Effect.gen(function* () {
   const threadDetail = (threadId: string) =>
     Effect.gen(function* () {
       const shell = yield* getShell(threadId);
-      const records = yield* readRecords(threadId);
+      // ardud: the detail reports the current run and the newest five. Reading every
+      // run the thread ever had made this the slowest call on the iMessage reply path
+      // (p50 14.4 s on 11 Nov 2026, most aborted by the bridge's 15 s timeout).
+      const records = yield* readRecords(threadId, { recentRunLimit: THREAD_DETAIL_RECENT_RUNS });
       const pending = records.runtimeRequests.filter((request) => request.status === "pending");
       const { state, run } = stateFromRuns(records.runs, pending.length > 0);
       const [summary] = yield* summarize([shell]);
@@ -683,7 +690,9 @@ const makeRoutes = Effect.gen(function* () {
         state,
         status: run?.status ?? "idle",
         run: run === null ? null : runSummary(run),
-        recentRuns: runsNewestFirst(records.runs).slice(0, 5).map(runSummary),
+        recentRuns: runsNewestFirst(records.runs)
+          .slice(0, THREAD_DETAIL_RECENT_RUNS)
+          .map(runSummary),
         pendingRequests: pending.map((request) =>
           pendingRequestSummary(request, records.turnItems),
         ),
@@ -1141,7 +1150,14 @@ const makeRoutes = Effect.gen(function* () {
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
-    return json({ ok: true, thread: yield* threadDetail(threadId) });
+    // ardud: bridges poll this per chat (the iMessage reply path). Admit it on the
+    // poll lane like /messages and read on the foreground reader, not behind sweeps
+    // and thread lists on the background lane (p95 wait 10-115 s on 11 Nov 2026).
+    const thread = yield* ReplyBuilders.bounded(
+      threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
+      "poll",
+    );
+    return json({ ok: true, thread });
   });
 
   const byNative = Effect.gen(function* () {

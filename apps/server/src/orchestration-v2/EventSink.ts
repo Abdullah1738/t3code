@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Scheduler from "effect/Scheduler";
 import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -275,9 +276,23 @@ const layerBase: Layer.Layer<
           ),
           Effect.uninterruptible,
         );
+        const started = performance.now();
         return sql
           .withTransaction(Effect.tap(transaction, () => takeLane))
           .pipe(
+            // ardud: the writer is a synchronous connection, yet single-event writes
+            // held it for 99-267 s on 11 Nov 2026 with no SQL running and no event-loop
+            // stall over 6 s. The body yields to Effect's scheduler every 2,048 ops, and
+            // each yield waited a full round of a saturated run queue while every other
+            // write queued behind it. Run the transaction body without cooperative yields;
+            // a real wait (the publish lane) still suspends.
+            Effect.provideService(Scheduler.PreventSchedulerYield, true),
+            Effect.tap(() =>
+              Effect.annotateCurrentSpan(
+                "orchestration_v2.transaction_ms",
+                Math.round(performance.now() - started),
+              ),
+            ),
             Effect.tap(publish),
             Effect.ensuring(
               Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void)),
@@ -392,6 +407,10 @@ const layerBase: Layer.Layer<
         "orchestration_v2.command_id": input.commandId ?? null,
         "orchestration_v2.event_count": input.events.length,
         "orchestration_v2.thread_id": input.events[0]?.threadId ?? null,
+        // ardud: names the write when a long writer hold shows up in a trace.
+        "orchestration_v2.event_types": [...new Set(input.events.map((event) => event.type))].join(
+          ",",
+        ),
       });
 
       return yield* commitThenPublish(

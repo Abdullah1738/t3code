@@ -336,6 +336,8 @@ export interface ProjectionRecordFilter {
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
+  /** ardud: unfinished runs plus the newest N, instead of every run the thread ever had. */
+  readonly recentRunLimit?: number;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly recentTurnItemLimit?: number;
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
@@ -344,6 +346,24 @@ export interface ProjectionRecordFilter {
 
 type ProjectionNode = OrchestrationV2ThreadProjection["nodes"][number];
 type ProjectionRun = OrchestrationV2ThreadProjection["runs"][number];
+const UNFINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "queued",
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
+/** In-memory twin of the SQL `recentRunLimit` filter. */
+const recentRuns = <T extends ReadonlyArray<ProjectionRun>>(runs: T, limit: number | undefined): T => {
+  if (limit === undefined) return runs;
+  const floor = runs
+    .map((run) => run.ordinal)
+    .toSorted((left, right) => right - left)[Math.max(0, Math.floor(limit) - 1)];
+  return runs.filter(
+    (run) =>
+      UNFINISHED_RUN_STATUSES.has(run.status) || floor === undefined || run.ordinal >= floor,
+  ) as unknown as T;
+};
 const settledLeafNodeKinds: ReadonlySet<ProjectionNode["kind"]> = new Set([
   "tool_call",
   "assistant_message",
@@ -3396,6 +3416,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_runs
             WHERE thread_id = ${threadId}
               ${filter?.runIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.runIds)}))`}
+              ${
+                filter?.recentRunLimit === undefined
+                  ? sql``
+                  : sql`AND (status IN ('queued','preparing','starting','running','waiting')
+                      OR ordinal >= COALESCE((
+                        SELECT ordinal FROM orchestration_v2_projection_runs
+                        WHERE thread_id = ${threadId}
+                        ORDER BY ordinal DESC
+                        LIMIT 1 OFFSET ${Math.max(0, Math.floor(filter.recentRunLimit) - 1)}
+                      ), 0))`
+              }
             ORDER BY ordinal ASC
           `
               : sql<PayloadRow>`
@@ -7263,10 +7294,12 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 (filter?.messageIds === undefined || filter.messageIds.includes(row.id)) &&
                 (filter?.messageRoles === undefined || filter.messageRoles.includes(row.role)),
             ),
-            runs:
+            runs: recentRuns(
               filter?.runIds === undefined
                 ? projection.runs
                 : projection.runs.filter((row) => filter.runIds!.includes(row.id)),
+              filter?.recentRunLimit,
+            ),
             turnItems: projection.turnItems
               .filter(
                 (row) =>

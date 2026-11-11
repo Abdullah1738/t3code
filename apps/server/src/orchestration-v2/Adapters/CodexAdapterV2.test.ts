@@ -3097,6 +3097,95 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("interrupts the native turn when its start is abandoned before Codex replies", () =>
+    Effect.gen(function* () {
+      // Live 2026-11-11: a board Stop landed 67ms after turn/start was sent.
+      // Codex started the turn anyway and it worked unseen for 30+ minutes.
+      const nativeThreadId = "abandoned-start-thread";
+      const nativeTurnId = "abandoned-start-turn";
+      const prompt = "Work the card.";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const transcript = makeCodexReplayTranscript({
+        scenario: "abandoned-turn-start-interrupt",
+        entries: [
+          ...preamble.slice(0, -2),
+          {
+            type: "emit_inbound",
+            label: "turn/start/late-reply",
+            afterMs: 1000,
+            frame: {
+              id: 3,
+              result: { turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }) },
+            },
+          },
+          {
+            type: "emit_inbound",
+            label: "turn/started",
+            frame: {
+              method: "turn/started",
+              params: {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+              },
+            },
+          },
+          {
+            type: "expect_outbound",
+            label: "turn/interrupt",
+            frame: {
+              id: 4,
+              method: "turn/interrupt",
+              params: { threadId: nativeThreadId, turnId: nativeTurnId },
+            },
+          },
+          { type: "emit_inbound", label: "turn/interrupt", frame: { id: 4, result: {} } },
+        ],
+      });
+      const turnStartSent = yield* Deferred.make<void>();
+      const interruptSent = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        transcript,
+        () => Effect.void,
+        (method) =>
+          method === "turn/start"
+            ? Deferred.succeed(turnStartSent, undefined)
+            : method === "turn/interrupt"
+              ? Deferred.succeed(interruptSent, undefined)
+              : Effect.void,
+      );
+      const start = yield* harness.runtime
+        .startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("abandoned-start-attempt"),
+            text: prompt,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(turnStartSent);
+      // The run is stopped while turn/start is still waiting for its reply.
+      yield* Fiber.interrupt(start);
+      assert.isFalse(yield* Deferred.isDone(interruptSent));
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(interruptSent);
+      // The abandoned turn is never adopted as this run's turn.
+      assert.isUndefined(
+        harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+        ),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect("settles Stop when a queued native turn fails before starting", () =>
     Effect.gen(function* () {
       const nativeThreadId = "early-stop-thread";
