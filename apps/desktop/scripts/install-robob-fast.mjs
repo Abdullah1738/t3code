@@ -13,6 +13,8 @@ import * as NodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
+export const INSTALL_DATABASE_FILE = /^(statev2|boards)\.sqlite(?:-wal)?$/;
+
 export const INSTALL_PLAN = [
   "pre-stage",
   "signature",
@@ -25,6 +27,7 @@ export const INSTALL_PLAN = [
   "launch",
   "read-ready",
   "continuation-report",
+  "prune-old-backups",
 ];
 
 // Robob builds are Developer ID signed but not notarized, so `spctl --assess`
@@ -81,6 +84,8 @@ export async function install(ops, { rollback = false } = {}) {
   await ops.readReady();
   await ops.phase("ready");
   await ops.report();
+  if (ops.prune)
+    await ops.prune().catch((error) => ops.phase("prune_failed", { error: String(error) }));
 }
 
 /** `ls -f DIR` in a child with a hard timeout: an NFS lookup that hangs puts
@@ -428,8 +433,15 @@ export async function clearStaleStaging({
 async function main(args) {
   const rollback = args.includes("--rollback");
   const dmgIndex = args.indexOf("--dmg");
+  const skipIndex = args.indexOf("--skip-migration-check");
+  // The pre-quit check clones the live database, and that clone stalls the running server's
+  // writes for as long as it takes (5.3 min on 11 Nov 2026). Skip it, with a stated reason,
+  // when the release changes no migration or schema files.
+  const skipMigrationCheck = skipIndex < 0 ? undefined : args[skipIndex + 1]?.trim();
+  if (skipIndex >= 0 && (!skipMigrationCheck || skipMigrationCheck.startsWith("--")))
+    throw new Error("--skip-migration-check requires a reason");
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--dmg" && args[i + 1]) {
+    if ((args[i] === "--dmg" || args[i] === "--skip-migration-check") && args[i + 1]) {
       i++;
       continue;
     }
@@ -437,7 +449,9 @@ async function main(args) {
       throw new Error(`Unknown argument: ${args[i]}`);
   }
   if (args.includes("--dry-run")) {
-    console.log(JSON.stringify({ rollback, steps: INSTALL_PLAN }));
+    console.log(
+      JSON.stringify({ rollback, skipMigrationCheck: skipMigrationCheck ?? null, steps: INSTALL_PLAN }),
+    );
     return;
   }
   if (!process.env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
@@ -463,13 +477,15 @@ async function main(args) {
     );
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const inputs = async () =>
-    (await fs.readdir(data)).filter((name) => /^(statev2|boards).*\.sqlite(?:-wal)?$/.test(name));
-  const clone = async (destination) => {
+    // Exact names only: the 226 GB statev2.pre-shrink-*.sqlite copy matched the old prefix pattern
+    // and was cloned on every install (11 Nov 2026).
+    (await fs.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
+  const clone = async (destination, perFileMs) => {
     await fs.mkdir(destination, { recursive: true, mode: 0o700 });
     const names = await inputs();
     if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
     for (const name of names)
-      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], 3000);
+      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], perFileMs);
   };
   const cfg = JSON.parse(
     await fs.readFile(
@@ -551,6 +567,10 @@ async function main(args) {
     },
     verify: () => verifyBundle(next),
     migrations: async () => {
+      if (skipMigrationCheck !== undefined) {
+        await phase("migration_check_skipped", { reason: skipMigrationCheck });
+        return;
+      }
       const sandbox = await fs.mkdtemp(path.join(path.dirname(data), ".install-clone-"));
       try {
         const fingerprint = async () =>
@@ -563,7 +583,7 @@ async function main(args) {
             ),
           );
         const before = await fingerprint();
-        await clone(sandbox);
+        await clone(sandbox, 3000);
         if (before !== (await fingerprint()))
           throw new Error("Database changed during preflight clone; retry before quitting");
         await fs.writeFile(path.join(sandbox, ".install-clone"), "", { mode: 0o600 });
@@ -624,13 +644,19 @@ async function main(args) {
     },
     backup: async () => {
       await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
-      await clone(path.join(backupRoot, stamp));
+      // No writer is left after the quit, so the clone only waits on APFS, not on the server.
+      await clone(path.join(backupRoot, stamp), 120_000);
+    },
+    // Deleting old clones of a fragmented 160 GB file takes tens of seconds; it runs after
+    // the new server is ready instead of inside the outage window.
+    prune: async () => {
       const old = (await fs.readdir(backupRoot))
         .filter((n) => /^\d{4}-/.test(n))
         .sort()
         .reverse()
         .slice(2);
       for (const name of old) await fs.rm(path.join(backupRoot, name), { recursive: true });
+      await phase("backups_pruned", { removed: old });
     },
     swap: async (rollback) => {
       if (rollback) {

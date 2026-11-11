@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import {
+  INSTALL_DATABASE_FILE,
   checkSignature,
   clearStaleStaging,
   getJson,
@@ -586,4 +587,48 @@ test("the pre-quit migration check waits 10 minutes by default and takes an env 
   assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "900000" }), 900_000);
   assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "5" }), 600_000);
   assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "nope" }), 600_000);
+});
+
+test("clones only the live databases, never the pre-shrink copy", () => {
+  const names = [
+    "statev2.sqlite",
+    "statev2.sqlite-wal",
+    "statev2.sqlite-shm",
+    "statev2.pre-shrink-20261105234934246.sqlite",
+    "boards.sqlite",
+    "boards.sqlite-wal",
+    "boards.sqlite.pre-ledger14",
+    "archive.sqlite",
+  ];
+  assert.deepEqual(
+    names.filter((n) => INSTALL_DATABASE_FILE.test(n)),
+    ["statev2.sqlite", "statev2.sqlite-wal", "boards.sqlite", "boards.sqlite-wal"],
+  );
+});
+
+test("prunes old backups only after the report, and a prune failure does not fail the install", async () => {
+  const calls = [];
+  const ops = Object.fromEntries(
+    [
+      "stage",
+      "verify",
+      "migrations",
+      "hostPreflight",
+      "cancelWindow",
+      "quit",
+      "backup",
+      "swap",
+      "launch",
+      "readReady",
+      "report",
+    ].map((name) => [name, async () => calls.push(name)]),
+  );
+  ops.phase = async (p, extra) => calls.push(extra?.error ? `${p}:${extra.error}` : p);
+  ops.prune = async () => {
+    calls.push("prune");
+    throw new Error("rm failed");
+  };
+  await install(ops);
+  assert.deepEqual(calls.slice(-4), ["ready", "report", "prune", "prune_failed:Error: rm failed"]);
+  assert.ok(calls.indexOf("backup") < calls.indexOf("swap"));
 });
