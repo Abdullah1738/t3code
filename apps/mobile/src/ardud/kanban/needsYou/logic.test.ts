@@ -12,7 +12,6 @@ import {
   acceptsInWords,
   acceptsOnlyMedia,
   askFacts,
-  askHtmlStaysInFrame,
   askKeyFromParams,
   askNeighbours,
   askParamsFromKey,
@@ -24,14 +23,15 @@ import {
   batchPrimaryLabel,
   boardChips,
   customValueAccepted,
+  customValueTaken,
   historyRows,
   isLoadablePicture,
-  linkHost,
   moveRank,
   needsYouItemsByKey,
   queueRows,
   rankOrder,
   readAskHtmlMessage,
+  stepWebLink,
   unreachedRetryGate,
 } from "./logic";
 
@@ -210,10 +210,17 @@ describe("one ask", () => {
   });
 
   it("names a link's site and what a file field takes", () => {
-    expect(linkHost("https://www.appstoreconnect.apple.com/agreements")).toBe(
-      "appstoreconnect.apple.com",
-    );
-    expect(linkHost("not a link")).toBe("the link");
+    expect(stepWebLink("https://www.appstoreconnect.apple.com/agreements")).toEqual({
+      url: "https://www.appstoreconnect.apple.com/agreements",
+      host: "appstoreconnect.apple.com",
+    });
+    // Only a web address is a link: nothing else an agent writes there can be opened.
+    expect(stepWebLink("not a link")).toBeNull();
+    expect(stepWebLink("robob://needs-you/history")).toBeNull();
+    expect(stepWebLink("tel:+15550100")).toBeNull();
+    expect(stepWebLink(undefined)).toBeNull();
+    // The site named is the one the link really leads to.
+    expect(stepWebLink("https://apple.com@evil.test/x")?.host).toBe("evil.test");
     expect(acceptsInWords(["application/pdf", "image/*"])).toBe("PDF or images");
     expect(acceptsInWords([".csv"])).toBe("CSV");
     expect(acceptsOnlyMedia(["image/*", "video/mp4"])).toBe(true);
@@ -242,6 +249,11 @@ describe("one ask", () => {
     expect(customValueAccepted({ min: 5, max: 50 }, Number.NaN)).toBe(false);
     expect(customValueAccepted({}, { region: "eu" })).toBe(true);
     expect(customValueAccepted({}, undefined)).toBe(false);
+    // A page keeps running while the answer can't be changed: what it posts is dropped.
+    expect(customValueTaken({ min: 5, max: 50 }, 25, false)).toBe(true);
+    expect(customValueTaken({ min: 5, max: 50 }, 25, true)).toBe(false);
+    expect(customValueTaken({ min: 5, max: 50 }, 55, false)).toBe(false);
+    expect(customValueTaken({}, { region: "eu" }, true)).toBe(false);
   });
 });
 
@@ -320,13 +332,6 @@ describe("a page inside an ask", () => {
     expect(readAskHtmlMessage("not json")).toBeNull();
     expect(readAskHtmlMessage(JSON.stringify({ type: "something.else" }))).toBeNull();
     expect(readAskHtmlMessage(JSON.stringify("text"))).toBeNull();
-  });
-
-  it("keeps the page where it is and sends every other address outside", () => {
-    expect(askHtmlStaysInFrame("about:blank")).toBe(true);
-    expect(askHtmlStaysInFrame("data:text/html,<p>x</p>")).toBe(true);
-    expect(askHtmlStaysInFrame("https://example.test/")).toBe(false);
-    expect(askHtmlStaysInFrame("robob://needs-you")).toBe(false);
   });
 });
 

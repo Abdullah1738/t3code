@@ -37,10 +37,11 @@ import type { FilePreviewSource } from "../../components/FilePreviewModal.types"
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
-import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { FeedError, LoadingLine } from "../common/FeedError";
 import { useBoardAction } from "../common/hooks";
 import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
+import { PageLinkOffer } from "../common/PageLinkOffer";
+import { pageNavigation } from "../common/pageNavigation";
 import {
   kanbanClient,
   useKanbanBoardCard,
@@ -673,13 +674,17 @@ function LiveHtml(props: {
   readonly height: number | null;
 }) {
   const height = Math.min(HTML_MAX_HEIGHT, props.height ?? HTML_DEFAULT_HEIGHT);
-  // The page draws in place; links it follows open outside the app. Frames
-  // inside it (iOS asks for those too) load where they are.
+  // A web link the page tried to follow, waiting for his tap.
+  const [offered, setOffered] = useState<string | null>(null);
+  // The page is text an agent wrote: it draws in place and goes nowhere by
+  // itself (`pageNavigation`). It can't move the app or open another one, and
+  // a web link it follows is only offered under the page. The origin whitelist
+  // stays "*" on purpose: a URL outside it is opened by the WebView library
+  // itself, with no question asked.
   const onNavigate = useCallback((request: WebViewNavigation & { isTopFrame?: boolean }) => {
-    if (request.url === "about:blank" || request.url.startsWith("data:")) return true;
-    if (request.isTopFrame === false) return true;
-    void tryOpenExternalUrl(request.url, "html-render");
-    return false;
+    const verdict = pageNavigation(request);
+    if (verdict._tag === "offer") setOffered(verdict.url);
+    return verdict._tag === "load";
   }, []);
   return (
     <View className="gap-1.5">
@@ -691,12 +696,28 @@ function LiveHtml(props: {
           source={{ html: props.html }}
           originWhitelist={["*"]}
           onShouldStartLoadWithRequest={onNavigate}
+          onOpenWindow={(event) => {
+            const verdict = pageNavigation({ url: event.nativeEvent.targetUrl });
+            if (verdict._tag === "offer") setOffered(verdict.url);
+          }}
           setSupportMultipleWindows={false}
+          javaScriptCanOpenWindowsAutomatically={false}
+          allowsLinkPreview={false}
+          dataDetectorTypes="none"
           incognito
+          cacheEnabled={false}
+          domStorageEnabled={false}
+          sharedCookiesEnabled={false}
+          thirdPartyCookiesEnabled={false}
+          allowFileAccess={false}
+          allowFileAccessFromFileURLs={false}
+          allowUniversalAccessFromFileURLs={false}
+          geolocationEnabled={false}
           nestedScrollEnabled
           style={{ backgroundColor: "transparent" }}
         />
       </View>
+      {offered !== null ? <PageLinkOffer url={offered} onDone={() => setOffered(null)} /> : null}
     </View>
   );
 }

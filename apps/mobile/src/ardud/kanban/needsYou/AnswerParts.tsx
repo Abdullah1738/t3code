@@ -17,7 +17,7 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
 import { tryOpenExternalUrl } from "../../../lib/openExternalUrl";
 import { useAsks } from "./askStore";
-import { linkHost } from "./logic";
+import { stepWebLink } from "./logic";
 import { Check, FieldLabel, GrowingInput, Pill, Problem, tapSelection } from "./ui";
 
 export type AskProblems = Readonly<Partial<Record<AskProblemKey, string>>>;
@@ -270,6 +270,7 @@ export function TaskSteps(props: {
   return (
     <View className="gap-1">
       {props.steps.map((step, index) => {
+        const link = stepWebLink(step.link);
         const done = form.steps.includes(index);
         return (
           // oxlint-disable-next-line react/no-array-index-key -- An ask's steps never reorder.
@@ -299,11 +300,11 @@ export function TaskSteps(props: {
                 {step.text}
               </Text>
             </Pressable>
-            {step.link ? (
+            {link !== null ? (
               <Pressable
                 accessibilityRole="link"
-                accessibilityLabel={`Open ${linkHost(step.link)}`}
-                onPress={() => void tryOpenExternalUrl(step.link!, "markdown-link")}
+                accessibilityLabel={`Open ${link.host}`}
+                onPress={() => void tryOpenExternalUrl(link.url, "markdown-link")}
                 className="ml-[34px] min-h-11 flex-row items-center gap-1.5 self-start"
               >
                 <SymbolView
@@ -312,10 +313,13 @@ export function TaskSteps(props: {
                   tintColorClassName="accent-primary-text"
                   type="monochrome"
                 />
-                <Text className="text-sm font-t3-medium text-primary-text">
-                  Open {linkHost(step.link)}
-                </Text>
+                <Text className="text-sm font-t3-medium text-primary-text">Open {link.host}</Text>
               </Pressable>
+            ) : step.link ? (
+              // Not a web address: shown as it is written, and it opens nothing.
+              <Text selectable className="ml-[34px] text-sm text-foreground-muted">
+                {step.link}
+              </Text>
             ) : null}
           </View>
         );

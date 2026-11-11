@@ -24,14 +24,14 @@ import { SymbolView, type AppSymbolName } from "../../../components/ui/AppSymbol
 import { AppText as Text } from "../../../components/ui/AppText";
 import { useAppearancePreferences } from "../../../features/settings/appearance/AppearancePreferencesProvider";
 import { mobileHtmlRenderTheme } from "../../../lib/htmlRenderTheme";
-import { tryOpenExternalUrl } from "../../../lib/openExternalUrl";
 import { useAssetUrl } from "../../../state/assets";
 import { MarkdownText } from "../../common/MarkdownText";
+import { PageLinkOffer } from "../../common/PageLinkOffer";
+import { pageNavigation } from "../../common/pageNavigation";
 import { CardBlock, Collapse, resolveKanbanLinkFor } from "../Chat";
 import {
   ASK_HTML_BRIDGE,
   askFileKind,
-  askHtmlStaysInFrame,
   askShown,
   readAskHtmlMessage,
   type AskFileKind,
@@ -232,10 +232,20 @@ function useAskHtmlTheme() {
 }
 
 /**
- * A page inside an ask. It is the ask's own text, loaded from a string into a
- * private WebView: no address of the server, no cookies, no storage, no file
- * access, and nothing of the app's session. The page can hand back a value for
- * a custom field and say how tall it is; any link it follows opens outside.
+ * A page inside an ask. It is text an agent wrote, so it is not trusted.
+ *
+ * What it cannot reach: it is loaded from a string with no base address, so it
+ * has no origin of the server's; the WebView is private (`incognito`, no
+ * shared or third-party cookies, no cache, no storage) so it holds no cookie
+ * of the app's, and the app's session is a token in the app's own memory that
+ * is never given to a WebView; files are off. The only way it can talk to the
+ * app is `postMessage`, and the app reads two things from that and nothing
+ * else: how tall the page is, and a value for a custom field. The app tells it
+ * the colours of the theme and nothing more.
+ *
+ * Where it can go: nowhere by itself (`pageNavigation`). It can never move the
+ * app or open another one, and a web link it follows is only offered under the
+ * page, to be opened by his own tap.
  */
 export function AskHtml(props: {
   readonly html: string;
@@ -243,11 +253,20 @@ export function AskHtml(props: {
   readonly height: number | null;
   /** Called when the page posts a value for a custom field. */
   readonly onValue?: ((value: unknown) => void) | undefined;
+  /**
+   * The answer can't be changed now (not his device, expired, handed over,
+   * sending): the page still shows, but it takes no touches and a value it
+   * posts is ignored.
+   */
+  readonly disabled?: boolean | undefined;
 }) {
   const title = props.title ?? "Page";
   const theme = useAskHtmlTheme();
   const [contentHeight, setContentHeight] = useState<number | null>(null);
   const [failed, setFailed] = useState(false);
+  // A web link the page tried to follow, waiting for his tap.
+  const [offered, setOffered] = useState<string | null>(null);
+  const disabled = props.disabled === true;
   const height = Math.min(
     INLINE_MAX_HEIGHT,
     clampHtmlRenderHeight(contentHeight ?? props.height ?? 320),
@@ -256,12 +275,16 @@ export function AskHtml(props: {
     const message = readAskHtmlMessage(event.nativeEvent.data);
     if (message === null) return;
     if (message._tag === "height") setContentHeight(message.height);
-    else props.onValue?.(message.value);
+    else if (!disabled) props.onValue?.(message.value);
   };
+  // Every navigation of the page and of its frames is asked about here. The
+  // origin whitelist stays "*" on purpose: a URL outside the whitelist is
+  // opened by the WebView library itself, with no question asked.
   const onNavigate = (request: WebViewNavigation & { isTopFrame?: boolean }) => {
-    if (askHtmlStaysInFrame(request.url) || request.isTopFrame === false) return true;
-    void tryOpenExternalUrl(request.url, "html-render");
-    return false;
+    const verdict = pageNavigation(request);
+    // He can't touch a disabled page, so a link it follows is its own doing.
+    if (verdict._tag === "offer" && !disabled) setOffered(verdict.url);
+    return verdict._tag === "load";
   };
   // The page takes the app's colours as it loads, and again when they change.
   const themeScript = `window.postMessage(${JSON.stringify(htmlRenderThemeMessage(theme))}, "*"); true;`;
@@ -281,7 +304,12 @@ export function AskHtml(props: {
           This page couldn't be shown here.
         </Text>
       ) : (
-        <View style={{ height }}>
+        <View
+          style={{ height, pointerEvents: disabled ? "none" : "auto" }}
+          accessibilityElementsHidden={disabled}
+          importantForAccessibility={disabled ? "no-hide-descendants" : "auto"}
+          className={disabled ? "opacity-60" : undefined}
+        >
           <WebView<object>
             ref={webView}
             source={{ html: injectHtmlRenderBootstrap(props.html) }}
@@ -291,8 +319,16 @@ export function AskHtml(props: {
             injectedJavaScript={themeScript}
             onMessage={onMessage}
             onShouldStartLoadWithRequest={onNavigate}
+            // A new window is a navigation like any other: offered, never opened.
+            onOpenWindow={(event) => {
+              const verdict = pageNavigation({ url: event.nativeEvent.targetUrl });
+              if (verdict._tag === "offer" && !disabled) setOffered(verdict.url);
+            }}
             onError={() => setFailed(true)}
             setSupportMultipleWindows={false}
+            javaScriptCanOpenWindowsAutomatically={false}
+            allowsLinkPreview={false}
+            dataDetectorTypes="none"
             incognito
             cacheEnabled={false}
             domStorageEnabled={false}
@@ -308,6 +344,9 @@ export function AskHtml(props: {
           />
         </View>
       )}
+      {offered !== null && !disabled ? (
+        <PageLinkOffer url={offered} onDone={() => setOffered(null)} />
+      ) : null}
     </View>
   );
 }

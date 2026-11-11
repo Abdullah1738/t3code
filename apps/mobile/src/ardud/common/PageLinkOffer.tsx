@@ -1,0 +1,55 @@
+import { Pressable, View } from "react-native";
+
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text } from "../../components/ui/AppText";
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { isWebAddress, pageLinkHost } from "./pageNavigation";
+
+/**
+ * A link a page inside the app tried to follow. The page never opens anything
+ * by itself: the link is shown here, with the site it leads to, and opens only
+ * when he taps it. Nothing but a web address ever gets this far, and it is
+ * checked once more before it opens.
+ */
+export function PageLinkOffer(props: { readonly url: string; readonly onDone: () => void }) {
+  const host = pageLinkHost(props.url);
+  if (host === "" || !isWebAddress(props.url)) return null;
+  return (
+    <View className="flex-row items-center gap-1 border-t border-border bg-card">
+      <Pressable
+        accessibilityRole="link"
+        accessibilityLabel={`Open ${host} in the browser`}
+        accessibilityHint={props.url}
+        onPress={() => {
+          props.onDone();
+          if (isWebAddress(props.url)) void tryOpenExternalUrl(props.url, "html-render");
+        }}
+        className="min-h-11 min-w-0 flex-1 flex-row items-center gap-2 px-3.5 py-2 active:opacity-70"
+      >
+        <SymbolView
+          name="arrow.up.right"
+          size={12}
+          tintColorClassName="accent-primary-text"
+          type="monochrome"
+        />
+        <Text numberOfLines={1} className="min-w-0 flex-1 text-sm font-t3-medium text-primary-text">
+          Open {host}
+        </Text>
+      </Pressable>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Dismiss link"
+        hitSlop={6}
+        onPress={props.onDone}
+        className="size-11 items-center justify-center active:opacity-70"
+      >
+        <SymbolView
+          name="xmark"
+          size={11}
+          tintColorClassName="accent-icon-muted"
+          type="monochrome"
+        />
+      </Pressable>
+    </View>
+  );
+}

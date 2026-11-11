@@ -4,6 +4,7 @@
  * marks a row shows, the queue as list rows, the bridge to a page inside an
  * ask, and when an answer made offline goes again. Pure.
  */
+import { isWebAddress, pageLinkHost } from "../../common/pageNavigation";
 import {
   askAge,
   askOutcome,
@@ -146,10 +147,17 @@ export function askFacts(
   return facts;
 }
 
-/** The site a step's link opens, without the scheme: "appstoreconnect.apple.com". */
-export function linkHost(link: string): string {
-  const host = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(link.trim())?.[1];
-  return host ? host.replace(/^www\./, "") : "the link";
+/**
+ * A step's link as something he can open: only a web address, named by the
+ * site it really leads to. Anything else an agent put there (the app's own
+ * scheme, a phone number, another app) is not a link here and opens nothing.
+ */
+export function stepWebLink(
+  link: string | undefined,
+): { readonly url: string; readonly host: string } | null {
+  if (link === undefined || !isWebAddress(link)) return null;
+  const host = pageLinkHost(link);
+  return host === "" ? null : { url: link.trim(), host };
 }
 
 /** What a file field takes, in words: "PDF or images", not "application/pdf, image/*". */
@@ -196,6 +204,17 @@ export function moveRank(order: ReadonlyArray<string>, id: string, to: number): 
   next.splice(target, 0, id);
   return next;
 }
+
+/**
+ * Whether a value a page handed back becomes the field's value. Never while
+ * the answer can't be changed (not his device, expired, handed over, sending):
+ * the page keeps running then, and what it posts is dropped.
+ */
+export const customValueTaken = (
+  field: Pick<KanbanAskField, "min" | "max">,
+  value: unknown,
+  disabled: boolean,
+): boolean => !disabled && customValueAccepted(field, value);
 
 /** Whether a value a page handed back fits its custom field's limits. */
 export function customValueAccepted(
@@ -314,7 +333,8 @@ export function askRowMedia(blocks: ReadonlyArray<KanbanAskBlock> | undefined): 
  * message it posts to itself is passed on to the app. A page in a frame tells
  * its host how tall it is; here it has no frame, so this says it instead. The
  * page gets nothing back but the theme: no token, no cookie, no way to call
- * the app.
+ * the app. Where the page may go is decided apart from this, for every
+ * navigation, by `pageNavigation` (ardud/common).
  */
 export const ASK_HTML_BRIDGE = `(function(){if(window.__robobAsk)return;window.__robobAsk=true;function send(d){try{window.ReactNativeWebView.postMessage(typeof d==="string"?d:JSON.stringify(d));}catch(_){}}window.addEventListener("message",function(e){var d=e.data;if(d===undefined||d===null)return;send(d);});var last;function size(){var r=document.documentElement;if(!r)return;var v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(!v||v===last)return;last=v;send({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:v}});}document.addEventListener("DOMContentLoaded",function(){size();if(window.ResizeObserver){var o=new ResizeObserver(size);o.observe(document.documentElement);if(document.body)o.observe(document.body);}});window.addEventListener("load",size);})();true;`;
 
@@ -343,10 +363,6 @@ export function readAskHtmlMessage(raw: string): AskHtmlMessage | null {
   const height = readHtmlRenderContentHeight(data);
   return height === undefined ? null : { _tag: "height", height };
 }
-
-/** Whether a page may load `url` in place: only itself. Everything else opens outside the app. */
-export const askHtmlStaysInFrame = (url: string): boolean =>
-  url === "about:blank" || url === "about:srcdoc" || url.startsWith("data:");
 
 // The queue as a list
 
