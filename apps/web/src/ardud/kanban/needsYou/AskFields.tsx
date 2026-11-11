@@ -432,6 +432,26 @@ function RankControl(props: {
 }
 
 /** Uploads started on a file field, by attachment id, so a removed file frees its upload. */
+/** What a file field takes, in words: "PDF or images", not "application/pdf, image/*". */
+const acceptsInWords = (accepts: ReadonlyArray<string>): string => {
+  const words = accepts.map((entry) => {
+    const type = entry.trim().toLowerCase();
+    if (type === "application/pdf" || type === ".pdf") return "PDF";
+    if (type === "image/*") return "images";
+    if (type === "video/*") return "videos";
+    if (type === "audio/*") return "audio";
+    if (type === "text/csv" || type === ".csv") return "CSV";
+    if (type === "text/plain" || type === ".txt") return "text";
+    if (type.startsWith(".")) return type.slice(1).toUpperCase();
+    const [, sub = type] = type.split("/");
+    return sub === "*" ? type.replace("/*", "") : sub.toUpperCase();
+  });
+  const unique = [...new Set(words)];
+  return unique.length < 2
+    ? (unique[0] ?? "")
+    : `${unique.slice(0, -1).join(", ")} or ${unique.at(-1)}`;
+};
+
 const uploadIdByAttachment = new Map<string, string>();
 
 function FileControl(props: {
@@ -585,19 +605,26 @@ function FileControl(props: {
             "flex min-h-24 flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed px-4 py-4 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) disabled:opacity-50",
             over
               ? "border-(--m-accent) bg-(--m-band)"
-              : "border-(--m-control) hover:bg-(--m-surface)",
+              : "border-(--ny-edge) hover:bg-(--m-surface)",
             common["aria-invalid"] && "border-(--m-negative)",
           )}
         >
           <UploadIcon aria-hidden className="size-4 text-(--m-muted)" />
           <span>
             <span className="font-medium">
-              {files.length + pending.length > 0 ? "Add another" : "Drop the file here"}
+              {files.length + pending.length > 0 ? (
+                "Add another"
+              ) : (
+                <>
+                  <span className="pointer-coarse:hidden">Drop the file here</span>
+                  <span className="pointer-fine:hidden">Choose a file</span>
+                </>
+              )}
             </span>
-            <span className="text-(--m-muted)">, or choose one</span>
+            <span className="text-(--m-muted) pointer-coarse:hidden">, or choose one</span>
           </span>
           {field.accepts ? (
-            <span className="text-xs text-(--m-muted)">{field.accepts.join(", ")}</span>
+            <span className="text-xs text-(--m-muted)">{acceptsInWords(field.accepts)}</span>
           ) : null}
         </button>
       ) : null}
@@ -670,7 +697,7 @@ function SecretControl(props: {
       />
       <p className="flex items-center gap-1.5 text-sm text-(--m-muted)">
         <LockIcon aria-hidden className="size-3.5" />
-        Sent privately with your answer. Never shown again.
+        Sent privately, at once: no undo. Never shown again.
       </p>
     </div>
   );

@@ -2,7 +2,7 @@ import {
   EMPTY_NEEDS_YOU_FILTER,
   askFieldKind,
   askKeyAction,
-  askKindLabel,
+  askBatchTitle,
   askRefusal,
   needsYouBatchKey,
   needsYouFiltered,
@@ -529,7 +529,7 @@ export function NeedsYouPage(props: {
               <BatchView
                 key={focused.key}
                 batchKey={focused.key}
-                title={`${focused.entries.length} alike: ${askKindLabel(focused.batch.batchKey).toLowerCase()}`}
+                title={askBatchTitle(focused.entries.map((entry) => entry.kind))}
                 boardName={boardNames.get(focused.batch.boardId) ?? ""}
                 entries={focused.entries}
                 layout={layout}

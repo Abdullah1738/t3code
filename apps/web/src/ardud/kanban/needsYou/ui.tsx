@@ -6,6 +6,7 @@ import { Dialog } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
 import {
   useLayoutEffect,
+  useRef,
   useState,
   type ComponentProps,
   type ReactNode,
@@ -38,7 +39,7 @@ export function Btn({
           ? "h-7.5 px-3 text-sm pointer-coarse:h-9"
           : "h-9 px-4 text-sm pointer-coarse:h-11 pointer-coarse:text-base",
         tone === "primary" && "bg-(--m-accent) text-(--m-accent-ink) hover:opacity-90",
-        tone === "plain" && "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
+        tone === "plain" && "bg-(--m-chip) text-(--m-text) hover:bg-(--m-control)",
         tone === "ghost" && "text-(--m-muted) hover:bg-(--m-chip) hover:text-(--m-text)",
         ring,
         // On the accent fill the ring is the fill's own ink, set in from the edge.
@@ -187,6 +188,9 @@ export function Layer(props: {
 }) {
   const { side } = props;
   const offset = props.bottomOffset ?? 0;
+  // Focus lands on the sheet itself unless its content names a better place:
+  // on Close it would open that button's tooltip over the title.
+  const popup = useRef<HTMLDivElement>(null);
   return (
     <Dialog.Root
       open={props.open}
@@ -202,8 +206,10 @@ export function Layer(props: {
           style={{ bottom: offset }}
         />
         <Dialog.Popup
-          initialFocus={props.initialFocus}
+          ref={popup}
+          initialFocus={props.initialFocus ?? popup}
           aria-label={props.title}
+          aria-modal={offset > 0 ? undefined : true}
           data-ny
           className={cn(
             "fixed flex min-h-0 flex-col bg-(--m-raised) text-(--m-text) shadow-xl ring-1 ring-(--m-rule) outline-none transition-[opacity,translate] duration-200 ease-out data-ending-style:opacity-0 data-starting-style:opacity-0 motion-reduce:transition-none",

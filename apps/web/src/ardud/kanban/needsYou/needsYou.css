@@ -57,6 +57,11 @@ html[data-theme-id="desk"].dark {
   padding: 1px 0;
 }
 
+/* The board's composer shows only a caret when it has focus. On this page it takes the page's ring. */
+[data-ny] form:has([role="textbox"]:focus-visible) {
+  box-shadow: inset 0 0 0 2px var(--m-accent);
+}
+
 /* The ask in focus arrives with a short rise; nothing else on the page performs. */
 @keyframes ny-rise {
   from {

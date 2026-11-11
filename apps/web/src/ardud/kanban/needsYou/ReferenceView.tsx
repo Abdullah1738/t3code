@@ -161,8 +161,8 @@ const NO_BLOCKS: ReadonlySet<number> = new Set();
 function Section(props: { title: string; sub?: string; children: ReactNode }) {
   return (
     <section className="flex min-w-0 flex-col">
-      <h2 className="text-base font-semibold">{props.title}</h2>
-      {props.sub ? <p className="mt-0.5 mb-1 text-(--m-muted)">{props.sub}</p> : null}
+      <h2 className="text-xl font-semibold text-balance">{props.title}</h2>
+      {props.sub ? <p className="mt-0.5 mb-1 text-pretty text-(--m-muted)">{props.sub}</p> : null}
       {props.children}
     </section>
   );
@@ -174,7 +174,7 @@ function Part(props: { name: string; how?: string; children: ReactNode }) {
     <div className="grid min-w-0 gap-x-6 gap-y-2.5 border-t border-(--m-rule) py-4 first-of-type:border-t-0 @2xl:grid-cols-[10rem_minmax(0,1fr)]">
       <div className="min-w-0">
         <h3 className="font-medium">{props.name}</h3>
-        {props.how ? <p className="text-(--m-muted)">{props.how}</p> : null}
+        {props.how ? <p className="text-pretty text-(--m-muted)">{props.how}</p> : null}
       </div>
       <div className="min-w-0 text-base">{props.children}</div>
     </div>
@@ -337,7 +337,7 @@ export function ReferenceView(props: {
         <div className="grid min-w-0 items-start gap-x-8 gap-y-9 @5xl:grid-cols-[minmax(0,1fr)_20rem]">
           <Section
             title="What you can give back"
-            sub="Six parts, always in this order: steps, options, fields, then the buttons."
+            sub="Always in this order: steps, options, fields, then the buttons."
           >
             <Part name="Approve or reject" how="The labels can say what happens.">
               <Buttons yes="Deploy" no="Don't deploy" />
@@ -345,7 +345,7 @@ export function ReferenceView(props: {
             <Part name="Choose" how="One or many. An option can carry a picture.">
               <ChooseSample />
             </Part>
-            <Part name="Fill in" how="A small form, checked as you type.">
+            <Part name="Fill in" how="A small form, checked before it sends.">
               <FillSample />
             </Part>
             <Part name="Edit" how="The draft is edited in place, then approved.">
@@ -368,7 +368,7 @@ export function ReferenceView(props: {
             </Label>
             <ol className="flex list-decimal flex-col gap-2 ps-5 marker:text-(--m-muted) marker:tabular-nums">
               {TOLD.map((sentence) => (
-                <li key={sentence} className="ps-1 [overflow-wrap:anywhere]">
+                <li key={sentence} className="ps-1 text-pretty [overflow-wrap:anywhere]">
                   {sentence}
                 </li>
               ))}

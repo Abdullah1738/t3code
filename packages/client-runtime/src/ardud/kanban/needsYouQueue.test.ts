@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { needsYouFromFeed } from "./needsYou.ts";
 import {
   askAge,
+  askBatchTitle,
   askKindLabel,
   EMPTY_NEEDS_YOU_FILTER,
   needsYouFocusOrder,
@@ -183,7 +184,9 @@ describe("labels", () => {
 
   it("reads any kind as a label and any wait as an age", () => {
     expect(askKindLabel("flake-triage")).toBe("Flake triage");
-    expect(askKindLabel("signoff")).toBe("Signoff");
+    expect(askKindLabel("signoff")).toBe("Sign-off");
+    expect(askBatchTitle(["action", "action", "action", "action"])).toBe("4 actions alike");
+    expect(askBatchTitle(["action", "change"])).toBe("2 asks alike");
     expect(askAge(5 * 86_400_000 + 9 * 3_600_000)).toBe("5d 9h");
     expect(askAge(3 * 3_600_000 + 10)).toBe("3h");
     expect(askAge(12 * 60_000)).toBe("12m");
