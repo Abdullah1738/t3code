@@ -31,6 +31,14 @@ const ui = vi.hoisted(() => ({
   scope: { current: null as unknown },
   boardPost: vi.fn(),
   alerts: [] as Array<string>,
+  configs: new Map<string, unknown>(),
+  /** The composer's "attach a file", as its button would call it. */
+  pickFiles: null as (() => Promise<void>) | null,
+  picked: [] as Array<unknown>,
+  /** What the upload helper was called with, and what it answers. */
+  uploads: [] as Array<{ readonly writeGate?: unknown }>,
+  uploadResult: { status: "cancelled" } as unknown,
+  releases: [] as Array<ReadonlyArray<unknown>>,
 }));
 
 vi.mock("react-native", () => ({
@@ -70,20 +78,28 @@ vi.mock("../../../components/ui/Dialog", () => ({
   alert: (title: string) => void ui.alerts.push(title),
 }));
 vi.mock("../../../features/threads/ComposerAttachmentButton", () => ({
-  ComposerAttachmentButton: () => null,
+  ComposerAttachmentButton: (props: { readonly onPickFiles: () => Promise<void> }) => {
+    ui.pickFiles = props.onPickFiles;
+    return null;
+  },
 }));
 vi.mock("../../../lib/composerImages", () => ({
-  pickComposerFiles: async () => ({ files: [] }),
+  pickComposerFiles: async () => ({ files: ui.picked }),
   pickComposerMedia: async () => ({ attachments: [] }),
 }));
 vi.mock("../../../lib/attachmentUpload", () => ({
-  prepareTurnAttachments: async () => ({ status: "cancelled" }),
-  releasePendingAttachmentUploads: async () => undefined,
+  prepareTurnAttachments: async (input: { readonly writeGate?: unknown }) => {
+    ui.uploads.push(input);
+    return ui.uploadResult;
+  },
+  releasePendingAttachmentUploads: async (...args: ReadonlyArray<unknown>) => {
+    ui.releases.push(args);
+  },
 }));
 vi.mock("../../../state/use-composer-drafts", () => ({
   releaseUnusedComposerAttachmentFiles: async () => undefined,
 }));
-vi.mock("../../../state/entities", () => ({ useServerConfigs: () => new Map() }));
+vi.mock("../../../state/entities", () => ({ useServerConfigs: () => ui.configs }));
 vi.mock("../../../state/assets", () => ({ useAssetUrl: () => null }));
 vi.mock("@t3tools/client-runtime/state/attachments", () => ({ formatAttachmentSize: () => "" }));
 vi.mock("../../common/environment", () => ({ usePairedEnvironmentId: () => "A" }));
@@ -243,6 +259,12 @@ beforeEach(() => {
   ui.presses.clear();
   ui.alerts.length = 0;
   ui.boardPost.mockClear();
+  ui.configs.clear();
+  ui.pickFiles = null;
+  ui.picked = [];
+  ui.uploads = [];
+  ui.uploadResult = { status: "cancelled" };
+  ui.releases = [];
 });
 
 afterEach(() => {
@@ -349,5 +371,59 @@ describe("a reply under an ask whose thread holds stand-ins", () => {
       { blocks: [{ _tag: "md", text: "first" }] },
       { blocks: [{ _tag: "md", text: "second" }] },
     ]);
+  });
+});
+
+describe("a file added to a reply under an ask", () => {
+  it("is uploaded, and its upload deleted, through the ask's own gate", async () => {
+    const { scopes } = server();
+    const scope = scopes.current();
+    ui.scope.current = scope;
+    await scope.asks.refreshAsks();
+    const entry = scope.cell.getState().feed!.open[0]!;
+    ui.configs.set("A", { environment: { capabilities: { attachmentUploads: true } } });
+    ui.picked = [
+      {
+        id: "local-1",
+        type: "file",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 3,
+        fileUri: "file:///picked/notes.txt",
+      },
+    ];
+    ui.uploadResult = {
+      status: "ready",
+      attachments: [
+        { type: "file", id: "up-1", name: "notes.txt", mimeType: "text/plain", sizeBytes: 3 },
+      ],
+    };
+    act(() =>
+      root.render(
+        <AskTalk
+          entry={entry}
+          waiting={false}
+          nowMs={Date.parse("2026-11-11T09:00:00.000Z")}
+          bottomInset={0}
+          onOpenCard={() => undefined}
+        />,
+      ),
+    );
+    if (ui.pickFiles === null) throw new Error("The composer's attach button is not rendered");
+    const pick = ui.pickFiles;
+    await act(async () => {
+      await pick();
+      await new Promise((done) => setTimeout(done, 0));
+    });
+    // The upload is asked of the helper with the scope's gate: the helper asks it
+    // before the upload is created and before its bytes go.
+    expect(ui.uploads).toHaveLength(1);
+    expect(ui.uploads[0]!.writeGate).toBe(scope.writeBlocked);
+    expect(ui.releases).toEqual([]);
+
+    // He leaves with the file still in the reply: its upload is deleted, through the same gate.
+    act(() => root.unmount());
+    expect(ui.releases).toEqual([["A", ["up-1"], scope.writeBlocked]]);
+    root = createRoot(host);
   });
 });

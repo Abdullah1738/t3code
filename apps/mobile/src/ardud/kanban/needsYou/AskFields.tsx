@@ -28,6 +28,7 @@ import {
   releasePendingAttachmentUploads,
 } from "../../../lib/attachmentUpload";
 import { cn } from "../../../lib/cn";
+import { AttachmentWriteRefused } from "../../common/attachmentWriteGate";
 import {
   pickComposerFiles,
   pickComposerMedia,
@@ -528,6 +529,8 @@ function ArrowButton(props: {
 interface PendingFile {
   readonly local: DraftComposerAttachment;
   readonly failed: boolean;
+  /** It failed because this phone may not write now: nothing of it was sent. */
+  readonly refused?: boolean;
   readonly controller: AbortController;
 }
 
@@ -537,6 +540,12 @@ const storedFiles = (value: unknown): ReadonlyArray<AskAnswerFile> =>
 /**
  * Files for the answer, from the photo library or the document picker. Each
  * one uploads as it is picked; a finished upload becomes part of the answer.
+ *
+ * An upload is a write, and so is deleting one. Both go through the scope's
+ * gate (`writeBlocked`), asked immediately before the upload is created, before
+ * its bytes go and before every delete: nothing of a file leaves the phone, and
+ * nothing on the server is deleted, unless this phone is confirmed as his over
+ * the connection that is up now. A file the gate stopped shows as "Not attached".
  */
 function FileControl(props: {
   readonly entry: KanbanAskFeedItem;
@@ -585,6 +594,14 @@ function FileControl(props: {
     };
   }, []);
 
+  // A server copy nobody holds any more is deleted, through the gate. A delete the
+  // gate refuses, or that fails, is not tried again: the server drops an upload no
+  // answer took, and the file is gone from here either way.
+  const forget = (environment: EnvironmentId, ids: ReadonlyArray<string>) =>
+    void releasePendingAttachmentUploads(environment, ids, scope.writeBlocked).catch(
+      () => undefined,
+    );
+
   const upload = (file: PendingFile, environment: EnvironmentId) => {
     const { local, controller } = file;
     const drop = () =>
@@ -594,6 +611,7 @@ function FileControl(props: {
       attachments: [local],
       supportsImageUploads: true,
       signal: controller.signal,
+      writeGate: scope.writeBlocked,
     })
       .then((result) => {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
@@ -601,7 +619,7 @@ function FileControl(props: {
         if (stored === undefined || id === undefined) throw new Error("Upload cancelled.");
         if (controller.signal.aborted || !live.current || lockedNow.current || !scope.live()) {
           // Removed, left, locked or the server changed while uploading: the server copy has no owner, so drop it.
-          void releasePendingAttachmentUploads(environment, [id]);
+          forget(environment, [id]);
           if (live.current) drop();
           return;
         }
@@ -620,11 +638,12 @@ function FileControl(props: {
         drop();
         void releaseUnusedComposerAttachmentFiles([local]);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (controller.signal.aborted || !live.current) return;
+        const refused = error instanceof AttachmentWriteRefused;
         setPending((current) =>
           current.map((other) =>
-            other.local.id === local.id ? { ...other, failed: true } : other,
+            other.local.id === local.id ? { ...other, failed: true, refused } : other,
           ),
         );
       });
@@ -686,7 +705,7 @@ function FileControl(props: {
 
   const retry = (file: PendingFile) => {
     if (props.disabled || environmentId === null) return;
-    const again = { ...file, failed: false, controller: new AbortController() };
+    const again = { ...file, failed: false, refused: false, controller: new AbortController() };
     setPending((current) =>
       current.map((other) => (other.local.id === file.local.id ? again : other)),
     );
@@ -699,7 +718,7 @@ function FileControl(props: {
   };
   const remove = (file: AskAnswerFile) => {
     if (props.disabled) return;
-    if (environmentId !== null) void releasePendingAttachmentUploads(environmentId, [file.id]);
+    if (environmentId !== null) forget(environmentId, [file.id]);
     asks.setAskValue(
       entry,
       field.id,
@@ -728,7 +747,7 @@ function FileControl(props: {
         <FileLine
           key={file.local.id}
           name={file.local.name}
-          detail={file.failed ? "Upload failed" : "Uploading"}
+          detail={file.failed ? (file.refused ? "Not attached" : "Upload failed") : "Uploading"}
           state={file.failed ? "failed" : "uploading"}
         >
           {file.failed ? (

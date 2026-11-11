@@ -114,7 +114,7 @@ export function AskTalk(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
-  const { asks, api } = useAskScope();
+  const { asks, api, writeBlocked } = useAskScope();
   const late = useLateStanding();
   const { entry } = props;
   // A reply is sent at once and never queued: it goes by the standing to send by.
@@ -211,6 +211,7 @@ export function AskTalk(props: {
             ensureDiscussion={() => Promise.resolve("")}
             bottomInset={props.bottomInset}
             placeholder="Ask the agent anything"
+            writeBlocked={writeBlocked}
             onSent={() => scroll.current?.scrollToEnd({ animated: true })}
             post={(blocks) => {
               setProblem(askReplyProblem(blocks));

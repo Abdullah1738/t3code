@@ -1055,6 +1055,17 @@ interface ComposerScope {
   live: boolean;
 }
 
+/**
+ * Deletes server copies of uploads nobody holds any more, through the caller's gate when
+ * there is one. A delete that is refused or fails is not tried again: the server drops an
+ * upload no message took.
+ */
+const forgetUploads = (
+  environment: EnvironmentId,
+  ids: ReadonlyArray<string>,
+  gate: (() => string | null) | undefined,
+) => void releasePendingAttachmentUploads(environment, ids, gate).catch(() => undefined);
+
 export function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
@@ -1064,6 +1075,12 @@ export function Composer(props: {
   /** Sends the blocks somewhere other than the discussion: a reply on an ask. */
   readonly post?: ((blocks: KanbanBlock[]) => Promise<void>) | undefined;
   readonly placeholder?: string | undefined;
+  /**
+   * Under an ask: why nothing may be written to the server now, or null (the
+   * ask scope's gate). Asked before a file's upload is created, before its
+   * bytes go and before every delete of one.
+   */
+  readonly writeBlocked?: (() => string | null) | undefined;
 }) {
   const [text, setText] = useState("");
   const [drafts, setDrafts] = useState<ReadonlyArray<ComposerDraft>>([]);
@@ -1088,10 +1105,12 @@ export function Composer(props: {
   // unmount cleanup reads them here; they are released only after the post settles.
   const sendingRef = useRef<ReadonlyArray<ComposerDraft>>([]);
   const environmentRef = useRef(environmentId);
+  const gateRef = useRef(props.writeBlocked);
   // Kept after each render, not during it: the cleanup below runs later and reads the last ones.
   useEffect(() => {
     draftsRef.current = drafts;
     environmentRef.current = environmentId;
+    gateRef.current = props.writeBlocked;
   });
   const scope = useRef<ComposerScope>({ live: true });
   useEffect(() => {
@@ -1104,7 +1123,7 @@ export function Composer(props: {
       const uploads = draftsRef.current.flatMap((draft) =>
         draft.uploaded === null ? [] : [draft.uploaded.id],
       );
-      if (id !== null && uploads.length > 0) void releasePendingAttachmentUploads(id, uploads);
+      if (id !== null && uploads.length > 0) forgetUploads(id, uploads, gateRef.current);
       void releaseUnusedComposerAttachmentFiles(draftsRef.current.map((draft) => draft.local));
     };
   }, []);
@@ -1119,6 +1138,7 @@ export function Composer(props: {
       attachments: [local],
       supportsImageUploads: true,
       signal: controller.signal,
+      writeGate: props.writeBlocked,
     })
       .then((result) => {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
@@ -1126,7 +1146,7 @@ export function Composer(props: {
         if (stored === undefined || storedId === undefined) throw new Error("Upload cancelled.");
         if (controller.signal.aborted || !owner.live) {
           // Removed or unmounted while uploading: the server copy has no owner, so drop it.
-          void releasePendingAttachmentUploads(environment, [storedId]);
+          forgetUploads(environment, [storedId], gateRef.current);
           return;
         }
         patch(local.id, (current) => ({ ...current, uploaded: stored as StoredAttachment }));
@@ -1186,7 +1206,7 @@ export function Composer(props: {
     removed.controller.abort();
     setDrafts((current) => current.filter((draft) => draft.local.id !== id));
     if (removed.uploaded !== null && environmentId !== null) {
-      void releasePendingAttachmentUploads(environmentId, [removed.uploaded.id]);
+      forgetUploads(environmentId, [removed.uploaded.id], gateRef.current);
     }
     void releaseUnusedComposerAttachmentFiles([removed.local]);
   };
@@ -1223,7 +1243,7 @@ export function Composer(props: {
             draft.uploaded === null ? [] : [draft.uploaded.id],
           );
           if (environmentRef.current !== null && ids.length > 0) {
-            void releasePendingAttachmentUploads(environmentRef.current, ids);
+            forgetUploads(environmentRef.current, ids, gateRef.current);
           }
           void releaseUnusedComposerAttachmentFiles(sending.map((draft) => draft.local));
           return;
