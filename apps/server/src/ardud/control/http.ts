@@ -977,7 +977,8 @@ const makeRoutes = Effect.gen(function* () {
    */
   const listUpdatedSince = Effect.fn("ControlApi.listUpdatedSince")(function* (input: {
     readonly location: "active" | "archive";
-    readonly since: number;
+    /** `null`: no time filter (a parentThreadId listing without updatedSince). */
+    readonly since: number | null;
     readonly active: boolean | undefined;
     readonly states: ReadonlyArray<string> | undefined;
     readonly projectId: string | null;
@@ -991,12 +992,14 @@ const makeRoutes = Effect.gen(function* () {
     // updated_at is an ISO string; widen by a second so precision differences can't drop a
     // row at the edge, then compare instants exactly.
     const rows = yield* store
-      .threadsUpdatedSince(DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)))
+      .threadsUpdatedSince(
+        since === null ? null : DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)),
+      )
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     let matched = rows.filter(
       (row) =>
         row.archived === (location === "archive") &&
-        Date.parse(row.updatedAt) > since &&
+        (since === null || Date.parse(row.updatedAt) > since) &&
         (input.includeSubagents ||
           parentThreadId !== null ||
           row.relationshipToParent !== "subagent") &&
@@ -1018,7 +1021,7 @@ const makeRoutes = Effect.gen(function* () {
     const needsState = active !== undefined || states !== undefined;
     // Shells are re-read, so a thread that moved since the range read is filtered again.
     const stillMatches = (shell: OrchestrationV2ThreadShell) =>
-      DateTime.toEpochMillis(shell.updatedAt) > since &&
+      (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
       (input.includeSubagents ||
         parentThreadId !== null ||
         shell.lineage.relationshipToParent !== "subagent") &&
@@ -1089,7 +1092,7 @@ const makeRoutes = Effect.gen(function* () {
     if ((since !== undefined || parentThreadId !== null) && !liveOnly && ids === undefined) {
       return yield* listUpdatedSince({
         location,
-        since: since ?? 0,
+        since: since ?? null,
         active,
         states,
         projectId,

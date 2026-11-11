@@ -257,9 +257,13 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(
     const started = yield* Clock.currentTimeMillis;
     const cutoff = DateTime.formatIso(DateTime.makeUnsafe(started - retentionDays() * 86_400_000));
     // Every step below can queue behind other work: the single background reader slot, the
-    // writer (including its WAL checkpoint admission), the snapshot gate or a barrier. The
-    // pass is the least urgent user of all of them, so a slow step ends the pass and the
-    // loop backs off instead of queueing again 25 ms later.
+    // writer (including its WAL checkpoint admission), the snapshot gate or a barrier.
+    // - A read that completed is never thrown away, however long it queued: a slow read
+    //   only limits the pass to one unit of progress (a cursor advance or one row), so a
+    //   lane that is always ~1 s slow still lets archiving move forward, at the paced gap.
+    // - Contention on a step that holds the writer or the snapshot gate (the progress
+    //   write, the copy, the delete) or a failed durability barrier ends the pass as
+    //   contended, and the loop backs off.
     const slow = (startedAt: number) =>
       Clock.currentTimeMillis.pipe(Effect.map((now) => now - startedAt >= pacing.contentionMs));
     const result = (moved: number, contended: boolean): HistoryArchivePassResult => ({
@@ -275,7 +279,7 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(
     SELECT thread_id, updated_at, payload_json FROM orchestration_v2_projection_threads
     WHERE thread_id > ${cursor[0]?.thread_id ?? ""} ORDER BY thread_id LIMIT 1
   `.pipe(NodeSqliteClient.readOnly);
-    if (yield* slow(discoveryStarted)) return result(0, true);
+    let readsSlow = yield* slow(discoveryStarted);
     const thread = next[0];
     const advance = (threadId: string) => sql`
     INSERT INTO ardud_history_archive_cursor (singleton, thread_id) VALUES (1, ${threadId})
@@ -310,7 +314,7 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(
       WHERE aggregate_kind = 'thread' AND stream_id = ${thread.thread_id}) AS revision`.pipe(
       NodeSqliteClient.readOnly,
     );
-    if (yield* slow(eligibilityStarted)) return result(0, true);
+    if (yield* slow(eligibilityStarted)) readsSlow = true;
     if (allowed[0]?.allowed !== 1) {
       yield* advance(thread.thread_id);
       return result(0, false);
@@ -347,8 +351,11 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(
     // Discovery may wait behind interactive reads; only row work consumes this
     // deadline, otherwise a slow discovery would starve this cursor forever.
     const workStarted = yield* Clock.currentTimeMillis;
+    // After a slow read, one moved (or skipped) row is this pass's unit of progress.
     const withinBudget = () =>
-      Clock.currentTimeMillis.pipe(Effect.map((now) => moved === 0 || now - workStarted < 50));
+      Clock.currentTimeMillis.pipe(
+        Effect.map((now) => moved === 0 || (!readsSlow && now - workStarted < 50)),
+      );
     for (const table of HISTORY_TABLES) {
       if (table.live === "orchestration_events" && progress.phase > 0) continue;
       while (moved < MAX_ROWS_PER_PASS && (yield* withinBudget())) {
@@ -381,7 +388,7 @@ export const archiveHistoryPass = Effect.fn("HistoryArchive.pass")(
             FROM orchestration_v2_projection_turn_items WHERE ${condition} ORDER BY ordinal, turn_item_id LIMIT 1`.pipe(
                 NodeSqliteClient.readOnly,
               );
-        if (yield* slow(candidateStarted)) return result(moved, true);
+        if (yield* slow(candidateStarted)) readsSlow = true;
         const row = candidates[0];
         if (row === undefined) {
           if (table.live === "orchestration_events") {

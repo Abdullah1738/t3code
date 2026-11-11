@@ -752,6 +752,9 @@ describe("control listings", () => {
       // Old children are listed too: there is no updatedSince cut.
       child("child-old", "2020-01-01T00:00:00.000Z", "parent-a"),
       child("child-other", "2026-03-01T00:00:03.000Z", "parent-b"),
+      // No updatedSince means no time filter at all, including the epoch and before it.
+      child("child-epoch", "1970-01-01T00:00:00.000Z", "parent-a"),
+      child("child-pre-epoch", "1969-12-31T23:59:59.000Z", "parent-a"),
       child("child-archived", "2026-03-01T00:00:04.000Z", "parent-a", {
         archivedAt: at("2026-03-01T00:00:04.000Z"),
       }),
@@ -776,15 +779,20 @@ describe("control listings", () => {
             );
           // The agent-tooling shape seen on 11 Nov 2026: newest first, every live child.
           assert.deepStrictEqual(yield* list("&includeSubagents=true&limit=500"), {
-            total: 2,
-            ids: ["child-new", "child-old"],
+            total: 4,
+            ids: ["child-new", "child-old", "child-epoch", "child-pre-epoch"],
           });
-          assert.deepStrictEqual(yield* list("&limit=1"), { total: 2, ids: ["child-new"] });
+          assert.deepStrictEqual(yield* list("&limit=1"), { total: 4, ids: ["child-new"] });
           assert.deepStrictEqual(yield* list("&archived=true"), {
             total: 1,
             ids: ["child-archived"],
           });
           assert.deepStrictEqual(yield* list("&active=false"), {
+            total: 4,
+            ids: ["child-new", "child-old", "child-epoch", "child-pre-epoch"],
+          });
+          // An explicit updatedSince still cuts exactly, at the epoch too.
+          assert.deepStrictEqual(yield* list("&updatedSince=0"), {
             total: 2,
             ids: ["child-new", "child-old"],
           });

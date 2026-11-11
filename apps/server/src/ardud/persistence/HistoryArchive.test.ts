@@ -431,22 +431,63 @@ const delayQuery =
       : Effect.succeed(statement);
   };
 
-it.effect("stops without advancing when its discovery read waits behind the lane", () =>
+const slowReads: Statement.Transformer = (statement) => {
+  const [query] = statement.compile();
+  // Discovery, eligibility and candidate reads all queue 1.5 s, past the 1 s budget.
+  return /ORDER BY thread_id LIMIT 1|AS allowed|AS archive_key/.test(query)
+    ? Effect.sleep("1500 millis").pipe(Effect.as(statement))
+    : Effect.succeed(statement);
+};
+
+it.effect("keeps archiving while every read stays slow, one unit per pass", () =>
+  Effect.gen(function* () {
+    yield* seed;
+    const sql = yield* SqlClient.SqlClient;
+    // Sorts before 'old' and is too recent to archive: it must not block later threads.
+    yield* sql`INSERT INTO orchestration_v2_projection_threads
+      (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json)
+      VALUES ('a-recent', 'project', 'Recent', 'opencode', 'full-access', 'default', '2026-11-04', '2026-11-04', '{"archivedAt":null}')`;
+    const slowPass = Effect.gen(function* () {
+      const fiber = yield* archiveHistoryPass().pipe(
+        Effect.provideService(Statement.CurrentTransformer, slowReads),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("20 seconds");
+      return yield* Fiber.join(fiber);
+    });
+    // The slow, ineligible thread still moves the cursor past itself.
+    assert.deepEqual(yield* slowPass, { moved: 0, contended: false });
+    assert.deepEqual(yield* sql`SELECT thread_id FROM ardud_history_archive_cursor`, [
+      { thread_id: "a-recent" },
+    ]);
+    const results: Array<{ readonly moved: number; readonly contended: boolean }> = [];
+    for (let pass = 0; pass < 8; pass++) results.push(yield* slowPass);
+    // Reads were slow throughout, yet nothing backed off and every row moved, one per pass.
+    assert.isTrue(results.every((result) => !result.contended && result.moved <= 1));
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_events`, [{ n: 2 }]);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_v2_projection_turn_items`, [
+      { n: 0 },
+    ]);
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM ardud_history_turn_items`, [{ n: 1 }]);
+  }).pipe(Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("backs off when the progress write waits for the writer", () =>
   Effect.gen(function* () {
     yield* seed;
     const sql = yield* SqlClient.SqlClient;
     const fiber = yield* archiveHistoryPass().pipe(
       Effect.provideService(
         Statement.CurrentTransformer,
-        delayQuery(/WHERE thread_id > \? ORDER BY thread_id LIMIT 1/, "2 seconds"),
+        delayQuery(/INSERT INTO ardud_history_archive_progress/, "1500 millis"),
       ),
       Effect.forkChild,
     );
-    yield* TestClock.adjust("2100 millis");
+    yield* TestClock.adjust("2 seconds");
     assert.deepEqual(yield* Fiber.join(fiber), { moved: 0, contended: true });
-    assert.deepEqual(yield* sql`SELECT * FROM ardud_history_archive_cursor`, []);
+    // Nothing was copied while the writer was congested.
+    assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM ardud_archive.ardud_events`, [{ n: 0 }]);
     assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_events`, [{ n: 4 }]);
-    // An uncongested pass then proceeds from the same cursor.
     for (let pass = 0; pass < 5; pass++) yield* runPass;
     assert.deepEqual(yield* sql`SELECT COUNT(*) AS n FROM orchestration_events`, [{ n: 2 }]);
   }).pipe(Effect.provide(Sqlite.layerMemory)),
