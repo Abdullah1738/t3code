@@ -733,6 +733,68 @@ describe("control listings", () => {
     );
   });
 
+  it.effect("lists /threads?parentThreadId children without the shell snapshot", () => {
+    const at = (iso: string) => DateTime.makeUnsafe(iso);
+    const child = (id: string, iso: string, parent: string, overrides = {}) =>
+      shell(id, {
+        ...idle,
+        updatedAt: at(iso),
+        creationSource: "provider",
+        lineage: {
+          rootThreadId: ThreadId.make(parent),
+          parentThreadId: ThreadId.make(parent),
+          relationshipToParent: "subagent",
+        },
+        ...overrides,
+      });
+    const extra = [
+      child("child-new", "2026-03-01T00:00:02.000Z", "parent-a"),
+      // Old children are listed too: there is no updatedSince cut.
+      child("child-old", "2020-01-01T00:00:00.000Z", "parent-a"),
+      child("child-other", "2026-03-01T00:00:03.000Z", "parent-b"),
+      child("child-archived", "2026-03-01T00:00:04.000Z", "parent-a", {
+        archivedAt: at("2026-03-01T00:00:04.000Z"),
+      }),
+      child("child-deleted", "2026-03-01T00:00:05.000Z", "parent-a", {
+        deletedAt: at("2026-03-01T00:00:05.000Z"),
+      }),
+    ];
+    return run(
+      ({ get, snapshotReads }) =>
+        Effect.gen(function* () {
+          const list = (query: string) =>
+            get(`/threads?parentThreadId=parent-a${query}`).pipe(
+              Effect.map((response) => {
+                assert.strictEqual(response.status, 200);
+                return {
+                  total: response.body.total as number,
+                  ids: (response.body.threads as ReadonlyArray<{ threadId: string }>).map(
+                    (thread) => thread.threadId,
+                  ),
+                };
+              }),
+            );
+          // The agent-tooling shape seen on 11 Nov 2026: newest first, every live child.
+          assert.deepStrictEqual(yield* list("&includeSubagents=true&limit=500"), {
+            total: 2,
+            ids: ["child-new", "child-old"],
+          });
+          assert.deepStrictEqual(yield* list("&limit=1"), { total: 2, ids: ["child-new"] });
+          assert.deepStrictEqual(yield* list("&archived=true"), {
+            total: 1,
+            ids: ["child-archived"],
+          });
+          assert.deepStrictEqual(yield* list("&active=false"), {
+            total: 2,
+            ids: ["child-new", "child-old"],
+          });
+          assert.strictEqual(yield* Ref.get(snapshotReads), 0);
+        }),
+      undefined,
+      extra,
+    );
+  });
+
   it.effect(
     "orders /threads?updatedSince ties by thread id and refills vanished candidates",
     () => {
