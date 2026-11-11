@@ -6,6 +6,7 @@ import { cdp, page } from "vite-plus/test/browser";
 
 import {
   boardStateFromSnapshot,
+  createBoardView,
   EMPTY_FILTER_PREFS,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -183,8 +184,7 @@ async function render(state = boardState()) {
     root.render(
       <BoardColumns
         boardId={BOARD_ID}
-        state={state}
-        nowMs={NOW}
+        model={createBoardView().model(state, NOW, { filter: {}, group: "stage" })}
         group="stage"
         filter={{}}
         selectedCardId={undefined}
@@ -365,8 +365,7 @@ describe("group columns", () => {
       root.render(
         <BoardColumns
           boardId={BOARD_ID}
-          state={withProjects}
-          nowMs={NOW}
+          model={createBoardView().model(withProjects, NOW, { filter: {}, group: "project" })}
           group="project"
           filter={{}}
           selectedCardId={undefined}

@@ -1,13 +1,22 @@
 import { memo } from "react";
 
-import type { CardView } from "@t3tools/client-runtime/ardud/kanban";
+import type { BoardTileView } from "@t3tools/client-runtime/ardud/kanban";
+import { ageView } from "@t3tools/client-runtime/ardud/common";
 
 import { cn } from "../../lib/utils";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../../components/ui/tooltip";
+import { useBoardClock } from "./useBoardClock";
 import { Chip, flagGlyph, Glyph, ModelMark, Pri, stageGlyph, UnreadDot } from "./parts";
 
+/** How long ago, counted against the board's one shared clock so no tile runs a timer. */
+export function CardAge(props: { since: string; prefix?: string }) {
+  const label = ageView(props.since, useBoardClock())?.label ?? "";
+  if (props.prefix === undefined) return label;
+  return label && label !== "now" ? `${props.prefix} ${label}` : props.prefix;
+}
+
 export const CardTile = memo(function CardTile(props: {
-  card: CardView;
+  card: BoardTileView;
   selected: boolean;
   raised?: boolean;
   /** Similar and other groupings show the stage instead of the goal. */
@@ -35,8 +44,10 @@ export const CardTile = memo(function CardTile(props: {
         <Pri priority={card.priority} />
         <span className="tabular-nums">#{card.number}</span>
         {card.unread > 0 ? <UnreadDot label={`${card.unread} unread`} /> : null}
-        {card.card.settledAt !== null ? <span>Settled</span> : null}
-        <span className="ms-auto tabular-nums">{card.age}</span>
+        {card.settled ? <span>Settled</span> : null}
+        <span className="ms-auto tabular-nums">
+          <CardAge since={card.movedAt} />
+        </span>
       </span>
       <span className="line-clamp-2 leading-snug font-medium wrap-break-word">{card.title}</span>
       {card.flag ? (
@@ -57,7 +68,11 @@ export const CardTile = memo(function CardTile(props: {
             className={card.flag.kind === "ask" ? "mt-0.75" : undefined}
           />
           <span className={card.flag.kind === "ask" ? "line-clamp-3 wrap-break-word" : "truncate"}>
-            {card.flag.label}
+            {card.flagSince !== null ? (
+              <CardAge since={card.flagSince} prefix={card.flag.label} />
+            ) : (
+              card.flag.label
+            )}
           </span>
         </span>
       ) : null}

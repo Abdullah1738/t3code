@@ -1,4 +1,5 @@
 export * from "./boardState.ts";
+export * from "./boardView.ts";
 export * from "./cardTruth.ts";
 export * from "./client.ts";
 export * from "./columns.ts";

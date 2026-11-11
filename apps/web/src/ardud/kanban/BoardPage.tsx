@@ -5,13 +5,14 @@ import { useState } from "react";
 
 import {
   boardFilter,
-  cardSteps,
+  boardSteps,
   clearFilters,
   EMPTY_FILTER_PREFS,
   pauseBanner,
   sanitizeBoardFilterPrefs,
   type BoardFilter,
   type BoardFilterPrefs,
+  type BoardModel,
   type GroupBy,
   type KanbanBoardState,
   type SettledFilter,
@@ -40,6 +41,7 @@ import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { useNowMs } from "./useNowMs";
+import { boardViewFor, useBoardClock } from "./useBoardClock";
 import { BoardColumns } from "./BoardColumns";
 import { BoardColumnsMenu } from "./BoardColumnsMenu";
 import { BoardIcon } from "./boardIcon";
@@ -96,6 +98,8 @@ export function BoardPage(props: {
   const canLiftPause = useKanbanPermission(KANBAN_WS_METHODS.boardPause);
   const view = search.view ?? "board";
   const nowMs = useNowMs();
+  // The columns run on a coarser shared clock than the page: a tick that changes no card costs nothing.
+  const boardClock = useBoardClock();
   const [query, setQuery] = useState("");
   const [storedPrefs, setPrefs] = useLocalStorage(
     filterStorageKey(boardId),
@@ -123,10 +127,13 @@ export function BoardPage(props: {
   const setup = state ? setupBanner(state.board) : null;
   const pause = state ? pauseBanner(state.board, state.cards) : null;
   const stepCard = (card: string) => go({ card }, { replace: true });
-  const steps =
-    view === "board" && state && filter && drawerOpen && search.card
-      ? cardSteps(state, nowMs, filter, search.group ?? "stage", search.card)
+  const group = search.group ?? "stage";
+  // Derived once per board state by the board's own cache; an unchanged board gives the same object.
+  const model =
+    view === "board" && state && filter
+      ? boardViewFor(boardId).model(state, boardClock, { filter, group })
       : null;
+  const steps = model && drawerOpen && search.card ? boardSteps(model, group, search.card) : null;
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
@@ -251,6 +258,7 @@ export function BoardPage(props: {
                   prefs={prefs}
                   onPrefs={setFilters}
                   nowMs={nowMs}
+                  model={model}
                   go={go}
                   openCard={openCard}
                   openGoal={openGoal}
@@ -284,6 +292,7 @@ function BoardBody(props: {
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
   nowMs: number;
+  model: BoardModel | null;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
   openGoal: (goalId: string) => void;
@@ -291,12 +300,12 @@ function BoardBody(props: {
   const { state, search, nowMs, go, filter } = props;
   switch (search.view ?? "board") {
     case "board":
+      if (props.model === null) return null;
       return (
         <div className="flex min-h-0 flex-1 flex-col gap-3">
           <BoardColumns
             boardId={props.boardId}
-            state={state}
-            nowMs={nowMs}
+            model={props.model}
             group={search.group ?? "stage"}
             filter={filter}
             onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
