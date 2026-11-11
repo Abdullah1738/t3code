@@ -28,10 +28,11 @@ import { FilePreviewLoading, FilePreviewNotice } from "./FilePreviewFeedback";
 import { FileMarkdownPreview } from "./FileMarkdownPreview";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { SourceFileSurface } from "./SourceFileSurface";
-import { WorkspaceFileVideoPreview } from "./WorkspaceFileVideoPreview";
 import { WorkspaceFileWebPreview } from "./WorkspaceFileWebPreview";
 // ardud: video plays in the app, and the system viewer is waited for a limited time
+import { AttachmentVideoPreview } from "../../ardud/common/AttachmentVideoPreview";
 import {
+  attachmentVideoKey,
   fileViewerStall,
   fileViewerTimeLimitMs,
   systemViewerKind,
@@ -65,6 +66,8 @@ function AttachmentDocumentBody(props: {
   readonly nativeViewer: NativeViewerState;
   readonly nativeError: string | null;
   readonly onOpenNative: () => void;
+  // ardud: what the video player goes by
+  readonly video: { readonly key: string; readonly local: boolean; readonly sizeBytes: number };
 }) {
   const { document } = props;
   if (document.error) {
@@ -163,14 +166,15 @@ function AttachmentDocumentBody(props: {
   }
   // ardud: the app's own player, the one that plays videos in a thread
   if (document.kind === "video") {
-    const playbackUri = document.uri;
     return (
-      <WorkspaceFileVideoPreview
+      <AttachmentVideoPreview
         name={props.name}
-        thumbnailKey={`attachment-video:${document.resource.attachmentId}:${document.revision}`}
-        uri={playbackUri}
-        source={null}
-        resolvePlaybackUri={async () => playbackUri}
+        uri={document.uri}
+        local={props.video.local}
+        environmentId={props.environmentId}
+        resource={document.resource}
+        videoKey={props.video.key}
+        sizeBytes={props.video.sizeBytes}
       />
     );
   }
@@ -440,6 +444,17 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
         nativeViewer={nativeViewer}
         nativeError={nativeError}
         onOpenNative={openNative}
+        video={{
+          key: attachmentVideoKey({
+            attachmentId: params.attachmentId,
+            name: params.name,
+            mimeType: params.mimeType,
+            environmentId,
+            localDraftKey: localAttachment ? draftKey : null,
+          }),
+          local: localAttachment !== null,
+          sizeBytes,
+        }}
       />
       {nativeOpen && nativeSource ? (
         <FilePreviewModal

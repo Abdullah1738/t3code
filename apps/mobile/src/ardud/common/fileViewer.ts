@@ -9,7 +9,10 @@
  * says so and offers to try again; a viewer that does come up later still
  * shows over that.
  */
+import type { EnvironmentId } from "@t3tools/contracts";
 import type { FilePreviewKind } from "@t3tools/shared/filePreview";
+
+import { mediaVideoThumbnailKey } from "../../lib/videoPreviewSource";
 
 /** The viewer a kind of file is handed to, or null when the app shows it itself. */
 export function systemViewerKind(kind: FilePreviewKind): "image" | "pdf" | "document" | null {
@@ -52,4 +55,41 @@ const MAX_MS = 120_000;
 export function fileViewerTimeLimitMs(sizeBytes: number): number {
   const megabytes = Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes / (1024 * 1024) : 0;
   return Math.min(MAX_MS, Math.round(BASE_MS + megabytes * PER_MEGABYTE_MS));
+}
+
+/**
+ * What a video attachment's player and its still frame are kept under. The
+ * frame cache is one for the whole app, and attachment ids are not unique
+ * across servers: two servers restored from the same data hold the same ids.
+ * So the key names the server, and is the one the thread's own tile uses for
+ * that attachment (the frame is the same file's). A file still on the phone,
+ * in a draft, has no server: its key names the draft.
+ */
+export function attachmentVideoKey(input: {
+  readonly attachmentId: string;
+  readonly name: string;
+  readonly mimeType: string;
+  /** The server that holds it; null when there is none. */
+  readonly environmentId: EnvironmentId | null;
+  /** The draft that holds the file when it is still on the phone. */
+  readonly localDraftKey: string | null;
+}): string {
+  if (input.localDraftKey !== null) {
+    return JSON.stringify(["attachment-video", "local", input.localDraftKey, input.attachmentId]);
+  }
+  if (input.environmentId === null) {
+    return JSON.stringify(["attachment-video", "nowhere", input.attachmentId]);
+  }
+  return mediaVideoThumbnailKey({
+    type: "media",
+    name: input.name,
+    mimeType: input.mimeType,
+    environmentId: input.environmentId,
+    resource: {
+      _tag: "attachment",
+      attachmentId: input.attachmentId,
+      fileName: input.name,
+      mimeType: input.mimeType,
+    },
+  });
 }

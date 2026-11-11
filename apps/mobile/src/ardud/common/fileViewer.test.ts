@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { fileViewerStall, fileViewerTimeLimitMs, systemViewerKind } from "./fileViewer";
+import { EnvironmentId } from "@t3tools/contracts";
+
+import {
+  attachmentVideoKey,
+  fileViewerStall,
+  fileViewerTimeLimitMs,
+  systemViewerKind,
+} from "./fileViewer";
+import { attachmentVideoPreviewSource, mediaVideoThumbnailKey } from "../../lib/videoPreviewSource";
 
 describe("which files go to the system's viewer", () => {
   it("video and audio are played in the app, never handed over", () => {
@@ -56,5 +64,47 @@ describe("how long the system's viewer is waited for", () => {
     expect(fileViewerTimeLimitMs(10 * 1024 * 1024)).toBe(60_000);
     expect(fileViewerTimeLimitMs(500 * 1024 * 1024)).toBe(120_000);
     expect(fileViewerTimeLimitMs(Number.POSITIVE_INFINITY)).toBe(20_000);
+  });
+});
+
+describe("what a video attachment's player and still frame are kept under", () => {
+  const clip = { attachmentId: "X", name: "clip.mp4", mimeType: "video/mp4" };
+  const A = EnvironmentId.make("A");
+  const B = EnvironmentId.make("B");
+
+  it("the same attachment id on two servers is two videos", () => {
+    const onA = attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: null });
+    const onB = attachmentVideoKey({ ...clip, environmentId: B, localDraftKey: null });
+    expect(onA).not.toBe(onB);
+    expect(onA).toContain("A");
+    expect(onB).toContain("B");
+  });
+
+  it("is the key the thread's tile uses for that attachment on that server", () => {
+    const tile = attachmentVideoPreviewSource(A, {
+      type: "file",
+      id: "X",
+      name: "clip.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 1,
+    } as Parameters<typeof attachmentVideoPreviewSource>[1]);
+    expect(attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: null })).toBe(
+      mediaVideoThumbnailKey(tile),
+    );
+  });
+
+  it("a file still on the phone goes by its draft, never by a server's attachment", () => {
+    const local = attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: "draft-1" });
+    expect(local).not.toBe(attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: null }));
+    expect(local).not.toBe(
+      attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: "draft-2" }),
+    );
+  });
+
+  it("with no server at all it still has a key of its own", () => {
+    const nowhere = attachmentVideoKey({ ...clip, environmentId: null, localDraftKey: null });
+    expect(nowhere).not.toBe(
+      attachmentVideoKey({ ...clip, environmentId: A, localDraftKey: null }),
+    );
   });
 });
