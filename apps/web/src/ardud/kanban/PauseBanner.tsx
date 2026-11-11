@@ -1,4 +1,5 @@
 import { PauseIcon } from "lucide-react";
+import { useState } from "react";
 
 import { cn } from "../../lib/utils";
 
@@ -8,6 +9,21 @@ const day = (atIso: string) => {
   const at = Date.parse(atIso);
   return Number.isFinite(at) ? dayMonth.format(at) : "";
 };
+
+/**
+ * Who set the pause, as a reader names them. The stored value is "owner" or a
+ * role followed by a thread id, which is never shown.
+ */
+export const pausedBy = (by: string): string => {
+  const role = by.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  if (role === "owner") return "You";
+  if (role === "evaluator") return "The evaluator";
+  if (role === "work" || role === "review" || role === "thread") return "A card thread";
+  return "An agent";
+};
+
+/** A note longer than this is folded to two lines until asked for. */
+const LONG_NOTE = 220;
 
 /**
  * A paused board says so above everything: since when, how much it still lets
@@ -25,7 +41,9 @@ export function PauseBanner(props: {
   className?: string | undefined;
 }) {
   const since = day(props.at);
-  const who = props.by === "owner" ? "You" : props.by;
+  const who = pausedBy(props.by);
+  const long = props.reason.length > LONG_NOTE;
+  const [whole, setWhole] = useState(false);
   return (
     <div
       className={cn(
@@ -53,10 +71,25 @@ export function PauseBanner(props: {
           Lift the pause
         </button>
       ) : null}
-      <p className="min-w-0 basis-full wrap-break-word">
+      <p
+        className={cn(
+          "min-w-0 basis-full wrap-break-word",
+          long && !whole ? "line-clamp-2" : "max-h-[40vh] overflow-y-auto",
+        )}
+      >
         {who}
         {since ? `, ${since}` : ""}: “{props.reason}”
       </p>
+      {long ? (
+        <button
+          type="button"
+          aria-expanded={whole}
+          onClick={() => setWhole((open) => !open)}
+          className="-mx-1 rounded px-1 font-medium text-(--m-muted) underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-(--m-accent) pointer-coarse:min-h-11"
+        >
+          {whole ? "Show less" : "Show the whole note"}
+        </button>
+      ) : null}
     </div>
   );
 }
