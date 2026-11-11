@@ -567,3 +567,34 @@ describe("a count is shown only when one is known", () => {
     );
   });
 });
+
+describe("whose phone, while the session can't be read", () => {
+  const READING = { state: "reading" } as const;
+  const FAILED = { state: "failed" } as const;
+  const OWNER = { state: "read", authenticated: true, owner: true } as const;
+
+  it("a phone never confirmed stays checking", () => {
+    expect(ownerStanding(READING, false)).toBe("checking");
+    expect(ownerStanding(READING, false, false)).toBe("checking");
+  });
+
+  it("a phone confirmed as his stays his while the session is out", () => {
+    expect(ownerStanding(READING, false, true)).toBe("owner");
+  });
+
+  it("a refusal from the server beats it", () => {
+    expect(ownerStanding(READING, true, true)).toBe("notOwner");
+    expect(ownerStanding(OWNER, true, true)).toBe("notOwner");
+  });
+
+  it("what the session says now beats what it said before", () => {
+    expect(ownerStanding({ state: "read", authenticated: true, owner: false }, false, true)).toBe(
+      "notOwner",
+    );
+    expect(
+      ownerStanding({ state: "read", authenticated: false, owner: undefined }, false, true),
+    ).toBe("unchecked");
+    // Refused outright (not a lost connection): not known, whatever it said before.
+    expect(ownerStanding(FAILED, false, true)).toBe("unchecked");
+  });
+});

@@ -232,6 +232,14 @@ export interface AskState {
    * nothing is held for Undo or offered for Retry: it could not succeed.
    */
   readonly notOwner: { readonly text: string; readonly device: boolean } | null;
+  /**
+   * The session said this is the owner's, since this store was opened, and
+   * nothing has said otherwise since. It stands while the session can't be
+   * read again (no connection), so he can still answer and the answer waits as
+   * "Not sent". A refusal from the server, or a session read that no longer
+   * says owner, takes it away.
+   */
+  readonly ownerSeen: boolean;
   /** How change asks show their texts; kept as he steps from ask to ask. */
   readonly changeView: ChangeView;
 }
@@ -260,6 +268,7 @@ export const INITIAL_ASK_STATE: AskState = {
   detailErrors: {},
   toast: null,
   notOwner: null,
+  ownerSeen: false,
   changeView: "after",
 };
 
@@ -773,26 +782,38 @@ export function createAskStore(host: AskStoreHost) {
   /** Remembers a "not the owner's session" refusal, whichever call met it. */
   const noteRefusal = (error: unknown) => {
     const notOwner = notOwnerOf(error);
-    if (notOwner !== null) set({ notOwner });
+    if (notOwner !== null) set({ notOwner, ownerSeen: false });
   };
 
   /**
    * What the session itself says: `false` is a session that is not the owner's,
    * known before anything is sent, so the notice shows up front and no answer is
-   * held as if it could go through. `true` clears a notice an earlier session left.
+   * held as if it could go through. `true` clears a notice an earlier session
+   * left, and is remembered (`ownerSeen`) for while the session can't be read.
+   * `null`: the session answered and does not say this is the owner's (signed
+   * out, a read that was refused, a server that does not say): no longer known
+   * to be his. `undefined`: nothing was read, and nothing changes.
    */
-  function noteOwnerStanding(owner: boolean | undefined) {
+  function noteOwnerStanding(owner: boolean | null | undefined) {
     if (owner === undefined) return;
-    const { notOwner } = get();
-    if (owner === false && notOwner === null) {
-      set({ notOwner: { text: ASK_NOT_OWNER_DEVICE_TEXT, device: true } });
-    } else if (owner === true && notOwner !== null) {
-      set({ notOwner: null });
+    const { notOwner, ownerSeen } = get();
+    if (owner === null) {
+      if (ownerSeen) set({ ownerSeen: false });
+    } else if (owner === false) {
+      if (notOwner === null || ownerSeen) {
+        set({
+          notOwner: notOwner ?? { text: ASK_NOT_OWNER_DEVICE_TEXT, device: true },
+          ownerSeen: false,
+        });
+      }
+    } else if (notOwner !== null || !ownerSeen) {
+      set({ notOwner: null, ownerSeen: true });
     }
   }
 
   /** The secret call met the same refusal over its own channel. */
-  const noteAskNotOwner = (text: string, device: boolean) => set({ notOwner: { text, device } });
+  const noteAskNotOwner = (text: string, device: boolean) =>
+    set({ notOwner: { text, device }, ownerSeen: false });
 
   /** One ask's send was refused: it comes back to the queue with what he typed. */
   function giveBack(send: AskSend, ref: AskSendRef, error: unknown) {
@@ -801,7 +822,7 @@ export function createAskStore(host: AskStoreHost) {
     const notOwner = notOwnerOf(error);
     if (notOwner !== null) {
       // Not his own session: the ask is back as he left it, and there is nothing to retry.
-      set({ hidden, notOwner });
+      set({ hidden, notOwner, ownerSeen: false });
       return "denied" as const;
     }
     if ((error instanceof AskApiError && error.stale) || askNow(ref) === "moved") {

@@ -1,9 +1,14 @@
-import { ASK_AUTO_RETRY_MAX, ASK_UNDO_MS, askKey } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  ASK_AUTO_RETRY_MAX,
+  ASK_UNDO_MS,
+  AskApiError,
+  askKey,
+} from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem, KanbanAskSecretAnswerInput } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { createAskScopes } from "./askScope";
-import { ASK_AUTO_RETRY_GAP_MS } from "./logic";
+import { ASK_RECONNECT_GAP_MS, createAskScopes, type AskConnection } from "./askScope";
+import { ASK_AUTO_RETRY_GAP_MS, ownerStanding, type SessionRead } from "./logic";
 
 const entry = (number: number): KanbanAskFeedItem =>
   ({
@@ -47,7 +52,7 @@ const SECRET_INPUT = {
  * Two servers, A and B, each with the same card and ask ids (the case that
  * would answer the wrong ask), and a phone that can be moved between them.
  */
-function harness() {
+function harness(start: { readonly sessionOut?: ReadonlyArray<string> } = {}) {
   let paired: string | null = "A";
   const pairedListeners = new Set<() => void>();
   const requests: Array<{
@@ -74,6 +79,10 @@ function harness() {
     requests.push({ server, method, path });
     if (method !== "GET" && writesHeld) await new Promise<void>((go) => heldWrites.push(go));
     if ((method === "GET" ? readsDown : writesDown).has(server)) throw new TypeError("offline");
+    if (unauthorized.has(server)) {
+      const refusal = { error: { code: "unauthorized", message: "Sign in again." } };
+      return { ok: false, status: 401, text: async () => JSON.stringify(refusal) };
+    }
     const body = path.endsWith("/asks")
       ? { at: "2026-11-11T08:00:00.000Z", open: feeds[server] ?? [], closed: [] }
       : { card: {}, ask: null };
@@ -82,27 +91,66 @@ function harness() {
   const deferred: Array<() => void> = [];
   /** What each server's session says of this phone: the owner's unless a test says otherwise. */
   const owners: Record<string, boolean> = { A: true, B: true };
+  /** Servers whose session can't be read right now: no connection, or still on its way. */
+  const sessionsOut = new Set<string>(start.sessionOut ?? []);
+  /** Servers whose session answers "signed out". */
+  const signedOut = new Set<string>();
+  /** Servers that no longer take this phone's credential. */
+  const unauthorized = new Set<string>();
+  const sessionListeners = new Set<() => void>();
+  const sessionRereads: Array<string> = [];
+  /** How the app's connection to each server stands; live unless a test says otherwise. */
+  const connections: Record<string, AskConnection> = {};
+  const connectionListeners = new Set<() => void>();
+  const reconnects: Array<string> = [];
+  const foregroundListeners = new Set<() => void>();
+  const session = (environmentId: string): SessionRead =>
+    sessionsOut.has(environmentId)
+      ? { state: "reading" }
+      : signedOut.has(environmentId)
+        ? { state: "read", authenticated: false, owner: undefined }
+        : { state: "read", authenticated: true, owner: owners[environmentId] === true };
+  const connection = (environmentId: string) => connections[environmentId] ?? "live";
   const scopes = createAskScopes({
     paired: () => paired,
     onPairedChange: (run) => {
       pairedListeners.add(run);
       return () => void pairedListeners.delete(run);
     },
-    target: (environmentId) => ({
-      base: `https://${environmentId.toLowerCase()}.test`,
-      headers: { authorization: `Bearer token-${environmentId}` },
-      cookies: false,
-    }),
+    target: (environmentId) => {
+      if (connection(environmentId) !== "live") {
+        throw new AskApiError(0, "offline", "Not connected to Robob.");
+      }
+      return {
+        base: `https://${environmentId.toLowerCase()}.test`,
+        headers: { authorization: `Bearer token-${environmentId}` },
+        cookies: false,
+      };
+    },
     sendSecrets: async (environmentId) => {
       secretSends.push(environmentId);
       return { _tag: "sent" };
     },
     watch: {
       onBoardsChange: () => () => undefined,
-      onForeground: () => () => undefined,
+      onForeground: (run) => {
+        foregroundListeners.add(run);
+        return () => void foregroundListeners.delete(run);
+      },
       isForeground: () => true,
     },
-    owner: (environmentId) => owners[environmentId] === true,
+    session,
+    onSessionChange: (_environmentId, run) => {
+      sessionListeners.add(run);
+      return () => void sessionListeners.delete(run);
+    },
+    rereadSession: (environmentId) => void sessionRereads.push(environmentId),
+    connection,
+    onConnectionChange: (_environmentId, run) => {
+      connectionListeners.add(run);
+      return () => void connectionListeners.delete(run);
+    },
+    reconnect: (environmentId) => void reconnects.push(environmentId),
     defer: (run) => deferred.push(run),
     now: () => Date.now(),
     fetch: fetchFake,
@@ -110,6 +158,36 @@ function harness() {
   return {
     scopes,
     owners,
+    /** What the session says of this phone on a server changes (or can no longer be read). */
+    setSession: (environmentId: string, owner: boolean | "out" | "signedOut") => {
+      sessionsOut.delete(environmentId);
+      signedOut.delete(environmentId);
+      if (owner === "out") sessionsOut.add(environmentId);
+      else if (owner === "signedOut") signedOut.add(environmentId);
+      else owners[environmentId] = owner;
+      for (const run of Array.from(sessionListeners)) run();
+    },
+    /** The app's connection to a server changes. */
+    setConnection: (environmentId: string, next: AskConnection) => {
+      connections[environmentId] = next;
+      for (const run of Array.from(connectionListeners)) run();
+    },
+    /** The standing the answer controls go by, as a screen would compute it. */
+    standing: () => {
+      const scope = scopes.current();
+      const state = scope.cell.getState();
+      return ownerStanding(
+        session(scope.environmentId ?? ""),
+        state.notOwner !== null,
+        state.ownerSeen,
+      );
+    },
+    foreground: () => {
+      for (const run of Array.from(foregroundListeners)) run();
+    },
+    sessionRereads,
+    reconnects,
+    unauthorized,
     feeds,
     requests,
     secretSends,
@@ -446,10 +524,12 @@ describe("an answer that never reached the server", () => {
     expect(scope.cell.getState().failed).toEqual({});
   });
 
-  it("does not go by itself while the phone is not known to be his, and goes once it is", async () => {
-    const h = harness();
+  it("does not go by itself while the phone was never known to be his, and goes once it is", async () => {
+    // The session has not been read since the app started: never confirmed.
+    const h = harness({ sessionOut: ["A"] });
     const scope = h.scopes.current();
     await scope.asks.refreshAsks();
+    expect(h.standing()).toBe("checking");
     const ask = scope.cell.getState().feed!.open[0]!;
     h.writesDown.add("A");
     scope.asks.answerAsk(ask, "primary");
@@ -457,8 +537,6 @@ describe("an answer that never reached the server", () => {
     h.writesDown.delete("A");
     expect(h.answers("A")).toHaveLength(1);
 
-    // The session is being read again, or could not be read: not known to be his.
-    h.owners.A = false;
     for (let n = 0; n < 3; n += 1) {
       await aWhile();
       await read(h);
@@ -468,7 +546,8 @@ describe("an answer that never reached the server", () => {
     expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
     expect(scope.cell.getState().failed[askKey(ask)]?.send.autoRetries).toBeUndefined();
 
-    h.owners.A = true;
+    h.setSession("A", true);
+    expect(h.standing()).toBe("owner");
     await aWhile();
     await read(h);
     expect(h.answers("A")).toHaveLength(2);
@@ -531,5 +610,247 @@ describe("an answer that never reached the server", () => {
       await read(h);
     }
     expect(h.answers("A")).toHaveLength(1);
+  });
+});
+
+describe("a phone the session confirmed as his, when the connection goes", () => {
+  /** What the scope decided on the last change of the store. */
+  const decide = async (h: ReturnType<typeof harness>) => {
+    h.runDeferred();
+    await settle();
+  };
+
+  it("can still answer: the answer waits as Not sent and goes exactly once when the connection is back", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    expect(h.standing()).toBe("owner");
+
+    // The server stops: no connection, and the session can't be read any more.
+    h.setConnection("A", "down");
+    h.setSession("A", "out");
+    expect(h.standing()).toBe("owner");
+    await scope.asks.refreshAsks();
+    expect(scope.cell.getState().error).toBe("Not connected to Robob.");
+
+    // He answers. Nothing can leave the phone: it is kept as "Not sent".
+    const before = h.requests.length;
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await decide(h);
+    expect(h.requests).toHaveLength(before);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(scope.cell.getState().toast?.text).toContain("Not sent");
+
+    // Reads keep failing while it is down, and nothing goes.
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await scope.asks.refreshAsks();
+      await decide(h);
+    }
+    expect(h.answers("A")).toHaveLength(0);
+
+    // The connection is back. The scope reads the feed by itself, and the answer goes
+    // on that read: the session is still on its way, and he was confirmed before.
+    h.setConnection("A", "live");
+    await settle();
+    expect(scope.cell.getState().error).toBeNull();
+    await decide(h);
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().failed).toEqual({});
+
+    // The session reads again and more reads follow: it was sent once, and only once.
+    h.setSession("A", true);
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await scope.asks.refreshAsks();
+      await decide(h);
+    }
+    expect(h.answers("A")).toHaveLength(1);
+    expect(h.standing()).toBe("owner");
+  });
+
+  it("a refusal from the server ends it, and the session coming back unread does not restore it", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setConnection("A", "down");
+    h.setSession("A", "out");
+    expect(h.standing()).toBe("owner");
+
+    scope.asks.noteAskNotOwner("This device is not paired as the owner's.", true);
+    expect(h.standing()).toBe("notOwner");
+    expect(scope.cell.getState().ownerSeen).toBe(false);
+
+    // A session that says owner again, read after the refusal, is what brings it back.
+    h.setConnection("A", "live");
+    expect(h.standing()).toBe("notOwner");
+    h.setSession("A", true);
+    expect(h.standing()).toBe("owner");
+  });
+
+  it("a session that comes back as not his, or signed out, ends it", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setSession("A", "out");
+    expect(h.standing()).toBe("owner");
+    h.setSession("A", false);
+    expect(h.standing()).toBe("notOwner");
+
+    h.setSession("A", true);
+    expect(h.standing()).toBe("owner");
+    h.setSession("A", "signedOut");
+    expect(h.standing()).toBe("unchecked");
+    // Signed out and then unreadable: no longer confirmed, so it does not come back as his.
+    h.setSession("A", "out");
+    expect(h.standing()).toBe("checking");
+    expect(scope.cell.getState().ownerSeen).toBe(false);
+  });
+
+  it("is confirmed per server: the next server starts unconfirmed", async () => {
+    const h = harness({ sessionOut: ["B"] });
+    await h.scopes.current().asks.refreshAsks();
+    expect(h.standing()).toBe("owner");
+    h.pair("B");
+    expect(h.standing()).toBe("checking");
+  });
+});
+
+describe("when the connection comes back", () => {
+  it("the feed is read at once, not at the next poll", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setConnection("A", "down");
+    await scope.asks.refreshAsks();
+    const reads = h.requests.length;
+    h.setConnection("A", "live");
+    await settle();
+    expect(h.requests).toHaveLength(reads + 1);
+    expect(scope.cell.getState().error).toBeNull();
+    // Signalled again while live: nothing more is read.
+    h.setConnection("A", "live");
+    await settle();
+    expect(h.requests).toHaveLength(reads + 1);
+  });
+
+  it("nothing is read for a store no screen has started", async () => {
+    const h = harness();
+    h.setConnection("A", "down");
+    h.setConnection("A", "live");
+    await settle();
+    expect(h.requests).toHaveLength(0);
+  });
+
+  it("the session is read again when the app comes to the front, on the server in use", async () => {
+    const h = harness();
+    h.foreground();
+    expect(h.sessionRereads).toEqual(["A"]);
+    h.pair("B");
+    h.foreground();
+    expect(h.sessionRereads).toEqual(["A", "B"]);
+    h.pair(null);
+    h.foreground();
+    expect(h.sessionRereads).toEqual(["A", "B"]);
+  });
+});
+
+describe("while the connection layer waits to try again", () => {
+  it("the feed is asked for where it was last read, and a good read tells the layer to try now", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    expect(h.reconnects).toEqual([]);
+
+    // The server is down and the app is between two attempts.
+    h.setConnection("A", "waiting");
+    h.readsDown.add("A");
+    const before = h.requests.length;
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before + 1);
+    expect(h.requests.at(-1)?.server).toBe("A");
+    expect(scope.cell.getState().error).toBe("Robob did not answer.");
+    expect(h.reconnects).toEqual([]);
+
+    // The server is back before the next attempt: the read finds it.
+    h.readsDown.delete("A");
+    await scope.asks.refreshAsks();
+    expect(scope.cell.getState().error).toBeNull();
+    expect(h.reconnects).toEqual(["A"]);
+
+    // The attempt has not landed yet: it is not asked for again on every read.
+    await scope.asks.refreshAsks();
+    expect(h.reconnects).toEqual(["A"]);
+    await vi.advanceTimersByTimeAsync(ASK_RECONNECT_GAP_MS);
+    await scope.asks.refreshAsks();
+    expect(h.reconnects).toEqual(["A", "A"]);
+
+    // Live again: reads tell the layer nothing.
+    h.setConnection("A", "live");
+    await settle();
+    await vi.advanceTimersByTimeAsync(ASK_RECONNECT_GAP_MS);
+    await scope.asks.refreshAsks();
+    expect(h.reconnects).toEqual(["A", "A"]);
+  });
+
+  it("an answer goes to that server too", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.setConnection("A", "waiting");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.answers("A")).toHaveLength(1);
+    expect(h.answers("B")).toHaveLength(0);
+    expect(scope.cell.getState().failed).toEqual({});
+  });
+
+  it("nothing is asked for when the connection is off, refused or the phone is offline", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setConnection("A", "down");
+    const before = h.requests.length;
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before);
+    expect(scope.cell.getState().error).toBe("Not connected to Robob.");
+    expect(h.reconnects).toEqual([]);
+  });
+
+  it("a server never reached over a live connection is not called", async () => {
+    const h = harness();
+    h.setConnection("A", "waiting");
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(0);
+    expect(scope.cell.getState().status).toBe("error");
+  });
+
+  it("a credential the server no longer takes is not used again", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    h.setConnection("A", "waiting");
+    h.unauthorized.add("A");
+    const before = h.requests.length;
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before + 1);
+    await scope.asks.refreshAsks();
+    expect(h.requests).toHaveLength(before + 1);
+    expect(scope.cell.getState().error).toBe("Not connected to Robob.");
+    expect(h.reconnects).toEqual([]);
+  });
+
+  it("the address of one server is never used for another", async () => {
+    const h = harness();
+    await h.scopes.current().asks.refreshAsks();
+    h.pair("B");
+    h.setConnection("B", "waiting");
+    const before = h.requests.length;
+    await h.scopes.current().asks.refreshAsks();
+    expect(h.requests).toHaveLength(before);
   });
 });

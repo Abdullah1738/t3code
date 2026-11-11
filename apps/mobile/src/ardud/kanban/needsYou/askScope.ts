@@ -25,7 +25,18 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskSecretAnswerInput } from "@t3tools/contracts";
 
-import { unreachedRetryTracker } from "./logic";
+import { ownerStanding, unreachedRetryTracker, type SessionRead } from "./logic";
+
+/**
+ * How the app's connection to a server stands. `live`: there is one to call.
+ * `waiting`: the app wants the server and waits between attempts (the
+ * connection layer backs off for up to five minutes). `down`: anything else
+ * (switched off, the phone is offline, an attempt is under way, refused).
+ */
+export type AskConnection = "live" | "waiting" | "down";
+
+/** The least time between two "try now" calls to the connection layer. */
+export const ASK_RECONNECT_GAP_MS = 30_000;
 
 export interface AskScopeHost {
   /** The server in use now, or null when there is none. */
@@ -40,12 +51,18 @@ export interface AskScopeHost {
     input: KanbanAskSecretAnswerInput,
   ) => Promise<AskSecretSendResult>;
   readonly watch: AskWatchHost;
-  /**
-   * Whether the session on this server is known, right now, to be the owner's.
-   * False while that is still being read or could not be read. Nothing is sent
-   * by itself unless it is true.
-   */
-  readonly owner: (environmentId: string) => boolean;
+  /** What the app holds of this server's session at this moment. */
+  readonly session: (environmentId: string) => SessionRead;
+  /** Calls `run` whenever that may have changed. It also keeps the session read while the scope lives. */
+  readonly onSessionChange: (environmentId: string, run: () => void) => () => void;
+  /** Reads the session again. */
+  readonly rereadSession: (environmentId: string) => void;
+  /** How the connection to this server stands now. */
+  readonly connection: (environmentId: string) => AskConnection;
+  /** Calls `run` whenever that may have changed. */
+  readonly onConnectionChange: (environmentId: string, run: () => void) => () => void;
+  /** Tells the connection layer to try this server now, not after its delay. */
+  readonly reconnect: (environmentId: string) => void;
   /** Runs `run` after the current store update has settled. */
   readonly defer: (run: () => void) => void;
   /** The time now, in epoch ms. */
@@ -93,18 +110,41 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
     // Its own server, still the one in use, or nothing at all.
     const mine = (): string | null =>
       !closed && environmentId !== null && host.paired() === environmentId ? environmentId : null;
+    // The address and credential of this server as last used over a live
+    // connection, in memory only. While the connection layer waits between
+    // attempts there is nothing live to call, though the server may be back
+    // long before the next attempt: the calls then go to where they last went.
+    // That is how the feed's own poll finds the server again. A credential the
+    // server no longer takes is dropped.
+    let kept: AskApiTarget | null = null;
+    let keptUsed = false;
+    const send = host.fetch ?? fetch;
     const api = createAskApi({
       target: () => {
         const id = mine();
         if (id === null) throw new AskApiError(0, "offline", NOT_CONNECTED);
-        return host.target(id);
+        try {
+          const live = host.target(id);
+          kept = live;
+          keptUsed = false;
+          return live;
+        } catch (error) {
+          const offline = error instanceof AskApiError && error.code === "offline";
+          if (!offline || kept === null || host.connection(id) !== "waiting") throw error;
+          keptUsed = true;
+          return kept;
+        }
       },
+      fetch: (async (...call: Parameters<typeof fetch>) => {
+        const response = await send(...call);
+        if (response.status === 401 && keptUsed) kept = null;
+        return response;
+      }) as typeof fetch,
       answerSecrets: async (input) => {
         const id = mine();
         if (id === null) return { _tag: "offline" };
         return host.sendSecrets(id, input);
       },
-      ...(host.fetch === undefined ? {} : { fetch: host.fetch }),
     });
     const cell = createAskStateCell();
     const asks = createAskStore({
@@ -119,19 +159,86 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
     // has tries left (`unreachedRetryTracker`). Sending is the owner's alone, so
     // it goes by itself only while the session is known to be his and the
     // server has not refused this phone since: asked at the moment it would go.
+    // "Known to be his" is what the answer controls go by too (`ownerStanding`):
+    // the session says so now, or said so before the connection went and
+    // nothing has said otherwise since.
     const ownerNow = (): boolean => {
       const id = mine();
-      return id !== null && cell.getState().notOwner === null && host.owner(id);
+      if (id === null) return false;
+      const state = cell.getState();
+      return ownerStanding(host.session(id), state.notOwner !== null, state.ownerSeen) === "owner";
     };
     const retries = unreachedRetryTracker();
+    let readsSeen = 0;
+    let reconnectAt: number | null = null;
     const stopRetry = cell.subscribe(() => {
-      const due = retries.next(cell.getState(), host.now());
+      const state = cell.getState();
+      // The feed was read while the connection layer still waits to try again:
+      // the server is back, so it is told to try now. Without this the rest of
+      // the app (and the session) stays disconnected for the rest of the delay.
+      if (state.reads !== readsSeen) {
+        const read = state.reads > readsSeen;
+        readsSeen = state.reads;
+        const id = mine();
+        const now = host.now();
+        if (
+          read &&
+          id !== null &&
+          host.connection(id) === "waiting" &&
+          (reconnectAt === null || now - reconnectAt >= ASK_RECONNECT_GAP_MS)
+        ) {
+          reconnectAt = now;
+          host.reconnect(id);
+        }
+      }
+      const due = retries.next(state, host.now());
       if (due.size === 0) return;
       host.defer(() => {
         if (closed || !ownerNow()) return;
         asks.retryUnreachedAskSends(undefined, (send) => due.has(send.id));
       });
     });
+    // What the session says goes to the store as it changes, whatever screen is
+    // up: a session that says owner is remembered for when it can't be read.
+    let noted: boolean | null | undefined;
+    const noteSession = () => {
+      const id = mine();
+      if (id === null) return;
+      const read = host.session(id);
+      const owner =
+        read.state === "reading"
+          ? undefined
+          : read.state === "read" && read.authenticated && read.owner !== undefined
+            ? read.owner
+            : null;
+      if (owner === noted) return;
+      noted = owner;
+      asks.noteOwnerStanding(owner);
+    };
+    // The connection is back: the feed is read at once, not at the next poll.
+    // The session reads itself again with every new connection.
+    let live = environmentId !== null && host.connection(environmentId) === "live";
+    const noteConnection = () => {
+      const id = mine();
+      const now = id !== null && host.connection(id) === "live";
+      const back = now && !live;
+      live = now;
+      // Only a store that has read, or tried to: the first read is the screen's to start.
+      if (back && cell.getState().status !== "idle") void asks.refreshAsks();
+    };
+    const stops =
+      environmentId === null
+        ? []
+        : [
+            host.onSessionChange(environmentId, noteSession),
+            host.onConnectionChange(environmentId, noteConnection),
+            // Back in front: the session is read again (the store reads the feed).
+            host.watch.onForeground(() => {
+              const id = mine();
+              if (id !== null) host.rereadSession(id);
+            }),
+          ];
+    noteSession();
     const scope: AskScope = {
       serial: ++serial,
       environmentId,
@@ -145,6 +252,8 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
       // Closed first, so nothing the store does while it empties can reach a server.
       closed = true;
       stopRetry();
+      for (const stop of stops) stop();
+      kept = null;
       asks.dispose();
     });
     return scope;

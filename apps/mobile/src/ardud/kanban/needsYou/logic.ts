@@ -660,10 +660,21 @@ export type SessionRead =
       readonly owner: boolean | undefined;
     };
 
-export function ownerStanding(session: SessionRead, refused: boolean): OwnerStanding {
+export function ownerStanding(
+  session: SessionRead,
+  refused: boolean,
+  /**
+   * The session said owner earlier in this run of the app and nothing has said
+   * otherwise since (`ownerSeen` in the store).
+   */
+  seen: boolean = false,
+): OwnerStanding {
   // The server refused an answer as not the owner's: that beats what the session said before.
   if (refused) return "notOwner";
-  if (session.state === "reading") return "checking";
+  // No connection, or the session is on its way: it can't say anything new. A phone that
+  // was confirmed as his stays so, and what he answers waits as "Not sent"; the server
+  // still refuses if that changed. A phone never confirmed stays "checking".
+  if (session.state === "reading") return seen ? "owner" : "checking";
   if (session.state === "failed") return "unchecked";
   // Signed out, or a server that does not say: not known to be his, so not his to answer.
   if (!session.authenticated || session.owner === undefined) return "unchecked";

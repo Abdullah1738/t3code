@@ -32,12 +32,13 @@ import { useNavigation } from "@react-navigation/native";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { AppState } from "react-native";
 
+import { environmentCatalog } from "../../../connection/catalog";
 import { appAtomRegistry } from "../../../state/atom-registry";
 import { serverEnvironment } from "../../../state/server";
 import { environmentSession } from "../../../state/session";
 import { pairedEnvironmentIdAtom } from "../../common/environment";
 import { kanbanClient } from "../kanbanStore";
-import { createAskScopes, type AskScope } from "./askScope";
+import { createAskScopes, type AskConnection, type AskScope } from "./askScope";
 import {
   lateStanding,
   ownerStanding,
@@ -98,15 +99,48 @@ const askScopes = createAskScopes({
     },
     isForeground: () => AppState.currentState === "active",
   },
-  // The session as the app holds it at this moment: the owner's, and read. A
-  // refusal the store met since is the scope's own to check.
-  owner: (environmentId) =>
-    ownerStanding(
-      sessionRead(
-        appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
-      ),
-      false,
-    ) === "owner",
+  // The session as the app holds it at this moment. Subscribing keeps it read
+  // for as long as the server is the one in use, with or without a screen.
+  session: (environmentId) =>
+    sessionRead(
+      appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
+    ),
+  onSessionChange: (environmentId, run) =>
+    appAtomRegistry.subscribe(
+      environmentSession.sessionStateAtom(environmentId as EnvironmentId),
+      run,
+    ),
+  rereadSession: (environmentId) =>
+    appAtomRegistry.refresh(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
+  connection: (environmentId): AskConnection => {
+    const id = environmentId as EnvironmentId;
+    if (Option.isSome(appAtomRegistry.get(environmentSession.preparedConnectionValueAtom(id)))) {
+      return "live";
+    }
+    const state = Option.getOrNull(
+      AsyncResult.value(appAtomRegistry.get(environmentCatalog.stateAtom(id))),
+    );
+    // Wanted, and between two attempts: the only time a call may go to where it last went.
+    return state !== null && state.desired && state.phase === "backoff" ? "waiting" : "down";
+  },
+  onConnectionChange: (environmentId, run) => {
+    const id = environmentId as EnvironmentId;
+    const stops = [
+      appAtomRegistry.subscribe(environmentSession.preparedConnectionValueAtom(id), run),
+      appAtomRegistry.subscribe(environmentCatalog.stateAtom(id), run),
+    ];
+    return () => {
+      for (const stop of stops) stop();
+    };
+  },
+  // What "Retry" in Connections does: the next attempt starts now.
+  reconnect: (environmentId) =>
+    void runAtomCommand(
+      appAtomRegistry,
+      environmentCatalog.retryNow,
+      environmentId as EnvironmentId,
+      { label: "needs-you reconnect", reportFailure: false },
+    ),
   // After the store update that asked for it has settled, not inside it.
   defer: (run) => setTimeout(run, 0),
   now: () => Date.now(),
@@ -211,25 +245,26 @@ const NO_SESSION = Atom.make(AsyncResult.initial<AuthSessionState>());
  * (`GET /api/auth/session` carries `owner`). Answering, replying, hand-over,
  * snooze and batches are on only for `owner`: while the session is still being
  * read, or could not be read, the asks can be read and nothing can be sent.
- * `recheck` reads the session again. It also tells the store, so a phone that
- * is not paired as his says so before he fills anything in.
+ * A phone the session already confirmed as his stays `owner` while there is no
+ * connection to read it again, so he can answer and the answer waits as "Not
+ * sent"; a refusal from the server ends that. `recheck` reads the session again.
  */
 export function useOwnerStanding(): {
   readonly standing: OwnerStanding;
   readonly recheck: () => void;
 } {
-  const { asks, environmentId } = useAskScope();
+  const { environmentId } = useAskScope();
   const atom =
     environmentId === null
       ? NO_SESSION
       : environmentSession.sessionStateAtom(environmentId as EnvironmentId);
   const result = useAtomValue(atom);
   const refused = useAsk((state) => state.notOwner !== null);
-  const read = sessionRead(result);
-  const owner = read.state === "read" && read.authenticated ? read.owner : undefined;
-  useEffect(() => asks.noteOwnerStanding(owner), [asks, owner]);
+  // Said owner before the connection went: it stands while the session can't be read.
+  // The scope tells the store what the session says (`askScope.ts`), screen or no screen.
+  const seen = useAsk((state) => state.ownerSeen);
   const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);
-  return { standing: ownerStanding(read, refused), recheck };
+  return { standing: ownerStanding(sessionRead(result), refused, seen), recheck };
 }
 
 /** Keeps the feed current while a screen shows it. `fast`: the queue or an ask is open. */

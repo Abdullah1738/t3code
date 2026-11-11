@@ -753,6 +753,51 @@ describe("owner standing", () => {
     expect(h.cell.getState().notOwner).toBeNull();
   });
 
+  it("remembers that the session said owner, until something says otherwise", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().ownerSeen).toBe(false);
+
+    h.store.noteOwnerStanding(true);
+    expect(h.cell.getState().ownerSeen).toBe(true);
+    // Nothing read (no connection): what was said stands.
+    h.store.noteOwnerStanding(undefined);
+    expect(h.cell.getState().ownerSeen).toBe(true);
+
+    // A session that answers without saying owner (signed out): no longer known.
+    h.store.noteOwnerStanding(null);
+    expect(h.cell.getState().ownerSeen).toBe(false);
+    expect(h.cell.getState().notOwner).toBeNull();
+
+    // A refusal met by any call takes it away, whichever call it was.
+    h.store.noteOwnerStanding(true);
+    h.fail.snooze = new AskApiError(403, "denied", "Not yours.", null, "not_owner_device");
+    await h.store.snoozeAsks([ask], "2026-11-12T05:00:00.000Z", "tomorrow 09:00");
+    expect(h.cell.getState().ownerSeen).toBe(false);
+    expect(h.cell.getState().notOwner?.device).toBe(true);
+
+    h.store.noteOwnerStanding(true);
+    expect(h.cell.getState()).toMatchObject({ ownerSeen: true, notOwner: null });
+    h.fail.answer = new AskApiError(403, "denied", "Not yours.", null, "not_owner_device");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await settle();
+    expect(h.cell.getState().ownerSeen).toBe(false);
+
+    h.store.noteOwnerStanding(true);
+    h.store.noteAskNotOwner("Not yours.", true);
+    expect(h.cell.getState().ownerSeen).toBe(false);
+
+    h.store.noteOwnerStanding(true);
+    h.store.noteOwnerStanding(false);
+    expect(h.cell.getState()).toMatchObject({
+      ownerSeen: false,
+      notOwner: { text: ASK_NOT_OWNER_DEVICE_TEXT, device: true },
+    });
+  });
+
   it("a snooze or reply refused as not the owner's is remembered", async () => {
     const h = harness();
     const ask = entry(1);
