@@ -7,7 +7,7 @@
  * Mac-made pairing link has it. Read from the session the cookie, bearer or
  * socket ticket maps to, never from the request.
  */
-import { KanbanError } from "@t3tools/contracts";
+import { KanbanError, isPairedDeviceSubject } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import { isOwnerSession } from "../auth/provenance.ts";
@@ -26,13 +26,6 @@ export const NOT_OWNER_DEVICE_MESSAGE =
 export const NOT_OWNER_MESSAGE =
   "Only the owner does this, from a Robob app he paired. A token, a CLI session or a component credential is not the owner.";
 
-/**
- * Subjects of sessions minted from a pairing link (`t3 pair`, `t3 auth pairing
- * create`, the startup link, a link made in an app). `t3 auth session issue`
- * refuses them, so a hand-issued token never reads as a paired device.
- */
-const PAIRED_SUBJECTS: ReadonlySet<string> = new Set(["one-time-token", "administrative-bootstrap"]);
-
 /** Null for the owner's own session. Otherwise the refusal: `denied`, with a reason for a paired device. */
 export const ownerRefusal = (session: OwnerGateSession): KanbanError | null => {
   if (isOwnerSession(session)) return null;
@@ -42,7 +35,7 @@ export const ownerRefusal = (session: OwnerGateSession): KanbanError | null => {
       detail: `${NOT_OWNER_MESSAGE} This is the ${session.origin.component} component's session.`,
     });
   }
-  if (session.origin === undefined && PAIRED_SUBJECTS.has(session.subject)) {
+  if (session.origin === undefined && isPairedDeviceSubject(session.subject)) {
     return new KanbanError({
       code: "denied",
       detail: NOT_OWNER_DEVICE_MESSAGE,

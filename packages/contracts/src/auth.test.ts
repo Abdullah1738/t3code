@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
+import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
+import { isDeviceNotPairedAsOwner } from "./ardud/ownerStanding.ts";
 import {
+  AuthClientSession,
   AuthEnvironmentScopes,
   AuthEnvironmentScope,
   authScopeRequiredResponse,
@@ -151,6 +154,37 @@ describe("legacy permission notice", () => {
       [],
     ]) {
       expect(sessionHasLegacyPermissions({ authenticated: true, permissions })).toBe(false);
+    }
+  });
+});
+
+describe("owner standing on a listed session", () => {
+  const listed = {
+    sessionId: "session-phone",
+    subject: "one-time-token",
+    scopes: ["orchestration:read", "orchestration:operate"],
+    method: "bearer-access-token",
+    client: { label: "iPhone", deviceType: "mobile" },
+    issuedAt: DateTime.makeUnsafe("2036-04-07T00:00:00.000Z"),
+    expiresAt: DateTime.makeUnsafe("2036-05-07T00:00:00.000Z"),
+    lastConnectedAt: null,
+    connected: false,
+    current: false,
+  };
+  const decode = Schema.decodeUnknownSync(AuthClientSession);
+
+  it("decodes a session from a server that does not say, and does not flag it", () => {
+    const session = decode(listed);
+    expect("owner" in session).toBe(false);
+    expect(isDeviceNotPairedAsOwner(session)).toBe(false);
+  });
+
+  it("flags a paired device the server says is not the owner's, and nothing else", () => {
+    expect(isDeviceNotPairedAsOwner(decode({ ...listed, owner: false }))).toBe(true);
+    expect(isDeviceNotPairedAsOwner(decode({ ...listed, owner: true }))).toBe(false);
+    // A component's or a hand-issued token's row is not a paired device.
+    for (const subject of ["component:telegram-bridge", "cli-issued-session", "desktop-bootstrap"]) {
+      expect(isDeviceNotPairedAsOwner(decode({ ...listed, subject, owner: false }))).toBe(false);
     }
   });
 });

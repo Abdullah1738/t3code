@@ -285,6 +285,12 @@ export const AuthClientSession = Schema.Struct({
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtc),
   connected: Schema.Boolean,
   current: Schema.Boolean,
+  // ardud:
+  /**
+   * Whether the session carries the owner claim (see `ardud/ownerStanding.ts`).
+   * Absent when the server does not say: an older server, or a change event.
+   */
+  owner: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthClientSession = typeof AuthClientSession.Type;
 
