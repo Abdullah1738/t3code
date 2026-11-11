@@ -851,7 +851,8 @@ function StatePills(props: {
         Out of date
       </Pill>,
     );
-  if (props.mark === "back") {
+  // The band under the title says it, with the time; the pill is only for when there is no band.
+  if (props.mark === "back" && !item.backFromSnoozeAt) {
     pills.push(
       <Pill key="back" tone="accent">
         Back from snooze
