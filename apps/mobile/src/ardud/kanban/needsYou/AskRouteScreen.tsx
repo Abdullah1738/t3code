@@ -766,7 +766,7 @@ function OpenAsk(props: {
       {props.toast(76)}
       <AskMediaViewer media={media} viewing={viewing} onClose={() => setViewing(null)} />
       {handOpen && !readOnly ? (
-        <HandOverSheet entries={[entry]} onClose={() => setHandOpen(false)} onLeave={nav.back} />
+        <HandOverSheet entries={[entry]} onClose={() => setHandOpen(false)} onLeave={nav.leave} />
       ) : null}
       {pickOpen && !readOnly ? (
         <SnoozePickSheet onClose={() => setPickOpen(false)} onSnooze={snoozeUntil} />

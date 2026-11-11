@@ -416,7 +416,7 @@ function OpenBatch(props: {
           focusKey={props.focusKey}
           title={sentTitle}
           onClose={() => setHandOpen(false)}
-          onLeave={nav.back}
+          onLeave={nav.leave}
         />
       ) : null}
       {pickOpen && !readOnly ? (
