@@ -88,7 +88,7 @@ if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
 completion or signals. Port ownership is checked with `lsof` before Quint runs.
 
 CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
-The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java `@argfile` tokens, and ambiguous backslash/whitespace spellings are refused. Expand argument-file options explicitly for guarded verify.
+The guard pins archive SHA256 `b4fc81998dd20d0b55a48c16d1caed1045e324bbbfe45ee7f625f6aaf70caf6f` and JAR `cb6a7d689b2937b00be5e7e30e9bb1925cde7c8ce47aaafddb1cf21c8c167593`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
 Apalache still binds IPv6 `*:<port>` with reflection registered: LAN/tailnet peers can reach it for the run's duration. The Mac firewall was disabled (block-all disabled, stealth off) on 12 Nov; a loopback source patch is a separate follow-up.
 `QUINT_ALLOW_VULNERABLE_APALACHE=1` explicitly bypasses this guard with a visible warning, permitting Quint's original cache/download/launch behavior; it never silences the protobuf warning.
 Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issue filing and all installations remain owner-approved evaluator actions.

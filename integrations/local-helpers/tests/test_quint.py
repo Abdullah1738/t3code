@@ -397,11 +397,47 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                 self.server_stopped()
 
     def test_argument_file_requires_the_explicit_unsafe_bypass(self):
-        r = self.run_cli('verify', 'a.qnt', JVM_GC_ARGS='@jvm.options',
-                         QUINT_ALLOW_VULNERABLE_APALACHE='1')
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('bypassing the patched backend guard', r.stderr)
-        self.assertFalse((self.root / 'server.json').exists())
+        for value in ('@jvm.options', '-XX:VMOptionsFile=jvm.options', '-XX:Flags=jvm.options'):
+            with self.subTest(value=value):
+                r = self.run_cli('verify', 'a.qnt', JVM_GC_ARGS=value,
+                                 QUINT_ALLOW_VULNERABLE_APALACHE='1')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('bypassing the patched backend guard', r.stderr)
+                self.assertFalse((self.root / 'server.json').exists())
+
+    def test_named_java_option_file_loaders_are_rejected_before_backend_start(self):
+        options = self.root / 'unsafe.vmoptions'
+        options.write_text('-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=false\n'
+                           '-Dcom.google.protobuf.use_unsafe_pre22_gencode=true\n')
+        for name in ('JVM_GC_ARGS', 'JVM_ARGS', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+            for loader in ('-XX:VMOptionsFile', '-XX:Flags'):
+                forms = {
+                    'absolute': loader + '=' + str(options),
+                    'relative': loader + '=unsafe.vmoptions',
+                    'quoted-path': loader + '="' + str(options) + '"',
+                    'quoted-option': '"' + loader + '=' + str(options) + '"',
+                    'single-quoted': "'" + loader + '=' + str(options) + "'",
+                    'quoted-name': loader[:-1] + '"' + loader[-1] + '"=' + str(options),
+                    'missing': loader + '=' + str(self.root / 'missing.vmoptions'),
+                    'bare': loader,
+                    'empty': loader + '=',
+                    'after-option': '-Xmx256m ' + loader + '=' + str(options),
+                    'shell-expanded-value': '-Dprobe="x ' + loader + '=unsafe.vmoptions -Dtail=x"',
+                }
+                for shape, value in forms.items():
+                    with self.subTest(name=name, loader=loader, shape=shape):
+                        r = self.run_cli('verify', 'a.qnt', **{name:value})
+                        self.assertNotEqual(r.returncode, 0)
+                        self.assertIn(name + ' contains a Java option-file loader', r.stderr)
+                        self.assertEqual(r.stdout, '')
+                        self.assertFalse((self.root / 'server.json').exists())
+
+    def test_option_file_loader_text_in_property_value_is_not_a_loader(self):
+        for name in ('JVM_ARGS', 'JVM_GC_ARGS', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+            for loader in ('-XX:VMOptionsFile', '-XX:Flags'):
+                with self.subTest(name=name, loader=loader):
+                    self.result('verify', 'a.qnt', **{name:'-Dprobe=' + loader + '=/missing.vmoptions'})
+                    self.server_stopped()
 
     def test_quoted_jvm_property_class(self):
         forms = [
