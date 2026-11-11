@@ -7122,6 +7122,8 @@ const make = Effect.gen(function* () {
   });
 
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
+    // One record for this tick, shared by its boards' steps: they run side by side
+    // and the dispatch below covers every board.
     const kicks: TickKicks = { held: true, asked: false };
     yield* tickSteps().pipe(
       Effect.provideService(tickKicks, kicks),
@@ -7130,10 +7132,14 @@ const make = Effect.gen(function* () {
           kicks.held = false;
         }),
       ),
-      // Steps that failed never reach the dispatch below: a kick they asked for is queued.
-      Effect.onError(() => Effect.suspend(() => (kicks.asked ? kick : Effect.void))),
+      Effect.andThen(dispatchUnlocked()),
+      // The steps' kicks were held for that dispatch. Whatever kept it from finishing
+      // (a step or the dispatch failed, or the tick was interrupted), a kick they
+      // asked for is queued, so what they freed does not wait for the next tick.
+      Effect.onExit((exit) =>
+        Effect.suspend(() => (Exit.isSuccess(exit) || !kicks.asked ? Effect.void : kick)),
+      ),
     );
-    yield* dispatchUnlocked();
   });
 
   /** One tiny generation on `model`: true when its provider answers. */
