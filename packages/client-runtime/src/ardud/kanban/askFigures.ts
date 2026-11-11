@@ -71,3 +71,44 @@ export function askFiguresAsOf(figures: AskFigures, nowMs: number): string | nul
   const when = shortWhen(figures.readAt, nowMs);
   return when === "" ? "as of the last read" : `as of ${when}`;
 }
+
+/** What a "Needs you" row shows beside its name: the sidebar's row on the web. */
+export interface AskRowFigure {
+  /** The number in the badge; null when no badge is shown. */
+  readonly count: number | null;
+  /** Quiet words beside it: "…" while the first read is out, "Not loaded", "as of 17:42". */
+  readonly note: string | null;
+  /** All of it, for a screen reader. */
+  readonly label: string;
+}
+
+/**
+ * The count on a "Needs you" row. No badge means "nothing to answer", and it
+ * means that only for a read that said so: while the first read is out the
+ * row says "…", after it failed "Not loaded", and a count held from an
+ * earlier read carries the time it was read, a held zero too.
+ */
+export function askRowFigure(figures: AskFigures, count: number, nowMs: number): AskRowFigure {
+  if (figures.state === "unknown") {
+    return figures.failed
+      ? { count: null, note: "Not loaded", label: "Asks not loaded" }
+      : { count: null, note: "…", label: "Loading asks" };
+  }
+  const said = `${count} ${count === 1 ? "ask" : "asks"} to answer`;
+  const badge = count > 0 ? count : null;
+  const asOf = askFiguresAsOf(figures, nowMs);
+  return asOf === null
+    ? { count: badge, note: null, label: said }
+    : { count: badge, note: asOf, label: `${said}, ${asOf}, may be out of date` };
+}
+
+/**
+ * What a list of the open asks says when it has no rows, filters aside. "No
+ * asks" is a claim like a count: it is said only for a read that came back.
+ * Null while the first read is out (the list shows its loading state).
+ */
+export function askListEmptyLine(figures: AskFigures, nowMs: number): string | null {
+  if (figures.state === "unknown") return figures.failed ? "Couldn't load asks" : null;
+  const asOf = askFiguresAsOf(figures, nowMs);
+  return asOf === null ? "No asks" : `No asks, ${asOf}`;
+}

@@ -3,6 +3,8 @@ import {
   askFieldKind,
   askKeyAction,
   askBatchTitle,
+  askListEmptyLine,
+  askQueueFigures,
   askRefusal,
   needsYouBatchKey,
   needsYouFiltered,
@@ -329,6 +331,9 @@ export function NeedsYouPage(props: {
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   const railProps = {
     status,
+    // "No asks" is a claim: the rail makes it only for a read that came back.
+    emptyLine: askListEmptyLine(askQueueFigures({ feed, status, error }), nowMs),
+    onRetry: () => void refreshAsks(),
     unreadable,
     onOpenUnreadable: (ask: AskUnreadable) => {
       if (ask.boardId === null || ask.cardId === null) return;

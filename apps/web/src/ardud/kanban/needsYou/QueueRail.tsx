@@ -48,6 +48,13 @@ export interface QueueRailProps {
   /** Open asks this build could not read: said in one line, with their cards to open. */
   readonly unreadable: ReadonlyArray<AskUnreadable>;
   readonly onOpenUnreadable: (ask: AskUnreadable) => void;
+  /**
+   * What the list says with no rows and no filter (`askListEmptyLine`): "No asks" only for a
+   * read that came back, "Couldn't load asks" after a failed first read.
+   */
+  readonly emptyLine: string | null;
+  /** Reads the asks again. */
+  readonly onRetry: () => void;
   /** In a sheet on a phone: no footer, rows a thumb can hit. */
   readonly inSheet?: boolean;
 }
@@ -166,6 +173,17 @@ export function QueueRail(props: QueueRailProps) {
         )}
         {props.status === "loading" || props.status === "idle" ? (
           <RailSkeleton />
+        ) : props.status === "error" ? (
+          // The first read failed: nothing is known, so it is not "No asks".
+          <div role="alert" className="flex flex-col items-start gap-2 px-2.5 pt-4 text-sm">
+            <p className="text-(--m-muted)">{props.emptyLine ?? "Couldn't load asks"}</p>
+            {/* Beside the reader the reader offers Retry; in a sheet this is the only place. */}
+            {props.inSheet ? (
+              <button type="button" onClick={props.onRetry} className={linkClass}>
+                Retry
+              </button>
+            ) : null}
+          </div>
         ) : sections.length === 0 &&
           props.unreadable.length > 0 &&
           !props.filtered ? null : sections.length === 0 ? (
@@ -182,7 +200,7 @@ export function QueueRail(props: QueueRailProps) {
               <p className="px-2.5 pt-4 text-sm text-(--m-muted)">No asks match</p>
             )
           ) : (
-            <p className="px-2.5 pt-4 text-sm text-(--m-muted)">No asks</p>
+            <p className="px-2.5 pt-4 text-sm text-(--m-muted)">{props.emptyLine ?? "No asks"}</p>
           )
         ) : (
           sections.map((section) => (
