@@ -219,6 +219,15 @@ export interface BoardViewEngine {
    * or prompt, so search can only read those for cards the client has learned.
    */
   readonly learn: (card: KanbanCard) => void;
+  /**
+   * Where the board puts one card and how many cards it holds up: what its tile
+   * shows, for a drawer to say the same. Null for a card the board doesn't have.
+   */
+  readonly place: (
+    state: KanbanBoardState,
+    nowMs: number,
+    cardId: string,
+  ) => { readonly place: TilePlace; readonly unblocks: number } | null;
   /** Per-card views built since the engine was made; for tests and measurements. */
   readonly computed: () => number;
 }
@@ -574,12 +583,8 @@ export function createBoardView(): BoardViewEngine {
     return text;
   };
 
-  const build = (
-    state: KanbanBoardState,
-    nowMs: number,
-    params: BoardViewParams,
-    previous: BoardModel | null,
-  ): { model: BoardModel; validUntil: number } => {
+  /** What every card's view depends on besides the card: the board's rules and the schedule. */
+  const prepare = (state: KanbanBoardState, nowMs: number): number => {
     if (state.board !== boardRef) {
       boardRef = state.board;
       boardKey = boardKeyOf(state);
@@ -591,6 +596,16 @@ export function createBoardView(): BoardViewEngine {
       scheduleBucket = bucket;
       schedule = kanbanSchedule([...state.cards.values()], { nowMs: bucket * SCHEDULE_CLOCK_MS });
     }
+    return bucket;
+  };
+
+  const build = (
+    state: KanbanBoardState,
+    nowMs: number,
+    params: BoardViewParams,
+    previous: BoardModel | null,
+  ): { model: BoardModel; validUntil: number } => {
+    const bucket = prepare(state, nowMs);
     if (entries.size > state.cards.size) {
       for (const id of entries.keys()) if (!state.cards.has(id)) entries.delete(id);
     }
@@ -992,6 +1007,13 @@ export function createBoardView(): BoardViewEngine {
       learned.set(card.id, text);
       // The next model call searches again.
       last = null;
+    },
+    place(state, nowMs, cardId) {
+      const card = state.cards.get(cardId);
+      if (card === undefined) return null;
+      prepare(state, nowMs);
+      const entry = entryFor(card, state, nowMs);
+      return { place: entry.place, unblocks: entry.holds };
     },
     computed: () => computed,
   };

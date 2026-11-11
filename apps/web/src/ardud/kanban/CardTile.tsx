@@ -29,8 +29,8 @@ function sinceText(line: TileLine, nowMs: number): string {
   return nowMs - at < DAY_MS ? ` for ${age}` : ` since ${dayMonth.format(at)}`;
 }
 
-/** "15:41" for later today, "Sat 14 Nov 09:00" for another day. */
-function wakeTime(atIso: string, nowMs: number): string {
+/** "15:41" for today, "Sat 14 Nov 09:00" for another day. */
+export function clockTime(atIso: string, nowMs: number): string {
   const time = formatTimeOfDay(atIso);
   const clock = clockLabel(atIso, nowMs);
   return clock === time ? time : `${clock} ${time}`;
@@ -43,8 +43,11 @@ const LINE_TONES = {
   negative: "text-(--m-negative)",
 } as const;
 
-/** The one line that matters: why the card is where it is, then what moves it next. */
-export function TileWhy(props: { line: TileLine; clamp?: boolean }) {
+/**
+ * The one line that matters: why the card is where it is, then what moves it next.
+ * `roomy` is the drawer's size: body text, nothing cut.
+ */
+export function TileWhy(props: { line: TileLine; clamp?: boolean; roomy?: boolean }) {
   const nowMs = useBoardClock();
   const { line } = props;
   const Icon = LINE_ICONS[line.icon];
@@ -53,11 +56,22 @@ export function TileWhy(props: { line: TileLine; clamp?: boolean }) {
       ? null
       : line.wakeAt === null
         ? line.wake
-        : `${line.wake} ${wakeTime(line.wakeAt, nowMs)}`;
+        : `${line.wake} ${clockTime(line.wakeAt, nowMs)}`;
   return (
-    <span className="flex min-w-0 flex-col gap-0.5 text-xs leading-snug pointer-coarse:text-sm">
+    <span
+      className={cn(
+        "flex min-w-0 flex-col gap-0.5 leading-snug",
+        props.roomy ? "text-sm pointer-coarse:text-base" : "text-xs pointer-coarse:text-sm",
+      )}
+    >
       <span className={cn("flex min-w-0 items-start gap-1.5", LINE_TONES[line.tone])}>
-        <Icon aria-hidden className="mt-0.5 size-3 shrink-0 pointer-coarse:size-3.5" />
+        <Icon
+          aria-hidden
+          className={cn(
+            "shrink-0",
+            props.roomy ? "mt-0.75 size-3.5" : "mt-0.5 size-3 pointer-coarse:size-3.5",
+          )}
+        />
         <span className={cn("min-w-0 wrap-break-word", props.clamp !== false && "line-clamp-2")}>
           {line.lead}
           {sinceText(line, nowMs)}
@@ -65,7 +79,11 @@ export function TileWhy(props: { line: TileLine; clamp?: boolean }) {
         </span>
       </span>
       {wake === null ? null : (
-        <span className="ps-4.5 text-(--m-muted) pointer-coarse:ps-5">{wake}</span>
+        <span
+          className={cn("text-(--m-muted)", props.roomy ? "ps-5" : "ps-4.5 pointer-coarse:ps-5")}
+        >
+          {wake}
+        </span>
       )}
     </span>
   );

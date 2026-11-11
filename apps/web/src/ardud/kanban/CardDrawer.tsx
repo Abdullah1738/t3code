@@ -1,9 +1,21 @@
 import { Link } from "@tanstack/react-router";
-import { ChevronDownIcon, ChevronUpIcon, XIcon } from "lucide-react";
+import {
+  ArrowRightIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  DotIcon,
+  OctagonXIcon,
+  PauseIcon,
+  PlayIcon,
+  TimerOffIcon,
+  XIcon,
+} from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   askViews,
+  cardHistory,
+  cardStateView,
   cardView,
   drawerCard,
   modelName,
@@ -11,6 +23,8 @@ import {
   STAGE_LABELS,
   subtaskOwnerLabel,
   subtaskSteps,
+  type CardHistoryLine,
+  type CardStateView,
   type CardSteps,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
@@ -35,10 +49,10 @@ import { cn } from "../../lib/utils";
 import { isConfirmDialogActive, requestConfirmDialog } from "../../confirmDialog";
 import { stepFromKey } from "./drawerKeys";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { boardViewFor } from "./useBoardClock";
+import { boardViewFor, useBoardClock } from "./useBoardClock";
 import { useNowMs } from "./useNowMs";
 import { CardDescription } from "./CardDescription";
-import { PrGlyph } from "./CardTile";
+import { clockTime, PrGlyph, TileWhy } from "./CardTile";
 import { Chat, Composer } from "./Chat";
 import {
   kanban,
@@ -102,6 +116,8 @@ export function CardDrawer(props: {
   }, [boardId, fullCard]);
   const detailFeed = useFeed(kanban.card(boardId, props.cardId));
   const nowMs = useNowMs();
+  // The board's own clock and cache: the header says what the card's tile says.
+  const boardClock = useBoardClock();
   const [tab, setTab] = useState<DrawerTab>("details");
   const panelRef = useRef<HTMLElement>(null);
 
@@ -171,8 +187,10 @@ export function CardDrawer(props: {
     };
   }, []);
 
-  if (!card) return null;
+  if (!card || !feedCard) return null;
   const view = cardView(card, state, nowMs);
+  const placed = boardViewFor(boardId).place(state, boardClock, props.cardId);
+  const where = placed === null ? null : cardStateView(feedCard, placed.place, placed.unblocks);
   const comments = (detail?.events ?? []).filter((event) => event.kind === "comment");
   const threads = detail?.threads ?? [];
   const linear = card.links.find((link) => link.kind === "linear");
@@ -284,9 +302,9 @@ export function CardDrawer(props: {
             </div>
           ) : null}
           <div className="mt-3 mb-3.5 flex flex-wrap gap-1.5">
-            <Chip>
+            <Chip className={where?.needsYou ? "text-(--m-warning)" : ""}>
               <Glyph kind={stageGlyph(card.stage)} />
-              {view.stageLabel}
+              {where?.column ?? view.stageLabel}
             </Chip>
             {view.goal ? <Chip>{view.goal.name}</Chip> : null}
             {view.pr ? (
@@ -298,6 +316,7 @@ export function CardDrawer(props: {
             {linear ? <LinkChip href={linear.url}>{linear.label ?? "Linear"}</LinkChip> : null}
             <Chip>{view.model.name}</Chip>
           </div>
+          {where ? <CardState view={where} /> : null}
           <OwnerAsks card={card} nowMs={nowMs} onAnswer={() => setTab("discussion")} />
         </div>
         <Tabs
@@ -426,10 +445,7 @@ function Details(props: {
       (await requestConfirmDialog(message, { variant: "destructive" })) ?? window.confirm(message);
     if (confirmed) patch({ removeLinks: [link.url] });
   };
-  const moves = props.events
-    .filter((event) => event.kind === "moved")
-    .slice(-6)
-    .toReversed();
+  const history = cardHistory(props.events);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto py-4">
@@ -595,22 +611,131 @@ function Details(props: {
         ) : null}
       </dl>
       <Subtasks card={card} />
-      {moves.length > 0 ? (
-        <ol className="mt-6 flex flex-col gap-2 text-sm">
-          {moves.map((event) => (
-            <li key={event.id} className="grid grid-cols-[64px_1fr] gap-3">
-              <span className="text-xs text-(--m-muted) tabular-nums">
-                {ageView(event.at, props.nowMs)?.label ?? ""}
-              </span>
-              <span>
-                {event.fromStage ? STAGE_LABELS[event.fromStage] : "New"} →{" "}
-                {event.toStage ? STAGE_LABELS[event.toStage] : ""}
+      <History lines={history} nowMs={props.nowMs} />
+    </div>
+  );
+}
+
+/** What the card waits on and what it holds up: the tile's own words, with room to read them. */
+function CardState(props: { view: CardStateView }) {
+  const { view } = props;
+  return (
+    <dl className="mb-3.5 grid grid-cols-[112px_1fr] items-start gap-x-4 gap-y-2 text-sm pointer-coarse:text-base">
+      <dt className="text-(--m-muted)">Waiting on</dt>
+      <dd className="min-w-0">
+        {view.line ? (
+          <TileWhy line={view.line} clamp={false} roomy />
+        ) : (
+          <span className={view.needsYou ? "font-medium text-(--m-warning)" : undefined}>
+            {view.plain}
+          </span>
+        )}
+      </dd>
+      {view.unblocks > 0 ? (
+        <>
+          <dt className="text-(--m-muted)">Unblocks</dt>
+          <dd className="tabular-nums">
+            {view.unblocks.toLocaleString("en-US")} {view.unblocks === 1 ? "card" : "cards"}
+          </dd>
+        </>
+      ) : null}
+    </dl>
+  );
+}
+
+/** How many history lines show before "N earlier". */
+const HISTORY_PREVIEW = 8;
+
+const HISTORY_ICONS = {
+  move: ArrowRightIcon,
+  wait: PauseIcon,
+  wake: PlayIcon,
+  expired: TimerOffIcon,
+  flag: OctagonXIcon,
+  plain: DotIcon,
+} as const;
+
+const HISTORY_TONES: Record<CardHistoryLine["kind"], string> = {
+  move: "text-(--m-muted)",
+  wait: "text-(--m-muted)",
+  wake: "text-(--m-accent-text)",
+  expired: "text-(--m-warning)",
+  flag: "text-(--m-negative)",
+  plain: "text-(--m-muted)",
+};
+
+const HISTORY_ACTORS: Record<CardHistoryLine["actor"], string | null> = {
+  owner: "You",
+  thread: "Worker",
+  evaluator: "Evaluator",
+  script: "Script",
+  // The board itself: saying so on every line it wrote is noise.
+  system: null,
+};
+
+/** The card's moves, waits and flags, newest first. */
+function History(props: { lines: ReadonlyArray<CardHistoryLine>; nowMs: number }) {
+  const [all, setAll] = useState(false);
+  if (props.lines.length === 0) return null;
+  const shown = all ? props.lines : props.lines.slice(0, HISTORY_PREVIEW);
+  const earlier = props.lines.length - shown.length;
+  return (
+    <section className="mt-6" aria-label="History">
+      <h3 className="mb-2 text-sm font-medium">History</h3>
+      <ol className="flex flex-col gap-2 text-sm pointer-coarse:text-base">
+        {shown.map((line) => {
+          const Icon = HISTORY_ICONS[line.kind];
+          const actor = HISTORY_ACTORS[line.actor];
+          return (
+            <li key={line.id} className="grid grid-cols-[112px_1fr] gap-x-4">
+              <time
+                dateTime={line.at}
+                className="pt-0.5 text-xs text-(--m-muted) tabular-nums pointer-coarse:text-sm"
+              >
+                {clockTime(line.at, props.nowMs)}
+              </time>
+              <span className="flex min-w-0 items-start gap-1.5">
+                <Icon
+                  aria-hidden
+                  className={cn("mt-0.75 size-3.5 shrink-0", HISTORY_TONES[line.kind])}
+                />
+                <span className="min-w-0 wrap-break-word">
+                  {line.parts.map((part, index) =>
+                    typeof part === "string" ? (
+                      part
+                    ) : (
+                      <time key={index} dateTime={part.at}>
+                        {clockTime(part.at, props.nowMs)}
+                      </time>
+                    ),
+                  )}
+                  {actor ? (
+                    <>
+                      {" "}
+                      <span className="whitespace-nowrap text-(--m-muted)">· {actor}</span>
+                    </>
+                  ) : null}
+                  {line.moved ? (
+                    <span className="block text-xs text-(--m-muted) pointer-coarse:text-sm">
+                      {line.moved}
+                    </span>
+                  ) : null}
+                </span>
               </span>
             </li>
-          ))}
-        </ol>
+          );
+        })}
+      </ol>
+      {earlier > 0 ? (
+        <button
+          type="button"
+          onClick={() => setAll(true)}
+          className="mt-2 h-7 rounded-lg text-sm text-(--m-muted) tabular-nums outline-none hover:text-(--m-text) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
+        >
+          {earlier.toLocaleString("en-US")} earlier
+        </button>
       ) : null}
-    </div>
+    </section>
   );
 }
 

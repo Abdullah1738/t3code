@@ -614,6 +614,34 @@ describe("createBoardView", () => {
     const removed = applyKanbanChange(state, { _tag: "cardRemoved", cardId: "card-2" } as never);
     expect(idsOf(engine.model(removed, NOW, STAGE).active[0]!)).toEqual(["card-1", "card-3"]);
   });
+
+  it("places one card for a drawer the way its tile is placed, with or without a model", () => {
+    const cards = [
+      card(1),
+      card(2, { blockedBy: ["card-1"] as never }),
+      card(3, { blockedBy: ["card-1"] as never }),
+    ];
+    const state = stateOf(cards);
+    // No model built yet: a drawer over another view still gets the card's place.
+    const cold = createBoardView().place(state, NOW, "card-2");
+    expect(cold?.place.column).toBe("todo");
+    expect(cold?.place.group).toBe("blocked");
+    expect(cold?.place.line?.lead).toBe("Blocked by #1");
+
+    const engine = createBoardView();
+    const built = engine.model(state, NOW, STAGE);
+    const tile = built.active[0]!.rows.flatMap((row) =>
+      row.kind === "card" && row.card.id === "card-1" ? [row.card] : [],
+    )[0]!;
+    const computed = engine.computed();
+    const warm = engine.place(state, NOW, "card-1");
+    expect(warm?.unblocks).toBe(tile.unblocks);
+    expect(warm?.unblocks).toBe(2);
+    expect(warm?.place.line).toBe(tile.line);
+    // Read from the board's own cache: nothing was derived again.
+    expect(engine.computed()).toBe(computed);
+    expect(engine.place(state, NOW, "card-9")).toBeNull();
+  });
 });
 
 describe("boardSteps", () => {
