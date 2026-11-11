@@ -291,7 +291,7 @@ function Row(props: {
           </span>
         </span>
         <span className={cn("truncate text-sm", focused || mark ? "font-medium" : "")}>
-          {item.ask.title ?? item.ask.text}
+          {item.ask.title ?? item.cardTitle}
         </span>
       </button>
     </li>
