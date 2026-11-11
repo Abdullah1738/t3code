@@ -390,7 +390,7 @@ function AskList(props: {
     <ul className="flex flex-col divide-y divide-(--m-rule) rounded-xl ring-1 ring-(--m-rule)">
       {left && props.onToggleAll && props.entries.length > 1 ? (
         <li className="px-3.5 py-2 text-sm">
-          <label className="flex items-baseline gap-3 pointer-coarse:min-h-8">
+          <label className="flex items-baseline gap-3 pointer-coarse:-my-1.5 pointer-coarse:min-h-11 pointer-coarse:items-center pointer-coarse:[&>input]:translate-y-0">
             <input
               type="checkbox"
               className={tick}
@@ -404,13 +404,16 @@ function AskList(props: {
       {props.entries.map((entry, index) => (
         <li key={askKey(entry)} className="flex min-w-0 items-baseline gap-3 px-3.5 py-2.5 text-sm">
           {left && onToggle ? (
-            <input
-              type="checkbox"
-              className={tick}
-              aria-label={`Answer #${entry.cardNumber} with the rest`}
-              checked={!left.has(askKey(entry))}
-              onChange={() => onToggle(askKey(entry))}
-            />
+            // The label is the target: 44 px under a finger, the box itself stays small.
+            <label className="-m-2.5 flex p-2.5 pointer-coarse:-mx-3 pointer-coarse:-my-3.5 pointer-coarse:px-3 pointer-coarse:py-3.5">
+              <input
+                type="checkbox"
+                className={tick}
+                aria-label={`Answer #${entry.cardNumber} with the rest`}
+                checked={!left.has(askKey(entry))}
+                onChange={() => onToggle(askKey(entry))}
+              />
+            </label>
           ) : null}
           <button
             type="button"
