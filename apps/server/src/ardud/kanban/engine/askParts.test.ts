@@ -183,7 +183,7 @@ it.effect(
         const evaluator = (yield* fake.evaluators)[0]!;
         const told = evaluator.messages.join("\n");
         assert.include(told, "q1 on card #1 was asked to you, the evaluator, not to the owner");
-        assert.include(told, "It takes the verdict picked or answered.");
+        assert.include(told, "It takes the verdict picked.");
 
         // Only a card's thread addresses the evaluator; nobody else is a valid addressee.
         const fromEvaluator = yield* Effect.flip(
@@ -291,10 +291,7 @@ it.effect("an action with a field and a file over HTTP: checked, kept, and told 
           values: { when: "o1" },
         });
         assert.strictEqual(verdict.status, 400);
-        assert.include(
-          verdict.body.error.message,
-          'takes approved, rejected, answered (got "done")',
-        );
+        assert.include(verdict.body.error.message, 'takes approved, rejected (got "done")');
         // A file the board can't keep refuses the whole answer and changes nothing.
         const ghost = yield* http.post(answerUrl, {
           revision: 0,

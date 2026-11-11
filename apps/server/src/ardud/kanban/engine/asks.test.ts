@@ -501,9 +501,14 @@ describe("answerFor and answerText", () => {
       'no option "zz" (it has o1, o2)',
     );
     assert.include(detail({ verdict: "picked", optionIds: ["o1", "o2"] }), "takes one option");
-    assert.include(detail({ verdict: "answered" }), "needs text");
-    assert.include(detail({ verdict: "approved" }), 'takes picked, answered (got "approved")');
-    assert.include(detail({ verdict: "maybe" }, draftAsk), "takes approved, rejected, answered");
+    // Words are not a pick: said on the ask, they keep it open.
+    assert.include(
+      detail({ verdict: "answered", text: "Neither." }),
+      "can't be answered in words alone: it takes picked. To say something about it without deciding, reply on the ask instead",
+    );
+    assert.include(detail({ verdict: "answered" }, ask({}, "Which tier?")), "needs text");
+    assert.include(detail({ verdict: "approved" }), 'takes picked (got "approved")');
+    assert.include(detail({ verdict: "maybe" }, draftAsk), "takes approved, rejected (got");
     assert.include(
       detail({ verdict: "picked", optionIds: ["o1"], finalDraft: "x" }),
       "has no draft",

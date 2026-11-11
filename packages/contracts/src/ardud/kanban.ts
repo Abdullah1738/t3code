@@ -652,6 +652,30 @@ export const kanbanAskIsFreeText = (ask: AskResponseFields): boolean => {
   );
 };
 
+/**
+ * The start of the refusal an answer route gives when words alone were sent to
+ * an ask that needs a verdict or a pick. Clients match on it to offer a reply
+ * on the ask instead.
+ */
+export const KANBAN_ASK_WORDS_REFUSED = "can't be answered in words alone";
+
+/**
+ * Words alone can answer an ask with these response parts (the `answered`
+ * verdict): there is no verdict to give and no pick he has to make, and there
+ * is something words fill in (a field, or a pick he may leave empty). An
+ * approval, a required pick, a task with nothing to fill in and a notice
+ * never close on words: he says them in a reply on the ask, which stays open.
+ */
+export const kanbanResponseTakesWords = (response: KanbanAskResponse): boolean =>
+  !response.ack &&
+  response.verdict === null &&
+  (response.choose === null || response.choose.min === 0) &&
+  (response.fields.length > 0 || response.choose !== null);
+
+/** `kanbanResponseTakesWords` for an ask. */
+export const kanbanAskTakesWords = (ask: AskResponseFields): boolean =>
+  kanbanResponseTakesWords(kanbanAskResponse(ask));
+
 /** A notice: nothing to decide, he only marks it seen. Never blocking, never in the needs-owner count. */
 export const kanbanAskIsNotice = (ask: {
   readonly respond?: { readonly ack?: boolean | undefined } | undefined;
@@ -2003,9 +2027,18 @@ export const KanbanErrorCode = Schema.Literals([
 ]);
 export type KanbanErrorCode = typeof KanbanErrorCode.Type;
 
+/**
+ * Why a `denied` was refused, when a client can do better than show the detail.
+ * `not_owner_device`: the session is a paired device, but not one the owner
+ * paired as his own. It has to be paired again from an owner device.
+ */
+export const KanbanDeniedReason = Schema.Literals(["not_owner_device"]);
+export type KanbanDeniedReason = typeof KanbanDeniedReason.Type;
+
 export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError", {
   code: KanbanErrorCode,
   detail: Schema.String,
+  reason: Schema.optionalKey(KanbanDeniedReason),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

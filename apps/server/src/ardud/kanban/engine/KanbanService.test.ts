@@ -384,6 +384,12 @@ const observedTestLayer = (
   );
 
 const owner: KanbanActor = { _tag: "owner" };
+/** The session of the owner's own app, for the WS handlers. */
+const OWNER_APP_SESSION = {
+  sessionId: "session-owner",
+  subject: "one-time-token",
+  origin: { _tag: "owner", source: "paired-client" },
+} as const;
 
 it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
   Effect.gen(function* () {
@@ -503,7 +509,7 @@ it.effect("the shared HTTP and WS block input preserves controls for service val
           multi: false,
         }),
       ]);
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       for (const block of blocks) {
         const error = yield* ws[M.messagePost]({
           discussionId: discussion.id,
@@ -1102,7 +1108,7 @@ it.effect("owner repeats through the board websocket are saved twice", () =>
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       const board = yield* kanban.ensureBoard({
         slug: "owner-ws-repeat",
         name: "Owner WS repeat",
@@ -1357,7 +1363,7 @@ it.effect(
       yield* Effect.gen(function* () {
         const service = yield* KanbanService.KanbanService;
         const settings = yield* ServerSettings.ServerSettingsService;
-        const ws = makeKanbanWsHandlers(service, {} as KanbanScriptsShape);
+        const ws = makeKanbanWsHandlers(service, {} as KanbanScriptsShape, OWNER_APP_SESSION);
         const legacy = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
         const expected: ModelSelection = {
           instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -5786,7 +5792,7 @@ it.effect("a multi ask posts a tick-several pick and wakes the card with every p
   }),
 );
 
-it.effect("a blocked ask answered in his own words wakes the card with them", () =>
+it.effect("his own words on a blocked pick keep it open, and a pick then wakes the card", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -5803,8 +5809,9 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
       );
       yield* kanban.changeAsk(card.id, "q1", "block", owner, "owner");
 
+      // Words are not a pick: they are a reply on the ask, which still holds the card.
       const talk = yield* kanban.cardDiscussion(card.id);
-      const answered = yield* kanban.answer(
+      const shown = yield* kanban.answer(
         talk.id,
         asked.asks[0]!.seq!,
         "q1",
@@ -5812,9 +5819,13 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
         owner,
         "Wait for Monday",
       );
-      const ownAnswer = answered.answers.find((entry) => entry.by._tag === "owner");
-      assert.deepStrictEqual(ownAnswer?.choice, []);
-      assert.strictEqual(ownAnswer?.text, "Wait for Monday");
+      assert.deepStrictEqual(shown.answers, []);
+      const held = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(held.stage, "needs_owner");
+      assert.isNull(held.asks[0]!.closedAt);
+      assert.isDefined(held.asks[0]!.clarifyAskedAt);
+
+      yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", ["o2"], owner, "Wait for Monday");
       const woken = (yield* kanban.card(card.id)).card;
       assert.strictEqual(woken.stage, "todo");
       assert.include(woken.wakeNote ?? "", "Wait for Monday");
@@ -5823,7 +5834,7 @@ it.effect("a blocked ask answered in his own words wakes the card with them", ()
   }),
 );
 
-it.effect("an async ask answered in his own words reaches the working thread", () =>
+it.effect("his own words on an async pick reach the working thread as a reply", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -5839,13 +5850,18 @@ it.effect("an async ask answered in his own words reaches the working thread", (
         "cardThread",
       );
 
+      // The thread that asked is working, so it hears his words itself, once, as a reply
+      // that decided nothing.
       const talk = yield* kanban.cardDiscussion(card.id);
       yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", [], owner, "Use 2%");
       const after = (yield* kanban.card(card.id)).card;
       assert.strictEqual(after.stage, "working");
-      assert.isNotNull(after.asks[0]!.closedAt);
+      assert.isNull(after.asks[0]!.closedAt);
       const sent = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
-      assert.strictEqual(sent.filter((message) => message.includes("Use 2%")).length, 1);
+      const heard = sent.filter((message) => message.includes("Use 2%"));
+      assert.strictEqual(heard.length, 1);
+      assert.include(heard[0]!, "without answering it");
+      assert.include(heard[0]!, "It is not a pick.");
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -6253,7 +6269,7 @@ it.effect(
         assert.deepStrictEqual(clientRpcRequiredScopes(KANBAN_WS_METHODS.boardPause, {}), [
           AuthOrchestrationOperateScope,
         ]);
-        const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+        const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
         const paused = yield* handlers[KANBAN_WS_METHODS.boardPause]({
           boardId: board.id,
           reason: "Hold",
@@ -13096,7 +13112,7 @@ it.effect("message pages are cut by size, page back with beforeSeq and stub big 
         assert.isAtMost(stub.text.length, 2_100);
       }
       // Older clients asking for 200 still get a size-bounded page.
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       const legacy = yield* ws[M.messages]({ discussionId: channel.id, limit: 200 });
       assert.isAtMost(
         legacy.reduce((sum, message) => sum + JSON.stringify(message).length, 0),

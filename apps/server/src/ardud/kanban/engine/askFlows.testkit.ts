@@ -127,6 +127,26 @@ export const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
     Layer.provideMerge(filesLayer),
   );
 
+/**
+ * The same service over a database file, so a test can stop one service and
+ * start another on what it left behind. `store` stands in for the board store.
+ */
+export const fileTestLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  dbPath: string,
+  store: typeof KanbanStore.layer = KanbanStore.layer,
+) =>
+  KanbanService.layer.pipe(
+    Layer.provideMerge(fake),
+    Layer.provideMerge(KanbanModels.layerTest(null)),
+    Layer.provideMerge(store),
+    Layer.provideMerge(Sqlite.layerFromPath(dbPath)),
+    Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
+    Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+    Layer.provideMerge(providerRegistryLayer([opencodeTestProvider()])),
+    Layer.provideMerge(filesLayer),
+  );
+
 export const toyBoard = (slug = "toy") =>
   Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
@@ -177,8 +197,28 @@ export const writePending = (name: string, mimeType: string, bytes: string) =>
 export type HttpCaller =
   | { readonly _tag: "owner" }
   | { readonly _tag: "component"; readonly component: string }
-  /** A session nobody marked: a Mac link, `t3 auth session issue`, the old shared control token. */
-  | { readonly _tag: "unmarked" };
+  /** A session nobody marked, issued by hand: `t3 auth session issue`, the old shared control token. */
+  | { readonly _tag: "unmarked" }
+  /** A device paired from a link made on the Mac (`t3 pair`): a pairing-link session nobody marked. */
+  | { readonly _tag: "paired" };
+
+/** The session each caller's cookie or bearer maps to. */
+export const sessionOf = (caller: HttpCaller) => ({
+  sessionId: AuthSessionId.make(`session-${caller._tag}`),
+  subject:
+    caller._tag === "component"
+      ? `component:${caller.component}`
+      : caller._tag === "unmarked"
+        ? "cli-issued-session"
+        : "one-time-token",
+  method: "bearer-access-token" as const,
+  scopes: ["orchestration:read" as const, "orchestration:operate" as const],
+  ...(caller._tag === "owner"
+    ? { origin: { _tag: "owner" as const, source: "paired-client" as const } }
+    : caller._tag === "component"
+      ? { origin: { _tag: "component" as const, component: caller.component } }
+      : {}),
+});
 
 /** The board's HTTP routes over the service under test, as the owner's app or as `caller`. */
 export const makeHttpAs = (caller: HttpCaller) => makeHttpFor(caller);
@@ -195,18 +235,7 @@ const makeHttpFor = (caller: HttpCaller) =>
             Layer.provide(
               Layer.mergeAll(
                 Layer.mock(EnvironmentAuth.EnvironmentAuth)({
-                  authenticateHttpRequest: () =>
-                    Effect.succeed({
-                      sessionId: AuthSessionId.make("session-owner"),
-                      subject: "owner",
-                      method: "bearer-access-token" as const,
-                      scopes: ["orchestration:read", "orchestration:operate"],
-                      ...(caller._tag === "owner"
-                        ? { origin: { _tag: "owner" as const, source: "paired-client" as const } }
-                        : caller._tag === "component"
-                          ? { origin: { _tag: "component" as const, component: caller.component } }
-                          : {}),
-                    }),
+                  authenticateHttpRequest: () => Effect.succeed(sessionOf(caller)),
                 }),
                 Layer.succeed(KanbanService.KanbanService, kanban),
                 Layer.mock(KanbanScripts)({}),
@@ -230,7 +259,7 @@ const makeHttpFor = (caller: HttpCaller) =>
       ServerSettings.ServerSettingsService,
       yield* ServerSettings.ServerSettingsService,
     );
-    const call = (method: "GET" | "POST", path: string, body?: unknown) =>
+    const call = (method: "GET" | "POST" | "PATCH", path: string, body?: unknown) =>
       Effect.promise(async () => {
         const response = await web.handler(
           new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
@@ -246,5 +275,6 @@ const makeHttpFor = (caller: HttpCaller) =>
     return {
       get: (path: string) => call("GET", path),
       post: (path: string, body?: unknown) => call("POST", path, body),
+      request: call,
     };
   });

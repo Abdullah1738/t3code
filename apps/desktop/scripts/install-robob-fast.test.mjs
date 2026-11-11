@@ -10,6 +10,7 @@ import {
   getJson,
   hostPreflight,
   install,
+  migrationCheckTimeoutMs,
   otherInstallerPids,
   pidsRunningFrom,
   probeDirectory,
@@ -578,4 +579,11 @@ test("readiness polls reject on every failure and never use global fetch", async
   // Node 26.2's fetch crashed the installer from a socket callback; keep it out.
   const source = await readFile(new URL("./install-robob-fast.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source.replace(/^\s*(\*|\/\/).*$/gm, ""), /\bfetch\(/);
+});
+
+test("the pre-quit migration check waits 10 minutes by default and takes an env override", () => {
+  assert.equal(migrationCheckTimeoutMs({}), 600_000);
+  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "900000" }), 900_000);
+  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "5" }), 600_000);
+  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "nope" }), 600_000);
 });

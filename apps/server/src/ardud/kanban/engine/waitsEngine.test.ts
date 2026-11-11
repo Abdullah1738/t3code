@@ -943,6 +943,10 @@ it.effect(
         yield* kanban.tick;
         assert.strictEqual((yield* cardOf(pushed.id)).stage, "completed");
         assert.strictEqual(world.toldEvaluator("is no longer waiting"), 0);
+        // The history says the evaluator was never told, not that it took too long.
+        const lines = (yield* eventsOf(pushed.id)).map((event) => event.body);
+        assert.include(lines, Waits.DECIDING_NEVER_TOLD);
+        assert.notInclude(lines, Waits.DECIDING_RAN_OUT);
         yield* Fiber.interrupt(answering);
 
         // From the tick: the send fails then and there, nobody was told, so nothing holds it.
@@ -1433,6 +1437,64 @@ it.effect("a check that outlives its wait does not answer for the wait that repl
       assert.strictEqual(world.cardThreads(), 0);
     }),
   ),
+);
+
+it.effect(
+  "a check cannot answer for a card it was not asked about, even one that waits on its script by now",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, board } = yield* setup;
+        const scripts = yield* ScriptService.KanbanScripts;
+        const parked = (title: string) =>
+          placed(board, title, { stage: "in_review", reviewStep: 1 });
+        const asked = yield* parked("Blocked on ENG-1");
+        const late = yield* parked("Blocked on ENG-2");
+        // Once let go, the check wakes a card that was not in its input (a line from
+        // an earlier run's cache, say) and says nothing about the one that was.
+        const go = NodePath.join(
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-waits-go-")),
+          "go",
+        );
+        const wake = `{"kanban":{"wait":{"card":"#${late.number}","result":"wake","to":"work","note":"ENG-2 is Done"}}}`;
+        const script = yield* scripts.register(
+          {
+            boardId: board.id,
+            name: "linear-state",
+            path: scriptFile(
+              `#!/bin/sh\nwhile [ ! -f "${go}" ]; do sleep 0.05; done\necho '${wake}'\n`,
+              "linear-state.sh",
+            ),
+            trigger: { _tag: "manual" },
+          },
+          owner,
+        );
+        const waitOn = (card: KanbanCard, issue: string) =>
+          kanban.waitCard(
+            card.id,
+            { on: "script", script: "linear-state", args: { issue }, note: `${issue} Done` },
+            owner,
+          );
+        yield* waitOn(asked, "ENG-1");
+        // The check starts with one card in its batch...
+        yield* kanban.tick;
+        yield* scripts.tick;
+        // ...and while it runs, the other card starts waiting on the same script.
+        const waiting = yield* waitOn(late, "ENG-2");
+        NodeFS.writeFileSync(go, "");
+        yield* scripts.idle;
+        // The answer was for a card this run never checked: its wait stands, untouched.
+        assert.deepStrictEqual(yield* cardOf(late.id), waiting);
+        assert.strictEqual(world.cardThreads(), 0);
+        const [run] = yield* scripts.runs(script.id, 1);
+        assert.include(
+          run?.output ?? "",
+          `Refused for card #${late.number}: this check was not asked about card #${late.number}`,
+        );
+        // The card it was asked about got no line, which is a hold: still waiting.
+        assert.isTrue(kanbanWaiting(yield* cardOf(asked.id)));
+      }),
+    ),
 );
 
 it.effect("a pushed wake can name the wait it means, and is refused once that wait is gone", () =>
