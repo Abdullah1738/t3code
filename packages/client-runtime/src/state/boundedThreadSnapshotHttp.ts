@@ -54,7 +54,8 @@ export const fetchEnvironmentBoundedThreadSnapshot = Effect.fn(
 /**
  * Older servers that lack the bounded route (plain/generic 404) fall back to
  * the existing full HTTP thread snapshot. Structured
- * EnvironmentResourceNotFoundError from either endpoint still means missing.
+ * EnvironmentResourceNotFoundError from either endpoint means "missing": not found
+ * right now. Only a thread.deleted event confirms a delete.
  */
 export const layer: Layer.Layer<
   ThreadSnapshotLoader.ThreadSnapshotLoader,
@@ -86,7 +87,7 @@ export const layer: Layer.Layer<
             EnvironmentOperationForbiddenError: () => Effect.succeed({ _tag: "denied" } as const),
             EnvironmentResourceNotFoundError: () =>
               Effect.logDebug(
-                "Full thread snapshot not found over HTTP after bounded fallback; treating the thread as deleted.",
+                "Full thread snapshot not found over HTTP after bounded fallback; treating the thread as not found yet.",
               ).pipe(
                 Effect.annotateLogs({ threadId }),
                 Effect.as({
@@ -131,7 +132,7 @@ export const layer: Layer.Layer<
             EnvironmentOperationForbiddenError: () => Effect.succeed({ _tag: "denied" } as const),
             EnvironmentResourceNotFoundError: () =>
               Effect.logDebug(
-                "Bounded thread snapshot not found over HTTP; treating the thread as deleted.",
+                "Bounded thread snapshot not found over HTTP; treating the thread as not found yet.",
               ).pipe(
                 Effect.annotateLogs({ threadId }),
                 Effect.as({

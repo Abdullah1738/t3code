@@ -264,6 +264,16 @@ export function createEnvironmentThreadShellAtoms(input: {
     }).pipe(Atom.withLabel(`environment-thread-shell:${key}`));
   });
 
+  // True while the shell lists the thread and it is not deleted. Detail state
+  // uses this to load a thread it was opened for before the server created it.
+  const threadPresenceAtomFamily = Atom.family((key: string) => {
+    const ref = parseThreadKey(key);
+    return Atom.make((get) => {
+      const source = get(environmentThreadIndexAtom(ref.environmentId)).get(ref.threadId);
+      return source !== undefined && source.deletedAt == null;
+    }).pipe(Atom.withLabel(`environment-thread-presence:${key}`));
+  });
+
   // Keeps the previous shell while only streaming ticks changed. During a run,
   // its timestamps, item counts and latest message are as of the last kept
   // change; anything that needs them current reads threadShellAtom.
@@ -416,6 +426,7 @@ export function createEnvironmentThreadShellAtoms(input: {
       threadShellsForProjectRefsAtomFamily(projectRefCollectionKey(refs)),
     threadShellAtom: (ref: ScopedThreadRef) => threadShellAtomFamily(threadKey(ref)),
     quietThreadShellAtom: (ref: ScopedThreadRef) => quietThreadShellAtomFamily(threadKey(ref)),
+    threadPresenceAtom: (ref: ScopedThreadRef) => threadPresenceAtomFamily(threadKey(ref)),
     childThreadInputsAtom: (ref: ScopedThreadRef) => childThreadInputsAtomFamily(threadKey(ref)),
   };
 }

@@ -8,7 +8,13 @@ export type EnvironmentThreadStatus =
   | "cached"
   | "synchronizing"
   | "live"
+  /** Confirmed by a `thread.deleted` event. Retained across navigation. */
   | "deleted"
+  /**
+   * The server answered "not found" for longer than the grace window (an HTTP
+   * miss, not a delete event). Never retained: reopening the thread refetches.
+   */
+  | "not-found"
   | "no-access";
 
 export interface EnvironmentThreadState {
