@@ -4,6 +4,7 @@
  * card; an evaluator acts on the whole board. The service enforces the moves.
  */
 import {
+  CARD_ASK_TOOL_DESCRIPTION,
   KanbanBlockInput,
   KanbanBoardIcon,
   KanbanPriority,
@@ -349,8 +350,9 @@ const AskFieldsInput = {
         target: Schema.optional(Schema.String),
         evidence: Schema.optional(Schema.Array(Schema.String)),
         undo: Schema.optional(Schema.String),
+        then: Schema.optional(Schema.String),
       }),
-      "What you will do, the command, where, the proof it is ready, and how to undo it.",
+      "What you will do, the command, where, the proof it is ready, how to undo it, and what you do once it is done (then).",
     ),
   ),
   change: Schema.optional(
@@ -402,7 +404,7 @@ const AskActionInput = AskFieldsInput.action;
 const CardAsk = tool(
   "card_ask",
   "Ask the owner",
-  "Ask the owner on a card. He answers from a list, without opening the card, so the ask must stand on its own, and the question must read alone; his answer comes back to you. Async by default: the card and its work go on. Pass blocking only when the work can't go on without the answer: the card then waits in Needs Owner (a work thread's own card must be in Working, and gives up its slot). One thing per ask. He can give back: approve or reject, a pick, values he fills in (text, a number, a date, a file), an edit of your draft, a step he does himself, or nothing but having seen it. Shortcuts set that up from what you pass: a bare question (free text); options (he picks: give each a detail and mark yours recommended); draft (a text you will post or send: he may edit it, and you post exactly what comes back); action (something you will run, with command, evidence and undo: approve or reject); change or changes (texts you replace, before and after). For anything else say it with respond. Use kind notice for something he should only see; when nothing needs him, don't ask. Always give title and context. Show evidence instead of describing it, with blocks: attach screenshots, screen recordings, audio, PDFs or files (upload with t3_attachment_prepare_upload, then pass an attachment block), and put a visualization in an html block (a self-contained page like the ones html_render publishes: chart, table, before/after, diagram; no external scripts, fonts or fetches; readable at phone width, in light and dark). Give every image alt text and a one-line caption (an md block after it).",
+  CARD_ASK_TOOL_DESCRIPTION,
   {
     card: Schema.optional(CardRef),
     question: describe(Schema.String, "The question itself, one or two sentences."),

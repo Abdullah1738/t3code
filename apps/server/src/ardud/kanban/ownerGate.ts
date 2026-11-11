@@ -45,6 +45,16 @@ export const ownerRefusal = (session: OwnerGateSession): KanbanError | null => {
   return new KanbanError({ code: "denied", detail: NOT_OWNER_MESSAGE });
 };
 
+/**
+ * The refusal for a paired device that is not the owner's, and null for any
+ * other session. For owner checks that have their own refusal for everyone
+ * else and only want to tell such a device how to become his.
+ */
+export const notOwnerDeviceRefusal = (session: OwnerGateSession): KanbanError | null => {
+  const refusal = ownerRefusal(session);
+  return refusal?.reason === "not_owner_device" ? refusal : null;
+};
+
 /** Fails with the refusal unless the session is the owner's own. */
 export const requireOwner = (session: OwnerGateSession): Effect.Effect<void, KanbanError> => {
   const refusal = ownerRefusal(session);

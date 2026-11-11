@@ -794,6 +794,16 @@ const uuid = () => NodeCrypto.randomUUID();
 const failWith = (code: KanbanError["code"], detail: string) =>
   Effect.fail(new KanbanError({ code, detail }));
 
+/** A refused answer, with the revision the ask is at when that is why. */
+const failAnswer = (problem: Asks.AskProblem) =>
+  Effect.fail(
+    new KanbanError({
+      code: problem.code,
+      detail: problem.detail,
+      ...(problem.revision === undefined ? {} : { revision: problem.revision }),
+    }),
+  );
+
 const checkText = (fields: ReadonlyArray<readonly [string, string | null | undefined]>) => {
   const problem = Text.textProblem(fields);
   return problem ? failWith("invalid", problem) : Effect.void;
@@ -4371,6 +4381,8 @@ const make = Effect.gen(function* () {
     saveRoute = false,
     /** The ask whose discussion the message belongs to. */
     askId?: string,
+    /** With askId, for a message that is the ask itself: the revision it shows. */
+    askRevision?: number,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
@@ -4418,6 +4430,7 @@ const make = Effect.gen(function* () {
       answers: [],
       createdAt: at,
       ...(askId === undefined ? {} : { askId }),
+      ...(askId === undefined || askRevision === undefined ? {} : { askRevision }),
     };
     const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
     const durablePost = saveRoute && author._tag === "owner";
@@ -8224,6 +8237,7 @@ const make = Effect.gen(function* () {
       false,
       false,
       ask.id,
+      kanbanAskRevision(ask),
     );
     const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, {
       ...fields,
@@ -8389,6 +8403,7 @@ const make = Effect.gen(function* () {
           false,
           false,
           ask.id,
+          kanbanAskRevision(revised),
         );
         const edited = Asks.replaceAsk(yield* cardOf(card.id), {
           ...revised,
@@ -8472,7 +8487,7 @@ const make = Effect.gen(function* () {
           yield* nowIso,
           new Set(Object.keys(secrets ?? {})),
         );
-        if (Asks.isAskProblem(checked)) return yield* failWith(checked.code, checked.detail);
+        if (Asks.isAskProblem(checked)) return yield* failAnswer(checked);
         // The files he gave are kept before the card changes: one that can't be refuses the answer.
         let answer = checked;
         const given = Asks.answerFiles(ask, checked);
@@ -9985,10 +10000,11 @@ const make = Effect.gen(function* () {
             const ref = `${pick.ask.id} on card #${pick.card.number}`;
             if (pick.stale) {
               // An earlier version of the ask: answering it would answer something he no longer sees.
-              return failWith(
-                "conflict",
-                `${ref} was updated since this message (it is at revision ${kanbanAskRevision(pick.ask)} now). Nothing was answered: answer its current version.`,
-              );
+              return failAnswer({
+                code: "conflict",
+                detail: `${ref} was updated since this message (it is at revision ${kanbanAskRevision(pick.ask)} now). Nothing was answered: answer its current version.`,
+                revision: kanbanAskRevision(pick.ask),
+              });
             }
             // A closed ask's late pick, and an ask that takes words alone, go the way a reply does.
             if (pick.ask.closedAt !== null || kanbanAskIsFreeText(pick.ask)) {

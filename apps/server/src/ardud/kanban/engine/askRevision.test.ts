@@ -37,7 +37,10 @@ it.effect("an answer with no revision is refused with the current one, on every 
         assert.strictEqual(direct.code, "invalid");
         assert.include(direct.detail, "q1 on card #1 needs the revision you are answering");
         assert.include(direct.detail, "It is at revision 0");
+        // The revision is a field too, so a client need not read it out of the words.
+        assert.strictEqual(direct.revision, 0);
 
+        const firstSeq = askOf((yield* kanban.card(first.id)).card).seq!;
         // The ask moves on; the refusal names the revision it is at now.
         yield* kanban.editAsk(
           first.id,
@@ -50,6 +53,24 @@ it.effect("an answer with no revision is refused with the current one, on every 
         assert.strictEqual(single.status, 400);
         assert.strictEqual(single.body.error.code, "invalid");
         assert.include(single.body.error.message, "It is at revision 1");
+        assert.strictEqual(single.body.error.revision, 1);
+        // An older revision is a conflict, and says where the ask is now the same way.
+        const stale = yield* http.post("/cards/toy:1/asks/q1/answer", {
+          verdict: "approved",
+          revision: 0,
+        });
+        assert.strictEqual(stale.status, 409);
+        assert.deepInclude(stale.body.error, { code: "conflict", revision: 1 });
+        const stalePick = yield* kanban
+          .answer(
+            (yield* kanban.cardDiscussion(first.id)).id,
+            firstSeq,
+            "q1",
+            ["approve"],
+            owner,
+          )
+          .pipe(Effect.flip);
+        assert.deepInclude(stalePick, { code: "conflict", revision: 1 });
         // Rejecting needs it as much as approving does.
         const rejected = yield* http.post("/cards/toy:1/asks/q1/answer", { verdict: "rejected" });
         assert.strictEqual(rejected.status, 400);
@@ -76,6 +97,7 @@ it.effect("an answer with no revision is refused with the current one, on every 
           ],
         );
         assert.include(batch.body.results[1].error.message, "It is at revision 0");
+        assert.strictEqual(batch.body.results[1].error.revision, 0);
         assert.isNull(askOf((yield* kanban.card(second.id)).card).closedAt);
 
         // A notice is not a plain question either.

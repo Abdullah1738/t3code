@@ -34,11 +34,13 @@ import { featureUsage } from "../../../telemetry/FeatureUsage.ts";
 import { HELD_SECRET_MAX, SecretRedeemer, makeHeldSecrets } from "../../auth/heldSecrets.ts";
 import type { OwnerProvenance } from "../../auth/provenance.ts";
 import { answerAskSecrets } from "../askSecrets.ts";
+import { NOT_OWNER_DEVICE_MESSAGE } from "../ownerGate.ts";
 import {
   askOf,
   makeFake,
   makeHttp,
   owner,
+  sessionOf,
   testLayer,
   toyBoard,
   workingCard,
@@ -357,6 +359,24 @@ it.effect(
           const refused = yield* spied(input(card.id), null).pipe(Effect.flip);
           assert.strictEqual(refused._tag, "EnvironmentAuthorizationError");
           assert.include(refused.message, "Only the owner can answer a secret request");
+          // A phone paired from a Mac-made link is told how to become his; nothing is kept.
+          const phone = yield* spied(input(card.id), null, sessionOf({ _tag: "paired" })).pipe(
+            Effect.flip,
+          );
+          assert.strictEqual(phone._tag, "KanbanError");
+          assert.deepInclude(phone, {
+            code: "denied",
+            reason: "not_owner_device",
+            detail: NOT_OWNER_DEVICE_MESSAGE,
+          });
+          // A token or a component keeps the plain refusal.
+          for (const caller of [
+            { _tag: "unmarked" },
+            { _tag: "component", component: "telegram-bridge" },
+          ] as const) {
+            const other = yield* spied(input(card.id), null, sessionOf(caller)).pipe(Effect.flip);
+            assert.strictEqual(other._tag, "EnvironmentAuthorizationError", caller._tag);
+          }
           // The store itself refuses too, whoever calls it.
           const direct = yield* secrets
             .hold(
