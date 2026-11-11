@@ -33,6 +33,7 @@ import {
   stepWebLink,
   lateStanding,
   homeRowCount,
+  leaveAfterAnswer,
   ownerStanding,
   queueSubtitle,
   toastUndo,
@@ -596,5 +597,35 @@ describe("whose phone, while the session can't be read", () => {
     ).toBe("unchecked");
     // Refused outright (not a lost connection): not known, whatever it said before.
     expect(ownerStanding(FAILED, false, true)).toBe("unchecked");
+  });
+});
+
+describe("where an ask's screen goes after an answer, so Undo can be reached", () => {
+  it("goes back when the screen underneath shows the toast", () => {
+    expect(leaveAfterAnswer(["Home", "NeedsYou", "NeedsYouAsk"], 2)).toBe("back");
+    expect(leaveAfterAnswer(["Home", "NeedsYou", "NeedsYouAsk", "NeedsYouAsk"], 3)).toBe("back");
+    expect(leaveAfterAnswer(["Home", "NeedsYou", "NeedsYouBatch", "NeedsYouAsk"], 3)).toBe("back");
+    expect(leaveAfterAnswer(["Home", "NeedsYouHistory", "NeedsYouAsk"], 2)).toBe("back");
+  });
+
+  it("an ask opened by a link over Home, a card or a discussion goes to the queue instead", () => {
+    expect(leaveAfterAnswer(["Home", "NeedsYouAsk"], 1)).toBe("newQueue");
+    expect(leaveAfterAnswer(["Home", "KanbanRecord", "NeedsYouAsk"], 2)).toBe("newQueue");
+    expect(leaveAfterAnswer(["Home", "Thread", "NeedsYouBatch"], 2)).toBe("newQueue");
+    // The ask's own discussion does not draw the toast either.
+    expect(leaveAfterAnswer(["Home", "NeedsYouDiscussion", "NeedsYouAsk"], 2)).toBe("newQueue");
+  });
+
+  it("a link that started the app leaves nothing underneath: the queue takes its place", () => {
+    expect(leaveAfterAnswer(["NeedsYouAsk"], 0)).toBe("newQueue");
+    expect(leaveAfterAnswer([], 0)).toBe("newQueue");
+  });
+
+  it("returns to the queue already in the stack when a card sits between", () => {
+    expect(leaveAfterAnswer(["Home", "NeedsYou", "KanbanRecord", "NeedsYouAsk"], 3)).toBe("queue");
+  });
+
+  it("looks only at what is under the screen he is on", () => {
+    expect(leaveAfterAnswer(["Home", "NeedsYouAsk", "NeedsYou"], 1)).toBe("newQueue");
   });
 });

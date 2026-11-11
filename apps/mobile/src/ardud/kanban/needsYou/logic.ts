@@ -597,6 +597,36 @@ export function queueSubtitle(
     .join(" · ");
 }
 
+/** The Needs-you screens that draw the toast (`AskToastBar`), by route name. */
+export const ASK_TOAST_ROUTES: ReadonlySet<string> = new Set([
+  "NeedsYou",
+  "NeedsYouAsk",
+  "NeedsYouBatch",
+  "NeedsYouHistory",
+]);
+
+/**
+ * Where an ask's screen goes once he has answered, snoozed or handed it over.
+ * What he just did shows in the toast, with Undo for the seconds an answer is
+ * held, and only the Needs-you screens draw it. So it goes back only when the
+ * screen underneath is one of them. An ask opened by a link sits on Home, a
+ * card or a discussion, or on nothing at all when the link started the app:
+ * then it goes to the queue, which shows the toast and what is left to answer.
+ *
+ * `routes` are the stack's route names from the bottom, `index` the screen he
+ * is on. `back`: the screen underneath. `queue`: the queue already lower in
+ * the stack. `newQueue`: the queue, in this screen's place.
+ */
+export function leaveAfterAnswer(
+  routes: ReadonlyArray<string>,
+  index: number,
+): "back" | "queue" | "newQueue" {
+  const under = routes.slice(0, Math.max(0, index));
+  const previous = under.at(-1);
+  if (previous !== undefined && ASK_TOAST_ROUTES.has(previous)) return "back";
+  return under.includes("NeedsYou") ? "queue" : "newQueue";
+}
+
 /**
  * What the toast's Undo would do now. `held`: cancel an answer that is still
  * only held on this phone; nothing is sent, so it is always his to do.

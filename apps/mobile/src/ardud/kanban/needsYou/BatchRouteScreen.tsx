@@ -174,7 +174,8 @@ function OpenBatch(props: {
         sentTitle,
       );
       tapDone();
-      nav.back();
+      // To a screen that shows the toast, wherever this batch was opened from.
+      nav.leave();
     };
     if (shape === "ack") return go("acknowledged", "Seen");
     if (shape === "verdict") {
@@ -202,7 +203,7 @@ function OpenBatch(props: {
 
   const snoozeUntil = (until: SnoozeUntil) => {
     if (readOnly) return;
-    nav.back();
+    nav.leave();
     void asks.snoozeAsks(included.length > 0 ? included : offered, until.iso, until.label);
   };
   const more: ReadonlyArray<AppBarMenuItem> = readOnly
@@ -367,7 +368,7 @@ function OpenBatch(props: {
                 }
                 onPress={() => {
                   if (readOnly) return;
-                  nav.back();
+                  nav.leave();
                   asks.handAsks(included, props.focusKey, undefined, sentTitle);
                 }}
               />

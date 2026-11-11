@@ -305,9 +305,10 @@ function OpenAsk(props: {
     toAnswer();
     if (text) AccessibilityInfo.announceForAccessibility(text);
   };
+  // To a screen that shows the toast: Undo has to be reachable wherever this ask was opened from.
   const leave = () => {
     tapDone();
-    nav.back();
+    nav.leave();
   };
 
   // An answer that carries a secret is not held for Undo and never queued: it
@@ -382,7 +383,7 @@ function OpenAsk(props: {
   };
   const snoozeUntil = (until: SnoozeUntil) => {
     if (readOnly) return;
-    nav.back();
+    nav.leave();
     void asks.snoozeAsks([entry], until.iso, until.label);
   };
   const primary = () => send(form.refusing ? "refuse" : "primary");
@@ -693,7 +694,7 @@ function OpenAsk(props: {
                   label="Evaluator decides this one"
                   onPress={() => {
                     if (readOnly) return;
-                    nav.back();
+                    nav.leave();
                     asks.handAsks([entry], key);
                   }}
                 />
