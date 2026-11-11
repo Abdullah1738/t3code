@@ -1,10 +1,12 @@
 import {
   askAfterAnswer,
+  askHistoryFacts,
   askOutcome,
   avatarOf,
   diffPieces,
   wordDiff,
   type AskOutcome,
+  type AskUnreadable,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem } from "@t3tools/contracts";
 import { useEffect, type ReactNode } from "react";
@@ -14,6 +16,7 @@ import { KanbanLinksProvider, KanbanMarkdown } from "../links";
 import { Avatar } from "../parts";
 import { askAsker, loadClosedAsks, useAskStore, type AskSend } from "./askStore";
 import { EvaluatorThreadLink } from "./HandOver";
+import { UnreadableNotice } from "./QueueRail";
 import { sameDay, shortWhen } from "./snoozeTimes";
 import { Bar, Btn, Label, linkClass, type PageLayout } from "./ui";
 
@@ -207,8 +210,13 @@ export function HistoryView(props: {
   onBack: () => void;
   onUndo: () => void;
   onOpenCard: (entry: KanbanAskFeedItem) => void;
+  /** Opens the card of a closed ask this build can't show. */
+  onOpenUnreadable: (ask: AskUnreadable) => void;
 }) {
   const closed = useAskStore((state) => state.closed);
+  // Closed asks that came but can't be read: History is then not the whole of it.
+  const unreadable = useAskStore((state) => state.unreadableClosed);
+  const incomplete = unreadable.length > 0;
   const status = useAskStore((state) => state.closedStatus);
   const sent = useAskStore((state) => state.sent);
   const heldId = useAskStore((state) => state.held?.payload.id ?? null);
@@ -223,13 +231,12 @@ export function HistoryView(props: {
   });
   const today = rows.filter((row) => sameDay(row.entry.ask.answer!.at, props.nowMs));
   const earlier = rows.filter((row) => !sameDay(row.entry.ask.answer!.at, props.nowMs));
-  const facts: ReadonlyArray<readonly [string, number]> = [
-    ["Answered", today.length],
-    ["With a note", today.filter((row) => row.outcome.note !== null).length],
-    ["Drafts you edited", today.filter((row) => row.outcome.draft !== null).length],
-    ["Waiting on agents", props.waiting],
-    ["Still to answer", props.toAnswer],
-  ];
+  const facts = askHistoryFacts({
+    today,
+    waiting: props.waiting,
+    toAnswer: props.toAnswer,
+    incomplete,
+  });
   const list = (items: typeof rows) => (
     <ul className="flex flex-col gap-3">
       {items.map(({ entry, outcome }) => (
@@ -248,10 +255,19 @@ export function HistoryView(props: {
       <div>
         <Label className="mb-2">Today</Label>
         <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1.5">
-          {facts.map(([name, value]) => (
+          {facts.map(({ name, value, spoken }) => (
             <div key={name} className="contents">
               <dt>{name}</dt>
-              <dd className="text-end font-medium tabular-nums">{value}</dd>
+              <dd className="text-end font-medium tabular-nums">
+                {spoken === value ? (
+                  value
+                ) : (
+                  <>
+                    <span aria-hidden>{value}</span>
+                    <span className="sr-only">{spoken}</span>
+                  </>
+                )}
+              </dd>
             </div>
           ))}
         </dl>
@@ -300,12 +316,15 @@ export function HistoryView(props: {
             ))}
           </ul>
         ) : null}
+        {/* Said first: what follows is then not everything he answered. */}
+        <UnreadableNotice asks={unreadable} onOpen={props.onOpenUnreadable} />
         {closed !== null ? (
           <>
             <h2 className="text-xs text-(--m-muted)">Today</h2>
             {today.length > 0 ? (
               list(today)
-            ) : session.length === 0 ? (
+            ) : session.length === 0 && !incomplete ? (
+              // Only when all of History could be read: otherwise "nothing" is not known.
               <p className="pb-2 text-sm text-(--m-muted)">Nothing answered yet today.</p>
             ) : null}
             {earlier.length > 0 ? (

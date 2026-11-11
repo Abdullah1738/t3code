@@ -158,7 +158,11 @@ export function QueueRail(props: QueueRailProps) {
         aria-busy={props.status === "loading"}
       >
         {props.status === "loading" || props.status === "idle" ? null : (
-          <UnreadableNotice asks={props.unreadable} onOpen={props.onOpenUnreadable} />
+          <UnreadableNotice
+            asks={props.unreadable}
+            onOpen={props.onOpenUnreadable}
+            className="px-2.5 pt-3"
+          />
         )}
         {props.status === "loading" || props.status === "idle" ? (
           <RailSkeleton />
@@ -227,12 +231,14 @@ export function QueueRail(props: QueueRailProps) {
 }
 
 /**
- * Asks the feed carried that this build can't read. They are still open, so
- * the queue says so in one quiet line and names the cards he can open instead.
+ * Asks the feed carried that this build can't read: open ones in the queue,
+ * closed ones in History. The page says so in one quiet line and names the
+ * cards he can open instead, for as many as could be read that far.
  */
-function UnreadableNotice(props: {
+export function UnreadableNotice(props: {
   readonly asks: ReadonlyArray<AskUnreadable>;
   readonly onOpen: (ask: AskUnreadable) => void;
+  readonly className?: string;
 }) {
   if (props.asks.length === 0) return null;
   const named = props.asks.filter(
@@ -240,7 +246,10 @@ function UnreadableNotice(props: {
   );
   const shown = named.slice(0, 3);
   return (
-    <p role="status" className="px-2.5 pt-3 text-xs text-(--m-muted) [overflow-wrap:anywhere]">
+    <p
+      role="status"
+      className={cn("text-xs text-(--m-muted) [overflow-wrap:anywhere]", props.className)}
+    >
       {askUnreadableLine(props.asks.length)}.{shown.length > 0 ? " Open " : ""}
       {shown.map((ask, index) => (
         <span key={`${ask.cardId}:${ask.askId}`}>

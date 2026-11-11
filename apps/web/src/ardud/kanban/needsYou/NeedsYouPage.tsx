@@ -507,6 +507,7 @@ export function NeedsYouPage(props: {
                 onBack={() => setView("queue")}
                 onUndo={undo}
                 onOpenCard={openCard}
+                onOpenUnreadable={railProps.onOpenUnreadable}
               />
             ) : view === "reference" ? (
               <ReferenceView

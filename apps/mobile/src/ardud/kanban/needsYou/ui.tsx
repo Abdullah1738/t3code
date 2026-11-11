@@ -377,12 +377,15 @@ export function OwnerBand() {
 }
 
 /**
- * Asks the feed carried that this build can't read. They are still open, so
- * the page says how many in one quiet line and names the cards to open instead.
+ * Asks the feed carried that this build can't read: open ones in the queue,
+ * closed ones in History (`closed`). The page says how many in one quiet line
+ * and names the cards to open instead, for as many as could be read that far.
  */
 export function UnreadableLine(props: {
   readonly asks: ReadonlyArray<AskUnreadable>;
   readonly onOpenCard: (boardId: string, cardId: string) => void;
+  /** They are closed asks: nothing here says they are still open. */
+  readonly closed?: boolean;
 }) {
   if (props.asks.length === 0) return null;
   const named = props.asks.flatMap((ask) => {
@@ -396,7 +399,11 @@ export function UnreadableLine(props: {
     <View className="px-0.5">
       <Text className="text-sm text-foreground-muted">
         {askUnreadableLine(props.asks.length)}.{" "}
-        {shown.length > 0 ? "Open the card instead:" : "They are still open."}
+        {shown.length > 0
+          ? "Open the card instead:"
+          : props.closed
+            ? "What you answered there is not listed here."
+            : "They are still open."}
       </Text>
       {shown.length > 0 ? (
         <View className="flex-row flex-wrap items-center gap-x-4">

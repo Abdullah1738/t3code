@@ -1,7 +1,7 @@
 import {
   askAfterAnswer,
   askAsker,
-  askUnreadableLine,
+  askHistoryFacts,
   avatarOf,
   shortWhen,
   type AskOutcome,
@@ -22,7 +22,7 @@ import { useAsk, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
 import { historyRows } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
-import { AskToastBar, Band, BarButton, Label, OfflineBand } from "./ui";
+import { AskToastBar, Band, BarButton, Label, OfflineBand, UnreadableLine } from "./ui";
 import { useQueue } from "./useQueue";
 
 /** What he answered in the last week, newest first, and what each agent said next. */
@@ -46,13 +46,9 @@ export function HistoryRouteScreen() {
   const rows = historyRows(closed, sent, nowMs);
   const owed = queue.needsYou.items.filter((item) => !queue.hidden.has(item.key)).length;
   const waiting = queue.needsYou.counts.agent + queue.needsYou.counts.evaluator;
-  const facts: ReadonlyArray<readonly [string, number]> = [
-    ["Answered", rows.today.length],
-    ["With a note", rows.today.filter((row) => row.outcome.note !== null).length],
-    ["Drafts you edited", rows.today.filter((row) => row.outcome.draft !== null).length],
-    ["Waiting on agents", waiting],
-    ["Still to answer", owed],
-  ];
+  // Closed asks that came but can't be read: History is then not the whole of it.
+  const incomplete = unreadableClosed.length > 0;
+  const facts = askHistoryFacts({ today: rows.today, waiting, toAnswer: owed, incomplete });
   const refresh = () => {
     setRefreshing(true);
     const done = () => setRefreshing(false);
@@ -84,11 +80,8 @@ export function HistoryRouteScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
       >
         <OfflineBand />
-        {unreadableClosed.length > 0 ? (
-          <Text className="px-0.5 text-sm text-foreground-muted">
-            {askUnreadableLine(unreadableClosed.length)}.
-          </Text>
-        ) : null}
+        {/* Said first, with the cards that are known: what follows is not everything he answered. */}
+        <UnreadableLine closed asks={unreadableClosed} onOpenCard={nav.openCard} />
         {closed === null && status !== "error" ? <LoadingLine /> : null}
         {closed === null && status === "error" ? (
           <Band
@@ -112,7 +105,8 @@ export function HistoryRouteScreen() {
             <Label className="px-1 pt-1">Today</Label>
             {rows.today.length > 0 ? (
               list(rows.today)
-            ) : rows.session.length === 0 ? (
+            ) : rows.session.length === 0 && !incomplete ? (
+              // Only when all of History could be read: otherwise "nothing" is not known.
               <Text className="px-1 text-sm text-foreground-muted">
                 Nothing answered yet today.
               </Text>
@@ -127,11 +121,11 @@ export function HistoryRouteScreen() {
         ) : null}
         <View className="mt-2 gap-1.5 rounded-2xl bg-card px-3.5 py-3">
           <Label>Today</Label>
-          {facts.map(([name, value]) => (
+          {facts.map(({ name, value, spoken }) => (
             <View
               key={name}
               accessible
-              accessibilityLabel={`${name}: ${value}`}
+              accessibilityLabel={`${name}: ${spoken}`}
               className="flex-row items-baseline justify-between gap-4"
             >
               <Text className="text-sm text-foreground">{name}</Text>

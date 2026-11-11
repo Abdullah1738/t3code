@@ -164,8 +164,15 @@ quiet line, "1 ask can't be shown in this version of Robob", with its card to op
 message, with Retry. Only a feed with no readable shape at all is an error for the page, and
 then what was read before stays: never an empty queue.
 
+History says the same of closed asks that can't be read, with the cards that are known
+(`UnreadableLine closed`). It is then not the whole of what he answered, so it never says
+"Nothing answered yet today", and the figures counted from his answers are a floor: "3+",
+read out as "at least 3" (`askHistoryFacts` in the shared runtime; the web's History uses it
+too).
+
 A poll that brings the same text again is not parsed at all, and in a changed feed an ask that
-comes again unchanged is not read through the schema again.
+comes again unchanged is not read through the schema again. The feeds kept whole for that are
+bounded (`ASK_FEEDS_KEPT`), one per window asked for.
 
 ## Offline
 
