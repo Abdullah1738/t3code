@@ -35,9 +35,8 @@ import {
 } from "../../../lib/composerImages";
 import { useServerConfigs } from "../../../state/entities";
 import { releaseUnusedComposerAttachmentFiles } from "../../../state/use-composer-drafts";
-import { usePairedEnvironmentId } from "../../common/environment";
 import { AskHtml } from "./AskBlocks";
-import { asks, askState } from "./askStore";
+import { useAskScope, useAsks } from "./askStore";
 import {
   acceptsInWords,
   acceptsOnlyMedia,
@@ -71,6 +70,7 @@ export function FieldRow(props: {
   readonly secret?: string;
   readonly onSecret?: (value: string) => void;
 }) {
+  const asks = useAsks();
   const { entry, field, value } = props;
   const kind = askFieldKind(field);
   // A value he has left is checked at once; an empty required one only when he sends.
@@ -530,8 +530,11 @@ function FileControl(props: {
   readonly value: unknown;
   readonly disabled: boolean;
 }) {
+  // Uploads go to the server this ask was read from, and land in its store.
+  const scope = useAskScope();
+  const { asks, cell } = scope;
   const { entry, field } = props;
-  const environmentId = usePairedEnvironmentId();
+  const environmentId = scope.environmentId as EnvironmentId | null;
   const configs = useServerConfigs();
   const capabilities =
     environmentId === null ? undefined : configs.get(environmentId)?.environment.capabilities;
@@ -583,7 +586,7 @@ function FileControl(props: {
           return;
         }
         // Read now, not when the upload began: another file may have finished meanwhile.
-        const current = storedFiles(askFormOf(askState(), entry).values[field.id]);
+        const current = storedFiles(askFormOf(cell.getState(), entry).values[field.id]);
         asks.setAskValue(entry, field.id, [
           ...current,
           {

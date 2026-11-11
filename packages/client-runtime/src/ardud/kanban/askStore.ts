@@ -75,6 +75,13 @@ export interface AskSend {
   readonly to: string;
   readonly at: number;
   readonly state: "held" | "sending" | "sent";
+  /**
+   * How many times this answer has gone again by itself after never reaching
+   * the server. It stays with the answer through every failure and retry, so
+   * the limit holds however the connection flaps; only a new answer starts at
+   * none.
+   */
+  readonly autoRetries?: number;
   /** With "from now on": the evaluator thread it started, or why it did not. */
   readonly evaluator?: {
     readonly started: boolean;
@@ -185,6 +192,18 @@ export function createAskStateCell(initial: AskState = INITIAL_ASK_STATE): AskSt
   };
 }
 
+/** At most this many times an answer that never reached the server goes again by itself. */
+export const ASK_AUTO_RETRY_MAX = 3;
+
+/** Whether some answer that never reached the server may still go again by itself. */
+export const askAutoRetryOwed = (
+  state: Pick<AskState, "failed">,
+  max: number = ASK_AUTO_RETRY_MAX,
+): boolean =>
+  Object.values(state.failed).some(
+    (failed) => failed.unreached === true && (failed.send.autoRetries ?? 0) < max,
+  );
+
 /** How the store hears that the feed may have moved. Each returns its own stop. */
 export interface AskWatchHost {
   /** A board's counts changed (the board list feed). */
@@ -248,12 +267,17 @@ export type AskStore = ReturnType<typeof createAskStore>;
 export function createAskStore(host: AskStoreHost) {
   const { api: askApi } = host;
   const get = host.cell.getState;
-  const set = host.cell.setState;
+  /** Set by `dispose`: from then on nothing is sent, read or written. */
+  let disposed = false;
+  const set = (patch: Partial<AskState>) => {
+    if (!disposed) host.cell.setState(patch);
+  };
 
   let toastId = 0;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
   function showAskToast(toast: Omit<AskToast, "id">, ms = 4_200) {
+    if (disposed) return;
     if (toastTimer !== null) clearTimeout(toastTimer);
     toastTimer = null;
     const id = ++toastId;
@@ -333,6 +357,7 @@ export function createAskStore(host: AskStoreHost) {
 
   /** Reads the feed again. Calls that arrive while one is running fold into one more. */
   function refreshAsks(): Promise<void> {
+    if (disposed) return Promise.resolve();
     if (inFlight !== null) {
       again = true;
       return inFlight;
@@ -364,7 +389,7 @@ export function createAskStore(host: AskStoreHost) {
 
   /** Reads the asks closed in the last week, for History. */
   async function loadClosedAsks(): Promise<void> {
-    if (get().closedStatus === "loading") return;
+    if (disposed || get().closedStatus === "loading") return;
     set({ closedStatus: get().closed === null ? "loading" : "ready" });
     try {
       const feed = await askApi.feed({ closed: "7d" });
@@ -399,6 +424,7 @@ export function createAskStore(host: AskStoreHost) {
    * itself; the sidebar count alone polls slowly.
    */
   function watchAsks(fast: boolean): () => void {
+    if (disposed) return () => undefined;
     watchers += 1;
     if (fast) {
       pollMs = 15_000;
@@ -423,6 +449,7 @@ export function createAskStore(host: AskStoreHost) {
       };
     }
     return () => {
+      if (disposed) return;
       watchers -= 1;
       if (fast) {
         pollMs = 60_000;
@@ -466,7 +493,7 @@ export function createAskStore(host: AskStoreHost) {
   /** Reads an ask whole when the feed sent its big blocks as stubs. */
   async function loadAskDetail(entry: KanbanAskFeedItem): Promise<void> {
     const id = `${askKey(entry)}@${entry.revision}`;
-    if (get().details[id] !== undefined) return;
+    if (disposed || get().details[id] !== undefined) return;
     const detail = await askApi.detail(entry.cardRef, entry.ask.id);
     set({ details: { ...get().details, [id]: detail.ask } });
   }
@@ -572,6 +599,7 @@ export function createAskStore(host: AskStoreHost) {
   }
 
   async function deliver(send: AskSend, leaving: boolean) {
+    if (disposed) return;
     sending.add(send.id);
     patchSend(send.id, { state: "sending" });
     const first = send.refs[0]!;
@@ -701,6 +729,7 @@ export function createAskStore(host: AskStoreHost) {
   const flushAskSends = (leaving: boolean) => queue.flush(leaving);
 
   function hold(send: AskSend, text: string) {
+    if (disposed) return;
     const state = get();
     if (state.notOwner !== null) {
       // This session was refused as not the owner's: nothing is held or hidden
@@ -839,6 +868,7 @@ export function createAskStore(host: AskStoreHost) {
    * still offers to undo. Returns what to focus again, or null when there was nothing.
    */
   function undoAskSend(): string | null {
+    if (disposed) return null;
     const send = queue.undo();
     if (send === null) {
       const snoozed = get().toast?.undoSnooze;
@@ -865,8 +895,12 @@ export function createAskStore(host: AskStoreHost) {
     return send.focusKey;
   }
 
-  /** Sends a failed answer again, at once. */
-  function retryAskSend(key: string) {
+  /**
+   * Sends a failed answer again, at once. `auto`: it goes by itself, which
+   * counts against the answer's limit; a retry by hand never does.
+   */
+  function retryAskSend(key: string, auto = false) {
+    if (disposed) return;
     const state = get();
     const failed = state.failed[key];
     if (!failed) return;
@@ -877,6 +911,7 @@ export function createAskStore(host: AskStoreHost) {
       refs: failed.send.refs.filter((ref) => keys.includes(ref.key)),
       state: "sending",
       at: Date.now(),
+      ...(auto ? { autoRetries: (failed.send.autoRetries ?? 0) + 1 } : {}),
     };
     const hidden = { ...state.hidden };
     for (const ref of send.refs) hidden[ref.key] = send.id;
@@ -895,17 +930,21 @@ export function createAskStore(host: AskStoreHost) {
    * again, once. An answer the server refused stays where it is. A send leaves
    * the failed list before it goes, so the same answer is never sent twice from
    * here; if the first try did reach the server after all, the second is
-   * refused as out of date and the feed shows the ask closed.
+   * refused as out of date and the feed shows the ask closed. An answer that
+   * has already gone by itself `max` times stays for him to retry by hand: the
+   * count rides on the answer, so it holds while the answer is on its way too.
    */
-  function retryUnreachedAskSends(): number {
+  function retryUnreachedAskSends(max: number = ASK_AUTO_RETRY_MAX): number {
+    if (disposed) return 0;
     const seen = new Set<number>();
     let count = 0;
     for (const [key, failed] of Object.entries(get().failed)) {
       if (failed.unreached !== true || seen.has(failed.send.id)) continue;
+      if ((failed.send.autoRetries ?? 0) >= max) continue;
       // A batch sits under each of its asks: one retry covers them all.
       seen.add(failed.send.id);
       if (get().failed[key] === undefined) continue;
-      retryAskSend(key);
+      retryAskSend(key, true);
       count += 1;
     }
     return count;
@@ -913,6 +952,7 @@ export function createAskStore(host: AskStoreHost) {
 
   /** Takes an ask back from the evaluator. */
   async function takeBackAsk(entry: KanbanAskFeedItem) {
+    if (disposed) return;
     try {
       await askApi.hand(entry.cardRef, entry.ask.id, { action: "take_back" });
       showAskToast({ text: `${entry.boardName} #${entry.cardNumber} is yours again.` });
@@ -931,6 +971,7 @@ export function createAskStore(host: AskStoreHost) {
     entry: KanbanAskFeedItem,
     blocks: ReadonlyArray<KanbanBlock>,
   ): Promise<void> {
+    if (disposed) throw new Error("Not connected to Robob.");
     const problem = askReplyProblem(blocks);
     if (problem !== null) throw new Error(problem);
     try {
@@ -955,7 +996,7 @@ export function createAskStore(host: AskStoreHost) {
     untilLabel: string,
   ): Promise<void> {
     const first = entries[0];
-    if (!first) return;
+    if (!first || disposed) return;
     const refs = entries.map(refOf);
     const what =
       entries.length > 1 ? `${entries.length} asks` : `${first.boardName} #${first.cardNumber}`;
@@ -1009,6 +1050,34 @@ export function createAskStore(host: AskStoreHost) {
     void refreshAsks();
   }
 
+  /**
+   * The server this store talks to is no longer the one in use (the connection
+   * was switched, disabled or removed). Everything that was waiting on it is
+   * dropped rather than carried to another server: the held answer is never
+   * sent, answers that failed are never retried, forms and what was read are
+   * cleared, and a read or send still on its way changes nothing when it
+   * lands. A disposed store stays empty; the host makes a new one for the
+   * next server.
+   */
+  function dispose() {
+    if (disposed) return;
+    // Forms first: they hold what he typed for that server.
+    host.cell.setState({ forms: {}, tried: {}, refused: {} });
+    // The held answer is dropped, not flushed.
+    queue.undo();
+    if (toastTimer !== null) clearTimeout(toastTimer);
+    toastTimer = null;
+    stopWatching?.();
+    stopWatching = null;
+    watchers = 0;
+    again = false;
+    closedOwed = false;
+    focusedKey = null;
+    sending.clear();
+    host.cell.setState({ ...INITIAL_ASK_STATE });
+    disposed = true;
+  }
+
   /** For tests and the stories: back to an empty store. */
   const resetAskStore = () => {
     queue.undo();
@@ -1037,6 +1106,7 @@ export function createAskStore(host: AskStoreHost) {
     undoAskSend,
     retryAskSend,
     retryUnreachedAskSends,
+    dispose,
     takeBackAsk,
     replyOnAsk,
     snoozeAsks,

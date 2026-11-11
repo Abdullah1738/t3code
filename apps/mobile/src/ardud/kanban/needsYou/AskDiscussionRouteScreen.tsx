@@ -15,7 +15,7 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { Composer, MessageView } from "../Chat";
-import { asks, useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAskScope, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
 import { askKeyFromParams, askTurn, type NeedsYouAskParams } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -32,6 +32,7 @@ export function AskDiscussionRouteScreen({
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
   const bottomInset = useBottomInset();
+  const { serial } = useAskScope();
   useWatchAsks(true);
   useOwnerStanding();
   const queue = useQueue(nowMs);
@@ -65,7 +66,8 @@ export function AskDiscussionRouteScreen({
       ]}
     >
       <Talk
-        key={askKey(entry)}
+        // A draft typed for one server never shows under another's ask.
+        key={`${serial}:${askKey(entry)}`}
         entry={entry}
         waiting={askTurn(entry, item) === "agent" && !askRepliedOnCard(entry)}
         nowMs={nowMs}
@@ -84,6 +86,7 @@ function Talk(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
+  const asks = useAsks();
   const { entry } = props;
   const readOnly = useAsk((state) => state.notOwner !== null);
   // What was said counts; older versions of the ask sit between, folded away.

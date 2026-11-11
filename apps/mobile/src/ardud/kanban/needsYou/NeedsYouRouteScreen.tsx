@@ -26,7 +26,7 @@ import { cn } from "../../../lib/cn";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { ChoiceRow } from "../../common/parts";
-import { asks, useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
 import {
   MARK_LABELS,
   askRowMedia,
@@ -44,6 +44,7 @@ const ALL_BOARDS = "";
 
 /** Every ask that waits on him, across boards: the list he works down. */
 export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueueParams | undefined>) {
+  const asks = useAsks();
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
   const bottomInset = useBottomInset();
@@ -461,10 +462,11 @@ function AllClear(props: {
   readonly snoozed: number;
   readonly onHistory: () => void;
 }) {
+  const asks = useAsks();
   const closed = useAsk((state) => state.closed);
   useEffect(() => {
     void asks.loadClosedAsks();
-  }, []);
+  }, [asks]);
   const answered =
     closed === null
       ? null

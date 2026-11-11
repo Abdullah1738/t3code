@@ -375,30 +375,20 @@ describe("answers made offline", () => {
   it("go again once each time the feed comes back, and not while it reads fine", () => {
     const gate = unreachedRetryGate();
     // The send failed but the feed still reads: he retries by hand.
-    expect(gate.next({ reading: true, unreached: true })).toBe(false);
+    expect(gate.next({ reading: true, owed: true })).toBe(false);
     // Offline: the feed fails too.
-    expect(gate.next({ reading: false, unreached: true })).toBe(false);
+    expect(gate.next({ reading: false, owed: true })).toBe(false);
     // Back: one automatic try.
-    expect(gate.next({ reading: true, unreached: true })).toBe(true);
-    expect(gate.next({ reading: true, unreached: true })).toBe(false);
+    expect(gate.next({ reading: true, owed: true })).toBe(true);
+    expect(gate.next({ reading: true, owed: true })).toBe(false);
   });
 
-  it("stops after a few rounds and starts over once nothing is unsent", () => {
-    const gate = unreachedRetryGate(2);
-    const flap = () => {
-      gate.next({ reading: false, unreached: true });
-      return gate.next({ reading: true, unreached: true });
-    };
-    expect(flap()).toBe(true);
-    expect(flap()).toBe(true);
-    expect(flap()).toBe(false);
-    expect(gate.next({ reading: true, unreached: false })).toBe(false);
-    expect(flap()).toBe(true);
-  });
-
-  it("never fires with nothing unsent", () => {
+  it("does nothing when no answer has automatic tries left", () => {
     const gate = unreachedRetryGate();
-    expect(gate.next({ reading: false, unreached: false })).toBe(false);
-    expect(gate.next({ reading: true, unreached: false })).toBe(false);
+    expect(gate.next({ reading: false, owed: false })).toBe(false);
+    expect(gate.next({ reading: true, owed: false })).toBe(false);
+    // The answer is on its way, so nothing is owed for a moment: that resets nothing.
+    expect(gate.next({ reading: false, owed: true })).toBe(false);
+    expect(gate.next({ reading: true, owed: true })).toBe(true);
   });
 });

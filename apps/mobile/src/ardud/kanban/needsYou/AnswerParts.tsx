@@ -16,7 +16,7 @@ import { SymbolView } from "../../../components/ui/AppSymbol";
 import { AppText as Text } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
 import { tryOpenExternalUrl } from "../../../lib/openExternalUrl";
-import { asks } from "./askStore";
+import { useAsks } from "./askStore";
 import { linkHost } from "./logic";
 import { Check, FieldLabel, GrowingInput, Pill, Problem, tapSelection } from "./ui";
 
@@ -108,6 +108,7 @@ export function OptionList(props: {
   /** A picture an option points at, drawn inside it. */
   readonly renderBlock?: ((index: number) => ReactNode) | undefined;
 }) {
+  const asks = useAsks();
   const { entry, choose, form } = props;
   const [ownOpen, setOwnOpen] = useState(false);
   const own = props.ownWords && (ownOpen || form.ownWords !== "");
@@ -210,6 +211,7 @@ export function WhyField(props: {
   readonly form: AskForm;
   readonly problem: string | undefined;
 }) {
+  const asks = useAsks();
   const refusal = askRefusal(props.response);
   if (refusal === null) return null;
   return (
@@ -239,6 +241,7 @@ export function NoteField(props: {
   readonly disabled: boolean;
   readonly autoFocus?: boolean;
 }) {
+  const asks = useAsks();
   return (
     <View className="gap-1.5">
       <FieldLabel label="Note for the agent" aside="Goes with your answer" />
@@ -262,6 +265,7 @@ export function TaskSteps(props: {
   readonly form: AskForm;
   readonly disabled: boolean;
 }) {
+  const asks = useAsks();
   const { entry, form } = props;
   return (
     <View className="gap-1">

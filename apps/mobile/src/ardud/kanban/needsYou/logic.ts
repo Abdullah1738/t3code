@@ -508,31 +508,24 @@ export function historyRows(
 
 // Offline
 
-/** At most this many automatic tries of an answer that never reached the server. */
-export const UNREACHED_RETRY_ROUNDS = 3;
-
 /**
  * Decides when answers that never reached the server go again by themselves:
- * once each time the feed goes from failing to reading, and at most a few
- * rounds, so a server that takes reads and drops writes is not hammered. Retry
- * by hand always stays. The count starts over once nothing is left unsent.
+ * once each time the feed goes from failing to reading, never while it simply
+ * reads fine. `owed` is whether any such answer still has automatic tries
+ * left; that count is kept on the answer itself by the shared store
+ * (`ASK_AUTO_RETRY_MAX`, `askAutoRetryOwed`), not here, so it survives the
+ * answer leaving the failed list while it is on its way. Retry by hand always
+ * stays.
  */
-export function unreachedRetryGate(maxRounds: number = UNREACHED_RETRY_ROUNDS): {
-  readonly next: (state: { readonly reading: boolean; readonly unreached: boolean }) => boolean;
+export function unreachedRetryGate(): {
+  readonly next: (state: { readonly reading: boolean; readonly owed: boolean }) => boolean;
 } {
   let wasReading = true;
-  let rounds = 0;
   return {
-    next: ({ reading, unreached }) => {
+    next: ({ reading, owed }) => {
       const cameBack = reading && !wasReading;
       wasReading = reading;
-      if (!unreached) {
-        rounds = 0;
-        return false;
-      }
-      if (!cameBack || rounds >= maxRounds) return false;
-      rounds += 1;
-      return true;
+      return cameBack && owed;
     },
   };
 }

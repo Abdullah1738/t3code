@@ -14,7 +14,7 @@ import {
   type AppTextInputProps,
 } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
-import { asks, useAsk } from "./askStore";
+import { useAsk, useAsks } from "./askStore";
 import type { Tone } from "./logic";
 
 const TONE_SURFACE: Record<Tone, string> = {
@@ -240,6 +240,7 @@ export function AskToastBar(props: {
   readonly onUndo: (key: string | null) => void;
   readonly onView?: ((key: string) => void) | undefined;
 }) {
+  const asks = useAsks();
   const toast = useAsk((state) => state.toast);
   const held = useAsk((state) => state.held);
   const [now, setNow] = useState(Date.now);
@@ -344,6 +345,7 @@ export function NotOwnerBand() {
 
 /** The feed could not be read just now: what shows is what was last read. */
 export function OfflineBand() {
+  const asks = useAsks();
   const stale = useAsk((state) => state.feed !== null && state.error !== null);
   if (!stale) return null;
   return (

@@ -29,7 +29,7 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { SegmentedControl } from "../../../components/ui/SegmentedControl";
 import { cn } from "../../../lib/cn";
 import { MarkdownText, type ResolveKanbanLink } from "../../common/MarkdownText";
-import { asks } from "./askStore";
+import { useAsks } from "./askStore";
 import { askFacts } from "./logic";
 import { GrowingInput, Label, Panel, Problem } from "./ui";
 
@@ -191,6 +191,7 @@ export function ChangeViewer(props: {
   readonly view: ChangeView;
   readonly resolveKanbanLink: ResolveKanbanLink;
 }) {
+  const asks = useAsks();
   const { changes } = props;
   const [at, setAt] = useState(0);
   const index = Math.max(0, Math.min(changes.length - 1, at));
@@ -319,6 +320,7 @@ export function DraftPart(props: {
   readonly problem: string | undefined;
   readonly resolveKanbanLink: ResolveKanbanLink;
 }) {
+  const asks = useAsks();
   const { entry, draft, form } = props;
   const text = askDraftText({ draft }, form);
   const edited = askDraftEdited({ draft }, form);

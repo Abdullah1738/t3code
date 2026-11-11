@@ -18,7 +18,7 @@ import { KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, View } fr
 import type { AppBarMenuItem } from "../../../components/ui/AppBar.types";
 import { AppText as Text } from "../../../components/ui/AppText";
 import { Button } from "../../../components/ui/Button";
-import { asks } from "./askStore";
+import { useAsks } from "./askStore";
 import { GrowingInput, Label, Problem, tapProblem } from "./ui";
 
 function Dialog(props: {
@@ -62,6 +62,7 @@ export function HandOverSheet(props: {
   /** The asks left the queue. */
   readonly onLeave: () => void;
 }) {
+  const asks = useAsks();
   const { entries } = props;
   const first = entries[0];
   const many = entries.length > 1;

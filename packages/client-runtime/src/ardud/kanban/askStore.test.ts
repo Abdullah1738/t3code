@@ -4,7 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { AskApiError, type AskApi } from "./askApi.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { ASK_UNDO_MS } from "./askSendQueue.ts";
-import { askFormOf, askKey, createAskStateCell, createAskStore } from "./askStore.ts";
+import {
+  ASK_AUTO_RETRY_MAX,
+  INITIAL_ASK_STATE,
+  askAutoRetryOwed,
+  askFormOf,
+  askKey,
+  createAskStateCell,
+  createAskStore,
+} from "./askStore.ts";
 
 const entry = (
   number: number,
@@ -282,6 +290,124 @@ describe("offline", () => {
     await settle();
     expect(h.named("answerBatch")).toHaveLength(2);
     expect((h.named("answerBatch")[1]!.args[1] as ReadonlyArray<unknown>).length).toBe(3);
+  });
+});
+
+describe("automatic retries", () => {
+  it("an answer goes by itself a few times at most, counted through every failure and send", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.fail.answer = new AskApiError(0, "network", "Robob did not answer.");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(askAutoRetryOwed(h.cell.getState())).toBe(true);
+
+    for (let round = 1; round <= ASK_AUTO_RETRY_MAX; round += 1) {
+      expect(h.store.retryUnreachedAskSends()).toBe(1);
+      // On its way it has left the failed list; the count is on the answer itself.
+      expect(h.cell.getState().failed).toEqual({});
+      expect(h.cell.getState().sent[0]?.autoRetries).toBe(round);
+      await settle();
+      expect(h.cell.getState().failed[askKey(ask)]?.send.autoRetries).toBe(round);
+    }
+    expect(h.named("answer")).toHaveLength(1 + ASK_AUTO_RETRY_MAX);
+
+    // The limit is reached: nothing more goes by itself, however often it is asked.
+    expect(askAutoRetryOwed(h.cell.getState())).toBe(false);
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+    await settle();
+    expect(h.named("answer")).toHaveLength(1 + ASK_AUTO_RETRY_MAX);
+
+    // By hand it always goes, and that does not buy more automatic tries.
+    h.store.retryAskSend(askKey(ask));
+    await settle();
+    expect(h.named("answer")).toHaveLength(2 + ASK_AUTO_RETRY_MAX);
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+  });
+
+  it("a new answer to the same ask starts its own count", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.fail.answer = new AskApiError(0, "network", "Robob did not answer.");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    for (let round = 0; round < ASK_AUTO_RETRY_MAX; round += 1) {
+      h.store.retryUnreachedAskSends();
+      await settle();
+    }
+    expect(askAutoRetryOwed(h.cell.getState())).toBe(false);
+
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.cell.getState().failed[askKey(ask)]?.send.autoRetries).toBeUndefined();
+    expect(askAutoRetryOwed(h.cell.getState())).toBe(true);
+  });
+});
+
+describe("a store whose server is gone", () => {
+  it("drops the held answer: it is never sent", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.store.patchAskForm(ask, { note: "for the old server" });
+    h.store.answerAsk(ask, "primary");
+    expect(h.cell.getState().held).not.toBeNull();
+
+    h.store.dispose();
+    expect(h.cell.getState()).toEqual(INITIAL_ASK_STATE);
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS * 3);
+    h.store.flushAskSends(true);
+    await settle();
+    expect(h.named("answer")).toHaveLength(0);
+  });
+
+  it("never retries an answer that failed, by itself or by hand", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.fail.answer = new AskApiError(0, "network", "Robob did not answer.");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+
+    delete h.fail.answer;
+    h.store.dispose();
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+    h.store.retryAskSend(askKey(ask));
+    await settle();
+    expect(h.named("answer")).toHaveLength(1);
+  });
+
+  it("sends, reads and writes nothing afterwards, and a read on its way changes nothing", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    const reading = h.store.refreshAsks();
+    h.store.dispose();
+    await reading;
+    expect(h.cell.getState()).toEqual(INITIAL_ASK_STATE);
+
+    const before = h.calls.length;
+    h.store.answerAsk(ask, "primary");
+    h.store.handAsks([ask], askKey(ask));
+    h.store.patchAskForm(ask, { note: "typed late" });
+    await h.store.snoozeAsks([ask], "2026-11-12T05:00:00.000Z", "tomorrow 09:00");
+    await h.store.takeBackAsk(ask);
+    await h.store.refreshAsks();
+    await h.store.loadClosedAsks();
+    await expect(h.store.replyOnAsk(ask, [{ _tag: "md", text: "hello" }])).rejects.toThrow();
+    const stop = h.store.watchAsks(true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    stop();
+    expect(h.calls.length).toBe(before);
+    expect(h.cell.getState()).toEqual(INITIAL_ASK_STATE);
+    expect(h.boards.size + h.foreground.size).toBe(0);
   });
 });
 

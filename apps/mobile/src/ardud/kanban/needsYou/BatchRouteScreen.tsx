@@ -18,7 +18,7 @@ import { cn } from "../../../lib/cn";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { OptionRow } from "./AnswerParts";
-import { asks, useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAskScope, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
 import { batchAll, batchPrimaryLabel, type NeedsYouBatchParams } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -51,6 +51,7 @@ export function BatchRouteScreen({ route }: StaticScreenProps<NeedsYouBatchParam
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
   const bottomInset = useBottomInset();
+  const { serial } = useAskScope();
   useWatchAsks(true);
   useOwnerStanding();
   const queue = useQueue(nowMs);
@@ -93,7 +94,8 @@ export function BatchRouteScreen({ route }: StaticScreenProps<NeedsYouBatchParam
   }
   return (
     <OpenBatch
-      key={needsYouBatchKey(batch)}
+      // What he ticked and typed for one server's batch never carries to another's.
+      key={`${serial}:${needsYouBatchKey(batch)}`}
       focusKey={needsYouBatchKey(batch)}
       title={askBatchTitle(entries.map((entry) => entry.kind))}
       boardName={queue.boardNames.get(boardId) ?? ""}
@@ -114,6 +116,7 @@ function OpenBatch(props: {
   readonly bottomInset: number;
   readonly toast: (bar: number) => ReactNode;
 }) {
+  const asks = useAsks();
   const nav = useNeedsYouNav();
   const readOnly = useAsk((state) => state.notOwner !== null);
   const plan = planAskBatch(props.entries);

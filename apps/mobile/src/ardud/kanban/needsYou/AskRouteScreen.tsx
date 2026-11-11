@@ -32,7 +32,7 @@ import {
   kanbanAskRevision,
   type KanbanAskFeedItem,
 } from "@t3tools/contracts";
-import { type ComponentRef, type ReactNode, useEffect, useRef, useState } from "react";
+import { type ComponentRef, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { AccessibilityInfo, ScrollView, View } from "react-native";
 
 import type { AppBarMenuItem } from "../../../components/ui/AppBar.types";
@@ -52,7 +52,7 @@ import {
 import { AskBlocks, AskMediaViewer, BlockPicture, useAskMedia } from "./AskBlocks";
 import { FieldRow } from "./AskFields";
 import { ActionDetails, AskFacts, ChangeViewer, DiffText, DraftPart } from "./AskParts";
-import { askApi, asks, useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAskScope, useAskSecretsHeld, useOwnerStanding, useWatchAsks } from "./askStore";
 import {
   askKeyFromParams,
   askNeighbours,
@@ -82,6 +82,7 @@ import { useQueue } from "./useQueue";
 
 /** One ask, whole: what it says, what it shows, his answer, and the bar to send it. */
 export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | undefined>) {
+  const { asks, serial } = useAskScope();
   const navigation = useNavigation();
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
@@ -96,7 +97,7 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
   useEffect(() => {
     asks.noteAskFocus(key);
     return () => asks.noteAskFocus(null);
-  }, [key]);
+  }, [asks, key]);
 
   const toast = (bar: number) => (
     <AskToastBar
@@ -163,7 +164,9 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
   };
   return (
     <OpenAsk
-      key={key}
+      // A new server is a new ask, even under the same card and ask id: what
+      // he typed for the old one, secrets included, does not carry over.
+      key={`${serial}:${key}`}
       entry={entry}
       item={item}
       nowMs={nowMs}
@@ -186,6 +189,9 @@ function OpenAsk(props: {
   readonly onStep: (key: string | null) => void;
   readonly toast: (bar: number) => ReactNode;
 }) {
+  // The store and the server calls of the server this ask was read from: an
+  // answer or a secret started here can go nowhere else.
+  const { asks, api: askApi } = useAskScope();
   const { entry, item, nowMs } = props;
   const nav = useNeedsYouNav();
   const key = askKey(entry);
@@ -221,15 +227,18 @@ function OpenAsk(props: {
   const needsDetail = detail === undefined && askNeedsDetail(entry.ask);
   useEffect(() => {
     if (needsDetail) void asks.loadAskDetail(entry).catch(() => undefined);
-  }, [needsDetail, entry]);
+  }, [asks, needsDetail, entry]);
 
   // What was new on the ask counts as seen once he moves on from it.
-  useEffect(() => () => asks.seeAsk(key), [key]);
+  useEffect(() => () => asks.seeAsk(key), [asks, key]);
 
   // Secret values live here and nowhere else: gone when he sends, and when he leaves the ask.
   const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
   const [secretBusy, setSecretBusy] = useState(false);
   const [secretError, setSecretError] = useState<string | null>(null);
+  // The server changed: secrets are cleared before anything else is dropped.
+  const dropSecrets = useCallback(() => setSecrets({}), []);
+  useAskSecretsHeld(dropSecrets);
 
   const media = useAskMedia(ask);
   const changes = kanbanAskChanges(ask);

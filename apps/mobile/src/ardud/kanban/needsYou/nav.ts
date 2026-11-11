@@ -1,8 +1,8 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
 import type { ThreadId } from "@t3tools/contracts";
 
-import { usePairedEnvironmentId } from "../../common/environment";
 import { askParamsFromKey } from "./logic";
+import { useAskEnvironmentId } from "./askStore";
 
 export interface NeedsYouNav {
   readonly back: () => void;
@@ -20,7 +20,7 @@ export interface NeedsYouNav {
 /** The ways between the Needs-you screens, and out of them to a card or a thread. */
 export function useNeedsYouNav(): NeedsYouNav {
   const navigation = useNavigation();
-  const environmentId = usePairedEnvironmentId();
+  const environmentId = useAskEnvironmentId();
   return {
     back: () => {
       if (navigation.canGoBack()) navigation.goBack();

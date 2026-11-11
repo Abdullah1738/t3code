@@ -26,7 +26,6 @@ import { useAppearancePreferences } from "../../../features/settings/appearance/
 import { mobileHtmlRenderTheme } from "../../../lib/htmlRenderTheme";
 import { tryOpenExternalUrl } from "../../../lib/openExternalUrl";
 import { useAssetUrl } from "../../../state/assets";
-import { usePairedEnvironmentId } from "../../common/environment";
 import { MarkdownText } from "../../common/MarkdownText";
 import { CardBlock, Collapse, resolveKanbanLinkFor } from "../Chat";
 import {
@@ -39,6 +38,7 @@ import {
   type AskPicture,
   type AskShown,
 } from "./logic";
+import { useAskEnvironmentId } from "./askStore";
 
 const INLINE_MAX_HEIGHT = 520;
 
@@ -65,7 +65,7 @@ const previewItem = (picture: AskPicture, environmentId: EnvironmentId): FilePre
 
 /** The pictures of an ask, gathered once for the reader and its viewer. */
 export function useAskMedia(ask: Pick<KanbanOwnerAsk, "blocks">): AskMedia {
-  const environmentId = usePairedEnvironmentId();
+  const environmentId = useAskEnvironmentId();
   const shown = askShown(ask.blocks ?? []);
   return {
     ...shown,
@@ -123,7 +123,7 @@ export function BlockPicture(props: {
 
 function PictureImage(props: { readonly picture: AskPicture }) {
   const { source } = props.picture;
-  const environmentId = usePairedEnvironmentId();
+  const environmentId = useAskEnvironmentId();
   const stored = useAssetUrl(
     source._tag === "attachment" ? environmentId : null,
     source._tag === "attachment"
@@ -167,7 +167,7 @@ function FileRow(props: {
 }) {
   const { attachment } = props;
   const navigation = useNavigation();
-  const environmentId = usePairedEnvironmentId();
+  const environmentId = useAskEnvironmentId();
   const kind = askFileKind(attachment);
   const size = formatAttachmentSize(attachment.sizeBytes);
   const what = FILE_WORDS[kind];

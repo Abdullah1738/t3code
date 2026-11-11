@@ -17,7 +17,7 @@ import { MarkdownText } from "../../common/MarkdownText";
 import { resolveKanbanLinkFor } from "../Chat";
 import { Avatar } from "../parts";
 import { DiffText } from "./AskParts";
-import { asks, useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
 import { historyRows } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -26,6 +26,7 @@ import { useQueue } from "./useQueue";
 
 /** What he answered in the last week, newest first, and what each agent said next. */
 export function HistoryRouteScreen() {
+  const asks = useAsks();
   const nav = useNeedsYouNav();
   const nowMs = useNowMs();
   const bottomInset = useBottomInset();
@@ -39,7 +40,7 @@ export function HistoryRouteScreen() {
   const [refreshing, setRefreshing] = useState(false);
   useEffect(() => {
     void asks.loadClosedAsks();
-  }, []);
+  }, [asks]);
   const rows = historyRows(closed, sent, nowMs);
   const owed = queue.needsYou.items.filter((item) => !queue.hidden.has(item.key)).length;
   const waiting = queue.needsYou.counts.agent + queue.needsYou.counts.evaluator;
