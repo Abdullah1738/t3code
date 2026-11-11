@@ -59,7 +59,7 @@ export function ActionBar(props: {
   }
   return (
     <Shell>
-      {props.phone ? props.lead : null}
+      {props.phone && !form.refusing ? props.lead : null}
       <Btn
         tone="primary"
         disabled={props.busy}
@@ -67,7 +67,7 @@ export function ActionBar(props: {
         className={props.phone ? "min-w-0 flex-1" : undefined}
       >
         <span className="truncate">{props.busy ? "Sending…" : askPrimaryLabel(ask, form)}</span>
-        <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
+        <Key className="text-(--m-accent-ink) ring-(--m-accent-ink)/40">A</Key>
       </Btn>
       {form.refusing ? (
         <Btn tone="ghost" onClick={props.onBack}>

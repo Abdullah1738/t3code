@@ -306,15 +306,16 @@ export function BatchView(props: {
               className={phone ? "min-w-0 flex-1" : undefined}
             >
               <span className="truncate">{primaryLabel}</span>
-              <Key className="text-(--m-accent-ink)/80 ring-(--m-accent-ink)/40">A</Key>
+              <Key className="text-(--m-accent-ink) ring-(--m-accent-ink)/40">A</Key>
             </Btn>
+            {phone ? null : <SnoozeMenu label={`Snooze ${all}`} onSnooze={snoozeUntil} />}
+            {/* The "no" is last, as under a single ask. */}
             {shape === "verdict" && !phone ? (
               <Btn tone="ghost" onClick={() => send("refuse")}>
                 {reject} {all}
                 <Key>X</Key>
               </Btn>
             ) : null}
-            {phone ? null : <SnoozeMenu label={`Snooze ${all}`} onSnooze={snoozeUntil} />}
           </div>
         </div>
       ) : null}

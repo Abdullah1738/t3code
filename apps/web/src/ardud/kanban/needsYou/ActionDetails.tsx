@@ -60,7 +60,7 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
           <Label className="mb-2">Runs exactly this</Label>
           <pre
             translate="no"
-            className="mb-4 overflow-x-auto rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 ring-1 ring-inset ring-(--m-rule)"
+            className="mb-4 rounded-xl bg-(--m-ground) px-3.5 py-2.5 font-mono text-sm leading-6 whitespace-pre-wrap ring-1 ring-inset ring-(--m-rule) [overflow-wrap:anywhere]"
           >
             <span aria-hidden className="text-(--m-muted) select-none">
               ${" "}

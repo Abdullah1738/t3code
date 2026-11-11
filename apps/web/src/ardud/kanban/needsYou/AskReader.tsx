@@ -196,6 +196,11 @@ export function AskReader(props: {
     ...refused,
   };
 
+  const canEditDraft =
+    ask.draft !== undefined && response.edit === "draft" && !locked && !form.refusing;
+  const editDraft = () => {
+    root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
+  };
   const focusAt = (at: string) => {
     requestAnimationFrame(() => {
       const target = root.current?.querySelector<HTMLElement>(`[data-ny-at="${CSS.escape(at)}"]`);
@@ -316,10 +321,7 @@ export function AskReader(props: {
         case "reply":
           return reply();
         case "edit":
-          if (response.edit === "draft") {
-            root.current?.querySelector<HTMLElement>("[data-ny-edit]")?.click();
-            return undefined;
-          }
+          if (response.edit === "draft") return editDraft();
           return firstText ? focusAt(`field:${firstText.id}`) : undefined;
         case "view":
           return setAskChangeView(nextChangeView(changeView, wide));
@@ -351,7 +353,7 @@ export function AskReader(props: {
       turn={turn}
       onOpenCard={props.onOpenCard}
       handOver={
-        canTalk && !response.ack && ask.to !== "evaluator" ? (
+        canTalk && !response.ack && response.task === null && ask.to !== "evaluator" ? (
           <HandOver
             entries={[entry]}
             phone={layout === "phone"}
@@ -373,13 +375,13 @@ export function AskReader(props: {
           data-ny-enter
           className={cn(
             "min-h-0 flex-1 overflow-y-auto overscroll-contain outline-none",
-            layout === "desktop" && "grid grid-cols-[minmax(0,1fr)_232px] gap-x-7 pe-7",
+            layout === "desktop" && "grid grid-cols-[minmax(0,800px)_232px] gap-x-7 pe-7",
           )}
         >
           <article
             aria-labelledby="ny-ask-title"
             className={cn(
-              "flex min-w-0 flex-col gap-5 pt-6 pb-8",
+              "flex w-full max-w-[800px] min-w-0 flex-col gap-5 pt-6 pb-8",
               layout === "phone" ? "px-4" : layout === "tablet" ? "px-6" : "ps-7",
             )}
           >
@@ -520,7 +522,7 @@ export function AskReader(props: {
                 entry={entry}
                 draft={ask.draft}
                 form={form}
-                editable={response.edit === "draft" && !locked && !form.refusing}
+                editable={canEditDraft}
                 problem={problems.draft}
               />
             ) : null}
@@ -552,7 +554,7 @@ export function AskReader(props: {
                         media={media}
                         index={index}
                         onOpen={setViewing}
-                        className="h-40 w-full max-w-none rounded-none object-cover"
+                        className="h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
                       />
                     )}
                   />
@@ -671,6 +673,12 @@ export function AskReader(props: {
               )
             }
           >
+            {canEditDraft ? (
+              <Btn onClick={editDraft}>
+                Edit
+                <Key>E</Key>
+              </Btn>
+            ) : null}
             {canNote && !showNote && layout === "desktop" ? (
               <Btn onClick={addNote}>
                 Add a note
@@ -712,6 +720,16 @@ export function AskReader(props: {
               side={phone ? "bottom" : "center"}
               bodyClassName="flex flex-col gap-1 p-3"
             >
+              {canEditDraft && phone ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    editDraft();
+                  }}
+                >
+                  Edit the draft
+                </MoreRow>
+              ) : null}
               {canNote && !showNote ? (
                 <MoreRow
                   onClick={() => {
