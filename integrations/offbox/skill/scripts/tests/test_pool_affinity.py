@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, lease, pool, runs, ssh_sync
+from offbox_lib import allocation, api, cli, common, lease, pool, runs, ssh_sync
 from test_capacity import Isolated
 
 
@@ -129,7 +129,7 @@ class AffinityTests(Isolated):
             self.assertEqual(self.acquire()['box_id'], 'B')
         self.assertEqual(self.clock.t, 1003)
 
-    def growing(self, timeout=False):
+    def growing(self, timeout=False, live_state="running"):
         self.me['repo_root'] = self.tmp.name
         (Path(self.tmp.name) / 'package.json').write_text('{}')
         self.own()
@@ -144,7 +144,7 @@ class AffinityTests(Isolated):
             if bid == 'B':
                 return {'state': 'running', 'type': 'xlarge'}
             if bid in self.resumed:
-                return {'state': 'running', 'type': 'xlarge'}
+                return {'state': live_state, 'type': 'xlarge'}
             if bid in self.stopped:
                 return {'state': 'archiving' if timeout else 'archived', 'type': 'large'}
             return {'state': 'running', 'type': 'large'}
@@ -199,6 +199,128 @@ class AffinityTests(Isolated):
         self.assertEqual(self.resumed, [])
         self.assertIn('your last box A is stopped; using B', self.err.getvalue())
         self.assertLessEqual(self.clock.t, 1060)
+
+    def test_own_grow_after_resume_readiness_failure_switches_to_ready_box(self):
+        # live state x SSH phase: every failure here follows a confirmed successful grow/resume.
+        for live_state in api.LIVE_STATES:
+            for phase in ('setup', 'wait_ssh'):
+                with self.subTest(live_state=live_state, phase=phase):
+                    for table in ('leases', 'pool_members', 'pool_callers', 'runs', 'events', 'kv', 'start_requests'):
+                        self.con.execute(f'DELETE FROM {table}')
+                    self.clock.t = 1000
+                    self.err.seek(0); self.err.truncate()
+                    self.growing(live_state=live_state)
+                    def fail(bid, *args, **kw):
+                        if bid == 'A':
+                            self.assertEqual(self.resumed, ['A'])
+                            self.clock.t += max(0, api.left())
+                            raise common.OffboxError('SSH readiness timed out after resume')
+                    with patch.object(ssh_sync, phase, side_effect=fail), \
+                            patch.object(lease, 'acquire_private') as create:
+                        self.assertEqual(self.acquire(size='xlarge')['box_id'], 'B')
+                    create.assert_not_called()
+                    self.assertEqual(self.stopped, ['A'])
+                    self.assertEqual(self.resumed, ['A'])
+                    self.assertEqual(self.clock.t, 1060)
+                    old = self.con.execute("SELECT state,size,ssh_ready_at FROM leases WHERE box_id='A'").fetchone()
+                    self.assertEqual(tuple(old), ('running', 'xlarge', None))
+                    self.assertEqual(self.err.getvalue().count('your last box A is busy; using B'), 1)
+                    with common.file_lock('box-A', timeout=0):
+                        pass
+
+    def test_unanswered_grow_resume_does_not_switch_to_ready_box(self):
+        self.growing()
+        def unresolved(c, bid, *args, **kw):
+            c.execute("INSERT INTO kv VALUES ('resume_unanswered:A','xlarge',1000)")
+            c.commit()
+            self.clock.t += max(0, api.left())
+            raise lease.ResumeUnresolved('resume send could not be confirmed')
+        with patch.object(lease, '_resume_confirmed', side_effect=unresolved), \
+                patch.object(lease, 'acquire_private') as create:
+            with self.assertRaises(lease.ResumeUnresolved):
+                self.acquire(size='xlarge')
+        create.assert_not_called()
+        self.assertEqual(self.stopped, ['A'])
+        self.assertIsNotNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:A'").fetchone())
+        self.assertNotIn('your last box', self.err.getvalue())
+        self.assertNotIn('B', [call.args[0] for call in api.get.call_args_list])
+
+    def test_readiness_failure_with_unresolved_marker_does_not_switch(self):
+        for marker in ('resume_unanswered:A', 'resume_provision:A'):
+            with self.subTest(marker=marker):
+                for table in ('leases', 'pool_members', 'pool_callers', 'runs', 'events', 'kv', 'start_requests'):
+                    self.con.execute(f'DELETE FROM {table}')
+                self.clock.t = 1000
+                self.err.seek(0); self.err.truncate()
+                self.growing()
+                def fail(bid, *args, **kw):
+                    if bid == 'A':
+                        self.con.execute('INSERT INTO kv VALUES (?,?,1000)', (marker, '2000' if marker.startswith('resume_provision:') else 'xlarge'))
+                        self.con.commit()
+                        raise common.OffboxError('SSH readiness failed')
+                with patch.object(ssh_sync, 'wait_ssh', side_effect=fail):
+                    with self.assertRaises(lease.ResumeUnresolved):
+                        self.acquire(size='xlarge')
+                self.assertIsNotNone(self.con.execute('SELECT 1 FROM kv WHERE k=?', (marker,)).fetchone())
+                self.assertNotIn('your last box', self.err.getvalue())
+                self.assertNotIn('B', [call.args[0] for call in api.get.call_args_list])
+
+    def test_running_own_box_readiness_failure_also_uses_ready_alternative(self):
+        self.growing()
+        self.con.execute("UPDATE leases SET size='xlarge',ssh_ready_at=999 WHERE box_id='A'")
+        self.con.commit()
+        def fail(bid, *args, **kw):
+            if bid == 'A':
+                self.clock.t += max(0, api.left())
+                raise common.OffboxError('SSH readiness timed out')
+        with patch.object(api, 'get', return_value={'state': 'running', 'type': 'xlarge'}), \
+                patch.object(ssh_sync, 'wait_ssh', side_effect=fail):
+            self.assertEqual(self.acquire(size='xlarge')['box_id'], 'B')
+        self.assertEqual(self.stopped, [])
+        self.assertEqual(self.resumed, [])
+        self.assertEqual(self.clock.t, 1060)
+        self.assertIn('your last box A is busy; using B', self.err.getvalue())
+        self.assertIsNone(self.con.execute("SELECT ssh_ready_at FROM leases WHERE box_id='A'").fetchone()[0])
+
+    def test_reconciled_own_resume_readiness_timeout_also_switches(self):
+        self.growing()
+        self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:A','xlarge',1000)")
+        self.con.commit()
+        def confirmed(c, bid, *args, **kw):
+            allocation.clear_resume(c, bid)
+            self.resumed.append(bid)
+            return {'state': 'running', 'type': 'xlarge'}, False
+        def fail(bid, *args, **kw):
+            if bid == 'A':
+                self.clock.t += 60
+                raise common.OffboxError('SSH readiness timed out after reconciliation')
+        with patch.object(lease, '_resume_confirmed', side_effect=confirmed), \
+                patch.object(ssh_sync, 'wait_ssh', side_effect=fail):
+            self.assertEqual(self.acquire(size='xlarge')['box_id'], 'B')
+        self.assertEqual(self.resumed, ['A'])
+        self.assertEqual(self.clock.t, 1060)
+        self.assertIn('your last box A is busy; using B', self.err.getvalue())
+
+    def test_pending_live_own_box_reconciles_with_zero_or_positive_queue_wait(self):
+        confirm = lease._resume_confirmed
+        for queue_wait in ('0', '1', '120'):
+            for live_state in api.LIVE_STATES:
+                with self.subTest(queue_wait=queue_wait, live_state=live_state):
+                    for table in ('leases', 'pool_members', 'pool_callers', 'runs', 'events', 'kv', 'start_requests'):
+                        self.con.execute(f'DELETE FROM {table}')
+                    self.clock.t = 1000
+                    self.err.seek(0); self.err.truncate()
+                    self.growing(live_state=live_state)
+                    self.resumed.append('A')
+                    self.con.execute("INSERT INTO kv VALUES ('resume_unanswered:A','xlarge',1000)")
+                    self.con.commit()
+                    with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': queue_wait}), \
+                            patch.object(lease, '_resume_confirmed', confirm), patch.object(api, 'resume') as resume:
+                        self.assertEqual(self.acquire(size='xlarge')['box_id'], 'A')
+                    self.assertGreater(api.get.call_count, 0)
+                    resume.assert_not_called()
+                    self.assertIsNone(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:A'").fetchone())
+                    self.assertNotIn('your last box', self.err.getvalue())
 
     def test_pass_stops_at_most_one_box(self):
         self.box('A', size='large', member=True, used=900)

@@ -202,7 +202,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     next_progress = 0
     create_first = False
     resume_stall = None
-    resume_stuck = set()
+    unusable = set()
     pending_retries = set()
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
@@ -215,6 +215,20 @@ def _acquire(con, me, size, template, base, fresh, run_id):
         if grew:
             raise lease.ArchivingSkip("already stopped one pool box to grow; trying another ready box", code=EXIT_BUSY)
         grew = True
+
+    def readiness_failed(row, error):
+        bid = row['box_id']
+        if bid not in mine:
+            raise error
+        if con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
+                       (f"resume_unanswered:{bid}", f"resume_provision:{bid}")).fetchone():
+            raise lease.ResumeUnresolved(f"{bid} still has an unanswered resume; nothing ran. Retry later", error) from error
+        observed_size = error.state.get('type')
+        known_size = observed_size if observed_size in SIZES else row['size']
+        con.execute("UPDATE leases SET state='running', size=?, ssh_ready_at=NULL WHERE box_id=?", (known_size, bid))
+        con.commit()
+        unusable.add(bid)
+        say(f"could not prepare your box {bid} ({error}); trying other pool boxes")
 
     while True:
         lease.cap_check()
@@ -236,6 +250,10 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     raise lease.ResumeUnresolved(f"{bid} has an active run and an unanswered resume; nothing ran")
                 try:
                     got = lease._reuse(con, pending, size, skip_archiving=True)
+                except lease.BoxNotReady as e:
+                    readiness_failed(pending, e)
+                    guard.__exit__(None, None, None)
+                    continue
                 except lease.ResumeStopped as e:
                     pending_retries.add(bid)
                     guard.__exit__(None, None, None)
@@ -267,7 +285,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
             # Outside the pool lock: it asks boat about every detached run.
             _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
-        tried = set(resume_stuck)
+        tried = set(unusable)
         stopped_tries = 0
         stopped_error = None
         capacity_outage = None
@@ -407,6 +425,10 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         create_first = True
                         say(str(e))
                         continue
+                    except lease.BoxNotReady as e:
+                        readiness_failed(row, e)
+                        stopped_error, stopped_failed = e, True
+                        continue
                     except (lease.ResumeUnresolved, allocation.Unresolved):
                         # Do not create another machine while this resume may still have been accepted.
                         raise
@@ -429,7 +451,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                         raise
                     except lease.ArchivingSkip as e:
                         if isinstance(e, lease.ResumeStuck):
-                            resume_stuck.add(row['box_id'])
+                            unusable.add(row['box_id'])
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':

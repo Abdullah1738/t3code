@@ -573,8 +573,13 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
     options = {"on_state": on_state} if on_state is not None else {}
     with outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
-        ssh_sync.setup(box_id)
-        ssh_sync.wait_ssh(box_id)
+        try:
+            ssh_sync.setup(box_id)
+            ssh_sync.wait_ssh(box_id)
+        except capacity.CapacityError:
+            raise
+        except OffboxError as e:
+            raise BoxNotReady(box_id, s, e) from e
         if recipe:
             run_recipe(box_id, recipe, box_held=box_held)
         elif fresh:
@@ -773,6 +778,15 @@ def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
         return
     con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (box_id,))
     con.commit()
+
+
+class BoxNotReady(OffboxError):
+    """Boat confirmed the machine is live, but its SSH setup/readiness failed."""
+
+    def __init__(self, box_id: str, state: dict, cause: OffboxError):
+        super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
+                         code=cause.code, started=cause.started, outage=cause.outage)
+        self.box_id, self.state = box_id, state
 
 
 class ResumeUnresolved(OffboxError):
@@ -999,7 +1013,7 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
 
     try:
         return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady):
         raise
     except OffboxError as e:
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
@@ -1153,6 +1167,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
+        except BoxNotReady:
+            raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)
