@@ -15,7 +15,8 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { Composer, MessageView } from "../Chat";
-import { useAsk, useAskScope, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
+import { messageReadWhole } from "../logic";
+import { useAsk, useAskScope, useOwnerStanding, useWatchAsks } from "./askStore";
 import { askKeyFromParams, askTurn, type NeedsYouAskParams } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -86,14 +87,25 @@ function Talk(props: {
   readonly bottomInset: number;
   readonly onOpenCard: (cardId: string) => void;
 }) {
-  const asks = useAsks();
+  const { asks, api } = useAskScope();
   const { entry } = props;
   const readOnly = useAsk((state) => state.notOwner !== null);
   // What was said counts; older versions of the ask sit between, folded away.
   const thread = askThread(entry);
+  // The feed cuts big blocks short. "Show full" reads that one message whole,
+  // from the server this ask came from, and keeps it for as long as he is here.
+  const [whole, setWhole] = useState<Readonly<Record<number, KanbanMessage>>>({});
+  const loadFull = async (seq: number) => {
+    const message = thread.find((item) => item.message.seq === seq)?.message;
+    if (message === undefined) return;
+    const full = await api.message(message.discussionId, seq);
+    setWhole((current) => ({ ...current, [seq]: full }));
+  };
   // A reply over a limit is told here, beside the composer that still holds it.
   const [problem, setProblem] = useState<string | null>(null);
   const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
+  // How many messages the list had when it last jumped to its end.
+  const followed = useRef(-1);
   return (
     <View className="flex-1">
       <ScrollView
@@ -101,7 +113,13 @@ function Talk(props: {
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerClassName="gap-3 px-4 pb-4 pt-4"
-        onContentSizeChange={() => scroll.current?.scrollToEnd({ animated: false })}
+        onContentSizeChange={() => {
+          // Follow the talk to its newest message, but leave him where he is
+          // when a message he is reading grows ("Show full", a fold opened).
+          if (followed.current === thread.length) return;
+          followed.current = thread.length;
+          scroll.current?.scrollToEnd({ animated: false });
+        }}
       >
         <NotOwnerBand />
         <OfflineBand />
@@ -113,18 +131,21 @@ function Talk(props: {
               <EarlierVersion
                 key={message.seq}
                 boardId={entry.boardId}
-                message={message}
+                message={messageReadWhole(message, whole[message.seq])}
                 nowMs={props.nowMs}
                 onOpenCard={props.onOpenCard}
+                onLoadFull={loadFull}
               />
             ) : (
               <MessageView
                 key={message.seq}
                 boardId={entry.boardId}
+                // No discussion feed behind it here: a pick in it is read, not answered.
                 discussionId={null}
-                message={message}
+                message={messageReadWhole(message, whole[message.seq])}
                 nowMs={props.nowMs}
                 onOpenCard={props.onOpenCard}
+                onLoadFull={loadFull}
               />
             ),
           )
@@ -171,12 +192,17 @@ function Talk(props: {
   );
 }
 
-/** What the ask said before its agent edited it, to read: its buttons no longer answer anything. */
+/**
+ * What the ask said before its agent edited it. It can be read in full (long
+ * text, folds, pages, files), but nothing in it answers anything any more: it
+ * is shown outside a discussion feed, so its picks are locked.
+ */
 function EarlierVersion(props: {
   readonly boardId: string;
   readonly message: KanbanMessage;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onLoadFull: (seq: number) => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -197,13 +223,14 @@ function EarlierVersion(props: {
         <Text className="text-sm text-foreground-muted">Earlier version</Text>
       </Pressable>
       {open ? (
-        <View pointerEvents="none" className="border-t border-border px-3.5 py-3 opacity-80">
+        <View className="border-t border-border px-3.5 py-3">
           <MessageView
             boardId={props.boardId}
             discussionId={null}
             message={props.message}
             nowMs={props.nowMs}
             onOpenCard={props.onOpenCard}
+            onLoadFull={props.onLoadFull}
           />
         </View>
       ) : null}

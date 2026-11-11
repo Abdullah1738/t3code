@@ -52,6 +52,7 @@ import {
   cardGlyph,
   choiceView,
   firstSendText,
+  blockReadsWhole,
   groupBlockRuns,
   isLoadableImageUrl,
   nextTypingExpiry,
@@ -325,10 +326,17 @@ function useMarkRead(
 
 export function MessageView(props: {
   readonly boardId: string;
+  /** Null where the message is shown outside its discussion's feed: its picks then answer nothing. */
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly nowMs: number;
   readonly onOpenCard: (cardId: string) => void;
+  /**
+   * Reads this message whole, for a screen that shows it outside its
+   * discussion's feed (an ask's discussion). It only reads: a big block cut
+   * short by the feed gets its "Show full" without the message's picks coming alive.
+   */
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
   const { message } = props;
   const time = clockLabel(message.createdAt, props.nowMs);
@@ -339,6 +347,7 @@ export function MessageView(props: {
       message={message}
       resolveKanbanLink={resolveKanbanLinkFor(props.boardId)}
       onOpenCard={props.onOpenCard}
+      onLoadFull={props.onLoadFull}
     />
   );
   if (message.author._tag === "owner") {
@@ -375,6 +384,7 @@ function Blocks(props: {
   readonly message: KanbanMessage;
   readonly resolveKanbanLink: ResolveKanbanLink;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
   return groupBlockRuns(props.message.blocks).map((run) =>
     run.kind === "attachments" ? (
@@ -397,19 +407,25 @@ function BlockView(props: {
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
   readonly onOpenCard: (cardId: string) => void;
+  readonly onLoadFull?: ((seq: number) => Promise<void>) | undefined;
 }) {
-  const { block } = props;
+  const { block, boardId, discussionId, onLoadFull } = props;
+  // The screen's own reader first; else the discussion's feed reads it whole.
+  const loadFull =
+    onLoadFull ??
+    (discussionId === null
+      ? undefined
+      : (seq: number) => kanbanClient().expandMessage(boardId, discussionId, seq));
   if (
-    (block._tag === "md" || block._tag === "collapse" || block._tag === "html") &&
-    block.truncated &&
-    props.discussionId !== null
+    loadFull !== undefined &&
+    blockReadsWhole(block, true) &&
+    (block._tag === "md" || block._tag === "collapse" || block._tag === "html")
   ) {
     return (
       <TruncatedBlock
         block={block}
-        boardId={props.boardId}
-        discussionId={props.discussionId}
         seq={props.message.seq}
+        onLoadFull={loadFull}
         resolveKanbanLink={props.resolveKanbanLink}
       />
     );
@@ -611,9 +627,8 @@ function LoadEarlier(props: { readonly boardId: string; readonly discussionId: s
 /** A big block sent as a preview, with a button that reads the message in full. */
 function TruncatedBlock(props: {
   readonly block: Extract<KanbanBlock, { _tag: "md" | "collapse" | "html" }>;
-  readonly boardId: string;
-  readonly discussionId: string;
   readonly seq: number;
+  readonly onLoadFull: (seq: number) => Promise<void>;
   readonly resolveKanbanLink: ResolveKanbanLink;
 }) {
   const { block } = props;
@@ -639,9 +654,7 @@ function TruncatedBlock(props: {
         label={action.pending ? "Loading…" : `Show full (${size})`}
         disabled={action.pending}
         onPress={() =>
-          void action.run("Couldn't load the message", () =>
-            kanbanClient().expandMessage(props.boardId, props.discussionId, props.seq),
-          )
+          void action.run("Couldn't load the message", () => props.onLoadFull(props.seq))
         }
       />
     </View>
@@ -756,10 +769,14 @@ function ChoiceBlock(props: {
   const mine = current?.choice ?? view.mine;
   const text = current?.text ?? "";
   const poll = block.style === "poll";
+  // Shown outside its discussion's feed (under an ask, or as an earlier
+  // version of one) there is nowhere to send an answer: it is only read.
+  const readOnly = props.discussionId === null;
   // Every owner answer reaches the agent, so a pick is answered once; a poll
   // vote can move.
   const locked =
-    !poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true);
+    readOnly ||
+    (!poll && (view.mine.length > 0 || view.mineText !== null || current?.sent === true));
   const multiPick = !poll && block.multi;
   const canSend = canSendChoice(block, mine, text);
   // Sending from the field removes it while ChoiceBlock stays mounted, and
