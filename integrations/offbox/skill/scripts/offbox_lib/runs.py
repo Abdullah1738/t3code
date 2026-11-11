@@ -1215,6 +1215,9 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
 
 def run_remote(a, me: dict) -> int:
     """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
+    # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
+    if not a.no_sync and getattr(a, "include", None):
+        ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
     rn = Runner(a, me)
     try:
         return _run_remote(a, rn)

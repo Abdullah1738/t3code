@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import cli, ssh_sync
+from offbox_lib import cli, runs, ssh_sync
 from offbox_lib.common import OffboxError
 
 
@@ -109,14 +109,17 @@ def test_sources_outside_include_are_unchanged(repo):
     assert "src/main.py" in before
 
 
-@pytest.mark.parametrize("command", ("ls-files", "check-ignore"))
+@pytest.mark.parametrize("command", ("ls-files", "check-ignore", "tracked-check-ignore"))
 @pytest.mark.parametrize("failure", ("oserror", "timeout", "rc128"))
 def test_git_inspection_failure_refuses_before_rsync(repo, command, failure):
+    if command == "tracked-check-ignore":
+        write(repo, "tmp/cards/tracked.txt")
+        git(repo, "add", "-f", "tmp/cards/tracked.txt")
     real_run = subprocess.run
 
     def fail(cmd, **kwargs):
         assert cmd[0] != ssh_sync.RSYNC, "no transfer may start after an inspection failure"
-        if cmd[0] == "git" and command in cmd:
+        if cmd[0] == "git" and (command in cmd or command == "tracked-check-ignore" and "--no-index" in cmd):
             if failure == "oserror":
                 raise OSError("synthetic git failure")
             if failure == "timeout":
@@ -157,17 +160,15 @@ def test_refusal_reaches_cli_as_usage_error_without_fallback(repo):
             return subprocess.CompletedProcess(cmd, 128, b"", b"synthetic git failure")
         return real_run(cmd, **kwargs)
 
-    def sync(*args):
-        return ssh_sync.push("testbox", repo, "unused", includes=CASES["a"][0])
-
     args = cli.build_parser().parse_args(["run", "--include", "tmp/cards/x/f.tar", "--", "echo", "ok"])
     with patch.object(ssh_sync.subprocess, "run", side_effect=fail), \
             patch("offbox_lib.localfirst.decide", return_value="test"), \
-            patch.object(cli, "_remote_once", side_effect=sync), \
+            patch.object(runs.pool, "acquire") as acquire, \
             patch.object(cli, "log"), patch.object(cli, "say"), \
             patch("offbox_lib.fallback.run_local") as fallback, \
             patch("offbox_lib.fallback.note_infra_failure") as infra:
-        assert cli.cmd_run(args, {}) == 2
+        assert cli.cmd_run(args, {"repo_root": str(repo)}) == 2
+    acquire.assert_not_called()
     fallback.assert_not_called()
     infra.assert_not_called()
 
@@ -207,18 +208,82 @@ def test_non_git_roots_guard_every_opened_ancestor(tmp_path, case):
 
 
 @pytest.mark.parametrize("tracked", ("tmp/tracked.txt", "tmp/cards/tracked.txt", "tmp/cards/x/tracked.txt"))
-def test_tracked_file_in_ignored_ancestor_does_not_open_siblings(repo, tracked, request):
-    # q2 on #782: the packet's tracked-ancestor exemption conflicts with its no-extra-files invariant.
+def test_tracked_file_in_ignored_ancestor_refuses_before_box_work(repo, tracked, request):
     rule = request.node.callspec.params["repo"]
-    if rule != "tmp/*" or tracked != "tmp/tracked.txt":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="#782 q2: mixed ignored/tracked ancestor"))
     write(repo, tracked)
     git(repo, "add", "-f", tracked)
-    before = sent(repo)
-    try:
-        after = sent(repo, CASES["a"][0])
-    except OffboxError as refused:
-        assert refused.code == 2
+    if rule == "tmp/*" and tracked == "tmp/tracked.txt":
+        paths = sent(repo, CASES["a"][0])
+        assert {p for p in paths if p.startswith("tmp/")} == CASES["a"][1]
         return
-    allowed = before | CASES["a"][1] | {tracked}
-    assert {p for p in after - allowed if not p.endswith("/")} == set()
+    top = "tmp/cards" if rule == "tmp/*" else "tmp"
+    includes = CASES["a"][0]
+    with patch.object(ssh_sync, "_rsync") as transfer, pytest.raises(OffboxError) as refused:
+        ssh_sync.push("testbox", repo, "unused", includes=includes)
+    transfer.assert_not_called()
+    assert refused.value.code == 2
+    assert repr(includes[0]) in str(refused.value)
+    assert repr(top) in str(refused.value)
+    assert "can't send only the named path there" in str(refused.value)
+    assert "argv" in str(refused.value) and "--step" in str(refused.value)
+    assert "move it out of the ignored directory" in str(refused.value)
+    args = cli.build_parser().parse_args(["run", "--include", includes[0], "--", "echo", "ok"])
+    with patch("offbox_lib.localfirst.decide", return_value="test"), \
+            patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+            patch.object(cli, "log"), patch.object(cli, "say") as say, \
+            patch("offbox_lib.fallback.run_local") as fallback, \
+            patch("offbox_lib.fallback.note_infra_failure") as infra:
+        assert cli.cmd_run(args, {"repo_root": str(repo)}) == 2
+    database.assert_not_called()
+    acquire.assert_not_called()
+    fallback.assert_not_called()
+    infra.assert_not_called()
+    assert str(refused.value) in say.call_args.args[0]
+
+
+@pytest.mark.parametrize("with_git", (False, True))
+def test_ignored_tracked_ancestor_refuses_directory_include(repo, with_git):
+    write(repo, "tmp/cards/tracked.txt")
+    git(repo, "add", "-f", "tmp/cards/tracked.txt")
+    args = cli.build_parser().parse_args(["run", *(["--git"] if with_git else []),
+                                         "--include", "tmp/cards/x/red-go", "--", "echo", "ok"])
+    with patch.object(runs, "db") as database, patch.object(runs.pool, "acquire") as acquire, \
+            pytest.raises(OffboxError) as refused:
+        runs.run_remote(args, {"repo_root": str(repo)})
+    assert refused.value.code == 2
+    assert "tmp/cards/x/red-go" in str(refused.value)
+    database.assert_not_called()
+    acquire.assert_not_called()
+
+
+def test_no_sync_does_not_validate_unused_include(repo):
+    args = cli.build_parser().parse_args(["run", "--no-sync", "--include", "tmp/cards/x/f.tar", "--", "echo", "ok"])
+    with patch.object(ssh_sync, "push_filters", side_effect=AssertionError("no sync requested")), \
+            patch.object(runs, "_run_remote", return_value=0):
+        assert runs.run_remote(args, {"repo_root": str(repo)}) == 0
+
+
+def test_file_include_never_walks_path_max_sibling(repo):
+    write(repo, "tmp/card-x/proof.py")
+    sibling = repo / "tmp/card-y"
+    sibling.mkdir()
+    # Relative mkdir/chdir reaches beyond PATH_MAX without constructing an invalid absolute pathname.
+    subprocess.run([sys.executable, "-c", """
+import os
+from pathlib import Path
+for _ in range(40):
+    name = 'implementation-evidence-' + 'x' * 100
+    os.mkdir(name)
+    os.chdir(name)
+Path('scratch.txt').write_text('synthetic')
+"""], cwd=sibling, check=True)
+    dest = repo.parent / "dest"
+    dest.mkdir()
+    cmd = [ssh_sync.RSYNC, "-a", "--dry-run", "--out-format=%n"]
+    cmd += ssh_sync.push_filters(repo, False, ["tmp/card-x/proof.py"])
+    result = subprocess.run(cmd + [f"{repo}/", f"{dest}/"], capture_output=True, text=True,
+                            check=True, timeout=10)
+    assert "File name too long" not in result.stderr
+    assert {p for p in result.stdout.splitlines() if p.startswith("tmp/")} == {
+        "tmp/", "tmp/card-x/", "tmp/card-x/proof.py",
+    }
