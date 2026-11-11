@@ -2,6 +2,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  CARD_ASK_TOOL_DESCRIPTION,
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -475,6 +476,9 @@ it("the card_ask description says what he can give back, and stays short", () =>
     assert.include(description, word);
   }
   assert.isBelow(description.length, 1_800);
+  // The tool and any page that shows it read the same constant.
+  assert.strictEqual(description, CARD_ASK_TOOL_DESCRIPTION);
+  assert.include(CARD_ASK_TOOL_DESCRIPTION, "and then for what you do after it");
 });
 
 it.effect(
