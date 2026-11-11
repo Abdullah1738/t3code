@@ -111,6 +111,45 @@ class BoxWedgedTests(Isolated):
                 finally:
                     case.doCleanups()
 
+    def test_user_exit97_with_local_start_fence_does_not_need_history(self):
+        acquire, start = self.prepare_run([(97, 'offbox-command-started: r\nuser exit 97\n')])
+        with patch.object(api, 'history_logs', side_effect=common.OffboxError('history unavailable')) as history:
+            self.assertEqual(runs.run_remote(self.a, self.me), 97)
+        history.assert_not_called()
+        acquire.assert_called_once()
+        start.assert_called_once()
+        row = self.con.execute('SELECT * FROM runs').fetchone()
+        self.assertEqual((row['status'], row['exit_code']), ('failed', 97))
+        self.assertEqual(lease.active_runs(self.con, 'bxA'), 0)
+        self.assertIsNone(self.row('bxA')['note'])
+        self.stop_box.assert_not_called()
+
+    def test_detached_user_exit97_with_local_start_fence_does_not_need_history(self):
+        for entry in ('wait', 'pool', 'reaper'):
+            with self.subTest(entry=entry):
+                case = BoxWedgedTests('runTest')
+                case.setUp()
+                try:
+                    row = case.detached_row()
+                    path = Path(row['log_path'])
+                    path.write_text('offbox-command-started: r\n' + EVIDENCE)
+                    with patch.object(api, 'cmd_status', return_value={'status':'exited','running':False,'exitCode':97}), \
+                         patch.object(api, 'history_logs', side_effect=common.OffboxError('history unavailable')) as history:
+                        if entry == 'wait':
+                            self.assertEqual(misc._finalize(row, 97, path), 97)
+                        elif entry == 'pool':
+                            pool._refresh_background(case.con, 'repo')
+                        else:
+                            reap._check_stale_runs(case.con, 'bxA', api.LIVE_STATES[0], False, [])
+                    history.assert_not_called()
+                    current = case.con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+                    self.assertEqual((current['status'], current['exit_code']), ('failed', 97))
+                    self.assertEqual(lease.active_runs(case.con, 'bxA'), 0)
+                    self.assertIsNone(case.row('bxA')['note'])
+                    case.stop_box.assert_not_called()
+                finally:
+                    case.doCleanups()
+
     def test_mixed_stream_chunk_matrix_never_authorizes_replay(self):
         # A display log can glue either marker to stdout, or split a stderr marker around stdout chunks.
         cases = [

@@ -624,6 +624,12 @@ def settle_box_wedged(con, run, code):
     """Only a confirmed pre-command marker plus exit 97 permits moving off a box. Caller holds its box lock."""
     if code != 97 or not run:
         return None
+    # A local start fence rules out retry even when command history is unavailable.
+    try:
+        if run['log_path'] and COMMAND_STARTED_MARKER in Path(run['log_path']).read_text(errors='replace'):
+            return None
+    except OSError:
+        pass
     # Display logs interleave streams and may split/glue a marker around stdout chunks. Only complete stderr
     # from offset zero authorizes retry; neither a merged log nor a status tail can prove the command never ran.
     if not run['command_id']:
