@@ -19,6 +19,9 @@ OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 OVMF_CODE_SB = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 OVMF_VARS_SB = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
 STICK_P2_START_MIB = 1 + 16384
+# Files on the unrelated USB volume of the "fat" KVM shape: two are named like our marker files on purpose.
+FOREIGN_FILES = (("WIPE-EVERYTHING", "decoy: not on the offbox stick, must be ignored\n"),
+                 ("REINSTALL-OS.txt", "decoy\n"), ("notes.txt", "unrelated volume\n"))
 
 
 class Fail(Exception):
@@ -65,6 +68,9 @@ class VM:
         self.proc = None
         self.cable_out = False
         self.qmp_lock = threading.Lock()
+        # What a network KVM adds to the machine: None, "empty" (USB keyboard + mouse + a virtual USB drive
+        # with no medium) or "fat" (the same, the drive holding an unrelated FAT volume). See kvm_devices().
+        self.kvm = None
 
     # ------------------------------------------------------------------ images
     def fresh_disks(self):
@@ -125,6 +131,7 @@ class VM:
         for i in disks:
             cmd += ["-drive", f"file={self.disks[i]},if=none,id=nv{i},format=qcow2,discard=unmap,detect-zeroes=unmap,cache=writeback",
                     "-device", f"nvme,drive=nv{i},serial=OFFBOXTEST{i}" + (f",bootindex={i + 1}" if stick_first else "")]
+        cmd += self.kvm_devices()   # before the stick: the stick is then not the first USB disk (not /dev/sda)
         if stick:
             cmd += ["-drive", f"file={self.stick},if=none,id=stick,format=qcow2,cache=writethrough",
                     "-device", "usb-storage,bus=xhci.0,drive=stick,removable=on" + (",bootindex=0" if stick_first else "")]
@@ -149,6 +156,56 @@ class VM:
             self.qmp("cont")
             threading.Thread(target=self._hold_cable_out, args=(self.proc,), daemon=True).start()
         self.log(f"{self.name}: power on #{self.boots} disks={list(disks)} stick={stick} net={net} stick_first={stick_first}")
+
+    def kvm_devices(self):
+        """The USB devices of a network KVM (GL.iNet Comet and the like): keyboard, mouse, virtual media drive."""
+        if not self.kvm:
+            return []
+        cmd = ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-tablet,bus=xhci.0"]
+        if self.kvm == "empty":
+            # a virtual drive with nothing mounted: a removable USB device without a medium
+            cmd += ["-drive", "if=none,id=kvmdrive,media=cdrom", "-device", "usb-storage,bus=xhci.0,drive=kvmdrive,removable=on"]
+        else:
+            img = os.path.join(self.dir, "kvm-foreign.img")
+            if not os.path.exists(img):
+                self.make_foreign_volume(img)
+            cmd += ["-drive", f"file={img},if=none,id=kvmdrive,format=raw,cache=writethrough",
+                    "-device", "usb-storage,bus=xhci.0,drive=kvmdrive,removable=on"]
+        return cmd
+
+    @staticmethod
+    def make_foreign_volume(img):
+        """A 96 MB USB disk that has nothing to do with us: MBR, one FAT32 volume "KVMDATA" with a few files,
+        among them decoys named like our marker files and our log-volume sentinel's neighbours."""
+        run(["truncate", "-s", str(96 * 1024 * 1024), img])
+        subprocess.run(["sfdisk", "--quiet", img], input="label: dos\nstart=2048, type=c\n", text=True, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run(["mkfs.vfat", "-F", "32", "-n", "KVMDATA", "--offset", "2048", img, str(96 * 1024 - 1024)])
+        env = dict(os.environ, MTOOLS_SKIP_CHECK="1")
+        tmp = img + ".d"
+        os.makedirs(tmp, exist_ok=True)
+        for name, text in FOREIGN_FILES:
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(text)
+            subprocess.run(["mcopy", "-i", f"{img}@@{2048 * 512}", os.path.join(tmp, name), "::" + name], env=env, check=True)
+        shutil.rmtree(tmp)
+
+    def foreign_listing(self):
+        """Names and sha256 of the files on the unrelated volume, read from the image (machine off)."""
+        img = os.path.join(self.dir, "kvm-foreign.img")
+        env = dict(os.environ, MTOOLS_SKIP_CHECK="1")
+        out = []
+        for name, _text in FOREIGN_FILES:
+            p = subprocess.run(["mtype", "-i", f"{img}@@{2048 * 512}", "::" + name], env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+            out.append((name, p.stdout.decode(errors="replace") if p.returncode == 0 else None))
+        return out
+
+    def keys(self, *names, gap=0.4):
+        """Press keys one after the other on the machine's keyboard (QMP qcodes: down, up, ret, ...)."""
+        for n in names:
+            self.qmp("send-key", keys=[{"type": "qcode", "data": n}])
+            time.sleep(gap)
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None

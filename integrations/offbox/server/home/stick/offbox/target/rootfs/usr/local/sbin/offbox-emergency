@@ -6,6 +6,7 @@
 # shellcheck source=../lib/offbox/lib.sh
 . /usr/local/lib/offbox/lib.sh
 say "emergency: system is in emergency/rescue mode; starting network + sshd, restart follows"
+screen "EMERGENCY MODE: the system did not boot normally. Starting network and SSH; it restarts by itself."
 mount -o remount,rw / 2>/dev/null || true
 n=$(( $(cat "$STATE/emergency-count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STATE/emergency-count" 2>/dev/null || true
@@ -35,8 +36,25 @@ say "emergency: ssh up on $(hostname -I 2>/dev/null | tr ' ' ,); emergency boot 
 
 if [ "$n" -ge 3 ]; then hold=$(cfgval emergency_long_hold_seconds 3600); else hold=$(cfgval emergency_hold_seconds 600); fi
 end=$(( $(date +%s) + hold ))
-while [ "$(date +%s)" -lt "$end" ] || [ -e "$RUN/hold" ]; do sleep 5; done
+# The same on the screen, with a countdown once a minute: whoever looks through the KVM sees why the machine
+# is here, how to reach it and when it restarts. (The console also offers a root login; nothing waits for it.)
+last=0
+while :; do
+  t=$(date +%s)
+  if [ "$t" -ge "$end" ] && [ ! -e "$RUN/hold" ]; then break; fi
+  if [ $(( t - last )) -ge 60 ]; then
+    last=$t
+    ips=$(hostname -I 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+    if [ -e "$RUN/hold" ]; then
+      screen "EMERGENCY MODE (boot $n in a row). SSH: root@${ips:-no address}. Held by $RUN/hold: not restarting."
+    else
+      screen "EMERGENCY MODE (boot $n in a row). SSH: root@${ips:-no address}. Restarting in $(( end - t )) s. To stay: touch $RUN/hold"
+    fi
+  fi
+  sleep 5
+done
 say "emergency: restarting after ${hold}s"
+screen "EMERGENCY MODE: restarting now"
 sync
 systemctl reboot 2>/dev/null || reboot -f
 sleep 60

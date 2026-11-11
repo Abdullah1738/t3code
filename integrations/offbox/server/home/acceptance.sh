@@ -9,6 +9,8 @@
 #   --test-watchdog      hang every CPU. The chipset watchdog must reset the machine within about 2 minutes.
 #                        Run `acceptance.sh --after-watchdog` once it is back.
 #   --after-rtc-wake / --after-watchdog   verdict of the destructive test that ran before the restart
+#   --kvm-steps          only print the steps that are driven with the network KVM (power and reset buttons on
+#                        its ATX board, the screen), with the expected result of each
 #
 # Every line starts with PASS, FAIL, WARN or INFO. Exit code 1 if anything FAILed.
 # One thing no script can check: pull the power cable for 30 s and plug it back in. The machine must start by
@@ -24,7 +26,23 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 mkdir -p "$STATE"
 
+# ---------------------------------------------------------------- steps driven with the network KVM
+# Not run by this script: each needs a button on the KVM's ATX board or its screen. `uptime -s` and
+# `journalctl -b -1 | tail` over SSH afterwards show which boot is which.
+kvm_steps() {
+  cat <<'EOF'
+== steps to drive with the KVM (its power/reset buttons and screen), once each, server idle
+INFO KVM-1 short press of the power button. Expected: the screen shows a normal shutdown and, without ever going dark for more than the firmware's POST, a normal boot to the "offbox home server ... login:" prompt; SSH answers again within ~2 min; `uptime -s` is new. The power LED never goes off for good. FAIL if the machine stays off.
+INFO KVM-2 long press (hold ~6 s) = hard power-off, wait 10 s, short press = power on. Expected: boots to the login prompt; `cat /proc/mdstat` may show a short resync, `zpool status -x` says healthy; `offbox-status` shows no failed units. (Leave it off instead and the RTC alarm switches it on by itself within 15 min: that is KVM-4's proof without the script.)
+INFO KVM-3 reset button while it is booting (during the kernel messages, before the login prompt). Expected: boots normally on the next try, no reinstall even with the stick plugged in (the stick's menu says "installed=1 ... -> disk" on screen), arrays and pool as in KVM-2.
+INFO KVM-4 RTC wake after a real power-off: run `acceptance.sh --test-rtc-wake` over SSH and watch the screen and the power LED. Expected: off (LED dark, no signal) for about 4 min, then on by itself without any button; then `acceptance.sh --after-rtc-wake` says PASS. If it is still dark after 10 min: short press, and RTC wake does not work (BIOS: check Advanced > APM Configuration > ErP Ready = Disabled; Linux sets the alarm itself).
+INFO KVM-5 watchdog: run `acceptance.sh --test-watchdog` and watch the screen. Expected: the picture freezes, within ~2 min the firmware logo appears by itself, then `--after-watchdog` says PASS. If it stays frozen for 10 min: reset button, and the chipset watchdog does not work.
+INFO KVM-6 stick's manual menu (only if wanted, needs the stick first in the boot order or F8 at the logo): arrow down to "installer session only", Enter. Expected: the status page says "manual entry: nothing is installed"; reset to leave.
+INFO NOT-KVM real loss of mains power can only be tested by a person at the box (Abdullah): pull the power cable for 30 s, plug it back in. Expected: the machine starts by itself (BIOS: Restore AC Power Loss = Power On). The KVM's power button cannot stand in for this.
+EOF
+}
 case ${1:-} in
+  --kvm-steps) kvm_steps; exit 0 ;;
   --after-rtc-wake)
     f=$STATE/acceptance-rtc-wake
     [ -s "$f" ] || { fail "no RTC wake test was started"; exit 1; }
@@ -265,4 +283,5 @@ fi
 
 echo "== $([ "$FAILS" = 0 ] && echo "ALL CHECKS PASSED" || echo "$FAILS CHECK(S) FAILED")"
 echo "== still to do by hand, once each: --test-watchdog, --test-rtc-wake, and pulling the power cable (must start by itself)"
+kvm_steps
 [ "$FAILS" = 0 ]

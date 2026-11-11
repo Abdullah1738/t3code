@@ -2,9 +2,12 @@
 # watch-install.zsh: from this Mac, say which stage the home server is in and what to do next.
 #
 #   watch-install.zsh [--minutes N] [--once] [--host ADDR]
+#   OFFBOX_KVM_URL=https://<the KVM's address>  (optional) is printed as the first thing to open when the
+#                                               box is silent. Nothing here logs in to the KVM or drives it.
 #
-# The server has no screen, so there are exactly three ways to see it: the tailnet, the LAN this Mac is on,
-# and the stick's log volume once the stick is plugged back into the Mac (read-stick-log.zsh).
+# The server has no monitor. Ways to see it: the network KVM on its HDMI port (screen, keyboard, power and
+# reset buttons), the tailnet, the LAN this Mac is on, and the stick's log volume once the stick is plugged
+# back into the Mac (read-stick-log.zsh). This script watches the tailnet and the LAN; the KVM is for eyes.
 # This script polls the first two until the installed system answers on the tailnet (exit 0) or N minutes have
 # passed (exit 1, with the debugging steps for a box that stayed silent). Default N = 90.
 #
@@ -26,6 +29,15 @@ while (( $# )); do
   esac
 done
 mkdir -p $STATE
+KVM_URL=${OFFBOX_KVM_URL:-}
+kvm_first() { # the first debugging step of every silent state
+  if [[ -n $KVM_URL ]]; then
+    print -r -- "  0. Open the KVM screen: $KVM_URL"
+  else
+    print -r -- "  0. Open the KVM screen (the Comet's web page; set OFFBOX_KVM_URL to have its address printed here)."
+  fi
+  print -r -- "     $1"
+}
 TS=$(command -v tailscale || true)
 [[ -z $TS && -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]] && TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 
@@ -116,8 +128,9 @@ done
 print
 case "$kind/$where" in
   installer/*)
+    print -r -- "The INSTALLER is running and reachable ($where, $addr) but the install has not finished."
+    kvm_first "The installer's status page (Alt+F8) shows the same stage lines, the addresses and, when it waits, why and for how long. Alt+F1 is Ubuntu's own installer screen, Alt+F2 a shell."
     cat <<EOF
-The INSTALLER is running and reachable ($where, $addr) but the install has not finished.
   look:   ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$addr
           cat /run/offbox/stage.log            # one line per step; the last line is where it is
           tail -50 /run/offbox/early.log /run/offbox/late.log /var/log/installer/subiquity-server-debug.log
@@ -131,8 +144,9 @@ The INSTALLER is running and reachable ($where, $addr) but the install has not f
 EOF
     ;;
   installed/LAN)
+    print -r -- "The server is INSTALLED and reachable on the LAN ($addr) but not on the tailnet."
+    kvm_first "The login screen shows the server's addresses; log in as root with the console password (Keychain: offbox-server-console) and run offbox-status."
     cat <<EOF
-The server is INSTALLED and reachable on the LAN ($addr) but not on the tailnet.
   look:   ssh -i $KEY root@$addr 'offbox-status; journalctl -u offbox-tailscale-join -u tailscaled -n 40 --no-pager'
   no key: "no auth key on this machine" -> the stick had no tailscale-authkey file, or the key had expired.
           Fix: ssh -i $KEY root@$addr 'tailscale up --auth-key=<new key> --hostname=offbox-server --ssh=false --accept-dns=false'
@@ -141,10 +155,24 @@ The server is INSTALLED and reachable on the LAN ($addr) but not on the tailnet.
 EOF
     ;;
   *)
+    print -r -- "NOTHING answered after ${mins} minutes: not on the tailnet, not on this Mac's LAN (mDNS offbox-installer.local /"
+    print -r -- "offbox-server.local, DHCP names offbox-installer / offbox-server).$detail"
+    print -r -- "Work through this in order; each step says what the cause would be."
+    kvm_first "What is on the screen decides everything below:"
     cat <<EOF
-NOTHING answered after ${mins} minutes: not on the tailnet, not on this Mac's LAN (mDNS offbox-installer.local /
-offbox-server.local, DHCP names offbox-installer / offbox-server).$detail
-Work through this in order; each step says what the cause would be.
+       - black, no signal                          -> not powered or no POST: power LED on the KVM's ATX board;
+                                                      press power there; the board's Q-LED needs eyes on site
+       - ASUS logo / "memory training" for minutes -> normal on the first boot with 4 DIMMs (5-15 min): wait
+       - a BIOS message waiting for a key          -> answer it with the KVM keyboard (F1; fTPM prompt: Y),
+                                                      then fix the cause in the BIOS (README: BIOS settings)
+       - BIOS setup or "no boot device"            -> the stick is not being booted: F8 at the logo, pick it
+       - the stick's menu, countdown stopped       -> a key was pressed: Enter on the highlighted entry
+       - the installer's status page               -> read its last lines; it also shows the addresses
+       - "EMERGENCY MODE" lines                    -> the installed system could not boot normally; it shows
+                                                      the SSH address and restarts by itself
+       - "offbox home server ... login:"           -> it is installed and up; the network is the problem
+                                                      (addresses are printed above the prompt)
+     The KVM itself does not answer: go on with step 1; nothing below needs it.
   1. Is the Mac on the same network as the server (same router, not a guest Wi-Fi)? If not, look in the router's
      DHCP client list for "offbox-installer" or "offbox-server" and rerun:  $0 --host <that ip>
   2. Router shows NO such client: the box never got on the network.

@@ -153,6 +153,8 @@ if [ -n "$TSDEB" ]; then
       done
       if "$T/usr/bin/tailscale" --socket="$sock" status --json 2>/dev/null | grep -q '"BackendState": *"Running"'; then
         stage tailscale "joined the tailnet as $TSHOST, $("$T/usr/bin/tailscale" --socket="$sock" ip -4 | head -1)"
+        # the node is authenticated: the installed system does not need the key any more
+        rm -f "$T/etc/offbox/tailscale-authkey"
       else
         stage tailscale "join during install failed ($(tail -1 "$RUN/tailscale-target-up.log" | cut -c1-120)); the server retries after boot"
         rm -f "$T/var/lib/tailscale/tailscaled.state"

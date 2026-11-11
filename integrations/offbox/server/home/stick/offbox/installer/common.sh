@@ -6,6 +6,9 @@ export OFFBOX_SRC=/cdrom/offbox
 RUN=/run/offbox
 LOGMNT=$RUN/logvol
 mkdir -p "$RUN"
+# The status screen of the installer session lives on its own virtual console (live-setup.sh draws it).
+# tty1 is Ubuntu's installer UI and tty2-6 are shells; none of them is touched.
+SCREEN_VT=8
 
 # Test knobs come from QEMU fw_cfg (opt/offbox/<name>). The files do not exist on real hardware, so the
 # defaults below are what the real box runs.
@@ -99,12 +102,24 @@ logvol_mount() {
   for p in $( { [ -n "$disk" ] && lsblk -lnpo NAME,FSTYPE "/dev/$disk" | awk '$2=="vfat"{print $1}'
                 lsblk -lnpo NAME,FSTYPE | awk '$2=="vfat"{print $1}'; } | awk '!seen[$0]++'); do
     [ "$p" = "$src" ] && continue
-    mount -t vfat -o rw,flush,quiet,umask=077,shortname=mixed,tz=UTC "$p" "$LOGMNT" 2>/dev/null || continue
-    if [ -e "$LOGMNT/OFFBOX-LOG-VOLUME" ]; then
+    # Look read-only first: other USB volumes (a KVM's virtual drive, a forgotten stick) are never written to.
+    mount -t vfat -o ro,tz=UTC "$p" "$LOGMNT" 2>/dev/null || continue
+    if [ ! -e "$LOGMNT/OFFBOX-LOG-VOLUME" ]; then
+      umount "$LOGMNT" 2>/dev/null || true
+      continue
+    fi
+    umount "$LOGMNT" 2>/dev/null || true
+    if mount -t vfat -o rw,flush,quiet,umask=077,shortname=mixed,tz=UTC "$p" "$LOGMNT" 2>/dev/null &&
+       touch "$LOGMNT/.offbox-write-test" 2>/dev/null; then
+      rm -f "$LOGMNT/.offbox-write-test"
       echo "$p" > "$RUN/logvol.dev"
       return 0
     fi
+    # Our log volume, but it cannot be written (read-only virtual media, a write-protected stick):
+    # logs stay in RAM for this boot.
     umount "$LOGMNT" 2>/dev/null || true
+    echo "$p" > "$RUN/logvol.readonly"
+    return 1
   done
   return 1
 }
@@ -220,8 +235,11 @@ sync_logs() {
 hold_then_reboot() {
   local secs=$1 reason=$2 end
   stage hold "seconds=$secs reason=$reason (touch /run/offbox/hold to stay here)"
-  sync_logs
   end=$(( $(date +%s) + secs ))
+  # for the status screen (live-setup.sh): what it is waiting for and until when; and bring that screen up
+  printf '%s\n%s\n' "$end" "$reason" > "$RUN/hold-until"
+  chvt "$SCREEN_VT" 2>/dev/null || true
+  sync_logs
   while [ "$(date +%s)" -lt "$end" ] || [ -e "$RUN/hold" ]; do
     sleep 5
   done

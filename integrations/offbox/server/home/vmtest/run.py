@@ -19,7 +19,7 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from vm import OVMF_VARS, VM, Fail, run  # noqa: E402
+from vm import FOREIGN_FILES, OVMF_VARS, VM, Fail, run  # noqa: E402
 
 HOME_DIR = os.path.dirname(HERE)
 SERVER_DIR = os.path.dirname(HOME_DIR)
@@ -798,6 +798,19 @@ def c9(c):
     c.check(state.split()[1:2] == ["active"] and state.split()[-1] == "1" and state.split()[0] in ("maintenance", "starting"),
             "boot dropped to emergency mode and is reachable over SSH",
             f"{int(time.time() - t0)}s after the restart; {state.replace(chr(10), ' ')}")
+    # The countdown line is printed once the script has brought the network up (and again every minute); the
+    # login prompt that starts on tty1 meanwhile clears whatever was printed before it. So wait for the line
+    # instead of reading the screen the moment SSH answers.
+    scr, seen = "", False
+    t1 = time.time()
+    while time.time() - t1 < 90:
+        scr = sshv(vm, "cat /dev/vcs1 | tr -s ' '", check=False)
+        seen = "EMERGENCY MODE" in scr and "Restarting in" in scr and "SSH: root@10." in scr
+        if seen:
+            break
+        time.sleep(3)
+    c.check(seen, "emergency mode is announced on the screen: state, SSH address and the restart countdown",
+            f"after {int(time.time() - t1)}s: " + (scr[scr.find("EMERGENCY MODE"):][:220] if "EMERGENCY MODE" in scr else scr[-160:]))
     boot2 = vm.wait_ssh("installed", 900, not_boot=boot1)
     state2 = sshv(vm, "systemctl is-active emergency.target; cat /var/lib/offbox/emergency-count", check=False)
     c.check(state2.split() == ["active", "2"], "left alone in emergency mode it restarts by itself and is reachable again",
@@ -806,7 +819,9 @@ def c9(c):
     vm.ssh("mkdir -p /run/offbox && touch /run/offbox/hold")
     time.sleep(130)
     kind, b = vm.who()
-    c.check(kind == "installed" and b == boot2, "`touch /run/offbox/hold` stops the automatic restart while debugging")
+    scr = sshv(vm, "cat /dev/vcs1 | tr -s ' '", check=False)
+    c.check(kind == "installed" and b == boot2 and "Held by /run/offbox/hold" in scr,
+            "`touch /run/offbox/hold` stops the automatic restart while debugging, and the screen says so")
     vm.ssh("sed -i '/00000000dead/d' /etc/fstab; sync; rm -f /run/offbox/hold")
     boot3 = vm.wait_ssh("installed", 900, not_boot=boot2)
     state3 = ""
@@ -997,7 +1012,7 @@ def ts(c):
         c.check("joined the tailnet as offbox-vmtest" in late and ip in late,
                 "the join happened during the install (same tailnet address before and after the first boot)", late[-160:])
         c.check(sshv(vm, "ls /etc/offbox/tailscale-authkey 2>&1 | grep -c 'No such'") == "1"
-                and sshv(vm, "tailscale debug prefs | grep -E 'RunSSH|CorpDNS' | tr -d ' \\n'") == '"CorpDNS":false,"RunSSH":false,',
+                and sshv(vm, "tailscale debug prefs | grep -E 'RunSSH|CorpDNS' | tr -d ' \\t\\n'") == '"CorpDNS":false,"RunSSH":false,',
                 "auth key file removed from the installed system once joined; --ssh=false, --accept-dns=false in effect")
         with open(os.path.join(c.dir, "tailnet.txt"), "a") as f:
             f.write(f"installed {ip}\n")
@@ -1061,6 +1076,121 @@ def acc(c):
             f"back after {int(time.time() - t0)}s; {out.strip()[:200]}")
     assert new
     vm.power_cut()
+
+
+def kvm_shape(c, extra, port):
+    """C1 and C3 again in the shape the box has with a network KVM attached: a USB keyboard and mouse and a
+    second USB mass-storage device, enumerated before the stick (so the stick is not the first USB disk)."""
+    vm = c.vm(port)
+    vm.kvm = extra
+    vm.fresh_disks()
+    vm.fresh_stick(STICK)
+    if extra == "empty":
+        # --- the keyboard works and the manual entry does what it says: session up, nothing installed
+        since = vm.serial_size()
+        vm.start()
+        vm.wait_serial("offbox: installed=0 marker=0 -> install", 300, since)
+        time.sleep(1.5)
+        vm.keys("down", "down", "ret")          # install (default) -> disk -> installer session only
+        vm.wait_ssh("installer", 600)
+        st = ""
+        for _ in range(30):
+            st = sshv(vm, "cat /run/offbox/stage 2>/dev/null; grep -c . /run/offbox/plan.json 2>/dev/null", check=False)
+            if st.startswith("shell"):
+                break
+            time.sleep(5)
+        time.sleep(45)
+        parts = sshv(vm, "lsblk -lno NAME,TYPE /dev/nvme0n1 /dev/nvme1n1 | grep -c part; grep -c offbox.mode=shell /proc/cmdline; "
+                         "cat /run/offbox/stage; fgconsole", check=False).split()
+        scr = sshv(vm, "cat /dev/vcs8", check=False)
+        c.check(st.startswith("shell") and parts[:3] == ["0", "1", "shell"],
+                "manual GRUB entry picked with the keyboard: installer session with SSH is up, nothing is installed, it stays",
+                f"stage={st.split()[0] if st else ''} partitions on the NVMe disks={parts[0] if parts else '?'} after 45 s")
+        c.check("offbox installer" in scr and "manual entry" in scr and parts[3:4] == ["8"],
+                "manual entry: the status screen is the visible console and says what this session is", scr.strip()[:160].replace("\n", " | "))
+        vm.power_cut()
+    # --- C1 in this shape
+    since = vm.serial_size()
+    vm.start()
+    t0 = time.time()
+    seen = None
+    shape = scr = ""
+    while time.time() - t0 < 3600:
+        if not vm.running():
+            raise Fail("machine switched off during the install")
+        kind, _ = vm.who()
+        if kind == "installer" and seen is None:
+            seen = int(time.time() - t0)
+            time.sleep(20)
+            shape = sshv(vm, "lsblk -dno NAME,TRAN,TYPE,SIZE,RM | tr -s ' ' | tr '\n' ';'; echo; findmnt -no SOURCE /cdrom; "
+                             "cat /run/offbox/logvol.dev; fgconsole; lsusb | grep -ci -e keyboard -e tablet -e hid", check=False)
+            scr = sshv(vm, "cat /dev/vcs8", check=False)
+        if kind == "installed":
+            break
+        time.sleep(5)
+    else:
+        raise Fail("no installed system after 60 minutes")
+    ser = vm.serial_text(since)
+    c.check("offbox: installed=0 marker=0 -> install" in ser and ser.count("power on #") == 1,
+            f"KVM shape ({extra} virtual drive, USB keyboard + mouse): one power-on with blank disks ended in a running installed system",
+            f"{int(time.time() - t0)}s after power-on")
+    lines = shape.splitlines()
+    stick_part = lines[1] if len(lines) > 1 else ""
+    if extra == "fat":
+        shape_ok = not stick_part.startswith("/dev/sda")     # the unrelated disk is sda, the stick comes after it
+        what = "the stick was not the first USB disk (not /dev/sda); its boot and log volumes were still found, by content"
+    else:
+        shape_ok = "sr0" in (lines[0] if lines else "")       # the empty virtual drive is there as a CD without medium
+        what = "an empty virtual USB drive sits next to the stick; the stick's boot and log volumes were found"
+    c.check(len(lines) >= 4 and shape_ok and stick_part.startswith("/dev/sd") and lines[2].startswith(stick_part[:8])
+            and lines[2] != stick_part, what,
+            f"devices: {lines[0] if lines else ''} boot volume={stick_part} log volume={lines[2] if len(lines) > 2 else ''}")
+    c.check("offbox installer" in scr and "steps so far" in scr and "addresses: 10." in scr and len(lines) >= 4 and lines[3] == "8",
+            "installer status screen is the visible console: stage lines and the address are on it",
+            scr.strip()[:200].replace("\n", " | "))
+    c.check("tskey-" not in scr and "$6$" not in scr and "$y$" not in scr, "nothing secret on the installer status screen")
+    verify_install(c, vm, expect_mode="full")
+    tty = sshv(vm, "systemctl is-active getty@tty1.service; cat /proc/cmdline; cat /dev/vcs1 | tr -s ' \n' ' '", check=False)
+    c.check(tty.startswith("active") and "quiet" not in tty.split("\n")[1] and "splash" not in tty.split("\n")[1]
+            and tty.split("\n")[1].split("console=")[-1].startswith("tty0") and "offbox home server" in tty and "login:" in tty
+            and "addresses: 10." in tty,
+            "installed system: login prompt on tty1 with the server's addresses above it, kernel boots verbose with console=tty0 last",
+            tty.split("\n")[-1][:200])
+    want = make_pool(vm).strip()
+    boot = vm.boot_id()
+    vm.clean_stop()
+    st = vm.stick_logs(os.path.join(c.dir, "stick-log"))
+    c.check(len(stage_lines(st, "late-done")) == 1 and any("installed-system boot" in l for l in st.splitlines()),
+            "the stick's log volume has the install and the first boot of the installed system")
+    # --- C3 in this shape: stick first in the boot order, the extra USB devices still there
+    for i in (1, 2, 3):
+        since = vm.serial_size()
+        vm.start(stick_first=True)
+        boot = vm.wait_ssh("installed", 900, not_boot=boot)
+        ser = vm.serial_text(since)
+        marker = pool_marker(vm)
+        c.check("offbox: installed=1 marker=0 -> disk" in ser and "offbox: loading the installed system's boot menu" in ser
+                and " early-start " not in ser and marker.startswith(want) and "healthy" in marker,
+                f"restart {i} with the stick first and the KVM's USB devices present: the installed system starts, no reinstall, pool intact")
+        if i < 3:
+            vm.clean_stop()
+    if extra == "fat":
+        seen_vol = sshv(vm, "lsblk -lno LABEL | grep -c KVMDATA; grep -c . /boot/efi/EFI/offbox/consumed 2>/dev/null", check=False).split()
+        vm.clean_stop()
+        listing = vm.foreign_listing()
+        c.check(seen_vol[:1] == ["1"] and listing == list(FOREIGN_FILES),
+                "the unrelated FAT volume, with files named like our marker files, was ignored and is unchanged",
+                " ".join(f"{n}:{'same' if t == dict(FOREIGN_FILES)[n] else 'CHANGED'}" for n, t in listing))
+    else:
+        vm.power_cut()
+
+
+def kvm_empty(c):
+    kvm_shape(c, "empty", 2228)
+
+
+def kvm_fat(c):
+    kvm_shape(c, "fat", 2229)
 
 
 def macstick(c):
@@ -1168,6 +1298,8 @@ CASES = {
     "sb": (sb, "extra: Secure Boot enforced, install + the stick starting the installed system"),
     "err": (err, "extra: a failed install is logged, reachable and retried by itself"),
     "acc": (acc, "extra: acceptance.sh runs cleanly on an install and its watchdog test works"),
+    "kvm-empty": (kvm_empty, "KVM attached (USB keyboard, mouse, empty virtual drive): C1 + C3 again, manual GRUB entry"),
+    "kvm-fat": (kvm_fat, "KVM attached, its drive holding an unrelated FAT volume with decoy marker files: C1 + C3 again"),
     "macstick": (macstick, "extra: an image written by the Mac's write-stick.zsh installs and boots (OHV_MAC_STICK)"),
     "ts": (ts, "tailnet: installer and installed system join by themselves, reachable from the Mac"),
 }

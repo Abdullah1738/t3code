@@ -66,6 +66,54 @@ mdns_links() {
 mdns_links
 (sleep 20; for l in /sys/class/net/e*; do [ -e "$l" ] && timeout 20 networkctl renew "${l##*/}"; done) >/dev/null 2>&1 &
 
+# ---- status screen: a plain page on its own virtual console, made the visible one, redrawn every 5 s.
+# For whoever looks at the HDMI output (a network KVM). Shows only what the stage log shows: no secrets.
+screen_draw() {
+  local t=/dev/tty$SCREEN_VT size rows cols ips ts end reason left
+  size=$(stty -F "$t" size 2>/dev/null)
+  rows=${size% *}; cols=${size#* }
+  case $rows in '' | *[!0-9]*) rows=25 ;; esac
+  case $cols in '' | *[!0-9]*) cols=80 ;; esac
+  ips=$(hostname -I 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+  ts=$(cat "$RUN/tailscale-ip" 2>/dev/null)
+  {
+    printf '\033[H\033[2J'
+    echo "offbox installer    $(date -u +'%F %T') UTC    running for $(( $(date +%s) - START )) s"
+    echo "started because: $(cmdline_arg offbox.why || echo unknown)    mode: $(cmdline_arg offbox.mode || echo install)"
+    echo "addresses: ${ips:-none yet (no DHCP lease)}    tailnet: ${ts:-not joined}"
+    echo "reach it:  ssh root@<address> with the offbox key    name: $(hostname)"
+    echo
+    echo "steps so far (newest last):"
+    tail -n "$(( rows > 16 ? rows - 12 : 4 ))" "$RUN/stage.log" 2>/dev/null | cut -c1-"$cols"
+    echo
+    if [ -s "$RUN/hold-until" ]; then
+      end=$(sed -n 1p "$RUN/hold-until"); reason=$(sed -n 2p "$RUN/hold-until")
+      left=$(( end - $(date +%s) ))
+      echo "WAITING: $reason" | cut -c1-"$cols"
+      if [ -e "$RUN/hold" ]; then echo "held by /run/offbox/hold: no automatic restart until that file is removed"
+      elif [ "$left" -gt 0 ]; then echo "restarts by itself in $left s    (to stay here: touch /run/offbox/hold)"
+      else echo "restarting now"; fi
+    elif [ -e "$RUN/install-done" ]; then
+      echo "INSTALL FINISHED: restarting into the installed system"
+    fi
+    echo "Alt+F1: Ubuntu installer's own screen    Alt+F2: shell    Alt+F8: this page"
+  } > "$t" 2>/dev/null
+}
+(
+  set +x
+  n=0
+  : > "/dev/tty$SCREEN_VT" 2>/dev/null
+  chvt "$SCREEN_VT" 2>/dev/null
+  while :; do
+    screen_draw
+    n=$((n + 1))
+    # while the session is still coming up, something else may take the display: take it back (first 2 min only,
+    # after that whoever is at the KVM keyboard decides what is shown)
+    if [ "$n" -le 24 ] && [ "$(fgconsole 2>/dev/null)" = 1 ]; then chvt "$SCREEN_VT" 2>/dev/null; fi
+    sleep 5
+  done
+) &
+
 inventory
 stage live-ready "agent running; ssh and network come up with the rest of the boot"
 (
@@ -96,7 +144,8 @@ tailscale_loop() {
   fi
   deb=$(find "$OFFBOX_SRC/pkgs" -maxdepth 1 -name 'tailscale_*_amd64.deb' 2>/dev/null | sort | head -1)
   if [ -z "$deb" ]; then stage tailscale-skip "no tailscale .deb on the stick"; return 0; fi
-  ts=$RUN/ts
+  # not under /run: it is mounted noexec, the binaries could not start from there
+  ts=/opt/offbox-ts
   sock=$ts/tailscaled.sock
   mkdir -p "$ts" "$state"
   dpkg -x "$deb" "$ts" || { stage tailscale-fail "cannot unpack $deb"; return 0; }

@@ -23,6 +23,12 @@ say() {
   timeout 2 sh -c 'echo "offbox: $1" > /dev/ttyS0' _ "$*" 2>/dev/null || true
 }
 
+# screen TEXT: one line on the visible console (the HDMI output a network KVM shows), next to say's log line.
+# Only for the few states a person looking at the screen must see. Never put anything secret through it.
+screen() {
+  timeout 2 sh -c 'printf "\r\noffbox: %s\r\n" "$1" > /dev/tty0' _ "$*" 2>/dev/null || true
+}
+
 booted_kernel() {
   local a
   for a in $(cat /proc/cmdline); do

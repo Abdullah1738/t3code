@@ -14,6 +14,15 @@ bootdir >/dev/null
 stage early-start "subiquity reached early-commands"
 inventory
 
+# Manual menu entry "installer session only": stop here, before any disk is looked at, and stay up.
+if [ "$(cmdline_arg offbox.mode)" = shell ]; then
+  touch "$RUN/hold" "$RUN/holding"
+  stage shell "manual entry: nothing is installed, this session stays up (SSH, Alt+F2 shell); restart the machine to leave"
+  chvt "$SCREEN_VT" 2>/dev/null || true
+  sync_logs
+  while :; do sleep 3600; done
+fi
+
 PLAN=$RUN/plan.json
 if ! python3 "$OFFBOX_SRC/installer/plan.py" decide > "$PLAN.tmp"; then
   stage early-fail "plan.py decide crashed (see early.log)"
