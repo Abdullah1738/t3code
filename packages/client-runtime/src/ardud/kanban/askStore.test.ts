@@ -956,6 +956,31 @@ describe("batches, hand-over and snooze", () => {
     ]);
   });
 
+  it("an undo that may not write takes back a held answer and leaves a snooze alone", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask, entry(2)]);
+    await h.store.refreshAsks();
+
+    // A snooze went through; its toast offers Undo.
+    await h.store.snoozeAsks([ask], "2026-11-12T08:00:00.000Z", "tomorrow");
+    expect(h.cell.getState().toast?.undoSnooze).toHaveLength(1);
+    expect(h.named("snooze")).toHaveLength(1);
+    // The host is not sure the session is his: nothing is written.
+    expect(h.store.undoAskSend("held")).toBeNull();
+    await settle();
+    expect(h.named("snooze")).toHaveLength(1);
+    expect(h.cell.getState().toast?.undoSnooze).toHaveLength(1);
+
+    // An answer still held here was never sent: taking it back stays available.
+    const other = entry(2);
+    h.store.answerAsk(other, "primary");
+    expect(h.store.undoAskSend("held")).toBe(askKey(other));
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.named("answer")).toHaveLength(0);
+    expect(h.named("snooze")).toHaveLength(1);
+  });
+
   it("a reply that breaks a limit is refused before it is sent", async () => {
     const h = harness();
     const ask = entry(1);
@@ -1003,7 +1028,7 @@ describe("what was read is never sent back", () => {
             askId: "q1",
           },
         ] as never,
-      } as Partial<KanbanAskFeedItem>,
+      } as unknown as Partial<KanbanAskFeedItem>,
     );
 
   it("an answer, a draft edit, a reply, a batch, hand-over and snooze carry only what he gave", async () => {

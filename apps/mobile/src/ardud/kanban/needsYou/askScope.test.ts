@@ -80,6 +80,8 @@ function harness() {
     return { ok: true, status: 200, text: async () => JSON.stringify(body) };
   }) as unknown as typeof fetch;
   const deferred: Array<() => void> = [];
+  /** What each server's session says of this phone: the owner's unless a test says otherwise. */
+  const owners: Record<string, boolean> = { A: true, B: true };
   const scopes = createAskScopes({
     paired: () => paired,
     onPairedChange: (run) => {
@@ -100,12 +102,15 @@ function harness() {
       onForeground: () => () => undefined,
       isForeground: () => true,
     },
+    owner: (environmentId) => owners[environmentId] === true,
     defer: (run) => deferred.push(run),
     now: () => Date.now(),
     fetch: fetchFake,
   });
   return {
     scopes,
+    owners,
+    feeds,
     requests,
     secretSends,
     readsDown,
@@ -439,6 +444,77 @@ describe("an answer that never reached the server", () => {
     await read(h);
     expect(h.answers("A")).toHaveLength(2);
     expect(scope.cell.getState().failed).toEqual({});
+  });
+
+  it("does not go by itself while the phone is not known to be his, and goes once it is", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.writesDown.delete("A");
+    expect(h.answers("A")).toHaveLength(1);
+
+    // The session is being read again, or could not be read: not known to be his.
+    h.owners.A = false;
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await read(h);
+    }
+    expect(h.answers("A")).toHaveLength(1);
+    // The answer is still there, with every try left and Retry by hand for when he is known.
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(scope.cell.getState().failed[askKey(ask)]?.send.autoRetries).toBeUndefined();
+
+    h.owners.A = true;
+    await aWhile();
+    await read(h);
+    expect(h.answers("A")).toHaveLength(2);
+    expect(scope.cell.getState().failed).toEqual({});
+  });
+
+  it("does not go by itself once the server has refused this phone as not the owner's", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.writesDown.delete("A");
+
+    // A refusal met since (a reply, a snooze): the session said owner, the server says not.
+    scope.asks.noteAskNotOwner("This device is not paired as the owner's.", true);
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await read(h);
+    }
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+  });
+
+  it("an answer whose ask moved is not sent again by itself: it comes back as updated", async () => {
+    const h = harness();
+    const scope = h.scopes.current();
+    await scope.asks.refreshAsks();
+    const ask = scope.cell.getState().feed!.open[0]!;
+    h.writesDown.add("A");
+    scope.asks.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    h.writesDown.delete("A");
+    expect(h.answers("A")).toHaveLength(1);
+
+    // The ask was edited while the answer sat unsent.
+    h.feeds.A = [{ ...entry(1), revision: 1 } as KanbanAskFeedItem];
+    for (let n = 0; n < 3; n += 1) {
+      await aWhile();
+      await read(h);
+    }
+    expect(h.answers("A")).toHaveLength(1);
+    expect(scope.cell.getState().failed).toEqual({});
+    expect(scope.cell.getState().marks[askKey(ask)]).toBe("updated");
   });
 
   it("waits for a good read: a failed one sends nothing", async () => {

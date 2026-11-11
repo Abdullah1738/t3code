@@ -59,7 +59,8 @@ export function HistoryRouteScreen() {
     void asks.loadClosedAsks().then(done, done);
   };
   const undo = () => {
-    const key = asks.undoAskSend();
+    // The row offers Undo for a held answer only: nothing else is ever undone from here.
+    const key = asks.undoAskSend("held");
     if (key === null) return;
     const batch = /^batch:([^:]+):(.*)$/.exec(key);
     if (batch) nav.openBatch(batch[1]!, batch[2]!);

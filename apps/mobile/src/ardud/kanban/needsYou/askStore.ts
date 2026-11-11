@@ -43,6 +43,16 @@ import {
   type SessionRead,
 } from "./logic";
 
+/** What the app holds of a server's session, as `ownerStanding` reads it. */
+const sessionRead = (result: AsyncResult.AsyncResult<AuthSessionState, unknown>): SessionRead => {
+  const session = Option.getOrNull(AsyncResult.value(result));
+  return session !== null
+    ? { state: "read", authenticated: session.authenticated, owner: session.owner }
+    : result._tag === "Failure" && !result.waiting
+      ? { state: "failed" }
+      : { state: "reading" };
+};
+
 const askScopes = createAskScopes({
   paired: () => appAtomRegistry.get(pairedEnvironmentIdAtom),
   onPairedChange: (run) => appAtomRegistry.subscribe(pairedEnvironmentIdAtom, run),
@@ -85,6 +95,15 @@ const askScopes = createAskScopes({
     },
     isForeground: () => AppState.currentState === "active",
   },
+  // The session as the app holds it at this moment: the owner's, and read. A
+  // refusal the store met since is the scope's own to check.
+  owner: (environmentId) =>
+    ownerStanding(
+      sessionRead(
+        appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
+      ),
+      false,
+    ) === "owner",
   // After the store update that asked for it has settled, not inside it.
   defer: (run) => setTimeout(run, 0),
   now: () => Date.now(),
@@ -180,13 +199,7 @@ export function useOwnerStanding(): {
       : environmentSession.sessionStateAtom(environmentId as EnvironmentId);
   const result = useAtomValue(atom);
   const refused = useAsk((state) => state.notOwner !== null);
-  const session = Option.getOrNull(AsyncResult.value(result));
-  const read: SessionRead =
-    session !== null
-      ? { state: "read", authenticated: session.authenticated, owner: session.owner }
-      : result._tag === "Failure" && !result.waiting
-        ? { state: "failed" }
-        : { state: "reading" };
+  const read = sessionRead(result);
   const owner = read.state === "read" && read.authenticated ? read.owner : undefined;
   useEffect(() => asks.noteOwnerStanding(owner), [asks, owner]);
   const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);

@@ -33,6 +33,8 @@ import {
   stepWebLink,
   lateStanding,
   ownerStanding,
+  toastUndo,
+  toastUndoAllowed,
   ownerStandingBarText,
   unreachedRetryTracker,
 } from "./logic";
@@ -459,5 +461,33 @@ describe("whether this phone may answer", () => {
     expect(ownerStandingBarText("notOwner", "reply")).toBe(
       "This phone can read asks, not reply to them.",
     );
+  });
+});
+
+describe("the toast's Undo", () => {
+  const REFS = [{ key: "c1:q1", cardRef: "robob:1", askId: "q1", revision: 0 }];
+
+  it("knows a held answer, which sends nothing, from a snooze, which writes", () => {
+    expect(toastUndo(null, null)).toBeNull();
+    expect(toastUndo({ undoSendId: 7 }, 7)).toBe("held");
+    // The answer has gone: there is nothing held to take back.
+    expect(toastUndo({ undoSendId: 7 }, null)).toBeNull();
+    expect(toastUndo({ undoSendId: 7 }, 8)).toBeNull();
+    expect(toastUndo({ undoSnooze: REFS }, null)).toBe("write");
+    expect(toastUndo({}, null)).toBeNull();
+  });
+
+  it("a held answer can be taken back whatever the session says", () => {
+    for (const standing of ["checking", "unchecked", "owner", "notOwner"] as const) {
+      expect(toastUndoAllowed("held", standing)).toBe(true);
+      expect(toastUndoAllowed(null, standing)).toBe(false);
+    }
+  });
+
+  it("an Undo that writes is only for a phone known to be his", () => {
+    expect(toastUndoAllowed("write", "owner")).toBe(true);
+    expect(toastUndoAllowed("write", "checking")).toBe(false);
+    expect(toastUndoAllowed("write", "unchecked")).toBe(false);
+    expect(toastUndoAllowed("write", "notOwner")).toBe(false);
   });
 });

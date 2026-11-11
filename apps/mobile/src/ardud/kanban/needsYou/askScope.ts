@@ -40,6 +40,12 @@ export interface AskScopeHost {
     input: KanbanAskSecretAnswerInput,
   ) => Promise<AskSecretSendResult>;
   readonly watch: AskWatchHost;
+  /**
+   * Whether the session on this server is known, right now, to be the owner's.
+   * False while that is still being read or could not be read. Nothing is sent
+   * by itself unless it is true.
+   */
+  readonly owner: (environmentId: string) => boolean;
   /** Runs `run` after the current store update has settled. */
   readonly defer: (run: () => void) => void;
   /** The time now, in epoch ms. */
@@ -110,13 +116,20 @@ export function createAskScopes(host: AskScopeHost): AskScopes {
     // An answer that never reached the server is kept in memory as "not
     // sent". Once the feed has been read with success a while after it failed,
     // the server is reachable: the answer goes once more, by itself, while it
-    // has tries left (`unreachedRetryTracker`).
+    // has tries left (`unreachedRetryTracker`). Sending is the owner's alone, so
+    // it goes by itself only while the session is known to be his and the
+    // server has not refused this phone since: asked at the moment it would go.
+    const ownerNow = (): boolean => {
+      const id = mine();
+      return id !== null && cell.getState().notOwner === null && host.owner(id);
+    };
     const retries = unreachedRetryTracker();
     const stopRetry = cell.subscribe(() => {
       const due = retries.next(cell.getState(), host.now());
       if (due.size === 0) return;
       host.defer(() => {
-        if (!closed) asks.retryUnreachedAskSends(undefined, (send) => due.has(send.id));
+        if (closed || !ownerNow()) return;
+        asks.retryUnreachedAskSends(undefined, (send) => due.has(send.id));
       });
     });
     const scope: AskScope = {

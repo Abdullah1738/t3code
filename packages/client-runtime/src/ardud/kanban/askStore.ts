@@ -976,11 +976,17 @@ export function createAskStore(host: AskStoreHost) {
   /**
    * Takes back the last thing he did: the held answer, or the snooze the toast
    * still offers to undo. Returns what to focus again, or null when there was nothing.
+   *
+   * Taking back a held answer is local: it was never sent. Bringing a snoozed
+   * ask back is a write to the server. With `only: "held"` nothing is written:
+   * a held answer is cancelled, and a snooze stays as it is. A host that is not
+   * sure the session is the owner's passes it.
    */
-  function undoAskSend(): string | null {
+  function undoAskSend(only?: "held"): string | null {
     if (disposed) return null;
     const send = queue.undo();
     if (send === null) {
+      if (only === "held") return null;
       const snoozed = get().toast?.undoSnooze;
       if (snoozed === undefined || snoozed.length === 0) return null;
       dismissAskToast();

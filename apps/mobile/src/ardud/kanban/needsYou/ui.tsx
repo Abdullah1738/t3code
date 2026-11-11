@@ -22,7 +22,7 @@ import {
 } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
 import { useAsk, useAsks, useOwnerStanding } from "./askStore";
-import type { Tone } from "./logic";
+import { toastUndo, toastUndoAllowed, type Tone } from "./logic";
 
 const TONE_SURFACE: Record<Tone, string> = {
   plain: "bg-secondary",
@@ -251,12 +251,13 @@ export function AskToastBar(props: {
   const toast = useAsk((state) => state.toast);
   const held = useAsk((state) => state.held);
   // Sending again is an answer: only for a phone known to be his.
-  const canSend = useOwnerStanding().standing === "owner";
+  const { standing } = useOwnerStanding();
+  const canSend = standing === "owner";
   const [now, setNow] = useState(Date.now);
-  const undoable =
-    toast !== null &&
-    ((toast.undoSendId !== undefined && held?.payload.id === toast.undoSendId) ||
-      toast.undoSnooze !== undefined);
+  // Taking back a held answer sends nothing and is always his to do. Undoing a
+  // snooze writes to the server: only for a phone known to be his, as it is now
+  // (the session may have gone unchecked or been refused since the snooze).
+  const undoable = toastUndoAllowed(toastUndo(toast, held?.payload.id ?? null), standing);
   const counting = toast?.undoSendId !== undefined && held?.payload.id === toast.undoSendId;
   useEffect(() => {
     if (!counting) return;
@@ -280,7 +281,8 @@ export function AskToastBar(props: {
     ? {
         label: seconds === null ? "Undo" : `Undo ${seconds}`,
         accessibilityLabel: seconds === null ? "Undo" : `Undo, ${seconds} seconds left`,
-        onPress: () => props.onUndo(asks.undoAskSend()),
+        // Not known to be his: only what is held here is taken back, nothing is written.
+        onPress: () => props.onUndo(asks.undoAskSend(canSend ? undefined : "held")),
       }
     : toast.retryKey !== undefined && canSend
       ? {

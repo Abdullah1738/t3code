@@ -108,6 +108,14 @@ session could not be read, and the pairing notice when the phone is not his. The
 ask says the same in place of its buttons. A refusal from the server ("not the owner's
 device") turns the controls off again, whatever the session said before.
 
+The same holds for what would go without a control being pressed again. The toast's Undo is
+offered for a held answer whatever the session says, because taking it back sends nothing; an
+Undo that writes (bringing a snoozed ask back) is offered only while the phone is known to be
+his, as it is at that moment, not as it was when he snoozed (`toastUndo`, `toastUndoAllowed`).
+An answer that never reached the server goes again by itself only while the session is known
+to be his and the server has not refused this phone since (`owner` on the scope's host);
+otherwise it waits as "Not sent" with its tries left.
+
 A call that comes back late acts only for the screen and server that started it
 (`useLateStanding`): nothing at all once the server changed, and no navigation, haptic or
 announcement from a screen that was left or covered.

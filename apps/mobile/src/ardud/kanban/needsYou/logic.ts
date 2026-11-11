@@ -14,6 +14,7 @@ import {
   type AskOutcome,
   type AskSend,
   type AskState,
+  type AskToast,
   type NeedsYou,
   type NeedsYouEntry,
   type NeedsYouItem,
@@ -534,6 +535,27 @@ export function unreachedRetryTracker(
     },
   };
 }
+
+/**
+ * What the toast's Undo would do now. `held`: cancel an answer that is still
+ * only held on this phone; nothing is sent, so it is always his to do.
+ * `write`: bring back asks a snooze put away, which is a write to the server
+ * and so only for a phone known to be his (`toastUndoAllowed`). Null: the
+ * toast has nothing to undo.
+ */
+export function toastUndo(
+  toast: Pick<AskToast, "undoSendId" | "undoSnooze"> | null,
+  heldId: number | null,
+): "held" | "write" | null {
+  if (toast === null) return null;
+  if (toast.undoSendId !== undefined && heldId === toast.undoSendId) return "held";
+  if (toast.undoSnooze !== undefined) return "write";
+  return null;
+}
+
+/** Whether Undo is offered: always for a held answer, for a write only to the owner. */
+export const toastUndoAllowed = (undo: "held" | "write" | null, standing: OwnerStanding): boolean =>
+  undo === "held" || (undo === "write" && standing === "owner");
 
 /**
  * Where a screen stands when a call it started comes back. The server may have
