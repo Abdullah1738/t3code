@@ -89,7 +89,8 @@ export function OptionList(props: {
   const full = choose.multi && form.optionIds.length >= choose.max;
 
   return (
-    <div>
+    // Picture options go two abreast by the room the reader has, not by the window's width.
+    <div className="@container">
       {choose.multi ? (
         <p className="mb-2 text-sm text-(--m-muted)">
           {choose.min === choose.max
@@ -114,7 +115,7 @@ export function OptionList(props: {
           const step = event.key === "ArrowDown" ? 1 : -1;
           options[(at + step + options.length) % options.length]?.focus();
         }}
-        className={cn("grid gap-2", pictures && "sm:grid-cols-2")}
+        className={cn("grid gap-2", pictures && "@xl:grid-cols-2")}
       >
         {choose.options.map((option, index) => {
           const checked = !own && form.optionIds.includes(option.id);
