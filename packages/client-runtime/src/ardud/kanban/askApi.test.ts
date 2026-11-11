@@ -655,8 +655,8 @@ describe("what the server sent is read through the apps' read schemas", () => {
     }
     const one = Math.min(...moved);
     // For the record (the numbers are printed, not asserted tightly: machines differ).
-    console.info(
-      `ask feed, 200 asks, ${(size / 1024).toFixed(0)} KiB: first read ${first.ms.toFixed(1)} ms, one ask changed ${one.toFixed(1)} ms, unchanged poll ${same.toFixed(1)} ms`,
+    process.stdout.write(
+      `ask feed, 200 asks, ${(size / 1024).toFixed(0)} KiB: first read ${first.ms.toFixed(1)} ms, one ask changed ${one.toFixed(1)} ms, unchanged poll ${same.toFixed(1)} ms\n`,
     );
     // Neither kind of poll may cost what the first read does.
     expect(one).toBeLessThan(Math.max(first.ms, 5));

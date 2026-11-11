@@ -200,7 +200,7 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     )
   ) : filtered ? (
     <Empty title="No asks match" action={{ label: "Clear filters", onPress: clearFilter }} />
-  ) : unreadable.length > 0 ? null : (
+  ) : unreadable.length > 0 ? undefined : (
     // With asks open that this build can't show, the line above says so: it is not "all clear".
     <AllClear
       nowMs={nowMs}
