@@ -910,6 +910,7 @@ class Runner:
             node_block = node_version.block(w) if w else ""
         except Exception:
             node_block = ""
+        new_checkout_hint(row, self.root)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                repo_key=me["repo_key"])
@@ -1293,10 +1294,29 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             mf.close()
 
 
+def new_checkout_hint(row: dict, root: Path) -> None:
+    if not row.get("_new_checkout") or not (root / "package.json").exists():
+        return
+    try:
+        manifest = json.loads((root / "package.json").read_text())
+    except (OSError, ValueError):
+        manifest = {}
+    uses_vp = isinstance(manifest, dict) and any(
+        isinstance(manifest.get(key), dict) and "vite-plus" in manifest[key]
+        for key in ("dependencies", "devDependencies"))
+    install = ("vp i" if uses_vp
+               else "pnpm install --frozen-lockfile" if (root / "pnpm-lock.yaml").exists()
+               else "yarn install" if (root / "yarn.lock").exists()
+               else "npm ci" if (root / "package-lock.json").exists() else "npm install")
+    say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
+
+
 def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:
     for p in pulls:
         st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]))
-        if st.get("ok"):
+        if st.get("missing"):
+            say(f"pull {p}: not created on the box")
+        elif st.get("ok"):
             say(f"pulled {p} ({st.get('files', 0)} files)")
         else:
             say(f"pull {p} failed: {st.get('error')}")

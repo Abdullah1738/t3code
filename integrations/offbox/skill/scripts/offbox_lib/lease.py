@@ -573,8 +573,13 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
     options = {"on_state": on_state} if on_state is not None else {}
     with outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
-        ssh_sync.setup(box_id)
-        ssh_sync.wait_ssh(box_id)
+        try:
+            ssh_sync.setup(box_id)
+            ssh_sync.wait_ssh(box_id)
+        except capacity.CapacityError:
+            raise
+        except OffboxError as e:
+            raise BoxNotReady(box_id, s, e) from e
         if recipe:
             run_recipe(box_id, recipe, box_held=box_held)
         elif fresh:
@@ -788,6 +793,15 @@ def set_aside_dead_mount(con, box_id: str, reason: str) -> None:
     set_aside(con, box_id, DEAD_MOUNT_NOTE.rstrip(':'), reason)
 
 
+class BoxNotReady(OffboxError):
+    """Boat confirmed the machine is live, but its SSH setup/readiness failed."""
+
+    def __init__(self, box_id: str, state: dict, cause: OffboxError):
+        super().__init__(f"{box_id} is live but SSH did not become ready; nothing ran: {cause}",
+                         code=cause.code, started=cause.started, outage=cause.outage)
+        self.box_id, self.state = box_id, state
+
+
 class ResumeUnresolved(OffboxError):
     """A resume may have been accepted, but its box could not be confirmed."""
 
@@ -812,6 +826,11 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         while True:
             left = end - time.time()
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
                 con.commit()
@@ -829,7 +848,11 @@ def _wait_unanswered_resume(con, box_id):
                 from . import allocation
                 allocation.clear_resume(con, box_id)
                 return
-            time.sleep(min(2, max(0, end - time.time())))
+            pause = min(2, max(0, end - time.time()))
+            budget_left = api.left()
+            if budget_left is not None:
+                pause = min(pause, max(0, budget_left))
+            time.sleep(pause)
 
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
@@ -867,6 +890,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if left <= 0:
                 break
             try:
@@ -900,6 +928,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
                                        "nothing ran. Retry later") from unanswered
@@ -995,13 +1028,13 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
 
     try:
         return _bring_up(box_id, since=since, stale_error=stale_error, on_state=check_resume)
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled):
+    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady):
         raise
     except OffboxError as e:
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
@@ -1062,14 +1095,14 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                                               f"{iso(capacity.supply_until(want))}", tried=False)
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
+        if before_grow is not None:
+            before_grow(box_id)
         api.stop(box_id)
+        con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+        con.commit()
+        event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+        ssh_sync.close_master(box_id)
         if skip_archiving:
-            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
-            # bigger size once boat reports it archived.
-            ssh_sync.close_master(box_id)
-            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-            con.commit()
-            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
             raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
         # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
@@ -1153,6 +1186,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
+        except BoxNotReady:
+            raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
         ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, want)), s)

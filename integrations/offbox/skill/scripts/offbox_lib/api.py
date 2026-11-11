@@ -218,6 +218,7 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
     raises OffboxError without sending. `connect_retries=0` disables the not-delivered connect retries."""
     if _DEADLINE is not None:
         retries = 0
+        deadline = _DEADLINE if deadline is None else min(deadline, _DEADLINE)
     if deadline is not None:
         _check_deadline(deadline, method, path)
     max_connect = CONNECT_RETRIES if connect_retries is None else connect_retries

@@ -265,6 +265,8 @@ class PoolTests(Isolated):
             row = pool.acquire(self.me)
             pool.release_guard(row)
             self.assertEqual(reuse.call_args.args[1]['box_id'],'cold')
+            self.con.execute("UPDATE pool_callers SET box_id='mine' WHERE owner='worker'")
+            self.con.commit()
             row = pool.acquire(self.me, size='xlarge')
             pool.release_guard(row)
         self.assertEqual(reuse.call_args.args[1]['box_id'],'mine')  # a run that needs xlarge still gets it
