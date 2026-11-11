@@ -24,16 +24,17 @@ class CheckEngine:
         self.log_lock = threading.Lock()
         self.verdicts = OrderedDict()
 
-    def _rules(self, cwd, tool, arguments, *, explicit_only=False):
+    def _rules(self, cwd, tool, arguments, *, explicit_only=False, session_id=None, text=""):
         from recall_local import rule_preflight_enabled
         if not rule_preflight_enabled():
             return [], None
         if not self.rules_path.exists():
             return [], "rules index missing"
-        from recall_rules import RuleIndex
+        from recall_rules import RuleIndex, filter_facts, dedupe_facts
         index = RuleIndex(self.rules_path)
         try:
-            return index.applicable(cwd, tool, arguments, explicit_only=explicit_only), None
+            return dedupe_facts(filter_facts(index.applicable(cwd, tool, arguments, explicit_only=explicit_only),
+                                              text or json.dumps(arguments), session_id)), None
         finally:
             close = getattr(index, "close", None)
             if close:
@@ -49,7 +50,7 @@ class CheckEngine:
         if body.get("trigger") == "tool":
             from recall_local import preflight, local_note
             try:
-                rules, conflict = preflight(tool, arguments, cwd, self.rules_path)
+                rules, conflict = preflight(tool, arguments, cwd, self.rules_path, session_id=body.get("session_id"))
             except Exception as exc:
                 rules, conflict, error = [], None, type(exc).__name__
             note = local_note(rules)
@@ -61,7 +62,7 @@ class CheckEngine:
                           "classifier": "owner-rule", **conflict}
                 return rules, error, self._finish(result, tool, started)
         else:
-            rules, error = self._rules(cwd, tool, arguments)
+            rules, error = self._rules(cwd, tool, arguments, session_id=body.get("session_id"), text=str(body.get("prompt") or ""))
         return rules, error, None
 
     def check(self, body, preflight=None):

@@ -306,10 +306,10 @@ class RecallManifestTests(unittest.TestCase):
         claude = generator.claude_hooks(generator.hooks_for_harness(recall, "claude"))
         codex = generator.codex_hooks_json(generator.hooks_for_harness(recall, "codex"))["hooks"]
         self.assertEqual(codex, generator.codex_hooks_json(generator.hooks_for_harness(recall, "codex-cu"))["hooks"])
-        self.assertEqual(set(claude), {"UserPromptSubmit", "PreToolUse", "PreCompact", "SessionStart", "PostToolUse", "PostToolUseFailure"})
-        self.assertEqual(set(codex), {"UserPromptSubmit", "PreToolUse", "PreCompact", "PostCompact", "SessionStart", "PostToolUse"})
+        self.assertEqual(set(claude), {"UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
+        self.assertEqual(set(codex), {"UserPromptSubmit", "PostToolUse", "SubagentStart", "Stop", "SubagentStop", "SessionEnd"})
         for hook in recall:
-            self.assertEqual(hook["timeoutSec"], 4 if hook["event"] == "PreToolUse" else 2)
+            self.assertEqual(hook["timeoutSec"], 15)
 
 
 class InstallerTests(unittest.TestCase):
