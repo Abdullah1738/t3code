@@ -620,10 +620,17 @@ function Details(props: {
 /** What the card waits on and what it holds up: the tile's own words, with room to read them. */
 function CardState(props: { view: CardStateView }) {
   const { view } = props;
+  // A failed or idle card is not waiting on anything: the label says what it is doing.
+  const label =
+    view.line?.icon === "stop"
+      ? "Stopped"
+      : view.line?.icon === "retry"
+        ? "Retrying"
+        : "Waiting on";
   return (
     // On a phone the label sits over its value: beside it the value wrapped to five lines.
     <dl className="mb-3.5 grid grid-cols-[112px_1fr] items-start gap-x-4 gap-y-2 text-sm max-sm:grid-cols-1 max-sm:gap-y-0.5 pointer-coarse:text-base max-sm:[&>dd:not(:last-child)]:mb-2">
-      <dt className="text-(--m-muted)">Waiting on</dt>
+      <dt className="text-(--m-muted)">{label}</dt>
       <dd className="min-w-0">
         {view.line ? (
           <TileWhy line={view.line} clamp={false} roomy />
