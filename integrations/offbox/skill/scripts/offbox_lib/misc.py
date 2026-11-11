@@ -438,6 +438,9 @@ def _catch_up_finished(con, run_id) -> None:
 
 
 def _incomplete_log(r, result) -> None:
+    if result == 'n/a' and r['status'] not in ('starting', 'running') and r['box_id'] and r['command_id']:
+        # A newer run or another catch-up may own this box lock. Skipping is safe, claiming completeness is not.
+        result = 'incomplete:box lock held'
     if result.startswith('incomplete:'):
         p = LOGS_DIR / f"{r['run_id']}.log"
         size = p.stat().st_size if p.exists() else 0

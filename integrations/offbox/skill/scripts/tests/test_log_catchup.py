@@ -109,6 +109,10 @@ class LogCatchupTests(Isolated):
     def test_held_lock_skips_fetch_and_write(self):
         with common.file_lock('box-bx_a', timeout=0):
             self.assertEqual(misc._catch_up_log(self.row()), 'n/a')
+            code, out, err = self.invoke()
+            self.assertEqual((code, out), (0, 'prefix\n'))
+            self.assertIn('box lock held', err)
+            self.assertIn('output is incomplete', err)
         self.history.assert_not_called()
         self.assertEqual(self.path.read_bytes(), b'prefix\n')
 
