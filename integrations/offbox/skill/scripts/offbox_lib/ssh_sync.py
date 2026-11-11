@@ -53,7 +53,10 @@ def setup(box_id: str) -> Path:
             last = e
             if e.api_code in ("machine_not_running", "sandbox_starting", "boat_starting", "ssh_host_key_unavailable") \
                     or e.status in (409, 502, 503):
-                time.sleep(1 + attempt)
+                left = api.left()
+                if left is not None and left <= 0:
+                    raise
+                time.sleep(1 + attempt if left is None else min(1 + attempt, left))
                 continue
             raise
     else:
@@ -104,11 +107,12 @@ def ssh(box_id: str, command: str, input: bytes | None = None, timeout: float = 
 
 
 def wait_ssh(box_id: str, timeout: float = 90) -> None:
-    deadline = time.time() + timeout
+    left = api.left()
+    deadline = time.time() + (timeout if left is None else max(0, min(timeout, left)))
     err = ""
     while time.time() < deadline:
         try:
-            p = ssh(box_id, "true", timeout=20)
+            p = ssh(box_id, "true", timeout=min(20, deadline - time.time()))
             if p.returncode == 0:
                 return
             err = p.stderr.decode(errors="replace")[-300:]
@@ -116,13 +120,18 @@ def wait_ssh(box_id: str, timeout: float = 90) -> None:
                 setup(box_id)
         except subprocess.TimeoutExpired:
             err = "timeout"
-        time.sleep(1)
+        time.sleep(max(0, min(1, deadline - time.time())))
     raise OffboxError(f"ssh to {box_id} not ready after {int(timeout)}s: {err}")
 
 
 def close_master(box_id: str) -> None:
-    if cfg_path(box_id).exists():
-        subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=10)
+    try:
+        left = api.left()
+        timeout = 10 if left is None else min(10, max(0, left))
+        if timeout > 0 and cfg_path(box_id).exists():
+            subprocess.run(ssh_base(box_id) + ["-O", "exit", box_id], capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # closing a cached connection must not undo a confirmed box stop
 
 
 DEAD_MOUNT = re.compile(r"Transport endpoint is not connected|Software caused connection abort|Stale file handle", re.I)
@@ -506,6 +515,19 @@ def _rsync(box_id: str, remote_dir: str, cmd: list[str], timeout: float, files: 
     return p.stdout or ""
 
 
+def _missing_pull(code: int, error: str) -> bool:
+    if code != 23:
+        return False
+    missing = False
+    for line in error.splitlines():
+        if re.fullmatch(r'rsync: (?:\[sender\] )?link_stat ".*" failed: No such file or directory \(2\)', line):
+            missing = True
+        elif not (line.startswith("rsync error: some files/attrs were not transferred")
+                  or re.fullmatch(r'rsync: \[.*\] write error: Broken pipe \(32\)', line)):
+            return False
+    return missing
+
+
 def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
@@ -522,6 +544,7 @@ def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path)
     st = _stats(p.stdout)
     st["ok"] = p.returncode == 0
     if p.returncode != 0:
+        st["missing"] = _missing_pull(p.returncode, p.stderr.strip())
         st["error"] = p.stderr.strip()[-300:]
     return st
 

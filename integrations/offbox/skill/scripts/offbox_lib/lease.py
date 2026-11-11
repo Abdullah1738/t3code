@@ -799,6 +799,11 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         while True:
             left = end - time.time()
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later")
+                left = min(left, budget_left)
             if left <= 0:
                 con.execute("UPDATE leases SET state='resume_stalled' WHERE box_id=?", (box_id,))
                 con.commit()
@@ -816,7 +821,11 @@ def _wait_unanswered_resume(con, box_id):
                 from . import allocation
                 allocation.clear_resume(con, box_id)
                 return
-            time.sleep(min(2, max(0, end - time.time())))
+            pause = min(2, max(0, end - time.time()))
+            budget_left = api.left()
+            if budget_left is not None:
+                pause = min(pause, max(0, budget_left))
+            time.sleep(pause)
 
 
 def _resume_confirmed(con, box_id: str, ttl: int, size: str | None, pending: bool = False, retry: bool = True,
@@ -854,6 +863,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if left <= 0:
                 break
             try:
@@ -887,6 +901,11 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             remaining = outage.allocation_left()
             if remaining is not None:
                 left = min(left, remaining)
+            budget_left = api.left()
+            if budget_left is not None:
+                if budget_left <= 0.05:
+                    raise ResumeUnresolved(f"resume of {box_id} still needs confirmation; nothing ran. Retry later") from unanswered
+                left = min(left, budget_left)
             if remaining is not None and remaining <= 0:
                 raise ResumeUnresolved(f"resume of {box_id} was unanswered; its state could not be confirmed; "
                                        "nothing ran. Retry later") from unanswered
@@ -986,7 +1005,7 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
         raise ResumeUnresolved(f"{box_id} was resumed but did not become ready; nothing ran: {e}", e) from e
 
 
-def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False):
+def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
     box_id = row["box_id"]
     from . import allocation
     allocation.recover_resumes(con, row['repo_key'])
@@ -1043,14 +1062,14 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
                                               f"{iso(capacity.supply_until(want))}", tried=False)
         say(f"resizing {box_id} {have} -> {want} (stop + resume)")
         capacity.check(con)
+        if before_grow is not None:
+            before_grow(box_id)
         api.stop(box_id)
+        con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
+        con.commit()
+        event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
+        ssh_sync.close_master(box_id)
         if skip_archiving:
-            # Pool callers hold the pool lock: start the stop and skip the box. A later pass resumes it at the
-            # bigger size once boat reports it archived.
-            ssh_sync.close_master(box_id)
-            con.execute("UPDATE leases SET state='stopped' WHERE box_id=?", (box_id,))
-            con.commit()
-            event(con, box_id, "lease_resize_stop", f"{have} -> {want}")
             raise ArchivingSkip(f"{box_id} is stopping to grow to {want}; skipping it for now", code=EXIT_BUSY)
         # Direct callers wait for the stop, but no longer than the archiving wait: a stop that sticks in
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
