@@ -51,7 +51,8 @@ it.layer(Layer.provideMerge(layerAuth, NodeServices.layer))("owner standing in t
             .pipe(Effect.map((session) => session.sessionId));
 
         // The desktop app, and a phone paired from a link it made in Settings > Connections.
-        const desktop = yield* idOf((yield* auth.createBrowserSession(DESKTOP_TOKEN, client)).sessionToken);
+        const desktopToken = (yield* auth.createBrowserSession(DESKTOP_TOKEN, client)).sessionToken;
+        const desktop = yield* idOf(desktopToken);
         const settingsPaired = yield* idOf(
           (yield* auth.createBrowserSession(
             (yield* auth.issuePairingCredential({ label: "iPhone" }, { sessionId: desktop }))
@@ -60,13 +61,12 @@ it.layer(Layer.provideMerge(layerAuth, NodeServices.layer))("owner standing in t
           )).sessionToken,
         );
         // A phone paired from a link made on the Mac (`t3 pair`).
-        const macLink = yield* idOf(
-          (yield* auth.createBrowserSession(
-            (yield* auth.createPairingLink({ subject: "one-time-token", label: "t3 pair" }))
-              .credential,
-            client,
-          )).sessionToken,
-        );
+        const macLinkToken = (yield* auth.createBrowserSession(
+          (yield* auth.createPairingLink({ subject: "one-time-token", label: "t3 pair" }))
+            .credential,
+          client,
+        )).sessionToken;
+        const macLink = yield* idOf(macLinkToken);
         // A hand-issued token (`t3 auth session issue`, the old control token).
         const token = yield* auth.issueSession({ label: "bridges" });
 
@@ -76,6 +76,18 @@ it.layer(Layer.provideMerge(layerAuth, NodeServices.layer))("owner standing in t
         expect(row(settingsPaired)).toMatchObject({ owner: true, current: false });
         expect(row(macLink)).toMatchObject({ owner: false, subject: "one-time-token" });
         expect(row(token.sessionId)).toMatchObject({ owner: false });
+
+        // The session reply the app loads at startup says the same about the session asking.
+        const stateOf = (sessionToken: string | null) =>
+          auth.getSessionState({
+            cookies: sessionToken === null ? {} : { [sessions.cookieName]: sessionToken },
+            headers: {},
+          } as never);
+        expect(yield* stateOf(desktopToken)).toMatchObject({ authenticated: true, owner: true });
+        expect(yield* stateOf(macLinkToken)).toMatchObject({ authenticated: true, owner: false });
+        const signedOut = yield* stateOf(null);
+        expect(signedOut.authenticated).toBe(false);
+        expect("owner" in signedOut).toBe(false);
 
         // Only the Mac-link phone is a paired device that is not his: the token row is not flagged.
         expect(listed.filter(isDeviceNotPairedAsOwner).map((entry) => entry.sessionId)).toEqual([

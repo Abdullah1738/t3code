@@ -187,4 +187,16 @@ describe("owner standing on a listed session", () => {
       expect(isDeviceNotPairedAsOwner(decode({ ...listed, subject, owner: false }))).toBe(false);
     }
   });
+
+  it("the session reply decodes with or without the owner flag", () => {
+    const decodeState = Schema.decodeUnknownSync(AuthSessionState);
+    const auth = {
+      policy: "loopback-browser",
+      bootstrapMethods: ["one-time-token"],
+      sessionMethods: ["browser-session-cookie"],
+      sessionCookieName: "t3_session",
+    };
+    expect("owner" in decodeState({ authenticated: true, auth })).toBe(false);
+    expect(decodeState({ authenticated: true, auth, owner: false }).owner).toBe(false);
+  });
 });
