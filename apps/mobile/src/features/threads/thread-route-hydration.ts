@@ -10,7 +10,12 @@ export function threadRouteIsHydrating(input: {
   readonly detailStatus: EnvironmentThreadStatus;
   readonly detailHasError: boolean;
 }): boolean {
-  if (input.detailStatus === "deleted" || input.shellHasError || input.detailHasError) {
+  if (
+    input.detailStatus === "deleted" ||
+    input.detailStatus === "not-found" ||
+    input.shellHasError ||
+    input.detailHasError
+  ) {
     return false;
   }
   if (input.isLoadingConnections) {

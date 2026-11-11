@@ -18,6 +18,7 @@ export function resolveThreadSyncPhase(input: {
       return input.detailExists ? "syncing" : "loading";
     case "no-access":
     case "deleted":
+    case "not-found":
     case "live":
       return null;
   }

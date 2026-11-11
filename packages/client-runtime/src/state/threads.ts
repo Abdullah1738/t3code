@@ -1,6 +1,7 @@
 import {
   ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
+  type ScopedThreadRef,
   type OrchestrationV2ThreadDetailSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
@@ -8,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
@@ -19,7 +21,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient } from "effect/http";
-import { Atom } from "effect/reactivity";
+import { Atom, type AtomRegistry } from "effect/reactivity";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
@@ -32,7 +34,11 @@ import * as ManagedRelay from "../relay/managedRelay.ts";
 import { subscribeDynamic } from "../rpc/client.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyOrchestrationV2ProjectionEvent } from "./orchestrationV2Projection.ts";
-import { THREAD_SNAPSHOT_IDLE_TTL_MS } from "./threadRetention.ts";
+import {
+  THREAD_NOT_FOUND_GRACE_MS,
+  THREAD_SNAPSHOT_IDLE_TTL_MS,
+  threadNotFoundRetryDelayMs,
+} from "./threadRetention.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
 import { fetchEnvironmentThreadHistoryPage } from "./threadHistoryHttp.ts";
@@ -50,6 +56,11 @@ import {
   type EnvironmentThreadState,
   type EnvironmentThreadStatus,
 } from "./threadState.ts";
+
+/** Terminal "no thread" outcomes that connection-phase updates must not overwrite. */
+function isAbsentStatus(status: EnvironmentThreadStatus): boolean {
+  return status === "deleted" || status === "not-found";
+}
 
 function statusWithoutLiveData(
   data: Option.Option<OrchestrationV2ThreadProjection>,
@@ -149,6 +160,8 @@ function matchesThreadSnapshot(
   );
 }
 
+// Only a delete event is kept. "not-found" (an HTTP miss) falls back to
+// empty/cached, so reopening the thread loads it again.
 function cachedThreadState(value: EnvironmentThreadState): EnvironmentThreadState {
   return {
     ...value,
@@ -161,9 +174,18 @@ function cachedThreadState(value: EnvironmentThreadState): EnvironmentThreadStat
   };
 }
 
+export interface EnvironmentThreadStateOptions {
+  /**
+   * Whether the environment shell lists this thread. A thread that was not
+   * found is loaded again when this turns true.
+   */
+  readonly presence?: Stream.Stream<boolean>;
+}
+
 export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make")(function* (
   threadId: ThreadIdType,
   resumeCache?: ThreadResumeCache,
+  options?: EnvironmentThreadStateOptions,
 ) {
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
   const cache = yield* Persistence.EnvironmentCacheStore;
@@ -309,7 +331,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   yield* runCachePersistence(persistence, persist).pipe(Effect.forkScoped);
 
   const setConnecting = SubscriptionRef.update(state, (current) =>
-    current.status === "deleted" || Option.isSome(current.error)
+    isAbsentStatus(current.status) || Option.isSome(current.error)
       ? current
       : {
           ...current,
@@ -318,7 +340,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         },
   );
   const setReady = SubscriptionRef.update(state, (current) =>
-    current.status === "live" || current.status === "deleted" || Option.isSome(current.error)
+    current.status === "live" || isAbsentStatus(current.status) || Option.isSome(current.error)
       ? current
       : {
           ...current,
@@ -330,7 +352,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     yield* Ref.set(awaitingCompletion, false);
     yield* SubscriptionRef.update(state, (current) => ({
       ...current,
-      status: current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
+      status: isAbsentStatus(current.status) ? current.status : statusWithoutLiveData(current.data),
     }));
   });
   let consecutiveSyncFailures = 0;
@@ -342,8 +364,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       Effect.andThen(
         SubscriptionRef.update(state, (current) => ({
           ...current,
-          status:
-            current.status === "deleted" ? current.status : statusWithoutLiveData(current.data),
+          status: isAbsentStatus(current.status)
+            ? current.status
+            : statusWithoutLiveData(current.data),
           error: Option.some(
             `Could not synchronize the thread. Showing saved history; retrying. ${message}`,
           ),
@@ -420,6 +443,59 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           }),
         ),
       ),
+    );
+  });
+
+  // An HTTP miss is not a delete: the thread may not be committed yet (draft
+  // promotion, a queued creation) or the read raced. Retry with backoff for a
+  // grace window, then show "not-found" until the shell lists the thread or the
+  // user retries. Nothing is removed from the disk cache and the state is never
+  // retained as deleted.
+  let missSince: number | undefined;
+  let missAttempts = 0;
+  const presence = options?.presence ?? Stream.never;
+  const awaitPresenceAppears = presence.pipe(
+    Stream.changes,
+    // A shell that already lists the thread while the server says it is
+    // missing is not news; wait for it to appear (absent -> present).
+    Stream.dropWhile((present) => present),
+    Stream.filter((present) => present),
+    Stream.runHead,
+    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: () => Effect.void })),
+  );
+  const clearMiss = Effect.sync(() => {
+    missSince = undefined;
+    missAttempts = 0;
+  });
+  const waitAfterMiss = Effect.fn("EnvironmentThreadState.waitAfterMiss")(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    if (missSince === undefined) missSince = now;
+    missAttempts += 1;
+    if (now - missSince < THREAD_NOT_FOUND_GRACE_MS) {
+      yield* Effect.logDebug("Thread not found yet; retrying.").pipe(
+        Effect.annotateLogs({ environmentId, threadId, attempt: missAttempts }),
+      );
+      yield* Effect.sleep(threadNotFoundRetryDelayMs(missAttempts));
+      return;
+    }
+    yield* Ref.set(awaitingCompletion, false);
+    yield* SubscriptionRef.update(state, (current) =>
+      current.status === "deleted"
+        ? current
+        : {
+            data: Option.none(),
+            status: "not-found" as const,
+            error: Option.none(),
+            history: EMPTY_THREAD_HISTORY_META,
+          },
+    );
+    yield* remember;
+    yield* awaitPresenceAppears;
+    yield* clearMiss;
+    yield* SubscriptionRef.update(state, (current) =>
+      current.status === "not-found"
+        ? { ...current, status: "synchronizing" as const, error: Option.none() }
+        : current,
     );
   });
 
@@ -761,7 +837,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const markSynchronizing = Effect.gen(function* () {
     if (yield* Ref.get(resumingLive)) return;
     yield* SubscriptionRef.update(state, (current) =>
-      current.status === "deleted" || Option.isSome(current.error)
+      isAbsentStatus(current.status) || Option.isSome(current.error)
         ? current
         : { ...current, status: "synchronizing" as const, error: Option.none() },
     );
@@ -778,9 +854,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           );
         }
         let current = yield* SubscriptionRef.get(state);
-        // A prior definitive miss (or delete event) already cleared this thread.
-        // Park the subscription attempt without opening the socket so we do not
-        // retry forever against a known-missing id.
+        // A delete event already cleared this thread. Park the subscription
+        // attempt without opening the socket. An HTTP miss never lands here: it
+        // is "not-found" and retried below.
         if (current.status === "deleted") {
           return yield* Effect.never;
         }
@@ -793,7 +869,14 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         yield* markSynchronizing;
         yield* Ref.set(resumingLive, false);
 
-        if (Option.isNone(current.data)) {
+        let loading = Option.isNone(current.data);
+        if (loading && current.status === "not-found") {
+          // A new session or retry is loading again; show progress, not the old miss.
+          yield* SubscriptionRef.update(state, (value) =>
+            value.status === "not-found" ? { ...value, status: "synchronizing" as const } : value,
+          );
+        }
+        while (loading) {
           const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
             Effect.flatMap(
               Option.match({
@@ -821,6 +904,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               return yield* Effect.never;
             }
             case "present": {
+              yield* clearMiss;
+              loading = false;
               if (canLoadHistory && httpResult.history !== undefined) {
                 yield* Ref.set(acceptsBoundedSocketSnapshots, true);
               }
@@ -849,10 +934,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               break;
             }
             case "missing": {
-              yield* setDeleted();
-              return yield* Effect.never;
+              yield* waitAfterMiss();
+              current = yield* SubscriptionRef.get(state);
+              if (current.status === "deleted") return yield* Effect.never;
+              break;
             }
             case "unavailable": {
+              loading = false;
               break;
             }
           }
@@ -911,13 +999,24 @@ function threadStateChanges(
   environmentId: EnvironmentIdType,
   threadId: ThreadIdType,
   resumeCache?: ThreadResumeCache,
+  options?: EnvironmentThreadStateOptions,
 ) {
   return followStreamInEnvironment(
     environmentId,
     Stream.unwrap(
-      makeEnvironmentThreadState(threadId, resumeCache).pipe(Effect.map(SubscriptionRef.changes)),
+      makeEnvironmentThreadState(threadId, resumeCache, options).pipe(
+        Effect.map(SubscriptionRef.changes),
+      ),
     ),
   );
+}
+
+export interface EnvironmentThreadStateAtomsOptions {
+  /**
+   * True while the environment shell lists the thread. Lets a thread that was
+   * not found (e.g. opened before the server created it) load once it exists.
+   */
+  readonly threadPresenceAtom?: (ref: ScopedThreadRef) => Atom.Atom<boolean>;
 }
 
 export function createEnvironmentThreadStateAtoms<R, E>(
@@ -928,6 +1027,7 @@ export function createEnvironmentThreadStateAtoms<R, E>(
     | R,
     E
   >,
+  atomsOptions?: EnvironmentThreadStateAtomsOptions,
 ) {
   // Cache definitions must outlive collectible live-atom definitions. The
   // registry retains these nodes without retaining environment or RPC scopes.
@@ -948,7 +1048,12 @@ export function createEnvironmentThreadStateAtoms<R, E>(
         (get) => {
           get.mount(resumeAtom);
           const resume = get.once(resumeAtom);
-          const live = threadStateChanges(environmentId, threadId, resume);
+          // `stream` subscribes without making the shell a dependency, so shell
+          // updates never restart this thread's stream.
+          const presenceAtom = atomsOptions?.threadPresenceAtom?.({ environmentId, threadId });
+          const live = threadStateChanges(environmentId, threadId, resume, {
+            ...(presenceAtom === undefined ? {} : { presence: get.stream(presenceAtom) }),
+          });
           return resume.snapshot === undefined
             ? live
             : Stream.concat(Stream.succeed(cachedThreadState(resume.snapshot.state)), live);
@@ -963,6 +1068,22 @@ export function createEnvironmentThreadStateAtoms<R, E>(
   return {
     stateAtom: (environmentId: EnvironmentIdType, threadId: ThreadIdType) =>
       family(threadKey({ environmentId, threadId })),
+    /**
+     * Loads the thread again from the server, dropping the retained in-memory
+     * state first. Use this for Retry: refreshing the state atom alone would
+     * resume a retained "deleted" state and park again.
+     */
+    reload: (
+      registry: AtomRegistry.AtomRegistry,
+      environmentId: EnvironmentIdType,
+      threadId: ThreadIdType,
+    ) => {
+      const key = threadKey({ environmentId, threadId });
+      const resume = registry.get(resumeFamily(key));
+      resume.snapshot = undefined;
+      resume.owner = undefined;
+      registry.refresh(family(key));
+    },
   };
 }
 
