@@ -29,7 +29,9 @@
  * Script waits are parked too. No script runs here: after the quiet ticks the soak
  * answers "hold" for all of them in the one batch call the scripts' pass makes, which
  * must load the board once and read or write no card. A tick that runs by itself
- * must never give up (see `ticksGivenUp`).
+ * must never give up (see `ticksGivenUp`). Every write that moves the board's
+ * generation is recorded with the call it came from, and the report says who
+ * wrote while each tick ran.
  *
  * It prints tick, dispatch, turn-end and start-a-card timings and the count of
  * reruns (operations redone because the board changed under them), and fails on
@@ -146,13 +148,21 @@ const CEILING = {
    */
   waitPassP95Ms: FULL ? 2_000 : 500,
   /**
-   * Ticks of the board that give up: redone eight times because the board kept
-   * changing under them, then skipped (the tick call still succeeds, and every
-   * step of that tick comes 30 seconds later). On the base this branch started
-   * from (release-20261110c, 11 Nov 2026, smoke, three runs) 3 of 9 ticks give up,
-   * each of them a tick started in the middle of a round's whole traffic, which
-   * every second round does. No worse than that: at most the ticks run that way,
-   * and never a tick that runs by itself.
+   * Ticks of the board that give up: the board changed under them and they could
+   * not start over (redone eight times already, or they had written or sent
+   * something themselves). The tick call still succeeds, and every step of that
+   * tick comes 30 seconds later. Every second round starts a tick in the middle of
+   * the round's whole traffic, and each of those gives up, here and on the base
+   * this branch started from (release-20261110c, 11 Nov 2026: 3 of 3 on the smoke,
+   * 20 of 20 on the full board, all after eight redos). That is the ceiling: at
+   * most the ticks run that way.
+   *
+   * A tick that runs by itself must never give up. On the base 5 of 40 did on the
+   * full board (none on the smoke), and 1 to 3 of 45 here before the fix: each had
+   * handled a failed run the round left behind, which queued a dispatch kick, and
+   * the worker's dispatcher then started a card under the rest of the tick. A tick
+   * now holds its own kicks until its closing dispatch (`tickKicks`). The report
+   * lists who wrote during each tick, from the recorder in `watchedStore`.
    */
   ticksGivenUp: Math.floor(ROUNDS / 2),
 };
@@ -218,8 +228,70 @@ interface Probe {
   hostRequests: number;
 }
 
+/**
+ * Store writes that go through the board's lock. Each one moves the board's
+ * generation (`lockedStore.ts`), which is what makes a tick that is outside the
+ * gate at that moment stale.
+ */
+const LOCKED_WRITES = [
+  "putBoard",
+  "putBoardWithPools",
+  "putCard",
+  "addCardEvent",
+  "putGoal",
+  "putPool",
+  "removePool",
+  "rekeyBoard",
+  "migrateBoardSelections",
+  "putGroups",
+  "putDiscussion",
+  "putMessage",
+  "putAutomation",
+  "putWiki",
+  "putThreadLink",
+  "addThreadCard",
+] as const;
+
+/** One write that moved the board's generation, and the call it came from. */
+interface Bump {
+  readonly at: number;
+  readonly method: string;
+  /** The spans it ran under, outermost first: the driver's call, then the engine's. */
+  readonly chain: string;
+  /** The driver call (or worker) it descends from. */
+  readonly root: string;
+  readonly rootId: string | null;
+  /** That call had already returned: the write came from work it left running. */
+  readonly rootEnded: boolean;
+  /** The engine operation under the root: one job of the worker, one call of the driver. */
+  readonly opId: string | null;
+  readonly opStart: bigint | null;
+}
+
+const spanChain = (span: Tracer.Span | null): Array<Tracer.Span> => {
+  const chain: Array<Tracer.Span> = [];
+  let at: Tracer.AnySpan | undefined = span ?? undefined;
+  while (at !== undefined && at._tag === "Span") {
+    chain.push(at);
+    at = Option.getOrUndefined(at.parent);
+  }
+  return chain.reverse();
+};
+const spanLabel = (span: Tracer.Span) => {
+  const name = span.name.replace("KanbanService.", "");
+  const queue = span.attributes.get("serial.queue");
+  return typeof queue === "string" ? `${name}(${queue})` : name;
+};
+
 const makeWatch = () => {
   const state: { probe: Probe | null } = { probe: null };
+  const bumps: Array<Bump> = [];
+  /** Messages and launches: after one, the operation that made it is not redone. */
+  const sends: Array<{
+    readonly at: number;
+    readonly chain: string;
+    readonly rootId: string | null;
+  }> = [];
   /** Runs `effect`, timed into the open probe when `count` takes it. */
   const seen = <A, E, R>(count: (probe: Probe) => boolean, effect: Effect.Effect<A, E, R>) =>
     Effect.suspend(() => {
@@ -234,6 +306,53 @@ const makeWatch = () => {
       return Effect.ensuring(effect, Effect.sync(touch));
     });
   return {
+    bumps,
+    /** Records `effect`, a write through the board's lock, when it has landed. */
+    bump: <A, E, R>(method: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.flatMap(Effect.currentSpan.pipe(Effect.orElseSucceed(() => null)), (span) =>
+        Effect.tap(effect, () =>
+          Effect.sync(() => {
+            const chain = spanChain(span);
+            const root = chain[0];
+            const driven = root?.name.startsWith("soak:") === true;
+            const operation = driven ? chain[1] : root;
+            const labels: Array<string> = [];
+            for (const entry of chain) {
+              const label = spanLabel(entry);
+              if (labels.at(-1) !== label) labels.push(label);
+            }
+            bumps.push({
+              at: performance.now(),
+              method,
+              chain: labels.join(">"),
+              root: root === undefined ? "no span" : spanLabel(root),
+              rootId: root?.spanId ?? null,
+              rootEnded: root?.status._tag === "Ended",
+              opId: operation?.spanId ?? null,
+              opStart: operation?.status.startTime ?? null,
+            });
+          }),
+        ),
+      ),
+    sends,
+    /** Records a message or a launch under the call that made it. */
+    sent: <A, E, R>(kind: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.flatMap(Effect.currentSpan.pipe(Effect.orElseSucceed(() => null)), (span) =>
+        Effect.suspend(() => {
+          const chain = spanChain(span);
+          const labels: Array<string> = [];
+          for (const entry of chain) {
+            const label = spanLabel(entry);
+            if (labels.at(-1) !== label) labels.push(label);
+          }
+          sends.push({
+            at: performance.now(),
+            chain: `${kind}: ${labels.join(">")}`,
+            rootId: chain[0]?.spanId ?? null,
+          });
+          return effect;
+        }),
+      ),
     open: (cards: ReadonlySet<string>, threads: ReadonlySet<string>) => {
       state.probe = {
         cards,
@@ -346,11 +465,22 @@ const watchedStore = (watch: Watch) =>
     KanbanStore.KanbanStore,
     Effect.gen(function* () {
       const store = yield* KanbanStore.KanbanStore;
+      type Write = (
+        ...args: ReadonlyArray<unknown>
+      ) => Effect.Effect<unknown, KanbanStore.KanbanStoreError>;
+      const recorded = Object.fromEntries(
+        LOCKED_WRITES.map((name) => [
+          name,
+          (...args: ReadonlyArray<unknown>) =>
+            watch.bump(name, (store[name] as unknown as Write)(...args)),
+        ]),
+      ) as unknown as Pick<KanbanStore.KanbanStoreShape, (typeof LOCKED_WRITES)[number]>;
       return KanbanStore.KanbanStore.of({
         ...store,
+        ...recorded,
         cards: (boardId) => watch.boardLoad(store.cards(boardId)),
         card: (cardId) => watch.cardRead(cardId, store.card(cardId)),
-        putCard: (card) => watch.cardWrite(card.id, store.putCard(card)),
+        putCard: (card) => watch.cardWrite(card.id, recorded.putCard(card)),
       });
     }),
   ).pipe(Layer.provide(KanbanStore.layer));
@@ -413,6 +543,7 @@ const makeThreads = (watch: Watch) => {
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {
+          yield* watch.sent("launch", Effect.void);
           counts.launches += 1;
           yield* io(3);
           nextThread += 1;
@@ -429,6 +560,7 @@ const makeThreads = (watch: Watch) => {
       // A message starts a turn (or steers the running one): the failed run is no longer the latest.
       send: (input) =>
         Effect.gen(function* () {
+          yield* watch.sent("send", Effect.void);
           counts.sends += 1;
           yield* io(3);
           const thread = threads.get(input.threadId);
@@ -608,6 +740,20 @@ it.live(
       });
       // Warnings the service logs, counted by their first words, with one example each.
       const logged = new Map<string, { count: number; example: string }>();
+      /** Each "kanban board tick failed", with what the engine said. */
+      const tickFailures: Array<{ readonly at: number; readonly text: string }> = [];
+      /** Every tick the driver ran: when, under which span, and whether its board gave up. */
+      const tickRuns: Array<{
+        readonly label: string;
+        readonly alone: boolean;
+        readonly from: number;
+        to: number;
+        readonly startNs: bigint;
+        rootId: string | null;
+        readonly spansFrom: number;
+        spansTo: number;
+        gaveUp: boolean;
+      }> = [];
       const warnings = Logger.make(({ message, logLevel }) => {
         if (logLevel !== "Warn" && logLevel !== "Error") return;
         const parts = (Array.isArray(message) ? message : [message]).map((part) => {
@@ -624,6 +770,9 @@ it.live(
         const entry = logged.get(key);
         if (entry) entry.count += 1;
         else logged.set(key, { count: 1, example: text.slice(0, 300) });
+        if (key === "kanban board tick failed") {
+          tickFailures.push({ at: performance.now(), text: text.slice(0, 500) });
+        }
       });
       /** Ticks of the board that gave up: logged by the engine, and the tick call still succeeds. */
       const boardTicksFailed = () => logged.get("kanban board tick failed")?.count ?? 0;
@@ -634,7 +783,8 @@ it.live(
       const op = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
         Effect.gen(function* () {
           const from = performance.now();
-          const exit = yield* Effect.exit(effect);
+          // Named, so a write the call (or work it leaves running) makes can be traced to it.
+          const exit = yield* Effect.exit(effect.pipe(Effect.withSpan(`soak:${name}`)));
           const list = timings.get(name) ?? [];
           list.push(performance.now() - from);
           timings.set(name, list);
@@ -644,6 +794,44 @@ it.live(
               firstFailure.set(name, Cause.pretty(exit.cause).slice(0, 400));
           }
           return exit;
+        });
+      /** Runs one tick, timed as `name`, and records it for the report of who wrote during it. */
+      const ticked = <E, R>(
+        name: "tick" | "tick.quiet",
+        label: string,
+        alone: boolean,
+        tick: Effect.Effect<void, E, R>,
+      ) =>
+        Effect.gen(function* () {
+          const failedBefore = boardTicksFailed();
+          const run: (typeof tickRuns)[number] = {
+            label,
+            alone,
+            from: performance.now(),
+            to: 0,
+            startNs: yield* Clock.currentTimeNanos,
+            rootId: null,
+            spansFrom: spans.length,
+            spansTo: 0,
+            gaveUp: false,
+          };
+          tickRuns.push(run);
+          const exit = yield* op(
+            name,
+            Effect.currentSpan.pipe(
+              Effect.orElseSucceed(() => null),
+              Effect.tap((span) =>
+                Effect.sync(() => {
+                  run.rootId = span?.spanId ?? null;
+                }),
+              ),
+              Effect.andThen(tick),
+            ),
+          );
+          run.to = performance.now();
+          run.spansTo = spans.length;
+          run.gaveUp = boardTicksFailed() > failedBefore;
+          return { exit, gaveUp: run.gaveUp };
         });
       const problems: Array<string> = [];
       /** Turn ends that reported a failure after saving or sending something. */
@@ -762,8 +950,12 @@ it.live(
           }
         };
         const random = soakRandom(SEED + 1);
+        // The pools' setup queued a dispatch kick. Run that dispatch here, so the worker's
+        // copy of it finds nothing to start: left to the worker it started the board's
+        // first cards under the first tick, which then did not run by itself.
+        yield* kanban.dispatchNow.pipe(Effect.orDie);
         // As production: queued dispatch kicks run on the worker.
-        const worker = yield* Effect.forkChild(kanban.worker);
+        const worker = yield* Effect.forkChild(kanban.worker.pipe(Effect.withSpan("soak:worker")));
 
         const cardsNow = kanban.cards(board.id).pipe(Effect.orDie);
         const check = (when: string) =>
@@ -879,10 +1071,9 @@ it.live(
         let started = 0;
         for (let round = 0; round < ROUNDS; round += 1) {
           if (round === WAIT_MID_ROUND) yield* endMidWaits;
-          const failedBefore = boardTicksFailed();
-          const ticked = yield* op("tick", kanban.tick);
-          tickDone.push(Exit.isSuccess(ticked) && boardTicksFailed() === failedBefore);
-          if (boardTicksFailed() > failedBefore) gaveUp.push(`round ${round + 1}, by itself`);
+          const first = yield* ticked("tick", `round ${round + 1}, by itself`, true, kanban.tick);
+          tickDone.push(Exit.isSuccess(first.exit) && !first.gaveUp);
+          if (first.gaveUp) gaveUp.push(`round ${round + 1}, by itself`);
           const cards = yield* cardsNow;
           noteWoken(cards, round);
           const byThread = new Map<string, Array<KanbanCard>>();
@@ -1077,13 +1268,15 @@ it.live(
           // Odd rounds: everything at once, with a tick running through it. Even
           // rounds: the turn ends land together first, then the owner's writes.
           if (round % 2 === 1) {
-            const failedBefore = boardTicksFailed();
-            const midTick = op("tick", kanban.tick).pipe(
-              Effect.tap(() =>
+            const midTick = ticked(
+              "tick",
+              `round ${round + 1}, in the round's traffic`,
+              false,
+              kanban.tick,
+            ).pipe(
+              Effect.tap((mid) =>
                 Effect.sync(() => {
-                  if (boardTicksFailed() > failedBefore) {
-                    gaveUp.push(`round ${round + 1}, in the round's traffic`);
-                  }
+                  if (mid.gaveUp) gaveUp.push(`round ${round + 1}, in the round's traffic`);
                 }),
               ),
               Effect.asVoid,
@@ -1280,7 +1473,7 @@ it.live(
           );
           const spansBefore = spans.length;
           watch.open(new Set(before.keys()), new Set(threadOf.keys()));
-          yield* op("tick.quiet", kanban.tick);
+          yield* ticked("tick.quiet", `quiet tick ${i + 1}, by itself`, true, kanban.tick);
           const probe = watch.close();
           // A tick redone because the board changed under it asks again.
           const ran =
@@ -1438,6 +1631,102 @@ it.live(
         }
         if (span.name === "KanbanService.turnEndedUnlocked") turnEndAttempts += 1;
       }
+      // Who moved the board's generation while each tick ran. A tick is redone when a
+      // write lands while it is outside the gate, and gives up after eight redos or
+      // on the first one after it has written or sent something itself.
+      const rootOf = new Map<string, string>();
+      const rootIdOf = (span: Tracer.Span) => {
+        const known = rootOf.get(span.spanId);
+        if (known !== undefined) return known;
+        const root = spanChain(span)[0]?.spanId ?? span.spanId;
+        rootOf.set(span.spanId, root);
+        return root;
+      };
+      const ticksWatched = tickRuns.map((run) => {
+        const during = watch.bumps.filter((bump) => bump.at >= run.from && bump.at <= run.to);
+        const groups = new Map<
+          string,
+          {
+            writes: number;
+            readonly operations: Set<string>;
+            readonly startedBefore: Set<string>;
+            first: number;
+            last: number;
+            readonly methods: Map<string, number>;
+          }
+        >();
+        let own = 0;
+        for (const bump of during) {
+          const mine = bump.rootId !== null && bump.rootId === run.rootId;
+          if (mine) own += 1;
+          const kind = mine
+            ? "the tick itself"
+            : bump.root === "soak:worker"
+              ? "a worker job"
+              : !bump.root.startsWith("soak:")
+                ? "background work no call of the driver started"
+                : bump.rootEnded
+                  ? "left running by an earlier call"
+                  : "a call running beside it";
+          const key = `${kind}: ${bump.chain}`;
+          const group = groups.get(key) ?? {
+            writes: 0,
+            operations: new Set<string>(),
+            startedBefore: new Set<string>(),
+            first: bump.at - run.from,
+            last: bump.at - run.from,
+            methods: new Map<string, number>(),
+          };
+          group.writes += 1;
+          group.last = bump.at - run.from;
+          group.methods.set(bump.method, (group.methods.get(bump.method) ?? 0) + 1);
+          if (bump.opId !== null) {
+            group.operations.add(bump.opId);
+            if (bump.opStart !== null && bump.opStart < run.startNs)
+              group.startedBefore.add(bump.opId);
+          }
+          groups.set(key, group);
+        }
+        let redone = 0;
+        for (const span of spans.slice(run.spansFrom, run.spansTo)) {
+          if (span.name !== "KanbanService.serial") continue;
+          if (span.attributes.get("serial.queue") !== "ticking") continue;
+          if (rootIdOf(span) !== run.rootId) continue;
+          const attempt = span.attributes.get("board.rerun_attempt");
+          if (typeof attempt === "number") redone = Math.max(redone, attempt);
+        }
+        return {
+          tick: run.label,
+          alone: run.alone,
+          ms: Math.round(run.to - run.from),
+          gaveUp: run.gaveUp,
+          redone,
+          said:
+            tickFailures.find((failure) => failure.at >= run.from && failure.at <= run.to + 5)
+              ?.text ?? null,
+          ownWrites: own,
+          ownSends: (() => {
+            const counts = new Map<string, number>();
+            for (const send of watch.sends) {
+              if (send.at < run.from || send.at > run.to || send.rootId !== run.rootId) continue;
+              counts.set(send.chain, (counts.get(send.chain) ?? 0) + 1);
+            }
+            return Object.fromEntries(counts);
+          })(),
+          otherWrites: during.length - own,
+          writers: [...groups]
+            .map(([who, group]) => ({
+              who,
+              writes: group.writes,
+              operations: group.operations.size,
+              startedBeforeTheTick: group.startedBefore.size,
+              firstMs: Math.round(group.first),
+              lastMs: Math.round(group.last),
+              methods: Object.fromEntries(group.methods),
+            }))
+            .toSorted((a, b) => b.writes - a.writes),
+        };
+      });
       const { quiet, ...boardResult } = result;
       const most = (values: ReadonlyArray<number>) =>
         values.length === 0 ? 0 : Math.max(...values);
@@ -1470,6 +1759,7 @@ it.live(
           boardTicksFailed: boardTicksFailed(),
           ticksGivenUpAt: result.gaveUp,
         },
+        ticks: ticksWatched,
         threadIo: fake.counts,
         firstFailure: Object.fromEntries(firstFailure),
         warnings: Object.fromEntries(logged),
@@ -1505,6 +1795,37 @@ it.live(
             `wait pass (quiet tick, ${report.waitPass.parked} parked) n=${report.waitPass.ms.n} p50=${report.waitPass.ms.p50}ms p95=${report.waitPass.ms.p95}ms max=${report.waitPass.ms.max}ms; most in a tick: card rows read=${report.waitPass.cardRowsRead} thread views read=${report.waitPass.threadViewsRead} host requests=${report.waitPass.hostRequests} card writes=0; woken in those ticks=${report.waitPass.woken}`,
             `reruns=${reruns} deepest=${deepest} turnEnds=${result.turnEnds} attempts=${turnEndAttempts} failed=${result.turnEndsFailed} savedThenFailed=${savedThenFailed.length}`,
             `ticksGivenUp=${boardTicksFailed()} of ${(report.timings.tick?.n ?? 0) + (report.timings["tick.quiet"]?.n ?? 0) + 1}${result.gaveUp.length > 0 ? ` (${result.gaveUp.join("; ")})` : ""}`,
+            // Who wrote while a tick ran. In full for a tick that ran by itself; the ticks
+            // run through a round's traffic are summed (KANBAN_SOAK_OUT has each of them).
+            ...ticksWatched.flatMap((tick) => {
+              if (!tick.alone || (!tick.gaveUp && tick.otherWrites === 0)) return [];
+              return [
+                `TICK ${tick.tick}: ${tick.gaveUp ? "GAVE UP" : "did its work"} in ${tick.ms}ms, redone ${tick.redone}x, its own writes=${tick.ownWrites}, writes by others=${tick.otherWrites}, its own sends=${JSON.stringify(tick.ownSends)}${tick.said === null ? "" : `; engine: ${tick.said.split("\n")[0]?.slice(0, 160)}`}`,
+                ...tick.writers
+                  .slice(0, 8)
+                  .map(
+                    (writer) =>
+                      `   ${writer.writes} writes at +${writer.firstMs}..${writer.lastMs}ms in ${writer.operations} operation(s), ${writer.startedBeforeTheTick} begun before the tick: ${writer.who} ${JSON.stringify(writer.methods)}`,
+                  ),
+              ];
+            }),
+            (() => {
+              const busy = ticksWatched.filter((tick) => !tick.alone && tick.gaveUp);
+              const kinds = new Map<string, number>();
+              for (const tick of busy) {
+                for (const writer of tick.writers) {
+                  const kind = writer.who.split(": ")[0] ?? writer.who;
+                  kinds.set(kind, (kinds.get(kind) ?? 0) + writer.writes);
+                }
+              }
+              return `ticks in traffic that gave up: ${busy.length}, after 8 redos ${busy.filter((tick) => tick.redone >= 8).length}, after their own write or send ${busy.filter((tick) => tick.redone < 8).length}; writes during them: ${
+                [...kinds]
+                  .toSorted((a, b) => b[1] - a[1])
+                  .map(([kind, writes]) => `${writes} by ${kind}`)
+                  .join(", ") || "none"
+              }`;
+            })(),
+            `ticks by themselves: ${ticksWatched.filter((tick) => tick.alone).length}, gave up ${ticksWatched.filter((tick) => tick.alone && tick.gaveUp).length}, with writes by others during them ${ticksWatched.filter((tick) => tick.alone && tick.otherWrites > 0).length}; ticks in traffic: ${ticksWatched.filter((tick) => !tick.alone).length}, gave up ${ticksWatched.filter((tick) => !tick.alone && tick.gaveUp).length}`,
             `script batch (${result.batch.cards} cards, all hold): board loads=${result.batch.boardLoads} card rows read=${result.batch.cardReads} cards written=${result.batch.cardWrites} in ${result.batch.ms}ms`,
             ...[...logged].map(([key, entry]) => `warning x${entry.count}: ${key}`),
             ...savedThenFailed.slice(0, 5).map((entry) => `SAVED-THEN-FAILED ${entry}`),
