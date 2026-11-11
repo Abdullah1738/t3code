@@ -32,7 +32,9 @@ import {
   rankOrder,
   stepWebLink,
   lateStanding,
+  bottomInsetFor,
   homeRowCount,
+  inputAccessibilityState,
   leaveAfterAnswer,
   ownerStanding,
   queueSubtitle,
@@ -627,5 +629,37 @@ describe("where an ask's screen goes after an answer, so Undo can be reached", (
 
   it("looks only at what is under the screen he is on", () => {
     expect(leaveAfterAnswer(["Home", "NeedsYouAsk", "NeedsYou"], 1)).toBe("newQueue");
+  });
+});
+
+describe("the room under the last control", () => {
+  it("clears the home indicator when no keyboard is up", () => {
+    expect(bottomInsetFor({ visible: false, height: 0 }, 34)).toBe(34);
+    expect(bottomInsetFor({ visible: false, height: 0 }, 0)).toBe(12);
+  });
+
+  it("is a little air when the control sits on the keyboard", () => {
+    expect(bottomInsetFor({ visible: true, height: 336 }, 34)).toBe(8);
+  });
+
+  it("a keyboard reported as showing with no height covers nothing", () => {
+    // A hardware keyboard, or one dismissed without the app hearing of it.
+    expect(bottomInsetFor({ visible: true, height: 0 }, 34)).toBe(34);
+    expect(bottomInsetFor({ visible: true, height: 20 }, 34)).toBe(34);
+  });
+});
+
+describe("a field that takes no input, for assistive tech", () => {
+  it("is disabled, so it is not read as a field to type in", () => {
+    expect(inputAccessibilityState(false)).toEqual({ disabled: true });
+  });
+
+  it("a field that takes input is not", () => {
+    expect(inputAccessibilityState(true)).toEqual({ disabled: false });
+    expect(inputAccessibilityState(undefined)).toEqual({ disabled: false });
+  });
+
+  it("keeps what else the field says of itself", () => {
+    expect(inputAccessibilityState(false, { busy: true })).toEqual({ busy: true, disabled: true });
   });
 });

@@ -597,6 +597,32 @@ export function queueSubtitle(
     .join(" · ");
 }
 
+/**
+ * The room under the last control of a screen. With the keyboard up the
+ * control sits on it, with a little air. Otherwise it clears the home
+ * indicator. A keyboard that is reported as showing with no height (a hardware
+ * keyboard, or one that left without saying so) covers nothing: the home
+ * indicator still has to be cleared.
+ */
+export function bottomInsetFor(
+  keyboard: { readonly visible: boolean; readonly height: number },
+  safeBottom: number,
+): number {
+  return keyboard.visible && keyboard.height > safeBottom ? 8 : Math.max(safeBottom, 12);
+}
+
+/**
+ * How a text field is described to assistive tech. One that takes no input
+ * (not his phone, expired, with the evaluator, on its way) is disabled, so it
+ * is read as dimmed and not as a field to type in.
+ */
+export function inputAccessibilityState<T extends object>(
+  editable: boolean | undefined,
+  state?: T,
+): T & { readonly disabled: boolean } {
+  return { ...(state as T), disabled: editable === false };
+}
+
 /** The Needs-you screens that draw the toast (`AskToastBar`), by route name. */
 export const ASK_TOAST_ROUTES: ReadonlySet<string> = new Set([
   "NeedsYou",

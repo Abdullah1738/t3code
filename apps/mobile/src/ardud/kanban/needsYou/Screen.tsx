@@ -6,12 +6,15 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppBar } from "../../../components/ui/AppBar";
 import type { AppBarAction, AppBarMenu, AppBarSearch } from "../../../components/ui/AppBar.types";
 import { useHeaderInset } from "../../common/hooks";
+import { bottomInsetFor } from "./logic";
 
 /** Room under the last control: the home indicator, or a little air above the keyboard. */
 export function useBottomInset(): number {
   const insets = useSafeAreaInsets();
-  const keyboardVisible = useKeyboardState((state) => state.isVisible);
-  return keyboardVisible ? 8 : Math.max(insets.bottom, 12);
+  // Read one by one: a selector has to give the same value for the same state.
+  const visible = useKeyboardState((state) => state.isVisible);
+  const height = useKeyboardState((state) => state.height);
+  return bottomInsetFor({ visible, height }, insets.bottom);
 }
 
 /** One pushed Needs-you screen: the app's header, then the body above the keyboard. */
@@ -36,7 +39,14 @@ export function Screen(props: {
         {...(props.menus ? { menus: props.menus } : {})}
         {...(props.search ? { search: props.search } : {})}
       />
-      <KeyboardAvoidingView automaticOffset behavior="height" className="flex-1">
+      {/*
+        Padding, not height: in its height mode the view is pinned to a height it measured
+        earlier for as long as the keyboard counts as open, and a keyboard that went away
+        without saying so (a hardware keyboard, an interrupted dismissal) left the bar
+        under an ask partly below the screen. With padding the body always fills what is
+        there and only makes room for the keyboard that is really up.
+      */}
+      <KeyboardAvoidingView automaticOffset behavior="padding" className="flex-1">
         {props.children}
       </KeyboardAvoidingView>
     </View>

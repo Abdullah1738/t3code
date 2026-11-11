@@ -161,6 +161,12 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
 
   const header = (
     <View className="gap-3 pb-1">
+      {/* In the list, where it wraps: the header's own subtitle is one line and cuts it off. */}
+      {subtitle === undefined ? null : (
+        <Text accessibilityRole="summary" className="px-0.5 text-sm text-foreground-muted">
+          {subtitle}
+        </Text>
+      )}
       <OwnerBand />
       <OfflineBand />
       <UnreadableLine asks={unreadable} onOpenCard={nav.openCard} />
@@ -213,7 +219,7 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
   );
 
   return (
-    <Screen title="Needs you" subtitle={subtitle} onBack={nav.back} menus={menus}>
+    <Screen title="Needs you" onBack={nav.back} menus={menus}>
       <FlatList
         data={rows}
         keyExtractor={(row) => row.key}

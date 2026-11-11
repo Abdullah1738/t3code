@@ -783,9 +783,8 @@ function AskBar(props: {
     />
   );
   const state = (text: string) => (
-    <Text numberOfLines={2} className="min-w-0 flex-1 text-sm text-foreground-muted">
-      {text}
-    </Text>
+    // As many lines as it takes: at the largest text sizes two lines cut it off.
+    <Text className="min-w-0 flex-1 text-sm text-foreground-muted">{text}</Text>
   );
   return (
     <View

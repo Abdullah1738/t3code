@@ -24,7 +24,7 @@ import {
 import { cn } from "../../../lib/cn";
 import { useNowMs } from "../../common/hooks";
 import { useAsk, useAsks, useOwnerStanding, useQueueFigures } from "./askStore";
-import { toastUndo, toastUndoAllowed, type Tone } from "./logic";
+import { inputAccessibilityState, toastUndo, toastUndoAllowed, type Tone } from "./logic";
 
 const TONE_SURFACE: Record<Tone, string> = {
   plain: "bg-secondary",
@@ -141,10 +141,23 @@ export function FieldLabel(props: { readonly label: string; readonly aside?: str
 }
 
 /** A text box that grows with what is typed in it. */
+/**
+ * The app's text field, as the Needs-you screens use it: one that takes no
+ * input is also disabled for assistive tech (`inputAccessibilityState`).
+ */
+export function AskInput(props: AppTextInputProps) {
+  return (
+    <AppTextInput
+      {...props}
+      accessibilityState={inputAccessibilityState(props.editable, props.accessibilityState)}
+    />
+  );
+}
+
 export function GrowingInput(props: AppTextInputProps & { readonly invalid?: boolean }) {
   const { invalid, className, ...rest } = props;
   return (
-    <AppTextInput
+    <AskInput
       multiline
       scrollEnabled={false}
       textAlignVertical="top"

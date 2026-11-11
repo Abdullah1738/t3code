@@ -21,7 +21,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { AccessibilityInfo, Platform, Pressable, View } from "react-native";
 
 import { SymbolView } from "../../../components/ui/AppSymbol";
-import { AppText as Text, AppTextInput } from "../../../components/ui/AppText";
+import { AppText as Text } from "../../../components/ui/AppText";
 import { ThemedSwitch } from "../../../components/ui/ThemedSwitch";
 import {
   prepareTurnAttachments,
@@ -45,7 +45,7 @@ import {
   rankOrder,
   shownValue,
 } from "./logic";
-import { Check, FieldLabel, GrowingInput, Pill, Problem, tapSelection } from "./ui";
+import { AskInput, Check, FieldLabel, GrowingInput, Pill, Problem, tapSelection } from "./ui";
 
 const isBlank = (value: unknown): boolean =>
   value === undefined ||
@@ -107,7 +107,7 @@ export function FieldRow(props: {
     case "number":
       control = (
         <View className="flex-row items-center gap-2.5">
-          <AppTextInput
+          <AskInput
             accessibilityLabel={field.unit ? `${label}, in ${field.unit}` : label}
             keyboardType="decimal-pad"
             autoComplete="off"
@@ -212,7 +212,7 @@ export function FieldRow(props: {
       break;
     default:
       control = (
-        <AppTextInput
+        <AskInput
           accessibilityLabel={label}
           autoComplete="off"
           editable={editable}
@@ -860,7 +860,7 @@ function SecretControl(props: {
 }) {
   return (
     <View className="gap-1.5">
-      <AppTextInput
+      <AskInput
         accessibilityLabel={props.label}
         secureTextEntry
         autoCapitalize="none"
