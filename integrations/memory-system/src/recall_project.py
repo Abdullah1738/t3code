@@ -98,6 +98,31 @@ def _clean(value: str) -> str:
     return re.sub(r"[^\w./:@+ -]", "", value)[:200]
 
 
+def _redact_url(url: str) -> str:
+    """A remote URL without credentials, query or fragment (only host and path survive)."""
+    url = (url or "").strip()
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+            if parts.port:
+                host += f":{parts.port}"
+            return f"{parts.scheme}://{host}{parts.path}"
+        except ValueError:
+            return ""
+    # scp-like user@host:path: drop the user part
+    return re.sub(r"^[^/@:]+@", "", url.split("?", 1)[0].split("#", 1)[0])
+
+
+def _line(value) -> str:
+    """One line of plain text: no control characters, bounded."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))[:300]
+
+
+MAX_REMOTES = 8
+MAX_DESCRIBE = 2000
+
+
 def project_of_repo(repo: str | None) -> str | None:
     if not repo:
         return None
@@ -177,11 +202,11 @@ def resolve(cwd: str, depth: int = 0) -> dict:
     except (OSError, ValueError, subprocess.TimeoutExpired):
         remotes = {}
     labels = []
-    for name, urls in remotes.items():
+    for name, urls in list(remotes.items())[:MAX_REMOTES]:
         repos = [remote_repo(url) for url in urls]
         named = [repo for repo in repos if repo]
         result["remotes"][_clean(name)] = _clean(named[0] if named and len(set(named)) == 1 and len(named) == len(repos) else ", ".join(
-            repo or url for repo, url in zip(repos, urls)))
+            repo or _redact_url(url) for repo, url in zip(repos, urls)))
         labels.extend(project_of_repo(repo) or "" for repo in named)
     source = _source_repo(common)
     if source and _abs(source) != str(root):
@@ -213,15 +238,15 @@ def describe(cwd: str | None) -> str:
     if not cwd:
         return ""
     info = resolve(cwd)
-    lines = [f"Working directory: {info['cwd']}"]
+    lines = [f"Working directory: {_line(info['cwd'])}"]
     if info["root"]:
-        lines.append(f"Repository: {info['root']}")
+        lines.append(f"Repository: {_line(info['root'])}")
     if info["checkout_of"]:
-        lines.append(f"Checkout of: {info['checkout_of']}")
+        lines.append(f"Checkout of: {_line(info['checkout_of'])}")
     if info["remotes"]:
-        lines.append("Remotes: " + ", ".join(f"{name}={repo}" for name, repo in sorted(info["remotes"].items())))
-    lines.append("Project: " + (info["project"] or ("unknown" if info["root"] else "not inside a repository")))
-    return "\n".join(lines)
+        lines.append(_line("Remotes: " + ", ".join(f"{name}={repo}" for name, repo in sorted(info["remotes"].items()))[:1000]))
+    lines.append("Project: " + _line(info["project"] or ("unknown" if info["root"] else "not inside a repository")))
+    return "\n".join(lines)[:MAX_DESCRIBE]
 
 
 def label(cwd: str | None) -> str:
