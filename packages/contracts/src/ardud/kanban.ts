@@ -160,7 +160,16 @@ const KanbanBlockStub = {
   fullBytes: Schema.optional(NonNegativeInt),
 };
 
-const MdBlock = Schema.TaggedStruct("md", { text: Schema.String, ...KanbanBlockStub });
+const MdBlock = Schema.TaggedStruct("md", {
+  text: Schema.String,
+  ...KanbanBlockStub,
+  /**
+   * Set only by the reader, on the text that stands in for a block of a kind
+   * this build doesn't know: the block as it was stored, so writing the card
+   * or message back keeps it. Never sent in and never shown.
+   */
+  original: Schema.optional(Schema.Unknown),
+});
 const CollapseBlock = Schema.TaggedStruct("collapse", {
   title: TrimmedNonEmptyString,
   text: Schema.String,
@@ -211,6 +220,65 @@ export const KanbanAskBlock = Schema.Union([
   AttachmentBlock,
 ]);
 export type KanbanAskBlock = typeof KanbanAskBlock.Type;
+
+/** What stands in for a block of a kind this build doesn't know. */
+export const KANBAN_UNKNOWN_BLOCK_TEXT = "A part here can't be shown in this version of Robob.";
+
+const blockTag = (raw: unknown): string | null =>
+  typeof raw === "object" &&
+  raw !== null &&
+  "_tag" in raw &&
+  typeof (raw as { _tag: unknown })._tag === "string"
+    ? (raw as { _tag: string })._tag
+    : null;
+
+/**
+ * A block as it is read back from a card or a message. A block of a kind this
+ * build doesn't know (a newer server's) decodes as a line of text saying so,
+ * in the same place, instead of failing: the indexes a field or an option
+ * points at stay right, and the rest of the card or message still loads. The
+ * stored block rides along as `original` and is what encodes back, so a build
+ * that rewrites the card loses nothing. A block of a known kind is checked as
+ * before. Blocks coming in are checked by `KanbanBlockInput`, which stays
+ * closed.
+ */
+const readBlock = <S extends Schema.Top>(block: S, known: ReadonlyArray<string>) =>
+  Schema.Unknown.pipe(
+    Schema.decodeTo(
+      block,
+      SchemaTransformation.transform<S["Encoded"], unknown>({
+        decode: (raw) => {
+          const tag = blockTag(raw);
+          return tag === null || known.includes(tag)
+            ? (raw as S["Encoded"])
+            : ({ _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT, original: raw } as S["Encoded"]);
+        },
+        encode: (encoded) => {
+          const original =
+            blockTag(encoded) === "md" ? (encoded as { original?: unknown }).original : undefined;
+          return original === undefined ? encoded : original;
+        },
+      }),
+    ),
+  );
+
+const KanbanBlockRead = readBlock(KanbanBlock, [
+  "md",
+  "collapse",
+  "html",
+  "choice",
+  "card",
+  "image",
+  "attachment",
+]);
+const KanbanAskBlockRead = readBlock(KanbanAskBlock, [
+  "md",
+  "collapse",
+  "html",
+  "card",
+  "image",
+  "attachment",
+]);
 
 /**
  * Kinds with a ready layout and ready response parts. A kind is a label, not a
@@ -497,7 +565,7 @@ export const KanbanOwnerAsk = Schema.Struct({
    * files. On the card a big md, collapse or html body is a stub (`truncated`,
    * `fullBytes`); the single-ask read returns them whole. Absent means none.
    */
-  blocks: Schema.optional(Schema.Array(KanbanAskBlock)),
+  blocks: Schema.optional(Schema.Array(KanbanAskBlockRead)),
 });
 export type KanbanOwnerAsk = typeof KanbanOwnerAsk.Type;
 
@@ -1860,7 +1928,7 @@ export const KanbanMessage = Schema.Struct({
   author: KanbanActor,
   /** Display name at post time ("Evaluator", "U1-U4 union reader", "Cert check"). */
   authorName: Schema.String,
-  blocks: Schema.Array(KanbanBlock),
+  blocks: Schema.Array(KanbanBlockRead),
   answers: Schema.Array(KanbanAnswer),
   createdAt: IsoDateTime,
   /** Set on a message that belongs to one ask's discussion (`q1`, ... on the discussion's card). */
