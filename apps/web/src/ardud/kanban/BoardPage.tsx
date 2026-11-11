@@ -1,5 +1,12 @@
 import { useNavigate } from "@tanstack/react-router";
-import { ArchiveIcon, ChevronDownIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+import {
+  ArchiveIcon,
+  ChevronDownIcon,
+  LayersIcon,
+  PlusIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
 import { KANBAN_WS_METHODS, type KanbanBoard } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useState } from "react";
@@ -42,10 +49,11 @@ import {
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
 import { useNowMs } from "./useNowMs";
 import { boardViewFor, useBoardClock } from "./useBoardClock";
-import { BoardColumns } from "./BoardColumns";
+import { BoardColumns, BoardLoading } from "./BoardColumns";
 import { BoardColumnsMenu } from "./BoardColumnsMenu";
 import { BoardIcon } from "./boardIcon";
 import { CardDrawer, noteDrawerOpener } from "./CardDrawer";
@@ -155,6 +163,10 @@ export function BoardPage(props: {
     await runAction("Couldn't lift the pause", () => kanban.liftPause(boardId));
   };
 
+  const narrow = useMediaQuery("max-md");
+  const controls: ControlsProps | null = state
+    ? { boardId, state, search, go, prefs, onPrefs: setFilters }
+    : null;
   // The board view places the banner itself: above its numbers, scrolling away on a phone.
   const pauseBanner = pause ? (
     <PauseBanner
@@ -189,17 +201,15 @@ export function BoardPage(props: {
               </WorkspaceBreadcrumbText>
             </WorkspaceBreadcrumbItem>
           </WorkspaceBreadcrumb>
-          {view === "board" && state ? (
-            <BoardControls
-              boardId={boardId}
-              state={state}
-              search={search}
-              go={go}
-              query={query}
-              onQuery={setQuery}
-              prefs={prefs}
-              onPrefs={setFilters}
-            />
+          {view === "board" && state && controls ? (
+            narrow ? (
+              // A phone's header holds the board, search and New; the rest sits above the cards.
+              <div className="flex min-w-0 flex-1 items-center justify-end">
+                <QueryField value={query} onChange={setQuery} />
+              </div>
+            ) : (
+              <BoardHeaderControls {...controls} query={query} onQuery={setQuery} />
+            )
           ) : (
             <span className="flex-1" />
           )}
@@ -216,7 +226,7 @@ export function BoardPage(props: {
           <KanbanLinksProvider boardId={boardId}>
             {state === undefined ? (
               feed.failure ? (
-                <div className="flex flex-col items-start gap-3 pe-5">
+                <div role="alert" className="flex flex-col items-start gap-3 pe-5">
                   <p className="font-medium">Couldn't load the board.</p>
                   <p className="text-sm text-(--m-muted)">
                     {kanbanErrorMessage(feed.failure.error)}
@@ -229,6 +239,8 @@ export function BoardPage(props: {
                     Retry
                   </button>
                 </div>
+              ) : view === "board" ? (
+                <BoardLoading />
               ) : null
             ) : (
               <div inert={drawerOpen} className="flex min-h-0 flex-1 flex-col">
@@ -279,6 +291,11 @@ export function BoardPage(props: {
                   lens={lens}
                   onLens={setLens}
                   lead={pauseBanner}
+                  controls={
+                    narrow && controls
+                      ? (phone) => <BoardViewControls {...controls} size="icons" columns={!phone} />
+                      : null
+                  }
                   onGroup={setGroup}
                   go={go}
                   openCard={openCard}
@@ -317,6 +334,7 @@ function BoardBody(props: {
   lens: BoardLens;
   onLens: (lens: BoardLens) => void;
   lead: React.ReactNode;
+  controls: ((phone: boolean) => React.ReactNode) | null;
   onGroup: (id: string, state: BoardGroupState) => void;
   go: (patch: SearchPatch) => void;
   openCard: (cardId: string) => void;
@@ -335,6 +353,8 @@ function BoardBody(props: {
             lens={props.lens}
             onLens={props.onLens}
             lead={props.lead}
+            empty={state.cards.size === 0}
+            controls={props.controls}
             onGroup={props.onGroup}
             filter={filter}
             onClearFilters={() => props.onPrefs(clearFilters(props.prefs))}
@@ -403,38 +423,104 @@ function BoardBody(props: {
   }
 }
 
-function BoardControls(props: {
+type ControlsProps = {
   boardId: string;
   state: KanbanBoardState;
   search: BoardSearch;
   go: (patch: SearchPatch) => void;
-  query: string;
-  onQuery: (query: string) => void;
   prefs: BoardFilterPrefs;
   onPrefs: (prefs: BoardFilterPrefs) => void;
-}) {
-  const narrow = useMediaQuery("max-md");
+};
+
+/**
+ * How much the board's controls spell out. `full`: Group by as a five-way switch and
+ * every control with its word. `menu`: Group by folds into a menu. `tight`: the other
+ * controls drop their words too. `icons`: the phone's row above the cards.
+ */
+type ControlsSize = "full" | "menu" | "tight" | "icons";
+
+// The room the header's controls need, search included, for a mouse and for touch.
+const FULL_CONTROLS_MIN_WIDTH = { fine: 700, coarse: 860 } as const;
+const MENU_CONTROLS_MIN_WIDTH = { fine: 470, coarse: 590 } as const;
+
+/** The header's controls on a tablet or desktop, sized to the room the header has left. */
+function BoardHeaderControls(
+  props: ControlsProps & { query: string; onQuery: (query: string) => void },
+) {
+  const [width, setWidth] = useState<number | null>(null);
+  const coarse = useMediaQuery({ pointer: "coarse" });
+  const measure = (element: HTMLDivElement) =>
+    observeResize(element, ([entry]) => {
+      if (entry) setWidth(entry.contentRect.width);
+    });
+  const pointer = coarse ? "coarse" : "fine";
+  const size: ControlsSize =
+    width === null
+      ? "tight"
+      : width >= FULL_CONTROLS_MIN_WIDTH[pointer]
+        ? "full"
+        : width >= MENU_CONTROLS_MIN_WIDTH[pointer]
+          ? "menu"
+          : "tight";
+  return (
+    <div ref={measure} className="flex min-w-0 flex-1 items-center gap-2">
+      <BoardViewControls {...props} size={size} columns />
+      <span className="flex-1" />
+      <QueryField value={props.query} onChange={props.onQuery} />
+    </div>
+  );
+}
+
+const CONTROL_BUTTON =
+  "inline-flex h-8 shrink-0 items-center rounded-full text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base";
+const CONTROL_ON = "bg-(--m-text) text-(--m-ground)";
+const CONTROL_OFF = "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)";
+
+/** Group by, Columns, Filter and Settled. */
+function BoardViewControls(
+  props: ControlsProps & {
+    size: ControlsSize;
+    /** The column menu only means something where columns sit side by side. */
+    columns: boolean;
+  },
+) {
+  const icons = props.size === "icons";
+  const worded = props.size === "full" || props.size === "menu";
   const group = props.search.group ?? "stage";
   const settled = props.prefs.settled;
   const setSettled = (next: SettledFilter) => props.onPrefs({ ...props.prefs, settled: next });
   const setGroup = (next: GroupBy) => props.go({ group: next === "stage" ? undefined : next });
+  const groupLabel = GROUP_OPTIONS.find((option) => option.value === group)?.label ?? "";
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-2">
-      {narrow ? (
+    <>
+      {props.size === "full" ? (
+        <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
+      ) : (
         <Menu>
           <MenuTrigger
             render={
               <button
                 type="button"
-                aria-label="Group by"
-                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full bg-(--m-chip) ps-3 pe-2 text-sm font-medium outline-none hover:bg-(--m-active) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base"
+                aria-label={`Group by: ${groupLabel}`}
+                className={cn(
+                  CONTROL_BUTTON,
+                  icons ? "px-3" : "gap-1 ps-3 pe-2",
+                  // On the phone's icon the grouping in force shows only when it isn't the usual one.
+                  icons && group !== "stage" ? CONTROL_ON : CONTROL_OFF,
+                )}
               />
             }
           >
-            {GROUP_OPTIONS.find((option) => option.value === group)?.label}
-            <ChevronDownIcon className="size-3.5 text-(--m-muted)" aria-hidden />
+            {icons ? (
+              <LayersIcon className="size-4 shrink-0" aria-hidden />
+            ) : (
+              <>
+                {groupLabel}
+                <ChevronDownIcon className="size-3.5 text-(--m-muted)" aria-hidden />
+              </>
+            )}
           </MenuTrigger>
-          <MenuPopup align="start" side="bottom">
+          <MenuPopup align={icons ? "end" : "start"} side="bottom">
             <MenuRadioGroup value={group} onValueChange={(value) => setGroup(value as GroupBy)}>
               {GROUP_OPTIONS.map((option) => (
                 <MenuRadioItem key={option.value} value={option.value}>
@@ -444,14 +530,14 @@ function BoardControls(props: {
             </MenuRadioGroup>
           </MenuPopup>
         </Menu>
-      ) : (
-        <Seg label="Group by" value={group} options={GROUP_OPTIONS} onChange={setGroup} />
       )}
-      {group === "stage" ? <BoardColumnsMenu boardId={props.boardId} /> : null}
+      {props.columns && group === "stage" ? (
+        <BoardColumnsMenu boardId={props.boardId} compact={!worded} />
+      ) : null}
       <BoardFilterMenu
         state={props.state}
         prefs={props.prefs}
-        narrow={narrow}
+        narrow={!worded}
         onChange={props.onPrefs}
       />
       <Menu>
@@ -461,18 +547,17 @@ function BoardControls(props: {
               type="button"
               aria-label="Settled cards"
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:h-11 pointer-coarse:text-base",
-                settled !== "hide"
-                  ? "bg-(--m-text) text-(--m-ground)"
-                  : "bg-(--m-chip) text-(--m-text) hover:bg-(--m-active)",
+                CONTROL_BUTTON,
+                "gap-1.5 px-3",
+                settled !== "hide" ? CONTROL_ON : CONTROL_OFF,
               )}
             />
           }
         >
           <ArchiveIcon className="size-3.5 shrink-0" aria-hidden />
-          <span className="max-md:sr-only">{settled === "only" ? "Settled only" : "Settled"}</span>
+          {worded ? <span>{settled === "only" ? "Settled only" : "Settled"}</span> : null}
         </MenuTrigger>
-        <MenuPopup align="start" side="bottom">
+        <MenuPopup align={icons ? "end" : "start"} side="bottom">
           <MenuRadioGroup
             value={settled}
             onValueChange={(value) => setSettled(value as SettledFilter)}
@@ -483,9 +568,7 @@ function BoardControls(props: {
           </MenuRadioGroup>
         </MenuPopup>
       </Menu>
-      <span className="flex-1" />
-      <QueryField value={props.query} onChange={props.onQuery} />
-    </div>
+    </>
   );
 }
 

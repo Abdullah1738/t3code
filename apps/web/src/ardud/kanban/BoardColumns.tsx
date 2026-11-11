@@ -52,6 +52,10 @@ export function BoardColumns(props: {
   onLens: (lens: BoardLens) => void;
   /** The paused-board banner: pinned above the numbers, or scrolling away with them on a phone. */
   lead?: React.ReactNode;
+  /** The board has no cards at all, whatever the filters. */
+  empty?: boolean;
+  /** Group by, Filter and Settled when the page header has no room for them (a phone's). */
+  controls?: ((phone: boolean) => React.ReactNode) | null;
 }) {
   // The board's own width decides, not the screen's: an iPad with the sidebar open
   // is a wide screen with a narrow board.
@@ -73,50 +77,84 @@ export function BoardColumns(props: {
       if (entry) setWidth(entry.contentRect.width);
     });
   const { model, filter } = props;
-  if (model.total === 0) {
-    return (
-      <div className="flex min-h-0 flex-col gap-3.5">
-        {props.lead ? <div className="flex flex-col pe-5 max-sm:pe-4">{props.lead}</div> : null}
-        <NoCardsMatch searching={(filter.query ?? "") !== ""} onClear={props.onClearFilters} />
-      </div>
-    );
-  }
   const picked = filter.goalIds ?? [];
   const shownGoals =
     picked.length > 0 ? model.goals.filter((entry) => picked.includes(entry.goal.id)) : model.goals;
 
+  const controls = props.controls?.(phone) ?? null;
   // All / Stuck sits above the columns at every width: the page header is full by a tablet's.
-  const lens =
-    props.group === "stage" ? (
-      <div className="flex shrink-0 flex-wrap items-center gap-x-3.5 gap-y-2">
-        <Seg
-          label="Lens"
-          value={props.lens}
-          options={lensOptions(model.stuck.count)}
-          onChange={props.onLens}
-        />
-        {props.lens === "stuck" ? (
-          <p className="min-w-0 text-sm text-(--m-text) pointer-coarse:text-base">
+  const switches =
+    props.group === "stage" || controls !== null ? (
+      <div className="flex shrink-0 items-center gap-1.5">
+        {props.group === "stage" ? (
+          <Seg
+            label="Lens"
+            value={props.lens}
+            options={lensOptions(model.stuck.count)}
+            onChange={props.onLens}
+          />
+        ) : null}
+        {props.lens === "stuck" && controls === null ? (
+          <p className="ms-2 min-w-0 text-sm text-(--m-text) pointer-coarse:text-base">
             {model.stuck.line}
           </p>
         ) : null}
+        <span className="flex-1" />
+        {controls}
       </div>
+    ) : null;
+  // Beside the switch where there is room, under it where the controls took the row.
+  const lensLine =
+    props.lens === "stuck" && controls !== null ? (
+      <p className="shrink-0 text-sm text-(--m-text) pointer-coarse:text-base">
+        {model.stuck.line}
+      </p>
     ) : null;
   // On a phone the numbers scroll away with the cards; everywhere else they stay put.
   const top = (
     <>
       {props.lead}
       <BoardSummaryStrip boardId={props.boardId} summary={model.summary} phone={phone} />
-      {lens}
+      {switches}
+      {lensLine}
     </>
   );
   const scrollsAway = phone && props.group === "stage";
+
+  if (model.total === 0) {
+    // Nothing to show: a board with no cards yet, or filters and a search that match none.
+    return (
+      <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
+        <div className={cn("flex shrink-0 flex-col gap-3 empty:hidden", phone ? "pe-4" : "pe-5")}>
+          {props.lead}
+          {props.empty ? null : switches}
+        </div>
+        {props.empty ? (
+          <div className="flex flex-col gap-1 pe-5">
+            <p className="font-medium">No cards yet</p>
+            <p className="text-sm text-(--m-muted) pointer-coarse:text-base">
+              New starts a discussion that makes them.
+            </p>
+          </div>
+        ) : (
+          <NoCardsMatch searching={(filter.query ?? "") !== ""} onClear={props.onClearFilters} />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div ref={measure} className="flex min-h-0 flex-1 flex-col gap-3.5">
       {scrollsAway ? null : (
         <div className={cn("flex shrink-0 flex-col gap-3", phone ? "pe-4" : "pe-5")}>
-          {phone ? props.lead : top}
+          {phone ? (
+            <>
+              {props.lead}
+              {switches}
+            </>
+          ) : (
+            top
+          )}
         </div>
       )}
       {shownGoals.length > 0 && !phone ? (
@@ -154,6 +192,33 @@ export function BoardColumns(props: {
 }
 
 type ColumnsProps = Parameters<typeof BoardColumns>[0];
+
+const SKELETON_COLUMNS = [4, 2, 3, 2] as const;
+
+/** The board before its first state arrives: its shape in flat bars, nothing moving. */
+export function BoardLoading() {
+  return (
+    <div aria-busy className="flex min-h-0 flex-1 flex-col gap-3.5 pe-5 max-sm:pe-4">
+      <p role="status" className="sr-only">
+        Loading the board
+      </p>
+      <span aria-hidden className="block h-19 shrink-0 rounded-xl bg-(--m-surface)" />
+      <div aria-hidden className="flex min-h-0 flex-1 gap-2.5 overflow-hidden">
+        {SKELETON_COLUMNS.map((tiles, column) => (
+          <div
+            key={column}
+            className={cn("flex min-w-0 flex-1 flex-col gap-2", column > 0 && "max-sm:hidden")}
+          >
+            <span className="my-1.5 block h-3 w-20 rounded-full bg-(--m-chip)" />
+            {Array.from({ length: tiles }, (_, tile) => (
+              <span key={tile} className="block h-24 shrink-0 rounded-xl bg-(--m-surface)" />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /** "All" and "Stuck 54": the count is on the switch, so the lens never has to be tried to be read. */
 const lensOptions = (stuck: number): ReadonlyArray<{ value: BoardLens; label: string }> => [
