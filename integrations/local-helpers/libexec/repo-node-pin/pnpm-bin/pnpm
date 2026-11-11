@@ -1,0 +1,10 @@
+#!/bin/sh
+# Execute the cached CLI directly: Corepack dispatch may download or update its default.
+if [ -z "${ROBOB_REPO_PNPM_CLI:-}" ]; then
+    printf '%s\n' "repo-node: ${ROBOB_REPO_PNPM_HINT:-no compatible pnpm selected}" >&2
+    exit 127
+fi
+export COREPACK_ENABLE_NETWORK=0
+export npm_config_manage_package_manager_versions=false
+export npm_config_package_manager_strict_version=false
+exec "$ROBOB_REPO_NODE" "$ROBOB_REPO_PNPM_CLI" "$@"

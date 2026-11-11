@@ -151,3 +151,27 @@ Output: `tmp/apalache-patched-0.62.4/apalache-0.62.4-grpc-1.75.0.tgz`; SHA256 `b
 The recipe checks resolved dependencies and reflection bytecode, records the JAR hash, and retains v1alpha reflection for quint 0.33.1; installation and wrapper selection are separate.
 Launch with `JVM_ARGS=-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=true apalache/bin/apalache-mc server --port=<n>`; this version binds `*:<n>` and has no checker `--hostname` option.
 As of 9 Nov 2026, upstream main has no dependency fix after 0.62.4; the upstream issue draft is on Robob card #787 and has not been filed.
+
+## Repo Node and pnpm selection
+
+`python3 integrations/local-helpers/install-node-pin.py` prints the exact proposed
+shell-file and helper diffs without writing. After approval, run the same command
+with `--install` from a clean revision on `origin/main`; `--check` reports drift.
+The installer preserves existing shell-file contents and keeps backups.
+
+The helper selects the highest installed nvm Node satisfying the nearest
+`.nvmrc` or `.node-version` and `engines.node`, falling back to engines when the
+file pin is unavailable. pnpm uses the `packageManager` major, or the lockfile
+format (v9 prefers pnpm 10, then 9). It reads installed package metadata and the
+Corepack cache, runs the selected cached CLI directly, and never installs a
+runtime or downloads a package manager. Missing versions produce an explicit
+install hint. The safe-chain pnpm function remains in place.
+
+zsh uses chpwd/preexec hooks and a DEBUG trap for noninteractive snapshot PATH
+restoration; Bash wraps cd/pushd/popd (preserving existing functions) and passes BASH_ENV to its children. Start a fresh shell
+after changing a pin in the current directory. Unpinned directories retain
+the incoming PATH. `zsh -f` and fresh `bash --noprofile --norc` without BASH_ENV
+explicitly bypass shell setup; they need the helper sourced by their caller.
+
+Focused verification:
+`PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s integrations/local-helpers/tests -p test_repo_node_pin.py`.
