@@ -24,9 +24,10 @@ const SCRIPT_RUNS_PAGE = 20;
 type ScriptId = Parameters<KanbanScriptsShape["runs"]>[0];
 
 /**
- * WS handlers for the board UI, for one connection. Writes run as the owner.
- * The ones that carry his words or his pick to a card or an ask go through
- * `asOwner`: the connection's session must be his own (see `ownerGate.ts`).
+ * WS handlers for the board UI, for one connection. Every write runs as the
+ * owner, so it goes through `asOwner`: the connection's session must be his
+ * own (see `ownerGate.ts`). Reads don't, and neither does opening a card's
+ * discussion, which the board creates as itself.
  */
 export const makeKanbanWsHandlers = (
   service: KanbanServiceShape,
@@ -84,32 +85,39 @@ export const makeKanbanWsHandlers = (
     // The owner's create never reuses a board: a taken slug fails with conflict, checked
     // under the service lock (ensureBoard would return the existing board instead).
     [M.boardCreate]: (input: Parameters<KanbanServiceShape["createBoard"]>[0]) =>
-      service.createBoard(input),
-    [M.boardUpdate]: updateBoard,
+      asOwner(service.createBoard(input)),
+    [M.boardUpdate]: (input: KanbanBoardUpdateInput) => asOwner(updateBoard(input)),
     [M.setupStart]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["startSetup"]>[0];
       readonly evaluatorModel: Parameters<KanbanServiceShape["startSetup"]>[1]["evaluatorModel"];
       readonly text?: string | undefined;
     }) =>
-      service.startSetup(input.boardId, { evaluatorModel: input.evaluatorModel, text: input.text }),
+      asOwner(
+        service.startSetup(input.boardId, {
+          evaluatorModel: input.evaluatorModel,
+          text: input.text,
+        }),
+      ),
     [M.setupEnd]: (input: { readonly boardId: Parameters<KanbanServiceShape["endSetup"]>[0] }) =>
-      service.endSetup(input.boardId, OWNER),
+      asOwner(service.endSetup(input.boardId, OWNER)),
     [M.boardPause]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["pauseBoard"]>[0];
       readonly keep?: ReadonlyArray<KanbanCardId> | undefined;
       readonly reason?: string | undefined;
       readonly clear?: boolean | undefined;
     }) =>
-      service.pauseBoard(
-        input.boardId,
-        input.clear ? null : { reason: input.reason ?? "", keep: input.keep ?? [] },
-        OWNER,
+      asOwner(
+        service.pauseBoard(
+          input.boardId,
+          input.clear ? null : { reason: input.reason ?? "", keep: input.keep ?? [] },
+          OWNER,
+        ),
       ),
-    [M.cardPatch]: patchCard,
+    [M.cardPatch]: (input: KanbanCardPatchInput) => asOwner(patchCard(input)),
     [M.cardSettle]: (input: { readonly cardId: Parameters<KanbanServiceShape["settleCard"]>[0] }) =>
-      service.settleCard(input.cardId),
+      asOwner(service.settleCard(input.cardId)),
     [M.cardStop]: (input: { readonly cardId: Parameters<KanbanServiceShape["cardThread"]>[0] }) =>
-      service.cardThread(input.cardId, "stop", "Stopped by the owner.", OWNER),
+      asOwner(service.cardThread(input.cardId, "stop", "Stopped by the owner.", OWNER)),
     [M.cardAsk]: (input: {
       readonly cardId: Parameters<KanbanServiceShape["changeAsk"]>[0];
       readonly askId: string;
@@ -123,22 +131,25 @@ export const makeKanbanWsHandlers = (
       readonly model: Parameters<KanbanServiceShape["setPool"]>[1];
       readonly slots?: number | undefined;
       readonly replaces?: string | undefined;
-    }) => service.setPool(input.boardId, input.model, input.slots, { replaces: input.replaces }),
+    }) =>
+      asOwner(
+        service.setPool(input.boardId, input.model, input.slots, { replaces: input.replaces }),
+      ),
     [M.poolRemove]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["removePool"]>[0];
       readonly model: Parameters<KanbanServiceShape["removePool"]>[1];
       readonly replaces?: string | undefined;
-    }) => service.removePool(input.boardId, input.model, { replaces: input.replaces }),
+    }) => asOwner(service.removePool(input.boardId, input.model, { replaces: input.replaces })),
     [M.discussionCreate]: (input: {
       readonly boardId: Parameters<KanbanServiceShape["createDiscussion"]>[0];
       readonly title: string;
-    }) => service.createDiscussion(input.boardId, input.title, OWNER),
+    }) => asOwner(service.createDiscussion(input.boardId, input.title, OWNER)),
     [M.discussionUpdate]: ({ discussionId, ...patch }: KanbanDiscussionUpdateInput) =>
-      service.updateDiscussion(discussionId, patch, OWNER),
+      asOwner(service.updateDiscussion(discussionId, patch, OWNER)),
     [M.discussionRead]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["markRead"]>[0];
       readonly seq: number;
-    }) => service.markRead(input.discussionId, OWNER, input.seq).pipe(Effect.as({})),
+    }) => asOwner(service.markRead(input.discussionId, OWNER, input.seq)).pipe(Effect.as({})),
     [M.messagePost]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["post"]>[0];
       readonly blocks: Parameters<KanbanServiceShape["post"]>[2];
@@ -166,8 +177,8 @@ export const makeKanbanWsHandlers = (
     [M.scriptRuns]: (input: { readonly scriptId: ScriptId; readonly limit?: number | undefined }) =>
       scripts.runs(input.scriptId, input.limit || SCRIPT_RUNS_PAGE),
     [M.scriptEnable]: (input: { readonly scriptId: ScriptId; readonly enabled: boolean }) =>
-      scripts.setEnabled(input.scriptId, input.enabled),
+      asOwner(scripts.setEnabled(input.scriptId, input.enabled)),
     [M.scriptRun]: (input: { readonly scriptId: ScriptId }) =>
-      scripts.run(input.scriptId, "manual"),
+      asOwner(scripts.run(input.scriptId, "manual")),
   } as const;
 };

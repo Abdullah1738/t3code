@@ -2,8 +2,9 @@ import { annotateHttpAction } from "../observability/actionCorrelation.ts";
 /**
  * Small HTTP surface for the Missions board, for scripts and local tools
  * (the board UI uses the WS RPC group). Every write acts as the owner, so it
- * needs the operate scope; reads need the read scope. The writes that carry
- * the owner's words or his pick also need his own session (`ownerWrite`).
+ * needs the operate scope and his own session (`ownerWrite`); reads need the
+ * read scope. A script's webhook run and opening a card's discussion are the
+ * two writes that are not his: they need the operate scope only.
  */
 import {
   AuthOrchestrationOperateScope,
@@ -283,9 +284,10 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         Effect.map((value) => json(value)),
       );
     /**
-     * A write only the owner makes: his words in a discussion, a pick, his
-     * answer to an ask, a hand-over, a snooze. The operate scope is not
-     * enough (see `ownerGate.ts`): the session itself must carry the owner claim.
+     * A write as the owner: his words, his picks and answers, and every change
+     * the board records or applies as his (cards, discussions, boards, pools,
+     * scripts, evaluators). The operate scope is not enough (see
+     * `ownerGate.ts`): the session itself must carry the owner claim.
      */
     const ownerWrite = <A, R>(effect: Effect.Effect<A, KanbanError, R>) =>
       authenticate(AuthOrchestrationOperateScope).pipe(
@@ -326,7 +328,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
 
     const listBoards = read(service.boards);
 
-    const createBoard = write(
+    const createBoard = ownerWrite(
       Effect.gen(function* () {
         const input = yield* body(CreateBoardBody);
         const projectId = input.projectId ? ProjectId.make(input.projectId) : null;
@@ -381,7 +383,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const createCard = write(
+    const createCard = ownerWrite(
       Effect.gen(function* () {
         const board: KanbanBoard = yield* boardOf(yield* param("board"));
         const { model, ...input } = yield* body(CreateCardBody);
@@ -395,7 +397,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const updateBoard = write(
+    const updateBoard = ownerWrite(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(BoardBody);
@@ -434,7 +436,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const setPool = write(
+    const setPool = ownerWrite(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(PoolBody);
@@ -461,7 +463,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const moveCard = write(
+    const moveCard = ownerWrite(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
         const input = yield* body(MoveBody);
@@ -472,6 +474,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
+    // Not an owner write: the board opens a card's discussion as itself.
     const cardDiscussion = write(
       Effect.gen(function* () {
         const card = yield* cardOf(yield* param("card"));
@@ -486,7 +489,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const createDiscussion = write(
+    const createDiscussion = ownerWrite(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(TitleBody);
@@ -494,7 +497,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const updateDiscussion = write(
+    const updateDiscussion = ownerWrite(
       Effect.gen(function* () {
         const id = KanbanDiscussionId.make(yield* param("discussion"));
         const input = yield* body(DiscussionPatchBody);
@@ -769,7 +772,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const startEvaluator = write(
+    const startEvaluator = ownerWrite(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(EvaluatorBody);
@@ -792,7 +795,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const registerScript = write(
+    const registerScript = ownerWrite(
       Effect.gen(function* () {
         const board = yield* boardOf(yield* param("board"));
         const input = yield* body(ScriptBody);
@@ -802,7 +805,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
 
     const scriptId = Effect.map(param("script"), (id) => KanbanScriptId.make(id));
 
-    const patchScript = write(
+    const patchScript = ownerWrite(
       Effect.gen(function* () {
         const id = yield* scriptId;
         const input = yield* body(ScriptPatchBody);
@@ -810,13 +813,19 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       }),
     );
 
-    const runScript = write(
-      Effect.gen(function* () {
-        const id = yield* scriptId;
-        const input = yield* body(RunBody);
-        // The app runs scripts over the socket, so a bare HTTP call is a webhook.
-        return yield* scripts.run(id, input.trigger ?? "webhook");
-      }),
+    // Not an owner write: a webhook sender holds the operate scope and nothing
+    // more. Only a manual run (which also runs a script that is off) is the owner's.
+    const runScript = authenticate(AuthOrchestrationOperateScope).pipe(
+      Effect.flatMap((session) =>
+        Effect.gen(function* () {
+          const id = yield* scriptId;
+          const input = yield* body(RunBody);
+          if (input.trigger === "manual") yield* requireOwner(session);
+          // The app runs scripts over the socket, so a bare HTTP call is a webhook.
+          return yield* scripts.run(id, input.trigger ?? "webhook");
+        }),
+      ),
+      Effect.map((value) => json(value)),
     );
 
     const listRuns = read(

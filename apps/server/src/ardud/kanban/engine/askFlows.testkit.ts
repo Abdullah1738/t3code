@@ -259,7 +259,7 @@ const makeHttpFor = (caller: HttpCaller) =>
       ServerSettings.ServerSettingsService,
       yield* ServerSettings.ServerSettingsService,
     );
-    const call = (method: "GET" | "POST", path: string, body?: unknown) =>
+    const call = (method: "GET" | "POST" | "PATCH", path: string, body?: unknown) =>
       Effect.promise(async () => {
         const response = await web.handler(
           new Request(`http://env.local${KANBAN_ROUTE_PREFIX}${path}`, {
@@ -275,5 +275,6 @@ const makeHttpFor = (caller: HttpCaller) =>
     return {
       get: (path: string) => call("GET", path),
       post: (path: string, body?: unknown) => call("POST", path, body),
+      request: call,
     };
   });

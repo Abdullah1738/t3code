@@ -4,9 +4,6 @@
  * one. A component credential, a hand-issued token and a device paired from a
  * Mac-made link all hold the operate scope, and none of them is him.
  */
-// @effect-diagnostics-next-line nodeBuiltinImport:off
-import { readFileSync } from "node:fs";
-
 import { assert, it } from "@effect/vitest";
 import { KANBAN_WS_METHODS as M, kanbanAskWaitsOn, type KanbanError } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -216,71 +213,5 @@ it.effect("over the socket, the same writes are refused with the board's typed d
   }),
 );
 
-/**
- * The engine calls through which the owner's words or pick reach a card or an
- * ask: `post` and `answer` end in `routeToOwnerAgent` or `answerChoice`, and
- * `changeAsk` closes an ask through `answerAsks`, as whoever the actor is.
- */
-const OWNER_WORD_CALLS =
-  /service\s*\.\s*(post|answer|answerAsk|replyOnAsk|handAsk|snoozeAsk|changeAsk)\(/;
-
-const source = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
-
-/** Each `const name = read|write|ownerWrite(` handler of the HTTP routes, with its body. */
-const httpHandlers = () => {
-  const text = source("http.ts");
-  const starts = [...text.matchAll(/\n {4}const (\w+) = (read|write|ownerWrite)\(/g)];
-  const end = text.indexOf("const p = KANBAN_ROUTE_PREFIX");
-  return starts.map((match, index) => ({
-    name: match[1]!,
-    wrapper: match[2]!,
-    body: text.slice(match.index, starts[index + 1]?.index ?? end),
-  }));
-};
-
-/** Each `[M.name]:` handler of the WS group, with its body. */
-const wsHandlers = () => {
-  const text = source("ws.ts");
-  const table = text.slice(text.indexOf("  return {\n    [M."));
-  const starts = [...table.matchAll(/\n {4}\[M\.(\w+)\]:/g)];
-  return starts.map((match, index) => ({
-    name: match[1]!,
-    body: table.slice(match.index, starts[index + 1]?.index ?? table.length),
-  }));
-};
-
-it("every route and RPC that carries the owner's words or pick has the owner check", () => {
-  const http = httpHandlers();
-  // The scan sees every route: a rename of the helpers must not empty it.
-  assert.strictEqual(http.length, source("http.ts").match(/HttpRouter\.route\(/g)?.length);
-  const httpOwnerWords = http.filter((handler) => OWNER_WORD_CALLS.test(handler.body));
-  assert.deepStrictEqual(
-    httpOwnerWords.map((handler) => handler.name),
-    [
-      "postMessage",
-      "answer",
-      "answerAsk",
-      "answerAsks",
-      "replyOnAsk",
-      "handAsk",
-      "snoozeAsk",
-      "snoozeAsks",
-    ],
-  );
-  assert.deepStrictEqual(
-    httpOwnerWords.filter((handler) => handler.wrapper !== "ownerWrite").map((h) => h.name),
-    [],
-  );
-
-  const ws = wsHandlers();
-  assert.strictEqual(ws.length, Object.keys(M).length);
-  const wsOwnerWords = ws.filter((handler) => OWNER_WORD_CALLS.test(handler.body));
-  assert.deepStrictEqual(
-    wsOwnerWords.map((handler) => handler.name),
-    ["cardAsk", "messagePost", "answer"],
-  );
-  assert.deepStrictEqual(
-    wsOwnerWords.filter((handler) => !handler.body.includes("asOwner(")).map((h) => h.name),
-    [],
-  );
-});
+// That no route or RPC acts as the owner without this check is in `ownerRoutes.test.ts`,
+// which calls every one of them.
