@@ -66,7 +66,7 @@ export function AskDiscussionRouteScreen({
         },
       ]}
     >
-      <Talk
+      <AskTalk
         // A draft typed for one server never shows under another's ask.
         key={`${serial}:${askKey(entry)}`}
         entry={entry}
@@ -79,7 +79,12 @@ export function AskDiscussionRouteScreen({
   );
 }
 
-function Talk(props: {
+/**
+ * The thread under the ask and the composer that replies on it. On its own so
+ * a test can render it over a store it made: what the composer sends from
+ * here is pinned in `askReply.test.tsx`.
+ */
+export function AskTalk(props: {
   readonly entry: KanbanAskFeedItem;
   /** The ask waits on its agent after his reply. */
   readonly waiting: boolean;

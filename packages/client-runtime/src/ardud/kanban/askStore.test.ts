@@ -1053,7 +1053,10 @@ describe("what was read is never sent back", () => {
     h.store.patchAskForm(draft, { draft: "his own draft" });
     expect(h.store.answerAsk(draft, "primary").ok).toBe(true);
     await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
-    // A reply: the blocks the composer built, and nothing of the ask.
+    // A reply: the blocks it is handed, and nothing of the ask. (What the composers
+    // hand it, with stand-ins in the thread, is pinned where they live:
+    // apps/mobile/src/ardud/kanban/needsYou/askReply.test.tsx renders the phone's
+    // composer; apps/web/src/ardud/kanban/needsYou/askReply.test.ts runs the web's builder.)
     const typed = [{ _tag: "md" as const, text: "his reply" }];
     await h.store.replyOnAsk(approval, typed);
     // One answer for several, a hand-over and a snooze.
