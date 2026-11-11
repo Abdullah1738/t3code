@@ -2027,9 +2027,18 @@ export const KanbanErrorCode = Schema.Literals([
 ]);
 export type KanbanErrorCode = typeof KanbanErrorCode.Type;
 
+/**
+ * Why a `denied` was refused, when a client can do better than show the detail.
+ * `not_owner_device`: the session is a paired device, but not one the owner
+ * paired as his own. It has to be paired again from an owner device.
+ */
+export const KanbanDeniedReason = Schema.Literals(["not_owner_device"]);
+export type KanbanDeniedReason = typeof KanbanDeniedReason.Type;
+
 export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError", {
   code: KanbanErrorCode,
   detail: Schema.String,
+  reason: Schema.optionalKey(KanbanDeniedReason),
 }) {
   override get message(): string {
     return `Missions board ${this.code}: ${this.detail}`;

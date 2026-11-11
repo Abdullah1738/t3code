@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import type { BoardPatch, KanbanServiceShape } from "./engine/KanbanService.ts";
 import type { KanbanScriptsShape } from "./engine/ScriptService.ts";
 import { stubMessage } from "./engine/messagePages.ts";
+import { requireOwner, type OwnerGateSession } from "./ownerGate.ts";
 
 const OWNER = { _tag: "owner" } as const;
 
@@ -22,8 +23,18 @@ const SCRIPT_RUNS_PAGE = 20;
 
 type ScriptId = Parameters<KanbanScriptsShape["runs"]>[0];
 
-/** WS handlers for the board UI. Every write runs as the owner (the operate scope gates it). */
-export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: KanbanScriptsShape) => {
+/**
+ * WS handlers for the board UI, for one connection. Writes run as the owner.
+ * The ones that carry his words or his pick to a card or an ask go through
+ * `asOwner`: the connection's session must be his own (see `ownerGate.ts`).
+ */
+export const makeKanbanWsHandlers = (
+  service: KanbanServiceShape,
+  scripts: KanbanScriptsShape,
+  session: OwnerGateSession,
+) => {
+  const owner = requireOwner(session);
+  const asOwner = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.andThen(owner, effect);
   const patchCard = Effect.fn("KanbanWs.patchCard")(function* (input: KanbanCardPatchInput) {
     const { cardId, stage, stalled, comment, ...fields } = input;
     let card = (yield* service.card(cardId)).card;
@@ -103,7 +114,7 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly cardId: Parameters<KanbanServiceShape["changeAsk"]>[0];
       readonly askId: string;
       readonly action: "block" | "drop";
-    }) => service.changeAsk(input.cardId, input.askId, input.action, OWNER, "owner"),
+    }) => asOwner(service.changeAsk(input.cardId, input.askId, input.action, OWNER, "owner")),
     [M.cardDiscussion]: (input: {
       readonly cardId: Parameters<KanbanServiceShape["cardDiscussion"]>[0];
     }) => service.cardDiscussion(input.cardId),
@@ -131,7 +142,8 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
     [M.messagePost]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["post"]>[0];
       readonly blocks: Parameters<KanbanServiceShape["post"]>[2];
-    }) => service.post(input.discussionId, OWNER, input.blocks).pipe(Effect.map(stubMessage)),
+    }) =>
+      asOwner(service.post(input.discussionId, OWNER, input.blocks)).pipe(Effect.map(stubMessage)),
     [M.answer]: (input: {
       readonly discussionId: Parameters<KanbanServiceShape["answer"]>[0];
       readonly seq: number;
@@ -139,16 +151,16 @@ export const makeKanbanWsHandlers = (service: KanbanServiceShape, scripts: Kanba
       readonly choice: ReadonlyArray<string>;
       readonly text?: string | null | undefined;
     }) =>
-      service
-        .answer(
+      asOwner(
+        service.answer(
           input.discussionId,
           input.seq,
           input.blockId,
           input.choice,
           OWNER,
           input.text ?? null,
-        )
-        .pipe(Effect.map(stubMessage)),
+        ),
+      ).pipe(Effect.map(stubMessage)),
     [M.scripts]: (input: { readonly boardId: Parameters<KanbanScriptsShape["scripts"]>[0] }) =>
       scripts.scripts(input.boardId),
     [M.scriptRuns]: (input: { readonly scriptId: ScriptId; readonly limit?: number | undefined }) =>

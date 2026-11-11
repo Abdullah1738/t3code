@@ -1330,13 +1330,14 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
 );
 
 // ardud: missions board
-const layerWsKanbanRpc = ServerWsKanbanRpcGroup.toLayer(
-  Effect.gen(function* () {
-    const service = yield* KanbanService;
-    const scripts = yield* KanbanScripts;
-    return ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service, scripts));
-  }),
-);
+const layerWsKanbanRpc = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  ServerWsKanbanRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const service = yield* KanbanService;
+      const scripts = yield* KanbanScripts;
+      return ServerWsKanbanRpcGroup.of(makeKanbanWsHandlers(service, scripts, currentSession));
+    }),
+  );
 
 // ardud: board-run threads are read-only to the owner; the board drives them through
 // KanbanThreads.send, which bypasses this owner RPC entry, so steering keeps working.
@@ -3415,7 +3416,7 @@ export const layer = Layer.unwrap(
                 serverBrowser,
               ),
               // ardud: missions board
-              layerWsKanbanRpc,
+              layerWsKanbanRpc(session),
             ).pipe(
               Layer.provideMerge(
                 Layer.succeed(

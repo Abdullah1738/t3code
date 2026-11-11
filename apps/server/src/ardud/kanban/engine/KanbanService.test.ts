@@ -384,6 +384,12 @@ const observedTestLayer = (
   );
 
 const owner: KanbanActor = { _tag: "owner" };
+/** The session of the owner's own app, for the WS handlers. */
+const OWNER_APP_SESSION = {
+  sessionId: "session-owner",
+  subject: "one-time-token",
+  origin: { _tag: "owner", source: "paired-client" },
+} as const;
 
 it.effect("refuses corrupted board text before saving and preserves clean comments", () =>
   Effect.gen(function* () {
@@ -503,7 +509,7 @@ it.effect("the shared HTTP and WS block input preserves controls for service val
           multi: false,
         }),
       ]);
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       for (const block of blocks) {
         const error = yield* ws[M.messagePost]({
           discussionId: discussion.id,
@@ -1102,7 +1108,7 @@ it.effect("owner repeats through the board websocket are saved twice", () =>
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const kanban = yield* KanbanService.KanbanService;
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       const board = yield* kanban.ensureBoard({
         slug: "owner-ws-repeat",
         name: "Owner WS repeat",
@@ -1357,7 +1363,7 @@ it.effect(
       yield* Effect.gen(function* () {
         const service = yield* KanbanService.KanbanService;
         const settings = yield* ServerSettings.ServerSettingsService;
-        const ws = makeKanbanWsHandlers(service, {} as KanbanScriptsShape);
+        const ws = makeKanbanWsHandlers(service, {} as KanbanScriptsShape, OWNER_APP_SESSION);
         const legacy = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "xhigh" });
         const expected: ModelSelection = {
           instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -6263,7 +6269,7 @@ it.effect(
         assert.deepStrictEqual(clientRpcRequiredScopes(KANBAN_WS_METHODS.boardPause, {}), [
           AuthOrchestrationOperateScope,
         ]);
-        const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+        const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
         const paused = yield* handlers[KANBAN_WS_METHODS.boardPause]({
           boardId: board.id,
           reason: "Hold",
@@ -13106,7 +13112,7 @@ it.effect("message pages are cut by size, page back with beforeSeq and stub big 
         assert.isAtMost(stub.text.length, 2_100);
       }
       // Older clients asking for 200 still get a size-bounded page.
-      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape);
+      const ws = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, OWNER_APP_SESSION);
       const legacy = yield* ws[M.messages]({ discussionId: channel.id, limit: 200 });
       assert.isAtMost(
         legacy.reduce((sum, message) => sum + JSON.stringify(message).length, 0),
