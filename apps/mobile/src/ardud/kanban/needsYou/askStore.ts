@@ -13,6 +13,9 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   AskApiError,
+  askHistoryFigures,
+  askQueueFigures,
+  type AskFigures,
   type AskSecretSendResult,
   type AskState,
   type AskStore,
@@ -142,6 +145,29 @@ export function useAskEnvironmentId(): EnvironmentId | null {
 export function useAsk<T>(select: (state: AskState) => T): T {
   const { cell } = useAskScope();
   return useSyncExternalStore(cell.subscribe, () => select(cell.getState()));
+}
+
+/**
+ * Whether the open asks' figures are known, held from an earlier read, or not
+ * known at all (`askQueueFigures`). A screen asks before it shows a count.
+ */
+export function useQueueFigures(): AskFigures {
+  const feed = useAsk((state) => state.feed);
+  const status = useAsk((state) => state.status);
+  const error = useAsk((state) => state.error);
+  return askQueueFigures({ feed, status, error });
+}
+
+/** The same for History's figures, which need the closed asks read too (`askHistoryFigures`). */
+export function useHistoryFigures(): AskFigures {
+  const feed = useAsk((state) => state.feed);
+  const status = useAsk((state) => state.status);
+  const error = useAsk((state) => state.error);
+  const closed = useAsk((state) => state.closed);
+  const closedStatus = useAsk((state) => state.closedStatus);
+  const closedAt = useAsk((state) => state.closedAt);
+  const closedError = useAsk((state) => state.closedError);
+  return askHistoryFigures({ feed, status, error, closed, closedStatus, closedAt, closedError });
 }
 
 /**

@@ -15,6 +15,7 @@ export * from "./askReply.ts";
 export * from "./askKeys.ts";
 export * from "./askSendQueue.ts";
 export * from "./askApi.ts";
+export * from "./askFigures.ts";
 export * from "./askStore.ts";
 export * from "./askSamples.ts";
 export * from "./askReference.ts";

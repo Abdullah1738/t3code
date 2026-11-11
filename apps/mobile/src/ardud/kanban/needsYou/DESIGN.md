@@ -174,6 +174,23 @@ A poll that brings the same text again is not parsed at all, and in a changed fe
 comes again unchanged is not read through the schema again. The feeds kept whole for that are
 bounded (`ASK_FEEDS_KEPT`), one per window asked for.
 
+## Figures
+
+A count is a claim: "0 to answer" says nothing waits on him. No screen shows a figure, or
+"nothing", for a read that has not come back or that failed. One function in the shared
+runtime decides (`askQueueFigures` for the open asks, `askHistoryFigures` for History, which
+needs the closed asks read as well; the web's History uses the same):
+
+| Read                                  | Home row              | Queue                               | History                                         |
+| ------------------------------------- | --------------------- | ----------------------------------- | ----------------------------------------------- |
+| First read not back (`unknown`)       | No count              | Loading, no subtitle                | Loading, no figures                             |
+| Failed or no connection, nothing held | "Not loaded"          | "Couldn't load asks", Retry         | "Couldn't load History", Retry, no figures      |
+| Held from an earlier read (`stale`)   | "as of 17:42" + count | Band and subtitle "As of 17:42 · …" | Band, "Today, as of 17:42. May be out of date." |
+| Read and reachable (`known`)          | Count, none for zero  | Subtitle with the counts            | Lists and figures                               |
+
+"Nothing answered yet today" and "Nothing needs you" are said only for a known read; held
+from an earlier one, they carry its time.
+
 ## Offline
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached

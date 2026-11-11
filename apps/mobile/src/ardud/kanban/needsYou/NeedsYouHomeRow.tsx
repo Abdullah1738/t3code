@@ -5,7 +5,8 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { SymbolView } from "../../../components/ui/AppSymbol";
 import { useNowMs } from "../../common/hooks";
 import { Group, Row, Title } from "../../common/parts";
-import { useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useOwnerStanding, useQueueFigures, useWatchAsks } from "./askStore";
+import { homeRowCount } from "./logic";
 import { useQueue } from "./useQueue";
 
 /**
@@ -24,14 +25,12 @@ export function NeedsYouHomeRow() {
   const unreadable = useAsk((state) => state.unreadable);
   const count = owed.length + unreadable.filter((ask) => ask.owed).length;
   const holding = owed.some((item) => item.blocking);
+  // A count is a claim: none is shown until a read said so (`homeRowCount`).
+  const shown = homeRowCount(useQueueFigures(), count, holding, nowMs);
   return (
     <Group>
       <Row
-        accessibilityLabel={
-          queue.read
-            ? `Needs you, ${count} to answer${holding ? ", some hold a card" : ""}`
-            : "Needs you"
-        }
+        accessibilityLabel={shown.accessibilityLabel}
         onPress={() => navigation.navigate("NeedsYou")}
         className="items-center"
       >
@@ -42,7 +41,10 @@ export function NeedsYouHomeRow() {
           type="monochrome"
         />
         <Title className="flex-1">Needs you</Title>
-        {count > 0 ? (
+        {shown.note !== null ? (
+          <Text className="text-xs text-foreground-muted">{shown.note}</Text>
+        ) : null}
+        {shown.count !== null ? (
           <View
             className={
               holding
@@ -57,7 +59,7 @@ export function NeedsYouHomeRow() {
                   : "text-xs font-t3-semibold tabular-nums text-foreground"
               }
             >
-              {count}
+              {shown.count}
             </Text>
           </View>
         ) : null}

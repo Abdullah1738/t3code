@@ -11,6 +11,8 @@ import {
   askOutcome,
   needsYouBatchKey,
   shortWhen,
+  askFiguresAsOf,
+  type AskFigures,
   type AskOutcome,
   type AskSend,
   type AskState,
@@ -534,6 +536,65 @@ export function unreachedRetryTracker(
       return due;
     },
   };
+}
+
+/**
+ * What "Needs you" on the thread list shows beside its name. A count is shown
+ * only when one is known. Before the first read there is none; when the read
+ * failed it says "Not loaded"; a count held from an earlier read carries the
+ * time it was read. It never shows nothing as if nothing needed him.
+ */
+export function homeRowCount(
+  figures: AskFigures,
+  count: number,
+  holding: boolean,
+  nowMs: number,
+): {
+  /** The number in the pill; null when none is shown. */
+  readonly count: number | null;
+  /** Quiet words beside it: "Not loaded", "as of 17:42". */
+  readonly note: string | null;
+  readonly accessibilityLabel: string;
+} {
+  if (figures.state === "unknown") {
+    return figures.failed
+      ? { count: null, note: "Not loaded", accessibilityLabel: "Needs you, not loaded" }
+      : { count: null, note: null, accessibilityLabel: "Needs you, loading" };
+  }
+  const said = `Needs you, ${count} to answer${holding ? ", some hold a card" : ""}`;
+  const pill = count > 0 ? count : null;
+  const asOf = askFiguresAsOf(figures, nowMs);
+  return asOf === null
+    ? { count: pill, note: null, accessibilityLabel: said }
+    : { count: pill, note: asOf, accessibilityLabel: `${said}, ${asOf}, may be out of date` };
+}
+
+/**
+ * The line under the queue's title: how many are his, can't be shown, wait on
+ * agents, are put away. Nothing while that is not known; held figures start
+ * with the time they were read.
+ */
+export function queueSubtitle(
+  figures: AskFigures,
+  counts: {
+    readonly owed: number;
+    readonly unreadable: number;
+    readonly waiting: number;
+    readonly snoozed: number;
+  },
+  nowMs: number,
+): string | undefined {
+  if (figures.state === "unknown") return undefined;
+  const asOf = askFiguresAsOf(figures, nowMs);
+  return [
+    asOf === null ? null : `${asOf[0]!.toUpperCase()}${asOf.slice(1)}`,
+    `${counts.owed} to answer`,
+    counts.unreadable > 0 ? `${counts.unreadable} can't be shown` : null,
+    counts.waiting > 0 ? `${counts.waiting} waiting on agents` : null,
+    counts.snoozed > 0 ? `${counts.snoozed} snoozed` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 /**

@@ -7,6 +7,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { AskApiError, type AskApi, type AskFeedRead, type AskUnreadable } from "./askApi.ts";
+import { askHistoryFigures, askQueueFigures } from "./askFigures.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { ASK_UNDO_MS } from "./askSendQueue.ts";
 import {
@@ -1028,6 +1029,78 @@ describe("an ask in the feed that can't even be identified", () => {
     await settle();
     expect(h.cell.getState().failed).toEqual({});
     expect(h.cell.getState().marks).toEqual({});
+  });
+});
+
+describe("when History was read", () => {
+  const OFFLINE = () => new AskApiError(0, "offline", "Not connected to Robob.");
+
+  it("with no connection nothing is held, and the figures are unknown and failed, not zero", async () => {
+    const h = harness();
+    h.fail.feed = OFFLINE();
+    await h.store.refreshAsks();
+    await h.store.loadClosedAsks();
+    const state = h.cell.getState();
+    expect(state.closed).toBeNull();
+    expect(state.closedAt).toBeNull();
+    expect(state.closedError).toBe("Not connected to Robob.");
+    expect(askHistoryFigures(state)).toEqual({
+      state: "unknown",
+      failed: true,
+      error: "Not connected to Robob.",
+    });
+    expect(askQueueFigures(state)).toEqual({
+      state: "unknown",
+      failed: true,
+      error: "Not connected to Robob.",
+    });
+
+    // The connection comes: the next good read of the feed reads History too, by itself.
+    delete h.fail.feed;
+    await h.store.refreshAsks();
+    await settle();
+    expect(h.cell.getState().closed).toEqual([]);
+    expect(h.cell.getState().closedAt).toBe("2026-11-11T08:00:00.000Z");
+    expect(h.cell.getState().closedError).toBeNull();
+    expect(askHistoryFigures(h.cell.getState())).toEqual({ state: "known" });
+  });
+
+  it("a read that can't be renewed leaves what is held, marked with when it was read", async () => {
+    const h = harness();
+    h.setFeed([entry(1)]);
+    await h.store.refreshAsks();
+    await h.store.loadClosedAsks();
+    expect(askHistoryFigures(h.cell.getState())).toEqual({ state: "known" });
+
+    h.fail.feed = OFFLINE();
+    await h.store.loadClosedAsks();
+    let state = h.cell.getState();
+    expect(state.closed).toEqual([]);
+    expect(state.closedStatus).toBe("ready");
+    expect(state.closedError).toBe("Not connected to Robob.");
+    expect(askHistoryFigures(state)).toEqual({
+      state: "stale",
+      readAt: "2026-11-11T08:00:00.000Z",
+      error: "Not connected to Robob.",
+    });
+    // The queue's own read fails too: its figures are held from the same time.
+    await h.store.refreshAsks();
+    expect(askQueueFigures(h.cell.getState())).toEqual({
+      state: "stale",
+      readAt: "2026-11-11T08:00:00.000Z",
+      error: "Not connected to Robob.",
+    });
+
+    // Back: the feed reads, History is read again by itself, and both are current.
+    delete h.fail.feed;
+    const reads = h.named("feed").length;
+    await h.store.refreshAsks();
+    await settle();
+    expect(h.named("feed").length).toBe(reads + 2);
+    state = h.cell.getState();
+    expect(state.closedError).toBeNull();
+    expect(askQueueFigures(state)).toEqual({ state: "known" });
+    expect(askHistoryFigures(state)).toEqual({ state: "known" });
   });
 });
 

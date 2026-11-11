@@ -200,6 +200,13 @@ export interface AskState {
   /** Asks closed in the History window; null until read. */
   readonly closed: ReadonlyArray<KanbanAskFeedItem> | null;
   readonly closedStatus: "idle" | "loading" | "ready" | "error";
+  /** When `closed` was read (the feed's own time); null until read. */
+  readonly closedAt: string | null;
+  /**
+   * Why the last read of History did not come back, until one does. With
+   * `closed` held, what History shows is then as of `closedAt`, not current.
+   */
+  readonly closedError: string | null;
   readonly forms: Readonly<Record<string, AskForm>>;
   /** Asks he tried to send with something missing: every problem shows. */
   readonly tried: Readonly<Record<string, true>>;
@@ -238,6 +245,8 @@ export const INITIAL_ASK_STATE: AskState = {
   reads: 0,
   closed: null,
   closedStatus: "idle",
+  closedAt: null,
+  closedError: null,
   forms: {},
   tried: {},
   refused: {},
@@ -605,7 +614,8 @@ export function createAskStore(host: AskStoreHost) {
       .then(
         (feed) => {
           mergeFeed(feed);
-          if (closedOwed) void loadClosedAsks();
+          // History is owed its first read, or holds a read it could not renew: now it can.
+          if (closedOwed || get().closedError !== null) void loadClosedAsks();
         },
         (error: unknown) => {
           set({
@@ -636,13 +646,20 @@ export function createAskStore(host: AskStoreHost) {
         closed: feed.closed,
         unreadableClosed: keptList(get().unreadableClosed, feed.unreadable?.closed),
         closedStatus: "ready",
+        closedAt: feed.at,
+        closedError: null,
       });
     } catch (error) {
       const none = get().closed === null;
       closedOwed = none;
-      // A reload lands on History before the connection is up: that is still loading, not a failure.
+      // Not connected yet (a reload lands on History before the connection is up): the read
+      // was not refused, and it goes again by itself on the next good read of the feed. What
+      // the screen says meanwhile is `askHistoryFigures`' to decide: never figures.
       const early = error instanceof AskApiError && error.code === "offline";
-      set({ closedStatus: none ? (early ? "idle" : "error") : "ready" });
+      set({
+        closedStatus: none ? (early ? "idle" : "error") : "ready",
+        closedError: error instanceof Error ? error.message : "Couldn't load History.",
+      });
     }
   }
 

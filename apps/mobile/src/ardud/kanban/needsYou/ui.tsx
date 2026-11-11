@@ -5,6 +5,7 @@
 import {
   ASK_NOT_OWNER_DEVICE_TEXT,
   ASK_UNDO_MS,
+  askFiguresAsOf,
   askUnreadableCard,
   askUnreadableLine,
   heldSecondsLeft,
@@ -21,7 +22,8 @@ import {
   type AppTextInputProps,
 } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
-import { useAsk, useAsks, useOwnerStanding } from "./askStore";
+import { useNowMs } from "../../common/hooks";
+import { useAsk, useAsks, useOwnerStanding, useQueueFigures } from "./askStore";
 import { toastUndo, toastUndoAllowed, type Tone } from "./logic";
 
 const TONE_SURFACE: Record<Tone, string> = {
@@ -433,11 +435,13 @@ export function UnreadableLine(props: {
 /** The feed could not be read just now: what shows is what was last read. */
 export function OfflineBand() {
   const asks = useAsks();
-  const stale = useAsk((state) => state.feed !== null && state.error !== null);
-  if (!stale) return null;
+  const nowMs = useNowMs();
+  // Held from an earlier read: what shows is not current, and the band says from when.
+  const asOf = askFiguresAsOf(useQueueFigures(), nowMs);
+  if (asOf === null) return null;
   return (
     <Band tone="warn" action={{ label: "Retry", onPress: () => void asks.refreshAsks() }}>
-      Can't reach Robob. This is what was last read.
+      Can't reach Robob. This is what was last read, {asOf}.
     </Band>
   );
 }

@@ -1,6 +1,7 @@
 import {
   askAfterAnswer,
   askAsker,
+  askFiguresAsOf,
   askHistoryFacts,
   avatarOf,
   shortWhen,
@@ -18,11 +19,11 @@ import { MarkdownText } from "../../common/MarkdownText";
 import { resolveKanbanLinkFor } from "../Chat";
 import { Avatar } from "../parts";
 import { DiffText } from "./AskParts";
-import { useAsk, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAsks, useHistoryFigures, useOwnerStanding, useWatchAsks } from "./askStore";
 import { historyRows } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
-import { AskToastBar, Band, BarButton, Label, OfflineBand, UnreadableLine } from "./ui";
+import { AskToastBar, Band, BarButton, Label, UnreadableLine } from "./ui";
 import { useQueue } from "./useQueue";
 
 /** What he answered in the last week, newest first, and what each agent said next. */
@@ -36,7 +37,9 @@ export function HistoryRouteScreen() {
   const queue = useQueue(nowMs);
   const closed = useAsk((state) => state.closed);
   const unreadableClosed = useAsk((state) => state.unreadableClosed);
-  const status = useAsk((state) => state.closedStatus);
+  // Known, held from an earlier read, or not known at all: no figure shows without asking.
+  const figures = useHistoryFigures();
+  const asOf = askFiguresAsOf(figures, nowMs);
   const sent = useAsk((state) => state.sent);
   const heldId = useAsk((state) => state.held?.payload.id ?? null);
   const [refreshing, setRefreshing] = useState(false);
@@ -79,16 +82,21 @@ export function HistoryRouteScreen() {
         contentContainerStyle={{ padding: 16, paddingBottom: bottomInset + 84, gap: 12 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
       >
-        <OfflineBand />
+        {/* Held from an earlier read and not renewed: said first, with when it was read. */}
+        {asOf !== null ? (
+          <Band tone="warn" action={{ label: "Retry", onPress: () => void asks.loadClosedAsks() }}>
+            Can't reach Robob. This is what was last read, {asOf}.
+          </Band>
+        ) : null}
         {/* Said first, with the cards that are known: what follows is not everything he answered. */}
         <UnreadableLine closed asks={unreadableClosed} onOpenCard={nav.openCard} />
-        {closed === null && status !== "error" ? <LoadingLine /> : null}
-        {closed === null && status === "error" ? (
+        {figures.state === "unknown" && !figures.failed ? <LoadingLine /> : null}
+        {figures.state === "unknown" && figures.failed ? (
           <Band
             tone="negative"
             action={{ label: "Retry", onPress: () => void asks.loadClosedAsks() }}
           >
-            Couldn't load History.
+            Couldn't load History. {figures.error}
           </Band>
         ) : null}
         {rows.session.map((send) => (
@@ -108,7 +116,7 @@ export function HistoryRouteScreen() {
             ) : rows.session.length === 0 && !incomplete ? (
               // Only when all of History could be read: otherwise "nothing" is not known.
               <Text className="px-1 text-sm text-foreground-muted">
-                Nothing answered yet today.
+                {asOf === null ? "Nothing answered yet today." : `Nothing answered today, ${asOf}.`}
               </Text>
             ) : null}
             {rows.earlier.length > 0 ? (
@@ -119,20 +127,25 @@ export function HistoryRouteScreen() {
             ) : null}
           </>
         ) : null}
-        <View className="mt-2 gap-1.5 rounded-2xl bg-card px-3.5 py-3">
-          <Label>Today</Label>
-          {facts.map(({ name, value, spoken }) => (
-            <View
-              key={name}
-              accessible
-              accessibilityLabel={`${name}: ${spoken}`}
-              className="flex-row items-baseline justify-between gap-4"
-            >
-              <Text className="text-sm text-foreground">{name}</Text>
-              <Text className="text-sm font-t3-medium tabular-nums text-foreground">{value}</Text>
-            </View>
-          ))}
-        </View>
+        {/* No figures until both reads came back: a number here is a claim. */}
+        {figures.state === "unknown" ? null : (
+          <View className="mt-2 gap-1.5 rounded-2xl bg-card px-3.5 py-3">
+            <Label>{asOf === null ? "Today" : `Today, ${asOf}. May be out of date.`}</Label>
+            {facts.map(({ name, value, spoken }) => (
+              <View
+                key={name}
+                accessible
+                accessibilityLabel={
+                  asOf === null ? `${name}: ${spoken}` : `${name}: ${spoken}, ${asOf}`
+                }
+                className="flex-row items-baseline justify-between gap-4"
+              >
+                <Text className="text-sm text-foreground">{name}</Text>
+                <Text className="text-sm font-t3-medium tabular-nums text-foreground">{value}</Text>
+              </View>
+            ))}
+          </View>
+        )}
         <BarButton label="Back to Needs you" onPress={nav.openQueue} />
       </ScrollView>
       <AskToastBar bottom={bottomInset + 8} onUndo={() => undefined} onView={nav.openAsk} />

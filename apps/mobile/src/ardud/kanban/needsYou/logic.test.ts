@@ -32,7 +32,9 @@ import {
   rankOrder,
   stepWebLink,
   lateStanding,
+  homeRowCount,
   ownerStanding,
+  queueSubtitle,
   toastUndo,
   toastUndoAllowed,
   ownerStandingBarText,
@@ -489,5 +491,79 @@ describe("the toast's Undo", () => {
     expect(toastUndoAllowed("write", "checking")).toBe(false);
     expect(toastUndoAllowed("write", "unchecked")).toBe(false);
     expect(toastUndoAllowed("write", "notOwner")).toBe(false);
+  });
+});
+
+describe("a count is shown only when one is known", () => {
+  const NOW = Date.parse("2026-11-11T18:00:00.000");
+  const LOADING = { state: "unknown", failed: false, error: null } as const;
+  const FAILED = { state: "unknown", failed: true, error: "Not connected to Robob." } as const;
+  const KNOWN = { state: "known" } as const;
+  const STALE = {
+    state: "stale",
+    readAt: "2026-11-11T17:42:00.000",
+    error: "Not connected to Robob.",
+  } as const;
+
+  it("the home row shows no count before the first read, and says so to a screen reader", () => {
+    // The count passed in is what an empty store adds up to: it must not be shown.
+    expect(homeRowCount(LOADING, 0, false, NOW)).toEqual({
+      count: null,
+      note: null,
+      accessibilityLabel: "Needs you, loading",
+    });
+  });
+
+  it("the home row says Not loaded when the read failed: never nothing, as if all were clear", () => {
+    expect(homeRowCount(FAILED, 0, false, NOW)).toEqual({
+      count: null,
+      note: "Not loaded",
+      accessibilityLabel: "Needs you, not loaded",
+    });
+  });
+
+  it("the home row shows a known count, and no pill for a known zero", () => {
+    expect(homeRowCount(KNOWN, 3, true, NOW)).toEqual({
+      count: 3,
+      note: null,
+      accessibilityLabel: "Needs you, 3 to answer, some hold a card",
+    });
+    expect(homeRowCount(KNOWN, 0, false, NOW)).toEqual({
+      count: null,
+      note: null,
+      accessibilityLabel: "Needs you, 0 to answer",
+    });
+  });
+
+  it("the home row marks a held count with the time it was read, a held zero too", () => {
+    expect(homeRowCount(STALE, 3, false, NOW)).toEqual({
+      count: 3,
+      note: "as of 17:42",
+      accessibilityLabel: "Needs you, 3 to answer, as of 17:42, may be out of date",
+    });
+    expect(homeRowCount(STALE, 0, false, NOW)).toEqual({
+      count: null,
+      note: "as of 17:42",
+      accessibilityLabel: "Needs you, 0 to answer, as of 17:42, may be out of date",
+    });
+  });
+
+  it("the queue's subtitle has no figures until a read said so", () => {
+    const counts = { owed: 0, unreadable: 0, waiting: 0, snoozed: 0 };
+    expect(queueSubtitle(LOADING, counts, NOW)).toBeUndefined();
+    expect(queueSubtitle(FAILED, counts, NOW)).toBeUndefined();
+    expect(queueSubtitle(KNOWN, counts, NOW)).toBe("0 to answer");
+    expect(queueSubtitle(KNOWN, { owed: 3, unreadable: 1, waiting: 2, snoozed: 4 }, NOW)).toBe(
+      "3 to answer · 1 can't be shown · 2 waiting on agents · 4 snoozed",
+    );
+  });
+
+  it("the queue's subtitle starts held figures with the time they were read", () => {
+    expect(queueSubtitle(STALE, { owed: 3, unreadable: 0, waiting: 2, snoozed: 0 }, NOW)).toBe(
+      "As of 17:42 · 3 to answer · 2 waiting on agents",
+    );
+    expect(queueSubtitle(STALE, { owed: 0, unreadable: 0, waiting: 0, snoozed: 0 }, NOW)).toBe(
+      "As of 17:42 · 0 to answer",
+    );
   });
 });

@@ -26,12 +26,13 @@ import { cn } from "../../../lib/cn";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { ChoiceRow } from "../../common/parts";
-import { useAsk, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useAsks, useOwnerStanding, useQueueFigures, useWatchAsks } from "./askStore";
 import {
   MARK_LABELS,
   askRowMedia,
   boardChips,
   queueRows,
+  queueSubtitle,
   type NeedsYouQueueParams,
   type QueueRow,
 } from "./logic";
@@ -146,16 +147,17 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
   ];
 
   const unreadable = useAsk((state) => state.unreadable);
-  const subtitle = queue.read
-    ? [
-        `${owed.length} to answer`,
-        unreadable.length > 0 ? `${unreadable.length} can't be shown` : null,
-        waiting > 0 ? `${waiting} waiting on agents` : null,
-        queue.needsYou.counts.snoozed > 0 ? `${queue.needsYou.counts.snoozed} snoozed` : null,
-      ]
-        .filter(Boolean)
-        .join(" · ")
-    : undefined;
+  // No figures until a read said so; held ones start with the time they were read.
+  const subtitle = queueSubtitle(
+    useQueueFigures(),
+    {
+      owed: owed.length,
+      unreadable: unreadable.length,
+      waiting,
+      snoozed: queue.needsYou.counts.snoozed,
+    },
+    nowMs,
+  );
 
   const header = (
     <View className="gap-3 pb-1">
