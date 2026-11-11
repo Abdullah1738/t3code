@@ -162,6 +162,8 @@ export function OptionList(props: {
                   ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
                   : "ring-(--ny-edge) hover:bg-(--m-surface)",
                 blocked && !checked && "opacity-50",
+                // A picture tile is narrow: tighter, so a short label stays on one line.
+                pictures && "gap-x-2 px-3",
               )}
             >
               {pictures && option.block !== undefined ? (
