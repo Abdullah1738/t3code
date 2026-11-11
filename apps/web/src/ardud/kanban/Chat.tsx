@@ -769,6 +769,9 @@ export function Composer(props: {
     pendingSlotsRef.current += batch.length;
     const next: ComposerDraftFile[] = [];
     const prep = (async () => {
+      // Cleanup after a catch, not in a `finally`: React Compiler skips a
+      // component that has one. The failure is thrown again once it has run.
+      let failure: { readonly error: unknown } | null = null;
       try {
         for (const raw of batch) {
           const added = await prepareDraftFile(raw, maxBytes);
@@ -778,19 +781,24 @@ export function Composer(props: {
           }
           next.push(added);
         }
-      } finally {
-        pendingSlotsRef.current -= batch.length;
+      } catch (caught) {
+        failure = { error: caught };
       }
+      pendingSlotsRef.current -= batch.length;
+      if (failure !== null) throw failure.error;
     })();
     // Registered with the files it selected. `handed` is set only when these files
     // reach the draft, so a send can tell a dropped selection from a staged one.
     const entry: PendingPreparation = { prep, selected: batch.length, handed: false };
     pendingPrepsRef.current.add(entry);
+    let prepFailure: { readonly error: unknown } | null = null;
     try {
       await prep;
-    } finally {
-      pendingPrepsRef.current.delete(entry);
+    } catch (caught) {
+      prepFailure = { error: caught };
     }
+    pendingPrepsRef.current.delete(entry);
+    if (prepFailure !== null) throw prepFailure.error;
     // The composer went away while files were being prepared: nothing will
     // ever own these, so release their previews now and start no uploads. The
     // entry stays unhanded, which a waiting send reads as a lost selection.
@@ -837,6 +845,7 @@ export function Composer(props: {
     if (sendingRef.current || blocked !== null) return;
     sendingRef.current = true;
     setSending(true);
+    let failure: { readonly error: unknown } | null = null;
     try {
       // Files still being prepared join this message, so wait for them first.
       // Each one is awaited, then whatever it staged is part of the snapshot.
@@ -847,27 +856,31 @@ export function Composer(props: {
       const lost = selections.some((entry) => !entry.handed && entry.selected > 0);
       if (lost) {
         setAttachError("A selected file did not finish preparing. Attach it again.");
-        return;
+      } else {
+        const body = outgoing(text).trim();
+        // The draft as it is now, including what was just staged.
+        const draft = filesRef.current;
+        if (body.length > 0 || draft.length > 0) await sendSnapshot(body, draft);
       }
-      const body = outgoing(text).trim();
-      // The draft as it is now, including what was just staged.
-      const draft = filesRef.current;
-      if (body.length === 0 && draft.length === 0) return;
-      await sendSnapshot(body, draft);
-    } finally {
-      sendingRef.current = false;
-      setSending(false);
+    } catch (caught) {
+      failure = { error: caught };
     }
+    // The lock is released however the send ended; a failure is thrown again after.
+    sendingRef.current = false;
+    setSending(false);
+    if (failure !== null) throw failure.error;
   };
 
   const sendSnapshot = async (body: string, draft: ReadonlyArray<ComposerDraftFile>) => {
     sendingDraft.current = draft;
     setInFlightIds(new Set(draft.map((file) => file.id)));
-    // Set when the send gives up, so the finally can release what an unmounted
-    // composer would otherwise leave behind.
+    // Set once the message is posted, so the cleanup below can release what an
+    // unmounted composer would otherwise leave behind when the send gave up.
     let posted = false;
+    let failure: { readonly error: unknown } | null = null;
     try {
-      let blocks: KanbanBlock[];
+      // Null when a file did not upload: nothing is posted.
+      let blocks: KanbanBlock[] | null;
       if (draft.length > 0 && environmentId !== null) {
         // The server only claims an upload that finished, so a half-uploaded
         // file must not reach the message.
@@ -875,39 +888,47 @@ export function Composer(props: {
         const uploaded = getUploadedAttachments({ environmentId, images: draft });
         if (uploaded === null) {
           setAttachError("Some files did not upload. Retry them or remove them.");
-          return;
+          blocks = null;
+        } else {
+          // Unknown attachment kinds never come from this composer, so they can't
+          // be posted as a block.
+          blocks = composerBlocks(body, uploaded.filter(isPostableAttachment));
         }
-        // Unknown attachment kinds never come from this composer, so they can't
-        // be posted as a block.
-        blocks = composerBlocks(body, uploaded.filter(isPostableAttachment));
       } else {
         blocks = composerBlocks(body, []);
       }
-      const ok = await runAction("Couldn't send", () => props.onSend(blocks));
-      if (!ok) return;
-      posted = true;
-      const sentIdSet = new Set(draft.map((file) => file.id));
-      for (const file of draft) {
-        sentIds.current.add(file.id);
-        revokePreview(file);
-      }
-      setFiles((current) => current.filter((file) => !sentIdSet.has(file.id)));
-      setAttachError(null);
-      setText("");
-      setCursor(0);
-      setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
-      editorRef.current?.focus();
-    } finally {
-      sendingDraft.current = [];
-      // An unmounted composer has no owner for a failed snapshot: release it.
-      if (!posted && !mountedRef.current) {
-        for (const file of draft) {
-          releaseAttachmentUpload(file.id);
-          revokePreview(file);
+      if (blocks !== null) {
+        const outgoingBlocks = blocks;
+        const ok = await runAction("Couldn't send", () => props.onSend(outgoingBlocks));
+        if (ok) {
+          posted = true;
+          const sentIdSet = new Set(draft.map((file) => file.id));
+          for (const file of draft) {
+            sentIds.current.add(file.id);
+            revokePreview(file);
+          }
+          setFiles((current) => current.filter((file) => !sentIdSet.has(file.id)));
+          setAttachError(null);
+          setText("");
+          setCursor(0);
+          setRecords(EMPTY_COMPOSER_CONTEXT_RECORDS);
+          editorRef.current?.focus();
         }
       }
-      if (mountedRef.current) setInFlightIds(new Set());
+    } catch (caught) {
+      failure = { error: caught };
     }
+    // Runs however the send ended (this was a `finally`); a failure is thrown again after.
+    sendingDraft.current = [];
+    // An unmounted composer has no owner for a failed snapshot: release it.
+    if (!posted && !mountedRef.current) {
+      for (const file of draft) {
+        releaseAttachmentUpload(file.id);
+        revokePreview(file);
+      }
+    }
+    if (mountedRef.current) setInFlightIds(new Set());
+    if (failure !== null) throw failure.error;
   };
 
   const onFilesPicked = (list: FileList | null) => {
