@@ -290,7 +290,7 @@ function useTypingClock(participants: ReadonlyArray<KanbanParticipant> | undefin
  * board's link, a missing record) stays inert, as on web. Read when a link is
  * pressed, so messages don't redraw on every board change.
  */
-function resolveKanbanLinkFor(boardId: string): ResolveKanbanLink {
+export function resolveKanbanLinkFor(boardId: string): ResolveKanbanLink {
   return (href) => {
     const link = parseKanbanLink(href);
     const state = kanbanClient().board(boardId).get();
@@ -322,7 +322,7 @@ function useMarkRead(
   }, [boardId, discussionId, focused, lastSeq, readSeq, unread]);
 }
 
-function MessageView(props: {
+export function MessageView(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
   readonly message: KanbanMessage;
@@ -455,7 +455,7 @@ function BlockView(props: {
 }
 
 /** Consecutive attachments share one wrapping row. */
-function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
+export function AttachmentRun(props: { readonly attachments: ReadonlyArray<StoredAttachment> }) {
   return (
     <View className="flex-row flex-wrap gap-2">
       {props.attachments.map((attachment) => (
@@ -537,7 +537,7 @@ function StoredAttachmentView(props: { readonly attachment: StoredAttachment }) 
   );
 }
 
-function Collapse(props: {
+export function Collapse(props: {
   readonly title: string;
   readonly text: string;
   readonly resolveKanbanLink: ResolveKanbanLink;
@@ -572,7 +572,7 @@ function Collapse(props: {
   );
 }
 
-function QuietButton(props: {
+export function QuietButton(props: {
   readonly label: string;
   readonly disabled?: boolean;
   readonly onPress: () => void;
@@ -933,7 +933,7 @@ interface ChoiceDraft {
   readonly sent: boolean;
 }
 
-function CardBlock(props: {
+export function CardBlock(props: {
   readonly boardId: string;
   readonly cardId: string;
   readonly onOpenCard: (cardId: string) => void;
@@ -1007,12 +1007,15 @@ interface ComposerScope {
   live: boolean;
 }
 
-function Composer(props: {
+export function Composer(props: {
   readonly boardId: string;
   readonly discussionId: string | null;
   readonly ensureDiscussion: (firstText: string) => Promise<string>;
   readonly bottomInset: number;
   readonly onSent: () => void;
+  /** Sends the blocks somewhere other than the discussion: a reply on an ask. */
+  readonly post?: ((blocks: KanbanBlock[]) => Promise<void>) | undefined;
+  readonly placeholder?: string | undefined;
 }) {
   const [text, setText] = useState("");
   const [drafts, setDrafts] = useState<ReadonlyArray<ComposerDraft>>([]);
@@ -1033,12 +1036,15 @@ function Composer(props: {
 
   // Live drafts and the in-flight send batch, read by the unmount cleanup, which runs once.
   const draftsRef = useRef(drafts);
-  draftsRef.current = drafts;
   // Files of a send whose post has not settled yet. They are out of `drafts` by then, so the
   // unmount cleanup reads them here; they are released only after the post settles.
   const sendingRef = useRef<ReadonlyArray<ComposerDraft>>([]);
   const environmentRef = useRef(environmentId);
-  environmentRef.current = environmentId;
+  // Kept after each render, not during it: the cleanup below runs later and reads the last ones.
+  useEffect(() => {
+    draftsRef.current = drafts;
+    environmentRef.current = environmentId;
+  });
   const scope = useRef<ComposerScope>({ live: true });
   useEffect(() => {
     const current = scope.current;
@@ -1149,6 +1155,7 @@ function Composer(props: {
     setField((key) => key + 1);
     void action
       .run("Couldn't send", async () => {
+        if (props.post) return props.post(sendBlocks(body, stored));
         const discussionId =
           props.discussionId ?? (await props.ensureDiscussion(firstSendText(body, stored)));
         await kanbanClient().post(props.boardId, discussionId, sendBlocks(body, stored));
@@ -1210,7 +1217,7 @@ function Composer(props: {
           accessibilityLabel="Message"
           value={text}
           onChangeText={setText}
-          placeholder="Message"
+          placeholder={props.placeholder ?? "Message"}
           placeholderTextColorClassName="accent-foreground-muted"
           className="max-h-32 min-h-8 flex-1 rounded-none border-0 bg-transparent px-0 py-1.5 text-[15px]"
         />
