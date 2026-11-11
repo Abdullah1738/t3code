@@ -569,7 +569,7 @@ async function deliver(send: AskSend, leaving: boolean) {
   } else if (outcome !== "sent") {
     showAskToast(
       {
-        text: `Not sent: ${send.label.toLowerCase()} on ${refLabel(send)}. ${get().failed[first.key]?.message ?? "Robob did not confirm it."}`,
+        text: `Not sent · ${refLabel(send)}. ${get().failed[first.key]?.message ?? "Robob did not confirm it."}`,
         ...(outcome === "failed" ? { retryKey: first.key } : { viewKey: first.key }),
       },
       9_000,

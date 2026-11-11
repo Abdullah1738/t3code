@@ -447,9 +447,9 @@ const acceptsInWords = (accepts: ReadonlyArray<string>): string => {
     return sub === "*" ? type.replace("/*", "") : sub.toUpperCase();
   });
   const unique = [...new Set(words)];
-  return unique.length < 2
-    ? (unique[0] ?? "")
-    : `${unique.slice(0, -1).join(", ")} or ${unique.at(-1)}`;
+  const said =
+    unique.length < 2 ? (unique[0] ?? "") : `${unique.slice(0, -1).join(", ")} or ${unique.at(-1)}`;
+  return said.charAt(0).toUpperCase() + said.slice(1);
 };
 
 const uploadIdByAttachment = new Map<string, string>();

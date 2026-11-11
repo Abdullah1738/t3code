@@ -18,7 +18,7 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
   if (action.summary) {
     rows.push([
       "Changes",
-      <div key="summary" className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      <div key="summary" data-ny-prose className="[&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
         <KanbanMarkdown text={action.summary} />
       </div>,
     ]);
