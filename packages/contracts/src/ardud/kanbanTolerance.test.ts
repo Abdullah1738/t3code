@@ -198,16 +198,13 @@ describe("the server's reader, which stores what it reads", () => {
   });
 
   it("so nothing can stand in for a stored block: what it reads is what it writes", () => {
-    const storedCard = card([
-      ask({
-        blocks: [
-          { _tag: "md", text: "Why" },
-          { _tag: "html", html: "<p>x</p>", title: "Chart", height: 240 },
-        ],
-      }),
-    ]);
+    const storedBlocks = [
+      { _tag: "md", text: "Why" },
+      { _tag: "html", html: "<p>x</p>", title: "Chart", height: 240 },
+    ];
+    const storedCard = card([ask({ blocks: storedBlocks })]);
     const cardBack = encodeCard(decodeCard(storedCard));
-    expect(cardBack.asks?.[0]?.blocks).toEqual(storedCard.asks[0]!.blocks);
+    expect(cardBack.asks?.[0]?.blocks).toEqual(storedBlocks);
     expect(JSON.stringify(cardBack)).not.toContain(KANBAN_UNKNOWN_BLOCK_TEXT);
     const storedMessage = message([
       { _tag: "md", text: "Look" },
