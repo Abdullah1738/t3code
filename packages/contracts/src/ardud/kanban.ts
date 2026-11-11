@@ -1865,6 +1865,13 @@ export const KanbanMessage = Schema.Struct({
   createdAt: IsoDateTime,
   /** Set on a message that belongs to one ask's discussion (`q1`, ... on the discussion's card). */
   askId: Schema.optional(Schema.String),
+  /**
+   * Set on a message that is the ask itself, as asked (0) or as edited: the
+   * revision it shows. Below the ask's own revision, it is an older version.
+   * A reply on the ask carries `askId` without it, and so do messages from
+   * before this field.
+   */
+  askRevision: Schema.optional(NonNegativeInt),
 });
 export type KanbanMessage = typeof KanbanMessage.Type;
 

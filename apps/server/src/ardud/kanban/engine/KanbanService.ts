@@ -4381,6 +4381,8 @@ const make = Effect.gen(function* () {
     saveRoute = false,
     /** The ask whose discussion the message belongs to. */
     askId?: string,
+    /** With askId, for a message that is the ask itself: the revision it shows. */
+    askRevision?: number,
   ) {
     yield* checkText(messageTextFields(blocks));
     if (blocks.length === 0)
@@ -4428,6 +4430,7 @@ const make = Effect.gen(function* () {
       answers: [],
       createdAt: at,
       ...(askId === undefined ? {} : { askId }),
+      ...(askId === undefined || askRevision === undefined ? {} : { askRevision }),
     };
     const writeTitle = author._tag === "owner" && (yield* wantsWrittenTitle(discussion));
     const durablePost = saveRoute && author._tag === "owner";
@@ -8234,6 +8237,7 @@ const make = Effect.gen(function* () {
       false,
       false,
       ask.id,
+      kanbanAskRevision(ask),
     );
     const next = Asks.updateAsk(yield* cardOf(card.id), ask.id, {
       ...fields,
@@ -8399,6 +8403,7 @@ const make = Effect.gen(function* () {
           false,
           false,
           ask.id,
+          kanbanAskRevision(revised),
         );
         const edited = Asks.replaceAsk(yield* cardOf(card.id), {
           ...revised,
