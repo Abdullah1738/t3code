@@ -508,6 +508,7 @@ export function NeedsYouPage(props: {
                 boardName={boardNames.get(focused.batch.boardId) ?? ""}
                 entries={focused.entries}
                 layout={layout}
+                nowMs={nowMs}
                 handle={readerRef}
                 onLeave={() => focusOn(null)}
                 onOpenAsk={pickRow}

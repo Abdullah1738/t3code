@@ -456,18 +456,44 @@ async function deliver(send: AskSend, leaving: boolean) {
   let outcome: "sent" | "stale" | "invalid" | "failed" | "denied" = "sent";
   let refusedCount = 0;
   let evaluator: AskSend["evaluator"];
+  // "From now on" rode on an ask that was refused: the rest went over without it.
+  let standingMissed = false;
   try {
     if (send.kind === "hand") {
-      const handed = await askApi.hand(
-        first.cardRef,
-        first.askId,
-        {
-          action: "hand",
-          ...(send.hand?.always ? { always: true, text: send.hand.text ?? "" } : {}),
-        },
-        leaving,
+      // The hand route takes one ask. Several go one call each; "from now on"
+      // rides on the first, so the batch starts one evaluator thread.
+      const handOne = (ref: AskSendRef, index: number) =>
+        askApi.hand(
+          ref.cardRef,
+          ref.askId,
+          {
+            action: "hand",
+            ...(index === 0 && send.hand?.always
+              ? { always: true, text: send.hand.text ?? "" }
+              : {}),
+          },
+          leaving,
+        );
+      const results: Array<PromiseSettledResult<Awaited<ReturnType<typeof handOne>>>> = [];
+      // A few at a time, or all at once when the page is going away.
+      const step = leaving ? send.refs.length : 4;
+      for (let from = 0; from < send.refs.length; from += step) {
+        results.push(
+          ...(await Promise.allSettled(
+            send.refs.slice(from, from + step).map((ref, index) => handOne(ref, from + index)),
+          )),
+        );
+      }
+      const lead = results[0]!;
+      if (lead.status === "fulfilled") evaluator = lead.value.evaluator;
+      const refusals = results.flatMap((result, index) =>
+        result.status === "rejected" ? [{ ref: send.refs[index]!, error: result.reason }] : [],
       );
-      evaluator = handed.evaluator;
+      // All refused: one failure for the whole send, handled below.
+      if (refusals.length === send.refs.length) throw refusals[0]!.error;
+      for (const refusal of refusals) giveBack(send, refusal.ref, refusal.error);
+      refusedCount = refusals.length;
+      standingMissed = send.hand?.always === true && lead.status === "rejected";
     } else if (send.kind === "batch") {
       const { revision: _revision, values: _values, finalDraft: _finalDraft, ...body } = send.body;
       const result = await askApi.answerBatch(
@@ -543,7 +569,7 @@ async function deliver(send: AskSend, leaving: boolean) {
   } else if (refusedCount > 0) {
     showAskToast(
       {
-        text: `${send.label} ${send.refs.length - refusedCount} of ${send.refs.length}. ${refusedCount} changed and ${refusedCount === 1 ? "was" : "were"} not answered.`,
+        text: `${send.label} ${send.refs.length - refusedCount} of ${send.refs.length}. ${refusedCount} changed and ${refusedCount === 1 ? "was" : "were"} not ${send.kind === "hand" ? "handed over" : "answered"}.${standingMissed ? " No evaluator thread started for the ones from now on." : ""}`,
       },
       9_000,
     );
@@ -670,16 +696,55 @@ export function answerAskBatch(
   hold(send, `${label} · ${entries.length} asks.${body.note ? " Your note goes with each." : ""}`);
 }
 
-/** Hands the ask to the board's evaluator; with `words`, also asks like it from now on. */
-export function handAsk(entry: KanbanAskFeedItem, words?: string) {
+/** Room left for his own words when a batch's other asks are listed after them. */
+export const HAND_WORDS_MAX = 4_000;
+export const HAND_BATCH_WORDS_MAX = 2_500;
+
+/**
+ * His words for a standing hand-over of several asks. The server takes one
+ * ask per hand-over, so the first carries his words and names the others.
+ */
+const standingWords = (words: string, rest: ReadonlyArray<KanbanAskFeedItem>): string => {
+  if (rest.length === 0) return words;
+  const refs = rest.map((entry) => `${entry.cardRef} ${entry.ask.id}`);
+  let list = refs.join(", ");
+  const room = HAND_WORDS_MAX - words.length - 120;
+  if (list.length > room) {
+    const kept: Array<string> = [];
+    for (const ref of refs) {
+      if (kept.join(", ").length + ref.length + 2 > room) break;
+      kept.push(ref);
+    }
+    list = `${kept.join(", ")} and ${refs.length - kept.length} more`;
+  }
+  return `${words}\n\nHanded over together with this one, ${rest.length} more of the same kind: ${list}.`;
+};
+
+/**
+ * Hands asks to their board's evaluator; with `words`, also asks like them
+ * from now on. Several asks are one send: held, undone and reported together.
+ */
+export function handAsks(
+  entries: ReadonlyArray<KanbanAskFeedItem>,
+  focusKey: string,
+  words?: string,
+  title?: string,
+) {
+  const first = entries[0];
+  if (!first) return;
+  const many = entries.length > 1;
   const send: AskSend = {
-    ...baseSend(entry, askKey(entry)),
+    ...baseSend(first, focusKey),
     kind: "hand",
-    refs: [refOf(entry)],
+    refs: entries.map(refOf),
     body: { verdict: "handed" },
     label: "Handed to the evaluator",
-    to: `the ${entry.boardName} evaluator`,
-    ...(words === undefined ? {} : { hand: { always: true, text: words } }),
+    to: `the ${first.boardName} evaluator`,
+    ...(title === undefined ? {} : { title }),
+    ...(many ? { cardNumber: null } : {}),
+    ...(words === undefined
+      ? {}
+      : { hand: { always: true, text: standingWords(words, entries.slice(1)) } }),
   };
   hold(
     send,

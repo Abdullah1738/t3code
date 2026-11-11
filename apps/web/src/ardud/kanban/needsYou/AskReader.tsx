@@ -84,7 +84,8 @@ import { ChangeViewer } from "./ChangeView";
 import { DraftPart } from "./DraftPart";
 import { EvaluatorThreadLink, HandOver } from "./HandOver";
 import { MediaViewer } from "./MediaViewer";
-import { shortWhen, tomorrowMorning } from "./snoozeTimes";
+import { SnoozeMenu, SnoozePick, SnoozeRows } from "./SnoozeMenu";
+import { shortWhen, tomorrowMorning, type SnoozeUntil } from "./snoozeTimes";
 import { Btn, Key, Label, Layer, Pill, linkClass, type PageLayout } from "./ui";
 
 export interface AskReaderHandle {
@@ -133,6 +134,7 @@ export function AskReader(props: {
   const [noteOpen, setNoteOpen] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [pickOpen, setPickOpen] = useState(false);
   const phone = layout === "phone";
   // On a phone the discussion is a sheet that stops above the answer bar.
   const bar = useRef<HTMLDivElement>(null);
@@ -255,11 +257,14 @@ export function AskReader(props: {
     const result = answerAsk({ ...entry, ask }, intent);
     if (!result.ok) focusAt(result.first);
   };
+  const snoozeUntil = (until: SnoozeUntil) => {
+    props.onLeave();
+    void snoozeAsks([entry], until.iso, until.label);
+  };
+  // The key and "Bring back": no menu, tomorrow morning or straight back.
   const snooze = () => {
     if (item.snoozed) return void snoozeAsks([entry], null, "");
-    const until = tomorrowMorning();
-    props.onLeave();
-    return void snoozeAsks([entry], until.iso, until.label);
+    return snoozeUntil(tomorrowMorning());
   };
   const primary = () => send(form.refusing ? "refuse" : "primary");
   const refuse = () => {
@@ -348,7 +353,7 @@ export function AskReader(props: {
       handOver={
         canTalk && !response.ack && ask.to !== "evaluator" ? (
           <HandOver
-            entry={entry}
+            entries={[entry]}
             phone={layout === "phone"}
             needsSecret={askRequiresSecret(ask)}
             onLeave={props.onLeave}
@@ -437,7 +442,10 @@ export function AskReader(props: {
             {secretError ? <Banner tone="negative">{secretError}</Banner> : null}
             {mark === "back" && item.backFromSnoozeAt ? (
               <Banner tone="accent">
-                Back from snooze since {shortWhen(item.backFromSnoozeAt, props.nowMs)}.
+                <b className="font-semibold">Back from snooze.</b>{" "}
+                {ask.backFromSnoozeAt
+                  ? `Its agent changed it or replied, ${shortWhen(ask.backFromSnoozeAt, props.nowMs)}.`
+                  : `You set this aside until ${shortWhen(item.backFromSnoozeAt, props.nowMs)}.`}
               </Banner>
             ) : null}
             {mark === "updated" ? (
@@ -621,8 +629,16 @@ export function AskReader(props: {
               </Btn>
             }
             busy={secretBusy}
-            snoozed={item.snoozed}
-            onSnooze={snooze}
+            snooze={
+              item.snoozed ? (
+                <Btn tone="ghost" onClick={snooze}>
+                  Bring back
+                  <Key>S</Key>
+                </Btn>
+              ) : (
+                <SnoozeMenu label="Snooze" onSnooze={snoozeUntil} />
+              )
+            }
             lead={
               canTalk ? (
                 <>
@@ -706,14 +722,16 @@ export function AskReader(props: {
                   Add a note for the agent
                 </MoreRow>
               ) : null}
-              <MoreRow
-                onClick={() => {
-                  setMoreOpen(false);
-                  snooze();
-                }}
-              >
-                {item.snoozed ? "Bring back" : "Snooze until tomorrow 09:00"}
-              </MoreRow>
+              {item.snoozed ? (
+                <MoreRow
+                  onClick={() => {
+                    setMoreOpen(false);
+                    snooze();
+                  }}
+                >
+                  Bring back
+                </MoreRow>
+              ) : null}
               {phone && refusal && !form.refusing ? (
                 <MoreRow
                   onClick={() => {
@@ -732,7 +750,26 @@ export function AskReader(props: {
               >
                 Open the card
               </MoreRow>
+              {item.snoozed ? null : (
+                <SnoozeRows
+                  nowMs={props.nowMs}
+                  onSnooze={(until) => {
+                    setMoreOpen(false);
+                    snoozeUntil(until);
+                  }}
+                  onPick={() => {
+                    setMoreOpen(false);
+                    setPickOpen(true);
+                  }}
+                />
+              )}
             </Layer>
+            <SnoozePick
+              open={pickOpen}
+              phone={phone}
+              onClose={() => setPickOpen(false)}
+              onSnooze={snoozeUntil}
+            />
           </>
         )}
         {viewing !== null && media.items.length > 0 ? (

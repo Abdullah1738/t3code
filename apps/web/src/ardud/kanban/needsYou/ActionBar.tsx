@@ -21,8 +21,8 @@ export function ActionBar(props: {
   more?: ReactNode;
   /** The answer is on its way and can't be sent twice. */
   busy?: boolean;
-  snoozed: boolean;
-  onSnooze: () => void;
+  /** The Snooze control: a menu of times, or "Bring back" on a snoozed ask. */
+  snooze?: ReactNode;
   onPrimary: () => void;
   onRefuse: () => void;
   onBack: () => void;
@@ -76,12 +76,7 @@ export function ActionBar(props: {
       ) : (
         <>
           {props.phone ? null : props.children}
-          {props.phone || props.compact ? null : (
-            <Btn tone="ghost" onClick={props.onSnooze}>
-              {props.snoozed ? "Bring back" : "Snooze"}
-              <Key>S</Key>
-            </Btn>
-          )}
+          {props.phone || props.compact ? null : props.snooze}
           {refusal && !props.phone ? (
             <Btn tone="ghost" onClick={props.onRefuse}>
               {refusal.label}
