@@ -397,9 +397,18 @@ export function NeedsYouPage(props: {
           </p>
           <span className="min-w-0 flex-1" />
           {view !== "queue" ? (
-            <Btn size="sm" onClick={() => setView("queue")}>
-              Needs you
-              <span className="tabular-nums">{owed.length}</span>
+            // A phone has room for the page's name or the way back spelled out, not both.
+            <Btn size="sm" onClick={() => setView("queue")} className="shrink-0">
+              {layout === "phone" ? (
+                <>
+                  Back<span className="sr-only"> to Needs you</span>
+                </>
+              ) : (
+                "Needs you"
+              )}
+              <span className={cn("tabular-nums", layout === "phone" && "sr-only")}>
+                {owed.length}
+              </span>
             </Btn>
           ) : layout === "phone" ? (
             <Btn size="sm" onClick={() => setQueueOpen(true)}>
@@ -431,7 +440,10 @@ export function NeedsYouPage(props: {
               label="History"
               aria-pressed={view === "history"}
               onClick={() => setView(view === "history" ? "queue" : "history")}
-              className="aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)"
+              className={cn(
+                "aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)",
+                layout === "phone" && view === "history" && "hidden",
+              )}
             >
               <HistoryIcon />
             </IconBtn>
@@ -439,7 +451,10 @@ export function NeedsYouPage(props: {
               label="What an ask can be"
               aria-pressed={view === "reference"}
               onClick={() => setView(view === "reference" ? "queue" : "reference")}
-              className="aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)"
+              className={cn(
+                "aria-pressed:bg-(--m-chip) aria-pressed:text-(--m-text)",
+                layout === "phone" && view === "reference" && "hidden",
+              )}
             >
               <ShapesIcon />
             </IconBtn>

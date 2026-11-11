@@ -198,7 +198,8 @@ function PdfPage(props: { name: string; url: string | null; onOpen: () => void }
           tabIndex={-1}
           src={`${props.url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`}
           type="application/pdf"
-          className="pointer-events-none size-full"
+          // A few pixels past the frame on every side: the viewer keeps a dark gutter around the page.
+          className="pointer-events-none absolute -inset-1 size-[calc(100%+0.5rem)] max-w-none"
         />
       )}
       <button
