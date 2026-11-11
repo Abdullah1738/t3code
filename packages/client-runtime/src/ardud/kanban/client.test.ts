@@ -5,7 +5,13 @@ import type {
   KanbanScriptRun,
   KanbanWatchEvent,
 } from "@t3tools/contracts";
+import {
+  KANBAN_UNKNOWN_BLOCK_TEXT,
+  KanbanMessage as KanbanMessageSchema,
+  tolerateUnknownKanbanBlocks,
+} from "@t3tools/contracts";
 import { Atom, AtomRegistry } from "effect/reactivity";
+import * as Schema from "effect/Schema";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { createKanbanClient } from "./client.ts";
@@ -144,6 +150,30 @@ const vote = {
 } as never;
 
 describe("createKanbanClient", () => {
+  it("lets the app read a message that carries a block of a kind its build doesn't know", () => {
+    const fromLater = {
+      seq: 1,
+      discussionId: "d1",
+      author: { _tag: "owner" },
+      authorName: "You",
+      createdAt: "2026-11-11T08:00:00.000Z",
+      blocks: [
+        { _tag: "md", text: "Look" },
+        { _tag: "map", zoom: 12 },
+      ],
+      answers: [],
+    };
+    const decode = Schema.decodeUnknownSync(KanbanMessageSchema);
+    tolerateUnknownKanbanBlocks(false);
+    // Without the board client (the server): refused, as ever.
+    expect(() => decode(fromLater)).toThrow();
+    createKanbanClient(fakeTransport().transport);
+    expect(decode(fromLater).blocks).toEqual([
+      { _tag: "md", text: "Look" },
+      { _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT },
+    ]);
+  });
+
   it("lifts the requested board pause", async () => {
     const fake = fakeTransport();
     const client = createKanbanClient(fake.transport);

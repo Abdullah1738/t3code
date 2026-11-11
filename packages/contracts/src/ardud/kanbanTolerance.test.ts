@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   KANBAN_UNKNOWN_BLOCK_TEXT,
@@ -7,10 +7,12 @@ import {
   KanbanCard,
   KanbanMessage,
   kanbanAskResponse,
+  tolerateUnknownKanbanBlocks,
 } from "./kanban.ts";
 
-// What a client older than its server has to survive: a card or a message that
-// carries something the client's build has never heard of.
+// What an app older than its server has to survive: a card or a message that
+// carries something the app's build has never heard of. The apps turn the
+// reading of unknown blocks on (the board client does); the server never does.
 
 const card = (asks: ReadonlyArray<unknown>, extra: Record<string, unknown> = {}) => ({
   id: "card-1",
@@ -80,8 +82,14 @@ const decodeMessage = Schema.decodeUnknownSync(KanbanMessage);
 const encodeMessage = Schema.encodeSync(KanbanMessage);
 
 const MAP = { _tag: "map", lat: 25.2, lng: 55.3, zoom: 12 };
+/** A block of a kind nobody knows yet, far over every inline limit. */
+const BIG_MARK = "payload-that-must-not-travel";
+const BIG = { _tag: "map", tiles: `${BIG_MARK}:${"x".repeat(400_000)}` };
 
-describe("a card from a newer server", () => {
+describe("a card from a newer server, in an app", () => {
+  beforeEach(() => tolerateUnknownKanbanBlocks());
+  afterEach(() => tolerateUnknownKanbanBlocks(false));
+
   it("loads with a field on the card or on an ask that this build doesn't know", () => {
     const decoded = decodeCard(card([ask({ fromTheFuture: { nested: true } })], { alsoNew: 1 }));
     expect(decoded.asks).toHaveLength(1);
@@ -128,10 +136,16 @@ describe("a card from a newer server", () => {
     expect(blocks[2]?._tag).toBe("image");
   });
 
-  it("writes the block back as it was stored, so nothing is lost by reading it", () => {
-    const stored = card([ask({ blocks: [{ _tag: "md", text: "Why" }, MAP] })]);
-    const encoded = encodeCard(decodeCard(stored));
-    expect(encoded.asks?.[0]?.blocks).toEqual([{ _tag: "md", text: "Why" }, MAP]);
+  it("the line that stands in holds nothing of the block: a big one never travels on", () => {
+    const decoded = decodeCard(card([ask({ blocks: [{ _tag: "md", text: "Why" }, BIG] })]));
+    const standIn = decoded.asks[0]!.blocks![1]!;
+    expect(standIn).toEqual({ _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT });
+    expect(Object.keys(standIn).toSorted()).toEqual(["_tag", "text"]);
+    // However the app passes the card on (as it is, or through the schema), the block is not in it.
+    for (const wire of [JSON.stringify(decoded), JSON.stringify(encodeCard(decoded))]) {
+      expect(wire).not.toContain(BIG_MARK);
+      expect(wire.length).toBeLessThan(4_000);
+    }
   });
 
   it("still refuses a pick block in an ask: known to this build, not allowed there", () => {
@@ -152,12 +166,16 @@ describe("a card from a newer server", () => {
   });
 });
 
-describe("a message from a newer server", () => {
+describe("a message from a newer server, in an app", () => {
+  beforeEach(() => tolerateUnknownKanbanBlocks());
+  afterEach(() => tolerateUnknownKanbanBlocks(false));
+
   it("loads with a block of a kind it doesn't know, and with a field it doesn't know", () => {
-    const decoded = decodeMessage(message([{ _tag: "md", text: "Look" }, MAP], { mood: "calm" }));
+    const decoded = decodeMessage(message([{ _tag: "md", text: "Look" }, BIG], { mood: "calm" }));
     expect(decoded.blocks.map((block) => block._tag)).toEqual(["md", "md"]);
-    expect(decoded.blocks[1]).toMatchObject({ text: KANBAN_UNKNOWN_BLOCK_TEXT });
-    expect(encodeMessage(decoded).blocks).toEqual([{ _tag: "md", text: "Look" }, MAP]);
+    expect(decoded.blocks[1]).toEqual({ _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT });
+    expect(JSON.stringify(decoded)).not.toContain(BIG_MARK);
+    expect(JSON.stringify(encodeMessage(decoded))).not.toContain(BIG_MARK);
   });
 
   it("reads and writes a message of known blocks unchanged", () => {
@@ -170,15 +188,54 @@ describe("a message from a newer server", () => {
   });
 });
 
+describe("the server's reader, which stores what it reads", () => {
+  // Nothing turns the apps' reading on here: this is how the server runs.
+
+  it("refuses a stored card or message with a block of a kind it doesn't know, as it always has", () => {
+    expect(() => decodeCard(card([ask({ blocks: [{ _tag: "md", text: "Why" }, MAP] })]))).toThrow();
+    expect(() => decodeCard(card([ask({ blocks: [BIG] })]))).toThrow();
+    expect(() => decodeMessage(message([{ _tag: "md", text: "Look" }, MAP]))).toThrow();
+  });
+
+  it("so nothing can stand in for a stored block: what it reads is what it writes", () => {
+    const storedCard = card([
+      ask({
+        blocks: [
+          { _tag: "md", text: "Why" },
+          { _tag: "html", html: "<p>x</p>", title: "Chart", height: 240 },
+        ],
+      }),
+    ]);
+    const cardBack = encodeCard(decodeCard(storedCard));
+    expect(cardBack.asks?.[0]?.blocks).toEqual(storedCard.asks[0]!.blocks);
+    expect(JSON.stringify(cardBack)).not.toContain(KANBAN_UNKNOWN_BLOCK_TEXT);
+    const storedMessage = message([
+      { _tag: "md", text: "Look" },
+      { _tag: "collapse", title: "More", text: "Detail" },
+    ]);
+    expect(encodeMessage(decodeMessage(storedMessage))).toEqual(storedMessage);
+  });
+
+  it("turning the apps' reading off again restores it", () => {
+    tolerateUnknownKanbanBlocks();
+    expect(decodeMessage(message([MAP])).blocks).toHaveLength(1);
+    tolerateUnknownKanbanBlocks(false);
+    expect(() => decodeMessage(message([MAP]))).toThrow();
+  });
+});
+
 describe("blocks coming in", () => {
   it("are still a closed list: a kind the server doesn't know is refused", () => {
     const decodeInput = Schema.decodeUnknownSync(KanbanBlockInput);
     expect(decodeInput({ _tag: "md", text: "x" })).toEqual({ _tag: "md", text: "x" });
     expect(() => decodeInput(MAP)).toThrow();
-    // The reader's own bookkeeping can't be sent in to smuggle a stored block.
+    // A key the block doesn't have is dropped, in an app and on the server alike.
     expect(decodeInput({ _tag: "md", text: "x", original: MAP })).toEqual({
       _tag: "md",
       text: "x",
     });
+    tolerateUnknownKanbanBlocks();
+    expect(() => decodeInput(MAP)).toThrow();
+    tolerateUnknownKanbanBlocks(false);
   });
 });

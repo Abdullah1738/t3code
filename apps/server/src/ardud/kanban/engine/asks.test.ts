@@ -114,6 +114,20 @@ describe("stored asks", () => {
     };
     assert.throws(() => decode(withPick));
   });
+
+  it("a stored ask with a block of a kind this server doesn't know is refused, not stood in for", () => {
+    // The apps can read past such a block (they may be older than their
+    // server). The server stores what it reads, so it never does: no line of
+    // text can take a stored block's place in a feed, a reply or a write.
+    const fromLater = {
+      ...old,
+      blocks: [
+        { _tag: "md", text: "caption" },
+        { _tag: "map", zoom: 12 },
+      ],
+    };
+    assert.throws(() => decode(fromLater));
+  });
 });
 
 describe("askFields", () => {
