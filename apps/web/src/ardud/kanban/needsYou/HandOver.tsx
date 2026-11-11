@@ -5,7 +5,7 @@ import { useId, useRef, useState, type ReactNode } from "react";
 
 import { cn } from "../../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../../state/environments";
-import { HAND_BATCH_WORDS_MAX, HAND_WORDS_MAX, askKey, handAsks } from "./askStore";
+import { HAND_WORDS_MAX, askKey, handAsks } from "./askStore";
 import { Btn, Label, Layer, fieldClass, linkClass } from "./ui";
 
 /** A link to the evaluator thread a standing hand-over started. */
@@ -112,7 +112,7 @@ export function HandOver(props: {
           ref={input}
           id={id}
           rows={5}
-          maxLength={many ? HAND_BATCH_WORDS_MAX : HAND_WORDS_MAX}
+          maxLength={HAND_WORDS_MAX}
           value={words}
           aria-invalid={tried && missing ? true : undefined}
           aria-describedby={`${id}-hint`}

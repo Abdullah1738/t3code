@@ -4,6 +4,7 @@
  * the page and the sidebar count.
  */
 import {
+  ASK_NOT_OWNER_DEVICE_TEXT,
   askReplyProblem,
   askFormCarried,
   askFormFor,
@@ -27,7 +28,7 @@ import {
 import { create } from "zustand";
 
 import { kanban } from "../kanbanStore";
-import { askApi, AskApiError, askFailureText } from "./askApi";
+import { askApi, AskApiError, askFailureText, type AskBatchResult } from "./askApi";
 
 export const askKey = (entry: Pick<KanbanAskFeedItem, "cardId" | "ask">): string =>
   `${entry.cardId}:${entry.ask.id}`;
@@ -404,6 +405,21 @@ const noteRefusal = (error: unknown) => {
   if (notOwner !== null) set({ notOwner });
 };
 
+/**
+ * What the session itself says: `false` is a session that is not the owner's,
+ * known before anything is sent, so the notice shows up front and no answer is
+ * held as if it could go through. `true` clears a notice an earlier session left.
+ */
+export function noteOwnerStanding(owner: boolean | undefined) {
+  if (owner === undefined) return;
+  const { notOwner } = get();
+  if (owner === false && notOwner === null) {
+    set({ notOwner: { text: ASK_NOT_OWNER_DEVICE_TEXT, device: true } });
+  } else if (owner === true && notOwner !== null) {
+    set({ notOwner: null });
+  }
+}
+
 /** The secret call met the same refusal over its own channel. */
 export const noteAskNotOwner = (text: string, device: boolean) =>
   set({ notOwner: { text, device } });
@@ -449,6 +465,30 @@ function giveBack(send: AskSend, ref: AskSendRef, error: unknown) {
   return "failed" as const;
 }
 
+/** Gives back the asks a batch route refused, each for its own reason. Returns how many. */
+function giveBackRefused(send: AskSend, results: AskBatchResult["results"]): number {
+  let refused = 0;
+  for (const entry of results) {
+    if (entry.ok) continue;
+    const ref = send.refs.find((item) => item.cardRef === entry.card && item.askId === entry.askId);
+    if (!ref) continue;
+    refused += 1;
+    const { code, message, reason, revision } = entry.error;
+    giveBack(
+      send,
+      ref,
+      new AskApiError(
+        code === "conflict" ? 409 : code === "denied" ? 403 : 400,
+        code,
+        message,
+        revision ?? null,
+        reason ?? null,
+      ),
+    );
+  }
+  return refused;
+}
+
 async function deliver(send: AskSend, leaving: boolean) {
   sending.add(send.id);
   patchSend(send.id, { state: "sending" });
@@ -456,44 +496,28 @@ async function deliver(send: AskSend, leaving: boolean) {
   let outcome: "sent" | "stale" | "invalid" | "failed" | "denied" = "sent";
   let refusedCount = 0;
   let evaluator: AskSend["evaluator"];
-  // "From now on" rode on an ask that was refused: the rest went over without it.
-  let standingMissed = false;
   try {
-    if (send.kind === "hand") {
-      // The hand route takes one ask. Several go one call each; "from now on"
-      // rides on the first, so the batch starts one evaluator thread.
-      const handOne = (ref: AskSendRef, index: number) =>
-        askApi.hand(
-          ref.cardRef,
-          ref.askId,
-          {
-            action: "hand",
-            ...(index === 0 && send.hand?.always
-              ? { always: true, text: send.hand.text ?? "" }
-              : {}),
-          },
-          leaving,
-        );
-      const results: Array<PromiseSettledResult<Awaited<ReturnType<typeof handOne>>>> = [];
-      // A few at a time, or all at once when the page is going away.
-      const step = leaving ? send.refs.length : 4;
-      for (let from = 0; from < send.refs.length; from += step) {
-        results.push(
-          ...(await Promise.allSettled(
-            send.refs.slice(from, from + step).map((ref, index) => handOne(ref, from + index)),
-          )),
-        );
-      }
-      const lead = results[0]!;
-      if (lead.status === "fulfilled") evaluator = lead.value.evaluator;
-      const refusals = results.flatMap((result, index) =>
-        result.status === "rejected" ? [{ ref: send.refs[index]!, error: result.reason }] : [],
+    if (send.kind === "hand" && send.refs.length === 1) {
+      const handed = await askApi.hand(
+        first.cardRef,
+        first.askId,
+        {
+          action: "hand",
+          ...(send.hand?.always ? { always: true, text: send.hand.text ?? "" } : {}),
+        },
+        leaving,
       );
-      // All refused: one failure for the whole send, handled below.
-      if (refusals.length === send.refs.length) throw refusals[0]!.error;
-      for (const refusal of refusals) giveBack(send, refusal.ref, refusal.error);
-      refusedCount = refusals.length;
-      standingMissed = send.hand?.always === true && lead.status === "rejected";
+      evaluator = handed.evaluator;
+    } else if (send.kind === "hand") {
+      const result = await askApi.handBatch(
+        send.refs.map((ref) => ({ card: ref.cardRef, askId: ref.askId, revision: ref.revision })),
+        send.hand?.always ? { always: true, text: send.hand.text ?? "" } : {},
+        leaving,
+      );
+      refusedCount = giveBackRefused(send, result.results);
+      // One thread per board; a batch is one board's asks, so the first is the one.
+      evaluator =
+        result.evaluators?.find((entry) => !entry.started) ?? result.evaluators?.[0] ?? undefined;
     } else if (send.kind === "batch") {
       const { revision: _revision, values: _values, finalDraft: _finalDraft, ...body } = send.body;
       const result = await askApi.answerBatch(
@@ -501,23 +525,7 @@ async function deliver(send: AskSend, leaving: boolean) {
         send.refs.map((ref) => ({ card: ref.cardRef, askId: ref.askId, revision: ref.revision })),
         leaving,
       );
-      for (const entry of result.results) {
-        if (entry.ok) continue;
-        const ref = send.refs.find(
-          (item) => item.cardRef === entry.card && item.askId === entry.askId,
-        );
-        if (!ref) continue;
-        refusedCount += 1;
-        giveBack(
-          send,
-          ref,
-          new AskApiError(
-            entry.error.code === "conflict" ? 409 : 400,
-            entry.error.code,
-            entry.error.message,
-          ),
-        );
-      }
+      refusedCount = giveBackRefused(send, result.results);
     } else {
       await askApi.answer(first.cardRef, first.askId, send.body, first.revision, leaving);
     }
@@ -569,14 +577,14 @@ async function deliver(send: AskSend, leaving: boolean) {
   } else if (refusedCount > 0) {
     showAskToast(
       {
-        text: `${send.label} ${send.refs.length - refusedCount} of ${send.refs.length}. ${refusedCount} changed and ${refusedCount === 1 ? "was" : "were"} not ${send.kind === "hand" ? "handed over" : "answered"}.${standingMissed ? " No evaluator thread started for the ones from now on." : ""}`,
+        text: `${send.label} ${send.refs.length - refusedCount} of ${send.refs.length}. ${refusedCount} changed and ${refusedCount === 1 ? "was" : "were"} not ${send.kind === "hand" ? "handed over" : "answered"}.`,
       },
       9_000,
     );
   } else if (evaluator && !evaluator.started) {
     showAskToast(
       {
-        text: `Handed over, but the evaluator did not start: ${evaluator.error ?? "no reason given"}.`,
+        text: `Handed over, but the evaluator thread did not start: ${evaluator.error ?? "no reason given"}.`,
       },
       9_000,
     );
@@ -696,29 +704,8 @@ export function answerAskBatch(
   hold(send, `${label} · ${entries.length} asks.${body.note ? " Your note goes with each." : ""}`);
 }
 
-/** Room left for his own words when a batch's other asks are listed after them. */
+/** The most his words for a standing hand-over may run to (the server's limit). */
 export const HAND_WORDS_MAX = 4_000;
-export const HAND_BATCH_WORDS_MAX = 2_500;
-
-/**
- * His words for a standing hand-over of several asks. The server takes one
- * ask per hand-over, so the first carries his words and names the others.
- */
-const standingWords = (words: string, rest: ReadonlyArray<KanbanAskFeedItem>): string => {
-  if (rest.length === 0) return words;
-  const refs = rest.map((entry) => `${entry.cardRef} ${entry.ask.id}`);
-  let list = refs.join(", ");
-  const room = HAND_WORDS_MAX - words.length - 120;
-  if (list.length > room) {
-    const kept: Array<string> = [];
-    for (const ref of refs) {
-      if (kept.join(", ").length + ref.length + 2 > room) break;
-      kept.push(ref);
-    }
-    list = `${kept.join(", ")} and ${refs.length - kept.length} more`;
-  }
-  return `${words}\n\nHanded over together with this one, ${rest.length} more of the same kind: ${list}.`;
-};
 
 /**
  * Hands asks to their board's evaluator; with `words`, also asks like them
@@ -742,9 +729,7 @@ export function handAsks(
     to: `the ${first.boardName} evaluator`,
     ...(title === undefined ? {} : { title }),
     ...(many ? { cardNumber: null } : {}),
-    ...(words === undefined
-      ? {}
-      : { hand: { always: true, text: standingWords(words, entries.slice(1)) } }),
+    ...(words === undefined ? {} : { hand: { always: true, text: words } }),
   };
   hold(
     send,

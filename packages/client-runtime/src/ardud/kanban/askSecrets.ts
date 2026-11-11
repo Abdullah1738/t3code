@@ -98,32 +98,45 @@ const tagOf = (failure: unknown): string | null =>
     ? failure._tag
     : null;
 
-const NOT_THE_OWNER: AskSecretFailure = {
-  message: "This one carries a secret. Answer it from your own Robob session.",
-  stale: false,
-  field: null,
-  notOwner: { device: false },
-};
+/**
+ * What the server tells a paired device that is not the owner's. The page
+ * shows the same sentence up front when the session says it is not his.
+ */
+export const ASK_NOT_OWNER_DEVICE_TEXT =
+  "This device isn't paired as yours. Pair it again from Settings > Connections in the Robob desktop app.";
 
-/** A refused secret answer, in the page's words. */
+const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+
+/** A refused secret answer, in the server's words where it gave any. */
 export function askSecretFailure(failure: unknown): AskSecretFailure {
   const tag = tagOf(failure);
-  if (tag === "EnvironmentAuthorizationError") return NOT_THE_OWNER;
+  if (tag === "EnvironmentAuthorizationError") {
+    // A component's or a hand-issued token: not his session, and not a device to pair again.
+    return {
+      message: text((failure as { message?: unknown }).message) || "Only the owner answers this.",
+      stale: false,
+      field: null,
+      notOwner: { device: false },
+    };
+  }
   if (tag === "KanbanError") {
-    const { code, detail } = failure as { code?: unknown; detail?: unknown };
-    const text = typeof detail === "string" ? detail : "";
+    const { code, detail, reason, revision } = failure as {
+      code?: unknown;
+      detail?: unknown;
+      reason?: unknown;
+      revision?: unknown;
+    };
+    const said = text(detail);
     if (code === "denied") {
-      // The server's own sentence: it says what to do on a device that is not paired as his.
-      const { reason } = failure as { reason?: unknown };
       return {
-        message: text === "" ? NOT_THE_OWNER.message : text,
+        message: said || "Only the owner answers this.",
         stale: false,
         field: null,
         notOwner: { device: reason === "not_owner_device" },
       };
     }
-    // A refusal that names the revision the ask is at means the one he read is gone.
-    if (code === "conflict" || code === "not-found" || /\bIt is at revision \d+/.test(text)) {
+    // A refusal that carries the revision the ask is at means the one he read is gone.
+    if (code === "conflict" || code === "not-found" || typeof revision === "number") {
       return {
         message: "It changed while you were answering. Type the secret again.",
         stale: true,
@@ -132,11 +145,11 @@ export function askSecretFailure(failure: unknown): AskSecretFailure {
     }
     return {
       message:
-        text === ""
+        said === ""
           ? "The answer was refused."
-          : `${text.charAt(0).toUpperCase()}${text.slice(1)}.`,
+          : `${said.charAt(0).toUpperCase()}${said.slice(1)}.`,
       stale: false,
-      field: /field "([^"]+)"/.exec(text)?.[1] ?? null,
+      field: /field "([^"]+)"/.exec(said)?.[1] ?? null,
     };
   }
   if (tag === "SecretRequestError") {

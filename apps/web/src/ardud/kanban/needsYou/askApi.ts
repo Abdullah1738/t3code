@@ -75,18 +75,13 @@ export class AskApiError extends Error {
 export const askFailureText = (error: unknown): string =>
   error instanceof Error && error.message !== "" ? error.message : "Robob did not confirm it.";
 
-/**
- * The revision a refusal says the ask is at. The server says it in words
- * ("It is at revision 3", on an answer that named none); a field is read too,
- * should it start sending one.
- */
+/** The revision a refusal says the ask is at now: its `revision` field. */
 const revisionIn = (error: unknown): number | null => {
   if (typeof error !== "object" || error === null) return null;
-  const { revision, currentRevision, message } = error as Record<string, unknown>;
-  const value = typeof currentRevision === "number" ? currentRevision : revision;
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
-  const said = typeof message === "string" ? /\bIt is at revision (\d+)/.exec(message) : null;
-  return said ? Number(said[1]) : null;
+  const { revision } = error as { revision?: unknown };
+  return typeof revision === "number" && Number.isInteger(revision) && revision >= 0
+    ? revision
+    : null;
 };
 
 interface CallOptions {
@@ -200,17 +195,37 @@ export interface AskBatchResult {
         readonly card: string;
         readonly askId: string;
         readonly ok: false;
-        readonly error: { readonly code: string; readonly message: string };
+        readonly error: {
+          readonly code: string;
+          readonly message: string;
+          readonly reason?: string;
+          /** The revision the ask is at now, on a refusal of an older one. */
+          readonly revision?: number;
+        };
       }
   >;
 }
 
+export interface AskEvaluatorStart {
+  readonly started: boolean;
+  readonly threadId: string | null;
+  readonly error: string | null;
+}
+
+/** Several asks handed over in one request. With `always`: one evaluator thread per board. */
+export interface AskHandBatchResult {
+  readonly handed: number;
+  readonly results: AskBatchResult["results"];
+  readonly evaluators?: ReadonlyArray<
+    AskEvaluatorStart & {
+      readonly board: string;
+      readonly asks: ReadonlyArray<{ readonly card: string; readonly askId: string }>;
+    }
+  >;
+}
+
 export interface AskHanded extends AskAnswered {
-  readonly evaluator?: {
-    readonly started: boolean;
-    readonly threadId: string | null;
-    readonly error: string | null;
-  };
+  readonly evaluator?: AskEvaluatorStart;
 }
 
 export const askApi = {
@@ -286,6 +301,19 @@ export const askApi = {
     },
     keepalive = false,
   ) => call<AskHanded>("POST", `${cardPath(cardRef, askId)}/hand`, { body: input, keepalive }),
+  /**
+   * Hands several asks over at once. An ask that can't be handed does not stop
+   * the rest; `always` with words that are too long is refused whole.
+   */
+  handBatch: (
+    items: ReadonlyArray<AskBatchItem>,
+    input: { readonly always?: boolean; readonly text?: string },
+    keepalive = false,
+  ) =>
+    call<AskHandBatchResult>("POST", "/asks/hand", {
+      body: { ...input, items: items.map(({ card, askId }) => ({ card, askId })) },
+      keepalive,
+    }),
   /** Puts an ask away until a time; `null` brings it back. */
   snooze: (cardRef: string, askId: string, until: string | null) =>
     call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/snooze`, { body: { until } }),

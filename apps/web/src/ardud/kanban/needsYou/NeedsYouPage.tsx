@@ -17,7 +17,12 @@ import {
   type NeedsYouItem,
   type NeedsYouMark,
 } from "@t3tools/client-runtime/ardud/kanban";
-import { kanbanAskChanges, kanbanAskResponse, type KanbanAskFeedItem } from "@t3tools/contracts";
+import {
+  kanbanAskChanges,
+  kanbanAskResponse,
+  type EnvironmentId,
+  type KanbanAskFeedItem,
+} from "@t3tools/contracts";
 import { HistoryIcon, KeyboardIcon, ListIcon, ShapesIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -26,6 +31,8 @@ import { WorkspacePageHeader } from "../../../components/WorkspacePageHeader";
 import { isElectron } from "../../../env";
 import { useStableCallback } from "../../../hooks/useStableCallback";
 import { cn } from "../../../lib/utils";
+import { usePrimaryEnvironmentId } from "../../../state/environments";
+import { useEnvironmentSessionState } from "../../../state/session";
 import { CardDrawer, noteDrawerOpener } from "../CardDrawer";
 import { useBoardState, useBoards } from "../kanbanStore";
 import { KanbanLinksProvider } from "../links";
@@ -36,6 +43,7 @@ import { AskToastView } from "./AskToast";
 import {
   askKey,
   flushAskSends,
+  noteOwnerStanding,
   noteAskFocus,
   refreshAsks,
   undoAskSend,
@@ -111,6 +119,7 @@ export function NeedsYouPage(props: {
   const [card, setCard] = useState<{ boardId: string; cardId: string } | null>(null);
 
   useEffect(() => watchAsks(true), []);
+  const environmentId = usePrimaryEnvironmentId();
   // A held answer goes out when he leaves the page or closes the tab.
   useEffect(() => {
     const leave = () => flushAskSends(true);
@@ -557,6 +566,7 @@ export function NeedsYouPage(props: {
         </div>
       </div>
 
+      {environmentId === null ? null : <OwnerStanding environmentId={environmentId} />}
       <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       <Layer
         open={queueOpen && layout === "phone"}
@@ -591,6 +601,18 @@ export function NeedsYouPage(props: {
       </Layer>
     </SidebarInset>
   );
+}
+
+/**
+ * Tells the page whether this session is the owner's, from the session state
+ * the app already holds. A session that is not shows the pairing notice before
+ * he answers anything.
+ */
+function OwnerStanding(props: { environmentId: EnvironmentId }) {
+  const session = useEnvironmentSessionState(props.environmentId).data;
+  const owner = session?.authenticated ? session.owner : undefined;
+  useEffect(() => noteOwnerStanding(owner), [owner]);
+  return null;
 }
 
 /** The card behind an ask, opened in place; its board is read only when asked for. */

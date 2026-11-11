@@ -57,9 +57,9 @@ describe("sanitizeBoardColumnPrefs", () => {
   });
 
   it("keeps a valid group width", () => {
-    expect(
-      sanitizeBoardColumnPrefs({ widths: {}, hidden: [], groupWidth: 320 }).groupWidth,
-    ).toBe(320);
+    expect(sanitizeBoardColumnPrefs({ widths: {}, hidden: [], groupWidth: 320 }).groupWidth).toBe(
+      320,
+    );
   });
 });
 

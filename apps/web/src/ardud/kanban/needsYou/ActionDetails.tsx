@@ -44,13 +44,12 @@ export function ActionDetails(props: { action: KanbanAskAction }) {
       </span>,
     ]);
   }
-  // What its agent does right after a yes. Read loosely: older servers do not send it.
-  const then = (action as { readonly then?: unknown }).then;
-  if (typeof then === "string" && then.trim() !== "") {
+  // What its agent does right after a yes.
+  if (action.then && action.then.trim() !== "") {
     rows.push([
       "Then",
       <span key="then" className="[overflow-wrap:anywhere]">
-        {then}
+        {action.then}
       </span>,
     ]);
   }

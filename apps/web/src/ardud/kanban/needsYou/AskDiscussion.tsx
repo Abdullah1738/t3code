@@ -1,9 +1,11 @@
 import {
   askDiscussion,
   askReplyProblem,
+  askThread,
   type KanbanBoardState,
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskFeedItem } from "@t3tools/contracts";
+import { ChevronRightIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Composer, Message } from "../Chat";
@@ -26,24 +28,48 @@ export function AskDiscussion(props: {
   onOpenCard: (cardId: string) => void;
 }) {
   const { entry } = props;
+  // What was said counts; older versions of the ask sit between, folded away.
   const messages = askDiscussion(entry);
+  const thread = askThread(entry);
   // A reply over a limit is told here, beside the composer that still holds it.
   const [problem, setProblem] = useState<string | null>(null);
-  if (!props.sheet && messages.length === 0 && !props.open && !props.waiting) return null;
+  if (!props.sheet && thread.length === 0 && !props.open && !props.waiting) return null;
   const talk = (
     <>
-      {messages.length > 0 ? (
+      {thread.length > 0 ? (
         <div className="flex flex-col gap-3">
-          {messages.map((message) => (
-            <Message
-              key={message.seq}
-              boardId={entry.boardId}
-              message={message}
-              cards={NO_CARDS}
-              seen={undefined}
-              onOpenCard={props.onOpenCard}
-            />
-          ))}
+          {thread.map(({ message, earlier }) =>
+            earlier ? (
+              <details key={message.seq} className="group rounded-xl ring-1 ring-(--m-rule)">
+                <summary className="flex cursor-pointer list-none items-center gap-2 rounded-xl px-3.5 py-2 text-sm text-(--m-muted) outline-none hover:bg-(--m-surface) focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--m-accent) pointer-coarse:min-h-11 [&::-webkit-details-marker]:hidden">
+                  <ChevronRightIcon
+                    aria-hidden
+                    className="size-4 shrink-0 transition-transform duration-150 group-open:rotate-90"
+                  />
+                  Earlier version
+                </summary>
+                {/* What it asked then, to read: its buttons no longer answer anything. */}
+                <div inert className="border-t border-(--m-rule) px-3.5 py-3 opacity-80">
+                  <Message
+                    boardId={entry.boardId}
+                    message={message}
+                    cards={NO_CARDS}
+                    seen={undefined}
+                    onOpenCard={props.onOpenCard}
+                  />
+                </div>
+              </details>
+            ) : (
+              <Message
+                key={message.seq}
+                boardId={entry.boardId}
+                message={message}
+                cards={NO_CARDS}
+                seen={undefined}
+                onOpenCard={props.onOpenCard}
+              />
+            ),
+          )}
         </div>
       ) : props.sheet ? (
         <p className="text-sm text-(--m-muted)">Nothing said yet.</p>
