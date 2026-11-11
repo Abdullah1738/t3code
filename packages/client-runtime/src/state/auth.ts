@@ -42,15 +42,21 @@ export function applyAuthAccessStreamEvent(
         ...current,
         pairingLinks: current.pairingLinks.filter((value) => value.id !== event.payload.id),
       };
-    case "clientUpserted":
+    case "clientUpserted": {
+      // ardud: a change event does not say whether the session is the owner's.
+      // That never changes for a session, so what the snapshot said still holds.
+      const known = current.clientSessions.find(
+        (value) => value.sessionId === event.payload.sessionId,
+      )?.owner;
+      const next =
+        event.payload.owner === undefined && known !== undefined
+          ? { ...event.payload, owner: known }
+          : event.payload;
       return {
         ...current,
-        clientSessions: upsertByKey(
-          current.clientSessions,
-          event.payload,
-          (value) => value.sessionId,
-        ),
+        clientSessions: upsertByKey(current.clientSessions, next, (value) => value.sessionId),
       };
+    }
     case "clientRemoved":
       return {
         ...current,
