@@ -235,6 +235,21 @@ export function createAskStateCell(initial: AskState = INITIAL_ASK_STATE): AskSt
   };
 }
 
+/**
+ * Whether an ask is no longer what he answered: it was edited (its revision
+ * moved), it expired, it was handed to the evaluator or it was put away. An
+ * answer given before that is out of date. It is never sent again as it is,
+ * by itself or by Retry: he reads the ask again and answers it again.
+ */
+export const askMovedSince = (
+  entry: Pick<KanbanAskFeedItem, "revision" | "expired" | "waitsOn" | "snoozed">,
+  ref: Pick<AskSendRef, "revision">,
+): boolean =>
+  entry.revision !== ref.revision ||
+  entry.expired ||
+  entry.waitsOn === "evaluator" ||
+  entry.snoozed === true;
+
 /** At most this many times an answer that never reached the server goes again by itself. */
 export const ASK_AUTO_RETRY_MAX = 3;
 
@@ -352,6 +367,25 @@ export function createAskStore(host: AskStoreHost) {
   let sendId = 0;
   const sending = new Set<number>();
 
+  /**
+   * The answers that did not go whose ask has moved since he gave them
+   * (`askMovedSince`), against the open asks as last read. An ask that is not
+   * among those is not judged here: it closed, or it could not be read.
+   */
+  const movedFailed = (
+    failed: AskState["failed"],
+    open: ReadonlyArray<KanbanAskFeedItem>,
+  ): ReadonlyArray<string> => {
+    const keys = Object.keys(failed);
+    if (keys.length === 0) return [];
+    const now = new Map(open.map((entry) => [askKey(entry), entry]));
+    return keys.filter((key) => {
+      const ref = failed[key]!.send.refs.find((item) => item.key === key);
+      const entry = now.get(key);
+      return ref !== undefined && entry !== undefined && askMovedSince(entry, ref);
+    });
+  };
+
   function mergeFeed(feed: AskFeedRead) {
     const state = get();
     const before = new Map((state.feed?.open ?? []).map((entry) => [askKey(entry), entry]));
@@ -392,6 +426,12 @@ export function createAskStore(host: AskStoreHost) {
       if (!live) delete hidden[key];
     }
     for (const key of Object.keys(marks)) if (gone(key)) delete marks[key];
+    const failed = without(state.failed, Object.keys(state.failed).filter(gone));
+    // An answer that did not go, for an ask that has moved since: it is out of
+    // date now, so it is no longer kept to go again, by itself or by Retry.
+    // What he filled in stays as the ask's draft, and the ask shows as updated.
+    const moved = movedFailed(failed, feed.open);
+    for (const key of moved) marks[key] = "updated";
     set({
       feed,
       unreadable,
@@ -402,8 +442,14 @@ export function createAskStore(host: AskStoreHost) {
       previous,
       forms,
       hidden,
-      failed: without(state.failed, Object.keys(state.failed).filter(gone)),
+      failed: without(failed, moved),
+      ...(moved.some((key) => state.refused[key] !== undefined)
+        ? { refused: without(state.refused, moved) }
+        : {}),
     });
+    // "Retry" on a toast for one of them would send nothing: the toast goes.
+    const retryKey = get().toast?.retryKey;
+    if (retryKey !== undefined && moved.includes(retryKey)) dismissAskToast();
   }
 
   /** Reads the feed again. Calls that arrive while one is running fold into one more. */
@@ -998,12 +1044,36 @@ export function createAskStore(host: AskStoreHost) {
    * has already gone by itself `max` times stays for him to retry by hand: the
    * count rides on the answer, so it holds while the answer is on its way too.
    * With `only`, just the answers it picks go (the host decides which are due).
+   *
+   * Nothing out of date goes from here. Before each one goes, its asks are
+   * held against the open asks as last read: an answer whose ask has moved
+   * (`askMovedSince`) leaves the failed list with his draft kept and the ask
+   * marked updated, and an answer whose ask can't be compared (no feed read
+   * yet, or the ask is not among the ones that read) waits where it is.
    */
   function retryUnreachedAskSends(
     max: number = ASK_AUTO_RETRY_MAX,
     only?: (send: AskSend) => boolean,
   ): number {
     if (disposed) return 0;
+    const feed = get().feed;
+    if (feed === null) return 0;
+    const moved = movedFailed(get().failed, feed.open);
+    if (moved.length > 0) {
+      const state = get();
+      const marks = { ...state.marks };
+      for (const key of moved) marks[key] = "updated";
+      set({
+        failed: without(state.failed, moved),
+        marks,
+        ...(moved.some((key) => state.refused[key] !== undefined)
+          ? { refused: without(state.refused, moved) }
+          : {}),
+      });
+      const retryKey = get().toast?.retryKey;
+      if (retryKey !== undefined && moved.includes(retryKey)) dismissAskToast();
+    }
+    const open = new Set(feed.open.map(askKey));
     const seen = new Set<number>();
     let count = 0;
     for (const [key, failed] of Object.entries(get().failed)) {
@@ -1013,6 +1083,11 @@ export function createAskStore(host: AskStoreHost) {
       // A batch sits under each of its asks: one retry covers them all.
       seen.add(failed.send.id);
       if (get().failed[key] === undefined) continue;
+      // Every ask it would go for is open and as he answered it, or it does not go by itself.
+      const current = failed.send.refs
+        .filter((ref) => get().failed[ref.key] !== undefined)
+        .every((ref) => open.has(ref.key));
+      if (!current) continue;
       retryAskSend(key, true);
       count += 1;
     }

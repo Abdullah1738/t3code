@@ -148,8 +148,16 @@ when it is a web address.
 The feed, one ask read whole and one message read whole come over HTTP and are read through
 the same schemas as a card (`askApi.ts` in the shared runtime, used by the web page too). A
 block of a kind this build doesn't know becomes its one-line stand-in and nothing of it is
-kept; anything else that doesn't fit is refused whole and the page shows the error with Retry,
-never an empty queue. An ask that comes again unchanged is not read through the schema again.
+kept. Anything else that doesn't fit is refused one thing at a time. An ask in the feed that
+can't be read is set aside and every other ask loads; it is never taken for closed or
+answered (it stays in the count, and nothing of his on it is cleared), and the queue says one
+quiet line, "1 ask can't be shown in this version of Robob", with its card to open
+(`UnreadableLine`). One ask or one message that can't be read whole is an error on that ask or
+message, with Retry. Only a feed with no readable shape at all is an error for the page, and
+then what was read before stays: never an empty queue.
+
+A poll that brings the same text again is not parsed at all, and in a changed feed an ask that
+comes again unchanged is not read through the schema again.
 
 ## Offline
 
@@ -162,3 +170,11 @@ count, so a dead connection is not hammered. The count is on the answer (`autoRe
 it holds while the answer is on its way; after that the band says it no longer goes by itself.
 Retry by hand always works. Nothing is written to disk, and nothing unsent survives a change
 of server.
+
+An answer that is out of date is never sent again, by itself or by Retry. When a good read
+shows that the ask of an unsent answer has moved since he gave it (edited, expired, handed to
+the evaluator or put away: `askMovedSince` in the shared store, so the web follows the same
+rule), the answer leaves "Not sent", what he filled in stays as the ask's draft, and the ask
+shows as updated for him to read and answer again. The same check runs before every automatic
+retry. An ask that can't be compared (it no longer reads in this build) waits: nothing goes
+for it by itself.

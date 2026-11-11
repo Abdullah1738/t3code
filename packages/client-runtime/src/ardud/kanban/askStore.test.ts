@@ -371,6 +371,180 @@ describe("automatic retries", () => {
   });
 });
 
+describe("an answer that did not go, for an ask that has moved since", () => {
+  const OFFLINE = () => new AskApiError(0, "network", "Robob did not answer.");
+
+  /** He answers ask 1 as he read it (revision 0); the answer never reaches the server. */
+  const unsent = async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask, entry(2)]);
+    await h.store.refreshAsks();
+    h.store.patchAskForm(ask, { note: "ship after lunch" });
+    h.fail.answer = OFFLINE();
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await settle();
+    expect(h.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(h.cell.getState().toast?.retryKey).toBe(askKey(ask));
+    expect(h.named("answer")).toHaveLength(1);
+    // The connection is back: a send from here on would get through.
+    delete h.fail.answer;
+    return { h, ask, key: askKey(ask) };
+  };
+
+  it.each([
+    ["was edited", entry(1, { revision: 1 })],
+    ["expired", entry(1, {}, { expired: true })],
+    ["was handed to the evaluator", entry(1, {}, { waitsOn: "evaluator" })],
+    ["was put away", entry(1, {}, { snoozed: true })],
+  ])(
+    "an ask that %s: the answer is not sent again, his draft stays, the ask shows as updated",
+    async (_how, now) => {
+      const { h, ask, key } = await unsent();
+      h.setFeed([now, entry(2)]);
+      await h.store.refreshAsks();
+      const state = h.cell.getState();
+      // Out of automatic retry, and nothing left for Retry to send.
+      expect(state.failed).toEqual({});
+      expect(askAutoRetryOwed(state)).toBe(false);
+      expect(state.marks[key]).toBe("updated");
+      expect(state.toast?.retryKey).toBeUndefined();
+      // What he filled in is still the ask's draft.
+      expect(askFormOf(state, ask).note).toBe("ship after lunch");
+      expect(askFormOf(state, now).note).toBe("ship after lunch");
+
+      expect(h.store.retryUnreachedAskSends()).toBe(0);
+      h.store.retryAskSend(key);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(h.named("answer")).toHaveLength(1);
+      expect(h.cell.getState().hidden).toEqual({});
+    },
+  );
+
+  it("an ask that closed: the answer is dropped and nothing is sent", async () => {
+    const { h } = await unsent();
+    h.setFeed([entry(2)]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().failed).toEqual({});
+    expect(h.cell.getState().marks).toEqual({});
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+    await settle();
+    expect(h.named("answer")).toHaveLength(1);
+  });
+
+  it("an ask that is as he answered it: the answer goes again, with the revision he read", async () => {
+    const { h, ask } = await unsent();
+    // Other things about it moved (an agent spoke), but not what he answered.
+    h.setFeed([entry(1, {}, { priority: 1 }), entry(2, { revision: 4 })]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+    expect(h.store.retryUnreachedAskSends()).toBe(1);
+    await settle();
+    expect(h.named("answer")).toHaveLength(2);
+    expect(h.named("answer")[1]!.args[3]).toBe(0);
+    expect(h.cell.getState().failed).toEqual({});
+  });
+
+  it("is checked before each retry too, when the ask moved before the answer failed", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.store.patchAskForm(ask, { note: "ship after lunch" });
+    h.store.answerAsk(ask, "primary");
+    // While the answer is held for undo, a read shows the ask edited.
+    h.setFeed([entry(1, { revision: 1 })]);
+    await h.store.refreshAsks();
+    // Then the connection drops: the answer never reaches the server, and neither does a read.
+    h.fail.answer = OFFLINE();
+    h.fail.feed = OFFLINE();
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await settle();
+    const key = askKey(ask);
+    expect(h.cell.getState().failed[key]?.unreached).toBe(true);
+    expect(h.cell.getState().failed[key]?.send.refs[0]?.revision).toBe(0);
+
+    // No read has come since, and the store already knows the ask is at revision 1.
+    delete h.fail.answer;
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+    await settle();
+    expect(h.named("answer")).toHaveLength(1);
+    const state = h.cell.getState();
+    expect(state.failed).toEqual({});
+    expect(state.marks[key]).toBe("updated");
+    expect(state.toast?.retryKey).toBeUndefined();
+    expect(askFormOf(state, ask).note).toBe("ship after lunch");
+  });
+
+  it("an ask that can't be compared waits: nothing goes by itself, Retry by hand stays", async () => {
+    const { h, key } = await unsent();
+    // The ask now comes in a shape this build can't read: its revision is not known.
+    h.setFeedRead({ ...feedOf([entry(2)]), unreadable: { open: [lost(1)], closed: [] } });
+    await h.store.refreshAsks();
+    expect(h.cell.getState().failed[key]?.unreached).toBe(true);
+    expect(h.store.retryUnreachedAskSends()).toBe(0);
+    await settle();
+    expect(h.named("answer")).toHaveLength(1);
+    expect(h.cell.getState().failed[key]?.unreached).toBe(true);
+    expect(h.cell.getState().marks[key]).toBe("failed");
+
+    // It reads again, unchanged: now it goes.
+    h.setFeed([entry(1), entry(2)]);
+    await h.store.refreshAsks();
+    expect(h.store.retryUnreachedAskSends()).toBe(1);
+    await settle();
+    expect(h.named("answer")).toHaveLength(2);
+  });
+
+  it("a batch goes again without the ask that moved", async () => {
+    const h = harness();
+    const asks = [entry(1), entry(2), entry(3)];
+    h.setFeed(asks);
+    await h.store.refreshAsks();
+    h.fail.answerBatch = OFFLINE();
+    h.store.answerAskBatch(asks, "batch:b1:k", { verdict: "approved" }, "Approved", "3 alike");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await settle();
+    expect(Object.keys(h.cell.getState().failed)).toHaveLength(3);
+
+    delete h.fail.answerBatch;
+    h.results.answerBatch = { answered: 2, results: [] };
+    h.setFeed([entry(1), entry(2, { revision: 1 }), entry(3)]);
+    await h.store.refreshAsks();
+    expect(Object.keys(h.cell.getState().failed).toSorted()).toEqual(["c1:q1", "c3:q1"]);
+    expect(h.cell.getState().marks["c2:q1"]).toBe("updated");
+
+    expect(h.store.retryUnreachedAskSends()).toBe(1);
+    await settle();
+    expect(h.named("answerBatch")).toHaveLength(2);
+    expect(h.named("answerBatch")[1]!.args[1]).toEqual([
+      { card: "robob:1", askId: "q1", revision: 0 },
+      { card: "robob:3", askId: "q1", revision: 0 },
+    ]);
+  });
+
+  it("the same for an answer the server did take and fail: Retry has nothing out of date to send", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    h.fail.answer = new AskApiError(500, "internal", "Robob failed.");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    await settle();
+    expect(h.cell.getState().failed[askKey(ask)]?.unreached).toBeUndefined();
+
+    h.setFeed([entry(1, { revision: 1 })]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().failed).toEqual({});
+    expect(h.cell.getState().marks[askKey(ask)]).toBe("updated");
+    h.store.retryAskSend(askKey(ask));
+    await settle();
+    expect(h.named("answer")).toHaveLength(1);
+  });
+});
+
 describe("a store whose server is gone", () => {
   it("drops the held answer: it is never sent", async () => {
     const h = harness();
