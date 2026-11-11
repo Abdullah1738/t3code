@@ -1869,6 +1869,19 @@ export const layerWsRpc = (
       const loadServerConfig = Effect.fn("ws.loadServerConfig")(function* (options: {
         readonly usageLimitsCommand: boolean;
       }) {
+        // ardud: the three host discoveries each have a 5 s budget and used to run one
+        // after another, inside the client's 15 s connection-setup budget. Start them
+        // together, before the other reads.
+        const discovery = yield* Effect.all(
+          {
+            availableEditors: resolveAvailableEditorsForConfig(
+              externalLauncher.resolveAvailableEditors(),
+            ),
+            remoteOpenTargets: resolveAvailableEditorsForConfig(remoteOpenTargets.resolveTargets()),
+            directEndpoints: resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          },
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const currentProviders = yield* providerRegistry.getProviders;
         const providers = options.usageLimitsCommand
@@ -1880,8 +1893,9 @@ export const layerWsRpc = (
         const environment = yield* serverEnvironment.getDescriptor;
         const auth = yield* serverAuth.getDescriptor();
         const scratchWorkspaceRoot = yield* managedFolders.scratchRoot;
+        const discovered = yield* Fiber.join(discovery);
         const editorConfig = yield* resolveEditorConfig(
-          yield* resolveAvailableEditorsForConfig(externalLauncher.resolveAvailableEditors()),
+          discovered.availableEditors,
           resolveFileManagerRevealKindForConfig(externalLauncher.resolveFileManagerRevealKind()),
         );
 
@@ -1894,10 +1908,8 @@ export const layerWsRpc = (
           issues: keybindingsConfig.issues,
           providers,
           ...editorConfig,
-          remoteOpenTargets: yield* resolveAvailableEditorsForConfig(
-            remoteOpenTargets.resolveTargets(),
-          ),
-          directEndpoints: yield* resolveAvailableEditorsForConfig(directEndpoints.resolve()),
+          remoteOpenTargets: discovered.remoteOpenTargets,
+          directEndpoints: discovered.directEndpoints,
           observability: {
             logsDirectoryPath: config.logsDir,
             localTracingEnabled: true,
