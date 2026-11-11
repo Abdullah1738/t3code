@@ -87,6 +87,14 @@ export function OptionList(props: {
     });
   };
   const full = choose.multi && form.optionIds.length >= choose.max;
+  // One answer: the group is a single tab stop, on the picked option or else the first.
+  const stop = own
+    ? choose.options.length
+    : Math.max(
+        0,
+        choose.options.findIndex((option) => form.optionIds.includes(option.id)),
+      );
+  const tabStop = (index: number) => (choose.multi ? undefined : index === stop ? 0 : -1);
 
   return (
     // Picture options go two abreast by the room the reader has, not by the window's width.
@@ -105,20 +113,32 @@ export function OptionList(props: {
         aria-label="Options"
         aria-describedby={props.problem ? problemId : undefined}
         onKeyDown={(event) => {
-          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          const step =
+            event.key === "ArrowDown" || event.key === "ArrowRight"
+              ? 1
+              : event.key === "ArrowUp" || event.key === "ArrowLeft"
+                ? -1
+                : 0;
+          if (step === 0) return;
           const options = [
             ...event.currentTarget.querySelectorAll<HTMLElement>("[data-ny-option]"),
           ];
           const at = options.indexOf(document.activeElement as HTMLElement);
           if (at === -1) return;
           event.preventDefault();
-          const step = event.key === "ArrowDown" ? 1 : -1;
-          options[(at + step + options.length) % options.length]?.focus();
+          const next = (at + step + options.length) % options.length;
+          options[next]?.focus();
+          // With one answer the arrows pick as they go, like any radio group. They never open
+          // "Your own answer" and never throw away words typed there.
+          const option = choose.options[next];
+          if (choose.multi || props.disabled || !option || form.ownWords !== "") return;
+          setOwnOpen(false);
+          patchAskForm(entry, { optionIds: [option.id] });
         }}
         className={cn(
           "grid gap-2",
           pictures && "@md:grid-cols-2",
-          pictures && choose.options.length % 3 === 0 && "@3xl:grid-cols-3",
+          pictures && choose.options.length % 3 === 0 && "@lg:grid-cols-3",
         )}
       >
         {choose.options.map((option, index) => {
@@ -131,11 +151,13 @@ export function OptionList(props: {
               role={choose.multi ? "checkbox" : "radio"}
               aria-checked={checked}
               aria-disabled={blocked || undefined}
+              tabIndex={tabStop(index)}
               data-ny-at={index === 0 ? "choose" : undefined}
               data-ny-option={index}
               onClick={() => toggle(option.id)}
               className={cn(
-                "grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent)",
+                // No key cap on a touch screen, so one column fewer there.
+                "grid grid-cols-[auto_minmax(0,1fr)_auto] content-start items-start gap-x-3 gap-y-1 rounded-xl px-3.5 py-3 text-start outline-none ring-1 ring-inset focus-visible:ring-2 focus-visible:ring-(--m-accent) pointer-coarse:grid-cols-[minmax(0,1fr)_auto]",
                 checked
                   ? "bg-(--m-band) ring-2 ring-(--m-accent) focus-visible:ring-(--m-text)"
                   : "ring-(--ny-edge) hover:bg-(--m-surface)",
@@ -143,25 +165,31 @@ export function OptionList(props: {
               )}
             >
               {pictures && option.block !== undefined ? (
-                <span className="col-span-3 mb-1.5 block overflow-hidden rounded-lg">
+                <span className="col-span-3 mb-1.5 block overflow-hidden rounded-lg pointer-coarse:col-span-2">
                   {props.renderBlock!(option.block)}
                 </span>
               ) : null}
               <Key className="mt-0.5">{index + 1}</Key>
               <span className="font-medium [overflow-wrap:anywhere]">{option.label}</span>
               <span className="flex items-center gap-2">
-                {option.recommended ? <Pill tone="accent">Recommended</Pill> : null}
+                {option.recommended && !pictures ? <Pill tone="accent">Recommended</Pill> : null}
                 {checked ? (
                   <CheckIcon aria-hidden className="size-4 text-(--m-accent-text)" />
                 ) : null}
               </span>
+              {/* Under a picture the tile is narrow: the mark gets a line of its own, so the label stays whole. */}
+              {option.recommended && pictures ? (
+                <span className="col-span-2 col-start-2 pointer-coarse:col-start-1">
+                  <Pill tone="accent">Recommended</Pill>
+                </span>
+              ) : null}
               {option.detail ? (
-                <span className="col-span-2 col-start-2 text-sm text-(--m-muted) [overflow-wrap:anywhere] pointer-coarse:col-span-3 pointer-coarse:col-start-1">
+                <span className="col-span-2 col-start-2 text-sm text-(--m-muted) [overflow-wrap:anywhere] pointer-coarse:col-start-1">
                   {option.detail}
                 </span>
               ) : null}
               {checked && option.consequence ? (
-                <span className="col-span-2 col-start-2 flex gap-1.5 text-sm [overflow-wrap:anywhere] pointer-coarse:col-span-3 pointer-coarse:col-start-1">
+                <span className="col-span-2 col-start-2 flex gap-1.5 text-sm [overflow-wrap:anywhere] pointer-coarse:col-start-1">
                   <CornerDownRightIcon
                     aria-hidden
                     className="mt-0.5 size-3.5 shrink-0 text-(--m-muted)"
@@ -176,6 +204,8 @@ export function OptionList(props: {
           <div
             className={cn(
               "relative grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-2 rounded-xl px-3.5 py-3 ring-1 ring-inset",
+              // Among picture tiles it is a row of its own, not a tall empty tile.
+              pictures && "col-span-full",
               own
                 ? "bg-(--m-band) ring-2 ring-(--m-accent)"
                 : "ring-(--ny-edge) hover:bg-(--m-surface)",
@@ -186,6 +216,7 @@ export function OptionList(props: {
               type="button"
               role="radio"
               aria-checked={own}
+              tabIndex={tabStop(choose.options.length)}
               data-ny-option={choose.options.length}
               disabled={props.disabled}
               onClick={() => {

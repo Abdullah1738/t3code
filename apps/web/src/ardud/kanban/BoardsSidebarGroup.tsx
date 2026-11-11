@@ -93,6 +93,7 @@ function NeedsYouRow(props: { onNavigate: () => void }) {
       if (
         entry.waitsOn === "owner" &&
         !entry.expired &&
+        !entry.snoozed &&
         entry.ask.respond?.ack !== true &&
         state.hidden[askKey(entry)] === undefined
       ) {

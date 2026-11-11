@@ -351,6 +351,7 @@ export function AskReader(props: {
       entry={entry}
       item={item}
       turn={turn}
+      twoUp={layout === "tablet"}
       onOpenCard={props.onOpenCard}
       handOver={
         canTalk && !response.ack && response.task === null && ask.to !== "evaluator" ? (
@@ -554,7 +555,7 @@ export function AskReader(props: {
                         media={media}
                         index={index}
                         onOpen={setViewing}
-                        className="h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
+                        className="aspect-[4/3] max-h-44 w-full max-w-none rounded-none bg-(--m-surface) object-contain"
                       />
                     )}
                   />
@@ -850,7 +851,8 @@ function StatePills(props: {
         Out of date
       </Pill>,
     );
-  if (props.mark === "back") {
+  // The band under the title says it, with the time; the pill is only for when there is no band.
+  if (props.mark === "back" && !item.backFromSnoozeAt) {
     pills.push(
       <Pill key="back" tone="accent">
         Back from snooze
@@ -918,6 +920,8 @@ function AskFacts(props: {
   entry: KanbanAskFeedItem;
   item: NeedsYouItem;
   turn: AskTurn;
+  /** Under the ask at tablet width: two abreast, no rules between. */
+  twoUp: boolean;
   onOpenCard: () => void;
   handOver: ReactNode;
 }) {
@@ -935,7 +939,15 @@ function AskFacts(props: {
     facts.push(["Edited", entry.revision === 1 ? "Once" : `${entry.revision} times`]);
   }
   return (
-    <aside aria-label="About this ask" className="flex min-w-0 flex-col gap-4 text-sm">
+    <aside
+      aria-label="About this ask"
+      className={cn(
+        "min-w-0 text-sm",
+        props.twoUp
+          ? "grid grid-cols-2 gap-x-6 gap-y-5 *:border-t-0 *:pt-0"
+          : "flex flex-col gap-4",
+      )}
+    >
       <div>
         <Label className="mb-2">Card</Label>
         <button

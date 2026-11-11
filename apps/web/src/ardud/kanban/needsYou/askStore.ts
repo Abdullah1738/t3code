@@ -633,7 +633,7 @@ const baseSend = (
 ): Omit<AskSend, "kind" | "refs" | "body" | "label"> => ({
   id: ++sendId,
   focusKey,
-  title: entry.ask.title ?? entry.ask.text,
+  title: entry.ask.title ?? entry.cardTitle,
   boardId: entry.boardId,
   boardName: entry.boardName,
   cardNumber: entry.cardNumber,
