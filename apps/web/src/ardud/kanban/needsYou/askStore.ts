@@ -116,6 +116,12 @@ interface AskState {
   /** Asks read whole (their big blocks are stubs in the feed), by `key@revision`. */
   readonly details: Readonly<Record<string, KanbanOwnerAsk>>;
   readonly toast: AskToast | null;
+  /**
+   * The server said this session is not the owner's own, in its words.
+   * `device`: a paired device that has to be paired again. While it stands,
+   * nothing is held for Undo or offered for Retry: it could not succeed.
+   */
+  readonly notOwner: { readonly text: string; readonly device: boolean } | null;
   /** How change asks show their texts; kept as he steps from ask to ask. */
   readonly changeView: ChangeView;
 }
@@ -137,6 +143,7 @@ const INITIAL: AskState = {
   sent: [],
   details: {},
   toast: null,
+  notOwner: null,
   changeView: "after",
 };
 
@@ -384,17 +391,40 @@ const refLabel = (send: AskSend) =>
       ? send.boardName
       : `${send.boardName} #${send.cardNumber}`;
 
+type NotOwner = NonNullable<AskState["notOwner"]>;
+
+const notOwnerOf = (error: unknown): NotOwner | null =>
+  error instanceof AskApiError && error.denied
+    ? { text: error.message, device: error.notOwnerDevice }
+    : null;
+
+/** Remembers a "not the owner's session" refusal, whichever call met it. */
+const noteRefusal = (error: unknown) => {
+  const notOwner = notOwnerOf(error);
+  if (notOwner !== null) set({ notOwner });
+};
+
+/** The secret call met the same refusal over its own channel. */
+export const noteAskNotOwner = (text: string, device: boolean) =>
+  set({ notOwner: { text, device } });
+
 /** One ask's send was refused: it comes back to the queue with what he typed. */
 function giveBack(send: AskSend, ref: AskSendRef, error: unknown) {
   const state = get();
   const hidden = without(state.hidden, [ref.key]);
+  const notOwner = notOwnerOf(error);
+  if (notOwner !== null) {
+    // Not his own session: the ask is back as he left it, and there is nothing to retry.
+    set({ hidden, notOwner });
+    return "denied" as const;
+  }
   if (error instanceof AskApiError && error.stale) {
     // The ask changed or closed since he read it: read it again and keep his form.
     set({ hidden, marks: { ...state.marks, [ref.key]: "updated" } });
     return "stale" as const;
   }
   const message = askFailureText(error);
-  if (error instanceof AskApiError && error.status === 400 && !error.ownerOnly) {
+  if (error instanceof AskApiError && error.status === 400) {
     // The server names the field that failed: show it on that field.
     const field = /field "([^"]+)"/.exec(message)?.[1];
     set({
@@ -423,7 +453,7 @@ async function deliver(send: AskSend, leaving: boolean) {
   sending.add(send.id);
   patchSend(send.id, { state: "sending" });
   const first = send.refs[0]!;
-  let outcome: "sent" | "stale" | "invalid" | "failed" = "sent";
+  let outcome: "sent" | "stale" | "invalid" | "failed" | "denied" = "sent";
   let refusedCount = 0;
   let evaluator: AskSend["evaluator"];
   try {
@@ -480,11 +510,21 @@ async function deliver(send: AskSend, leaving: boolean) {
     const done = send.refs.map((ref) => ref.key).filter((key) => get().failed[key] === undefined);
     set({ tried: without(get().tried, done), forms: without(get().forms, done) });
   }
+  // An answer got through: whatever refused this session before no longer does.
+  if (outcome === "sent" && get().notOwner !== null) set({ notOwner: null });
   if (leaving) return;
   void refreshAsks();
   // History, once read, shows the answer as its agent left it.
   if (get().closed !== null) void loadClosedAsks();
-  if (outcome === "stale") {
+  if (outcome === "denied") {
+    showAskToast(
+      {
+        text: `Not sent. ${get().notOwner?.text ?? "Only the owner answers."}`,
+        viewKey: first.key,
+      },
+      9_000,
+    );
+  } else if (outcome === "stale") {
     showAskToast(
       {
         text: `Not sent: ${refLabel(send)} changed while you were answering. What you typed is kept.`,
@@ -532,6 +572,14 @@ export const flushAskSends = (leaving: boolean) => queue.flush(leaving);
 
 function hold(send: AskSend, text: string) {
   const state = get();
+  if (state.notOwner !== null) {
+    // This session was refused as not the owner's: nothing is held or hidden
+    // as if it would go through. It is asked once, in the open, and the ask
+    // stays where it is with what he typed.
+    set({ sent: [{ ...send, state: "sending" }, ...state.sent] });
+    void deliver(send, false);
+    return;
+  }
   const hidden = { ...state.hidden };
   for (const ref of send.refs) hidden[ref.key] = send.id;
   const keys = send.refs.map((ref) => ref.key);
@@ -695,6 +743,7 @@ export async function takeBackAsk(entry: KanbanAskFeedItem) {
     await askApi.hand(entry.cardRef, entry.ask.id, { action: "take_back" });
     showAskToast({ text: `${entry.boardName} #${entry.cardNumber} is yours again.` });
   } catch (error) {
+    noteRefusal(error);
     showAskToast({ text: `Couldn't take it back. ${askFailureText(error)}` });
   }
   void refreshAsks();
@@ -713,6 +762,7 @@ export async function replyOnAsk(
   try {
     await askApi.reply(entry.cardRef, entry.ask.id, blocks);
   } catch (error) {
+    noteRefusal(error);
     throw new Error(askFailureText(error), { cause: error });
   }
   showAskToast({
@@ -749,6 +799,7 @@ export async function snoozeAsks(
       showAskToast({ text: `${what} ${entries.length > 1 ? "are" : "is"} back in the queue.` });
     else showAskToast({ text: `Snoozed until ${untilLabel} · ${what}.`, undoSnooze: refs }, 8_000);
   } catch (error) {
+    noteRefusal(error);
     showAskToast({
       text: `Couldn't snooze ${what}. ${askFailureText(error)}`,
     });

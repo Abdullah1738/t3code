@@ -5,6 +5,7 @@ import {
   askFormFor,
   askDiscussion,
   askRepliedOnCard,
+  askWordsForReply,
   askFormWithSecrets,
   nextChangeView,
   askKindLabel,
@@ -29,6 +30,7 @@ import {
   type KanbanAskFeedItem,
   type KanbanBoard,
 } from "@t3tools/contracts";
+import { Link } from "@tanstack/react-router";
 import { MessageSquareIcon } from "lucide-react";
 import {
   useEffect,
@@ -66,6 +68,7 @@ import {
   loadAskDetail,
   markAskTried,
   noteAskAnswered,
+  noteAskNotOwner,
   noteAskStale,
   patchAskForm,
   replyOnAsk,
@@ -125,6 +128,7 @@ export function AskReader(props: {
   const marks = useAskStore((state) => state.marks);
   const mark: NeedsYouMark | undefined = needsYouMarkOf(item, marks);
   const failed = useAskStore((state) => state.failed[key]);
+  const notOwner = useAskStore((state) => state.notOwner);
   const previous = useAskStore((state) => state.previous[key]);
   const [noteOpen, setNoteOpen] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
@@ -212,12 +216,26 @@ export function AskReader(props: {
     }
     if (outcome._tag === "interrupted") return;
     const { failure } = outcome;
+    if (failure.notOwner) {
+      // Not his own session: said once for the whole page, and not something to send again.
+      noteAskNotOwner(failure.message, failure.notOwner.device);
+      return;
+    }
     setSecretError(failure.message);
     if (failure.stale) noteAskStale(entry);
     focusAt(`field:${failure.field ?? askSecretFieldIds(ask)[0] ?? ""}`);
   };
+  // Words alone never close a pick he has to make: they go to its agent as a reply and the ask stays open.
+  const sendWordsAsReply = (words: string) => {
+    void replyOnAsk(entry, [{ _tag: "md", text: words }]).then(
+      () => patchAskForm(entry, { ownWords: "" }),
+      (error: unknown) => showAskToast({ text: `Reply not sent. ${askFailureText(error)}` }, 9_000),
+    );
+  };
   const send = (intent: "primary" | "refuse") => {
     if (locked || secretBusy) return;
+    const words = intent === "primary" ? askWordsForReply(ask, form) : null;
+    if (words !== null) return sendWordsAsReply(words);
     const now = buildAskAnswer(
       ask,
       askFormWithSecrets(ask, form, secrets),
@@ -390,6 +408,20 @@ export function AskReader(props: {
               </h2>
             </header>
 
+            {notOwner ? (
+              <Banner
+                tone="warn"
+                action={
+                  notOwner.device && layout === "desktop" ? (
+                    <Link to="/settings/connections" className={cn(linkClass, "shrink-0")}>
+                      Open Connections
+                    </Link>
+                  ) : undefined
+                }
+              >
+                {notOwner.text}
+              </Banner>
+            ) : null}
             {failed ? (
               <Banner
                 tone="negative"

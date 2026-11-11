@@ -9,6 +9,7 @@ import * as DateTime from "effect/DateTime";
 import {
   KANBAN_ASK_ANSWER_FIELD,
   kanbanAskResponse,
+  kanbanResponseTakesWords,
   type KanbanAskField,
   type KanbanAskResponse,
   type KanbanOwnerAsk,
@@ -341,10 +342,33 @@ export function askRefusal(response: KanbanAskResponse): {
   return null;
 }
 
+/**
+ * His own words, when they are all the form holds for a pick he has to make.
+ * Words alone never close such an ask (the server refuses them), so they go
+ * out as a reply on it and the ask stays open. Null when the form answers the
+ * ask, holds no words, or the ask takes words as its answer.
+ */
+export function askWordsForReply(ask: KanbanOwnerAsk, form: AskForm): string | null {
+  if (form.refusing) return null;
+  const response = kanbanAskResponse(ask);
+  if (
+    response.ack ||
+    response.verdict !== null ||
+    response.task !== null ||
+    response.choose === null ||
+    kanbanResponseTakesWords(response)
+  ) {
+    return null;
+  }
+  const words = form.ownWords.trim();
+  return words !== "" && form.optionIds.length === 0 ? words : null;
+}
+
 /** The label of the main button for the form as it stands. */
 export function askPrimaryLabel(ask: KanbanOwnerAsk, form: AskForm): string {
   const response = kanbanAskResponse(ask);
   if (response.ack) return "Seen";
+  if (askWordsForReply(ask, form) !== null) return "Send as a reply";
   if (form.refusing) {
     const refusal = askRefusal(response);
     return refusal ? `Send: ${refusal.label.toLowerCase()}` : "Send";
@@ -444,6 +468,9 @@ export function buildAskAnswer(
       problem("choose", max === 1 ? "Pick one" : `Pick at most ${max}`);
     } else if (optionIds.length < min && words === "") {
       problem("choose", min === 1 ? "Pick one first" : `Pick at least ${min}`);
+    } else if (optionIds.length < min) {
+      // Words are not a pick: the page sends them as a reply (`askWordsForReply`), never as the answer.
+      problem("choose", "Pick one to answer. Your words alone go as a reply.");
     }
   }
 

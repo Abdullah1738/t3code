@@ -37,12 +37,21 @@ export class AskApiError extends Error {
   readonly code: string;
   /** The ask's revision now, when the refusal carried it. */
   readonly revision: number | null;
-  constructor(status: number, code: string, message: string, revision: number | null = null) {
+  /** Why it was denied, when the server said (`not_owner_device`). */
+  readonly reason: string | null;
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    revision: number | null = null,
+    reason: string | null = null,
+  ) {
     super(message);
     this.name = "AskApiError";
     this.status = status;
     this.code = code;
     this.revision = revision;
+    this.reason = reason;
   }
   /** The ask changed or closed since it was read: read it again and keep what he typed. */
   get stale(): boolean {
@@ -50,23 +59,21 @@ export class AskApiError extends Error {
   }
   /**
    * Only the owner's own session answers, hands over, snoozes or replies on an
-   * ask. This session is not one (403 `denied`): a device paired from a link
-   * made on the Mac, a component credential, a session from before the check.
+   * ask, and this session is not one. Sending again from here can't work, so
+   * it is never retried and never held for Undo.
    */
-  get ownerOnly(): boolean {
+  get denied(): boolean {
     return this.status === 403 || this.code === "denied";
+  }
+  /** A paired device that was not paired as his: it has to be paired again from an owner device. */
+  get notOwnerDevice(): boolean {
+    return this.denied && this.reason === "not_owner_device";
   }
 }
 
-export const ASK_OWNER_ONLY = "Answer this from your own Robob session.";
-
-/** A failed call in the page's words. */
+/** A failed call in the server's own words. */
 export const askFailureText = (error: unknown): string =>
-  error instanceof AskApiError && error.ownerOnly
-    ? ASK_OWNER_ONLY
-    : error instanceof Error
-      ? error.message
-      : "Robob did not confirm it.";
+  error instanceof Error && error.message !== "" ? error.message : "Robob did not confirm it.";
 
 /**
  * The revision a refusal says the ask is at. The server says it in words
@@ -142,12 +149,15 @@ async function call<T>(
     throw new AskApiError(response.status, "failed", "Robob sent something that is not an answer.");
   }
   if (!response.ok) {
-    const error = (json as { error?: { code?: unknown; message?: unknown } } | null)?.error;
+    const error = (
+      json as { error?: { code?: unknown; message?: unknown; reason?: unknown } } | null
+    )?.error;
     throw new AskApiError(
       response.status,
       typeof error?.code === "string" ? error.code : "failed",
       typeof error?.message === "string" ? error.message : `Robob answered ${response.status}.`,
       revisionIn(error),
+      typeof error?.reason === "string" ? error.reason : null,
     );
   }
   return json as T;

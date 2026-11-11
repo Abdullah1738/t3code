@@ -72,9 +72,23 @@ describe("ask secrets", () => {
     expect(askSecretFailure({ _tag: "EnvironmentAuthorizationError", message: "no" }).message).toBe(
       "This one carries a secret. Answer it from your own Robob session.",
     );
-    expect(askSecretFailure({ _tag: "KanbanError", code: "denied", detail: "x" }).message).toBe(
-      "This one carries a secret. Answer it from your own Robob session.",
-    );
+    expect(
+      askSecretFailure({
+        _tag: "KanbanError",
+        code: "denied",
+        detail: "This device isn't paired as yours.",
+        reason: "not_owner_device",
+      }),
+    ).toEqual({
+      message: "This device isn't paired as yours.",
+      stale: false,
+      field: null,
+      notOwner: { device: true },
+    });
+    expect(
+      askSecretFailure({ _tag: "KanbanError", code: "denied", detail: "Only the owner does this." })
+        .notOwner,
+    ).toEqual({ device: false });
     expect(
       askSecretFailure({
         _tag: "KanbanError",

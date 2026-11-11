@@ -83,6 +83,11 @@ export interface AskSecretFailure {
   readonly stale: boolean;
   /** The field the server named, when it named one. */
   readonly field: string | null;
+  /**
+   * This session is not the owner's own, so sending again from here can't
+   * work. `device`: it is a paired device that has to be paired again.
+   */
+  readonly notOwner?: { readonly device: boolean };
 }
 
 const tagOf = (failure: unknown): string | null =>
@@ -97,6 +102,7 @@ const NOT_THE_OWNER: AskSecretFailure = {
   message: "This one carries a secret. Answer it from your own Robob session.",
   stale: false,
   field: null,
+  notOwner: { device: false },
 };
 
 /** A refused secret answer, in the page's words. */
@@ -106,7 +112,16 @@ export function askSecretFailure(failure: unknown): AskSecretFailure {
   if (tag === "KanbanError") {
     const { code, detail } = failure as { code?: unknown; detail?: unknown };
     const text = typeof detail === "string" ? detail : "";
-    if (code === "denied") return NOT_THE_OWNER;
+    if (code === "denied") {
+      // The server's own sentence: it says what to do on a device that is not paired as his.
+      const { reason } = failure as { reason?: unknown };
+      return {
+        message: text === "" ? NOT_THE_OWNER.message : text,
+        stale: false,
+        field: null,
+        notOwner: { device: reason === "not_owner_device" },
+      };
+    }
     // A refusal that names the revision the ask is at means the one he read is gone.
     if (code === "conflict" || code === "not-found" || /\bIt is at revision \d+/.test(text)) {
       return {

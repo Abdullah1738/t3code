@@ -8,6 +8,7 @@ import {
   askFormFor,
   askPrimaryLabel,
   askRefusal,
+  askWordsForReply,
   buildAskAnswer,
   planAskBatch,
   type AskForm,
@@ -117,15 +118,35 @@ describe("buildAskAnswer", () => {
     });
   });
 
-  it("takes his own words in place of a pick", () => {
-    const decision = ask({ kind: "decision", options: OPTIONS });
-    expect(
-      buildAskAnswer(decision, filled(decision, { ownWords: "Neither, wait a week" }), "primary"),
-    ).toEqual({
+  it("takes his own words in place of a pick he may leave empty", () => {
+    const decision = ask({ kind: "decision", options: OPTIONS, respond: { choose: { min: 0 } } });
+    const typed = filled(decision, { ownWords: "Neither, wait a week" });
+    expect(buildAskAnswer(decision, typed, "primary")).toEqual({
       ok: true,
       body: { verdict: "answered", text: "Neither, wait a week" },
       label: "Answer sent",
     });
+    expect(askWordsForReply(decision, typed)).toBeNull();
+    expect(askPrimaryLabel(decision, typed)).toBe("Send answer");
+  });
+
+  it("never sends words alone as the answer to a pick he has to make", () => {
+    const decision = ask({ kind: "decision", options: OPTIONS });
+    const typed = filled(decision, { ownWords: " Neither, wait a week " });
+    expect(buildAskAnswer(decision, typed, "primary")).toMatchObject({
+      ok: false,
+      first: "choose",
+    });
+    expect(askWordsForReply(decision, typed)).toBe("Neither, wait a week");
+    expect(askPrimaryLabel(decision, typed)).toBe("Send as a reply");
+    // A pick with words beside it is an answer, and so is a pick alone.
+    expect(askWordsForReply(decision, filled(decision, { optionIds: ["now"] }))).toBeNull();
+    expect(askWordsForReply(decision, askFormFor(decision))).toBeNull();
+  });
+
+  it("keeps words on an approval with its verdict, not as a reply", () => {
+    const approval = ask({ kind: "action", action: ACTION });
+    expect(askWordsForReply(approval, filled(approval, { note: "careful" }))).toBeNull();
   });
 
   it("asks for a pick when there is no recommendation", () => {
