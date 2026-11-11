@@ -479,7 +479,10 @@ export type OrchestratorMcpThreadReadResult = typeof OrchestratorMcpThreadReadRe
 export const OrchestratorMcpThreadSendInput = Schema.Struct({
   threadId: ThreadId,
   message: OrchestratorMcpPrompt,
-  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
+  mode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])).annotate({
+    description:
+      "auto starts an idle thread, steers a fully active turn, or queues behind a turn that is not yet steerable. queue adds a separate turn; steer updates a running turn. restart requires a running provider turn and interrupts it before delivering the message as the next turn, including on Claude. Providers without native restart must support interrupt and queued messages; otherwise use t3_thread_interrupt, then send with auto after the run stops.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
 });
 export type OrchestratorMcpThreadSendInput = typeof OrchestratorMcpThreadSendInput.Type;
