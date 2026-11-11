@@ -192,6 +192,10 @@ def guarded(cli, args):
             # whereas the JVM parses *_JAVA_OPTIONS itself. Check both views;
             # accepting a reserved override in either interpretation is unsafe.
             for option in options + raw_options.split():
+                # The launcher expands @files after these literal checks;
+                # their contents cannot be validated by this token fence.
+                if option.startswith('@'):
+                    fail(f'{name} contains a Java argument file; expand its options explicitly')
                 key, separator, value = option.partition('=')
                 if key == '-Dcom.google.protobuf.use_unsafe_pre22_gencode' or (key == '-Dcom.google.protobuf.error_on_unsafe_pre22_gencode' and (not separator or value != 'true')):
                     fail(f'{name} contains an unsafe protobuf override; remove it')

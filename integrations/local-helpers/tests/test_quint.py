@@ -366,6 +366,43 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn('unsafe protobuf override', r.stderr)
 
+    def test_java_argument_file_class_is_rejected_before_backend_start(self):
+        options = self.root / 'unsafe options.txt'
+        options.write_text('-Dcom.google.protobuf.error_on_unsafe_pre22_gencode=false\n'
+                           '-Dcom.google.protobuf.use_unsafe_pre22_gencode=true\n')
+        forms = {
+            'absolute': '@' + str(options),
+            'relative': '@jvm.options',
+            'quoted-token': '"@' + str(options) + '"',
+            'quoted-path': '@"' + str(options) + '"',
+            'single-quoted': "'@" + str(options) + "'",
+            'after-option': '-Xmx256m @' + str(options),
+            'shell-expanded-value': '-Dprobe="x @jvm.options -Dtail=x"',
+            'missing': '@' + str(self.root / 'missing.options'),
+            'escaped-marker': '@@jvm.options',
+        }
+        for name in ('JVM_GC_ARGS', 'JVM_ARGS', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+            for shape, value in forms.items():
+                with self.subTest(name=name, shape=shape):
+                    r = self.run_cli('verify', 'a.qnt', **{name:value})
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn(name + ' contains a Java argument file', r.stderr)
+                    self.assertEqual(r.stdout, '')
+                    self.assertFalse((self.root / 'server.json').exists())
+
+    def test_at_sign_in_property_value_is_not_an_argument_file(self):
+        for name in ('JVM_ARGS', 'JVM_GC_ARGS', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+            with self.subTest(name=name):
+                self.result('verify', 'a.qnt', **{name:'-Dcontact=owner@example.invalid'})
+                self.server_stopped()
+
+    def test_argument_file_requires_the_explicit_unsafe_bypass(self):
+        r = self.run_cli('verify', 'a.qnt', JVM_GC_ARGS='@jvm.options',
+                         QUINT_ALLOW_VULNERABLE_APALACHE='1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('bypassing the patched backend guard', r.stderr)
+        self.assertFalse((self.root / 'server.json').exists())
+
     def test_quoted_jvm_property_class(self):
         forms = [
             '-Dcom.google.protobuf.error_on_unsafe_pre22_gen"code"=false',
