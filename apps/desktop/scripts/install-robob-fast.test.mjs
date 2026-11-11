@@ -584,9 +584,15 @@ test("readiness polls reject on every failure and never use global fetch", async
 
 test("the pre-quit migration check waits 10 minutes by default and takes an env override", () => {
   assert.equal(migrationCheckTimeoutMs({}), 600_000);
-  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "900000" }), 900_000);
+  assert.equal(
+    migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "900000" }),
+    900_000,
+  );
   assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "5" }), 600_000);
-  assert.equal(migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "nope" }), 600_000);
+  assert.equal(
+    migrationCheckTimeoutMs({ ROBOB_INSTALL_MIGRATION_CHECK_TIMEOUT_MS: "nope" }),
+    600_000,
+  );
 });
 
 test("clones only the live databases, never the pre-shrink copy", () => {

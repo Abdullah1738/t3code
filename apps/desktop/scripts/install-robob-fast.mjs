@@ -453,7 +453,11 @@ async function main(args) {
   }
   if (args.includes("--dry-run")) {
     console.log(
-      JSON.stringify({ rollback, skipMigrationCheck: skipMigrationCheck ?? null, steps: INSTALL_PLAN }),
+      JSON.stringify({
+        rollback,
+        skipMigrationCheck: skipMigrationCheck ?? null,
+        steps: INSTALL_PLAN,
+      }),
     );
     return;
   }
@@ -488,7 +492,11 @@ async function main(args) {
     const names = await inputs();
     if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
     for (const name of names)
-      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], timeoutMs());
+      await run(
+        "/bin/cp",
+        ["-c", path.join(data, name), path.join(destination, name)],
+        timeoutMs(),
+      );
   };
   const cfg = JSON.parse(
     await fs.readFile(
