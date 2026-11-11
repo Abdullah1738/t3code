@@ -416,7 +416,8 @@ function NeedsYouLink(props: { boardId: string; label: string; count: number }) 
       search={{ board: props.boardId }}
       aria-label={`${props.label}: ${props.count}. Open Needs you for this board`}
       className={cn(
-        "flex h-6 shrink-0 items-center justify-between rounded-md px-1 text-xs text-(--m-warning) hover:bg-(--m-warnband) pointer-coarse:h-8 pointer-coarse:text-sm",
+        // On touch the heading keeps the other columns' height and its hit area grows to 44 px.
+        "relative flex h-6 shrink-0 items-center justify-between rounded-md px-1 text-xs text-(--m-warning) hover:bg-(--m-warnband) pointer-coarse:h-8 pointer-coarse:text-sm pointer-coarse:after:absolute pointer-coarse:after:inset-x-0 pointer-coarse:after:-inset-y-1.5",
         FOCUS,
       )}
     >
