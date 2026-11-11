@@ -28,16 +28,9 @@ import { useAssetUrl } from "../../../state/assets";
 import { MarkdownText } from "../../common/MarkdownText";
 import { PageLinkOffer } from "../../common/PageLinkOffer";
 import { pageNavigation } from "../../common/pageNavigation";
+import { newPageToken, pageShell, pageThemeScript, readPageMessage } from "../../common/pageShell";
 import { CardBlock, Collapse, resolveKanbanLinkFor } from "../Chat";
-import {
-  ASK_HTML_BRIDGE,
-  askFileKind,
-  askShown,
-  readAskHtmlMessage,
-  type AskFileKind,
-  type AskPicture,
-  type AskShown,
-} from "./logic";
+import { askFileKind, askShown, type AskFileKind, type AskPicture, type AskShown } from "./logic";
 import { useAskEnvironmentId } from "./askStore";
 
 const INLINE_MAX_HEIGHT = 520;
@@ -271,15 +264,24 @@ export function AskHtml(props: {
     INLINE_MAX_HEIGHT,
     clampHtmlRenderHeight(contentHeight ?? props.height ?? 320),
   );
+  // The page is never the WebView's own document: it sits in the one sandboxed
+  // frame of a shell the app writes (`pageShell`), and reaches the app only
+  // through that shell, which marks what it passes on with this token.
+  const [token] = useState(newPageToken);
+  const shell = pageShell({ html: injectHtmlRenderBootstrap(props.html), token, title });
   const onMessage = (event: WebViewMessageEvent) => {
-    const message = readAskHtmlMessage(event.nativeEvent.data);
+    const message = readPageMessage(event.nativeEvent.data, token);
     if (message === null) return;
     if (message._tag === "height") setContentHeight(message.height);
-    else if (!disabled) props.onValue?.(message.value);
+    // He can't touch a disabled page, so nothing it says is his doing.
+    else if (disabled) return;
+    else if (message._tag === "link") setOffered(message.url);
+    else props.onValue?.(message.value);
   };
-  // Every navigation of the page and of its frames is asked about here. The
-  // origin whitelist stays "*" on purpose: a URL outside the whitelist is
-  // opened by the WebView library itself, with no question asked.
+  // The second layer: every navigation the WebView asks about is answered
+  // here. Only the shell and frames of the page's own text load. The origin
+  // whitelist stays "*" on purpose: a URL outside the whitelist is opened by
+  // the WebView library itself, with no question asked.
   const onNavigate = (request: WebViewNavigation & { isTopFrame?: boolean }) => {
     const verdict = pageNavigation(request);
     // He can't touch a disabled page, so a link it follows is its own doing.
@@ -287,7 +289,7 @@ export function AskHtml(props: {
     return verdict._tag === "load";
   };
   // The page takes the app's colours as it loads, and again when they change.
-  const themeScript = `window.postMessage(${JSON.stringify(htmlRenderThemeMessage(theme))}, "*"); true;`;
+  const themeScript = pageThemeScript(htmlRenderThemeMessage(theme));
   const webView = useRef<WebView<object>>(null);
   useEffect(() => {
     webView.current?.injectJavaScript(themeScript);
@@ -312,10 +314,9 @@ export function AskHtml(props: {
         >
           <WebView<object>
             ref={webView}
-            source={{ html: injectHtmlRenderBootstrap(props.html) }}
+            source={{ html: shell }}
             accessibilityLabel={title}
             originWhitelist={["*"]}
-            injectedJavaScriptBeforeContentLoaded={ASK_HTML_BRIDGE}
             injectedJavaScript={themeScript}
             onMessage={onMessage}
             onShouldStartLoadWithRequest={onNavigate}

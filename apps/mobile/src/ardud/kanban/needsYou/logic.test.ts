@@ -30,7 +30,6 @@ import {
   needsYouItemsByKey,
   queueRows,
   rankOrder,
-  readAskHtmlMessage,
   stepWebLink,
   lateStanding,
   ownerStanding,
@@ -308,34 +307,6 @@ describe("what an ask shows", () => {
   it("hints at pictures and video on a row, and survives a part it does not know", () => {
     expect(askRowMedia(blocks)).toEqual({ pictures: 3, video: true });
     expect(askRowMedia(undefined)).toEqual({ pictures: 0, video: false });
-  });
-});
-
-describe("a page inside an ask", () => {
-  it("reads a value the page hands back, in either form", () => {
-    expect(readAskHtmlMessage(JSON.stringify({ type: "robob.ask.value", value: 25 }))).toEqual({
-      _tag: "value",
-      value: 25,
-    });
-    expect(readAskHtmlMessage(JSON.stringify({ robobPick: 3 }))).toEqual({
-      _tag: "value",
-      value: 3,
-    });
-  });
-
-  it("reads the page's height and ignores everything else", () => {
-    expect(
-      readAskHtmlMessage(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          method: "ui/notifications/size-changed",
-          params: { height: 212 },
-        }),
-      ),
-    ).toEqual({ _tag: "height", height: 212 });
-    expect(readAskHtmlMessage("not json")).toBeNull();
-    expect(readAskHtmlMessage(JSON.stringify({ type: "something.else" }))).toBeNull();
-    expect(readAskHtmlMessage(JSON.stringify("text"))).toBeNull();
   });
 });
 

@@ -7,10 +7,15 @@
  * the whole answer.
  *
  * - The page's own document and frames it builds from its own text load.
- * - A web address in a frame of the page loads in that frame.
- * - A web address for the page itself never loads in place and never opens by
- *   itself: it is offered to him as a link to tap (`PageLinkOffer`).
+ * - A web address never loads, in the page or in a frame of it. For the page
+ *   itself it is offered to him as a link to tap (`PageLinkOffer`); in a frame
+ *   it is refused.
  * - Everything else is refused, in every frame.
+ *
+ * This is the second layer. The first is the shell the page is drawn in
+ * (`pageShell.ts`), whose sandbox and policy hold without the WebView asking:
+ * on Android the WebView does not ask about a form POST, and lets a navigation
+ * through when the answer takes over 250 ms (the library's fixed timeout).
  */
 export type PageNavigation =
   | { readonly _tag: "load" }
@@ -74,7 +79,8 @@ export function pageNavigation(request: {
     const link = parseWebLink(url);
     if (link === null) return REFUSE;
     // What is offered is the address as the parser read it, the one that will open.
-    return top ? { _tag: "offer", url: link.url } : LOAD;
+    // A frame holds the page's own text and nothing from the web.
+    return top ? { _tag: "offer", url: link.url } : REFUSE;
   }
   return REFUSE;
 }

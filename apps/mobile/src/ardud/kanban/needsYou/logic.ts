@@ -22,7 +22,6 @@ import {
 } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanAskBlock, KanbanAskFeedItem, KanbanAskField } from "@t3tools/contracts";
 import { filePreviewKind, type FilePreviewKind } from "@t3tools/shared/filePreview";
-import { readHtmlRenderContentHeight } from "@t3tools/shared/htmlRender";
 
 // Routes
 
@@ -321,45 +320,6 @@ export function askRowMedia(blocks: ReadonlyArray<KanbanAskBlock> | undefined): 
       (block) => block._tag === "attachment" && block.attachment.mimeType.startsWith("video/"),
     ),
   };
-}
-
-// A page inside an ask
-
-/**
- * Runs inside the page before its own scripts. A page talks to its host with
- * `parent.postMessage`; in a WebView the page is its own parent, so every
- * message it posts to itself is passed on to the app. A page in a frame tells
- * its host how tall it is; here it has no frame, so this says it instead. The
- * page gets nothing back but the theme: no token, no cookie, no way to call
- * the app. Where the page may go is decided apart from this, for every
- * navigation, by `pageNavigation` (ardud/common).
- */
-export const ASK_HTML_BRIDGE = `(function(){if(window.__robobAsk)return;window.__robobAsk=true;function send(d){try{window.ReactNativeWebView.postMessage(typeof d==="string"?d:JSON.stringify(d));}catch(_){}}window.addEventListener("message",function(e){var d=e.data;if(d===undefined||d===null)return;send(d);});var last;function size(){var r=document.documentElement;if(!r)return;var v=Math.ceil(r.scrollHeight>r.clientHeight?r.scrollHeight:r.getBoundingClientRect().height);if(!v||v===last)return;last=v;send({jsonrpc:"2.0",method:"ui/notifications/size-changed",params:{height:v}});}document.addEventListener("DOMContentLoaded",function(){size();if(window.ResizeObserver){var o=new ResizeObserver(size);o.observe(document.documentElement);if(document.body)o.observe(document.body);}});window.addEventListener("load",size);})();true;`;
-
-export type AskHtmlMessage =
-  | { readonly _tag: "value"; readonly value: unknown }
-  | { readonly _tag: "height"; readonly height: number };
-
-/**
- * What a page inside an ask told the app: a value for a custom field
- * (`{ type: "robob.ask.value", value }`, or the older `{ robobPick }`), or how
- * tall it is. Anything else is ignored.
- */
-export function readAskHtmlMessage(raw: string): AskHtmlMessage | null {
-  let data: unknown;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof data !== "object" || data === null) return null;
-  const message = data as { type?: unknown; value?: unknown; robobPick?: unknown };
-  if (message.type === "robob.ask.value" && "value" in message) {
-    return { _tag: "value", value: message.value };
-  }
-  if (typeof message.robobPick === "number") return { _tag: "value", value: message.robobPick };
-  const height = readHtmlRenderContentHeight(data);
-  return height === undefined ? null : { _tag: "height", height };
 }
 
 // The queue as a list

@@ -42,6 +42,7 @@ import { useBoardAction } from "../common/hooks";
 import { MarkdownText, type ResolveKanbanLink } from "../common/MarkdownText";
 import { PageLinkOffer } from "../common/PageLinkOffer";
 import { pageNavigation } from "../common/pageNavigation";
+import { newPageToken, pageShell, readPageMessage } from "../common/pageShell";
 import {
   kanbanClient,
   useKanbanBoardCard,
@@ -690,10 +691,15 @@ function LiveHtml(props: {
   // A web link the page tried to follow, waiting for his tap.
   const [offered, setOffered] = useState<string | null>(null);
   // The page is text an agent wrote: it draws in place and goes nowhere by
-  // itself (`pageNavigation`). It can't move the app or open another one, and
-  // a web link it follows is only offered under the page. The origin whitelist
-  // stays "*" on purpose: a URL outside it is opened by the WebView library
-  // itself, with no question asked.
+  // itself. It is never the WebView's own document: it sits in the one
+  // sandboxed frame of a shell the app writes (`pageShell`), which cannot be
+  // navigated, posted from or left, whatever the WebView asks the app. A web
+  // link he taps in it is only offered under the page.
+  const [token] = useState(newPageToken);
+  const shell = pageShell({ html: props.html, token, title: props.title ?? undefined });
+  // The second layer (`pageNavigation`), for what the WebView does ask about.
+  // The origin whitelist stays "*" on purpose: a URL outside it is opened by
+  // the WebView library itself, with no question asked.
   const onNavigate = useCallback((request: WebViewNavigation & { isTopFrame?: boolean }) => {
     const verdict = pageNavigation(request);
     if (verdict._tag === "offer") setOffered(verdict.url);
@@ -706,8 +712,12 @@ function LiveHtml(props: {
       ) : null}
       <View className="overflow-hidden rounded-[12px] bg-screen" style={{ height }}>
         <WebView
-          source={{ html: props.html }}
+          source={{ html: shell }}
           originWhitelist={["*"]}
+          onMessage={(event) => {
+            const message = readPageMessage(event.nativeEvent.data, token);
+            if (message?._tag === "link") setOffered(message.url);
+          }}
           onShouldStartLoadWithRequest={onNavigate}
           onOpenWindow={(event) => {
             const verdict = pageNavigation({ url: event.nativeEvent.targetUrl });

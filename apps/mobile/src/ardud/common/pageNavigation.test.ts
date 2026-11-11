@@ -52,9 +52,9 @@ describe("where a page inside the app may go", () => {
     expect(pageNavigation({ url: "https://example.com" })._tag).toBe("offer");
   });
 
-  it("lets a frame of the page load a web address in place, and nothing opens", () => {
-    expect(frame("https://example.com/embed")).toBe("load");
-    expect(frame("http://example.com/embed")).toBe("load");
+  it("never loads a web address in a frame of the page either, and nothing opens", () => {
+    expect(frame("https://example.com/embed")).toBe("refuse");
+    expect(frame("http://example.com/embed")).toBe("refuse");
   });
 
   it("takes only a real web address for one", () => {

@@ -114,16 +114,29 @@ announcement from a screen that was left or covered.
 
 ## Pages inside an ask
 
-An `html` block is text an agent wrote, loaded from a string into a private WebView
-(`incognito`, no cookies, no cache, no storage, no file access, no base address). It can say
-how tall it is and hand back a value for a custom field; it is given the theme and nothing
-else. It goes nowhere by itself (`ardud/common/pageNavigation.ts`): its own document and
-frames load, a web address in a frame loads in that frame, and everything else is refused,
-the app's own scheme first of all. A web link the page follows is shown under it
-(`PageLinkOffer`, "Open example.com") and opens only on his tap. The origin whitelist stays
-`*`: the WebView library opens anything outside the whitelist by itself. The board
-discussion's page (`Chat.tsx`) follows the same rule. A task step's link is a link only when
-it is a web address.
+An `html` block is text an agent wrote. It is never the WebView's own document. The WebView
+(`incognito`, no cookies, no cache, no storage, no file access, no base address) loads a
+shell the app writes (`ardud/common/pageShell.ts`), and the shell holds the page in one frame:
+`<iframe sandbox="allow-scripts" srcdoc=...>`. The page runs its scripts and draws; it cannot
+navigate the WebView, post a form, open a window, download, or read the shell. The shell's
+policy, which the page inherits, forbids form posts and `<base>`, and lets a frame hold only
+the page's own text (`form-action 'none'; base-uri 'none'; frame-src about: data:`), so no
+frame can be sent to a website. None of this waits on the WebView asking the app: on Android
+that question is never asked for a form POST and is answered "yes" when the app takes over
+250 ms (a fixed timeout in the library).
+
+The page reaches the app only through the shell, which passes on three things, only from the
+page's own frame: its height, a value for a custom field, and a web link he tapped. Each
+carries a token the page cannot read, and the app drops anything without it. A tapped link
+never loads: it is shown under the page (`PageLinkOffer`, "Open example.com") and opens only
+on his tap there. The page is given the theme and nothing else.
+
+The app's own answer to a navigation (`ardud/common/pageNavigation.ts`) stays as the second
+layer: the shell and frames of the page's own text load, a web address for the WebView itself
+is offered, and everything else is refused, the app's own scheme first of all. The origin
+whitelist stays `*`: the WebView library opens anything outside the whitelist by itself. The
+board discussion's page (`Chat.tsx`) is drawn the same way. A task step's link is a link only
+when it is a web address.
 
 ## What is read
 
