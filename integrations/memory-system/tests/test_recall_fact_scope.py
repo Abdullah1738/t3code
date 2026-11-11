@@ -860,6 +860,56 @@ class FactScopeTests(unittest.TestCase):
                 for trigger in ('first_prompt', 'compaction'):
                     self.assertEqual([fact] if instruction else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0]])
 
+    def test_ambiguous_build_release_heads_require_imperative_mood(self):
+        from recall_fact_scope import comparison_text, standing_instruction
+        changed = ('Build and release changes, artifacts and results, report success and stay green for PR1145 head 72a10c19 with CI checks pending; '
+                   'do not claim build succeeded or release completed.')
+        matching = changed.replace('72a10c19', '66cfd86f')
+        predicates = ('succeeded', 'completed', 'failed', 'finished', 'shipped', 'succeeds', 'completes',
+                      'fails', 'finishes', 'ships', 'has succeeded', 'was completed', 'is green', 'did not pass')
+        commands = ('build artifacts', 'release artifacts', 'build tested artifacts', 'release completed builds',
+                    'build results', 'release results', 'build the release', 'release the build',
+                    'please build artifacts', 'never release completed builds', 'report success', 'stay green',
+                    'always report success', 'always stay green', 'please release changes',
+                    'please build changes', 'Please release changes')
+        for prefix in ('After', 'When', 'Once', 'If', 'Until', 'Unless'):
+            for anchor in ('', ' for PR1145 head 66cfd86f'):
+                for subject in ('build', 'release'):
+                    for predicate in predicates:
+                        for tail in ('', ' successfully', ' for PR1145'):
+                            fact = f'{prefix} CI passed{anchor}, {subject} {predicate}{tail}.'
+                            with self.subTest(prefix=prefix, anchor=anchor, subject=subject, predicate=predicate, tail=tail):
+                                self.assertFalse(standing_instruction(fact))
+                                self.assertEqual('', comparison_text(fact, changed))
+                                self.assertEqual(fact if anchor else '', comparison_text(fact, matching))
+                for command in commands:
+                    fact = f'{prefix} CI passed{anchor}, {command}.'
+                    with self.subTest(prefix=prefix, anchor=anchor, command=command):
+                        self.assertTrue(standing_instruction(fact))
+                        self.assertEqual(fact, comparison_text(fact, changed))
+        clauses = ('build succeeded', 'release completed', 'build succeeds', 'release has completed',
+                   'build finishes', 'release ships', *commands)
+        for i, clause in enumerate(clauses):
+            for anchored in (False, True):
+                anchor = ' for PR1145 head 66cfd86f' if anchored else ''
+                fact = f'After CI passed{anchor}, {clause}.'
+                instruction = clause in commands
+                with self.subTest(clause=clause, anchored=anchored):
+                    index = RuleIndex(self.root / f'ambiguous-head-{i}-{anchored}.db')
+                    index.remember(fact, scope=CWD)
+                    with patch('recall_messages.contradiction', side_effect=lambda m, f: ({str(r['id']): .99 for r in f}, 0)) as model:
+                        rules, result = preflight('t3_thread_send', {'message': changed}, CWD, index.path)
+                        self.assertEqual([fact] if instruction else [], [r['text'] for r in rules])
+                        self.assertEqual('deny' if instruction else None, result['decision'] if result else None)
+                        self.assertEqual(instruction, model.called)
+                        model.reset_mock()
+                        rules, result = preflight('t3_thread_send', {'message': matching}, CWD, index.path)
+                        self.assertEqual([fact] if instruction or anchored else [], [r['text'] for r in rules])
+                    engine = CheckEngine(rules_path=index.path)
+                    for trigger in ('first_prompt', 'compaction'):
+                        self.assertEqual([fact] if instruction else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=changed))[0]])
+                        self.assertEqual([fact] if instruction or anchored else [], [r['text'] for r in engine.preflight(dict(trigger=trigger, cwd=CWD, prompt=matching))[0]])
+
     def test_linked_ci_labels_keep_original_identities(self):
         from recall_fact_scope import comparison_text, ci_ids
         changed = 'PR1145 head 72a10c19 CI checks pending.'

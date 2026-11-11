@@ -119,8 +119,14 @@ _MODAL = (r"(?:always|never|don't|do not|only|must(?: not)?|should(?: not)?|cann
 
 @lru_cache(maxsize=1)
 def base_verbs():
-    return frozenset(w for w in Path(__file__).with_name('english_verbs.txt').read_text().splitlines()
+    return frozenset(w.split()[0] for w in Path(__file__).with_name('english_verbs.txt').read_text().splitlines()
                      if w and not w.startswith('#'))
+
+
+@lru_cache(maxsize=1)
+def noun_verbs():
+    return frozenset(word for line in Path(__file__).with_name('english_verbs.txt').read_text().splitlines()
+                     if line.startswith('# N ') for word in line[4:].split())
 
 
 def base_verb(word):
@@ -146,7 +152,38 @@ def nominal_instruction(text):
     return True
 
 
+def finite_result_clause(text):
+    clause = re.match(r"([a-z]+)\s+(" + _CI_STATES + r"|[a-z]+)\b(.*)", text, re.I)
+    if not clause or clause[1].casefold() not in noun_verbs():
+        return False
+    predicate, tail = clause[2].casefold().split()[0], clause[3].strip()
+    if predicate in {'is', 'are', 'was', 'were', 'has', 'have', 'had', 'does', 'did', 'will'}:
+        return True
+    finite = False
+    if predicate.endswith('ed'):
+        stem = predicate[:-2]
+        roots = {stem, stem + 'e', predicate[:-3] + 'y'}
+        if len(stem) > 1 and stem[-1] == stem[-2]:
+            roots.add(stem[:-1])
+        finite |= bool(roots & base_verbs())
+    if predicate.endswith('s'):
+        roots = {predicate[:-1], predicate[:-2], predicate[:-3] + 'y'} & base_verbs()
+        # "results" without its verbal in/from complement is also a plural
+        # object ("release results"). Other lexical inflections do not need
+        # a CI-status synonym to establish a finite predicate.
+        if roots == {'result'} and not re.match(r"(?:in|from)\b", tail, re.I):
+            roots = set()
+        finite |= bool(roots)
+    # A finite result after a noun/verb homograph is a report. A participle
+    # modifying its object ("release completed builds") remains imperative;
+    # plural objects such as "results" are not result predicates.
+    return finite and bool(re.fullmatch(r"[.!?]*", tail) or re.match(
+        r"(?:for|on|in|at|by|from|to|with|without|after|before|and|but|the|a|an)\b|[a-z]+ly\b", tail, re.I))
+
+
 def directive_clause(text):
+    polite = bool(re.match(r"\s*(?:\[Abdullah\]\s*)?(?:actually[,\s:]+)?please\b",
+                           directive_prefix(text), re.I))
     prefix = re.sub(r"^\s*(?:\[Abdullah\]\s*|(?:please|actually)[,:]?\s+)", "",
                     directive_prefix(text), flags=re.I).strip()
     if re.match(r"No\s+", prefix, re.I):
@@ -164,11 +201,14 @@ def directive_clause(text):
         return False
     head = re.match(r"[a-z]+\b", text, re.I)
     if modal:
-        return bool(head and (modal[0].strip().lower() != 'only' or base_verb(head[0])))
+        return bool(head and (modal[0].strip().lower() != 'only' or
+                              base_verb(head[0]) and not finite_result_clause(text)))
+    if polite:
+        return bool(head and base_verb(head[0]))
     # Use a fixed English lexicon for unmarked imperatives, not a growing
     # list of command objects or report subjects. Explicit modals do not
     # depend on vocabulary coverage; unknown non-CI facts still stay kept.
-    return bool(head and base_verb(head[0]))
+    return bool(head and base_verb(head[0]) and not finite_result_clause(text))
 
 
 def conditional_instruction(text):
