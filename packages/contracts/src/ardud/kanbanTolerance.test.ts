@@ -131,7 +131,19 @@ describe("a card from a newer server", () => {
   it("writes the block back as it was stored, so nothing is lost by reading it", () => {
     const stored = card([ask({ blocks: [{ _tag: "md", text: "Why" }, MAP] })]);
     const encoded = encodeCard(decodeCard(stored));
-    expect(encoded.asks[0]?.blocks).toEqual([{ _tag: "md", text: "Why" }, MAP]);
+    expect(encoded.asks?.[0]?.blocks).toEqual([{ _tag: "md", text: "Why" }, MAP]);
+  });
+
+  it("still refuses a pick block in an ask: known to this build, not allowed there", () => {
+    const pick = {
+      _tag: "choice",
+      id: "c1",
+      style: "pick",
+      question: "Which?",
+      options: [],
+      multi: false,
+    };
+    expect(() => decodeCard(card([ask({ blocks: [pick] })]))).toThrow();
   });
 
   it("still refuses a block of a known kind that is malformed", () => {

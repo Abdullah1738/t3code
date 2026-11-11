@@ -262,23 +262,15 @@ const readBlock = <S extends Schema.Top>(block: S, known: ReadonlyArray<string>)
     ),
   );
 
-const KanbanBlockRead = readBlock(KanbanBlock, [
-  "md",
-  "collapse",
-  "html",
-  "choice",
-  "card",
-  "image",
-  "attachment",
-]);
-const KanbanAskBlockRead = readBlock(KanbanAskBlock, [
-  "md",
-  "collapse",
-  "html",
-  "card",
-  "image",
-  "attachment",
-]);
+/**
+ * Every block kind this build knows. A kind it knows is checked against the
+ * place it sits in, so an ask still can't hold a pick block; only a kind it
+ * has never heard of is stood in for.
+ */
+const KNOWN_BLOCK_TAGS = ["md", "collapse", "html", "choice", "card", "image", "attachment"];
+
+const KanbanBlockRead = readBlock(KanbanBlock, KNOWN_BLOCK_TAGS);
+const KanbanAskBlockRead = readBlock(KanbanAskBlock, KNOWN_BLOCK_TAGS);
 
 /**
  * Kinds with a ready layout and ready response parts. A kind is a label, not a

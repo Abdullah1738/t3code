@@ -1,3 +1,4 @@
+// @effect-diagnostics globalDate:off - Snooze times follow his local calendar and clock.
 /** Snooze times, shared by the web page and the phone. */
 
 /** A time an ask is put away until, and how the page names it: "tomorrow 09:00". */

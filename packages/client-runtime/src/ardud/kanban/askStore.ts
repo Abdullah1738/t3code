@@ -1,3 +1,5 @@
+// @effect-diagnostics globalTimers:off - Plain callback store shared by web and mobile.
+// @effect-diagnostics globalDate:off - Send times and toasts run on the device clock, outside an Effect runtime.
 /**
  * What a Needs-you screen knows: the ask feed, what he has typed on each ask,
  * and the answers that are held, on their way, failed or sent. One store for
@@ -634,9 +636,7 @@ export function createAskStore(host: AskStoreHost) {
       set({ sent: state.sent.filter((entry) => entry.id !== send.id) });
     } else {
       patchSend(send.id, { state: "sent", ...(evaluator ? { evaluator } : {}) });
-      const done = send.refs
-        .map((ref) => ref.key)
-        .filter((key) => get().failed[key] === undefined);
+      const done = send.refs.map((ref) => ref.key).filter((key) => get().failed[key] === undefined);
       set({ tried: without(get().tried, done), forms: without(get().forms, done) });
     }
     // An answer got through: whatever refused this session before no longer does.
