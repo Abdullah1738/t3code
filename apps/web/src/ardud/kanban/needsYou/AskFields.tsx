@@ -545,7 +545,7 @@ function FileControl(props: {
 
   const { id, "data-ny-at": at, onBlur, disabled: _disabled, ...aria } = common;
   return (
-    <div className="flex max-w-[520px] flex-col gap-2">
+    <div className="flex max-w-[560px] flex-col gap-2">
       {files.map((file) => (
         <FileRow key={file.id} name={file.name} size={file.sizeBytes} state="ready">
           <IconBtn
@@ -685,7 +685,7 @@ function SecretControl(props: {
   onChange: (value: string) => void;
 }) {
   return (
-    <div className="flex max-w-[520px] flex-col gap-1.5">
+    <div className="flex max-w-[560px] flex-col gap-1.5">
       <input
         {...props.common}
         type="password"
