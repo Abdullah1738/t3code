@@ -447,6 +447,37 @@ describe("owner standing", () => {
   });
 });
 
+describe("a feed this build can't read", () => {
+  const unreadable = () =>
+    new AskApiError(200, "unreadable", "Robob sent asks this app can't read.");
+
+  it("is an error with nothing read, not an empty queue", async () => {
+    const h = harness();
+    h.fail.feed = unreadable();
+    await h.store.refreshAsks();
+    const state = h.cell.getState();
+    expect(state.status).toBe("error");
+    expect(state.error).toBe("Robob sent asks this app can't read.");
+    // Null is "not read": a page shows the error with Retry, where [] would say "all done".
+    expect(state.feed).toBeNull();
+  });
+
+  it("keeps the asks it had, and says so, when a later read can't be read", async () => {
+    const h = harness();
+    h.setFeed([entry(1)]);
+    await h.store.refreshAsks();
+    h.fail.feed = unreadable();
+    await h.store.refreshAsks();
+    const state = h.cell.getState();
+    expect(state.feed?.open).toHaveLength(1);
+    expect(state.error).toBe("Robob sent asks this app can't read.");
+    // Trying again reads it, once the server sends something this build can read.
+    delete h.fail.feed;
+    await h.store.refreshAsks();
+    expect(h.cell.getState().error).toBeNull();
+  });
+});
+
 describe("what a host retries on", () => {
   it("counts the reads that came back good, not the ones that failed", async () => {
     const h = harness();

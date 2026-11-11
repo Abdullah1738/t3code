@@ -239,6 +239,22 @@ export const tolerateUnknownKanbanBlocks = (on = true): void => {
 };
 
 /**
+ * Runs one read with unknown blocks stood in for, then puts the setting back
+ * as it was. `read` must finish before it returns (a synchronous decode): the
+ * setting is this process's, so nothing else may run while it is on. For an
+ * app's own reads of what a server sent over HTTP.
+ */
+export const readingUnknownKanbanBlocks = <A>(read: () => A): A => {
+  const before = readsUnknownBlocks;
+  readsUnknownBlocks = true;
+  try {
+    return read();
+  } finally {
+    readsUnknownBlocks = before;
+  }
+};
+
+/**
  * A block as it is read back from a card or a message. In an app that has
  * turned `tolerateUnknownKanbanBlocks` on, a block of a kind this build
  * doesn't know (a newer server's) decodes as a line of text saying so, in the
@@ -1978,6 +1994,16 @@ export const KanbanAskFeed = Schema.Struct({
   closed: Schema.Array(KanbanAskFeedItem),
 });
 export type KanbanAskFeed = typeof KanbanAskFeed.Type;
+
+/** One ask as the single-ask read sends it: its blocks whole, and where it sits. */
+export const KanbanAskDetail = Schema.Struct({
+  boardId: KanbanBoardId,
+  cardId: KanbanCardId,
+  cardNumber: PositiveInt,
+  discussionId: Schema.NullOr(KanbanDiscussionId),
+  ask: KanbanOwnerAsk,
+});
+export type KanbanAskDetail = typeof KanbanAskDetail.Type;
 
 export const KanbanParticipant = Schema.Struct({
   actor: KanbanActor,

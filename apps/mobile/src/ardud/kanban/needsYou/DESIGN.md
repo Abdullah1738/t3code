@@ -125,6 +125,14 @@ the app's own scheme first of all. A web link the page follows is shown under it
 discussion's page (`Chat.tsx`) follows the same rule. A task step's link is a link only when
 it is a web address.
 
+## What is read
+
+The feed, one ask read whole and one message read whole come over HTTP and are read through
+the same schemas as a card (`askApi.ts` in the shared runtime, used by the web page too). A
+block of a kind this build doesn't know becomes its one-line stand-in and nothing of it is
+kept; anything else that doesn't fit is refused whole and the page shows the error with Retry,
+never an empty queue. An ask that comes again unchanged is not read through the schema again.
+
 ## Offline
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached

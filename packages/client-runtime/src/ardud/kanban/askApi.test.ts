@@ -1,7 +1,13 @@
-import type { KanbanAskSecretAnswerInput } from "@t3tools/contracts";
+import {
+  KANBAN_UNKNOWN_BLOCK_TEXT,
+  KanbanMessage,
+  type KanbanAskSecretAnswerInput,
+} from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  ASK_UNREADABLE_TEXT,
   AskApiError,
   askRouteUrl,
   createAskApi,
@@ -232,5 +238,168 @@ describe("createAskApi", () => {
       _tag: "refused",
       failure: { message: "Not connected to Robob.", stale: false, field: null },
     });
+  });
+});
+
+// What the routes send, as plain JSON: the shapes the server's own values have.
+const wireMessage = (blocks: ReadonlyArray<unknown>, seq = 1) => ({
+  discussionId: "d1",
+  seq,
+  author: { _tag: "thread", threadId: "t1" },
+  authorName: "Worker",
+  blocks,
+  answers: [],
+  createdAt: "2026-11-11T08:00:00.000Z",
+  askId: "q1",
+});
+const wireAsk = (blocks: ReadonlyArray<unknown>, extra: Record<string, unknown> = {}) => ({
+  id: "q1",
+  text: "Ship it?",
+  blocking: true,
+  by: { _tag: "thread", threadId: "t1" },
+  at: "2026-11-11T08:00:00.000Z",
+  seq: 1,
+  closedAt: null,
+  kind: "approval",
+  respond: { verdict: {} },
+  blocks,
+  ...extra,
+});
+const wireItem = (
+  number: number,
+  blocks: ReadonlyArray<unknown> = [],
+  extra: Record<string, unknown> = {},
+) => ({
+  boardId: "b1",
+  boardSlug: "robob",
+  boardName: "Robob",
+  cardId: `c${number}`,
+  cardNumber: number,
+  cardRef: `robob:${number}`,
+  cardTitle: `Card ${number}`,
+  stage: "needs_owner",
+  priority: 3,
+  discussionId: "d1",
+  blocks: 0,
+  ask: wireAsk(blocks),
+  kind: "approval",
+  revision: 0,
+  waitsOn: "owner",
+  expired: false,
+  messages: [wireMessage(blocks)],
+  ...extra,
+});
+const wireFeed = (open: ReadonlyArray<unknown>, at = "2026-11-11T08:00:00.000Z") => ({
+  at,
+  open,
+  closed: [],
+});
+/** A block of a kind only a newer server knows, with a payload this build must not keep. */
+const FROM_LATER = { _tag: "map", zoom: 12, pins: [{ lat: 25.2, lng: 55.3, note: "private" }] };
+const STAND_IN = { _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT };
+
+describe("what the server sent is read through the apps' read schemas", () => {
+  it("a block of an unknown kind in the feed becomes the one-line stand-in, its payload dropped", async () => {
+    const { api } = harness(() =>
+      json(200, wireFeed([wireItem(1, [{ _tag: "md", text: "Look" }, FROM_LATER])])),
+    );
+    const feed = await api.feed();
+    const entry = feed.open[0]!;
+    expect(entry.ask.blocks).toEqual([{ _tag: "md", text: "Look" }, STAND_IN]);
+    expect(entry.messages[0]!.blocks).toEqual([{ _tag: "md", text: "Look" }, STAND_IN]);
+    expect(JSON.stringify(feed)).not.toContain("private");
+    expect(JSON.stringify(feed)).not.toContain("pins");
+  });
+
+  it("the same for the single-ask read and for one message read whole", async () => {
+    const { api } = harness(({ url }) =>
+      url.includes("/messages/")
+        ? json(200, wireMessage([FROM_LATER], 4))
+        : json(200, {
+            boardId: "b1",
+            cardId: "c1",
+            cardNumber: 1,
+            discussionId: null,
+            ask: wireAsk([FROM_LATER]),
+          }),
+    );
+    const detail = await api.detail("robob:1", "q1");
+    expect(detail.ask.blocks).toEqual([STAND_IN]);
+    const message = await api.message("d1", 4);
+    expect(message.blocks).toEqual([STAND_IN]);
+    expect(JSON.stringify([detail, message])).not.toContain("private");
+  });
+
+  it("does not leave the process reading unknown blocks: a server in it stays strict", async () => {
+    const strict = Schema.decodeUnknownSync(KanbanMessage);
+    const { api } = harness(() => json(200, wireFeed([wireItem(1, [FROM_LATER])])));
+    await api.feed();
+    expect(() => strict(wireMessage([FROM_LATER]))).toThrow();
+  });
+
+  it("a known kind of block that is malformed is refused, not stood in for", async () => {
+    const { api } = harness(() => json(200, wireFeed([wireItem(1, [{ _tag: "html", html: 42 }])])));
+    const error = await api.feed().catch((e) => e);
+    expect(error).toBeInstanceOf(AskApiError);
+    expect(error.code).toBe("unreadable");
+  });
+
+  it("a feed that can't be read is an error to show, never an empty queue", async () => {
+    for (const body of [
+      {},
+      { at: "now", open: "none", closed: [] },
+      wireFeed([wireItem(1), { ...wireItem(2), ask: undefined }]),
+      wireFeed([{ ...wireItem(1), cardNumber: "one" }]),
+    ]) {
+      const { api } = harness(() => json(200, body));
+      const error = await api.feed().catch((e) => e);
+      expect(error).toBeInstanceOf(AskApiError);
+      expect(error.code).toBe("unreadable");
+      expect(error.message).toBe(ASK_UNREADABLE_TEXT);
+      // The server did answer: it is not a lost connection, so nothing goes again by itself.
+      expect(error.unreached).toBe(false);
+      expect(error.stale).toBe(false);
+      expect(error.denied).toBe(false);
+    }
+    const detail = harness(() => json(200, { card: {}, ask: null }));
+    expect((await detail.api.detail("robob:1", "q1").catch((e) => e)).code).toBe("unreadable");
+    const message = harness(() => json(200, { seq: 1 }));
+    expect((await message.api.message("d1", 1).catch((e) => e)).code).toBe("unreadable");
+  });
+
+  it("an ask that comes again unchanged is not read again: it is the same object", async () => {
+    let at = 0;
+    let second: unknown = wireItem(2);
+    const { api } = harness(() =>
+      json(200, wireFeed([wireItem(1), second], `2026-11-11T08:00:0${(at += 1)}.000Z`)),
+    );
+    const first = await api.feed();
+    second = wireItem(2, [], { revision: 1 });
+    const next = await api.feed();
+    expect(next.at).not.toBe(first.at);
+    expect(next.open[0]).toBe(first.open[0]);
+    expect(next.open[1]).not.toBe(first.open[1]);
+    expect(next.open[1]!.revision).toBe(1);
+  });
+
+  it("a feed that was refused does not forget the asks of the one before", async () => {
+    let body: unknown = wireFeed([wireItem(1)]);
+    const { api } = harness(() => json(200, body));
+    const first = await api.feed();
+    body = wireFeed([wireItem(1), { broken: true }]);
+    await expect(api.feed()).rejects.toThrow(ASK_UNREADABLE_TEXT);
+    body = wireFeed([wireItem(1)]);
+    expect((await api.feed()).open[0]).toBe(first.open[0]);
+  });
+
+  it("reads a feed of two hundred asks, and the next one without reading them again", async () => {
+    const open = Array.from({ length: 200 }, (_, index) =>
+      wireItem(index + 1, [{ _tag: "md", text: `Ask ${index + 1}` }]),
+    );
+    const { api } = harness(() => json(200, wireFeed(open)));
+    const first = await api.feed();
+    expect(first.open).toHaveLength(200);
+    const next = await api.feed();
+    expect(next.open.every((entry, index) => entry === first.open[index])).toBe(true);
   });
 });

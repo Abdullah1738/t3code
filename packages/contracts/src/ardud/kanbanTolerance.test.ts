@@ -7,8 +7,13 @@ import {
   KanbanCard,
   KanbanMessage,
   kanbanAskResponse,
+  readingUnknownKanbanBlocks,
   tolerateUnknownKanbanBlocks,
 } from "./kanban.ts";
+
+// The setting is this process's: whatever a test here turns on is off again
+// for the next one, so no test can change another's result.
+afterEach(() => tolerateUnknownKanbanBlocks(false));
 
 // What an app older than its server has to survive: a card or a message that
 // carries something the app's build has never heard of. The apps turn the
@@ -234,5 +239,39 @@ describe("blocks coming in", () => {
     tolerateUnknownKanbanBlocks();
     expect(() => decodeInput(MAP)).toThrow();
     tolerateUnknownKanbanBlocks(false);
+  });
+});
+
+describe("one read with unknown blocks stood in for", () => {
+  const decode = Schema.decodeUnknownSync(KanbanMessage);
+  const fromLater = {
+    seq: 1,
+    discussionId: "d1",
+    author: { _tag: "owner" },
+    authorName: "You",
+    createdAt: "2026-11-11T08:00:00.000Z",
+    blocks: [{ _tag: "map", zoom: 12, secretish: "payload" }],
+    answers: [],
+  };
+
+  it("stands in for the block during the read and is strict again after it", () => {
+    expect(() => decode(fromLater)).toThrow();
+    const read = readingUnknownKanbanBlocks(() => decode(fromLater));
+    expect(read.blocks).toEqual([{ _tag: "md", text: KANBAN_UNKNOWN_BLOCK_TEXT }]);
+    // The same process reads strictly again, as a server must.
+    expect(() => decode(fromLater)).toThrow();
+  });
+
+  it("is strict again after a read that failed", () => {
+    expect(() =>
+      readingUnknownKanbanBlocks(() => decode({ ...fromLater, seq: "not a number" })),
+    ).toThrow();
+    expect(() => decode(fromLater)).toThrow();
+  });
+
+  it("leaves an app that reads this way all the time as it was", () => {
+    tolerateUnknownKanbanBlocks();
+    readingUnknownKanbanBlocks(() => decode(fromLater));
+    expect(decode(fromLater).blocks).toHaveLength(1);
   });
 });

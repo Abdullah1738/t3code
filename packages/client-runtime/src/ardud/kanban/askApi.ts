@@ -5,13 +5,17 @@
  * carries a secret. The web page and the phone share it; each passes in how it
  * reaches its server, so a call that moves changes here only.
  */
-import type {
-  KanbanAskFeed,
-  KanbanAskSecretAnswerInput,
-  KanbanBlock,
+import {
+  KanbanAskDetail,
+  KanbanAskFeedItem,
   KanbanMessage,
-  KanbanOwnerAsk,
+  readingUnknownKanbanBlocks,
+  type KanbanAskFeed,
+  type KanbanAskSecretAnswerInput,
+  type KanbanBlock,
+  type KanbanOwnerAsk,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import type { AskAnswerBody } from "./askAnswer.ts";
 import {
@@ -117,7 +121,9 @@ interface CallOptions {
 }
 
 const isAbort = (cause: unknown): boolean =>
-  typeof cause === "object" && cause !== null && (cause as { name?: unknown }).name === "AbortError";
+  typeof cause === "object" &&
+  cause !== null &&
+  (cause as { name?: unknown }).name === "AbortError";
 
 /**
  * The route on the server `base` names: its origin plus the absolute path, as
@@ -261,6 +267,40 @@ export interface AskApi {
   readonly message: (discussionId: string, seq: number) => Promise<KanbanMessage>;
 }
 
+/** Said when a read came back as JSON this build can't take in. */
+export const ASK_UNREADABLE_TEXT =
+  "Robob sent asks this app can't read. The app may be older than Robob: update it and try again.";
+
+/**
+ * What the server sent, read through the schema the apps read cards with. A
+ * block of a kind this build doesn't know becomes its one-line stand-in and
+ * nothing of it is kept; anything else that doesn't fit is refused whole, as
+ * an error the page shows with Retry, never as an empty or half-read answer.
+ */
+const reader =
+  <A>(decode: (json: unknown) => A) =>
+  (json: unknown): A => {
+    try {
+      return readingUnknownKanbanBlocks(() => decode(json));
+    } catch {
+      // Answered, but not with something to show: not a lost connection, so nothing is retried by itself.
+      throw new AskApiError(200, "unreadable", ASK_UNREADABLE_TEXT);
+    }
+  };
+
+const readFeedShape = reader(
+  Schema.decodeUnknownSync(
+    Schema.Struct({
+      at: Schema.String,
+      open: Schema.Array(Schema.Unknown),
+      closed: Schema.Array(Schema.Unknown),
+    }),
+  ),
+);
+const readFeedItem = reader(Schema.decodeUnknownSync(KanbanAskFeedItem));
+const readDetail = reader(Schema.decodeUnknownSync(KanbanAskDetail));
+const readMessage = reader(Schema.decodeUnknownSync(KanbanMessage));
+
 const cardPath = (cardRef: string, askId: string) =>
   `/cards/${encodeURIComponent(cardRef)}/asks/${encodeURIComponent(askId)}`;
 
@@ -317,14 +357,36 @@ export function createAskApi(host: AskApiHost): AskApi {
     return json as T;
   }
 
+  // The asks of the last feed, by the text each came as. The feed is read
+  // every few seconds and most asks come again unchanged: those are not read
+  // through the schema again, and stay the same object for whoever holds them.
+  let lastItems = new Map<string, KanbanAskFeedItem>();
+  const readFeed = (json: unknown): KanbanAskFeed => {
+    const shape = readFeedShape(json);
+    const items = new Map<string, KanbanAskFeedItem>();
+    const item = (raw: unknown): KanbanAskFeedItem => {
+      const text = JSON.stringify(raw);
+      const read = lastItems.get(text) ?? items.get(text) ?? readFeedItem(raw);
+      items.set(text, read);
+      return read;
+    };
+    const feed = { at: shape.at, open: shape.open.map(item), closed: shape.closed.map(item) };
+    // Only once the whole feed was read: a feed that is refused leaves the last one's asks known.
+    lastItems = items;
+    return feed;
+  };
+
   return {
-    feed: (input = {}) =>
-      call<KanbanAskFeed>(
-        "GET",
-        `/asks${input.closed ? `?closed=${encodeURIComponent(input.closed)}` : ""}`,
-        input.signal ? { signal: input.signal } : {},
+    feed: async (input = {}) =>
+      readFeed(
+        await call<unknown>(
+          "GET",
+          `/asks${input.closed ? `?closed=${encodeURIComponent(input.closed)}` : ""}`,
+          input.signal ? { signal: input.signal } : {},
+        ),
       ),
-    detail: (cardRef, askId) => call<AskDetail>("GET", cardPath(cardRef, askId)),
+    detail: async (cardRef, askId) =>
+      readDetail(await call<unknown>("GET", cardPath(cardRef, askId))),
     answer: (cardRef, askId, body, revision, keepalive = false) =>
       call<AskAnswered>("POST", `${cardPath(cardRef, askId)}/answer`, {
         body: { ...body, revision },
@@ -363,10 +425,12 @@ export function createAskApi(host: AskApiHost): AskApi {
         "/asks/snooze",
         { body: { until, items: items.map(({ card, askId }) => ({ card, askId })) } },
       ),
-    message: (discussionId, seq) =>
-      call<KanbanMessage>(
-        "GET",
-        `/discussions/${encodeURIComponent(discussionId)}/messages/${seq}`,
+    message: async (discussionId, seq) =>
+      readMessage(
+        await call<unknown>(
+          "GET",
+          `/discussions/${encodeURIComponent(discussionId)}/messages/${seq}`,
+        ),
       ),
   };
 }

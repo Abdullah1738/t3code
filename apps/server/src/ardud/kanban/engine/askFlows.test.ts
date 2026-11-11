@@ -5,15 +5,18 @@
  */
 import { assert, it } from "@effect/vitest";
 import {
+  KanbanAskDetail,
+  KanbanAskFeed,
+  KanbanMessage,
   ThreadId,
   kanbanAskWaitsOn,
   type KanbanActor,
-  type KanbanAskFeed,
   type KanbanBlock,
   type KanbanCard,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { resolveAttachmentPath } from "../../../attachmentStore.ts";
@@ -28,6 +31,11 @@ import {
   workingCard,
   writePending,
 } from "./askFlows.testkit.ts";
+
+// The schemas the web page and the phone read the ask routes back through.
+const readFeedAsApps = Schema.decodeUnknownSync(KanbanAskFeed);
+const readAskAsApps = Schema.decodeUnknownSync(KanbanAskDetail);
+const readMessageAsApps = Schema.decodeUnknownSync(KanbanMessage);
 
 it.effect(
   "a draft ask stores its template, posts a pick an old client can answer, and keeps its blocks",
@@ -124,6 +132,13 @@ it.effect(
         assert.strictEqual(full._tag === "html" && full.truncated, undefined);
         const feed = yield* kanban.askFeed({});
         assert.isBelow(JSON.stringify(feed).length, page.length);
+        // The apps read these back from JSON through the read schemas, strictly
+        // apart from unknown block kinds: an ask with every kind of block, a
+        // stub among them, has to fit, or a phone would refuse a good feed.
+        const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+        assert.deepStrictEqual(asJson(readFeedAsApps(asJson(feed))), asJson(feed));
+        assert.deepStrictEqual(asJson(readAskAsApps(asJson(detail))), asJson(detail));
+        assert.deepStrictEqual(asJson(readMessageAsApps(asJson(message))), asJson(message));
         // The board feed the web client already gets carries the ask with its new fields.
         const snapshot = yield* kanban.snapshot(asked.boardId);
         const fed = snapshot.cards.find((entry) => entry.id === card.id)!.asks[0]!;
@@ -1004,6 +1019,18 @@ it.effect("the HTTP routes: feed shape, single answer, batch answer, reply and h
         assert.strictEqual(first.messages.length, 1);
         assert.strictEqual(first.messages[0]!.askId, "q1");
         assert.deepStrictEqual(body.closed, []);
+        // What the three read routes send fits the schemas the apps read them with.
+        assert.deepStrictEqual(
+          readFeedAsApps(feed.body).open.map((item) => item.ask.id),
+          ["q1", "q1", "q2"],
+        );
+        const oneAsk = yield* http.get("/cards/toy:1/asks/q1");
+        assert.strictEqual(readAskAsApps(oneAsk.body).ask.id, "q1");
+        const asked = first.messages[0]!;
+        const oneMessage = yield* http.get(
+          `/discussions/${asked.discussionId}/messages/${asked.seq}`,
+        );
+        assert.strictEqual(readMessageAsApps(oneMessage.body).askId, "q1");
         assert.strictEqual((yield* http.get("/asks?board=toy")).body.open.length, 3);
         assert.strictEqual((yield* http.get("/asks?board=nope")).status, 404);
         assert.strictEqual((yield* http.get("/asks?closed=soon")).status, 400);
