@@ -581,6 +581,7 @@ const STEP_WAIT_P1_MS = 15 * 60_000;
 const STEP_WAIT_MS = 60 * 60_000;
 const waitingOnEvaluatorStep = (card: KanbanCard) =>
   card.stage === "todo" &&
+  card.priority !== KANBAN_BACKLOG &&
   card.settledAt === null &&
   card.activeThreadId === null &&
   card.stalled?.by._tag !== "evaluator" &&
@@ -5097,7 +5098,7 @@ const make = Effect.gen(function* () {
                   );
                 }
               }
-              // A todo card waiting on an evaluator step wakes its evaluator once. An evaluator
+              // Evaluator-only steps get one wake; backlog cards are parked and never woken. An evaluator
               // flag means it is waiting outside the board, so there is nothing to do until the
               // flag clears; the in-memory woken bit would otherwise be lost on a restart.
               for (const card of yield* cardsForPlan) {
