@@ -5,7 +5,7 @@ import { AppText as Text } from "../../../components/ui/AppText";
 import { SymbolView } from "../../../components/ui/AppSymbol";
 import { useNowMs } from "../../common/hooks";
 import { Group, Row, Title } from "../../common/parts";
-import { useOwnerStanding, useWatchAsks } from "./askStore";
+import { useAsk, useOwnerStanding, useWatchAsks } from "./askStore";
 import { useQueue } from "./useQueue";
 
 /**
@@ -20,7 +20,9 @@ export function NeedsYouHomeRow() {
   const queue = useQueue(nowMs);
   // An ask whose answer is on its way no longer counts.
   const owed = queue.needsYou.items.filter((item) => !queue.hidden.has(item.key));
-  const count = owed.length;
+  // An open ask this build can't read still waits on him: it counts, though it has no row.
+  const unreadable = useAsk((state) => state.unreadable);
+  const count = owed.length + unreadable.filter((ask) => ask.owed).length;
   const holding = owed.some((item) => item.blocking);
   return (
     <Group>

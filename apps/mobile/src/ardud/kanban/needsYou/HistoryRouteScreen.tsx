@@ -1,6 +1,7 @@
 import {
   askAfterAnswer,
   askAsker,
+  askUnreadableLine,
   avatarOf,
   shortWhen,
   type AskOutcome,
@@ -34,6 +35,7 @@ export function HistoryRouteScreen() {
   useOwnerStanding();
   const queue = useQueue(nowMs);
   const closed = useAsk((state) => state.closed);
+  const unreadableClosed = useAsk((state) => state.unreadableClosed);
   const status = useAsk((state) => state.closedStatus);
   const sent = useAsk((state) => state.sent);
   const heldId = useAsk((state) => state.held?.payload.id ?? null);
@@ -81,6 +83,11 @@ export function HistoryRouteScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
       >
         <OfflineBand />
+        {unreadableClosed.length > 0 ? (
+          <Text className="px-0.5 text-sm text-foreground-muted">
+            {askUnreadableLine(unreadableClosed.length)}.
+          </Text>
+        ) : null}
         {closed === null && status !== "error" ? <LoadingLine /> : null}
         {closed === null && status === "error" ? (
           <Band

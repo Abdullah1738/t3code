@@ -120,6 +120,7 @@ export function AskReader(props: {
   const key = askKey(entry);
   const turn = askTurn(entry, item);
   const detail = useAskStore((state) => state.details[`${key}@${entry.revision}`]);
+  const detailError = useAskStore((state) => state.detailErrors[`${key}@${entry.revision}`]);
   const ask = detail ?? entry.ask;
   // The stored form, or a fresh one: a selector must not build a new object per read.
   const storedForm = useAskStore((state) => state.forms[key]);
@@ -428,6 +429,19 @@ export function AskReader(props: {
                 }
               >
                 {notOwner.text}
+              </Banner>
+            ) : null}
+            {detailError !== undefined && detail === undefined ? (
+              // Its big parts did not load: said on this ask, and the rest of it still reads.
+              <Banner
+                tone="negative"
+                action={
+                  <Btn size="sm" onClick={() => void loadAskDetail(entry).catch(() => undefined)}>
+                    Retry
+                  </Btn>
+                }
+              >
+                Couldn't read all of this ask. {detailError}
               </Banner>
             ) : null}
             {failed ? (

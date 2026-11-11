@@ -1,4 +1,7 @@
 import {
+  askUnreadableCard,
+  askUnreadableLine,
+  type AskUnreadable,
   askAge,
   askBatchTitle,
   askKindLabel,
@@ -42,6 +45,9 @@ export interface QueueRailProps {
   readonly marks: Readonly<Record<string, NeedsYouMark>>;
   readonly nowMs: number;
   readonly onShortcuts: () => void;
+  /** Open asks this build could not read: said in one line, with their cards to open. */
+  readonly unreadable: ReadonlyArray<AskUnreadable>;
+  readonly onOpenUnreadable: (ask: AskUnreadable) => void;
   /** In a sheet on a phone: no footer, rows a thumb can hit. */
   readonly inSheet?: boolean;
 }
@@ -151,9 +157,14 @@ export function QueueRail(props: QueueRailProps) {
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-1 pb-3"
         aria-busy={props.status === "loading"}
       >
+        {props.status === "loading" || props.status === "idle" ? null : (
+          <UnreadableNotice asks={props.unreadable} onOpen={props.onOpenUnreadable} />
+        )}
         {props.status === "loading" || props.status === "idle" ? (
           <RailSkeleton />
-        ) : sections.length === 0 ? (
+        ) : sections.length === 0 &&
+          props.unreadable.length > 0 &&
+          !props.filtered ? null : sections.length === 0 ? (
           props.filtered ? (
             props.inSheet ? (
               <div className="flex flex-col items-start gap-2 px-2.5 pt-4 text-sm">
@@ -212,6 +223,36 @@ export function QueueRail(props: QueueRailProps) {
         </footer>
       )}
     </div>
+  );
+}
+
+/**
+ * Asks the feed carried that this build can't read. They are still open, so
+ * the queue says so in one quiet line and names the cards he can open instead.
+ */
+function UnreadableNotice(props: {
+  readonly asks: ReadonlyArray<AskUnreadable>;
+  readonly onOpen: (ask: AskUnreadable) => void;
+}) {
+  if (props.asks.length === 0) return null;
+  const named = props.asks.filter(
+    (ask) => ask.boardId !== null && ask.cardId !== null && askUnreadableCard(ask) !== null,
+  );
+  const shown = named.slice(0, 3);
+  return (
+    <p role="status" className="px-2.5 pt-3 text-xs text-(--m-muted) [overflow-wrap:anywhere]">
+      {askUnreadableLine(props.asks.length)}.{shown.length > 0 ? " Open " : ""}
+      {shown.map((ask, index) => (
+        <span key={`${ask.cardId}:${ask.askId}`}>
+          {index > 0 ? ", " : ""}
+          <button type="button" onClick={() => props.onOpen(ask)} className={linkClass}>
+            {askUnreadableCard(ask)}
+          </button>
+        </span>
+      ))}
+      {named.length > shown.length ? ` and ${named.length - shown.length} more` : ""}
+      {shown.length > 0 ? "." : ""}
+    </p>
   );
 }
 

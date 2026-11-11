@@ -24,7 +24,14 @@ import {
   type AskIntent,
   type AskProblemKey,
 } from "./askAnswer.ts";
-import { AskApiError, askFailureText, type AskApi, type AskBatchResult } from "./askApi.ts";
+import {
+  AskApiError,
+  askFailureText,
+  type AskApi,
+  type AskBatchResult,
+  type AskFeedRead,
+  type AskUnreadable,
+} from "./askApi.ts";
 import type { ChangeView } from "./askKeys.ts";
 import { askReplyProblem } from "./askReply.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
@@ -33,6 +40,22 @@ import type { NeedsYouMark } from "./needsYouQueue.ts";
 
 export const askKey = (entry: Pick<KanbanAskFeedItem, "cardId" | "ask">): string =>
   `${entry.cardId}:${entry.ask.id}`;
+
+/** The queue key of an ask that could not be read, when its card and id could be. */
+export const askUnreadableKey = (ask: AskUnreadable): string | null =>
+  ask.cardId !== null && ask.askId !== null ? `${ask.cardId}:${ask.askId}` : null;
+
+const NO_UNREADABLE: ReadonlyArray<AskUnreadable> = [];
+/** The same list object when nothing in it changed, so nothing re-renders for it. */
+const keptList = (
+  before: ReadonlyArray<AskUnreadable>,
+  next: ReadonlyArray<AskUnreadable> | undefined,
+): ReadonlyArray<AskUnreadable> => {
+  if (next === undefined || next.length === 0) return NO_UNREADABLE;
+  return before.length === next.length && before.every((item, index) => item === next[index])
+    ? before
+    : next;
+};
 
 /** Who asked, as a sentence names them: "the #457 work thread", "the Robob evaluator". */
 export function askAsker(entry: KanbanAskFeedItem): string {
@@ -118,6 +141,14 @@ export interface AskState {
   readonly error: string | null;
   readonly feed: KanbanAskFeed | null;
   /**
+   * Open asks the last feed carried that this build could not read. They are
+   * not in `feed.open` and not closed: the page says how many there are and
+   * points at their cards, and nothing of theirs is dropped as if answered.
+   */
+  readonly unreadable: ReadonlyArray<AskUnreadable>;
+  /** The same for the closed asks of the History window. */
+  readonly unreadableClosed: ReadonlyArray<AskUnreadable>;
+  /**
    * How many times the feed has been read with success. Each good read is a
    * sign the server is reachable; an answer that never reached it may go
    * again by itself after a later one (see `retryUnreachedAskSends`).
@@ -142,6 +173,8 @@ export interface AskState {
   readonly sent: ReadonlyArray<AskSend>;
   /** Asks read whole (their big blocks are stubs in the feed), by `key@revision`. */
   readonly details: Readonly<Record<string, KanbanOwnerAsk>>;
+  /** Why an ask could not be read whole, by `key@revision`: shown on that ask, with Retry. */
+  readonly detailErrors: Readonly<Record<string, string>>;
   readonly toast: AskToast | null;
   /**
    * The server said this session is not the owner's own, in its words.
@@ -157,6 +190,8 @@ export const INITIAL_ASK_STATE: AskState = {
   status: "idle",
   error: null,
   feed: null,
+  unreadable: NO_UNREADABLE,
+  unreadableClosed: NO_UNREADABLE,
   reads: 0,
   closed: null,
   closedStatus: "idle",
@@ -170,6 +205,7 @@ export const INITIAL_ASK_STATE: AskState = {
   failed: {},
   sent: [],
   details: {},
+  detailErrors: {},
   toast: null,
   notOwner: null,
   changeView: "after",
@@ -316,13 +352,19 @@ export function createAskStore(host: AskStoreHost) {
   let sendId = 0;
   const sending = new Set<number>();
 
-  function mergeFeed(feed: KanbanAskFeed) {
+  function mergeFeed(feed: AskFeedRead) {
     const state = get();
     const before = new Map((state.feed?.open ?? []).map((entry) => [askKey(entry), entry]));
     const marks = { ...state.marks };
     const previous = { ...state.previous };
     const forms = { ...state.forms };
     const openKeys = new Set<string>();
+    // An ask that could not be read is still open: nothing of it is cleared as if it had closed.
+    const unreadable = keptList(state.unreadable, feed.unreadable?.open);
+    for (const lost of unreadable) {
+      const key = askUnreadableKey(lost);
+      if (key !== null) openKeys.add(key);
+    }
     for (const entry of feed.open) {
       const key = askKey(entry);
       openKeys.add(key);
@@ -352,6 +394,7 @@ export function createAskStore(host: AskStoreHost) {
     for (const key of Object.keys(marks)) if (gone(key)) delete marks[key];
     set({
       feed,
+      unreadable,
       reads: state.reads + 1,
       status: "ready",
       error: null,
@@ -403,7 +446,11 @@ export function createAskStore(host: AskStoreHost) {
       const feed = await askApi.feed({ closed: "7d" });
       closedOwed = false;
       mergeFeed(feed);
-      set({ closed: feed.closed, closedStatus: "ready" });
+      set({
+        closed: feed.closed,
+        unreadableClosed: keptList(get().unreadableClosed, feed.unreadable?.closed),
+        closedStatus: "ready",
+      });
     } catch (error) {
       const none = get().closed === null;
       closedOwed = none;
@@ -502,8 +549,17 @@ export function createAskStore(host: AskStoreHost) {
   async function loadAskDetail(entry: KanbanAskFeedItem): Promise<void> {
     const id = `${askKey(entry)}@${entry.revision}`;
     if (disposed || get().details[id] !== undefined) return;
-    const detail = await askApi.detail(entry.cardRef, entry.ask.id);
-    set({ details: { ...get().details, [id]: detail.ask } });
+    if (get().detailErrors[id] !== undefined) {
+      set({ detailErrors: without(get().detailErrors, [id]) });
+    }
+    try {
+      const detail = await askApi.detail(entry.cardRef, entry.ask.id);
+      set({ details: { ...get().details, [id]: detail.ask } });
+    } catch (error) {
+      // Said on the ask itself, with Retry: the rest of the ask still shows.
+      set({ detailErrors: { ...get().detailErrors, [id]: askFailureText(error) } });
+      throw error;
+    }
   }
 
   const patchSend = (id: number, patch: Partial<AskSend>) => {

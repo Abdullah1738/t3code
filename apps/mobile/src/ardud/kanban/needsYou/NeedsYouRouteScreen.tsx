@@ -37,7 +37,7 @@ import {
 } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
-import { AskToastBar, BarButton, OfflineBand, OwnerBand, Pill } from "./ui";
+import { AskToastBar, BarButton, OfflineBand, OwnerBand, Pill, UnreadableLine } from "./ui";
 import { useQueue } from "./useQueue";
 
 const ALL_BOARDS = "";
@@ -145,9 +145,11 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     },
   ];
 
+  const unreadable = useAsk((state) => state.unreadable);
   const subtitle = queue.read
     ? [
         `${owed.length} to answer`,
+        unreadable.length > 0 ? `${unreadable.length} can't be shown` : null,
         waiting > 0 ? `${waiting} waiting on agents` : null,
         queue.needsYou.counts.snoozed > 0 ? `${queue.needsYou.counts.snoozed} snoozed` : null,
       ]
@@ -159,6 +161,7 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     <View className="gap-3 pb-1">
       <OwnerBand />
       <OfflineBand />
+      <UnreadableLine asks={unreadable} onOpenCard={nav.openCard} />
       {queue.open.length > 0 ? (
         <SearchField
           inputRef={searchRef}
@@ -197,7 +200,8 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
     )
   ) : filtered ? (
     <Empty title="No asks match" action={{ label: "Clear filters", onPress: clearFilter }} />
-  ) : (
+  ) : unreadable.length > 0 ? null : (
+    // With asks open that this build can't show, the line above says so: it is not "all clear".
     <AllClear
       nowMs={nowMs}
       waiting={waiting}

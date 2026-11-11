@@ -12,6 +12,8 @@ import {
   needsYouNextFocus,
   needsYouSections,
   needsYouStep,
+  askUnreadableLine,
+  type AskUnreadable,
   type NeedsYouEntry,
   type NeedsYouFilter,
   type NeedsYouItem,
@@ -100,6 +102,7 @@ export function NeedsYouPage(props: {
   const status = useAskStore((state) => state.status);
   const error = useAskStore((state) => state.error);
   const feed = useAskStore((state) => state.feed);
+  const unreadable = useAskStore((state) => state.unreadable);
   const marks = useAskStore((state) => state.marks) ?? NO_MARKS;
   const hiddenMap = useAskStore((state) => state.hidden);
   const boards = useBoards();
@@ -326,6 +329,12 @@ export function NeedsYouPage(props: {
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   const railProps = {
     status,
+    unreadable,
+    onOpenUnreadable: (ask: AskUnreadable) => {
+      if (ask.boardId === null || ask.cardId === null) return;
+      noteDrawerOpener();
+      setCard({ boardId: ask.boardId, cardId: ask.cardId });
+    },
     sections,
     focusKey,
     onFocus: pickRow,
@@ -555,6 +564,12 @@ export function NeedsYouPage(props: {
                     Clear filters
                   </button>
                 }
+              />
+            ) : unreadable.length > 0 ? (
+              // Not "all clear": asks are open that this build can't show.
+              <Empty
+                title={`${askUnreadableLine(unreadable.length)}.`}
+                detail="They are still open. Open the card from the queue to answer there."
               />
             ) : (
               <AllClear

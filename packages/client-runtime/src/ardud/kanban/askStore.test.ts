@@ -6,7 +6,7 @@ import {
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { AskApiError, type AskApi } from "./askApi.ts";
+import { AskApiError, type AskApi, type AskFeedRead, type AskUnreadable } from "./askApi.ts";
 import { ASK_NOT_OWNER_DEVICE_TEXT } from "./askSecrets.ts";
 import { ASK_UNDO_MS } from "./askSendQueue.ts";
 import {
@@ -15,6 +15,7 @@ import {
   askAutoRetryOwed,
   askFormOf,
   askKey,
+  askUnreadableKey,
   createAskStateCell,
   createAskStore,
 } from "./askStore.ts";
@@ -59,8 +60,21 @@ const entry = (
 const feedOf = (open: ReadonlyArray<KanbanAskFeedItem>): KanbanAskFeed =>
   ({ at: "2026-11-11T08:00:00.000Z", open, closed: [] }) as KanbanAskFeed;
 
+/** What the API makes of an ask it could not read. */
+const lost = (number: number, patch: Partial<AskUnreadable> = {}): AskUnreadable => ({
+  boardId: "b1",
+  boardName: "Robob",
+  cardId: `c${number}`,
+  cardNumber: number,
+  cardRef: `robob:${number}`,
+  cardTitle: `Card ${number}`,
+  askId: "q1",
+  owed: true,
+  ...patch,
+});
+
 function harness() {
-  let feed = feedOf([]);
+  let feed: AskFeedRead = feedOf([]);
   const boards = new Set<() => void>();
   const foreground = new Set<() => void>();
   const calls: Array<{ readonly name: string; readonly args: ReadonlyArray<unknown> }> = [];
@@ -117,6 +131,10 @@ function harness() {
     named: (name: string) => calls.filter((entry) => entry.name === name),
     setFeed: (open: ReadonlyArray<KanbanAskFeedItem>) => {
       feed = feedOf(open);
+    },
+    /** A feed as the API hands it over, with the asks it could not read noted. */
+    setFeedRead: (read: AskFeedRead) => {
+      feed = read;
     },
   };
 }
@@ -480,6 +498,111 @@ describe("a feed this build can't read", () => {
     delete h.fail.feed;
     await h.store.refreshAsks();
     expect(h.cell.getState().error).toBeNull();
+  });
+});
+
+describe("an ask in the feed this build can't read", () => {
+  const withLost = (
+    open: ReadonlyArray<KanbanAskFeedItem>,
+    unreadable: ReadonlyArray<AskUnreadable>,
+    closed: ReadonlyArray<AskUnreadable> = [],
+  ) => ({ ...feedOf(open), unreadable: { open: unreadable, closed } });
+
+  it("is told beside the asks that read, and they all load", async () => {
+    const h = harness();
+    h.setFeedRead(withLost([entry(1), entry(3)], [lost(2)]));
+    await h.store.refreshAsks();
+    const state = h.cell.getState();
+    expect(state.status).toBe("ready");
+    expect(state.error).toBeNull();
+    expect(state.feed?.open.map((item) => item.cardRef)).toEqual(["robob:1", "robob:3"]);
+    expect(state.unreadable).toEqual([lost(2)]);
+    expect(askUnreadableKey(state.unreadable[0]!)).toBe("c2:q1");
+  });
+
+  it("is not treated as closed when it read before: nothing of his is cleared", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask, entry(2)]);
+    await h.store.refreshAsks();
+    h.store.patchAskForm(ask, { note: "half written" });
+    // His answer did not reach the server, so it sits as "not sent" on the ask.
+    h.fail.answer = new AskApiError(0, "network", "Robob did not answer.");
+    h.store.answerAsk(ask, "primary");
+    await vi.advanceTimersByTimeAsync(ASK_UNDO_MS);
+    expect(h.cell.getState().failed[askKey(ask)]?.unreached).toBe(true);
+
+    // The server now sends the ask in a shape this build can't read.
+    h.setFeedRead(withLost([entry(2)], [lost(1)]));
+    await h.store.refreshAsks();
+    const state = h.cell.getState();
+    expect(state.feed?.open.map((item) => item.cardRef)).toEqual(["robob:2"]);
+    expect(state.unreadable).toEqual([lost(1)]);
+    // Had it closed, these would be gone.
+    expect(state.failed[askKey(ask)]?.unreached).toBe(true);
+    expect(state.marks[askKey(ask)]).toBe("failed");
+    expect(askFormOf(state, ask).note).toBe("half written");
+
+    // It reads again: it is back in the queue with what he wrote.
+    h.setFeed([ask, entry(2)]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().unreadable).toEqual([]);
+    expect(askFormOf(h.cell.getState(), ask).note).toBe("half written");
+  });
+
+  it("keeps the same list while nothing in it changes, and drops it when all read", async () => {
+    const h = harness();
+    const two = lost(2);
+    h.setFeedRead(withLost([entry(1)], [two]));
+    await h.store.refreshAsks();
+    const first = h.cell.getState().unreadable;
+    h.setFeedRead(withLost([entry(1)], [two]));
+    await h.store.refreshAsks();
+    expect(h.cell.getState().unreadable).toBe(first);
+    h.setFeed([entry(1)]);
+    await h.store.refreshAsks();
+    expect(h.cell.getState().unreadable).toEqual([]);
+  });
+
+  it("an ask with no readable card or id has no key, and still counts", async () => {
+    const h = harness();
+    const blank = lost(9, { cardId: null, askId: null, cardRef: null, cardNumber: null });
+    h.setFeedRead(withLost([entry(1)], [blank]));
+    await h.store.refreshAsks();
+    expect(askUnreadableKey(blank)).toBeNull();
+    expect(h.cell.getState().unreadable).toHaveLength(1);
+  });
+
+  it("closed asks that can't be read are counted for History", async () => {
+    const h = harness();
+    h.setFeedRead(withLost([entry(1)], [], [lost(7)]));
+    await h.store.loadClosedAsks();
+    expect(h.cell.getState().unreadableClosed).toEqual([lost(7)]);
+    expect(h.cell.getState().unreadable).toEqual([]);
+  });
+});
+
+describe("an ask that can't be read whole", () => {
+  it("says why on that ask and reads on Retry, without breaking the ask", async () => {
+    const h = harness();
+    const ask = entry(1);
+    h.setFeed([ask]);
+    await h.store.refreshAsks();
+    const id = `${askKey(ask)}@0`;
+
+    h.fail.detail = new AskApiError(200, "unreadable", "Robob sent asks this app can't read.");
+    await expect(h.store.loadAskDetail(ask)).rejects.toThrow();
+    expect(h.cell.getState().detailErrors[id]).toBe("Robob sent asks this app can't read.");
+    expect(h.cell.getState().details[id]).toBeUndefined();
+    // The ask itself is untouched: still open, still his to answer from what the feed carried.
+    expect(h.cell.getState().feed?.open).toHaveLength(1);
+    expect(h.cell.getState().error).toBeNull();
+
+    delete h.fail.detail;
+    h.results.detail = { ask: { ...ask.ask, text: "Whole" } };
+    await h.store.loadAskDetail(ask);
+    expect(h.cell.getState().detailErrors[id]).toBeUndefined();
+    expect(h.cell.getState().details[id]?.text).toBe("Whole");
   });
 });
 

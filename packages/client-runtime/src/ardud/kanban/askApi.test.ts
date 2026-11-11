@@ -9,6 +9,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ASK_UNREADABLE_TEXT,
   AskApiError,
+  askUnreadableCard,
+  askUnreadableLine,
   askRouteUrl,
   createAskApi,
   type AskApiHost,
@@ -337,20 +339,96 @@ describe("what the server sent is read through the apps' read schemas", () => {
     expect(() => strict(wireMessage([FROM_LATER]))).toThrow();
   });
 
-  it("a known kind of block that is malformed is refused, not stood in for", async () => {
-    const { api } = harness(() => json(200, wireFeed([wireItem(1, [{ _tag: "html", html: 42 }])])));
-    const error = await api.feed().catch((e) => e);
-    expect(error).toBeInstanceOf(AskApiError);
-    expect(error.code).toBe("unreadable");
+  it("a known kind of block that is malformed is not stood in for: its ask is set aside", async () => {
+    const { api } = harness(() =>
+      json(200, wireFeed([wireItem(1, [{ _tag: "html", html: 42 }]), wireItem(2)])),
+    );
+    const feed = await api.feed();
+    expect(feed.open.map((entry) => entry.cardRef)).toEqual(["robob:2"]);
+    expect(feed.unreadable?.open.map((ask) => ask.cardRef)).toEqual(["robob:1"]);
   });
 
-  it("a feed that can't be read is an error to show, never an empty queue", async () => {
-    for (const body of [
-      {},
-      { at: "now", open: "none", closed: [] },
-      wireFeed([wireItem(1), { ...wireItem(2), ask: undefined }]),
-      wireFeed([{ ...wireItem(1), cardNumber: "one" }]),
-    ]) {
+  it("one ask that can't be read never takes the rest of the feed with it", async () => {
+    const odd = { ...wireItem(2), ask: { ...wireAsk([]), seq: "first" } };
+    const { api } = harness(() =>
+      json(200, { ...wireFeed([wireItem(1), odd, wireItem(3)]), closed: [wireItem(4), { no: 1 }] }),
+    );
+    const feed = await api.feed({ closed: "7d" });
+    // Every ask that reads is there, in order.
+    expect(feed.open.map((entry) => entry.cardRef)).toEqual(["robob:1", "robob:3"]);
+    expect(feed.closed.map((entry) => entry.cardRef)).toEqual(["robob:4"]);
+    // The one that doesn't is named, by what little of it could be read, so its card can be opened.
+    expect(feed.unreadable).toEqual({
+      open: [
+        {
+          boardId: "b1",
+          boardName: "Robob",
+          cardId: "c2",
+          cardNumber: 2,
+          cardRef: "robob:2",
+          cardTitle: "Card 2",
+          askId: "q1",
+          owed: true,
+        },
+      ],
+      closed: [
+        {
+          boardId: null,
+          boardName: null,
+          cardId: null,
+          cardNumber: null,
+          cardRef: null,
+          cardTitle: null,
+          askId: null,
+          owed: true,
+        },
+      ],
+    });
+    expect(askUnreadableLine(1)).toBe("1 ask can't be shown in this version of Robob");
+    expect(askUnreadableLine(3)).toBe("3 asks can't be shown in this version of Robob");
+    expect(askUnreadableCard(feed.unreadable!.open[0]!)).toBe("Robob #2");
+    expect(askUnreadableCard(feed.unreadable!.closed[0]!)).toBeNull();
+  });
+
+  it("says nothing of unreadable asks when every one reads", async () => {
+    const { api } = harness(() => json(200, wireFeed([wireItem(1), wireItem(2)])));
+    expect("unreadable" in (await api.feed())).toBe(false);
+  });
+
+  it("an unreadable ask that waits on someone else, or is put away, is not counted as his", async () => {
+    const bad = (number: number, extra: Record<string, unknown>) => ({
+      ...wireItem(number),
+      priority: "high",
+      ...extra,
+    });
+    const { api } = harness(() =>
+      json(
+        200,
+        wireFeed([
+          bad(1, {}),
+          bad(2, { waitsOn: "agent" }),
+          bad(3, { waitsOn: "evaluator" }),
+          bad(4, { snoozed: true }),
+          bad(5, { waitsOn: 7 }),
+        ]),
+      ),
+    );
+    const feed = await api.feed();
+    expect(feed.open).toEqual([]);
+    expect(feed.unreadable?.open.map((ask) => ask.owed)).toEqual([true, false, false, false, true]);
+  });
+
+  it("an unreadable ask is not tried again on every poll", async () => {
+    const odd = { ...wireItem(2), priority: "high" };
+    const { api } = harness(() => json(200, wireFeed([wireItem(1), odd])));
+    const first = await api.feed();
+    const next = await api.feed();
+    expect(next.unreadable?.open[0]).toBe(first.unreadable?.open[0]);
+    expect(next.open[0]).toBe(first.open[0]);
+  });
+
+  it("no feed at all is an error to show, never an empty queue", async () => {
+    for (const body of [{}, { at: "now", open: "none", closed: [] }, [], "feed", null]) {
       const { api } = harness(() => json(200, body));
       const error = await api.feed().catch((e) => e);
       expect(error).toBeInstanceOf(AskApiError);
@@ -361,10 +439,104 @@ describe("what the server sent is read through the apps' read schemas", () => {
       expect(error.stale).toBe(false);
       expect(error.denied).toBe(false);
     }
+  });
+
+  it("a single ask or message that can't be read is an error on that read alone", async () => {
     const detail = harness(() => json(200, { card: {}, ask: null }));
     expect((await detail.api.detail("robob:1", "q1").catch((e) => e)).code).toBe("unreadable");
     const message = harness(() => json(200, { seq: 1 }));
     expect((await message.api.message("d1", 1).catch((e) => e)).code).toBe("unreadable");
+  });
+
+  it("reads an ask from before asks had kinds: only the first fields", async () => {
+    const old = {
+      ...wireItem(1),
+      ask: {
+        id: "q1",
+        text: "Which one?",
+        blocking: true,
+        by: { _tag: "thread", threadId: "t1" },
+        at: "2026-10-01T08:00:00.000Z",
+        seq: null,
+        closedAt: null,
+      },
+      kind: "question",
+      messages: [],
+    };
+    const { api } = harness(() => json(200, wireFeed([old])));
+    const feed = await api.feed();
+    expect(feed.unreadable).toBeUndefined();
+    expect(feed.open[0]!.ask).toEqual(old.ask);
+  });
+
+  it("reads asks as the live feed carries them, in every combination seen there", async () => {
+    // With and without each optional part, raised by a thread or an evaluator,
+    // blocking or not, on a card in each stage an open ask is found on.
+    const parts: ReadonlyArray<Record<string, unknown>> = [
+      {},
+      { title: "Deploy go" },
+      { context: "CI is green and the migration ran on staging." },
+      {
+        options: [
+          { id: "a", label: "Ship now", recommended: true, detail: "Today" },
+          { id: "b", label: "Wait", consequence: "Slips a day" },
+        ],
+        multi: false,
+      },
+      {
+        action: {
+          summary: "Deploy",
+          command: "make deploy",
+          target: "production",
+          evidence: ["CI green"],
+          undo: "make rollback",
+          // oxlint-disable-next-line unicorn/no-thenable -- The ask's own field is named "then".
+          then: "Post the result",
+        },
+      },
+      { batchKey: "deploy-go" },
+      { basis: "As of commit 1a2b3c" },
+      { respond: { verdict: { approve: "Ship", reject: "Hold" } } },
+      { respond: { choose: { min: 1, max: 2 } }, options: [{ id: "a", label: "A" }] },
+      { respond: { ack: true } },
+      {
+        to: "evaluator",
+        revision: 2,
+        revisedAt: "2026-11-11T09:00:00.000Z",
+        revisionNote: "Updated",
+      },
+      { expiresAt: "2026-11-12T08:00:00.000Z", snoozedUntil: "2026-11-11T20:00:00.000Z" },
+    ];
+    const raisers = [
+      { _tag: "thread", threadId: "t1" },
+      { _tag: "evaluator", threadId: "t2" },
+    ];
+    const stages = ["todo", "working", "in_review", "needs_owner", "completed", "deployed"];
+    const open: Array<unknown> = [];
+    let number = 0;
+    for (const part of parts) {
+      for (const by of raisers) {
+        for (const blocking of [true, false]) {
+          for (const stage of stages) {
+            number += 1;
+            const item = wireItem(number);
+            open.push({
+              ...item,
+              stage,
+              waitsOn: number % 3 === 0 ? "agent" : "owner",
+              ask: { ...item.ask, kind: undefined, respond: undefined, by, blocking, ...part },
+            });
+          }
+        }
+      }
+    }
+    expect(open).toHaveLength(parts.length * 2 * 2 * stages.length);
+    const { api } = harness(() => json(200, wireFeed(open)));
+    const feed = await api.feed();
+    expect(feed.unreadable).toBeUndefined();
+    expect(feed.open).toHaveLength(open.length);
+    // Read, not passed through: what comes back is what was sent, part for part.
+    expect(JSON.parse(JSON.stringify(feed.open))).toEqual(JSON.parse(JSON.stringify(open)));
   });
 
   it("an ask that comes again unchanged is not read again: it is the same object", async () => {
@@ -386,20 +558,51 @@ describe("what the server sent is read through the apps' read schemas", () => {
     let body: unknown = wireFeed([wireItem(1)]);
     const { api } = harness(() => json(200, body));
     const first = await api.feed();
-    body = wireFeed([wireItem(1), { broken: true }]);
+    body = { at: "now" };
     await expect(api.feed()).rejects.toThrow(ASK_UNREADABLE_TEXT);
     body = wireFeed([wireItem(1)]);
     expect((await api.feed()).open[0]).toBe(first.open[0]);
   });
 
   it("reads a feed of two hundred asks, and the next one without reading them again", async () => {
-    const open = Array.from({ length: 200 }, (_, index) =>
-      wireItem(index + 1, [{ _tag: "md", text: `Ask ${index + 1}` }]),
+    // Asks the size the live feed carries: text, a few blocks, a thread of messages.
+    const blocks = [
+      { _tag: "md", text: "Context. ".repeat(60) },
+      { _tag: "collapse", title: "Log", text: "line\n".repeat(80) },
+      {
+        _tag: "html",
+        title: "Chart",
+        html: "<p>stub</p>",
+        height: 200,
+        truncated: true,
+        fullBytes: 9000,
+      },
+    ];
+    const open = Array.from({ length: 200 }, (_, index) => ({
+      ...wireItem(index + 1, blocks),
+      messages: [1, 2, 3].map((seq) => wireMessage(blocks, seq)),
+    }));
+    const body = JSON.stringify(wireFeed(open));
+    const { api } = harness(
+      () => new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
     );
-    const { api } = harness(() => json(200, wireFeed(open)));
-    const first = await api.feed();
-    expect(first.open).toHaveLength(200);
-    const next = await api.feed();
-    expect(next.open.every((entry, index) => entry === first.open[index])).toBe(true);
+    const timed = async () => {
+      const start = performance.now();
+      const feed = await api.feed();
+      return { feed, ms: performance.now() - start };
+    };
+    const first = await timed();
+    expect(first.feed.open).toHaveLength(200);
+    const polls = [await timed(), await timed(), await timed()];
+    for (const poll of polls) {
+      expect(poll.feed.open.every((entry, index) => entry === first.feed.open[index])).toBe(true);
+    }
+    const again = Math.min(...polls.map((poll) => poll.ms));
+    // For the record (the numbers are printed, not asserted tightly: machines differ).
+    console.info(
+      `ask feed, 200 asks, ${(body.length / 1024).toFixed(0)} KiB: first read ${first.ms.toFixed(1)} ms, unchanged poll ${again.toFixed(1)} ms`,
+    );
+    // An unchanged poll parses the JSON and compares text: it must be far below a full read.
+    expect(again).toBeLessThan(Math.max(first.ms, 5));
   });
 });

@@ -5,7 +5,10 @@
 import {
   ASK_NOT_OWNER_DEVICE_TEXT,
   ASK_UNDO_MS,
+  askUnreadableCard,
+  askUnreadableLine,
   heldSecondsLeft,
+  type AskUnreadable,
 } from "@t3tools/client-runtime/ardud/kanban";
 import * as Haptics from "expo-haptics";
 import { type ReactNode, useEffect, useState } from "react";
@@ -368,6 +371,53 @@ export function OwnerBand() {
         ? " You can read everything here; answers from this phone are refused."
         : ""}
     </Band>
+  );
+}
+
+/**
+ * Asks the feed carried that this build can't read. They are still open, so
+ * the page says how many in one quiet line and names the cards to open instead.
+ */
+export function UnreadableLine(props: {
+  readonly asks: ReadonlyArray<AskUnreadable>;
+  readonly onOpenCard: (boardId: string, cardId: string) => void;
+}) {
+  if (props.asks.length === 0) return null;
+  const named = props.asks.flatMap((ask) => {
+    const name = askUnreadableCard(ask);
+    return ask.boardId !== null && ask.cardId !== null && name !== null
+      ? [{ key: `${ask.cardId}:${ask.askId}`, name, boardId: ask.boardId, cardId: ask.cardId }]
+      : [];
+  });
+  const shown = named.slice(0, 3);
+  return (
+    <View className="px-0.5">
+      <Text className="text-sm text-foreground-muted">
+        {askUnreadableLine(props.asks.length)}.{" "}
+        {shown.length > 0 ? "Open the card instead:" : "They are still open."}
+      </Text>
+      {shown.length > 0 ? (
+        <View className="flex-row flex-wrap items-center gap-x-4">
+          {shown.map((card) => (
+            <Pressable
+              key={card.key}
+              accessibilityRole="button"
+              accessibilityLabel={`Open ${card.name}`}
+              hitSlop={8}
+              onPress={() => props.onOpenCard(card.boardId, card.cardId)}
+              className="min-h-11 justify-center active:opacity-70"
+            >
+              <Text className="text-sm font-t3-semibold text-primary-text">{card.name}</Text>
+            </Pressable>
+          ))}
+          {named.length > shown.length ? (
+            <Text className="text-sm text-foreground-muted">
+              and {named.length - shown.length} more
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
   );
 }
 

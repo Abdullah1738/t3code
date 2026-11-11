@@ -202,12 +202,48 @@ export interface AskHanded extends AskAnswered {
   readonly evaluator?: AskEvaluatorStart;
 }
 
+/**
+ * An ask the feed carried that this build could not read: what little of it
+ * could be made out, so the page can say it is there and point at its card.
+ * It is not in the feed's lists, and it is not closed or answered either.
+ */
+export interface AskUnreadable {
+  readonly boardId: string | null;
+  readonly boardName: string | null;
+  readonly cardId: string | null;
+  readonly cardNumber: number | null;
+  /** `<board slug>:<number>`. */
+  readonly cardRef: string | null;
+  readonly cardTitle: string | null;
+  readonly askId: string | null;
+  /** False only when it plainly waits on someone else or is put away. */
+  readonly owed: boolean;
+}
+
+/** The feed as read: every ask that could be read, and a note of each that could not. */
+export interface AskFeedRead extends KanbanAskFeed {
+  readonly unreadable?: {
+    readonly open: ReadonlyArray<AskUnreadable>;
+    readonly closed: ReadonlyArray<AskUnreadable>;
+  };
+}
+
+/** "1 ask can't be shown in this version of Robob", for the page's one quiet line. */
+export const askUnreadableLine = (count: number): string =>
+  `${count} ${count === 1 ? "ask" : "asks"} can't be shown in this version of Robob`;
+
+/** How to name an unreadable ask's card: "Robob #12", else its ref, else nothing. */
+export const askUnreadableCard = (ask: AskUnreadable): string | null =>
+  ask.cardNumber !== null && ask.boardName !== null
+    ? `${ask.boardName} #${ask.cardNumber}`
+    : ask.cardRef;
+
 export interface AskApi {
   /** Open asks, plus the ones closed in the window given (`24h`, `7d`, an ISO time). */
   readonly feed: (input?: {
     readonly closed?: string;
     readonly signal?: AbortSignal;
-  }) => Promise<KanbanAskFeed>;
+  }) => Promise<AskFeedRead>;
   /** One ask with its big blocks whole. */
   readonly detail: (cardRef: string, askId: string) => Promise<AskDetail>;
   /** One answer. `revision` is the ask as he read it; the server refuses an answer to another one. */
@@ -274,8 +310,10 @@ export const ASK_UNREADABLE_TEXT =
 /**
  * What the server sent, read through the schema the apps read cards with. A
  * block of a kind this build doesn't know becomes its one-line stand-in and
- * nothing of it is kept; anything else that doesn't fit is refused whole, as
- * an error the page shows with Retry, never as an empty or half-read answer.
+ * nothing of it is kept. Anything else that doesn't fit is refused, one thing
+ * at a time: an ask in the feed that can't be read is set aside and the rest
+ * of the feed loads (`readFeed`); a single ask or message that can't be read
+ * is an error on that ask or message, with Retry.
  */
 const reader =
   <A>(decode: (json: unknown) => A) =>
@@ -298,6 +336,27 @@ const readFeedShape = reader(
   ),
 );
 const readFeedItem = reader(Schema.decodeUnknownSync(KanbanAskFeedItem));
+
+const record = (value: unknown): Record<string, unknown> =>
+  typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+const words = (value: unknown): string | null =>
+  typeof value === "string" && value.trim() !== "" ? value.slice(0, 200) : null;
+
+/** What can be made out of an ask that did not read: plain fields only, each checked. */
+const glimpse = (raw: unknown): AskUnreadable => {
+  const item = record(raw);
+  const { cardNumber, waitsOn } = item;
+  return {
+    boardId: words(item.boardId),
+    boardName: words(item.boardName),
+    cardId: words(item.cardId),
+    cardNumber: typeof cardNumber === "number" && Number.isInteger(cardNumber) ? cardNumber : null,
+    cardRef: words(item.cardRef),
+    cardTitle: words(item.cardTitle),
+    askId: words(record(item.ask).id),
+    owed: !(waitsOn === "agent" || waitsOn === "evaluator" || item.snoozed === true),
+  };
+};
 const readDetail = reader(Schema.decodeUnknownSync(KanbanAskDetail));
 const readMessage = reader(Schema.decodeUnknownSync(KanbanMessage));
 
@@ -360,20 +419,42 @@ export function createAskApi(host: AskApiHost): AskApi {
   // The asks of the last feed, by the text each came as. The feed is read
   // every few seconds and most asks come again unchanged: those are not read
   // through the schema again, and stay the same object for whoever holds them.
-  let lastItems = new Map<string, KanbanAskFeedItem>();
-  const readFeed = (json: unknown): KanbanAskFeed => {
+  // An ask that did not read is remembered the same way, so it is not tried
+  // again on every poll.
+  let lastItems = new Map<string, KanbanAskFeedItem | AskUnreadable>();
+  const isRead = (item: KanbanAskFeedItem | AskUnreadable): item is KanbanAskFeedItem =>
+    "ask" in item;
+  const readFeed = (json: unknown): AskFeedRead => {
+    // The envelope itself: without it there is no feed at all, and that is an error.
     const shape = readFeedShape(json);
-    const items = new Map<string, KanbanAskFeedItem>();
-    const item = (raw: unknown): KanbanAskFeedItem => {
+    const items = new Map<string, KanbanAskFeedItem | AskUnreadable>();
+    // Each ask by itself: one that can't be read never takes the others with it.
+    const one = (raw: unknown): KanbanAskFeedItem | AskUnreadable => {
       const text = JSON.stringify(raw);
-      const read = lastItems.get(text) ?? items.get(text) ?? readFeedItem(raw);
+      let read = lastItems.get(text) ?? items.get(text);
+      if (read === undefined) {
+        try {
+          read = readFeedItem(raw);
+        } catch {
+          read = glimpse(raw);
+        }
+      }
       items.set(text, read);
       return read;
     };
-    const feed = { at: shape.at, open: shape.open.map(item), closed: shape.closed.map(item) };
-    // Only once the whole feed was read: a feed that is refused leaves the last one's asks known.
+    const open = shape.open.map(one);
+    const closed = shape.closed.map(one);
     lastItems = items;
-    return feed;
+    const lost = {
+      open: open.filter((item): item is AskUnreadable => !isRead(item)),
+      closed: closed.filter((item): item is AskUnreadable => !isRead(item)),
+    };
+    return {
+      at: shape.at,
+      open: open.filter(isRead),
+      closed: closed.filter(isRead),
+      ...(lost.open.length + lost.closed.length > 0 ? { unreadable: lost } : {}),
+    };
   };
 
   return {

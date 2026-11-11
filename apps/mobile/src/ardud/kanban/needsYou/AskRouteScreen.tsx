@@ -9,6 +9,7 @@ import {
   askFormFor,
   askFormWithSecrets,
   askKey,
+  askUnreadableKey,
   askKindLabel,
   askNeedsDetail,
   askPrimaryLabel,
@@ -103,6 +104,10 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
   const key = askKeyFromParams(route.params);
   const entry = key === null ? undefined : queue.entries.get(key);
   const item = key === null ? undefined : queue.items.get(key);
+  // Open, but not readable by this build: it is not closed, and must not be said to be.
+  const unreadable = useAsk((state) =>
+    key === null ? undefined : state.unreadable.find((ask) => askUnreadableKey(ask) === key),
+  );
 
   useEffect(() => {
     asks.noteAskFocus(key);
@@ -140,15 +145,28 @@ export function AskRouteScreen({ route }: StaticScreenProps<NeedsYouAskParams | 
               <OfflineBand />
               <View className="gap-1 pt-4">
                 <Text accessibilityRole="header" className="text-xl font-t3-semibold">
-                  {key === null ? "This link opens no ask" : "This ask is closed"}
+                  {key === null
+                    ? "This link opens no ask"
+                    : unreadable
+                      ? "This ask can't be shown in this version of Robob"
+                      : "This ask is closed"}
                 </Text>
                 <Text className="text-base text-foreground-muted">
                   {key === null
                     ? "It names no card or ask."
-                    : "It was answered, taken back by its agent, or is on its way."}
+                    : unreadable
+                      ? "It is still open. Open its card to read it there."
+                      : "It was answered, taken back by its agent, or is on its way."}
                 </Text>
               </View>
               <View className="flex-row flex-wrap gap-2">
+                {unreadable && unreadable.boardId !== null && unreadable.cardId !== null ? (
+                  <BarButton
+                    tone="primary"
+                    label="Open the card"
+                    onPress={() => nav.openCard(unreadable.boardId!, unreadable.cardId!)}
+                  />
+                ) : null}
                 <BarButton label="Needs you" onPress={nav.openQueue} />
                 <BarButton label="See what you answered" onPress={nav.openHistory} />
               </View>
@@ -208,6 +226,7 @@ function OpenAsk(props: {
   const key = askKey(entry);
   const turn = askTurn(entry, item);
   const detail = useAsk((state) => state.details[`${key}@${entry.revision}`]);
+  const detailError = useAsk((state) => state.detailErrors[`${key}@${entry.revision}`]);
   const ask = detail ?? entry.ask;
   // The stored form, or a fresh one: a selector must not build a new object per read.
   const storedForm = useAsk((state) => state.forms[key]);
@@ -479,6 +498,18 @@ function OpenAsk(props: {
 
         <OwnerBand />
         <OfflineBand />
+        {detailError !== undefined && detail === undefined ? (
+          // Its big parts did not load: said here, on this ask, and the rest of it still reads.
+          <Band
+            tone="negative"
+            action={{
+              label: "Retry",
+              onPress: () => void asks.loadAskDetail(entry).catch(() => undefined),
+            }}
+          >
+            Couldn't read all of this ask. {detailError}
+          </Band>
+        ) : null}
         {failed ? (
           <Band
             tone="negative"
