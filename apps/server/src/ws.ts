@@ -2284,7 +2284,11 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({
             "kanban.card_id": input.cardId,
             "kanban.ask_id": input.askId,
-          }).pipe(Effect.andThen(answerAskSecrets(kanban, secretRequests)(input, ownerApp))),
+          }).pipe(
+            Effect.andThen(
+              answerAskSecrets(kanban, secretRequests)(input, ownerApp, currentSession),
+            ),
+          ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.listWebhookDeliveries(input)),

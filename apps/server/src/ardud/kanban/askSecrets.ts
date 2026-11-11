@@ -25,6 +25,7 @@ import type { OwnerProvenance } from "../auth/provenance.ts";
 import { requireSecretAnswerAuthority } from "../auth/secretAnswers.ts";
 import type { AskSecretRef } from "./engine/asks.ts";
 import type { KanbanServiceShape } from "./engine/KanbanService.ts";
+import { notOwnerDeviceRefusal, type OwnerGateSession } from "./ownerGate.ts";
 
 const OWNER = { _tag: "owner" } as const;
 
@@ -35,9 +36,18 @@ export const answerAskSecrets =
     kanban: Pick<KanbanServiceShape, "askSecretPlan" | "answerAsk" | "ownCards">,
     secrets: Pick<SecretRequests["Service"], "hold" | "discard">,
   ) =>
-  (input: KanbanAskSecretAnswerInput, answeredBy: OwnerProvenance | null) =>
+  (
+    input: KanbanAskSecretAnswerInput,
+    answeredBy: OwnerProvenance | null,
+    /** The connection's session, to tell a paired device that is not his how to become his. */
+    session?: OwnerGateSession,
+  ) =>
     Effect.gen(function* () {
-      // Refused before anything is read, kept or recorded.
+      // Refused before anything is read, kept or recorded. A paired device that
+      // is not the owner's gets the board's refusal, which says what to do.
+      const device =
+        answeredBy === null && session !== undefined ? notOwnerDeviceRefusal(session) : null;
+      if (device !== null) return yield* device;
       yield* requireSecretAnswerAuthority(answeredBy);
       const ids = Object.keys(input.secrets);
       if (ids.length === 0) {
