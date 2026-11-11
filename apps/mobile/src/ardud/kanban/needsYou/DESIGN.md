@@ -98,6 +98,20 @@ not the store, not the send queue, not a log. It goes once, over `secrets.answer
 Undo, and the field is emptied as it leaves. An answer that carries a secret is never retried
 by itself; he types it again.
 
+## Whose phone
+
+Answering, replying, hand-over, snooze and batches are on only once the session says this
+phone is the owner's (`useOwnerStanding`: `checking`, `unchecked`, `owner`, `notOwner`). The
+feed can load before the session does, so until then the asks read and nothing can be filled
+in or sent: `OwnerBand` shows one quiet line while it checks, a band with Retry when the
+session could not be read, and the pairing notice when the phone is not his. The bar under an
+ask says the same in place of its buttons. A refusal from the server ("not the owner's
+device") turns the controls off again, whatever the session said before.
+
+A call that comes back late acts only for the screen and server that started it
+(`useLateStanding`): nothing at all once the server changed, and no navigation, haptic or
+announcement from a screen that was left or covered.
+
 ## Pages inside an ask
 
 An `html` block is text an agent wrote, loaded from a string into a private WebView

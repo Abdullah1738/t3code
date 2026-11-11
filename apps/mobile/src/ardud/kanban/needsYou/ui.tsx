@@ -2,7 +2,11 @@
  * Small parts the Needs-you screens share, on the Desk tokens the boards use.
  * Colour only carries state, and every state is said in words first.
  */
-import { ASK_UNDO_MS, heldSecondsLeft } from "@t3tools/client-runtime/ardud/kanban";
+import {
+  ASK_NOT_OWNER_DEVICE_TEXT,
+  ASK_UNDO_MS,
+  heldSecondsLeft,
+} from "@t3tools/client-runtime/ardud/kanban";
 import * as Haptics from "expo-haptics";
 import { type ReactNode, useEffect, useState } from "react";
 import { AccessibilityInfo, Platform, Pressable, View } from "react-native";
@@ -14,7 +18,7 @@ import {
   type AppTextInputProps,
 } from "../../../components/ui/AppText";
 import { cn } from "../../../lib/cn";
-import { useAsk, useAsks } from "./askStore";
+import { useAsk, useAsks, useOwnerStanding } from "./askStore";
 import type { Tone } from "./logic";
 
 const TONE_SURFACE: Record<Tone, string> = {
@@ -243,6 +247,8 @@ export function AskToastBar(props: {
   const asks = useAsks();
   const toast = useAsk((state) => state.toast);
   const held = useAsk((state) => state.held);
+  // Sending again is an answer: only for a phone known to be his.
+  const canSend = useOwnerStanding().standing === "owner";
   const [now, setNow] = useState(Date.now);
   const undoable =
     toast !== null &&
@@ -273,7 +279,7 @@ export function AskToastBar(props: {
         accessibilityLabel: seconds === null ? "Undo" : `Undo, ${seconds} seconds left`,
         onPress: () => props.onUndo(asks.undoAskSend()),
       }
-    : toast.retryKey !== undefined
+    : toast.retryKey !== undefined && canSend
       ? {
           label: "Retry",
           accessibilityLabel: "Send it again",
@@ -331,14 +337,36 @@ export function AskToastBar(props: {
   );
 }
 
-/** The line a screen shows when this phone is not paired as the owner's. */
-export function NotOwnerBand() {
+/**
+ * What a screen says while this phone may not answer: a quiet line while the
+ * session is being read, a band with Retry when it could not be read, and the
+ * pairing notice when the phone is not paired as the owner's.
+ */
+export function OwnerBand() {
+  const { standing, recheck } = useOwnerStanding();
   const notOwner = useAsk((state) => state.notOwner);
-  if (notOwner === null) return null;
+  if (standing === "owner") return null;
+  if (standing === "checking") {
+    return (
+      <Text accessibilityLiveRegion="polite" className="px-0.5 text-sm text-foreground-muted">
+        Checking that this phone is yours. You can read meanwhile.
+      </Text>
+    );
+  }
+  if (standing === "unchecked") {
+    return (
+      <Band tone="warn" action={{ label: "Retry", onPress: recheck }}>
+        Couldn't check that this phone is paired as yours. You can read everything here; answering
+        is off until it is checked.
+      </Band>
+    );
+  }
   return (
     <Band tone="warn">
-      {notOwner.text}
-      {notOwner.device ? " You can read everything here; answers from this phone are refused." : ""}
+      {notOwner?.text ?? ASK_NOT_OWNER_DEVICE_TEXT}
+      {notOwner === null || notOwner.device
+        ? " You can read everything here; answers from this phone are refused."
+        : ""}
     </Band>
   );
 }

@@ -18,8 +18,13 @@ import { cn } from "../../../lib/cn";
 import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { OptionRow } from "./AnswerParts";
-import { useAsk, useAskScope, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
-import { batchAll, batchPrimaryLabel, type NeedsYouBatchParams } from "./logic";
+import { useAskScope, useAsks, useOwnerStanding, useWatchAsks } from "./askStore";
+import {
+  batchAll,
+  batchPrimaryLabel,
+  ownerStandingBarText,
+  type NeedsYouBatchParams,
+} from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
 import { HandOverSheet, SnoozePickSheet, snoozeMenuItem } from "./sheets";
@@ -32,7 +37,7 @@ import {
   GrowingInput,
   Heading,
   Label,
-  NotOwnerBand,
+  OwnerBand,
   OfflineBand,
   Problem,
   tapDone,
@@ -118,7 +123,9 @@ function OpenBatch(props: {
 }) {
   const asks = useAsks();
   const nav = useNeedsYouNav();
-  const readOnly = useAsk((state) => state.notOwner !== null);
+  const { standing } = useOwnerStanding();
+  // Not known to be his own device (not yet, or not at all): nothing can be sent.
+  const readOnly = standing !== "owner";
   const plan = planAskBatch(props.entries);
   const offered = plan.included.slice(0, ASK_BATCH_MAX);
   const over = plan.included.length - offered.length;
@@ -194,6 +201,7 @@ function OpenBatch(props: {
   };
 
   const snoozeUntil = (until: SnoozeUntil) => {
+    if (readOnly) return;
     nav.back();
     void asks.snoozeAsks(included.length > 0 ? included : offered, until.iso, until.label);
   };
@@ -229,7 +237,7 @@ function OpenBatch(props: {
             {props.title}
           </Text>
         </View>
-        <NotOwnerBand />
+        <OwnerBand />
         <OfflineBand />
 
         {offered.length > 0 ? (
@@ -358,6 +366,7 @@ function OpenBatch(props: {
                   count > 1 ? `Hand these ${count} to the evaluator` : "Evaluator decides this one"
                 }
                 onPress={() => {
+                  if (readOnly) return;
                   nav.back();
                   asks.handAsks(included, props.focusKey, undefined, sentTitle);
                 }}
@@ -379,9 +388,9 @@ function OpenBatch(props: {
           className="flex-row items-center gap-2 border-t border-border bg-screen px-3 pt-2.5"
           style={{ paddingBottom: props.bottomInset }}
         >
-          {readOnly ? (
+          {standing !== "owner" ? (
             <Text className="min-w-0 flex-1 text-sm text-foreground-muted">
-              This phone can read asks, not answer them.
+              {ownerStandingBarText(standing, "answer")}
             </Text>
           ) : (
             <>
@@ -400,7 +409,7 @@ function OpenBatch(props: {
         </View>
       ) : null}
       {props.toast(count > 0 && shape !== null ? 76 : 8)}
-      {handOpen ? (
+      {handOpen && !readOnly ? (
         <HandOverSheet
           entries={included}
           focusKey={props.focusKey}
@@ -409,7 +418,7 @@ function OpenBatch(props: {
           onLeave={nav.back}
         />
       ) : null}
-      {pickOpen ? (
+      {pickOpen && !readOnly ? (
         <SnoozePickSheet onClose={() => setPickOpen(false)} onSnooze={snoozeUntil} />
       ) : null}
     </Screen>

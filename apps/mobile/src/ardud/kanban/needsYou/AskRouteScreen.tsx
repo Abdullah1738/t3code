@@ -69,6 +69,8 @@ import {
   askTurn,
   type AskTurn,
   type NeedsYouAskParams,
+  ownerStandingBarText,
+  type OwnerStanding,
 } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
@@ -80,7 +82,7 @@ import {
   BarButton,
   Heading,
   Label,
-  NotOwnerBand,
+  OwnerBand,
   OfflineBand,
   Pill,
   tapDone,
@@ -215,7 +217,7 @@ function OpenAsk(props: {
   const marks = useAsk((state) => state.marks);
   const mark = needsYouMarkOf(item, marks);
   const failed = useAsk((state) => state.failed[key]);
-  const notOwner = useAsk((state) => state.notOwner);
+  const { standing } = useOwnerStanding();
   const previous = useAsk((state) => state.previous[key]);
   const changeView = useAsk((state) => state.changeView);
   const [noteOpen, setNoteOpen] = useState(false);
@@ -225,8 +227,9 @@ function OpenAsk(props: {
   const [viewing, setViewing] = useState<number | null>(null);
   const response = kanbanAskResponse(ask);
   const refusal = askRefusal(response);
-  // Not his own device: everything reads, nothing can be filled in or sent.
-  const readOnly = notOwner !== null;
+  // Not known to be his own device (not yet, or not at all): everything reads,
+  // nothing can be filled in or sent.
+  const readOnly = standing !== "owner";
   const locked = turn === "evaluator" || turn === "expired" || readOnly;
   const resolveKanbanLink = resolveKanbanLinkFor(entry.boardId);
   const scroll = useRef<ComponentRef<typeof ScrollView>>(null);
@@ -359,6 +362,7 @@ function OpenAsk(props: {
     else stopped(undefined);
   };
   const snoozeUntil = (until: SnoozeUntil) => {
+    if (readOnly) return;
     nav.back();
     void asks.snoozeAsks([entry], until.iso, until.label);
   };
@@ -473,7 +477,7 @@ function OpenAsk(props: {
           </Text>
         </View>
 
-        <NotOwnerBand />
+        <OwnerBand />
         <OfflineBand />
         {failed ? (
           <Band
@@ -657,6 +661,7 @@ function OpenAsk(props: {
                 <ActionRow
                   label="Evaluator decides this one"
                   onPress={() => {
+                    if (readOnly) return;
                     nav.back();
                     asks.handAsks([entry], key);
                   }}
@@ -674,7 +679,7 @@ function OpenAsk(props: {
 
       <AskBar
         turn={turn}
-        readOnly={readOnly}
+        standing={standing}
         refusing={form.refusing}
         primaryLabel={askPrimaryLabel(ask, form)}
         refusalLabel={refusal?.label ?? null}
@@ -685,7 +690,9 @@ function OpenAsk(props: {
         onPrimary={primary}
         onRefuse={refuse}
         onBack={() => asks.patchAskForm(entry, { refusing: false })}
-        onTakeBack={() => void asks.takeBackAsk(entry)}
+        onTakeBack={() => {
+          if (!readOnly) void asks.takeBackAsk(entry);
+        }}
         onRefresh={() =>
           void asks
             .replyOnAsk(entry, [
@@ -705,10 +712,10 @@ function OpenAsk(props: {
       />
       {props.toast(76)}
       <AskMediaViewer media={media} viewing={viewing} onClose={() => setViewing(null)} />
-      {handOpen ? (
+      {handOpen && !readOnly ? (
         <HandOverSheet entries={[entry]} onClose={() => setHandOpen(false)} onLeave={nav.back} />
       ) : null}
-      {pickOpen ? (
+      {pickOpen && !readOnly ? (
         <SnoozePickSheet onClose={() => setPickOpen(false)} onSnooze={snoozeUntil} />
       ) : null}
     </Screen>
@@ -721,7 +728,7 @@ function OpenAsk(props: {
  */
 function AskBar(props: {
   readonly turn: AskTurn;
-  readonly readOnly: boolean;
+  readonly standing: OwnerStanding;
   readonly refusing: boolean;
   readonly primaryLabel: string;
   readonly refusalLabel: string | null;
@@ -753,10 +760,10 @@ function AskBar(props: {
       className="flex-row items-center gap-2 border-t border-border bg-screen px-3 pt-2.5"
       style={{ paddingBottom: props.bottomInset }}
     >
-      {props.readOnly ? (
+      {props.standing !== "owner" ? (
         <>
           {discussion}
-          {state("This phone can read asks, not answer them.")}
+          {state(ownerStandingBarText(props.standing, "answer"))}
         </>
       ) : props.turn === "evaluator" ? (
         <>

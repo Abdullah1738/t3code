@@ -35,7 +35,13 @@ import { environmentSession } from "../../../state/session";
 import { pairedEnvironmentIdAtom } from "../../common/environment";
 import { kanbanClient } from "../kanbanStore";
 import { createAskScopes, type AskScope } from "./askScope";
-import { lateStanding, type LateStanding } from "./logic";
+import {
+  lateStanding,
+  ownerStanding,
+  type LateStanding,
+  type OwnerStanding,
+  type SessionRead,
+} from "./logic";
 
 const askScopes = createAskScopes({
   paired: () => appAtomRegistry.get(pairedEnvironmentIdAtom),
@@ -156,20 +162,35 @@ export function useLateStanding(): () => LateStanding {
 const NO_SESSION = Atom.make(AsyncResult.initial<AuthSessionState>());
 
 /**
- * Whether this phone's session is the owner's, from the session the app
- * already holds (`GET /api/auth/session` carries `owner`). Tells the store, so
- * a phone that is not paired as his says so before he fills anything in.
+ * Whether this phone may answer, from the session the app already holds
+ * (`GET /api/auth/session` carries `owner`). Answering, replying, hand-over,
+ * snooze and batches are on only for `owner`: while the session is still being
+ * read, or could not be read, the asks can be read and nothing can be sent.
+ * `recheck` reads the session again. It also tells the store, so a phone that
+ * is not paired as his says so before he fills anything in.
  */
-export function useOwnerStanding(): void {
+export function useOwnerStanding(): {
+  readonly standing: OwnerStanding;
+  readonly recheck: () => void;
+} {
   const { asks, environmentId } = useAskScope();
-  const result = useAtomValue(
+  const atom =
     environmentId === null
       ? NO_SESSION
-      : environmentSession.sessionStateAtom(environmentId as EnvironmentId),
-  );
+      : environmentSession.sessionStateAtom(environmentId as EnvironmentId);
+  const result = useAtomValue(atom);
+  const refused = useAsk((state) => state.notOwner !== null);
   const session = Option.getOrNull(AsyncResult.value(result));
-  const owner = session?.authenticated ? session.owner : undefined;
+  const read: SessionRead =
+    session !== null
+      ? { state: "read", authenticated: session.authenticated, owner: session.owner }
+      : result._tag === "Failure" && !result.waiting
+        ? { state: "failed" }
+        : { state: "reading" };
+  const owner = read.state === "read" && read.authenticated ? read.owner : undefined;
   useEffect(() => asks.noteOwnerStanding(owner), [asks, owner]);
+  const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);
+  return { standing: ownerStanding(read, refused), recheck };
 }
 
 /** Keeps the feed current while a screen shows it. `fast`: the queue or an ask is open. */

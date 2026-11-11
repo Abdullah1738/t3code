@@ -16,11 +16,11 @@ import { LoadingLine } from "../../common/FeedError";
 import { useNowMs } from "../../common/hooks";
 import { Composer, MessageView } from "../Chat";
 import { messageReadWhole } from "../logic";
-import { useAsk, useAskScope, useLateStanding, useOwnerStanding, useWatchAsks } from "./askStore";
-import { askKeyFromParams, askTurn, type NeedsYouAskParams } from "./logic";
+import { useAskScope, useLateStanding, useOwnerStanding, useWatchAsks } from "./askStore";
+import { askKeyFromParams, askTurn, ownerStandingBarText, type NeedsYouAskParams } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
-import { NotOwnerBand, OfflineBand } from "./ui";
+import { OwnerBand, OfflineBand } from "./ui";
 import { useQueue } from "./useQueue";
 
 /**
@@ -90,7 +90,7 @@ function Talk(props: {
   const { asks, api } = useAskScope();
   const late = useLateStanding();
   const { entry } = props;
-  const readOnly = useAsk((state) => state.notOwner !== null);
+  const { standing } = useOwnerStanding();
   // What was said counts; older versions of the ask sit between, folded away.
   const thread = askThread(entry);
   // The feed cuts big blocks short. "Show full" reads that one message whole,
@@ -124,7 +124,7 @@ function Talk(props: {
           scroll.current?.scrollToEnd({ animated: false });
         }}
       >
-        <NotOwnerBand />
+        <OwnerBand />
         <OfflineBand />
         {thread.length === 0 ? (
           <Text className="text-base text-foreground-muted">Nothing said yet.</Text>
@@ -159,12 +159,12 @@ function Talk(props: {
           </Text>
         ) : null}
       </ScrollView>
-      {readOnly ? (
+      {standing !== "owner" ? (
         <Text
           className="px-4 pt-2 text-sm text-foreground-muted"
           style={{ paddingBottom: props.bottomInset }}
         >
-          This phone can read asks, not reply to them.
+          {ownerStandingBarText(standing, "reply")}
         </Text>
       ) : (
         <View className="border-t border-border">

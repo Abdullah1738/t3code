@@ -595,3 +595,46 @@ export function lateStanding(now: {
   if (!now.live) return "gone";
   return now.mounted && now.focused ? "here" : "away";
 }
+
+/**
+ * Whether this phone may answer. Only `owner` turns the controls on.
+ *
+ * - `checking`: the session has not been read yet.
+ * - `unchecked`: the session could not be read, or does not say.
+ * - `owner`: the session says it is his.
+ * - `notOwner`: the session says it is not, or the server refused an answer for that reason.
+ */
+export type OwnerStanding = "checking" | "unchecked" | "owner" | "notOwner";
+
+/** What is known of the session: still being read, not readable, or read. */
+export type SessionRead =
+  | { readonly state: "reading" }
+  | { readonly state: "failed" }
+  | {
+      readonly state: "read";
+      readonly authenticated: boolean;
+      /** Absent when the server does not say. */
+      readonly owner: boolean | undefined;
+    };
+
+export function ownerStanding(session: SessionRead, refused: boolean): OwnerStanding {
+  // The server refused an answer as not the owner's: that beats what the session said before.
+  if (refused) return "notOwner";
+  if (session.state === "reading") return "checking";
+  if (session.state === "failed") return "unchecked";
+  // Signed out, or a server that does not say: not known to be his, so not his to answer.
+  if (!session.authenticated || session.owner === undefined) return "unchecked";
+  return session.owner ? "owner" : "notOwner";
+}
+
+/** The line in place of the answer controls while they are off. */
+export function ownerStandingBarText(
+  standing: Exclude<OwnerStanding, "owner">,
+  what: "answer" | "reply",
+): string {
+  if (standing === "checking") return "Checking that this phone is yours…";
+  if (standing === "unchecked") return "Couldn't check that this phone is yours.";
+  return what === "answer"
+    ? "This phone can read asks, not answer them."
+    : "This phone can read asks, not reply to them.";
+}

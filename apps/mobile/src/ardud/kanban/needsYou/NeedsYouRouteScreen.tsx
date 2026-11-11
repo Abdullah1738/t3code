@@ -37,7 +37,7 @@ import {
 } from "./logic";
 import { useNeedsYouNav } from "./nav";
 import { Screen, useBottomInset } from "./Screen";
-import { AskToastBar, BarButton, NotOwnerBand, OfflineBand, Pill } from "./ui";
+import { AskToastBar, BarButton, OfflineBand, OwnerBand, Pill } from "./ui";
 import { useQueue } from "./useQueue";
 
 const ALL_BOARDS = "";
@@ -157,7 +157,7 @@ export function NeedsYouRouteScreen({ route }: StaticScreenProps<NeedsYouQueuePa
 
   const header = (
     <View className="gap-3 pb-1">
-      <NotOwnerBand />
+      <OwnerBand />
       <OfflineBand />
       {queue.open.length > 0 ? (
         <SearchField

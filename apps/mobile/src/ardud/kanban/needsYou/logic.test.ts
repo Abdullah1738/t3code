@@ -33,6 +33,8 @@ import {
   readAskHtmlMessage,
   stepWebLink,
   lateStanding,
+  ownerStanding,
+  ownerStandingBarText,
   unreachedRetryTracker,
 } from "./logic";
 
@@ -442,5 +444,45 @@ describe("a result that comes back late", () => {
   it("does nothing once the server changed, even on a screen still in front", () => {
     expect(lateStanding({ live: false, mounted: true, focused: true })).toBe("gone");
     expect(lateStanding({ live: false, mounted: false, focused: false })).toBe("gone");
+  });
+});
+
+describe("whether this phone may answer", () => {
+  const read = (owner: boolean | undefined, authenticated = true) =>
+    ({ state: "read", authenticated, owner }) as const;
+
+  it("is only the owner's once the session says so", () => {
+    expect(ownerStanding(read(true), false)).toBe("owner");
+    expect(ownerStanding(read(false), false)).toBe("notOwner");
+  });
+
+  it("is still being checked until the session is read", () => {
+    // The feed can load first: nothing may be answered on the strength of that.
+    expect(ownerStanding({ state: "reading" }, false)).toBe("checking");
+  });
+
+  it("could not be checked when the session read failed or does not say", () => {
+    expect(ownerStanding({ state: "failed" }, false)).toBe("unchecked");
+    expect(ownerStanding(read(undefined), false)).toBe("unchecked");
+    expect(ownerStanding(read(true, false), false)).toBe("unchecked");
+  });
+
+  it("is not the owner's once the server refused an answer, whatever the session said", () => {
+    expect(ownerStanding(read(true), true)).toBe("notOwner");
+    expect(ownerStanding({ state: "reading" }, true)).toBe("notOwner");
+    expect(ownerStanding({ state: "failed" }, true)).toBe("notOwner");
+  });
+
+  it("says why the controls are off", () => {
+    expect(ownerStandingBarText("checking", "answer")).toBe("Checking that this phone is yours…");
+    expect(ownerStandingBarText("unchecked", "reply")).toBe(
+      "Couldn't check that this phone is yours.",
+    );
+    expect(ownerStandingBarText("notOwner", "answer")).toBe(
+      "This phone can read asks, not answer them.",
+    );
+    expect(ownerStandingBarText("notOwner", "reply")).toBe(
+      "This phone can read asks, not reply to them.",
+    );
   });
 });
