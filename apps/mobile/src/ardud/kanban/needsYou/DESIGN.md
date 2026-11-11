@@ -20,6 +20,18 @@ Mode: Operate. Abdullah works down a list and answers. Nothing here is decoratio
 The way in is the "Needs you" row above the Boards group on the thread list, with the number
 of asks that are his to answer.
 
+An ask's screen leaves, after an answer, a snooze or a hand-over, for a screen that draws the
+toast, so Undo can always be reached: back when the screen underneath is the queue, another
+ask, a batch or History; otherwise to the queue (`leaveAfterAnswer`). An ask opened by a link
+sits on Home, a card or a discussion, or on nothing when the link started the app, and none of
+those shows the toast. Back from a screen with nothing underneath goes to the queue, and from
+the queue to Home.
+
+A link to an ask that is not among the open asks is read by itself (`useAskWhereabouts`).
+"This ask is closed" is said only of an ask known to have closed: he answered it here,
+History holds it, or the server says so. An ask the server does not have "can't be found";
+when the server can't be asked the screen says it couldn't check, with "Check again".
+
 Web to phone: the list fills the screen and a row pushes its ask (no rail beside a reader).
 The header's board chips become one scrolling row of chips. Kind and "Holds a card" move into
 the header's Filter menu. The discussion is its own pushed screen, so the keyboard and the
@@ -60,7 +72,10 @@ Retry or View.
 Reused from the boards: `AppBar`, `ChoiceRow`, `Group`/`Row`, `SearchField`, `MarkdownText`,
 `SegmentedControl`, `ThemedSwitch`, the system date picker, `FilePreviewModal` (pictures, pinch
 to zoom, swipe between), the attachment screen (video, audio, PDF, any other file), and
-`MessageView`/`Composer` from `Chat.tsx`. A message under an ask is shown outside its
+`MessageView`/`Composer` from `Chat.tsx`. On the attachment screen video and audio play in the
+app's own players. Only pictures, PDFs and formats the app can't show go to the system's
+viewer, and that wait has a time limit (20 seconds, more for a large file): then the screen
+says the file hasn't opened and offers "Try again" (`ardud/common/fileViewer.ts`). A message under an ask is shown outside its
 discussion's feed: "Show full" reads it whole over the ask's own server calls, and a pick in
 it is read-only.
 
@@ -74,12 +89,17 @@ it is read-only.
 - The bar: discussion (with its count), the "no" in the ask's own word, the filled answer.
   The answer's label comes from `askPrimaryLabel`.
 - Every target is at least 44pt (`min-h-11`), most are 48.
+- Text that says a state wraps; it is never cut to a line or two. The queue's counts are a
+  line at the top of the list, not the header's subtitle, which is one line and cuts them off.
+- The body sits above the keyboard by padding (`Screen`), never by a pinned height, so the bar
+  under an ask can't be left below the screen by a keyboard that went away unannounced.
 - A band says what happened and what he can do. A refusal is shown in the server's words.
 - Not his device: a band at the top says so, everything stays readable, every control that
   would send is disabled and the bar says why.
 - An answer that can't be changed (not his device, expired, with the evaluator, on its way)
   takes no input anywhere: fields, options, steps, the reason for a no, the note, the draft,
-  uploads and a custom field's page. A field row drops any write while it is disabled.
+  uploads and a custom field's page. A field row drops any write while it is disabled. A
+  text field that takes no input is disabled for assistive tech too (`AskInput`).
 - One store per server. A screen keeps the store of the server it rendered with
   (`useAskScope`), so an answer, a retry or a secret goes to that server or nowhere. When the
   server changes, secrets on screen are cleared first, then the held answer and every unsent
@@ -107,6 +127,13 @@ in or sent: `OwnerBand` shows one quiet line while it checks, a band with Retry 
 session could not be read, and the pairing notice when the phone is not his. The bar under an
 ask says the same in place of its buttons. A refusal from the server ("not the owner's
 device") turns the controls off again, whatever the session said before.
+
+Once the session has said owner, that stands while the session can't be read (no connection,
+or a new connection still reading it): `ownerSeen` in the store, kept per server for this run
+of the app and never stored. So he can answer offline and the answer waits as "Not sent". It
+ends with a refusal from the server, a session that says the phone is not his, or one that
+answers signed out; a phone the session never confirmed stays `checking`. The scope tells the
+store what the session says, with or without a screen up (`askScope.ts`).
 
 The same holds for what would go without a control being pressed again. The toast's Undo is
 offered for a held answer whatever the session says, because taking it back sends nothing; an
@@ -192,6 +219,15 @@ needs the closed asks read as well; the web's History uses the same):
 from an earlier one, they carry its time.
 
 ## Offline
+
+The app's connection layer waits longer after every failed attempt, up to five minutes, and
+while it waits there is no live connection to call. The scope does not wait with it. It keeps
+the address and credential it last used over a live connection (in memory, for that server
+only) and, only while the layer is between attempts, sends its calls there. So the feed's own
+poll finds the server as soon as it is back; that good read tells the layer to try now, at
+most once in 30 seconds. A credential the server no longer takes is dropped. When the
+connection is live again the feed is read at once, and the session is read again with every
+new connection and whenever the app comes to the front.
 
 A failed read keeps what was last read and says so, with Retry. An answer that never reached
 the server is kept in memory as "Not sent" and goes again by itself on the next good read of

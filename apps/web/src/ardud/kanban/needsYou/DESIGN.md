@@ -170,3 +170,14 @@ of borders so corners stay clean.
 - Don't add shadows to anything that is not an overlay.
 - Don't keep a secret value anywhere but the reader's component state.
 - Don't use `title` tooltips or manual memo hooks (repo lint rules).
+
+## Counts and "nothing"
+
+A count is a claim, and so is "No asks". Neither is made for a read that has not come back or
+that failed; one function in the shared runtime decides (`askQueueFigures`).
+
+- The sidebar's "Needs you" row (`askRowFigure`): "…" while the first read is out, "Not loaded"
+  after it failed, the count for a read that came back (no badge for a known zero), and
+  "as of 17:42" beside a count held from an earlier read.
+- The queue rail (`askListEmptyLine`): "Couldn't load asks" under a failed first read, as the
+  reader says beside it; "No asks" only for a read that came back.
