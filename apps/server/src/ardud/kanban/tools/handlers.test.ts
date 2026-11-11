@@ -1066,6 +1066,99 @@ it.effect(
     }),
 );
 
+it.effect(
+  "pool tools target boardId without changing the evaluator's board and default to the caller's board",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "toy",
+        name: "Toy",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const other = yield* kanban.ensureBoard({
+        slug: "other",
+        name: "Other",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const evaluator = yield* kanban.startEvaluator(board.id, {
+        kind: "request",
+        text: "Manage pools",
+      });
+      const original = (yield* kanban.snapshot(board.id)).pools;
+      for (const boardId of [other.slug, other.id]) {
+        const set = yield* call(evaluator, "pool_set", {
+          boardId,
+          model: other.defaultCardModel,
+          slots: 6,
+        });
+        assert.isFalse(set.isError, set.text);
+        assert.strictEqual(
+          (yield* kanban.snapshot(other.id)).pools.find(
+            (p) => p.model.model === other.defaultCardModel.model,
+          )?.slots,
+          6,
+        );
+        assert.deepStrictEqual((yield* kanban.snapshot(board.id)).pools, original);
+      }
+      const local = yield* call(evaluator, "pool_set", { model: board.defaultCardModel, slots: 2 });
+      assert.isFalse(local.isError, local.text);
+      const localPools = (yield* kanban.snapshot(board.id)).pools;
+      assert.strictEqual(
+        localPools.find((p) => p.model.model === board.defaultCardModel.model)?.slots,
+        2,
+      );
+      assert.strictEqual(
+        (yield* kanban.snapshot(other.id)).pools.find(
+          (p) => p.model.model === other.defaultCardModel.model,
+        )?.slots,
+        6,
+      );
+
+      const unused = { instanceId: "opencode", model: "opus/gpt-6-astra", variant: "xhigh" };
+      for (const boardId of [board.id, other.id]) {
+        assert.isFalse(
+          (yield* call(evaluator, "pool_set", { boardId, model: unused, slots: 0 })).isError,
+        );
+      }
+      assert.isFalse(
+        (yield* call(evaluator, "pool_remove", { boardId: other.slug, model: unused })).isError,
+      );
+      assert.strictEqual((yield* kanban.snapshot(board.id)).pools.length, localPools.length + 1);
+      assert.strictEqual(
+        (yield* kanban.snapshot(other.id)).pools.some((p) => p.model.model === unused.model),
+        false,
+      );
+      assert.isFalse((yield* call(evaluator, "pool_remove", { model: unused })).isError);
+      assert.deepStrictEqual((yield* kanban.snapshot(board.id)).pools, localPools);
+
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const card = yield* kanban.createCard(board.id, { prompt: "Worker" }, owner);
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const before = (yield* kanban.snapshot(other.id)).pools;
+      for (const name of ["pool_set", "pool_remove"]) {
+        const denied = yield* call(worker, name, {
+          boardId: other.id,
+          model: other.defaultCardModel,
+          slots: 8,
+        });
+        assert.isTrue(denied.isError);
+        assert.include(denied.text, "Only evaluators");
+        const missing = yield* call(evaluator, name, {
+          boardId: "missing",
+          model: other.defaultCardModel,
+        });
+        assert.isTrue(missing.isError);
+        assert.include(missing.text, "No Missions board");
+        assert.include(missing.text, "missing");
+      }
+      assert.deepStrictEqual((yield* kanban.snapshot(other.id)).pools, before);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect("board model inputs preserve native options and reject conflicting levels", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {

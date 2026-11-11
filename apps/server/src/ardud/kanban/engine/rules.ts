@@ -3,6 +3,7 @@ import {
   KANBAN_DONE_STAGES,
   KANBAN_THREAD_STAGES,
   kanbanCardModels,
+  kanbanBlocking,
   kanbanHeldUpBy,
   kanbanPickOrder,
   kanbanScriptStep,
@@ -446,8 +447,9 @@ export function poolThreads(
 }
 
 /**
- * Fill free pool slots: reviews first (oldest first), then todo in pick
- * order, skipping blocked, settled and backlog cards. Lowering a pool below what is
+ * Fill free pool slots by urgency, reviews before todos at the same priority.
+ * Within each role, pick order uses inherited urgency, holds, then oldest first.
+ * Skip blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
  * card at all. A todo card whose work thread still holds a slot rejoins that
  * thread without taking another one. `holds` are this board's held slots.
@@ -490,50 +492,61 @@ export function planDispatch(
   );
   const reviews = waiting
     .filter((card) => card.stage === "needs_review")
-    .toSorted((a, b) => a.movedAt.localeCompare(b.movedAt));
+    .map((card) => ({ card, role: "review" as const }));
+  const blocking = kanbanBlocking(cards);
+  const pickOrder = kanbanPickOrder(cards);
   const todos = waiting
     .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .toSorted(kanbanPickOrder(cards));
+    .map((card) => ({ card, role: "work" as const }));
+  const priority = ({ card }: (typeof reviews)[number] | (typeof todos)[number]) =>
+    blocking.get(card.id)?.urgency ?? card.priority;
+  const queue = [...reviews, ...todos].toSorted(
+    (a, b) =>
+      priority(a) - priority(b) ||
+      (a.role !== b.role
+        ? a.role === "review"
+          ? -1
+          : 1
+        : pickOrder(a.card, b.card)),
+  );
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 
   const plan: Array<Dispatch> = [];
-  for (const [role, list] of [
-    ["review", reviews],
-    ["work", todos],
-  ] as const) {
-    for (const card of list) {
-      // Once a card has a work thread it stays on that thread's model.
-      const model =
-        role === "work" && card.workThreadId === null
-          ? weightedModel(card, pools, free, pick)
-          : nextModel(board, card);
-      if (model === null) continue;
-      const key = poolFor(pools, model)?.key;
-      if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
-      let thread = role === "work" ? card.workThreadId : null;
-      const fresh = thread !== null && busyElsewhere(thread, key);
-      // A new thread can't take a card its old thread's own work still holds up.
-      if (fresh && isBlocked(card, byId, null)) continue;
-      if (fresh) thread = null;
-      if (thread !== null && kept !== null && cards.some(
-        (other) => other.activeThreadId === thread && !kept.has(other.id),
-      )) continue;
-      const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
-      if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
-      if (!joins) {
-        const left = free.get(key) ?? 0;
-        if (left <= 0) continue;
-        free.set(key, left - 1);
-      }
-      if (thread !== null) {
-        carrying.set(thread, (carrying.get(thread) ?? 0) + 1);
-        const set = holding.get(key) ?? new Set<string>();
-        set.add(thread);
-        holding.set(key, set);
-      }
-      plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
+  for (const { role, card } of queue) {
+    // Once a card has a work thread it stays on that thread's model.
+    const model =
+      role === "work" && card.workThreadId === null
+        ? weightedModel(card, pools, free, pick)
+        : nextModel(board, card);
+    if (model === null) continue;
+    const key = poolFor(pools, model)?.key;
+    if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
+    let thread = role === "work" ? card.workThreadId : null;
+    const fresh = thread !== null && busyElsewhere(thread, key);
+    // A new thread can't take a card its old thread's own work still holds up.
+    if (fresh && isBlocked(card, byId, null)) continue;
+    if (fresh) thread = null;
+    if (
+      thread !== null &&
+      kept !== null &&
+      cards.some((other) => other.activeThreadId === thread && !kept.has(other.id))
+    )
+      continue;
+    const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
+    if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
+    if (!joins) {
+      const left = free.get(key) ?? 0;
+      if (left <= 0) continue;
+      free.set(key, left - 1);
     }
+    if (thread !== null) {
+      carrying.set(thread, (carrying.get(thread) ?? 0) + 1);
+      const set = holding.get(key) ?? new Set<string>();
+      set.add(thread);
+      holding.set(key, set);
+    }
+    plan.push({ cardId: card.id, role, pool: key, model, joins, fresh });
   }
   return plan;
 }

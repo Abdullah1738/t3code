@@ -260,7 +260,7 @@ const CardAskChange = tool(
 const CardFlag = tool(
   "card_flag",
   "Flag a card stalled",
-  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A card thread flagging its own card gives up its slot.",
+  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A stalled card gives up its slot and returns from work or review to its queue.",
   {
     card: Schema.optional(CardRef),
     stalled: Schema.Boolean,
@@ -451,8 +451,9 @@ const CardThread = tool(
 const PoolSet = tool(
   "pool_set",
   "Set a model pool",
-  "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
+  "Evaluators: how many threads may run at once on a model at one level; a model or level with no pool yet gets one. Pass boardId to target another board; without it, use the caller's board. Only models in the composer's list (orchestrator_capabilities). Name the variant when the model has pools at several levels. To change a pool's level, pass its key as replaces. Lowering never stops running threads by itself.",
   {
+    boardId: Schema.optional(TrimmedNonEmptyString),
     model: ModelInput,
     slots: Schema.optional(NonNegativeInt),
     replaces: Schema.optional(
@@ -469,8 +470,8 @@ const PoolSet = tool(
 const PoolRemove = tool(
   "pool_remove",
   "Remove a model pool",
-  "Evaluators: drop a pool at 0 slots that nothing on the board uses. Name the variant when the model has pools at several levels.",
-  { model: ModelInput },
+  "Evaluators: drop a pool at 0 slots that nothing on the board uses. Pass boardId to target another board; without it, use the caller's board. Name the variant when the model has pools at several levels.",
+  { boardId: Schema.optional(TrimmedNonEmptyString), model: ModelInput },
   { pools: Records },
   { readonly: false, destructive: true },
 );

@@ -56,6 +56,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.steer"),
+    activeTurnOnly: Schema.optional(Schema.Boolean),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -561,7 +562,12 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       ),
       // The worker polls for the next effect even when there is no work to claim.
       claimNext: Effect.fnUntraced(
-        function* ({ workerId, leaseDurationMs, excludeRestartContinuations = false, onlyEffectTypes }) {
+        function* ({
+          workerId,
+          leaseDurationMs,
+          excludeRestartContinuations = false,
+          onlyEffectTypes,
+        }) {
           if (onlyEffectTypes?.length === 0) return Option.none();
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);

@@ -145,6 +145,7 @@ export interface ThreadManagementSendInput {
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
+  readonly activeTurnOnly?: boolean;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -1067,6 +1068,7 @@ const make = Effect.gen(function* () {
         dispatchMode = {
           type: input.mode === "steer" ? "steer_active" : "restart_active",
           targetRunId: steerableRun.id,
+          ...(input.mode === "steer" && input.activeTurnOnly ? { activeTurnOnly: true } : {}),
         };
       }
     } else if (input.mode === "auto" && steerableRun !== undefined) {

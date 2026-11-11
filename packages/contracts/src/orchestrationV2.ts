@@ -2963,7 +2963,12 @@ export const OrchestrationV2Command = Schema.Union([
         type: Schema.Literal("defer_start"),
         workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
       }),
-      Schema.Struct({ type: Schema.Literal("steer_active"), targetRunId: RunId }),
+      Schema.Struct({
+        type: Schema.Literal("steer_active"),
+        targetRunId: RunId,
+        /** Drop the steer if its turn ends; never start a follow-up or restart. */
+        activeTurnOnly: Schema.optional(Schema.Boolean),
+      }),
       Schema.Struct({ type: Schema.Literal("restart_active"), targetRunId: RunId }),
       Schema.Struct({ type: Schema.Literal("queue_after_active") }),
       Schema.Struct({ type: Schema.Literal("start_immediately") }),

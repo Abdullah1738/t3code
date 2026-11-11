@@ -225,11 +225,15 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       yield* threads.send({ threadId, text: "Back", key: "wake:abc" });
       yield* threads.send({ threadId, text: "Unkeyed" });
       yield* threads.send({ threadId, text: "Unkeyed" });
+      yield* threads.send({ threadId, text: "Pause this card", mode: "steer" });
       expect(sent[0]?.commandId).toBe("kanban:send:wake:abc");
       expect(sent[0]?.messageId).toBe("kanban:wake:abc");
       expect(sent[1]?.commandId).toBe(sent[0]?.commandId);
       expect(sent[1]?.messageId).toBe(sent[0]?.messageId);
       expect(sent[2]?.commandId).not.toBe(sent[3]?.commandId);
+      expect(sent.slice(0, 4).every((input) => input.mode === "auto")).toBe(true);
+      expect(sent[4]?.mode).toBe("steer");
+      expect(sent[4]?.activeTurnOnly).toBe(true);
     }).pipe(
       Effect.provide(
         layer.pipe(

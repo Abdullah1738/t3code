@@ -4182,6 +4182,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly senderThreadId?: OrchestrationV2ConversationMessage["senderThreadId"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
     readonly forceRestart: boolean;
+    readonly activeTurnOnly?: boolean;
   }) {
     const targetRun = input.projection.runs.find((candidate) => candidate.id === input.targetRunId);
     if (targetRun === undefined) {
@@ -4417,6 +4418,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }),
     );
 
+    if (input.activeTurnOnly && steeringPolicy !== "active_steering") {
+      return yield* new OrchestratorDispatchError({
+        commandId: input.command.commandId,
+        commandType: input.command.type,
+        cause: "Active-turn-only steering cannot restart the turn.",
+      });
+    }
+
     if (steeringPolicy === "active_steering") {
       const instanceChanged =
         input.projection.thread.providerInstanceId !== input.modelSelection.instanceId;
@@ -4453,6 +4462,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: input.command.threadId,
           request: {
             type: "provider-turn.steer",
+            ...(input.activeTurnOnly ? { activeTurnOnly: true } : {}),
             providerSessionId,
             providerThreadId: providerThread.id,
             providerTurnId: providerTurn.id,
@@ -5132,6 +5142,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // The client may still show a running turn while its completion is being
       // projected. Preserve the submission as a new turn when steering is too late.
       if (
+        !dispatchMode.activeTurnOnly &&
         target !== undefined &&
         (target.status === "completed" ||
           ((target.status === "running" || target.status === "waiting") &&
@@ -5147,7 +5158,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // hold; an explicit steer or restart still fails below.
     if (
       command.deliveryIntent === "auto" &&
-      (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") &&
+      (dispatchMode.type === "restart_active" ||
+        (dispatchMode.type === "steer_active" && !dispatchMode.activeTurnOnly)) &&
       (yield* stopReachedRun(command, command.threadId, dispatchMode.targetRunId))
     ) {
       dispatchMode = { type: "queue_after_active" };
@@ -5321,6 +5333,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : { scheduledTaskId: command.scheduledTaskId }),
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         forceRestart: dispatchMode.type === "restart_active",
+        ...(dispatchMode.type === "steer_active" && dispatchMode.activeTurnOnly
+          ? { activeTurnOnly: true }
+          : {}),
       });
       return;
     }
