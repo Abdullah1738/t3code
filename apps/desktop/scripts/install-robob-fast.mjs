@@ -440,6 +440,9 @@ async function main(args) {
   const skipMigrationCheck = skipIndex < 0 ? undefined : args[skipIndex + 1]?.trim();
   if (skipIndex >= 0 && (!skipMigrationCheck || skipMigrationCheck.startsWith("--")))
     throw new Error("--skip-migration-check requires a reason");
+  // A rollback must always prove the previous binary still opens the migrated database.
+  if (rollback && skipMigrationCheck !== undefined)
+    throw new Error("--skip-migration-check cannot be used with --rollback");
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === "--dmg" || args[i] === "--skip-migration-check") && args[i + 1]) {
       i++;
@@ -480,12 +483,12 @@ async function main(args) {
     // Exact names only: the 226 GB statev2.pre-shrink-*.sqlite copy matched the old prefix pattern
     // and was cloned on every install (11 Nov 2026).
     (await fs.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
-  const clone = async (destination, perFileMs) => {
+  const clone = async (destination, timeoutMs) => {
     await fs.mkdir(destination, { recursive: true, mode: 0o700 });
     const names = await inputs();
     if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
     for (const name of names)
-      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], perFileMs);
+      await run("/bin/cp", ["-c", path.join(data, name), path.join(destination, name)], timeoutMs());
   };
   const cfg = JSON.parse(
     await fs.readFile(
@@ -583,7 +586,7 @@ async function main(args) {
             ),
           );
         const before = await fingerprint();
-        await clone(sandbox, 3000);
+        await clone(sandbox, () => 3000);
         if (before !== (await fingerprint()))
           throw new Error("Database changed during preflight clone; retry before quitting");
         await fs.writeFile(path.join(sandbox, ".install-clone"), "", { mode: 0o600 });
@@ -645,7 +648,23 @@ async function main(args) {
     backup: async () => {
       await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
       // No writer is left after the quit, so the clone only waits on APFS, not on the server.
-      await clone(path.join(backupRoot, stamp), 120_000);
+      // Leave at least 60 s of the 3 minute window for swap, launch and readiness: a backup that
+      // ate the window would fail the launch after the swap, where nothing relaunches either app.
+      const budget = () => {
+        const ms = Math.min(120_000, 180_000 - (Date.now() - quitAt) - 60_000);
+        if (ms <= 0) throw new Error("No time left for the backup before the swap");
+        return ms;
+      };
+      const destination = path.join(backupRoot, stamp);
+      try {
+        await clone(destination, budget);
+      } catch (error) {
+        // A partial folder would count as one of the two kept backups on the next prune. Rename it
+        // (instant) rather than delete it (tens of seconds) so the old app relaunches sooner;
+        // the next successful install's prune removes it.
+        await fs.rename(destination, path.join(backupRoot, `partial-${stamp}`)).catch(() => {});
+        throw error;
+      }
     },
     // Deleting old clones of a fragmented 160 GB file takes tens of seconds; it runs after
     // the new server is ready instead of inside the outage window.
@@ -655,8 +674,10 @@ async function main(args) {
         .sort()
         .reverse()
         .slice(2);
-      for (const name of old) await fs.rm(path.join(backupRoot, name), { recursive: true });
-      await phase("backups_pruned", { removed: old });
+      const partial = (await fs.readdir(backupRoot)).filter((n) => n.startsWith("partial-"));
+      for (const name of [...old, ...partial])
+        await fs.rm(path.join(backupRoot, name), { recursive: true });
+      await phase("backups_pruned", { removed: [...old, ...partial] });
     },
     swap: async (rollback) => {
       if (rollback) {
