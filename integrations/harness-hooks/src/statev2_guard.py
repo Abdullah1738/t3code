@@ -11,7 +11,9 @@ import stat
 
 LIVE = re.compile(
     r"(?:\.robob/userdata/statev2|robob-data/userdata/statev2|\.robob/userdata/\*\.sqlite|"
-    r"(?:\.local/share/opencode|opencode-data)/opencode\.db)"
+    r"(?:\.local/share/opencode|opencode-data)/opencode\.db|"
+    # The legacy home database is protected; workspace .t3 copies stay isolated.
+    rf"(?:{re.escape(str(Path.home()))}|~|\$HOME|\$\{{HOME\}})/\.t3/userdata/statev2)"
 )
 READER = re.compile(
     r"(?:^|[\s;&|('\"`])(?:\S*/)?(?:sqlite3?|python[\d.]*|node|bun|deno|duckdb|litecli|"
