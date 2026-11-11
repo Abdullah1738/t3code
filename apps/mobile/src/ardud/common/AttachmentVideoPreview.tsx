@@ -8,12 +8,15 @@
  * - The player and its still frame are kept under a key that names the server
  *   (`attachmentVideoKey`), so the same attachment id on another server never
  *   shows this one's frame.
+ * - Each attempt has a time limit (`fileViewerTimeLimitMs`): a request that
+ *   stalls is stopped and Retry is offered, as for the system's viewer.
  */
 import type { AssetResource, EnvironmentId } from "@t3tools/contracts";
 import { View } from "react-native";
 
 import { MediaVideoPlayer } from "../../components/MediaVideoPlayer";
 import { useRefreshAssetUrl } from "../../state/assets";
+import { fileViewerTimeLimitMs } from "./fileViewer";
 
 export function AttachmentVideoPreview(props: {
   readonly name: string;
@@ -35,6 +38,7 @@ export function AttachmentVideoPreview(props: {
         resolvePlaybackUri={async () => (local ? uri : renew())}
         name={props.name}
         thumbnailKey={props.videoKey}
+        loadTimeLimitMs={fileViewerTimeLimitMs(props.sizeBytes)}
       />
     </View>
   );

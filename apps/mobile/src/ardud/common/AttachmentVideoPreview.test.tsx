@@ -1,6 +1,8 @@
 /**
  * A video attachment through the real player (`MediaVideoPlayer`), over a
- * native player that is faked: what address each attempt plays.
+ * native player that is faked: what address each attempt plays, and that an
+ * attempt which never finishes loading is stopped at its time limit, says so
+ * and offers Retry. The clip from the smoke test stayed on a spinner for ever.
  */
 import { EnvironmentId } from "@t3tools/contracts";
 import type { ReactNode } from "react";
@@ -120,9 +122,10 @@ vi.mock("../../state/assets", () => ({
 }));
 
 import { AttachmentVideoPreview } from "./AttachmentVideoPreview";
-import { attachmentVideoKey } from "./fileViewer";
+import { attachmentVideoKey, fileViewerTimeLimitMs } from "./fileViewer";
 
 const SIZE = 68 * 1024;
+const LIMIT = fileViewerTimeLimitMs(SIZE);
 const A = EnvironmentId.make("A");
 const resource = {
   _tag: "attachment" as const,
@@ -164,6 +167,12 @@ const press = async (label: string) => {
     await vi.advanceTimersByTimeAsync(0);
   });
 };
+const pass = (ms: number) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+const status = (value: string) =>
+  act(async () => {
+    ui.emit("statusChange", { status: value });
+    await vi.advanceTimersByTimeAsync(0);
+  });
 const says = () => page.textContent ?? "";
 const offersRetry = () => page.querySelector('[aria-label="Retry video"]') !== null;
 
@@ -228,5 +237,90 @@ describe("the address a video attachment plays from", () => {
     await press("Play clip.mp4");
     expect(ui.loads).toEqual(["file:///drafts/clip.mp4"]);
     expect(ui.renewals).toEqual([]);
+  });
+});
+
+describe("a video attachment that never finishes loading", () => {
+  it("is stopped at the time limit, says so and offers Retry; Retry is a new attempt with its own limit", async () => {
+    ui.signed = ["https://a.example/fresh-1", "https://a.example/fresh-2"];
+    await show();
+    await press("Play clip.mp4");
+    expect(ui.loads).toEqual(["https://a.example/fresh-1"]);
+    expect(says()).toContain("Loading video");
+
+    await pass(LIMIT - 1);
+    expect(offersRetry()).toBe(false);
+    expect(says()).toContain("Loading video");
+
+    await pass(1);
+    expect(says()).toContain("The video hasn't loaded");
+    expect(says()).not.toContain("Loading video");
+    expect(offersRetry()).toBe(true);
+    // The attempt is stopped: the player is paused and told to drop the file.
+    expect(ui.loads).toEqual(["https://a.example/fresh-1", null]);
+    expect(ui.pauses).toBeGreaterThan(0);
+    expect(ui.plays).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await press("Retry video");
+    expect(ui.loads).toEqual(["https://a.example/fresh-1", null, "https://a.example/fresh-2"]);
+    expect(says()).toContain("Loading video");
+    expect(offersRetry()).toBe(false);
+    await pass(LIMIT);
+    expect(says()).toContain("The video hasn't loaded");
+    expect(ui.loads.at(-1)).toBeNull();
+  });
+
+  it("the same when the file opens and then stays loading", async () => {
+    ui.signed = ["https://a.example/fresh-1"];
+    ui.load = () => Promise.resolve();
+    await show();
+    await press("Play clip.mp4");
+    await status("loading");
+    expect(says()).toContain("Loading video");
+
+    await pass(LIMIT);
+    expect(says()).toContain("The video hasn't loaded");
+    expect(offersRetry()).toBe(true);
+    expect(ui.loads).toEqual(["https://a.example/fresh-1", null]);
+  });
+
+  it("the same when the server never answers with an address", async () => {
+    ui.signed = ["never"];
+    await show();
+    await press("Play clip.mp4");
+    expect(ui.loads).toEqual([]);
+    await pass(LIMIT);
+    expect(says()).toContain("The video hasn't loaded");
+    expect(offersRetry()).toBe(true);
+  });
+
+  it("a video that loads in time is left alone", async () => {
+    ui.signed = ["https://a.example/fresh-1"];
+    ui.load = () => Promise.resolve();
+    await show();
+    await press("Play clip.mp4");
+    await status("loading");
+    await pass(LIMIT - 1);
+    await status("readyToPlay");
+    expect(vi.getTimerCount()).toBe(0);
+
+    await pass(LIMIT * 3);
+    expect(offersRetry()).toBe(false);
+    expect(ui.loads).toEqual(["https://a.example/fresh-1"]);
+    expect(ui.plays).toBe(1);
+  });
+
+  it("leaving the screen ends the wait: nothing runs afterwards", async () => {
+    ui.signed = ["https://a.example/fresh-1"];
+    await show();
+    await press("Play clip.mp4");
+    expect(vi.getTimerCount()).toBe(1);
+
+    await act(async () => root.unmount());
+    expect(vi.getTimerCount()).toBe(0);
+    await pass(LIMIT * 2);
+    expect(ui.loads).toEqual(["https://a.example/fresh-1"]);
+    root = createRoot(page);
   });
 });

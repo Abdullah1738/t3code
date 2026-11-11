@@ -75,7 +75,13 @@ to zoom, swipe between), the attachment screen (video, audio, PDF, any other fil
 `MessageView`/`Composer` from `Chat.tsx`. On the attachment screen video and audio play in the
 app's own players. Only pictures, PDFs and formats the app can't show go to the system's
 viewer, and that wait has a time limit (20 seconds, more for a large file): then the screen
-says the file hasn't opened and offers "Try again" (`ardud/common/fileViewer.ts`). A message under an ask is shown outside its
+says the file hasn't opened and offers "Try again" (`ardud/common/fileViewer.ts`). A video
+has the same limit on every attempt to load it: at the limit the attempt is stopped, the
+player says "The video hasn't loaded" and offers Retry. Every attempt asks the server for a
+fresh address, so Retry works on a screen left open past the hour an address is signed for;
+a file still on the phone plays from where it is. The player and its still frame are kept
+under a key that names the server, since two servers can hold the same attachment id
+(`AttachmentVideoPreview`, `attachmentVideoKey`). A message under an ask is shown outside its
 discussion's feed: "Show full" reads it whole over the ask's own server calls, and a pick in
 it is read-only.
 
