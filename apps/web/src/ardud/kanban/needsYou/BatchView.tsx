@@ -1,5 +1,6 @@
 import {
   ASK_BATCH_MAX,
+  askBatchTitle,
   askKindLabel,
   planAskBatch,
   type AskKeyAction,
@@ -38,6 +39,11 @@ export function BatchView(props: {
   const [left, setLeft] = useState<ReadonlySet<string>>(new Set());
   const included = offered.filter((entry) => !left.has(askKey(entry)));
   const count = included.length;
+  // What History calls this answer: the asks it went to, not the whole batch.
+  const only = count === 1 ? included[0] : undefined;
+  const sentTitle = only
+    ? (only.ask.title ?? only.ask.text)
+    : askBatchTitle(included.map((entry) => entry.kind));
   const first = offered[0];
   const response = first ? kanbanAskResponse(first.ask) : null;
   const shape = plan.shape?.split(":")[0] ?? null;
@@ -71,7 +77,7 @@ export function BatchView(props: {
     const trimmedNote = note.trim();
     const extra = shape === "ack" || trimmedNote === "" ? {} : { note: trimmedNote };
     const go = (verdict: string, label: string, more: object = {}) =>
-      answerAskBatch(included, props.batchKey, { verdict, ...more, ...extra }, label, props.title);
+      answerAskBatch(included, props.batchKey, { verdict, ...more, ...extra }, label, sentTitle);
     if (shape === "ack") return go("acknowledged", "Seen");
     if (shape === "verdict") {
       return intent === "refuse"
@@ -285,7 +291,7 @@ export function BatchView(props: {
             <HandOver
               entries={included}
               focusKey={props.batchKey}
-              title={props.title}
+              title={sentTitle}
               phone={phone}
               onLeave={props.onLeave}
             />
