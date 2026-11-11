@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Scheduler from "effect/Scheduler";
 
 import { readThreadShellsShared } from "./sharedThreadShellReads.ts";
 
@@ -127,5 +128,69 @@ it.effect("drops the oldest entries past the cap", () =>
     yield* read(3);
     yield* read(1);
     expect(reads.calls.length).toBe(4);
+  }),
+);
+
+it.live("a subscriber interrupted while it registers a batch still starts the read", () =>
+  Effect.gen(function* () {
+    // 11 Nov 2026 review: with a small scheduler budget the claim loop yielded
+    // between publishing entries and starting the reader. Interrupting there left
+    // the entries without a reader, and the next subscriber for "t0" hung.
+    const owner = {};
+    const reads = makeReads();
+    const wanted = Array.from({ length: 64 }, (_, index) => ({
+      threadId: `t${index}`,
+      sequence: 1,
+    }));
+    const first = yield* readThreadShellsShared({
+      owner,
+      wanted,
+      ...reads,
+      batch: true,
+      batchMinThreads: 2,
+    }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 8), Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Fiber.interrupt(first);
+    const second = yield* readThreadShellsShared({
+      owner,
+      wanted: [{ threadId: "t0", sequence: 1 }],
+      ...reads,
+      batch: true,
+      batchMinThreads: 2,
+      // Long enough that only a real read, not the fallback, can answer in time.
+      waitTimeout: "1 minute",
+    }).pipe(Effect.timeout("2 seconds"));
+    expect(second.get("t0")).toMatch(/^t0:shell:/);
+    expect(reads.calls.length).toBe(1);
+    expect(reads.calls[0]).toHaveLength(64);
+  }),
+);
+
+it.live("a waiter whose shared read never settles reads the shell itself", () =>
+  Effect.gen(function* () {
+    const owner = {};
+    let reads = 0;
+    const read = () =>
+      readThreadShellsShared({
+        owner,
+        wanted: [{ threadId: "a", sequence: 1 }],
+        readMany: () => Effect.die("unused"),
+        readOne: (id: string) =>
+          Effect.suspend(() => {
+            reads += 1;
+            return reads === 1 ? Effect.never : Effect.succeed(`${id}:shell:${reads}`);
+          }),
+        batch: false,
+        batchMinThreads: 2,
+        waitTimeout: "30 millis",
+      });
+    const first = yield* Effect.forkChild(read());
+    const second = yield* read().pipe(Effect.timeout("2 seconds"));
+    expect(second.get("a")).toBe("a:shell:2");
+    expect((yield* Fiber.join(first).pipe(Effect.timeout("2 seconds"))).get("a")).toMatch(
+      /^a:shell:/,
+    );
+    // The stuck entry was dropped: a later subscriber reads again.
+    expect((yield* read().pipe(Effect.timeout("2 seconds"))).get("a")).toMatch(/^a:shell:/);
   }),
 );
