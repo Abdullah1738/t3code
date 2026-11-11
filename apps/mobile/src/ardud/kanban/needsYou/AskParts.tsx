@@ -381,19 +381,21 @@ export function DraftPart(props: {
           <Text className="text-sm text-warning-foreground">
             Edited. Your text is what gets sent.
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            hitSlop={8}
-            onPress={() => {
-              props.onEditing(false);
-              asks.patchAskForm(entry, { draft: null });
-            }}
-            className="min-h-11 justify-center self-start"
-          >
-            <Text className="text-sm font-t3-medium text-primary-text">
-              Revert to the agent's text
-            </Text>
-          </Pressable>
+          {props.editable ? (
+            <Pressable
+              accessibilityRole="button"
+              hitSlop={8}
+              onPress={() => {
+                props.onEditing(false);
+                asks.patchAskForm(entry, { draft: null });
+              }}
+              className="min-h-11 justify-center self-start"
+            >
+              <Text className="text-sm font-t3-medium text-primary-text">
+                Revert to the agent's text
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       ) : null}
     </Panel>

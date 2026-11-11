@@ -40,7 +40,7 @@ import { useAskScope, useAsks } from "./askStore";
 import {
   acceptsInWords,
   acceptsOnlyMedia,
-  customValueAccepted,
+  customValueTaken,
   moveRank,
   rankOrder,
   shownValue,
@@ -77,7 +77,11 @@ export function FieldRow(props: {
   const [touched, setTouched] = useState(false);
   const problem =
     props.problem ?? (touched && !isBlank(value) ? askFieldProblem(field, value, false) : null);
-  const set = (next: unknown) => asks.setAskValue(entry, field.id, next);
+  // No control of a field that can't be changed writes into the answer,
+  // whatever the control itself still lets through.
+  const set = (next: unknown) => {
+    if (!props.disabled) asks.setAskValue(entry, field.id, next);
+  };
   const text = typeof value === "string" ? value : "";
   const label = field.label || field.id;
   const invalid = problem !== null && problem !== undefined;
@@ -189,12 +193,22 @@ export function FieldRow(props: {
           value={props.secret ?? ""}
           invalid={invalid}
           disabled={props.disabled}
-          onChange={(next) => props.onSecret?.(next)}
+          onChange={(next) => {
+            if (!props.disabled) props.onSecret?.(next);
+          }}
         />
       );
       break;
     case "custom":
-      control = <CustomControl ask={props.ask} field={field} value={value} onChange={set} />;
+      control = (
+        <CustomControl
+          ask={props.ask}
+          field={field}
+          value={value}
+          disabled={props.disabled}
+          onChange={set}
+        />
+      );
       break;
     default:
       control = (
@@ -302,7 +316,7 @@ function DateControl(props: {
           </Pressable>
         ))}
       </View>
-      {picker !== null && at !== null ? (
+      {picker !== null && at !== null && !props.disabled ? (
         <DateTimePicker
           value={at}
           mode={picker}
@@ -557,6 +571,11 @@ function FileControl(props: {
   useEffect(() => {
     pendingNow.current = pending;
   }, [pending]);
+  // An upload that finishes after the answer was locked does not join it.
+  const lockedNow = useRef(props.disabled);
+  useEffect(() => {
+    lockedNow.current = props.disabled;
+  }, [props.disabled]);
   useEffect(() => {
     live.current = true;
     return () => {
@@ -580,9 +599,10 @@ function FileControl(props: {
         const stored = result.status === "ready" ? result.attachments[0] : undefined;
         const id = stored !== undefined && "id" in stored ? stored.id : undefined;
         if (stored === undefined || id === undefined) throw new Error("Upload cancelled.");
-        if (controller.signal.aborted || !live.current) {
-          // Removed or left while uploading: the server copy has no owner, so drop it.
+        if (controller.signal.aborted || !live.current || lockedNow.current) {
+          // Removed, left or locked while uploading: the server copy has no owner, so drop it.
           void releasePendingAttachmentUploads(environment, [id]);
+          if (live.current) drop();
           return;
         }
         // Read now, not when the upload began: another file may have finished meanwhile.
@@ -611,7 +631,7 @@ function FileControl(props: {
   };
 
   const pick = async (from: "media" | "files") => {
-    if (!canUpload || environmentId === null) return;
+    if (props.disabled || !canUpload || environmentId === null) return;
     if (room <= 0) {
       setRefused(max === 1 ? "One file only" : `At most ${max} files`);
       return;
@@ -664,7 +684,7 @@ function FileControl(props: {
   };
 
   const retry = (file: PendingFile) => {
-    if (environmentId === null) return;
+    if (props.disabled || environmentId === null) return;
     const again = { ...file, failed: false, controller: new AbortController() };
     setPending((current) =>
       current.map((other) => (other.local.id === file.local.id ? again : other)),
@@ -677,6 +697,7 @@ function FileControl(props: {
     void releaseUnusedComposerAttachmentFiles([file.local]);
   };
   const remove = (file: AskAnswerFile) => {
+    if (props.disabled) return;
     if (environmentId !== null) void releasePendingAttachmentUploads(environmentId, [file.id]);
     asks.setAskValue(
       entry,
@@ -713,6 +734,8 @@ function FileControl(props: {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Try ${file.local.name} again`}
+              accessibilityState={{ disabled: props.disabled }}
+              disabled={props.disabled}
               onPress={() => retry(file)}
               className="min-h-11 justify-center rounded-full px-3 active:bg-card-alt"
             >
@@ -874,9 +897,11 @@ function CustomControl(props: {
   readonly ask: KanbanOwnerAsk;
   readonly field: KanbanAskField;
   readonly value: unknown;
+  /** The page still shows, but takes no touches, and a value it posts is dropped. */
+  readonly disabled: boolean;
   readonly onChange: (value: unknown) => void;
 }) {
-  const { field, value } = props;
+  const { field, value, disabled } = props;
   const block = field.block === undefined ? undefined : props.ask.blocks?.[field.block];
   const page = block?._tag === "html" && block.truncated !== true ? block : null;
   const picked = !isBlank(value);
@@ -887,8 +912,9 @@ function CustomControl(props: {
           html={page.html}
           title={page.title}
           height={page.height}
+          disabled={disabled}
           onValue={(next) => {
-            if (customValueAccepted(field, next)) props.onChange(next);
+            if (customValueTaken(field, next, disabled)) props.onChange(next);
           }}
         />
       ) : block?._tag === "html" ? (
@@ -908,7 +934,7 @@ function CustomControl(props: {
           </>
         ) : (
           <Text className="text-sm text-foreground-muted">
-            {page ? "Pick a value in the page above" : "Nothing picked yet"}
+            {page && !disabled ? "Pick a value in the page above" : "Nothing picked yet"}
           </Text>
         )}
       </View>

@@ -2,6 +2,7 @@ import { type StaticScreenProps, useNavigation } from "@react-navigation/native"
 import {
   EMPTY_NEEDS_YOU_FILTER,
   askAge,
+  askAutoRetryOwed,
   askAsker,
   askDiscussion,
   askFailureText,
@@ -236,6 +237,8 @@ function OpenAsk(props: {
   const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
   const [secretBusy, setSecretBusy] = useState(false);
   const [secretError, setSecretError] = useState<string | null>(null);
+  // Nothing of the answer can be changed: not his to answer now, or it is on its way.
+  const frozen = locked || secretBusy;
   // The server changed: secrets are cleared before anything else is dropped.
   const dropSecrets = useCallback(() => setSecrets({}), []);
   useAskSecretsHeld(dropSecrets);
@@ -263,7 +266,7 @@ function OpenAsk(props: {
   };
 
   const canEditDraft =
-    ask.draft !== undefined && response.edit === "draft" && !locked && !form.refusing;
+    ask.draft !== undefined && response.edit === "draft" && !frozen && !form.refusing;
   const toAnswer = () => {
     scroll.current?.scrollTo({ y: Math.max(0, answerY.current - 16), animated: true });
   };
@@ -465,7 +468,11 @@ function OpenAsk(props: {
             }
           >
             Not sent. {failed.message}
-            {failed.unreached ? " Your answer is kept and goes again once Robob is back." : ""}
+            {failed.unreached
+              ? askAutoRetryOwed({ failed: { [key]: failed } })
+                ? " Your answer is kept and goes again once Robob is back."
+                : " Your answer is kept. It no longer goes by itself: retry when Robob is back."
+              : ""}
           </Band>
         ) : null}
         {secretError ? <Band tone="negative">{secretError}</Band> : null}
@@ -563,7 +570,7 @@ function OpenAsk(props: {
           >
             <Heading>{response.task ? "Your part" : "Your answer"}</Heading>
             {response.task && response.task.steps.length > 0 ? (
-              <TaskSteps entry={entry} steps={response.task.steps} form={form} disabled={locked} />
+              <TaskSteps entry={entry} steps={response.task.steps} form={form} disabled={frozen} />
             ) : null}
             {response.choose ? (
               <OptionList
@@ -572,7 +579,7 @@ function OpenAsk(props: {
                 ownWords={askOffersOwnWords(response)}
                 form={form}
                 problem={problems.choose}
-                disabled={locked || form.refusing}
+                disabled={frozen || form.refusing}
                 renderBlock={(index) => (
                   <BlockPicture bare media={media} index={index} onOpen={setViewing} />
                 )}
@@ -590,7 +597,7 @@ function OpenAsk(props: {
                     required={field.required === true || response.task?.proof === field.id}
                     problem={problems[`field:${field.id}`]}
                     bare={plain}
-                    disabled={locked || secretBusy}
+                    disabled={frozen}
                     secret={secrets[field.id] ?? ""}
                     onSecret={(value) => {
                       setSecretError(null);
@@ -601,14 +608,20 @@ function OpenAsk(props: {
               </View>
             ) : null}
             {form.refusing ? (
-              <WhyField entry={entry} response={response} form={form} problem={problems.why} />
+              <WhyField
+                entry={entry}
+                response={response}
+                form={form}
+                problem={problems.why}
+                disabled={frozen}
+              />
             ) : null}
             {showNote ? (
               <NoteField
                 entry={entry}
                 form={form}
                 problem={problems.note}
-                disabled={secretBusy}
+                disabled={frozen}
                 autoFocus={noteOpen && form.note === ""}
               />
             ) : null}

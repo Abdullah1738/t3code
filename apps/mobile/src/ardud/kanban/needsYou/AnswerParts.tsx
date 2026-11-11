@@ -210,6 +210,7 @@ export function WhyField(props: {
   readonly response: KanbanAskResponse;
   readonly form: AskForm;
   readonly problem: string | undefined;
+  readonly disabled: boolean;
 }) {
   const asks = useAsks();
   const refusal = askRefusal(props.response);
@@ -221,8 +222,9 @@ export function WhyField(props: {
         aside={refusal.why === "optional" ? "Optional" : undefined}
       />
       <GrowingInput
-        autoFocus
+        autoFocus={!props.disabled}
         accessibilityLabel={refusal.prompt}
+        editable={!props.disabled}
         invalid={props.problem !== undefined}
         value={props.form.why}
         maxLength={20_000}
