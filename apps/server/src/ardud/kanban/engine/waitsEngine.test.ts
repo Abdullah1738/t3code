@@ -14,12 +14,15 @@ import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import {
   KANBAN_BACKLOG,
@@ -99,6 +102,47 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     during: null,
     count: 0,
   };
+  /**
+   * Runs before the tick's closing dispatch reads the boards (its first read), so a
+   * test can fail or hold that dispatch after the tick's steps are done.
+   */
+  const closing: { before: Effect.Effect<void, KanbanStore.KanbanStoreError> | null } = {
+    before: null,
+  };
+  const storeLayer = Layer.effect(
+    KanbanStore.KanbanStore,
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const inClosingDispatch = Effect.map(
+        Effect.currentSpan.pipe(Effect.orElseSucceed(() => null)),
+        (span) => {
+          const names: Array<string> = [];
+          let at: Tracer.AnySpan | undefined = span ?? undefined;
+          while (at !== undefined && at._tag === "Span") {
+            names.push(at.name);
+            at = Option.getOrUndefined(at.parent);
+          }
+          return (
+            names.includes("KanbanService.dispatchUnlocked") &&
+            names.includes("KanbanService.tickUnlocked")
+          );
+        },
+      );
+      return KanbanStore.KanbanStore.of({
+        ...store,
+        boards: Effect.suspend(() =>
+          closing.before === null
+            ? store.boards
+            : inClosingDispatch.pipe(
+                Effect.flatMap((inside) =>
+                  inside ? (closing.before ?? Effect.void) : Effect.void,
+                ),
+                Effect.andThen(store.boards),
+              ),
+        ),
+      });
+    }),
+  ).pipe(Layer.provide(KanbanStore.layer));
   let next = 0;
   const view = (threadId: ThreadId) =>
     Effect.gen(function* () {
@@ -187,7 +231,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     Layer.provideMerge(threadsLayer),
     // The reader is provided around the board's layers, the way server.ts does it.
     Layer.provideMerge(options.reader === false ? Layer.empty : readerLayer),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(storeLayer),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
@@ -210,6 +254,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
     host,
     gate,
     reading,
+    closing,
     layer,
     /** Messages anywhere that include `text`. */
     said,
@@ -1836,4 +1881,88 @@ it.effect(
       }).pipe(Effect.provide(Logger.layer([warnings]))),
     );
   },
+);
+
+/**
+ * A board whose next tick ends a wait (which asks for a dispatch) with the worker
+ * running and idle, as in production. Returns the parked card and a bounded wait
+ * for the worker to have started it.
+ */
+const wakingTick = Effect.gen(function* () {
+  const { kanban, store, board } = yield* setup;
+  const parked = yield* placed(board, "Parked until the hour");
+  yield* kanban.waitCard(
+    parked.id,
+    { on: "time", until: iso(T0 + HOUR), note: "after the window" },
+    owner,
+  );
+  // The kick the setup queued starts this card; once it has, the worker is idle.
+  const canary = yield* placed(board, "Started by the setup's kick");
+  const worker = yield* Effect.forkChild(kanban.worker);
+  const startedOf = (cardId: KanbanCard["id"]) =>
+    store.card(cardId).pipe(
+      Effect.map((card) => card?.activeThreadId != null),
+      Effect.orDie,
+    );
+  const turns = (count: number, until: Effect.Effect<boolean>) =>
+    Effect.gen(function* () {
+      for (let i = 0; i < count; i += 1) {
+        if (yield* until) return true;
+        yield* Effect.yieldNow;
+      }
+      return yield* until;
+    });
+  assert.isTrue(yield* turns(20_000, startedOf(canary.id)), "the worker ran the queued kick");
+  yield* turns(200, Effect.succeed(false));
+  yield* TestClock.adjust(HOUR + MINUTE);
+  return { kanban, parked, worker, started: turns(5_000, startedOf(parked.id)) };
+});
+
+it.effect("a tick whose closing dispatch fails still gets the dispatch its steps asked for", () =>
+  inWorld((world) =>
+    Effect.gen(function* () {
+      const { kanban, parked, worker, started } = yield* wakingTick;
+      // The steps end the wait and note a kick; then the dispatch that was to stand
+      // in for that kick fails on its first read, once.
+      let failed = 0;
+      world.closing.before = Effect.suspend(() => {
+        world.closing.before = null;
+        failed += 1;
+        return Effect.fail(
+          new KanbanStore.KanbanStoreError({ operation: "boards", cause: "disk busy (test)" }),
+        );
+      });
+      const ticked = yield* Effect.exit(kanban.tick);
+      assert.strictEqual(failed, 1, "the closing dispatch failed");
+      assert.isTrue(Exit.isFailure(ticked), "the tick reports the failure");
+      assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
+      // No second tick: the kick is queued and the worker dispatches.
+      assert.isTrue(yield* started, "the woken card was started without another tick");
+      assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
+      yield* Fiber.interrupt(worker);
+    }),
+  ),
+);
+
+it.effect(
+  "a tick interrupted in its closing dispatch still gets the dispatch its steps asked for",
+  () =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, parked, worker, started } = yield* wakingTick;
+        const entered = yield* Deferred.make<void>();
+        world.closing.before = Effect.suspend(() => {
+          world.closing.before = null;
+          return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+        });
+        const tick = yield* Effect.forkChild(kanban.tick);
+        yield* Deferred.await(entered);
+        assert.isUndefined((yield* cardOf(parked.id)).wait, "the tick's steps ended the wait");
+        assert.isNull((yield* cardOf(parked.id)).activeThreadId);
+        yield* Fiber.interrupt(tick);
+        assert.isTrue(yield* started, "the woken card was started without another tick");
+        assert.strictEqual((yield* cardOf(parked.id)).activeRole, "work");
+        yield* Fiber.interrupt(worker);
+      }),
+    ),
 );
