@@ -1320,5 +1320,383 @@
     "cwd": "/Users/ardud/checkouts/task-1",
     "root": null,
     "case_class": "quoted tilde prefix"
+  },
+  {
+    "command": "{ cd /tmp; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline first cwd out"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline first cwd in"
+  },
+  {
+    "command": "{ { cd /tmp; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline first cwd out"
+  },
+  {
+    "command": "{ { cd /Users/ardud/checkouts; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline first cwd in"
+  },
+  {
+    "command": "(cd /tmp) | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline first cwd out"
+  },
+  {
+    "command": "(cd /Users/ardud/checkouts) | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline first cwd in"
+  },
+  {
+    "command": "{ export AGENT_GUARD_APPROVED=owner-approved; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline first grant"
+  },
+  {
+    "command": "{ unset AGENT_GUARD_APPROVED; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline first removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "{ { export AGENT_GUARD_APPROVED=owner-approved; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline first grant"
+  },
+  {
+    "command": "{ { unset AGENT_GUARD_APPROVED; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline first removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "printf hi | { cd /tmp; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline last cwd out"
+  },
+  {
+    "command": "printf hi | { cd /Users/ardud/checkouts; }; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline last cwd in"
+  },
+  {
+    "command": "printf hi | { { cd /tmp; }; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline last cwd out"
+  },
+  {
+    "command": "printf hi | { { cd /Users/ardud/checkouts; }; }; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline last cwd in"
+  },
+  {
+    "command": "printf hi | (cd /tmp); rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline last cwd out"
+  },
+  {
+    "command": "printf hi | (cd /Users/ardud/checkouts); rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline last cwd in"
+  },
+  {
+    "command": "printf hi | { export AGENT_GUARD_APPROVED=owner-approved; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline last grant"
+  },
+  {
+    "command": "printf hi | { unset AGENT_GUARD_APPROVED; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline last removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "printf hi | { { export AGENT_GUARD_APPROVED=owner-approved; }; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline last grant"
+  },
+  {
+    "command": "printf hi | { { unset AGENT_GUARD_APPROVED; }; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline last removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "printf hi | { cd /tmp; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline middle cwd out"
+  },
+  {
+    "command": "printf hi | { cd /Users/ardud/checkouts; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline middle cwd in"
+  },
+  {
+    "command": "printf hi | { { cd /tmp; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline middle cwd out"
+  },
+  {
+    "command": "printf hi | { { cd /Users/ardud/checkouts; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline middle cwd in"
+  },
+  {
+    "command": "printf hi | (cd /tmp) | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline middle cwd out"
+  },
+  {
+    "command": "printf hi | (cd /Users/ardud/checkouts) | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline middle cwd in"
+  },
+  {
+    "command": "printf hi | { export AGENT_GUARD_APPROVED=owner-approved; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline middle grant"
+  },
+  {
+    "command": "printf hi | { unset AGENT_GUARD_APPROVED; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline middle removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "printf hi | { { export AGENT_GUARD_APPROVED=owner-approved; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline middle grant"
+  },
+  {
+    "command": "printf hi | { { unset AGENT_GUARD_APPROVED; }; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline middle removal",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "cd /tmp && { cd /Users/ardud/checkouts; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && { cd /tmp; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "cd /tmp; { cd /Users/ardud/checkouts; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; { export AGENT_GUARD_APPROVED=owner-approved; } | cat; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; { export AGENT_GUARD_APPROVED=owner-approved; } | cat; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; } | cat & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } | cat & rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ rg --files; } | cat",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; rg --files; } | cat",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; } | rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "printf hi | { true; rg foo; }",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "printf hi | (true; rg foo)",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ printf hi; } | rg foo",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; } |\ncat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } |\ncat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "cd /tmp &&\n{ cd /Users/ardud/checkouts; } | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "cd /tmp &&\n{ cd /Users/ardud/checkouts; } | cat & rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; }; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ export AGENT_GUARD_APPROVED=owner-approved; }; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline boundary control"
+  },
+  {
+    "command": "{ cd /tmp; } |& cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "{ cd /tmp; } 2>&1 | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } |& cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "{ cd /Users/ardud/checkouts; } 2>&1 | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "{ export AGENT_GUARD_APPROVED=owner-approved; } |& cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "{ export AGENT_GUARD_APPROVED=owner-approved; } 2>&1 | cat; rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "stderr pipeline"
+  },
+  {
+    "command": "printf hi | sh -c 'rg foo'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | sh -c 'true; rg foo'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | sh -c 'rg --files'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | bash -c 'rg foo'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | bash -c 'true; rg foo'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null,
+    "case_class": "pipeline shell stdin"
+  },
+  {
+    "command": "printf hi | bash -c 'rg --files'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts",
+    "case_class": "pipeline shell stdin"
   }
 ]

@@ -164,7 +164,7 @@ def _tokens(source):
     tokens = []
     for word in lexer:
         if re.fullmatch(r"[;&|()<>\n]+", word):
-            tokens.extend(re.findall(r"&&|\|\||<<<|<<|>>|<&|>&|<>|[;&|(){}<>\n]", word))
+            tokens.extend(re.findall(r"&&|\|\||\|&|<<<|<<|>>|<&|>&|<>|[;&|(){}<>\n]", word))
             continue
         for key, value in quoted.items():
             word = word.replace(key, "\0literal:" + value if re.fullmatch(r"[;&|(){}<>\n]+", value) else value)
@@ -172,7 +172,7 @@ def _tokens(source):
     return tokens
 
 
-def classify(command, cwd, *, approved=None, home=None, _depth=0):
+def classify(command, cwd, *, approved=None, home=None, _depth=0, _stdin=False):
     """Return only a proven prohibited root. Never execute shell expansions."""
     if _depth > 8 or not isinstance(command, str):
         return None
@@ -241,7 +241,7 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0):
         if tool in {"sh", "bash", "zsh"}:
             for i, arg in enumerate(args):
                 if arg.startswith("-") and "c" in arg and "n" not in arg and i + 1 < len(args):
-                    return classify(args[i + 1].replace("\0dollar", "$").replace("\0tilde", "~"), directory, approved=local_approved, home=home, _depth=_depth + 1), directory, approved
+                    return classify(args[i + 1].replace("\0dollar", "$").replace("\0tilde", "~"), directory, approved=local_approved, home=home, _depth=_depth + 1, _stdin=stdin), directory, approved
             return None, directory, approved
         search_directory = directory
         if tool == "git":
@@ -281,39 +281,54 @@ def classify(command, cwd, *, approved=None, home=None, _depth=0):
                 return path, directory, approved
         return None, directory, approved
 
-    piped, pipeline = False, None
+    piped, inherited_stdin, pipeline = False, _stdin, None
     # An async AND/OR list runs in a child shell. Its checkpoint precedes the
     # whole list, not just the last command immediately before '&'.
-    list_state = (directory, approved)
+    list_state = stage_state = (directory, approved)
+    previous_separator = None
     for token in [*tokens, ";"]:
+        if token == "\n" and not words and previous_separator in {"|", "|&", "&&", "||"}:
+            continue
         # A brace after a command name is an argument, as in `echo { ... }`.
         if token in {"{", "}"} and words and not all(word in {"then", "do", "else"} for word in words):
             words.append(token)
             continue
-        if token in {";", "&&", "||", "|", "&", "\n", "(", ")", "{", "}"}:
-            previous = (directory, approved)
-            hit, directory, approved = inspect(words, directory, approved, piped)
+        if token in {";", "&&", "||", "|", "|&", "&", "\n", "(", ")", "{", "}"}:
+            hit, directory, approved = inspect(words, directory, approved, piped or inherited_stdin)
             if hit:
                 return hit
             words = []
-            if token == "|":
-                pipeline = pipeline or previous
+            previous_separator = token
+            if token in {"(", "{"}:
+                # A compound command is one pipeline stage. Its body has its
+                # own lists/pipelines; keep the outer stage's entry checkpoint.
+                scopes.append((token, directory, approved, list_state, stage_state,
+                               pipeline, piped, inherited_stdin))
+                inherited_stdin = inherited_stdin or piped
+                piped, pipeline = False, None
+                list_state = stage_state = (directory, approved)
+                continue
+            if token in {"|", "|&"}:
+                pipeline = pipeline or stage_state
                 directory, approved = pipeline
-            elif pipeline:
+                stage_state = pipeline
+                piped = True
+                continue
+            if pipeline:
                 directory, approved = pipeline
                 pipeline = None
-            piped = token == "|"
+            piped = False
             if token == "&":
                 directory, approved = list_state
-            elif token in {";", "\n"}:
-                list_state = (directory, approved)
-            elif token in {"(", "{"}:
-                scopes.append((token, directory, approved, list_state))
-                list_state = (directory, approved)
-            elif token in {")", "}"} and scopes:
-                opening, parent_directory, parent_approved, list_state = scopes.pop()
+            if token in {")", "}"} and scopes:
+                (opening, parent_directory, parent_approved, list_state, stage_state,
+                 pipeline, piped, inherited_stdin) = scopes.pop()
                 if opening == "(":
                     directory, approved = parent_directory, parent_approved
+            else:
+                stage_state = (directory, approved)
+                if token in {";", "\n", "&"}:
+                    list_state = stage_state
         else:
             words.append(token)
     return None
