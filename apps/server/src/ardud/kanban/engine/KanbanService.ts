@@ -58,6 +58,7 @@ import {
 } from "@t3tools/contracts";
 import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -916,7 +917,7 @@ const clampPriority = (value: number | undefined, fallback: number) => {
 };
 
 const linkKind = (url: string): KanbanLink["kind"] => {
-  if (/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url)) return "pr";
+  if (parseChangeRequestUrl(url) !== null) return "pr";
   if (/linear\.app\//.test(url)) return "linear";
   return "url";
 };
@@ -2438,9 +2439,9 @@ const make = Effect.gen(function* () {
     if (links.length !== card.links.length) changed = true;
     links = links.map((link) => {
       const pr = view.prs.find((candidate) => candidate.url === link.url);
-      if (!pr || link.state === pr.state) return link;
+      if (!pr || (link.state === pr.state && link.kind === "pr")) return link;
       changed = true;
-      return { ...link, state: pr.state, checkedAt: at };
+      return { ...link, kind: "pr" as const, state: pr.state, checkedAt: at };
     });
     if (!changed) return card;
     if (canSave && !(yield* canSave())) return card;
