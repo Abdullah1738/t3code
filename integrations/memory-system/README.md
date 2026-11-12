@@ -262,3 +262,4 @@ MCP/Starlette dependencies.
 
 Deploy: `integrations/deploy.zsh memory-system`, then
 `launchctl kickstart -k gui/$(id -u)/com.abdullah.recall`.
+The deploy installs `~/.local/bin/recall` from `scripts/recall`, so cutovers must not leave a hand-edited stub; redeploy instead.
