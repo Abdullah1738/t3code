@@ -1,0 +1,839 @@
+[
+  {
+    "command": "rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md -g '*card-1439*'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "cat /tmp/SKILL.md && rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files -g AGENTS.md -g !tmp -g !node_modules /Users/ardud/checkouts /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "grep -rl needle /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "find /Volumes/ExternalSSD/board-wt -name x",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files ~/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "find ~ -name AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "cd /Users/ardud/checkouts && rg foo",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "fd x /Volumes/ExternalSSD/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "grep -R needle /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "grep --recursive -e needle /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "find /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "fd x /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "ag foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "ack foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "git grep --no-index foo -- /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/./",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files /Users/ardud/checkouts/x/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "grep -R needle /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "grep --recursive -e needle /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "find /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "fd x /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "ag foo /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "ack foo /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "git grep --no-index foo -- /Volumes/ExternalSSD/board-wt",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/board-wt/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/board-wt/./",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/board-wt/x/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD/board-wt"
+  },
+  {
+    "command": "rg foo /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "grep -R needle /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "grep --recursive -e needle /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "find /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "fd x /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "ag foo /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "ack foo /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "git grep --no-index foo -- /Volumes/ExternalSSD",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/./",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg --files /Volumes/ExternalSSD/x/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Volumes/ExternalSSD"
+  },
+  {
+    "command": "rg foo /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "rg --files /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "grep -R needle /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "grep --recursive -e needle /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "find /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "fd x /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "ag foo /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "ack foo /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "git grep --no-index foo -- /Users/ardud",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "rg --files /Users/ardud/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "rg --files /Users/ardud/./",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "rg --files /Users/ardud/x/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud"
+  },
+  {
+    "command": "rg foo /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "rg --files /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "grep -R needle /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "grep --recursive -e needle /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "find /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "fd x /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "ag foo /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "ack foo /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "git grep --no-index foo -- /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "rg --files /",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "rg --files /./",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "rg --files /x/..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/"
+  },
+  {
+    "command": "rg --files \"$HOME/checkouts/\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files ${HOME}/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo ../",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg -e foo ..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "/opt/homebrew/bin/rg --files ..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "command rg --files ..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "env X=1 rg --files ..",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo /Users/ardud/checkouts/task-1",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files -g AGENTS.md /Users/ardud/checkouts/task-1",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "echo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "ls /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "ovnfs ls",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg '/Users/ardud/checkouts' src/",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "git -C /Users/ardud/checkouts/x grep foo",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "grep needle /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "grep -l /Users/ardud/checkouts src/a",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg -g '/Users/ardud/checkouts' foo src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --glob=/Users/ardud/checkouts foo src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg -e /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --regexp /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg -f /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg foo src --replace /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files --ignore-file /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "find src -name /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "fd /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "ag /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "ack /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "git grep --no-index /Users/ardud/checkouts -- src",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "echo \"rg --files /Users/ardud/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "echo \"a; rg foo /Users/ardud/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "printf \"%s\" \"/Users/ardud/checkouts\"",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "cat <<'EOF'\nrg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md\nEOF",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "cat <<EOF\nrg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md\nEOF",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "python3 - <<'PY'\nprint(\"rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md\")\nPY",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files '$HOME/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files \\$HOME/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files '~/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg foo /Users/ardud/checkouts-other",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files /Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "echo ok # rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "AGENT_GUARD_APPROVED=owner-approved rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "env AGENT_GUARD_APPROVED=owner-approved rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "export AGENT_GUARD_APPROVED=owner-approved; rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "rg --files --hidden tmp /Users/ardud/CrpkoArchitectureBroker/tmp /Volumes/ExternalSSD/board-wt /Users/ardud/checkouts -g '*PACKET-code*' -g 'facts-nov10.json' -g AGENTS.md",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null,
+    "approved": "owner-approved"
+  },
+  {
+    "command": "AGENT_GUARD_APPROVED=owner-approved echo ok; rg foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "env -u AGENT_GUARD_APPROVED rg foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts",
+    "approved": "owner-approved"
+  },
+  {
+    "command": "rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "cd /tmp && rg foo",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "(cd /Users/ardud/checkouts && rg foo)",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "(cd /tmp); rg foo",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "bash -lc 'rg --files /Users/ardud/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "bash -nc 'rg --files /Users/ardud/checkouts'",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": null
+  },
+  {
+    "command": "git -C /Users/ardud/checkouts grep --no-index foo",
+    "cwd": "/Users/ardud/checkouts/task-1",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -b /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -e /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -e/Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg --regexp=/Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -g /Users/ardud/checkouts foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -g!tmp foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg --glob /Users/ardud/checkouts foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg --files src -g /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg ';' src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg \"|\" src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "echo hi | rg foo",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg foo < /tmp/file",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "cd /Users/ardud/checkouts | cat; rg foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "cat <<'A' <<'B'\nrg --files /\nA\nfind ~\nB",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "ag -G /Users/ardud/checkouts foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "ag -g /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "fd -E /Users/ardud/checkouts foo src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "find src -path /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "grep -r -e /Users/ardud/checkouts src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "git grep --no-index -e /Users/ardud/checkouts -- src",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg -n foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg -b foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "grep -rd recurse foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "grep -d recurse foo /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "fd -g x /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "if true; then rg --files /Users/ardud/checkouts; fi",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo /Users/ardud/checkouts 2>/tmp/err",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo /Users/ardud/checkouts > /tmp/out",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "echo hi | rg --files",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "bash -lc 'rg --files ~/checkouts'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "bash -lc 'rg --files \"$HOME/checkouts\"'",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg --files //Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "git -C /Users/ardud/checkouts grep foo; rg foo",
+    "cwd": "/tmp",
+    "root": null
+  },
+  {
+    "command": "{ cd /tmp; }; rg foo",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg foo <<< \"/Users/ardud/checkouts\"",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg foo src > /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg foo src 2>&1",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "AGENT_GUARD_APPROVED=owner-approved; rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "env AGENT_GUARD_APPROVED=owner-approved; rg --files /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  },
+  {
+    "command": "rg foo src --iglob /Users/ardud/checkouts",
+    "cwd": "/Users/ardud/checkouts",
+    "root": null
+  },
+  {
+    "command": "rg --files -- \"/Users/ardud/checkouts\"",
+    "cwd": "/Users/ardud/checkouts",
+    "root": "/Users/ardud/checkouts"
+  }
+]
