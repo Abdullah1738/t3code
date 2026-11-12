@@ -42,7 +42,8 @@ with `offbox wait <run>`.
 existed to save boat.dev minutes. `OFFBOX_LOCAL_FIRST` no longer does anything. A narrow check the gate allows can
 still be run directly on the Mac without offbox; that is your choice, not a cost rule.
 
-Heavy = `go test` (multi-package or no `-run`), `pytest` on a dir or with `-n`, `jest`/`vitest` (whole suite),
+Heavy = `go test` (multi-package or no `-run`), `pytest` with no named file, on a dir, with a glob/brace expansion
+or `$VAR`/`$(...)`, or with `-n`; `jest`/`vitest`/`bun test`/`vp test` without 1-3 named files,
 `npm ci`/`npm install`/`pnpm install`/`yarn install`, `docker run/build/compose up`, testcontainers, `gradlew`,
 `cargo build/test`, `make test`, `forge test`/anvil. In review/worktree clones (`/tmp`, `$TMPDIR`, `coord-wt`,
 `crw` work dirs) also `go build`/`go vet` of `./...` or 4+ packages, project-wide `tsc`, `eslint .` and
@@ -52,7 +53,8 @@ imports from the module) never mentions testcontainers. The harness template's F
 compose project (`platform`).
 
 **Stays local** (don't wrap): `xcodebuild`, `adb`/`ph`, mitmproxy, Dia, `terraform` (AWS creds), `git`, and
-narrow single tests: `go test -run TestX ./pkg`, `jest path/file.test.ts`, `pytest path::test`. Wrap a narrow
+narrow tests: `go test -run TestX ./pkg`, `jest path/file.test.ts` (up to 3 files), `pytest a.py b.py::test_x`
+(any number of named files), and `--version`/`--help` calls or `command -v` lookups. Wrap a narrow
 test only when it needs Docker or Linux (testcontainers, e.g. rewards' Postgres conftest; a container an earlier
 box step started). Small scripts over local files (`python3 -c`, `node -e`, parsing a log you have here) belong
 on the Mac, not on a box.
