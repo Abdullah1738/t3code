@@ -98,7 +98,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if a run on the box started a container in
   the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
   counts) or half the hourly/daily start allowance is used, 60 min once 75% of the daily allowance is used or during a start
-  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). When a run's client dies,
+  cooldown (stopped = free; boat keeps the disk 14 days after the stop, then deletes it). When a run ends after its client dies,
   the reaper brings the box back to its idle window instead of the 30-min run ttl. A resume takes ~6-10 s. Resuming that box keeps everything
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
@@ -156,6 +156,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
+The reaper refreshes the box's deadline while the remote run is confirmed live, even if its starting client is gone, for up to 6 hours from run start.
 `offbox wait` / `logs --follow` on a run whose own `offbox run` is still following it waits for that run to record
 its end and returns its code. If the box says the process ended but that `offbox run` still hasn't recorded it a
 minute later (30 min with `--pull`), wait returns the box's exit code and says the other client looks stuck.
@@ -308,7 +309,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
 - Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
 - A bg run that settled while nobody followed it gets its log completed from boat's history the next time you run `offbox logs` or `offbox wait`; if that fails, offbox says the output is incomplete.
-- For a run that is still going, plain `offbox logs` shows only what was last pulled: use `offbox logs --follow` or `offbox wait --timeout` to see current output.
+- For a run that is still going, plain `offbox logs` fetches and saves the available output when no follower owns the box; use `offbox logs --follow` or `offbox wait --timeout` to keep following it.
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:
   `~/.config/opencode/skills/remote-compute/scripts/offbox.py` + `offbox_lib/`. Template recipes: `templates/`.
   Rebuild one: `offbox template build crpko-go` (keeps the old one until the new one is ready). `offbox template
