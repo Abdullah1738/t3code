@@ -1,3 +1,5 @@
+import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -10,6 +12,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 
 import * as CodexClient from "./client.ts";
+import * as CodexError from "./errors.ts";
+import { boundStderrTail } from "./_internal/stdio.ts";
 
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/codex-app-server-mock-peer.ts"),
@@ -238,4 +242,99 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       );
     }),
   );
+  it.effect("redacts credentials Codex prints as JSON or key=value before keeping them", () =>
+    Effect.gen(function* () {
+      const { failure } = yield* exitDuringResume({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR: [
+          'request body {"api_key":"dummy-api-key","access_token":"dummy-access-token"}',
+          "retrying with refresh_token=dummy-refresh password: dummy-password",
+          "GET https://user:dummy-pass@example.test/v1?token=dummy-query-token failed",
+          'fatal: {"client_secret": "dummy-client-secret"}',
+          "",
+        ].join("\n"),
+      });
+      const rendered = `${failure.message}\n${JSON.stringify(failure)}\n${Cause.pretty(Cause.fail(failure))}`;
+      for (const secret of [
+        "dummy-api-key",
+        "dummy-access-token",
+        "dummy-refresh",
+        "dummy-password",
+        "dummy-pass",
+        "dummy-query-token",
+        "dummy-client-secret",
+      ]) {
+        assert.notInclude(rendered, secret);
+      }
+      assert.include(failure.message, '{"client_secret": "[redacted]"}');
+    }),
+  );
+
+  it.effect("recognises a usage-limit exit only from Codex's last stderr line", () =>
+    Effect.gen(function* () {
+      const limited = yield* exitDuringResume({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR:
+          "starting\nYou've hit your usage limit. Upgrade to Pro or try again at Nov 16th, 2026 9:47 AM.\n",
+      });
+      if (limited.failure._tag !== "CodexAppServerProcessExitedError") {
+        return assert.fail(`unexpected ${limited.failure._tag}`);
+      }
+      assert.deepEqual(limited.failure.providerUsageLimit, {
+        resetAt: DateTime.formatIso(DateTime.makeUnsafe(Date.parse("2026-11-16T09:47:00"))),
+      });
+
+      const earlier = yield* exitDuringResume({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR:
+          "You've hit your usage limit. Try again later.\nfatal: state db is locked\n",
+      });
+      if (earlier.failure._tag !== "CodexAppServerProcessExitedError") {
+        return assert.fail(`unexpected ${earlier.failure._tag}`);
+      }
+      assert.isUndefined(earlier.failure.providerUsageLimit);
+    }),
+  );
 });
+
+it.each([
+  ['{"api_key":"S1"}', '{"api_key":"[redacted]"}'],
+  ["{'password': 'S1'}", "{'password': '[redacted]'}"],
+  ['{"refresh_token" : "S1"}', '{"refresh_token" : "[redacted]"}'],
+  ["access_token=S1&x=1", "access_token=[redacted]&x=1"],
+  ["client_secret: S1", "client_secret: [redacted]"],
+  ["Authorization: Bearer S1", "Authorization: [redacted] [redacted]"],
+  ["x-api-key: S1", "x-api-key: [redacted]"],
+  ["token='S1'", "token=[redacted]"],
+  ["see https://u:S1@host.test/p", "see https://host.test/p"],
+  ["GET https://host.test/p?key=S1#frag", "GET https://host.test/p#frag"],
+  ["key sk-S1abcdefghij", "key [redacted]"],
+  ["fatal: database is locked", "fatal: database is locked"],
+])("redacts %s from the stderr tail", (line, expected) => {
+  assert.equal(boundStderrTail(line), expected);
+});
+
+it.each([
+  ["You've hit your usage limit. Try again at Nov 16th, 2026 9:47 AM.", "2026-11-16T09:47:00"],
+  [
+    "You’ve hit your usage limit. try again after November 3rd, 2026 10:05 PM",
+    "2026-11-03T22:05:00",
+  ],
+  ["error: Usage limit reached", null],
+  ["stream error: usageLimitExceeded", null],
+  ["You've hit your usage limit. Try again at someday.", null],
+])("reads %s as a usage-limit exit", (line, localReset) => {
+  const error = new CodexError.CodexAppServerProcessExitedError({
+    code: 1,
+    stderrTail: `boot\n${line}\n`,
+  });
+  assert.deepEqual(error.providerUsageLimit, {
+    resetAt:
+      localReset === null ? null : DateTime.formatIso(DateTime.makeUnsafe(Date.parse(localReset))),
+  });
+});
+
+it.each(["usage limit is 80% used", "fatal: database is locked", ""])(
+  "does not read %j as a usage-limit exit",
+  (line) => {
+    const error = new CodexError.CodexAppServerProcessExitedError({ code: 0, stderrTail: line });
+    assert.isUndefined(error.providerUsageLimit);
+  },
+);

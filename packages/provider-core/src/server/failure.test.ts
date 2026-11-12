@@ -292,3 +292,32 @@ it("names a provider process exit inside or outside a failure category", () => {
     assert.equal(makeProviderFailure({ cause }).message, expected);
   }
 });
+
+it("classifies a provider usage limit anywhere in the cause chain over a generic class", () => {
+  const limitedExit = {
+    _tag: "CodexAppServerProcessExitedError",
+    message: "Codex App Server process 7 exited with code 1: You've hit your usage limit.",
+    providerUsageLimit: { resetAt: "2026-11-16T05:47:00.000Z" },
+  };
+  for (const cause of [
+    { _tag: "ProviderAdapterEventStreamError", cause: limitedExit },
+    { _tag: "ProviderAdapterEnsureThreadError", cause: Cause.fail(limitedExit) },
+  ]) {
+    const failure = makeProviderFailure({ cause, class: "provider_error" });
+    assert.equal(failure.class, "usage_limit");
+    assert.equal(failure.resetAt, "2026-11-16T05:47:00.000Z");
+  }
+  const unknownReset = makeProviderFailure({
+    cause: { ...limitedExit, providerUsageLimit: { resetAt: null } },
+    class: "provider_error",
+  });
+  assert.equal(unknownReset.class, "usage_limit");
+  assert.isUndefined(unknownReset.resetAt);
+  assert.equal(
+    makeProviderFailure({
+      cause: { _tag: "X", providerUsageLimit: "yes" },
+      class: "provider_error",
+    }).class,
+    "provider_error",
+  );
+});

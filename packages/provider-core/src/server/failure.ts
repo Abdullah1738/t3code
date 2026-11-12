@@ -124,6 +124,31 @@ function causeMessage(cause: unknown): string | undefined {
     : `${category.summary}. ${category.guidance}`;
 }
 
+// Errors expose `providerUsageLimit` when they reliably identify a provider
+// usage limit (e.g. Codex exiting with its limit notice), whatever wraps them.
+function usageLimitInCause(cause: unknown): { readonly resetAt: string | null } | undefined {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
+    seen.add(cause);
+    try {
+      if (Cause.isCause(cause)) {
+        cause = Cause.squash(cause);
+        continue;
+      }
+      if (typeof cause !== "object") return undefined;
+      const usageLimit = (cause as Record<string, unknown>).providerUsageLimit;
+      if (typeof usageLimit === "object" && usageLimit !== null) {
+        const resetAt = (usageLimit as Record<string, unknown>).resetAt;
+        return { resetAt: typeof resetAt === "string" ? resetAt : null };
+      }
+      cause = (cause as Record<string, unknown>).cause;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function stringField(value: unknown, key: "message" | "code"): string | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   try {
@@ -203,22 +228,23 @@ export function makeProviderFailure(input: {
 }): OrchestrationV2ProviderFailure {
   const rawMessage = input.message ?? causeMessage(input.cause) ?? DEFAULT_PROVIDER_FAILURE_MESSAGE;
   const message = boundedText(rawMessage, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  const usageLimit = usageLimitInCause(input.cause);
+  const failureClass = usageLimit === undefined ? (input.class ?? "unknown") : "usage_limit";
+  const resetAt = input.resetAt ?? usageLimit?.resetAt;
   const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
 
   return {
-    class: input.class ?? "unknown",
+    class: failureClass,
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
     // Only producers that classify a category set it. Others keep the record shape they
     // always had, so OpenCode and Pi failures serialize exactly as before.
     ...(input.category === undefined ? {} : { category: input.category }),
-    ...(input.class === "usage_limit" &&
-    input.resetAt != null &&
-    Number.isFinite(Date.parse(input.resetAt))
-      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(input.resetAt)) }
+    ...(failureClass === "usage_limit" && resetAt != null && Number.isFinite(Date.parse(resetAt))
+      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(resetAt)) }
       : {}),
   };
 }

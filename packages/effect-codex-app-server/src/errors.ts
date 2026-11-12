@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import type * as SchemaIssue from "effect/SchemaIssue";
 
@@ -163,6 +164,29 @@ export class CodexAppServerProcessExitedError extends Schema.TaggedError<CodexAp
     const line = lastMeaningfulStderrLine(this.stderrTail);
     return line === undefined ? `${base} (no stderr output)` : `${base}: ${line}`;
   }
+
+  /**
+   * Set when Codex's last words were its usage-limit notice; failure
+   * classification reads it to report a usage limit with its reset time.
+   */
+  get providerUsageLimit(): { readonly resetAt: string | null } | undefined {
+    const line =
+      this.stderrTail === undefined ? undefined : lastMeaningfulStderrLine(this.stderrTail);
+    if (line === undefined || !USAGE_LIMIT_PATTERN.test(line)) return undefined;
+    return { resetAt: usageLimitResetAt(line) };
+  }
+}
+
+const USAGE_LIMIT_PATTERN =
+  /you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded)|\busageLimitExceeded\b/i;
+const RETRY_AT_PATTERN = /try again (?:at|after) (.+?)\.?$/i;
+
+// Codex prints the reset in this machine's local time, e.g. "Nov 16th, 2026 9:47 AM".
+function usageLimitResetAt(line: string): string | null {
+  const when = RETRY_AT_PATTERN.exec(line)?.[1]?.replace(/(\d+)(?:st|nd|rd|th)\b/gi, "$1");
+  if (when === undefined) return null;
+  const resetMs = Date.parse(when);
+  return Number.isFinite(resetMs) ? DateTime.formatIso(DateTime.makeUnsafe(resetMs)) : null;
 }
 
 const MAX_STDERR_LINE_CHARS = 300;

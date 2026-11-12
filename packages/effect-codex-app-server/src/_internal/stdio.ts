@@ -57,23 +57,36 @@ export const appendStderrTail = (current: string, chunk: string): string => {
   return next.length <= STDERR_TAIL_MAX_CHARS ? next : next.slice(-STDERR_TAIL_MAX_CHARS);
 };
 
-const BEARER_TOKEN_PATTERN = /\bBearer\s+[A-Za-z0-9._\-+=/]+/gi;
-const AUTHORIZATION_HEADER_PATTERN = /\bAuthorization:\s*\S+(?:\s+\S+)?/gi;
-const API_KEY_HEADER_PATTERN = /\b(?:x-api-key|api[-_]?key)\s*[:=]\s*\S+/gi;
+const CREDENTIAL_KEY =
+  "(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization|credential|password|passwd|secret|token)";
+const QUOTED_CREDENTIAL_PATTERN = new RegExp(
+  `(["']${CREDENTIAL_KEY}["']\\s*:\\s*["'])[^"']*(["'])`,
+  "gi",
+);
+const ASSIGNED_CREDENTIAL_PATTERN = new RegExp(
+  `(\\b${CREDENTIAL_KEY}\\b\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;&"']+)`,
+  "gi",
+);
+const BEARER_TOKEN_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._\-+=/]+/gi;
+const URL_USERINFO_PATTERN = /\b(https?:\/\/)[^\s/@]+@/gi;
+const URL_QUERY_PATTERN = /\b(https?:\/\/[^\s?#]+)\?[^\s#]*/gi;
 const SECRET_TOKEN_PATTERN =
   /\b(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{7,}|ghp_[A-Za-z0-9]+|xox[a-zA-Z]-[A-Za-z0-9-]+)\b/g;
 
-// The tail ends up in run failures that agents and boards read, so it keeps
-// only the last lines and drops credentials Codex may echo from HTTP errors.
+// The tail reaches run failures and persisted session errors (rendered with
+// Cause.pretty, which skips later failure redaction), so it keeps only the last
+// lines and drops credentials Codex may echo from HTTP errors or config.
 export const boundStderrTail = (tail: string): string =>
   tail
     .replaceAll("\0", "")
     .split("\n")
     .slice(-STDERR_TAIL_MAX_LINES)
     .join("\n")
-    .replace(AUTHORIZATION_HEADER_PATTERN, "Authorization: [redacted]")
-    .replace(BEARER_TOKEN_PATTERN, "Bearer [redacted]")
-    .replace(API_KEY_HEADER_PATTERN, "api-key: [redacted]")
+    .replace(QUOTED_CREDENTIAL_PATTERN, "$1[redacted]$2")
+    .replace(BEARER_TOKEN_PATTERN, "$1 [redacted]")
+    .replace(ASSIGNED_CREDENTIAL_PATTERN, "$1[redacted]")
+    .replace(URL_USERINFO_PATTERN, "$1")
+    .replace(URL_QUERY_PATTERN, "$1")
     .replace(SECRET_TOKEN_PATTERN, "[redacted]");
 
 export const makeTerminationError = (
