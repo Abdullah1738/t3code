@@ -2977,7 +2977,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 
   const makeWakeHarnessWithOptions = (options?: {
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
-    readonly interrupt?: Effect.Effect<void>;
+    readonly interrupt?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
+    readonly offer?: (
+      message: SDKUserMessage,
+    ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly stopTask?: (
       taskId: string,
     ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
@@ -3096,7 +3099,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 offer: (message) =>
                   Effect.sync(() => {
                     offeredMessages.push(message);
-                  }),
+                  }).pipe(Effect.andThen(options?.offer?.(message) ?? Effect.void)),
                 setModel: (model) =>
                   Effect.sync(() => {
                     liveSelectionChanges.push({ model });
@@ -3197,6 +3200,205 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect(
+    "stops only the matching attached Claude attempt while prompt delivery is pending",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const offered = yield* Deferred.make<void>();
+          let closed = false;
+          const harness = yield* makeWakeHarnessWithOptions({
+            offer: () => Deferred.succeed(offered, undefined).pipe(Effect.andThen(Effect.never)),
+            close: (queue) =>
+              Effect.sync(() => {
+                closed = true;
+              }).pipe(Effect.andThen(Queue.shutdown(queue))),
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("pending-offer"),
+            text: "Work",
+            attachments: [],
+          });
+          const start = yield* harness.runtime.startTurn(first).pipe(Effect.forkScoped);
+          yield* Deferred.await(offered);
+          assert.isDefined(harness.runtime.interruptStartingRun);
+          yield* harness.runtime.interruptStartingRun!({
+            providerThread: harness.providerThread,
+            runId: first.runId,
+            attemptId: RunAttemptId.make("different-attempt"),
+          });
+          assert.isFalse(closed);
+          yield* harness.runtime.interruptStartingRun!({
+            providerThread: harness.providerThread,
+            runId: first.runId,
+            attemptId: first.attemptId,
+          });
+          assert.isTrue(closed);
+          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
+          yield* Fiber.interrupt(start);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["hang", "reject", "success"] as const)(
+    "closes the captured Claude query when interrupt is %s and accepts the next turn",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          let closed = false;
+          const harness = yield* makeWakeHarnessWithOptions({
+            freshQueueOnReopen: true,
+            interrupt: Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(
+                mode === "hang"
+                  ? Effect.never
+                  : mode === "reject"
+                    ? Effect.fail(
+                        new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                          method: "interrupt",
+                          cause: "lost control response",
+                        }),
+                      )
+                    : Effect.void,
+              ),
+            ),
+            close: (queue) =>
+              Effect.sync(() => {
+                closed = true;
+              }).pipe(Effect.andThen(Queue.shutdown(queue))),
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("bounded-stop-old"),
+            text: "Work",
+            attachments: [],
+          });
+          yield* harness.runtime.startTurn(first);
+          const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${first.attemptId}`,
+          });
+          const stopped = yield* harness.runtime
+            .interruptTurn({ providerThread: harness.providerThread, providerTurnId })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(entered);
+          if (mode === "hang") {
+            assert.isFalse(closed);
+            yield* TestClock.adjust("10 seconds");
+            assert.isTrue(closed);
+          }
+          yield* Fiber.join(stopped);
+          assert.isTrue(closed);
+          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
+          yield* harness.runtime.startTurn({
+            ...first,
+            runId: RunId.make("bounded-stop-new"),
+            attemptId: RunAttemptId.make("bounded-stop-new"),
+            providerTurnOrdinal: 2,
+          });
+          assert.lengthOf(harness.offeredMessages, 2);
+          assert.lengthOf(harness.terminalEvents(), 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect(
+    "serializes a delayed Claude interrupt with the next start and preserves its live turn",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          const harness = yield* makeWakeHarnessWithOptions({
+            freshQueueOnReopen: true,
+            interrupt: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+            close: Queue.shutdown,
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("captured-stop-old"),
+            text: "Work",
+            attachments: [],
+          });
+          yield* harness.runtime.startTurn(first);
+          const ids = yield* IdAllocator.IdAllocatorV2;
+          const oldId = ids.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${first.attemptId}`,
+          });
+          const stop = yield* harness.runtime
+            .interruptTurn({ providerThread: harness.providerThread, providerTurnId: oldId })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(entered);
+          // The result may arrive while the control request is still waiting.
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "command_lifecycle",
+              command_uuid: harness.promptUuid(0),
+              state: "started",
+            }),
+          );
+          yield* harness.offerAndWait(
+            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000899", result: "Done" }),
+          );
+          yield* Queue.take(harness.terminalReceipts);
+          const second = {
+            ...first,
+            runId: RunId.make("captured-stop-new"),
+            attemptId: RunAttemptId.make("captured-stop-new"),
+            providerTurnOrdinal: 2,
+          };
+          const start = yield* harness.runtime.startTurn(second).pipe(Effect.forkScoped);
+          yield* TestClock.adjust("10 seconds");
+          yield* Fiber.join(stop);
+          yield* Fiber.join(start);
+          assert.lengthOf(harness.terminalEvents(), 1);
+          const refusal = yield* harness.runtime.startTurn(first).pipe(Effect.flip);
+          const cause = refusal.cause;
+          assert.isTrue(Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(cause));
+          if (!Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(cause))
+            throw new Error("Expected protocol refusal");
+          assert.equal(cause.reason, "previous_turn_active");
+          assert.equal(cause.activeTurn?.runId, second.runId);
+          assert.equal(cause.activeTurn?.attemptId, second.attemptId);
+          yield* harness.runtime.steerTurn({
+            threadId: harness.threadId,
+            runId: second.runId,
+            providerThread: harness.providerThread,
+            providerTurnId: ids.derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${second.attemptId}`,
+            }),
+            message: {
+              ...second.message,
+              messageId: MessageId.make("live-steer"),
+              text: "Keep going",
+            },
+          });
+          assert.lengthOf(harness.terminalEvents(), 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
 
   it.effect.each(["echo", "lifecycle"] as const)(
     "marks prompt acceptance only after matching native SDK %s evidence, not the local offer",
@@ -11561,7 +11763,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           .pipe(Effect.forkScoped);
         yield* Deferred.await(stopRequested);
 
-        yield* TestClock.adjust("2 minutes");
+        yield* TestClock.adjust("9 seconds");
         assert.lengthOf(harness.terminalEvents(), 1);
 
         yield* Deferred.succeed(releaseStop, undefined);

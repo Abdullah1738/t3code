@@ -25,6 +25,7 @@ import {
   PullRequestOperationError,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunId,
@@ -6605,6 +6606,150 @@ it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (
       assert.deepEqual(interrupted.providerTurns, []);
       assert.isFalse(yield* effectWorker.runOnce);
     }),
+  );
+
+  it.effect(
+    "stops an attached starting attempt before terminalizing a run with no provider turn projection",
+    () =>
+      Effect.gen(function* () {
+        const projects = yield* ProjectService.ProjectService;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+        const effectWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const projectId = ProjectId.make("runtime-layer-attached-interrupt-project");
+        const threadId = ThreadId.make("runtime-layer-attached-interrupt-thread");
+
+        yield* projects.create({
+          commandId: CommandId.make("runtime-layer-attached-interrupt-project-create"),
+          projectId,
+          title: "Pending interrupt project",
+          workspaceRoot: "/tmp/runtime-layer-attached-interrupt-project",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-layer-attached-interrupt-create"),
+          threadId,
+          projectId,
+          title: "Pending interrupt",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-layer-attached-interrupt-message"),
+          threadId,
+          messageId: MessageId.make("runtime-layer-attached-interrupt-message"),
+          text: "Do not reach the provider.",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+
+        const starting = yield* orchestrator.getThreadProjection(threadId);
+        const run = starting.runs[0];
+        assert.isDefined(run);
+        assert.equal(run.status, "starting");
+
+        const sink = yield* EventSink.EventSinkV2;
+        const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const providerThread = starting.providerThreads.find(
+          (thread) => thread.id === run.providerThreadId,
+        )!;
+        const attempt = starting.attempts.find((attempt) => attempt.id === run.activeAttemptId)!;
+        const at = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("attached-run-running"),
+              type: "run.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: at,
+              payload: { ...run, status: "running" },
+            },
+            {
+              id: EventId.make("attached-attempt-running"),
+              type: "run-attempt.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: at,
+              payload: { ...attempt, status: "running" },
+            },
+            {
+              id: EventId.make("attached-session-bound"),
+              type: "provider-thread.updated",
+              threadId,
+              runId: run.id,
+              occurredAt: at,
+              payload: {
+                ...providerThread,
+                providerSessionId: ProviderSessionId.make("attached-claude-session"),
+              },
+            },
+          ],
+        });
+        const stopping = yield* Deferred.make<void>();
+        const stopped = yield* Deferred.make<void>();
+        const stopStarting = vi.fn<
+          NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"]>
+        >((input) =>
+          Effect.gen(function* () {
+            assert.equal(input.runId, run.id);
+            assert.equal(input.attemptId, attempt.id);
+            yield* Deferred.succeed(stopping, undefined);
+            yield* Deferred.await(stopped);
+          }),
+        );
+        const spy = vi.spyOn(sessions, "get").mockReturnValue(
+          Effect.succeed(
+            Option.some({
+              interruptStartingRun: stopStarting,
+            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+          ),
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const interrupting = yield* threadManagement
+          .interruptThread({
+            projectId,
+            commandId: CommandId.make("runtime-layer-attached-interrupt-command"),
+            threadId,
+            runId: run.id,
+            reason: "Cancelled before provider start",
+          })
+          .pipe(Effect.forkScoped);
+        const milestone = yield* Effect.raceFirst(
+          Deferred.await(stopping).pipe(Effect.as("stopping")),
+          Fiber.join(interrupting).pipe(Effect.as("returned")),
+        );
+        assert.equal(milestone, "stopping");
+        const during = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(during.runs.find((candidate) => candidate.id === run.id)?.status, "running");
+        yield* Deferred.succeed(stopped, undefined);
+        const interrupt = yield* Fiber.join(interrupting);
+        assert.equal(stopStarting.mock.calls.length, 1);
+        assert.equal(interrupt.type, "interrupt_requested");
+
+        const interrupted = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(interrupted.runs[0]?.status, "interrupted");
+        assert.equal(interrupted.attempts[0]?.status, "interrupted");
+        assert.equal(
+          interrupted.nodes.find((node) => node.kind === "root_turn")?.status,
+          "interrupted",
+        );
+        assert.deepEqual(
+          interrupted.turnItems.filter((item) => item.runId === run.id).map((item) => item.type),
+          ["user_message", "run_interrupt_request", "run_interrupt_result"],
+        );
+        assert.deepEqual(interrupted.providerTurns, []);
+        assert.isFalse(yield* effectWorker.runOnce);
+      }),
   );
 });
 

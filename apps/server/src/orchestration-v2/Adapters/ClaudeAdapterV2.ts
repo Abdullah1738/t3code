@@ -557,6 +557,10 @@ export interface ClaudeAgentSdkSubagentLookupInput {
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
 }
 
+// The CLI can stop answering control requests while still running tools. Close it
+// after this bound so orchestration can safely end the run and accept another.
+const CLAUDE_INTERRUPT_SETTLE_TIMEOUT = "10 seconds";
+
 const isClaudeAgentSdkQueryRunnerError = Schema.is(ClaudeAgentSdkQueryRunnerError);
 const isProviderAdapterRuntimeRequestResponseError = Schema.is(
   ProviderAdapter.ProviderAdapterRuntimeRequestResponseError,
@@ -4006,6 +4010,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             );
           });
         const sdkMessageLock = yield* Semaphore.make(1);
+        const turnControlLock = yield* Semaphore.make(1);
         // Survives turn settle: members mostly finish after the launching
         // turn has ended, and each transition must be emitted exactly once.
         const workflowMemberStates = yield* Ref.make(
@@ -9707,6 +9712,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 driver: CLAUDE_PROVIDER,
                 detail: `Claude provider turn ${currentTurn.providerTurnId} is still active.`,
                 reason: "previous_turn_active",
+                activeTurn: {
+                  runId: currentTurn.input.runId,
+                  attemptId: currentTurn.input.attemptId,
+                  providerThreadId: currentTurn.input.providerThread.id,
+                  providerTurnId: currentTurn.providerTurnId,
+                },
               });
             }
             yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
@@ -9814,8 +9825,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (userMessage !== null) {
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);
-              yield* querySession.query.offer(userMessage);
-              return;
+              return querySession.query.offer(userMessage);
             }
             // Transcript reads suspend replay. Hold live SDK frames until the whole
             // buffer has been applied so starts, completions and the root result stay ordered.
@@ -9946,6 +9956,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           },
           (effect, turnInput) =>
             effect.pipe(
+              turnControlLock.withPermits(1),
+              // Release the control lock before waiting for prompt delivery so Stop
+              // can close a query whose offer never acknowledges.
+              Effect.flatMap((offer) => offer ?? Effect.void),
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterTurnStartError({
@@ -10000,8 +10014,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.add(turnInput.providerTurnId);
               return next;
             });
-            yield* existing.query.interrupt;
-            yield* existing.query.close.pipe(Effect.ignore);
+            existing.stopping = true;
+            yield* existing.query.interrupt.pipe(
+              Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.claude-interrupt-did-not-settle", {
+                  providerTurnId: currentTurn.providerTurnId,
+                  cause,
+                }),
+              ),
+            );
+            yield* existing.query.close;
             const closed = yield* Deferred.await(existing.closed).pipe(
               Effect.timeoutOption("10 seconds"),
             );
@@ -10022,7 +10045,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               existing.stopping = true;
               yield* finalizeActiveTurnAfterQueryExit(existing);
               yield* endSubagentCallsOfClosedQuery(existing.nativeThreadId, "interrupted");
-            } else {
+            } else if ((yield* Ref.get(activeTurn)) === currentTurn) {
               yield* finalizeActiveTurn({
                 context: currentTurn,
                 status: "interrupted",
@@ -10446,7 +10469,28 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ),
             );
           }),
-          interruptTurn,
+          interruptTurn: Effect.fn("ClaudeAdapterV2.interruptTurnControl")(function* (turnInput) {
+            if ((yield* Ref.get(activeTurn)) === null && turnInput.requestRuntimeRestart === true) {
+              return yield* interruptTurn(turnInput);
+            }
+            yield* turnControlLock.withPermits(1)(interruptTurn(turnInput));
+          }),
+          interruptStartingRun: Effect.fn("ClaudeAdapterV2.interruptStartingRun")(function* (
+            runInput,
+          ) {
+            const current = yield* Ref.get(activeTurn);
+            if (
+              current === null ||
+              current.input.runId !== runInput.runId ||
+              current.input.attemptId !== runInput.attemptId ||
+              current.input.providerThread.id !== runInput.providerThread.id
+            )
+              return;
+            yield* interruptTurn({
+              providerThread: runInput.providerThread,
+              providerTurnId: current.providerTurnId,
+            });
+          }, turnControlLock.withPermits(1)),
           stopSubagent: Effect.fn("ClaudeAdapterV2.stopSubagent")(function* (input) {
             const existing = yield* Ref.get(queryContext);
             const nativeThreadId = input.providerThread.nativeThreadRef?.nativeId;

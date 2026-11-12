@@ -1811,9 +1811,28 @@ export const layer: Layer.Layer<
               }),
             ))
           : input.session.startTurn(turnInput);
+        const stopStartingRun =
+          input.session
+            .interruptStartingRun?.({
+              providerThread: input.providerThread,
+              runId: input.run.id,
+              attemptId: input.attemptId,
+            })
+            ?.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new RunExecutionStartError({
+                    commandId: input.commandId,
+                    runId: input.run.id,
+                    cause,
+                  }),
+              ),
+            ) ?? Effect.void;
         yield* Effect.andThen(shouldStart, startTurn).pipe(
           // The event fiber is detached; an interrupted start must not leak it.
-          Effect.onInterrupt(() => Fiber.interrupt(providerEventFiber)),
+          Effect.onInterrupt(() =>
+            stopStartingRun.pipe(Effect.ensuring(Fiber.interrupt(providerEventFiber))),
+          ),
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
           Effect.tap(() =>
@@ -1823,52 +1842,55 @@ export const layer: Layer.Layer<
             ),
           ),
           Effect.catchCause((cause) =>
-            Effect.logError("orchestration V2 provider turn start failed", {
-              runId: input.run.id,
-              cause,
-            }).pipe(
-              Effect.andThen(Fiber.interrupt(providerEventFiber)),
-              Effect.andThen(Ref.get(latestProviderThread)),
-              Effect.flatMap((providerThread) =>
-                Ref.get(latestTurnItemOrdinal).pipe(
-                  Effect.flatMap((latestItemOrdinal) =>
-                    Ref.get(openRunOwnedSubagents).pipe(
-                      Effect.flatMap((openSubagents) =>
-                        writeFinalRunEvents({
-                          run: input.run,
-                          rootNode: input.rootNode,
-                          checkpointScope: input.checkpointScope,
-                          providerThread,
-                          attempt: input.attempt,
-                          writeIfRunCurrent: {
-                            activeAttemptId: input.attempt.id,
-                            expectedStatus: "running",
-                          },
-                          openRunOwnedSubagents: openSubagents,
-                          terminal: makeFailedTerminalEvent(
-                            makeProviderFailure({
-                              cause: Cause.squash(cause),
-                              class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+            Cause.hasInterruptsOnly(cause) && input.session.interruptStartingRun !== undefined
+              ? Effect.interrupt
+              : Effect.logError("orchestration V2 provider turn start failed", {
+                  runId: input.run.id,
+                  cause,
+                }).pipe(
+                  Effect.andThen(stopStartingRun),
+                  Effect.andThen(Fiber.interrupt(providerEventFiber)),
+                  Effect.andThen(Ref.get(latestProviderThread)),
+                  Effect.flatMap((providerThread) =>
+                    Ref.get(latestTurnItemOrdinal).pipe(
+                      Effect.flatMap((latestItemOrdinal) =>
+                        Ref.get(openRunOwnedSubagents).pipe(
+                          Effect.flatMap((openSubagents) =>
+                            writeFinalRunEvents({
+                              run: input.run,
+                              rootNode: input.rootNode,
+                              checkpointScope: input.checkpointScope,
+                              providerThread,
+                              attempt: input.attempt,
+                              writeIfRunCurrent: {
+                                activeAttemptId: input.attempt.id,
+                                expectedStatus: "running",
+                              },
+                              openRunOwnedSubagents: openSubagents,
+                              terminal: makeFailedTerminalEvent(
+                                makeProviderFailure({
+                                  cause: Cause.squash(cause),
+                                  class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+                                }),
+                                latestItemOrdinal + 1,
+                              ),
+                              failureItemPersisted: false,
+                              refreshAfterTurn,
                             }),
-                            latestItemOrdinal + 1,
                           ),
-                          failureItemPersisted: false,
-                          refreshAfterTurn,
-                        }),
+                        ),
                       ),
                     ),
                   ),
+                  Effect.mapError(
+                    (writeCause) =>
+                      new RunExecutionStartError({
+                        commandId: input.commandId,
+                        runId: input.run.id,
+                        cause: { start: cause, write: writeCause },
+                      }),
+                  ),
                 ),
-              ),
-              Effect.mapError(
-                (writeCause) =>
-                  new RunExecutionStartError({
-                    commandId: input.commandId,
-                    runId: input.run.id,
-                    cause: { start: cause, write: writeCause },
-                  }),
-              ),
-            ),
           ),
         );
       }),
