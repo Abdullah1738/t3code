@@ -269,6 +269,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
     pending_retries = set()
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
+    prune_checked = False
     mine = own_boxes(con, me)
 
     def before_grow(bid):
@@ -351,6 +352,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
             # Outside the pool lock: it asks boat about every detached run.
             _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
+        if not prune_checked:
+            # Before reserving a create slot, and outside the pool lock: a held warm box may be ready now.
+            _recheck_prune_holds(con, key)
+            prune_checked = True
         tried = set(unusable)
         stopped_tries = 0
         stopped_error = None
@@ -603,8 +608,6 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
-        if _recheck_prune_holds(con, key):
-            continue
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error
@@ -712,12 +715,19 @@ def try_warm(me, size, source, exclude, run_id):
 
 
 def _recheck_prune_holds(con, key) -> bool:
-    """SSH stays outside the pool lock; callers share a per-box 60 second probe throttle."""
-    from . import lease
-    rows = con.execute(f"SELECT h.box_id FROM prune_holds h JOIN leases l USING(box_id) WHERE l.repo_key=? AND {token_mine('l')}",
+    """At most two five-second probes before allocation; share the per-box throttle across callers."""
+    from . import prune
+    rows = con.execute(f"SELECT h.box_id, h.run_id FROM prune_holds h JOIN leases l USING(box_id) "
+                       f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state='running' "
+                       "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=l.box_id "
+                       "AND r.status IN ('starting','running')) ORDER BY l.last_used_at DESC",
                        (key,)).fetchall()
     released = False
+    deadline = time.monotonic() + 10
+    checks = 0
     for row in rows:
+        if checks >= 2 or time.monotonic() >= deadline:
+            break
         bid = row['box_id']
         try:
             with file_lock('prunecheck-' + bid, timeout=0):
@@ -726,7 +736,8 @@ def _recheck_prune_holds(con, key) -> bool:
                 if last is not None and now() - last < 60:
                     continue
                 kv_set(con, check_key, now())
-                released = lease.release_hold_if_worker_gone(con, bid) or released
+                checks += 1
+                released = prune.recheck(con, bid, row['run_id'], deadline - time.monotonic()) or released
         except OffboxError:
             pass
     return released
