@@ -355,7 +355,12 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
-  readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getThreadRecords: <K extends ProjectionRecordField>(
+    threadId: ThreadId,
+    fields: ReadonlyArray<K>,
+    filter?: ProjectionRecordFilter,
+    options?: { readonly projectionOnly: boolean },
+  ) => Effect.Effect<ProjectionRecords<K>, Orchestrator.OrchestratorV2Error>;
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -1481,8 +1486,8 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.getTurnItem(input)),
         Effect.map((item) => ({ item: item === null ? null : projectTurnItemForDetail(item) })),
       ),
-    getThreadRecords: (threadId, fields, filter) =>
-      ensureProjectionTranscript(threadId).pipe(
+    getThreadRecords: (threadId, fields, filter, options) =>
+      (options?.projectionOnly ? Effect.void : ensureProjectionTranscript(threadId)).pipe(
         Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
       ),
     getThreadProjection,

@@ -21,9 +21,13 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/process";
@@ -65,7 +69,7 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 );
 
 describe("OrchestratorMcpService", () => {
-  it.effect("retries terminal acknowledgement with a fresh command id", () =>
+  it.effect("returns task status while the acknowledgement command queue is blocked", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");
       const childThreadId = ThreadId.make("thread:mcp-ack-child");
@@ -73,6 +77,10 @@ describe("OrchestratorMcpService", () => {
       const taskId = NodeId.make("node:mcp-ack-task");
       const acknowledgementCommandIds = yield* Ref.make<ReadonlyArray<string>>([]);
       const acknowledgementAttempts = yield* Ref.make(0);
+      const commandQueued = yield* Deferred.make<void>();
+      const releaseQueue = yield* Deferred.make<void>();
+      const commandFailed = yield* Deferred.make<void>();
+      const commandRetried = yield* Deferred.make<void>();
       const parentProjection = {
         thread: { id: parentThreadId },
         runs: [],
@@ -118,6 +126,7 @@ describe("OrchestratorMcpService", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (threadId) =>
             Effect.succeed(
               threadId === parentThreadId
@@ -148,8 +157,14 @@ describe("OrchestratorMcpService", () => {
               Effect.andThen(Ref.updateAndGet(acknowledgementAttempts, (count) => count + 1)),
               Effect.flatMap((attempt) =>
                 attempt === 1
-                  ? Effect.fail(new Error("simulated acknowledgement failure") as never)
-                  : Effect.succeed({} as never),
+                  ? Deferred.succeed(commandQueued, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseQueue)),
+                      Effect.andThen(Deferred.succeed(commandFailed, undefined)),
+                      Effect.andThen(
+                        Effect.fail(new Error("simulated acknowledgement failure") as never),
+                      ),
+                    )
+                  : Deferred.succeed(commandRetried, undefined).pipe(Effect.as({} as never)),
               ),
             ),
         }),
@@ -183,10 +198,23 @@ describe("OrchestratorMcpService", () => {
         assert.isNull(pending.summary);
         assert.equal(yield* Ref.get(acknowledgementAttempts), 0);
         hasNestedWork = false;
-        const error = yield* service.taskStatus(scope, taskId).pipe(Effect.flip);
-        assert.equal(error.code, "orchestration_error");
-
+        const reading = yield* service.taskStatus(scope, taskId).pipe(
+          Effect.timeoutOption("1 second"), Effect.forkChild,
+        );
+        yield* Deferred.await(commandQueued);
+        yield* TestClock.adjust("1 second");
+        const observed = yield* Fiber.join(reading);
+        assert.isFalse(yield* Deferred.isDone(releaseQueue));
+        yield* Deferred.succeed(releaseQueue, undefined);
+        assert.isTrue(Option.isSome(observed), "status must return while the command queue is held");
+        if (Option.isNone(observed)) return;
+        assert.equal(observed.value.status, "completed");
+        assert.equal(observed.value.partial, false);
+        assert.isNull(observed.value.currentRunId);
+        assert.isNull(observed.value.currentRunStatus);
+        yield* Deferred.await(commandFailed);
         const result = yield* service.taskStatus(scope, taskId);
+        yield* Deferred.await(commandRetried);
         assert.equal(result.status, "completed");
         assert.equal(result.summary, "terminal result");
         assert.equal(result.latestTerminalRunId, childRunId);
@@ -196,6 +224,109 @@ describe("OrchestratorMcpService", () => {
         assert.notEqual(commandIds[0], commandIds[1]);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
+  );
+
+  it.effect.each(["caller", "parent", "controls", "result", "restart"] as const)(
+    "returns only available fields at the task_status deadline during %s read",
+    (blockedStage) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("thread:deadline-parent");
+        const childThreadId = ThreadId.make("thread:deadline-child");
+        const taskId = NodeId.make("node:deadline-task");
+        const blocked = yield* Deferred.make<void>();
+        const never = yield* Deferred.make<never>();
+        let reads = 0;
+        const wait = Deferred.succeed(blocked, undefined).pipe(
+          Effect.andThen(Deferred.await(never)),
+        );
+        const parent = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
+              threadId: parentThreadId,
+              origin: "app_owned",
+              childThreadId,
+              status: "running",
+              result: null,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const child = {
+          thread: { id: childThreadId },
+          runs: [
+            {
+              id: RunId.make("run:deadline"),
+              delegatedTaskId: taskId,
+              ordinal: 1,
+              status: "cancelled",
+            },
+          ],
+          messages: [],
+          contextTransfers: [],
+          subagents: [],
+          providerThreads: [],
+          runtimeRequests: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) =>
+              blockedStage === "caller" ? wait : Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (threadId, _fields, _filter, options) => {
+              assert.equal(options?.projectionOnly, true);
+              const stage = ++reads === 1 ? "parent" : reads === 2 ? "controls" : "result";
+              return stage === blockedStage
+                ? wait
+                : Effect.succeed(threadId === parentThreadId ? parent : child);
+            },
+            delegatedTaskResultPending: () =>
+              blockedStage === "restart" ? wait : Effect.succeed(false),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const scope: McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:deadline"),
+            requestNamespace: "deadline",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "deadline",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const read = yield* service.taskStatus(scope, taskId).pipe(Effect.forkChild);
+          yield* Deferred.await(blocked);
+          yield* TestClock.adjust("10 seconds");
+          const result = yield* Fiber.join(read);
+          assert.equal(result.partial, true);
+          assert.equal(result.taskId, taskId);
+          assert.equal(
+            result.childThreadId,
+            ["caller", "parent"].includes(blockedStage) ? undefined : childThreadId,
+          );
+          assert.equal(
+            result.latestTerminalStatus,
+            ["result", "restart"].includes(blockedStage) ? "cancelled" : undefined,
+          );
+          assert.isUndefined(result.status);
+          assert.isUndefined(result.summary);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
   );
 
   it.effect("reports a restart-cut child as working until its continuation settles", () =>
@@ -234,6 +365,7 @@ describe("OrchestratorMcpService", () => {
             delegatedTaskId: taskId,
           },
           { id: RunId.make("run:mcp-restart-later"), ordinal: 2, status: "running" },
+          { id: RunId.make("run:mcp-restart-queued"), ordinal: 3, status: "queued" },
         ],
         contextTransfers: [],
         messages: [],
@@ -245,6 +377,7 @@ describe("OrchestratorMcpService", () => {
       const layerDependencies = Layer.mergeAll(
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
           getThreadRecords: (threadId) =>
             Effect.succeed(threadId === parentThreadId ? parentProjection : childProjection),
           delegatedTaskResultPending: () =>
@@ -284,12 +417,16 @@ describe("OrchestratorMcpService", () => {
         const held = yield* service.taskStatus(scope, taskId);
         assert.equal(held.status, "running");
         assert.equal(held.workState, "working");
+        assert.equal(held.childRunId, RunId.make("run:mcp-restart-child"));
+        assert.equal(held.currentRunId, RunId.make("run:mcp-restart-later"));
+        assert.equal(held.currentRunStatus, "running");
+        assert.equal(held.latestTerminalStatus, "cancelled");
+        assert.equal(held.hasPendingChildRuns, true);
         assert.isNull(held.summary);
         assert.equal(yield* Ref.get(dispatched), 0);
         awaitsRestart = false;
         const settled = yield* service.taskStatus(scope, taskId);
         assert.equal(settled.status, "cancelled");
-        assert.equal(yield* Ref.get(dispatched), 1);
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
   );
@@ -1213,6 +1350,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const layerDependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             hasReceipt: () => Effect.succeed(false),
             assertProviderInstanceEnabled: () => Effect.void,
             getThreadRecords: (threadId) =>
@@ -2531,6 +2669,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             getThreadRecords: (threadId) =>
               Effect.succeed(
                 threadId === parentThreadId

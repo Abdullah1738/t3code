@@ -5,6 +5,7 @@ import {
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpTaskStatusResult,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadListInput,
   OrchestratorMcpThreadReadInput,
@@ -22,6 +23,26 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("preserves known fields in partial task status and rejects an unmarked incomplete result", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpTaskStatusResult);
+    const partial = {
+      taskId: "node:task",
+      partial: true,
+      childThreadId: "thread:child",
+      currentRunId: "run:resumed",
+      currentRunStatus: "starting",
+      latestTerminalRunId: "run:original",
+      latestTerminalStatus: "cancelled",
+    };
+    expect(decode(partial)).toEqual(partial);
+    expect(decode({ taskId: "node:task", partial: true })).toEqual({
+      taskId: "node:task",
+      partial: true,
+    });
+    expect(() => decode({ ...partial, partial: false })).toThrow();
+    expect(() => decode({ taskId: "node:task" })).toThrow();
+  });
+
   it("accepts explicit worktree isolation and keeps shared delegation as the default", () => {
     expect(decodeDelegateTaskInput({ task: "Review changes" }).isolation).toBeUndefined();
     expect(

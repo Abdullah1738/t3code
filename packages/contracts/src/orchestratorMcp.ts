@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
@@ -200,6 +201,9 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   childThreadId: ThreadId,
   childRunId: Schema.NullOr(RunId),
   childNodeId: NodeId,
+  partial: Schema.optional(Schema.Literal(false)),
+  currentRunId: Schema.optional(Schema.NullOr(RunId)),
+  currentRunStatus: Schema.optional(Schema.NullOr(OrchestrationV2RunStatus)),
   status: OrchestratorMcpDelegatedTaskStatus,
   startedAt: Schema.optional(Schema.NullOr(Schema.String)).annotate({
     description:
@@ -253,6 +257,16 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
+
+export const OrchestratorMcpTaskStatusResult = Schema.Union([
+  OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpDelegateTaskResult.mapFields((fields) => ({
+    ...Struct.map(fields, Schema.optionalKey),
+    taskId: NodeId,
+    partial: Schema.Literal(true),
+  })),
+]);
+export type OrchestratorMcpTaskStatusResult = typeof OrchestratorMcpTaskStatusResult.Type;
 
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,

@@ -383,6 +383,7 @@ it.each(["working", "retrying", "resuming", "cancelled", "interrupted"])(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             delegatedTaskResultPending: () => Effect.succeed(false),
             getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
             getThreadRecords: (threadId) => {
