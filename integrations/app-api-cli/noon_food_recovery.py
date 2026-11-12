@@ -65,6 +65,7 @@ class NativeReader:
                 'order_id':data.get('orderNr'),
                 'automatic_eligible':data.get('paymentRequireCvv') is False
                     and data.get('paymentRequireCompletion') is False
+                    and 'paymentClientSecret' in data
                     and data.get('paymentClientSecret') is None
                     and minor(data.get('orderPaymentFinalTotal'))==review['payable_minor']}
 

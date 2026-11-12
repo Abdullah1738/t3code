@@ -441,6 +441,19 @@ class NativeOrderTests(unittest.TestCase):
         with patch.object(recovery.vertical,'food_orders',return_value={'orders':[]}),patch.object(food,'FoodFlow',return_value=flow),patch.object(food,'request',side_effect=lambda *a:data),patch.object(j,'inspect',return_value={
                 'operations':[{'name':'set_payment_method','state':'OBSERVED','kind':'cart'}]}):
             self.assertIsNone(reader.session()['order_id'])
+            data.update(paymentRequireCvv=False,paymentRequireCompletion=False,paymentClientSecret=None)
+            self.assertTrue(reader.session()['automatic_eligible'])
+            for key in ('paymentRequireCvv','paymentRequireCompletion','paymentClientSecret'):
+                values = (True, None, 0, 'false') if key != 'paymentClientSecret' else ('intent', False, 0, '')
+                old = data[key]
+                for value in values:
+                    with self.subTest(key=key,value=value):
+                        data[key]=value
+                        self.assertFalse(reader.session()['automatic_eligible'])
+                del data[key]
+                with self.subTest(key=key,value='missing'):
+                    self.assertFalse(reader.session()['automatic_eligible'])
+                data[key]=old
             data['orderNr']=ORDER
             self.assertEqual(reader.session()['order_id'],ORDER)
             data['paymentToken']='other'
