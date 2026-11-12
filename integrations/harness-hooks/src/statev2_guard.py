@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 
 
@@ -208,7 +209,29 @@ def _python_touches_live(source, directory):
     return False
 
 
-def _shell_fixture_source(source):
+def _trusted_fixture_tool(executable, name, directory):
+    trusted = {f'/bin/{name}', f'/usr/bin/{name}'}
+    # This Mac's default Bash is Homebrew's versioned package, not /bin/bash.
+    if name == 'bash':
+        brew = '/opt/homebrew/bin/bash'
+        if re.fullmatch(r'/opt/homebrew/Cellar/bash/[^/]+/bin/bash', os.path.realpath(brew)):
+            trusted.add(brew)
+    if executable in trusted:
+        return True
+    if executable != name:
+        return False
+    search = []
+    for entry in os.get_exec_path():
+        if not os.path.isabs(entry):
+            if directory is None:
+                return False
+            entry = str(directory / entry)
+        search.append(entry)
+    resolved = shutil.which(name, path=os.pathsep.join(search))
+    return resolved is not None and os.path.realpath(resolved) in {os.path.realpath(path) for path in trusted}
+
+
+def _shell_fixture_source(source, directory):
     """Discount only paths rooted in single, literal mktemp assignments."""
     try:
         shell, _ = _heredocs(source)
@@ -220,6 +243,9 @@ def _shell_fixture_source(source):
     except (ValueError, AmbiguousScript):
         return source
     audited = hashlib.sha256(source.encode()).hexdigest() == BACKUP_FIXTURE_SHA256
+    # An inherited PATH can replace mktemp or cat even in the audited body.
+    if not _trusted_fixture_tool('mktemp', 'mktemp', directory) or audited and not _trusted_fixture_tool('cat', 'cat', directory):
+        return source
     # Merely assigning in a skipped branch or uncalled function leaves the
     # inherited value intact. The committed backup test has audited setup
     # calls; other bodies need a straight-line proof.
@@ -295,9 +321,9 @@ def _shell_fixture_source(source):
             for key, literal in quoted.items():
                 executable = executable.replace(key, literal)
                 value = value.replace(key, literal)
-            # A computed command word can run side effects before cat sees
-            # the fixture path, invalidating its isolated-root proof.
-            if not re.fullmatch(r'[\w./+-]+', executable, re.ASCII) or os.path.basename(executable) != 'cat':
+            # A same-named helper or computed command can alter the fixture
+            # root before reading it. Only the system reader preserves it.
+            if not _trusted_fixture_tool(executable, 'cat', directory):
                 return source
             fixture = re.fullmatch(r'\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})/\.robob/userdata/statev2\.sqlite(?:-(?:wal|shm|journal))?', value)
             if not fixture or (fixture[1] or fixture[2]) not in assigned:
@@ -315,7 +341,7 @@ def _source_hit(source, directory, python=False, shell=False):
     if python:
         return _python_touches_live(source, directory)
     if shell:
-        source = _shell_fixture_source(source)
+        source = _shell_fixture_source(source, directory)
     if source_touches_live(source) or _relative_source_live(source, directory):
         return True
     def isolated_literal(match):
@@ -809,6 +835,7 @@ def scripts_in(command: str, cwd: str) -> list[Path]:
             invocation = []
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
                  os.path.basename(invocation[0]) == binary and invocation[1] == value and
+                 _trusted_fixture_tool(invocation[0], binary, directory) and
                  not value.startswith(('~', '$')) and '\\\n' not in command and '\\\r\n' not in command and
                  not any(os.environ.get(name) or name in shell_values for name in ('BASH_ENV', 'ENV')) and
                  not any(name.startswith('BASH_FUNC_') for name in os.environ))

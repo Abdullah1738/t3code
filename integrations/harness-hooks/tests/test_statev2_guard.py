@@ -112,6 +112,16 @@ class GuardTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
 
+    def test_mktemp_fixture_tool_identity(self):
+        backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/backup.sh', backup.read_text())
+        for label, source, search_path, expected, shell in isolated_source_cases.fixture_tool_cases(self.root):
+            self.write('tmp/fixture.sh', source)
+            with self.subTest(case=label, path=search_path), patch.dict(os.environ, {'PATH':search_path}):
+                self.assertEqual(guard.classify_detail(shell + ' tmp/fixture.sh', str(self.root)), (expected, None))
+                if label.startswith('path-'):
+                    self.assertEqual(guard.classify_detail(shell + ' tmp/backup.sh', str(self.root)), (expected, None))
+
     def test_heredoc_data_and_execution(self):
         body = "import hashlib, pathlib, subprocess\n# it's a diff check\nprint('ok')\n"
         self.table([

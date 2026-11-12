@@ -121,6 +121,19 @@ class RelativeScriptReporterTests(unittest.TestCase):
                 with self.subTest(source=source, harness=harness):
                     self.check(self.event('bash tmp/fixture.sh'), expected, harness)
 
+    def test_fixture_tool_identity_through_native_hooks(self):
+        source = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write('tmp/backup.sh', source.read_text())
+        for label, source, search_path, expected, shell in isolated_source_cases.fixture_tool_cases(self.root):
+            self.write('tmp/fixture.sh', source)
+            commands = [shell + ' tmp/fixture.sh']
+            if label.startswith('path-'):
+                commands.append(shell + ' tmp/backup.sh')
+            for harness, tool in [('codex', 'exec_command'), ('codex', 'Bash'), ('claude', 'Bash')]:
+                for command in commands:
+                    with self.subTest(case=label, path=search_path, harness=harness, tool=tool), patch.dict(os.environ, {'PATH':search_path}):
+                        self.check(self.event(command, tool), expected, harness)
+
     def test_exact_3464_code_mode_call(self):
         fixture = json.loads((FIXTURES / '3464.json').read_text())
         calls = code_mode_fixture.commands(fixture['payload']['input'], fixture['session_cwd'])

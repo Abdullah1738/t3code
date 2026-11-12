@@ -119,3 +119,41 @@ def mktemp_scripts():
              ('PATH=/tmp/helpers:$PATH\nT=$(mktemp -d)\ncat "$T' + suffix + '"', 'live-database-script'),
              ('T=$(mktemp -d)\ncat "prefix$T' + suffix + '"', 'live-database-script')]
     return rows
+
+
+def fixture_tool_cases(root):
+    """Executable fixtures are inspected by the guard, never run."""
+    source = 'T=$(mktemp -d)\ncat "$T/.robob/userdata/statev2.sqlite"\n'
+    system_path = '/usr/bin:/bin'
+    for name in ('cat', 'mktemp', 'bash'):
+        helper = root / (name + '-shadow') / name
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text('#!/bin/sh\nexit 1\n')
+        helper.chmod(0o755)
+    local = root / 'cat'
+    local.write_text('#!/bin/sh\nexit 1\n')
+    local.chmod(0o755)
+    alias = root / 'cat-alias' / 'cat'
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    alias.symlink_to('/bin/cat')
+    helper_alias = root / 'cat-helper-alias' / 'cat'
+    helper_alias.parent.mkdir(parents=True, exist_ok=True)
+    helper_alias.symlink_to(root / 'cat-shadow/cat')
+    rows = []
+    for executable in (str(root / 'cat-shadow/cat'), '"' + str(root / 'cat-shadow/cat') + '"',
+                       'cat-shadow/cat', './cat-shadow/cat', './cat'):
+        rows.append(('custom-literal', source.replace('\ncat ', '\n' + executable + ' '), system_path, 'live-database-script'))
+    for executable in ('cat', '/bin/cat', '/usr/bin/cat', '"/bin/cat"'):
+        rows.append(('system-reader', source.replace('\ncat ', '\n' + executable + ' '), system_path, None))
+    for entry in (str(root / 'cat-shadow'), 'cat-shadow', './cat-shadow', ''):
+        rows.append(('path-shadow-cat', source, entry + ':' + system_path, 'live-database-script'))
+    for entry in (str(root / 'mktemp-shadow'), 'mktemp-shadow'):
+        rows.append(('path-shadow-mktemp', source.replace('\ncat ', '\n/bin/cat '), entry + ':' + system_path, 'live-database-script'))
+    rows.append(('path-shadow-shell', source, str(root / 'bash-shadow') + ':' + system_path, 'live-database-script'))
+    rows.append(('path-system-alias', source, str(alias.parent) + ':' + system_path, None))
+    rows.append(('path-helper-alias', source, str(helper_alias.parent) + ':' + system_path, 'live-database-script'))
+    return [(*row, 'bash') for row in rows] + [
+        ('literal-helper-shell', source, system_path, 'live-database-script', str(root / 'bash-shadow/bash')),
+        ('relative-helper-shell', source, system_path, 'live-database-script', './bash-shadow/bash'),
+        ('system-shell', source, str(root / 'bash-shadow') + ':' + system_path, None, '/bin/bash'),
+    ]
