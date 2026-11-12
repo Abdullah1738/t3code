@@ -55,26 +55,28 @@ def lock_name(key: str) -> str:
 
 
 @contextlib.contextmanager
-def _pool_lock(key: str, deadline: float, wait: int):
-    """The pool lock covers only choosing a box or a create slot, so a wait for it is a busy pool, never infra."""
+def _pool_lock(key: str, deadline: float, wait: int, *, prepare_end: float | None = None,
+               box_id: str = "repository pool"):
+    """Queue expiry means busy; a selected box's readiness deadline also bounds its claim."""
     lk = file_lock(lock_name(key), timeout=max(1, deadline - time.monotonic()))
-    acquired = False
-    try:
-        with prepare.guard("repository pool"), prepare.phase("lock_wait", "repository pool"):
-            lk.__enter__()
-            acquired = True
-    except prepare.Stalled:
-        if acquired:
-            lk.__exit__(None, None, None)
-        raise
-    except OffboxError as e:
-        raise PoolBusyError(f"repository pool busy for {key}: other offbox runs kept its pool lock for the whole "
-                            f"{wait}s queue wait. Nothing ran (exit {EXIT_BUSY}, not an infra failure): retry, or "
-                            f"raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})") from e
-    try:
-        yield
-    finally:
-        lk.__exit__(None, None, None)
+    continuation = prepare.guard(box_id, prepare_end) if prepare_end is not None else contextlib.nullcontext()
+    with continuation:
+        acquired = False
+        try:
+            try:
+                with prepare.guard(box_id), prepare.phase("lock_wait", box_id):
+                    lk.__enter__()
+                    acquired = True
+            except prepare.Stalled:
+                raise
+            except OffboxError as e:
+                raise PoolBusyError(f"repository pool busy for {key}: other offbox runs kept its pool lock for the whole "
+                                    f"{wait}s queue wait. Nothing ran (exit {EXIT_BUSY}, not an infra failure): retry, or "
+                                    f"raise OFFBOX_POOL_WAIT_SECONDS (max {WAIT_MAX_S})") from e
+            yield
+        finally:
+            if acquired:
+                lk.__exit__(None, None, None)
 
 
 def _alive(pid) -> bool:
@@ -550,7 +552,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     try:
                         # The member row and the slot's removal happen in one step under the pool lock, so a
                         # selection never sees the box as neither a member nor a pending slot.
-                        with _pool_lock(key, deadline, wait):
+                        with _pool_lock(key, deadline, wait, prepare_end=got['_prepare_end'], box_id=got['box_id']):
                             _claim(con, me, got, run_id)
                             con.execute("DELETE FROM pool_pending WHERE token=?", (token,))
                             con.commit()

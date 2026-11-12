@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_capacity import Isolated
+from test_exit_and_queue import FakeClock
 from offbox_lib import api, cli, common, lease, pool, prepare, runs
 
 
@@ -21,6 +22,108 @@ class PrepareTests(Isolated):
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_PREPARE_DEADLINE_SECONDS': '1'}))
         self.stack.enter_context(patch.object(lease, 'cap_check'))
         self.stack.enter_context(patch.object(pool, '_refresh_background'))
+
+    def create_and_claim(self, lock_seconds, replacement=False):
+        clock = FakeClock()
+        created = []
+        starts = []
+        awaiting_claim = False
+        if replacement:
+            self.box('old', 'stopped', member=True)
+
+        def create(*args):
+            nonlocal awaiting_claim
+            bid = f'new-{len(created) + 1}'
+            starts.append(clock.t)
+            created.append(bid)
+            self.box(bid)
+            prepare.identify(bid)
+            hold = common.file_lock('box-' + bid, timeout=0)
+            hold.__enter__()
+            row = dict(self.con.execute('SELECT * FROM leases WHERE box_id=?', (bid,)).fetchone())
+            clock.sleep(.7)
+            awaiting_claim = True
+            return dict(row, _guard=hold)
+
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            nonlocal awaiting_claim
+            if name == pool.lock_name('repo') and awaiting_claim:
+                awaiting_claim = False
+                clock.sleep(lock_seconds)
+            with common.file_lock(name, timeout=timeout):
+                yield
+
+        with patch.object(pool, 'time', clock.time), patch.object(prepare, 'time', clock.time), \
+                patch.object(pool, 'file_lock', side_effect=lock), \
+                patch.object(lease, 'acquire_private', side_effect=create), \
+                patch.object(lease, '_reuse', side_effect=lease.ResumeProvisionStalled('old provisioning stalled')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            if lock_seconds > .3:
+                with self.assertRaises(common.OffboxError) as caught:
+                    pool.acquire(self.me)
+                self.assertEqual(caught.exception.code, 90)
+                self.assertIn(f'lock_wait on {created[-1]}', str(caught.exception))
+                self.assertEqual(len(created), 1 if replacement else 2)
+                for bid in created:
+                    self.assertIn(f'resume_stuck {bid} lock_wait', common.LOG_PATH.read_text())
+                    self.assertEqual(self.con.execute('SELECT state FROM leases WHERE box_id=?', (bid,)).fetchone()[0],
+                                     'resume_stalled')
+            else:
+                got = pool.acquire(self.me)
+                pool.release_guard(got)
+                self.assertEqual(len(created), 1)
+                self.assertEqual(got['_prepare_end'], starts[0] + 1)
+                self.assertLess(clock.t, got['_prepare_end'])
+        self.assertEqual(self.con.execute('SELECT count(*) FROM pool_pending').fetchone()[0], 0)
+        for bid in created:
+            with common.file_lock('box-' + bid, timeout=0):
+                pass
+
+    def test_creation_and_claim_lock_expire_with_one_shared_deadline(self):
+        self.create_and_claim(.7)
+
+    def test_replacement_creation_and_claim_lock_expire_with_one_shared_deadline(self):
+        self.create_and_claim(.7, replacement=True)
+
+    def test_creation_and_claim_lock_can_finish_within_shared_deadline(self):
+        self.create_and_claim(.2)
+
+    def test_replacement_creation_and_claim_lock_can_finish_within_shared_deadline(self):
+        self.create_and_claim(.2, replacement=True)
+
+    def test_slow_selection_does_not_strand_a_creation_slot(self):
+        clock = FakeClock()
+        first_lock = True
+
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            nonlocal first_lock
+            if name == pool.lock_name('repo') and first_lock:
+                first_lock = False
+                clock.sleep(.7)
+            with common.file_lock(name, timeout=timeout):
+                yield
+
+        def reservation_id(prefix):
+            clock.sleep(.7)
+            return 'create-reservation'
+
+        def create(*args):
+            self.box('new')
+            return dict(self.con.execute("SELECT * FROM leases WHERE box_id='new'").fetchone())
+
+        with patch.object(pool, 'time', clock.time), patch.object(prepare, 'time', clock.time), \
+                patch.object(pool, 'file_lock', side_effect=lock), patch.object(pool, 'new_id', side_effect=reservation_id), \
+                patch.object(lease, 'acquire_private', side_effect=create), \
+                patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}), contextlib.redirect_stderr(io.StringIO()):
+            got = None
+            try:
+                got = pool.acquire(self.me)
+            finally:
+                pool.release_guard(got)
+                self.assertEqual(self.con.execute('SELECT count(*) FROM pool_pending').fetchone()[0], 0)
+        self.assertEqual(got['box_id'], 'new')
 
     def acquire_after_stall(self, resume, state):
         self.box('old', 'stopped', member=True)
