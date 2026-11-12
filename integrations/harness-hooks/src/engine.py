@@ -28,6 +28,7 @@ import urllib.request
 
 import desktop_lease
 import statev2_guard
+import rootwide_search_guard
 
 
 HOME = Path.home()
@@ -67,6 +68,7 @@ _LOG_RULES = {
     "native-check-unavailable", "desktop-read-only", "desktop-admitted", "desktop-denied",
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
+    "rootwide-search",
 }
 _LOG_ERRORS = {
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
@@ -1117,6 +1119,17 @@ def decide(event, harness):
         if command:
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
+            try:
+                root = rootwide_search_guard.classify(command, command_cwd)
+            except Exception as error:
+                # A search-parser failure must not disable the independent DB,
+                # offbox or coord policies later in this hook.
+                error_type = type(error).__name__
+                root = None
+            if root:
+                result = {"decision": "deny", "reason": rootwide_search_guard.reason(root, command_cwd),
+                          "context": {"rule": "rootwide-search"}}
+                return result
             # The live DB rule is independent of native identity and offbox/coord
             # availability, so a service outage cannot disable this local check.
             try:

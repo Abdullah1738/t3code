@@ -63,6 +63,7 @@
   ],
   "paritySources": {
     "hook-adapters": ["../harness-hooks/src/claude.py", "../harness-hooks/src/codex.py"],
+    "rootwide-search": ["../harness-hooks/src/rootwide_search_guard.py", "../harness-hooks/src/engine.py", {"source": "../opencode-plugins/plugin/rootwide-search-guard.ts", "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"}],
     "live-database": ["../harness-hooks/src/statev2_guard.py", "../harness-hooks/src/engine.py"],
     "offbox": ["../harness-hooks/src/engine.py", {"source": "../offbox/skill/scripts/classify.py", "installed": "~/.config/opencode/skills/remote-compute/scripts/classify.py"}, {"source": "../offbox/skill/heavy-rules.json", "installed": "~/.config/opencode/skills/remote-compute/heavy-rules.json"}],
     "betterstack-scope": ["../harness-hooks/src/engine.py"],
