@@ -1007,6 +1007,16 @@ const withToolAnalytics =
             Effect.fnUntraced(function* (payload) {
               const capture = yield* Effect.serviceOption(McpReplyCapture);
               if (Option.isSome(capture)) capture.value.name = options.tool.name;
+              const invocation = Option.getOrUndefined(
+                yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+              );
+              // The shared tools/call span otherwise cannot be matched to a
+              // reporter after concurrent requests enter different service fibers.
+              yield* Effect.annotateCurrentSpan({
+                "mcp.tool.name": options.tool.name,
+                "mcp.caller.thread_id": invocation?.thread?.threadId ?? null,
+                "mcp.request.namespace": invocation?.requestNamespace ?? null,
+              });
               const startedAt = yield* Clock.currentTimeMillis;
               const rejection = { exceeded: false };
               if (BOARD_READ_TOOLS.has(options.tool.name)) yield* boardReplyReady;
