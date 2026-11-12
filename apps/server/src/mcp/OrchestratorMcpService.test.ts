@@ -3537,7 +3537,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         id,
         label: id,
         type: "select" as const,
-        options: ["high", "max"].map((value) => ({ id: value, label: value })),
+        options: ["high", "max", "xhigh", "default"].map((value) => ({ id: value, label: value })),
       });
       const haiku = "claude-haiku-5-5";
       const legacyHaiku = `opus/cc/${haiku}`;
@@ -3589,12 +3589,39 @@ describe("OrchestratorMcpService provider resolution", () => {
           select("reasoningEffort"),
           select("serviceTier"),
         ]),
+        snapshot(ProviderInstanceId.make("codex-cu"), "codex", "gpt-6.1-terra", [
+          select("reasoningEffort"),
+          select("serviceTier"),
+        ]),
       ];
       const maxVariant = [{ id: "variant", value: "max" }] as const;
       const maxEffort = [{ id: "effort", value: "max" }] as const;
       const nativeParent = { instanceId: claude, model: "claude-opus-5-5" };
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        ...(["sol", "terra"] as const).flatMap((name) =>
+          (["variant", "reasoningEffort"] as const).map((effortId) => ({
+            name: `preserves serviceTier on ${name} remap with ${effortId}`,
+            mode: "apply" as const,
+            parent: nativeParent,
+            target: {
+              providerInstanceId: opencode,
+              model: `opus/cx/gpt-6.1-${name}`,
+              options: [
+                { id: effortId, value: "xhigh" },
+                { id: "serviceTier", value: "default" },
+              ],
+            },
+            expected: {
+              instanceId: ProviderInstanceId.make(name === "sol" ? "codex" : "codex-cu"),
+              model: `gpt-6.1-${name}`,
+              options: [
+                { id: "reasoningEffort", value: "xhigh" },
+                { id: "serviceTier", value: "default" },
+              ],
+            },
+          })),
+        ),
         {
           name: "reports an explicit legacy Haiku request",
           mode: "apply",
@@ -3986,7 +4013,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                 : providers
               : [legacyProvider, ...providers],
           ),
-          adapterRegistryLayer([opencode, claude, codexInstanceId]),
+          adapterRegistryLayer([
+            opencode,
+            claude,
+            codexInstanceId,
+            ProviderInstanceId.make("codex-cu"),
+          ]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
@@ -4010,6 +4042,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.deepEqual(commands[0]?.modelSelection, testCase.expected, testCase.name);
             assert.equal(result.providerInstanceId, testCase.expected.instanceId, testCase.name);
             assert.equal(result.model, testCase.expected.model, testCase.name);
+            assert.deepEqual(
+              result.options,
+              commands[0]?.modelSelection.options ?? [],
+              testCase.name,
+            );
             if ("routingRequested" in testCase) {
               if (testCase.routingRequested === null) {
                 assert.isUndefined(result.selectionRouting, testCase.name);
