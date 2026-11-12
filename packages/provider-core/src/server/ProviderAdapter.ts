@@ -374,6 +374,14 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     detail: Schema.String,
     reason: Schema.optional(ProviderAdapterFailureReason),
+    activeTurn: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        attemptId: RunAttemptId,
+        providerThreadId: ProviderThreadId,
+        providerTurnId: ProviderTurnId,
+      }),
+    ),
     cause: Schema.optional(Schema.Defect()),
     payload: Schema.optional(Schema.Unknown),
   },
@@ -625,6 +633,11 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly stopTask?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly interruptStartingRun?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,
