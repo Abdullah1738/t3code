@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import zlib
+from functools import lru_cache
 
 import redact_guard as guard
 from redact_lock import fence
@@ -36,12 +37,35 @@ def read_needle(path):
     return needle
 
 
-def patterns(needle):
+@lru_cache(maxsize=4)
+def selector_variants(needle):
+    """Per-character JSON choices; their product includes partial escaping.
+
+    JSON decoding in contains() resolves arbitrary mixtures and nested strings.
+    FTS discards backslashes/quotes, so its check uses these same choices as
+    conservative term obligations instead of enumerating an exponential list.
+    """
     if needle is None:
         return ()
-    text = needle.decode('utf-8')
-    return tuple(set((needle, json.dumps(text,ensure_ascii=True)[1:-1].encode(),
-                      json.dumps(text,ensure_ascii=False)[1:-1].encode())))
+    choices=[]
+    for char in needle.decode('utf-8'):
+        units=char.encode('utf-16-be')
+        escaped=''.join('\\u'+units[i:i+2].hex() for i in range(0,len(units),2))
+        upper=re.sub(r'[a-f]',lambda m:m.group().upper(),escaped)
+        choices.append(tuple(dict.fromkeys((char,json.dumps(char,ensure_ascii=False)[1:-1],escaped,upper))))
+    return tuple(choices)
+
+
+@lru_cache(maxsize=4)
+def patterns(needle):
+    choices=tuple(selector_variants(needle))
+    if not choices:return ()
+    text=''.join(row[0] for row in choices)
+    forms={text,json.dumps(text,ensure_ascii=True)[1:-1],json.dumps(text,ensure_ascii=False)[1:-1],
+           ''.join(next(v for v in row if v.startswith('\\u')) for row in choices),
+           ''.join(next(v for v in reversed(row) if v.startswith('\\u')) for row in choices)}
+    forms.update(json.dumps(value,ensure_ascii=False)[1:-1] for value in tuple(forms))
+    return tuple(value.encode() for value in forms)
 
 
 def contains(value, needle):
@@ -161,11 +185,12 @@ def byte_hits(path, needle):
     if not needle or not Path(path).exists():
         return 0
     hits, tail = 0, b''
+    overlap=max(map(len,patterns(needle)))-1
     with open(path, 'rb') as f:
         while chunk := f.read(1024 * 1024):
             data = tail + chunk
-            hits += data.count(needle)
-            tail = data[-(len(needle)-1):] if len(needle) > 1 else b''
+            hits += int(contains(data,needle))
+            tail = data[-overlap:] if overlap else b''
     return hits
 
 
@@ -340,6 +365,9 @@ def redact_db(path, needle, marker, *, session=None, item=None, dry_run=False, e
             for fts in ('episodic_fts','episodic_text_fts'):
                 if fts in kinds:
                     remaining += check.execute(f'SELECT count(*) FROM {fts} WHERE {fts} MATCH ?',(query,)).fetchone()[0]
+                    from redact_fts import physical_hits
+                    sql=check.execute('SELECT sql FROM sqlite_schema WHERE name=?',(fts,)).fetchone()[0]
+                    remaining += physical_hits(check,fts,sql,needle)
     return {'matchedBefore':matched, 'replaced':replaced, 'remainingAfter':remaining}, affected_paths
 
 

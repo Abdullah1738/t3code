@@ -321,6 +321,12 @@ excluded; clean historical files remain byte-for-byte intact. Path hints never
 count as evidence of a match. Removal still affects whole matched historical
 files, followed by a sanitized stage backup.
 
+Literal, Unicode-escaped and nested JSON selectors share the same encoding
+choices across row, log, archive and physical-FTS inspection. Deleted FTS terms
+that could represent an encoded selector block verification when their original
+boundaries cannot be recovered. Rewritten and replacement snapshots must pass
+inspection before `prune` runs.
+
 Inspection stays diskless. Concatenated compression frames, trailing data and
 unclassified SQLite pages are rejected rather than skipped. SQLite snapshots
 larger than 128 MiB are read through a read-only APSW VFS backed by the existing

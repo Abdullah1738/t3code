@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 
-from redact import RedactionError
+from redact import RedactionError,contains,patterns
 
 
 def apsw_module():
@@ -86,10 +86,11 @@ class BlobImage:
 
     def __contains__(self,needle):
         tail=b''
+        overlap=max(map(len,patterns(needle)))-1
         for start in range(0,self.size,1<<20):
             value=tail+self[start:min(start+(1<<20),self.size)]
-            if needle in value:return True
-            tail=value[-(len(needle)-1):] if len(needle)>1 else b''
+            if contains(value,needle):return True
+            tail=value[-overlap:] if overlap else b''
         return False
 
     def close(self):

@@ -99,7 +99,10 @@ def sqlite_scan(con,data,needle):
         hits+=con.execute(f'SELECT count(*) FROM {table} WHERE {table} MATCH ?',(query,)).fetchone()[0]
         if hits:return hits
         hits+=physical_hits(con,name,sql,needle)
-    hits += int(needle in data)
+    if isinstance(data,(bytes,bytearray)):
+        hits += int(contains(bytes(data),needle))
+    else:
+        hits += int(needle in data)  # BlobImage uses the shared selector matcher.
     if hits:
         return hits
     if data[20] or int.from_bytes(data[52:56],'big'):

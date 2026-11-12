@@ -3,7 +3,7 @@ import re
 import sqlite3
 import contextlib
 
-from redact import RedactionError, qi
+from redact import RedactionError, qi, selector_variants
 
 
 def varint(data, offset, limit):
@@ -42,26 +42,60 @@ def physical_hits(con, name, sql, needle):
         raise RedactionError('custom FTS tokenizer needs physical inspection support')
     # The default unicode61 tokenizer is also used by recall's two indexes.
     # A separate in-memory index avoids changing the historical image.
+    choices=tuple(selector_variants(needle))
     with contextlib.closing(sqlite3.connect(':memory:')) as probe:
         probe.execute('CREATE VIRTUAL TABLE selector USING fts5(value)')
-        probe.execute('INSERT INTO selector(value) VALUES(?)',(needle.decode(),))
         probe.execute("CREATE VIRTUAL TABLE vocabulary USING fts5vocab(selector,'instance')")
-        tokens=[row[0].encode() for row in probe.execute('SELECT term FROM vocabulary ORDER BY offset')]
+        def tokenize(text):
+            probe.execute('DELETE FROM selector')
+            probe.execute('INSERT INTO selector(value) VALUES(?)',(text,))
+            return tuple(row[0].encode() for row in probe.execute('SELECT term FROM vocabulary ORDER BY offset'))
+        tokens=tokenize(''.join(row[0] for row in choices))
         wanted=set(tokens)
-    if not wanted:return 0
+        # A second JSON layer may itself Unicode-escape an earlier escape's
+        # spelling. Include that finite alphabet when propagating uncertainty.
+        units={row[0]:row for row in (*choices,*selector_variants(b'\\u0123456789abcdefABCDEFbtnfr/"'))}
+        obligations={char:tuple(tokenize(option) for option in row) for char,row in units.items()}
+    needed=wanted|{token for forms in obligations.values() for form in forms for token in form}
+    if not needed:return 0
+    def matcher_for(missing):
+        return re.compile(b'(?=('+b'|'.join(re.escape(t) for t in sorted(missing,key=len,reverse=True))+b'))') if missing else None
+    matcher=matcher_for(needed)
     found=set()
     for rowid,data in con.execute(f'SELECT id,block FROM {qi(name+"_data")} WHERE id>10'):
         segment=rowid>>37
         if segment>65535:continue  # Contentless-delete tombstone hash pages.
         if not segment or ((rowid>>31)&63):continue  # Doclist indexes contain integers.
         if not rowid&0x7fffffff:raise RedactionError('invalid FTS5 segment page')
+        before=len(found)
         for term in leaf_terms(data):
-            if term[:1]==b'0':found.update(token for token in wanted if token in term[1:])
-    if found==wanted:
+            if matcher and term[:1]==b'0':
+                for match in matcher.finditer(term[1:]):
+                    value=match.group(1)
+                    if value not in found:found.update(token for token in needed-found if token in value)
+        if len(found)!=before:matcher=matcher_for(needed-found)
+    if wanted and wanted<=found:
         if len(tokens)==1:
             # A longer normalized word is evidence of a possible substring,
             # not proof of the literal's original spelling or boundaries.
             return 1
         # Term presence alone cannot prove adjacency across deleted postings.
         raise RedactionError('physical FTS terms cannot rule out a deleted selector phrase')
+    possible={char for char,forms in obligations.items() if all(t in found for t in forms[0])}
+    encoded=False
+    for char,forms in obligations.items():
+        if any(form and all(t in found for t in form) for form in forms[1:]):
+            possible.add(char);encoded=True
+    if encoded:
+        # Terms have no recoverable JSON string boundaries or deleted-posting
+        # adjacency. Close over nested escape spellings, retaining uncertainty
+        # whenever any accepted mixture could still represent the selector.
+        changed=True
+        while changed:
+            changed=False
+            for char,row in units.items():
+                if char not in possible and any(all(c in possible for c in option) for option in row[1:]):
+                    possible.add(char);changed=True
+        if all(row[0] in possible for row in choices):
+            raise RedactionError('physical FTS terms cannot rule out an encoded selector')
     return 0

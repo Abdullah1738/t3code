@@ -27,6 +27,7 @@ import redact_inspect
 import recall_cli
 import redact_guard
 from redact_lock import fence
+from redact_variant_fixtures import variants as selector_forms, NEEDLE as VARIANT_NEEDLE, assert_single_snapshot_refused
 
 TOKEN = 'fabricatedcredentialquartz98765'
 SID = 'fixture-session'
@@ -64,6 +65,30 @@ class RedactTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_selector_variant_parity_for_rows_logs_and_archives(self):
+        forms=selector_forms();payload=('\n'.join(forms.values())+'\n').encode()
+        self.needle.write_bytes(VARIANT_NEEDLE)
+        with connect(self.db) as con:
+            for label,value in forms.items():
+                self.assertTrue(redact.contains(value,VARIANT_NEEDLE))
+                con.execute('INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,content_type,metadata_json) VALUES(?,?,?,0,?,?,?,?)',
+                            ('codex',SID,'variant-'+label,'assistant',value,'text','{}'))
+        log=self.root/'logs/variants.jsonl';log.write_bytes(payload)
+        self.assertTrue(redact.run(self.args)['verify'])
+        with connect(self.db) as con:
+            self.assertFalse(any(redact.contains(r[0],VARIANT_NEEDLE) for r in con.execute('SELECT content FROM episodic_events')))
+        self.assertFalse(redact.contains(log.read_bytes(),VARIANT_NEEDLE))
+        for label,value in forms.items():
+            data=(value+'\n').encode()
+            zipped=io.BytesIO()
+            with zipfile.ZipFile(zipped,'w',compression=zipfile.ZIP_DEFLATED) as archive:archive.writestr('fixture.jsonl',data)
+            for kind,encoded in (('gzip',gzip.compress(data)),('zip',zipped.getvalue())):
+                with self.subTest(form=label,store=kind):
+                    self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(encoded),VARIANT_NEEDLE)[0],0)
+        if shutil.which('zstd'):
+            data=subprocess.run(['zstd','-q','-c'],input=payload,capture_output=True,check=True).stdout
+            self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(data),VARIANT_NEEDLE)[0],0)
 
     def test_all_stores_fts_pages_and_output(self):
         log = self.root/'logs/recall-inject.jsonl'
@@ -398,6 +423,51 @@ class RedactTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('restic'),'restic not installed')
 class BackupTest(unittest.TestCase):
+    def test_failed_rewrite_verification_refuses_prune(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';path=root/'fixture.jsonl'
+            path.write_text(json.dumps({'text':TOKEN}))
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(path))
+            original=redact_backups.restic;commands=[]
+            def incomplete(repository,*args,**kwargs):
+                commands.append(args[0])
+                if args[0]=='rewrite':return b''
+                return original(repository,*args,**kwargs)
+            with patch('redact_backups.restic',side_effect=incomplete),self.assertRaises(redact.RedactionError):
+                redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+            self.assertIn('rewrite',commands);self.assertNotIn('prune',commands)
+            self.assertEqual(original(repo,'list','locks').splitlines(),[])
+
+    def test_deleted_encoded_fts_variants_block_rewrite_and_prune(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir()
+            redact_backups.restic(repo,'init')
+            for label,value in selector_forms().items():
+                path=files/(label+'.db')
+                with connect(path) as con:
+                    con.execute("CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value,content='',contentless_delete=1)")
+                    con.execute('INSERT INTO episodic_text_fts(value) VALUES(?)',(value,))
+                    con.execute("INSERT INTO episodic_text_fts(episodic_text_fts) VALUES('optimize')")
+                    segments=list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10'))
+                    con.execute('DELETE FROM episodic_text_fts');con.commit();con.execute('VACUUM')
+                    self.assertEqual(con.execute('SELECT count(*) FROM episodic_text_fts WHERE episodic_text_fts MATCH ?',(VARIANT_NEEDLE.decode(),)).fetchone()[0],0)
+                    self.assertTrue(any(r in list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10')) for r in segments))
+                with self.subTest(form=label):
+                    try:result=redact_inspect.inspect_stream(io.BytesIO(path.read_bytes()),VARIANT_NEEDLE)
+                    except redact.RedactionError:pass
+                    else:self.assertGreater(result[0],0)
+            redact_backups.restic(repo,'backup',str(files))
+            before=redact_backups.restic(repo,'snapshots','--json',json_output=True)
+            original=redact_backups.restic
+            with patch('redact_backups.restic',wraps=original) as calls,self.assertRaises(redact.RedactionError):
+                redact_backups.rewrite_repo(repo,None,VARIANT_NEEDLE,set(),dry_run=False)
+            self.assertFalse(any(call.args[1] in ('rewrite','prune') for call in calls.call_args_list))
+            self.assertEqual(original(repo,'snapshots','--json',json_output=True),before)
+            self.assertEqual(original(repo,'list','locks').splitlines(),[])
+            for label in ('unicode-lower','nested-stringified'):
+                with self.subTest(single_snapshot=label):
+                    assert_single_snapshot_refused(self,root/('repo-'+label),files/(label+'.db'))
+
     def test_rewrite_two_snapshots_and_prune_removes_packs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); stage=root/'replica'; stage.mkdir(); repo=root/'repo'

@@ -155,14 +155,14 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
         if exclusions:
             affected.append((sid, sorted(exclusions)))
     if not dry_run:
+        if stage and any(r['remainingAfter'] for r in stage_sweep(stage,needle,False).values()):
+            raise RedactionError('replica still contains matches; rewrite refused')
         for sid, exclusions in affected:
             # restic exclude arguments are glob patterns. Refuse ambiguous path
             # syntax instead of accidentally excluding another snapshot member.
             if any(any(c in p for c in '*?[]\\\n\r') for p in exclusions):
                 raise RedactionError('snapshot path needs literal restic exclusion support')
             restic(repo,'rewrite','--forget',sid,*[arg for p in exclusions for arg in ('--exclude',p)])
-        # Also prune leftovers from interrupted/previous rewrites with no snapshots.
-        restic(repo,'prune','--max-unused','0')
         if stage:
             if any(r['remainingAfter'] for r in stage_sweep(stage,needle,False).values()):
                 raise RedactionError('replica still contains matches; fresh snapshot refused')
@@ -175,6 +175,11 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
                 raise RedactionError('snapshot path intersects redaction selector')
             n, _ = inspect_dump(repo,snap['id'],path,needle,size=node.get('size'))
             remaining += int(n>0)
+    if not dry_run:
+        if remaining:raise RedactionError('snapshot matches remain; prune refused')
+        # Verify rewritten and replacement snapshots before destroying packs.
+        # Also clears leftovers from an earlier interrupted rewrite.
+        restic(repo,'prune','--max-unused','0')
     after_packs = {str(p.relative_to(repo)) for p in (Path(repo)/'data').rglob('*') if p.is_file()}
     return {'matchedBefore':len(affected),'replaced':0 if dry_run else len(affected),
             'remainingAfter':remaining,'packsRemoved':len(before_packs-after_packs)}

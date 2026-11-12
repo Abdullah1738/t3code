@@ -16,12 +16,52 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 import redact_backups
 import redact_inspect
 from redact_reader import BlobImage,sqlite_connection
+import redact
+import recall_cli
+from redact_variant_fixtures import variants as selector_forms,NEEDLE as VARIANT_NEEDLE,assert_single_snapshot_refused
 
 AVAILABLE=bool(os.environ.get('RECALL_RESTIC_READER')) and importlib.util.find_spec('apsw') is not None
 
 
 @unittest.skipUnless(AVAILABLE,'build restic-reader and install APSW for diskless integration fixtures')
 class ReaderTest(unittest.TestCase):
+    def test_encoded_deleted_fts_variants_block_vfs_rewrite_and_prune(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir();stage=root/'stage';stage.mkdir()
+            needle=root/'needle';needle.write_bytes(VARIANT_NEEDLE);needle.chmod(0o600)
+            for label,value in selector_forms().items():
+                with contextlib.closing(sqlite3.connect(files/(label+'.db'))) as con:
+                    con.execute("CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value,content='',contentless_delete=1)")
+                    con.execute('INSERT INTO episodic_text_fts(value) VALUES(?)',(value,))
+                    con.execute("INSERT INTO episodic_text_fts(episodic_text_fts) VALUES('optimize')")
+                    segments=list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10'))
+                    con.execute('DELETE FROM episodic_text_fts');con.commit();con.execute('VACUUM')
+                    self.assertEqual(con.execute('SELECT count(*) FROM episodic_text_fts WHERE episodic_text_fts MATCH ?',(VARIANT_NEEDLE.decode(),)).fetchone()[0],0)
+                    self.assertTrue(any(row in list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10')) for row in segments))
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(files))
+            before=redact_backups.restic(repo,'snapshots','--json',json_output=True);sid=before[0]['id']
+            with patch.object(redact_inspect,'MAX_IMAGE_BYTES',1024):
+                for node in redact_backups.nodes(repo,sid):
+                    with self.subTest(form=Path(node['path']).stem):
+                        try:result=redact_backups.inspect_dump(repo,sid,node['path'],VARIANT_NEEDLE,size=node['size'])
+                        except redact.RedactionError:pass
+                        else:self.assertGreater(result[0],0)
+                original=redact_backups.restic
+                with patch('redact_backups.restic',wraps=original) as calls,self.assertRaises(redact.RedactionError):
+                    redact_backups.rewrite_repo(repo,None,VARIANT_NEEDLE,set(),dry_run=False)
+                self.assertFalse(any(c.args[1] in ('rewrite','prune') for c in calls.call_args_list))
+                output=io.StringIO();errors=io.StringIO()
+                with contextlib.redirect_stdout(output),contextlib.redirect_stderr(errors):
+                    status=recall_cli.main(['redact-backups','--root',str(root),'--repository',str(repo),'--stage',str(stage),
+                                          '--needle-file',str(needle),'--local-only','--yes'])
+                self.assertNotEqual(status,0);self.assertFalse(json.loads(output.getvalue() or errors.getvalue())['verify'])
+                self.assertFalse(VARIANT_NEEDLE.decode() in output.getvalue()+errors.getvalue())
+                for label in ('unicode-lower','nested-stringified'):
+                    with self.subTest(single_snapshot=label):
+                        assert_single_snapshot_refused(self,root/('repo-'+label),files/(label+'.db'))
+            self.assertEqual(redact_backups.restic(repo,'snapshots','--json',json_output=True),before)
+            self.assertEqual(redact_backups.restic(repo,'list','locks').splitlines(),[])
+
     def test_seekable_sqlite_matches_and_preserves_clean(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
             root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir()
