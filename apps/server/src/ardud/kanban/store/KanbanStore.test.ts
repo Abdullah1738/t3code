@@ -857,3 +857,59 @@ it.effect(
       assert.deepStrictEqual(yield* store.discussionBoardIdsByEvaluator(evaluator), [boardId]);
     }).pipe(Effect.provide(TestLayer)),
 );
+
+it.effect("releases the reader every 64 summary rows on a 3,000-card board", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const expected = Array.from({ length: 3_000 }, (_, i) => ({
+      ...card((i + 1) * 2, i % 2 === 0 ? "needs_owner" : "working"),
+      settledAt: i % 7 === 0 ? at : null,
+      asks: [
+        {
+          id: "q1",
+          text: "Go?",
+          blocking: false,
+          by: { _tag: "owner" as const },
+          at,
+          seq: null,
+          closedAt: i % 3 === 0 ? at : null,
+        },
+      ],
+    }));
+    yield* sql.withTransaction(Effect.forEach(expected, store.putCard, { discard: true }));
+    const batches: Array<number> = [];
+    const observe: Statement.Transformer = (statement) => {
+      const [query, params] = statement.compile();
+      if (!query.includes("json_object(") || !query.includes("'settledAt'"))
+        return Effect.succeed(statement);
+      return sql.unsafe<{ count: number }>(`SELECT COUNT(*) AS count FROM (${query})`, params).pipe(
+        Effect.provideService(Statement.CurrentTransformer, undefined),
+        Effect.tap((rows) => Effect.sync(() => batches.push(rows[0]!.count))),
+        Effect.as(statement),
+        Effect.orDie,
+      );
+    };
+    const summary = yield* store
+      .summaryCards(boardId)
+      .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+    assert.deepStrictEqual(
+      summary,
+      expected.map(({ id, stage, settledAt, activeThreadId, asks }) => ({
+        id,
+        stage,
+        settledAt,
+        activeThreadId,
+        asks: asks.map(({ closedAt }) => ({ closedAt })),
+      })),
+    );
+    assert.strictEqual(
+      batches.reduce((a, b) => a + b, 0),
+      3_000,
+    );
+    assert.isAtMost(Math.max(...batches), 64);
+    // A write between reads must be visible: batching adds no cached result.
+    yield* store.putCard({ ...expected[0]!, stage: "verified", settledAt: at });
+    assert.strictEqual((yield* store.summaryCards(boardId))[0]!.stage, "verified");
+  }).pipe(Effect.provide(TestLayer)),
+);

@@ -395,34 +395,42 @@ const make = Effect.gen(function* () {
   const summaryCards = (boardId: KanbanBoardId) =>
     runRead(
       "read summary cards",
-      Effect.flatMap(
-        sql<JsonRow>`
-          SELECT json_object(
-            'id', id,
-            'stage', stage,
-            'settledAt', json_extract(json, '$.settledAt'),
-            'activeThreadId', active_thread_id,
-            'asks', json(COALESCE((
-              SELECT json_group_array(json_patch(
-                json_object('closedAt', json_extract(ask.value, '$.closedAt')),
-                json_object(
-                  'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
-                  'handedAt', json_extract(ask.value, '$.handedAt'),
-                  'expiresAt', json_extract(ask.value, '$.expiresAt'),
-                  'snoozedUntil', json_extract(ask.value, '$.snoozedUntil'),
-                  'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
-                    THEN json_object('ack', json('true')) END
-                )
-              ))
-              FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
-            ), '[]'))
-          ) AS json
-          FROM ardud_kanban_cards
-          WHERE board_id = ${boardId}
-          ORDER BY number
-        `,
-        (rows) => decodeAll(rows, Summary.decode),
-      ),
+      Effect.gen(function* () {
+        const cards: Array<SummaryCard> = [];
+        let after = 0;
+        // Release the reader between batches; a board list must not monopolize
+        // the boards lane while SQLite parses every card's asks.
+        while (true) {
+          const rows = yield* sql<JsonRow & { number: number }>`
+            SELECT number, json_object(
+              'id', id,
+              'stage', stage,
+              'settledAt', json_extract(json, '$.settledAt'),
+              'activeThreadId', active_thread_id,
+              'asks', json(COALESCE((
+                SELECT json_group_array(json_patch(
+                  json_object('closedAt', json_extract(ask.value, '$.closedAt')),
+                  json_object(
+                    'clarifyAskedAt', json_extract(ask.value, '$.clarifyAskedAt'),
+                    'handedAt', json_extract(ask.value, '$.handedAt'),
+                    'expiresAt', json_extract(ask.value, '$.expiresAt'),
+                    'snoozedUntil', json_extract(ask.value, '$.snoozedUntil'),
+                    'respond', CASE WHEN json_extract(ask.value, '$.respond.ack') = 1
+                      THEN json_object('ack', json('true')) END
+                  )
+                ))
+                FROM json_each(ardud_kanban_cards.json, '$.asks') AS ask
+              ), '[]'))
+            ) AS json
+            FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${after}
+            ORDER BY number LIMIT 64
+          `;
+          cards.push(...(yield* decodeAll(rows, Summary.decode)));
+          if (rows.length < 64) return cards;
+          after = rows.at(-1)!.number;
+        }
+      }),
     );
   const card = (cardId: KanbanCardId) =>
     runRead(
