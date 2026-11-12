@@ -67,7 +67,7 @@ class ApiOutageTests(OutageBase):
         self.urlopen.side_effect = cf(525)
         with self.assertRaises(api.ApiError):
             api.cmd_start("bx", "true")
-        self.assertEqual(self.urlopen.call_count, 1 + api.CONNECT_RETRIES)
+        self.assertEqual(self.urlopen.call_count, 1)
 
     def test_resume_is_sent_once_on_525(self):
         self.urlopen.side_effect = cf(525)

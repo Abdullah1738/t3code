@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, misc, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, runs  # noqa: E402
 from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 
@@ -609,15 +609,17 @@ class NoBoxYetTests(WaitLockTests):
         self.assertEqual(rc, 124)
         self.assertEqual(self.row(), ('starting', None, None, None))
 
-    def test_nobox_dead_client_with_a_box_is_left_to_the_reaper(self):
-        # It had a box, so the start may have reached boat: wait must not mark it, only say so.
+    def test_nobox_dead_client_with_a_box_is_settled_unknown(self):
+        # With no box evidence, settle infra and retain the box reservation.
         self.con.execute("UPDATE runs SET client_pid=4242, box_id='bx_a' WHERE run_id='run-x'")
         self.con.commit()
         with patch.object(misc.os, 'kill', side_effect=ProcessLookupError):
             rc, out, err = self.cli_wait(['wait', 'run-x'], Clock())
         self.assertEqual(rc, 90)
         self.assertIn('offbox reap', err)
-        self.assertEqual(self.row(), ('starting', 'bx_a', None, None))
+        self.assertEqual(self.row(), ('infra', 'bx_a', None, None))
+        self.assertIn('offbox ssh bx_a', err)
+        self.assertGreater(lease.active_runs(self.con, 'bx_a'), 0)
         self.assert_no_crash()
 
     def test_nobox_wait_on_a_local_first_run_waits_for_its_end(self):

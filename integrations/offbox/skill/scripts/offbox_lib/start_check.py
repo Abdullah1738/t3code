@@ -1,0 +1,97 @@
+"""Box evidence for a command start whose response was lost. Callers hold the box lock."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import re
+import shlex
+import subprocess
+
+from . import ssh_sync
+from .common import OffboxError, event, now
+
+SSH_TIMEOUT_S = 10
+GRACE_S = 5
+REFUSED_RC = 98
+REFUSED_MARKER = 'offbox-claim-refused'
+
+
+@dataclass(frozen=True)
+class Result:
+    verdict: str = 'unknown'
+    code: int | None = None
+    pid: int | None = None
+
+
+def hint(box: str, run: str, pid: int | None = None) -> str:
+    receipt = f'offbox ssh {box} -- \'cat "$HOME/.offbox/exit/{run}.rc"\''
+    return receipt + (f'; logs: offbox ssh {box} -- \'cat "$HOME/.ascii/processes/{pid}.log"\'' if pid else '')
+
+
+def claims_enabled(con, run: str) -> bool:
+    return con.execute('SELECT 1 FROM kv WHERE k=?', (f'start_claim:{run}',)).fetchone() is not None
+
+
+def script(run: str, claim: bool) -> str:
+    # Only $r appears in the pgrep pattern: this checking shell must not match itself.
+    return '\n'.join([
+        f'r={shlex.quote(run)}',
+        'd="$HOME/.offbox/claim/$r"; c=legacy',
+        ('mkdir -p "$HOME/.offbox/claim" 2>/dev/null; '
+         'if mkdir "$d" 2>/dev/null; then c=won; : > "$d/by-fence"; '
+         'elif [ -f "$d/by-fence" ]; then c=won; '
+         'elif [ -d "$d" ]; then c=taken; else c=error; fi') if claim else ':',
+        '[ "$c" = won ] && rm -f "$HOME/.offbox/env/$r.env"',
+        'rc=-; [ -f "$HOME/.offbox/exit/$r.rc" ] && rc=$(cat "$HOME/.offbox/exit/$r.rc" 2>/dev/null)',
+        'p=x; if command -v pgrep >/dev/null 2>&1; then '
+        'pgrep -f "offbox/(claim/$r|exit/$r[.]rc)" >/dev/null 2>&1; s=$?; '
+        'case "$s" in 0) p=1;; 1) p=0;; esac; fi',
+        # Completion may race the first read and the process probe.
+        '[ -f "$HOME/.offbox/exit/$r.rc" ] && rc=$(cat "$HOME/.offbox/exit/$r.rc" 2>/dev/null)',
+        'pid=-; [ -f "$d/pid" ] && pid=$(cat "$d/pid" 2>/dev/null)',
+        'printf "offbox-start claim=%s rc=%s proc=%s pid=%s\\n" "$c" "$rc" "$p" "$pid"',
+    ])
+
+
+def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOUT_S) -> Result:
+    try:
+        p = ssh_sync.ssh(box, script(run, claim), timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError):
+        return Result()
+    m = re.search(r'^offbox-start claim=(won|taken|legacy|error) rc=(-|\d+) proc=([01x]) pid=(-|\d+)$',
+                  p.stdout.decode(errors='replace'), re.M) if p.returncode == 0 else None
+    if not m:
+        return Result()
+    c, rc, proc, pid = m.groups()
+    code = int(rc) if rc != '-' and 0 <= int(rc) <= 255 else None
+    wrapper_pid = int(pid) if pid != '-' and int(pid) > 1 else None
+    if code is not None:
+        return Result('started', code, wrapper_pid)
+    if proc == 'x' or c in ('error', 'legacy'):
+        return Result(pid=wrapper_pid)
+    if c == 'won' and proc == '0':
+        return Result('fenced')
+    return Result('started', pid=wrapper_pid)
+
+
+def settle(con, row, result: Result, reason: str, *, until: float | None = None) -> None:
+    """End the row, retaining a separate reservation whenever execution is still possible."""
+    rid, box = row['run_id'], row['box_id']
+    if result.code is not None:
+        from .runs import do_pulls
+        pulls = json.loads(row['pulls'] or '[]')
+        if pulls:
+            do_pulls(box, dict(row), pulls, until=until)
+        status, error = ('done' if result.code == 0 else 'failed'), None
+    elif result.verdict == 'fenced':
+        status, error = 'lost', f'{reason}; never started, nothing ran'
+        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
+    else:
+        status = 'infra'
+        error = f'{rid} on {box}: start unknown: {reason}; ssh check failed or command may still be running; {hint(box, rid)}'
+        con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_unknown:{rid}', box))
+    con.execute("UPDATE runs SET status=?, exit_code=?, end_at=?, error=?, process_id=COALESCE(?,process_id) "
+                "WHERE run_id=? AND status IN ('starting','running')",
+                (status, result.code, now(), error, result.pid, rid))
+    con.commit()
+    event(con, box, 'start_settled', f'{rid} {status} exit={result.code}: {error or reason}')

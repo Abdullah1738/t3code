@@ -11,6 +11,8 @@ from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
 REAP_BUDGET_S = 100
+START_GRACE_S = 300
+START_CHECKS_PER_PASS = 3
 # Leave cleanup time after a fair, bounded pass over run keepalives.
 RENEW_BUDGET_S = 60
 RENEW_BOX_BUDGET_S = 5
@@ -107,6 +109,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             con.execute("UPDATE runs SET status='lost', end_at=?, error=? WHERE run_id=? AND box_id IS NULL "
                         "AND status IN ('starting','running')", (now(), "client ended before it got a box", rid))
             con.commit()
+    start_budget = {'checks': START_CHECKS_PER_PASS}
     pooled = {r[0] for r in con.execute('SELECT box_id FROM pool_members')}
     snap = capacity.snapshot(con)
     protected = _protected(con)
@@ -191,7 +194,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             actions.append(f"prune hold {'released' if released else 'kept'} {bid}")
         running_runs = lease.active_runs(con, bid)
         if running_runs:
-            _check_stale_runs(con, bid, state, dry, actions)
+            _check_stale_runs(con, bid, state, dry, actions, start_budget)
             running_runs = lease.active_runs(con, bid)
             # Failed history reconciliation must not be overwritten by release_if_confirmed's generic lost update.
             if running_runs:
@@ -348,24 +351,51 @@ def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
             continue
 
 
-def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
+def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str], budget=None) -> None:
     try:
-        with file_lock('box-'+bid, timeout=0), api.budget(RENEW_BOX_BUDGET_S):
-            _check_unlocked(con, bid, state, dry, actions)
+        with file_lock('box-'+bid, timeout=0), api.budget(RENEW_BOX_BUDGET_S + 10):
+            _check_unlocked(con, bid, state, dry, actions, budget)
     except OffboxError:
         pass
 
 
-def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
+def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], budget=None) -> None:
     """Runs marked running on a box that is stopped, or whose process ended while nobody was attached."""
     from .runs import confirmed_lost, reconcile_lost
+    from . import start_check
+    from .misc import _client_alive
+    budget = budget if budget is not None else {'checks': START_CHECKS_PER_PASS}
+    if not dry and state in api.STOPPED_STATES and con.execute(
+            "SELECT 1 FROM kv WHERE k LIKE 'start_unknown:%' AND v=?", (bid,)).fetchone():
+        lease._release_locked(con, bid)
     if not dry:
         reconcile_lost(con, bid, state=state)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status IN ('starting','running')", (bid,)).fetchall():
         status, code = None, None
-        if run['status'] == 'starting' and not run['process_id'] and now()-(run['start_at'] or 0) < 3600:
-            continue
+        unattached = con.execute('SELECT 1 FROM kv WHERE k=?', (f"start_unattached:{run['run_id']}",)).fetchone()
+        if (run['status'] == 'starting' and not run['process_id']) or unattached:
+            age = now() - (run['start_at'] or 0)
+            orphan = bool(run['error']) or not _client_alive(run['client_pid'], run['start_at'])
+            if orphan and age >= START_GRACE_S:
+                if dry:
+                    actions.append(f"would check run {run['run_id']} on {bid} over ssh")
+                    continue
+                left = api.left()
+                if budget['checks'] <= 0 or (left is not None and left < start_check.SSH_TIMEOUT_S + 2):
+                    continue
+                budget['checks'] -= 1
+                modern = start_check.claims_enabled(con, run['run_id'])
+                result = (start_check.check(bid, run['run_id'], claim=modern)
+                          if state in api.LIVE_STATES else start_check.Result())
+                # Legacy wrappers cannot be fenced; receipts are still authoritative.
+                if modern or result.code is not None:
+                    start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
+                                       until=None if api.left() is None else now() + max(0, api.left()))
+                    actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
+                    continue
+            if age < 3600 or not orphan:
+                continue
         if state in api.STOPPED_STATES or state in ('error','cancelled'):
             status = "lost"
             if run['command_id']:

@@ -223,7 +223,10 @@ def cmd_run(a, me) -> int:
         if e.code == EXIT_INFRA and not isinstance(e, capacity.CapacityError):
             fallback.note_infra_failure(str(e))
         if e.started:
-            say(f"remote run failed after the command started: {e}. Not re-running locally (it may have side effects).")
+            from .start_check import hint
+            check = hint(e.box, e.run_id) if e.box and e.run_id else 'offbox list'
+            say(f"remote run {e.run_id or 'unknown'} on {e.box or 'unknown box'} failed after the command may have "
+                f"started: {e}. Not re-running locally (it may have side effects). Check: {check}")
             return e.code
         if a.no_fallback or a.remote:
             say(str(e))

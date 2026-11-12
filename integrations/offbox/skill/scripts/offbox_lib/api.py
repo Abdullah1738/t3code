@@ -798,7 +798,8 @@ def cmd_start(box_id: str, command: str, cwd: str | None = None) -> dict:
     body = {"command": command, "detached": True}
     if cwd:
         body["cwd"] = cwd
-    return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
+    # Every run ID is submitted once; ambiguous proxy errors are settled by the wrapper claim over SSH.
+    return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0, connect_retries=0)
 
 
 def cmd_status(box_id: str, pid: int, timeout: float = 60, retries: int = 2,

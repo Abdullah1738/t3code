@@ -282,6 +282,12 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   Only a confirmed missing process with no saved exit returns 90. `offbox wait` on a wrongly-lost run recovers
   its saved exit code and corrects the row, or re-attaches while its process is alive. After a confirmed loss,
   inspect the box with `offbox ssh <box>` before rerunning.
+  After a network error or a non-Cloudflare 5xx on start, offbox checks the box over SSH. Its atomic start claim
+  prevents a late copy from running: “Nothing ran” retries through the outage wait with a new run ID; an exit
+  receipt supplies the real result; an unknown start ends as infra and reserves the box until it stops. The
+  message gives the run ID, box and receipt check command. `offbox wait` and `offbox reap` use the same check
+  for a dead client's unrecorded start. Claims remain for the box's lifetime.
+
 - Three ordinary infra failures within an hour send one Telegram; start-limit alerts use the six-hour cooldown.
 
 ## Troubleshooting

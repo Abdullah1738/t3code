@@ -173,13 +173,14 @@ class RemoteWrapperTests(unittest.TestCase):
             cases = [(['false'], 1), (['exit 3'], 3), (['true'], 0), (['sh', '-c', 'kill -KILL $$'], 137)]
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.object(runs, 'LDCACHE_REPAIR', ':'):
-                for argv, code in cases:
+                for i, (argv, code) in enumerate(cases):
+                    run_id = f"run-test-{i}"
                     with self.subTest(argv=argv):
-                        script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
-                        cmd = runs.exit_recording_command(script, 'run-test')
+                        script = runs.remote_script('w/repo', 'sub', argv, None, run_id)
+                        cmd = runs.exit_recording_command(script, run_id)
                         p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=10)
                         self.assertEqual(p.returncode, code)
-                        rc_file = Path(home) / '.offbox/exit/run-test.rc'
+                        rc_file = Path(home) / f'.offbox/exit/{run_id}.rc'
                         self.assertEqual(rc_file.read_text().strip(), str(code))
                 steps_script = runs.remote_script('w/repo', 'sub', ['true; false; exit 4'], None, 'run-test',
                                                   steps=['true', 'false', 'exit 4'])
