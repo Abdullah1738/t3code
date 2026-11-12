@@ -1,8 +1,8 @@
 /**
- * Every open ask across boards (or on one), for the Needs-you page, in one
- * cheap read. It never decodes a board's cards: SQLite picks the cards that
+ * Every open ask across boards (or on one), for the Needs-you page, in bounded
+ * reader statements. It never decodes a board's cards: SQLite picks the cards that
  * hold a matching ask with a substring test on the stored JSON (no JSON parse
- * for the rest), and only those come back, trimmed to the few card fields the
+ * for the rest), trimmed to the few card fields the
  * page shows plus their matching asks.
  */
 import {
@@ -71,33 +71,52 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
   at: string,
 ) {
   const since = input.closedSince ?? null;
-  const cardRows = yield* sql<JsonRow>`
-    SELECT json_object(
-      'id', c.id,
-      'boardId', c.board_id,
-      'number', c.number,
-      'title', substr(json_extract(c.json, '$.title'), 1, 512),
-      'stage', c.stage,
-      'priority', json_extract(c.json, '$.priority'),
-      'discussionId', json_extract(c.json, '$.discussionId'),
-      'settledAt', json_extract(c.json, '$.settledAt'),
-      'asks', json(COALESCE((
-        SELECT json_group_array(json(ask.value))
-        FROM json_each(c.json, '$.asks') AS ask
-        WHERE json_extract(ask.value, '$.closedAt') IS NULL
-          OR (${since} IS NOT NULL AND json_extract(ask.value, '$.closedAt') >= ${since})
-      ), '[]'))
-    ) AS json
-    FROM ardud_kanban_cards c
-    WHERE ${input.boardId === undefined ? sql`1 = 1` : sql`c.board_id = ${input.boardId}`}
-      AND (instr(c.json, ${OPEN_MARK}) > 0
-        OR (${since} IS NOT NULL AND instr(c.json, ${CLOSED_MARK}) > 0))
-    ORDER BY c.board_id, c.number
-  `;
   const cards: Array<FeedCard> = [];
-  for (const row of cardRows) {
-    const card = yield* decodeCard(row.json);
-    if (card.asks.length > 0) cards.push(card);
+  let boardAfter = input.boardId ?? "";
+  let numberAfter = 0;
+  while (true) {
+    // Limit the input before filtering JSON: LIMIT after the ask predicate can
+    // still scan the entire board when its last cards have no matching asks.
+    const cardRows = yield* sql<{ boardId: string; number: number; json: string | null }>`
+      WITH page AS MATERIALIZED (
+        SELECT id, board_id, number FROM ardud_kanban_cards
+        WHERE ${
+          input.boardId === undefined
+            ? sql`(board_id, number) > (${boardAfter}, ${numberAfter})`
+            : sql`board_id = ${input.boardId} AND number > ${numberAfter}`
+        }
+        ORDER BY board_id, number LIMIT 64
+      )
+      SELECT c.board_id AS boardId, c.number, CASE WHEN
+        instr(c.json, ${OPEN_MARK}) > 0
+        OR (${since} IS NOT NULL AND instr(c.json, ${CLOSED_MARK}) > 0)
+      THEN json_object(
+        'id', c.id,
+        'boardId', c.board_id,
+        'number', c.number,
+        'title', substr(json_extract(c.json, '$.title'), 1, 512),
+        'stage', c.stage,
+        'priority', json_extract(c.json, '$.priority'),
+        'discussionId', json_extract(c.json, '$.discussionId'),
+        'settledAt', json_extract(c.json, '$.settledAt'),
+        'asks', json(COALESCE((
+          SELECT json_group_array(json(ask.value))
+          FROM json_each(c.json, '$.asks') AS ask
+          WHERE json_extract(ask.value, '$.closedAt') IS NULL
+            OR (${since} IS NOT NULL AND json_extract(ask.value, '$.closedAt') >= ${since})
+        ), '[]'))
+      ) END AS json
+      FROM page p JOIN ardud_kanban_cards c ON c.id = p.id
+      ORDER BY c.board_id, c.number
+    `;
+    for (const row of cardRows) {
+      if (row.json === null) continue;
+      const card = yield* decodeCard(row.json);
+      if (card.asks.length > 0) cards.push(card);
+    }
+    if (cardRows.length < 64) break;
+    boardAfter = cardRows.at(-1)!.boardId;
+    numberAfter = cardRows.at(-1)!.number;
   }
 
   const boardRows =
