@@ -209,7 +209,7 @@ class RunTests(NoNetwork):
         with patch.object(prune.ssh_sync, "ssh", side_effect=self.fake_ssh(self.home.name, self.bindir.name,
                                                                           self.calls, exc)) as m, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            n = prune.run(self.con, "bx", "w/keep-cccccc")
+            n = prune.run(self.con, "bx", "w/keep-cccccc").pruned
         return n, m, err.getvalue()
 
     def test_prunes_stale_and_records_event(self):
@@ -260,7 +260,7 @@ class RunTests(NoNetwork):
             return subprocess.CompletedProcess(["ssh"], 255, b"", b"ssh: connect failed")
         with patch.object(prune.ssh_sync, "ssh", side_effect=failing):
             with contextlib.redirect_stderr(io.StringIO()):
-                n = prune.run(self.con, "bx", "w/keep-cccccc")
+                n = prune.run(self.con, "bx", "w/keep-cccccc").pruned
         self.assertEqual(n, 0)
         self.assertEqual(prune.kv_get(self.con, "prune:bx")["left"], 2)
         n, _, _ = self.run_prune()  # inside RETRY_S: throttled, no second ssh
@@ -320,7 +320,7 @@ class RunTests(NoNetwork):
             with patch.object(prune, "BUDGET_S", 2), patch.object(prune, "BACKGROUND", "true"), \
                     patch.object(prune.ssh_sync, "ssh", side_effect=ssh_gives_up_while_worker_alive), \
                     contextlib.redirect_stderr(io.StringIO()):
-                n = prune.run(self.con, "bx", "w/keep-cccccc")
+                n = prune.run(self.con, "bx", "w/keep-cccccc").pruned
             # run() returned while the worker is alive; the worker is still running and must not have renamed
             # the candidate. The box must be recorded as pending, not settled.
             self.assertEqual(n, 0)
@@ -409,7 +409,7 @@ class RunTests(NoNetwork):
         with patch.object(prune, "CALLER_BUDGET_S", 20), patch.object(prune.ssh_sync, "ssh", side_effect=timing_out), \
                 contextlib.redirect_stderr(io.StringIO()):
             t0 = time.monotonic()
-            n = prune.run(self.con, "bx", "w/keep-cccccc")
+            n = prune.run(self.con, "bx", "w/keep-cccccc").pruned
             elapsed = time.monotonic() - t0
         self.assertEqual(n, 0)
         self.assertLessEqual(seen["probe_timeout"], 20)  # the probe never gets more than the caller budget
@@ -546,7 +546,7 @@ class RunTests(NoNetwork):
         with patch.object(prune, "BACKGROUND", "true"), \
                 patch.object(prune.ssh_sync, "ssh", side_effect=timeout_then_probe_ok), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            n = prune.run(self.con, "bx", "w/keep-cccccc")
+            n = prune.run(self.con, "bx", "w/keep-cccccc").pruned
         self.assertNotIn("UnboundLocalError", err.getvalue())
         self.assertEqual(n, 0)  # nothing was actually pruned (the probe does not report per-dir outcomes)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM prune_holds WHERE box_id='bx'").fetchone()[0], 0)
@@ -1032,8 +1032,8 @@ class RunnerHookTests(NoNetwork):
                 patch.object(runs.ssh_sync, "put_file"), \
                 patch.object(runs.ssh_sync, "push", side_effect=lambda *a, **k: order.append("push") or {}), \
                 patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \
-                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
-                patch.object(runs.prune, "run", side_effect=lambda con, box, d: order.append(("prune", box, d)) or 0) as pr, \
+                patch.object(runs.ssh_sync, "probe_home", return_value=(None, None)), \
+                patch.object(runs.prune, "run", side_effect=lambda con, box, d: order.append(("prune", box, d)) or prune.Result()) as pr, \
                 patch.object(api, "cmd_start", side_effect=api.ApiError(400, "x", "y")), \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(common.OffboxError):

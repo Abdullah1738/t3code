@@ -461,7 +461,7 @@ class RunnerImageSelectionTests(Isolated):
                  (['--step', 'true', '--step', 'echo ' + 'x' * 4000 + '; docker ps'], True, True)]
         with contextlib.redirect_stderr(io.StringIO()), \
              patch.object(runs.pool, 'acquire', return_value=row), \
-             patch.object(runs.Runner, '_prepare_box'), \
+             patch.object(runs.Runner, '_prepare_box', return_value=None), \
              patch.object(runs.api, 'cmd_start', return_value={'processId': 7}), \
              patch.object(runs.lease, 'touch'), patch.object(runs.node_version, 'want', return_value=None):
             for argv, expected, docker_used in cases:

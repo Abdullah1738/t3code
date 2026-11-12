@@ -1,0 +1,36 @@
+{
+  "file": "rollout-2026-11-12T01-27-25-01a1cc82-2a25-7893-a13f-6443f5139c94.jsonl",
+  "timestamp": "2026-11-11T21:29:33.747Z",
+  "session_cwd": "/Volumes/ExternalSSD/t3code-fork",
+  "payload": {
+    "type": "custom_tool_call",
+    "id": "ctc_05b495d3759af33b016af4de2eb7ac87d0bc75dc20f17fddcf",
+    "status": "completed",
+    "call_id": "call_a79cbd4ccc094db585f578d35802515b",
+    "name": "exec",
+    "input": "text(await tools.exec_command({cmd:\"mkdir -p tmp/card-675\\ncp /Users/ardud/checkouts/apalache-patched-787/tmp/card-787/build3/apalache-0.62.4-grpc-1.75.0.tgz tmp/card-675/\\nshasum -a 256 tmp/card-675/apalache-0.62.4-grpc-1.75.0.tgz\\ntar xzf tmp/card-675/apalache-0.62.4-grpc-1.75.0.tgz -C tmp/card-675\\nshasum -a 256 tmp/card-675/apalache/lib/apalache.jar\",workdir:\"/Users/ardud/checkouts/quint-guard-675\",yield_time_ms:1000,max_output_tokens:1000}));\ntext(await tools.exec_command({cmd:\"rg --files --hidden --no-ignore /Users/ardud/.npm /Users/ardud/.nvm /Users/ardud/.cache /Users/ardud/.local /Users/ardud/.robob /Users/ardud/.config -g '*apalache*.jar' -g '*apalache*.tgz' -g '*apalache*.zip' -g '!statev2.sqlite*' -g '!opencode.db*' > /tmp/card675-cache-paths.txt\\nwc -l /tmp/card675-cache-paths.txt\",yield_time_ms:1000,max_output_tokens:1000}));\ntext(await tools.exec_command({cmd:\"nl -ba /Users/ardud/.nvm/versions/node/v26.2.0/lib/node_modules/@informalsystems/quint/dist/src/config.js | head -65\\nrg -n 'fetchApalache|apalacheDistDir|QUINT_HOME' /Users/ardud/.nvm/versions/node/v26.2.0/lib/node_modules/@informalsystems/quint/dist/src -g '*.js' | head -25\",max_output_tokens:2000}));\n",
+    "internal_chat_message_metadata_passthrough": {
+      "turn_id": "01a1cc82-327d-7542-a23e-615b0953ba8c",
+      "create_time": 1794432558.7258713
+    }
+  },
+  "commands": [
+    {
+      "cmd": "mkdir -p tmp/card-675\ncp /Users/ardud/checkouts/apalache-patched-787/tmp/card-787/build3/apalache-0.62.4-grpc-1.75.0.tgz tmp/card-675/\nshasum -a 256 tmp/card-675/apalache-0.62.4-grpc-1.75.0.tgz\ntar xzf tmp/card-675/apalache-0.62.4-grpc-1.75.0.tgz -C tmp/card-675\nshasum -a 256 tmp/card-675/apalache/lib/apalache.jar",
+      "workdir": "/Users/ardud/checkouts/quint-guard-675",
+      "sha256": "d3cfbdbf8c5d38fce166d13a5fc73f76d15441196909b7998a8fd8da08632308"
+    },
+    {
+      "cmd": "rg --files --hidden --no-ignore /Users/ardud/.npm /Users/ardud/.nvm /Users/ardud/.cache /Users/ardud/.local /Users/ardud/.robob /Users/ardud/.config -g '*apalache*.jar' -g '*apalache*.tgz' -g '*apalache*.zip' -g '!statev2.sqlite*' -g '!opencode.db*' > /tmp/card675-cache-paths.txt\nwc -l /tmp/card675-cache-paths.txt",
+      "workdir": "/Volumes/ExternalSSD/t3code-fork",
+      "sha256": "d88b050e97a348b778bb41c52c44eb90793df881ee7f0abafc8ed96c90680c7e"
+    },
+    {
+      "cmd": "nl -ba /Users/ardud/.nvm/versions/node/v26.2.0/lib/node_modules/@informalsystems/quint/dist/src/config.js | head -65\nrg -n 'fetchApalache|apalacheDistDir|QUINT_HOME' /Users/ardud/.nvm/versions/node/v26.2.0/lib/node_modules/@informalsystems/quint/dist/src -g '*.js' | head -25",
+      "workdir": "/Volumes/ExternalSSD/t3code-fork",
+      "sha256": "6e9b84ee2d46d324c5043423ccbb05daa6bb89a0d73cac155d74268188d78a14"
+    }
+  ],
+  "case": "v",
+  "hook_provenance": "Reconstructed native Bash.command + cwd; raw hook stdin was not retained."
+}

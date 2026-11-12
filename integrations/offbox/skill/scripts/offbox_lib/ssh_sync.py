@@ -145,20 +145,47 @@ def dead_mount(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-def probe_home(box_id: str, timeout: float = 45) -> str | None:
+def _write_seconds(output: bytes) -> float | None:
+    match = re.search(rb"^OFFBOX_WRITE_SECONDS ([0-9]+(?:\.[0-9]+)?)$", output, re.M)
+    return float(match[1]) if match else None
+
+
+def _timed_write(privileged: bool = False) -> str:
+    sudo = "sudo -n " if privileged else ""
+    return (f"{{ trap '{sudo}rm -f -- \"$p\"' EXIT; export LC_ALL=C; TIMEFORMAT='OFFBOX_WRITE_SECONDS %R'; "
+            f'{{ time {sudo}dd if=/dev/zero of="$p" bs=1M count=1 conv=fsync; }} 2>&1; }}')
+
+
+def probe_home(box_id: str, timeout: float = 45, *, measure_write: bool = False) -> tuple[str | None, float | None]:
     """The matched dead-mount error when $HOME on the box can't be written, else None (also None when the probe
-    can't tell: the sync still catches it). Creates nothing outside .offbox, so a --no-sync run still sees a
-    missing remote dir."""
+    can't tell: the sync still catches it), plus the optional fsync duration. Creates nothing outside .offbox,
+    so a --no-sync run still sees a missing remote dir. Timing is remote, excluding SSH connection latency."""
+    script = 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && '
+    script += _timed_write() if measure_write else ': > "$p" && rm -f -- "$p"'
+    script += ' && echo OFFBOX_PROBE_OK'
     try:
-        p = ssh(box_id, 'cd "$HOME" && mkdir -p .offbox && p=".offbox/probe-$$" && : > "$p" && rm -f -- "$p" '
-                        '&& echo OFFBOX_PROBE_OK', timeout=timeout)
+        p = ssh(box_id, "bash -c " + shlex.quote(script), timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"probe {box_id} inconclusive ({type(e).__name__})")
-        return None
+        return None, None
     text = (p.stdout + p.stderr).decode(errors="replace")
     if p.returncode == 0 and "OFFBOX_PROBE_OK" in text:
+        return None, _write_seconds(p.stdout) if measure_write else None
+    return dead_mount(text), None
+
+
+def probe_docker_root(box_id: str, timeout: float = 45) -> float | None:
+    """Best effort fsync on Docker's disk; missing or wedged Docker is handled by image readiness."""
+    try:
+        info = ssh(box_id, "docker info -f '{{.DockerRootDir}}'", timeout=10)
+        root = info.stdout.decode(errors="replace").strip()
+        if info.returncode or not root.startswith("/") or "\n" in root:
+            return None
+        script = f'p={shlex.quote(root)}/.offbox-probe-$$; ' + _timed_write(privileged=True)
+        p = ssh(box_id, "bash -c " + shlex.quote(script), timeout=timeout)
+        return _write_seconds(p.stdout) if p.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
         return None
-    return dead_mount(text)
 
 
 def _gitinfo_exclude(root: Path) -> list[str]:

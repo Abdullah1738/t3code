@@ -8,7 +8,7 @@ import os
 import time
 
 from . import capacity
-from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
+from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      now, say)
 from .identity import remote_dir_for
 
@@ -174,17 +174,17 @@ def candidates(con, key, size, source, me=None):
     return out, not full
 
 
-def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None):
+def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, exclude=None):
     from . import allocation
     con = db()
     try:
         with allocation.scope(me['repo_key']):
-            return _acquire(con, me, size, template, base, fresh, run_id)
+            return _acquire(con, me, size, template, base, fresh, run_id, exclude)
     finally:
         con.close()
 
 
-def _acquire(con, me, size, template, base, fresh, run_id):
+def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
     from . import allocation, api, lease, outage
     from .identity import require_proven
     # A pooled box is mapped to the caller's owner string. An unproven caller's string is shared, so it can't take one.
@@ -206,7 +206,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
     next_progress = 0
     create_first = False
     resume_stall = None
-    unusable = set()
+    unusable = set(exclude or ())
     pending_retries = set()
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
@@ -239,7 +239,7 @@ def _acquire(con, me, size, template, base, fresh, run_id):
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               "WHERE l.repo_key=? AND l.state IN ('running','stopped') "
                               "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone()
-        if create_first:
+        if create_first or (pending and pending['box_id'] in unusable):
             pending = None
         if pending:
             bid = pending["box_id"]
@@ -564,6 +564,84 @@ def _acquire(con, me, size, template, base, fresh, run_id):
                     f"{busy}/{cap} busy, {waiting} other caller(s) waiting")
             next_progress = t + PROGRESS_EVERY_S
         time.sleep(min(2, max(0, deadline-time.monotonic())))
+
+
+def try_warm(me, size, source, exclude, run_id):
+    """Claim a free running peer once, without resuming, growing or creating a box."""
+    from . import api, lease, ssh_sync
+    con = db()
+    try:
+        capacity.schema(con)
+        key = me['repo_key']
+        source = source.replace('recipe:', 'template:', 1) if source else None
+        got = None
+        with _pool_lock(key, time.monotonic() + 1, 0):
+            rows, _ = candidates(con, key, size, source, me)
+            for row in rows:
+                bid = row['box_id']
+                if bid in exclude or row['state'] != 'running' or row['size'] != size:
+                    continue
+                guard = file_lock('box-' + bid, timeout=0)
+                try:
+                    guard.__enter__()
+                except OffboxError:
+                    continue
+                claimed = False
+                try:
+                    # A prior holder may have changed the lease or marked it cold after our first scan.
+                    current, _ = candidates(con, key, size, source, me)
+                    row = next((r for r in current if r['box_id'] == bid), None)
+                    if row is None or row['state'] != 'running' or row['size'] != size or lease.active_runs(con, bid):
+                        continue
+                    if con.execute("SELECT 1 FROM events WHERE box_id=? AND kind='cold_home' AND ts>? LIMIT 1",
+                                   (bid, now() - 15 * 60)).fetchone():
+                        continue
+                    if con.execute("SELECT 1 FROM kv WHERE k IN (?,?)",
+                                   (f'resume_unanswered:{bid}', f'resume_provision:{bid}')).fetchone():
+                        continue
+                    got = dict(row)
+                    con.execute('INSERT OR REPLACE INTO pool_members VALUES (?,?)', (bid, key))
+                    con.commit()
+                    got['_guard'] = guard
+                    claimed = True
+                    break
+                finally:
+                    if not claimed:
+                        guard.__exit__(None, None, None)
+        if got is not None:
+            claimed = False
+            try:
+                # The peer's idle TTL can expire during a first push. Refresh outside the pool lock,
+                # still holding its box guard, before changing the run's assignment.
+                try:
+                    with api.budget(10):
+                        if not lease.ensure_ttl(got['box_id'], RUN_TTL_S):
+                            return None
+                        # A cached running lease and a successful TTL update can both outlive its machine.
+                        peer = api.get(got['box_id'], deadline=time.time() + 10)
+                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') \
+                                or peer.get('type') != got['size']:
+                            return None
+                        left = api.left()
+                        if left is not None and left <= 0:
+                            return None
+                        ready = ssh_sync.ssh(got['box_id'], 'true', timeout=min(10, left) if left is not None else 10)
+                        if ready.returncode != 0:
+                            return None
+                except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
+                    return None
+                _claim(con, me, got, run_id)
+                claimed = True
+                return got
+            finally:
+                if not claimed:
+                    release_guard(got)
+    except OffboxError:
+        # A contended pool is optional here: keep the already-held cold box.
+        return None
+    finally:
+        con.close()
+    return None
 
 
 def _claim(con, me, row, run_id):
