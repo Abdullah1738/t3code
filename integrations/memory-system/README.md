@@ -263,3 +263,84 @@ MCP/Starlette dependencies.
 Deploy: `integrations/deploy.zsh memory-system`, then
 `launchctl kickstart -k gui/$(id -u)/com.abdullah.recall`.
 The deploy installs `~/.local/bin/recall` from `scripts/recall`, so cutovers must not leave a hand-edited stub; redeploy instead.
+
+## Redacting a secret
+
+Run only after approval to destroy the affected recall data and backup history.
+First rewrite the provider/Robob source transcripts (the thread-item redaction
+workflow). Recall does not rewrite those sources or previously injected notes
+in other applications. Revoke the credential separately.
+
+Supply the literal in an **owned 0600 file**, with no trailing newline. Never
+put it in shell arguments, environment variables, a reason, a search or a log.
+Use an incident identifier for the reason. Preview and save count-only results:
+
+```sh
+recall redact --session SESSION --item CALL_ID --needle-file /private/path/needle --reason INCIDENT --dry-run
+recall redact --session SESSION --item CALL_ID --needle-file /private/path/needle --reason INCIDENT --yes > /private/path/result.json
+recall redact-backups --needle-file /private/path/needle --paths-from /private/path/result.json --dry-run
+recall redact-backups --needle-file /private/path/needle --paths-from /private/path/result.json --yes
+```
+
+Either the session/item pair or the needle is sufficient for `redact`; use both
+for a secret incident. Only the needle sweeps uncited copies in logs and other
+sessions. Every store reports `matchedBefore`, `replaced`, `remainingAfter`;
+`verify` covers the selected stores, not copies outside recall or Dropbox
+version history. A dry run never verifies a purge. Errors return a count without
+child output or a traceback; rerun a dry run to inspect remaining counts.
+
+The sweep covers SQLite files and flat logs under the integration's `data/` and
+`logs/`: memory events, both FTS indexes, lossless native journals, compressed
+OpenCode raw payloads, catalog first prompts/titles, hot search excerpts, rules
+and inject/plugin/capture logs. Matching log lines are replaced atomically with
+the same permissions. Database writes use secure deletion, FTS deletion using
+old content, optimization, VACUUM and truncating WAL checkpoints. Cold event IDs
+also select hot-index rows whose stored excerpt omits the secret; verification
+queries both FTS indexes. A busy reader
+fails verification instead of leaving an unchecked WAL. This needs free space
+for VACUUM and can take a long time on the full memory store.
+
+Capture, backup, cold finalization and recall server requests share a maintenance
+fence. Active work prevents redaction; retry when it finishes. The server rejects
+new requests during maintenance and invalidates cached notes afterwards.
+Deploy and restart the updated recall server **before** applying these commands;
+old running server code does not participate in the fence. Sync cursors reset
+for replay rather than jumping to EOF, preserving uncaptured records after a
+source rewrite. Identifier tombstones, including existing native capture identities for records
+without JSON IDs, suppress known items in raw capture and projection; no needle or needle digest is retained. Source-file matches make
+verification fail. New copies with different identities still require a fresh
+needle sweep; source cleanup must precede resumed capture and backups.
+
+`redact-backups` scrubs the replica stage, enumerates every restic snapshot,
+rewrites affected file paths with `--forget`, prunes with `--max-unused 0`, and
+rebuilds the transcript manifests and backs up the sanitized stage. Historical SQLite/WAL and compressed transcript
+containers are identified by headers as well as known sidecar names, and excluded
+conservatively: a byte search cannot prove absence
+inside compressed cells. This removes **whole historical files**, not just one
+item; inspect the dry-run snapshot counts. Unaffected plain files remain.
+The cold archive is also a restic repo. If its local copy was finalized away,
+the command downloads and verifies the encrypted Dropbox copy to temporary
+storage, rewrites/prunes it, then mirrors both repos with remote deletion.
+Old cold files have no replacement when their original source no longer exists.
+Restic passwords use the existing `RESTIC_PASSWORD_COMMAND`/`RESTIC_PASSWORD`
+configuration (production Keychain service `restic-memory-backup`).
+
+Dropbox's mirror uses `files/delete_batch`, not permanent deletion. Its personal
+OAuth client cannot use the team-only `files/permanently_delete` endpoint.
+Deleted packs remain **restic encrypted** in Dropbox recovery/version history.
+The account's exact retention/add-ons are not established by this tool;
+`dropboxRetentionDays` is therefore null and `dropboxHistoryPurged` is false.
+[Dropbox's documented windows](https://help.dropbox.com/delete-restore/version-history-overview)
+are 30 days for Basic/Plus/Family, 180 for Professional/Essentials/Business/Standard,
+and 365 for Business Plus/Advanced/Enterprise, with possible extensions.
+[Dropbox also says](https://help.dropbox.com/delete-restore/deleted-files)
+normal storage removal can take up to 90 days after the recovery window.
+[The API restriction](https://github.com/dropbox/dropbox-sdk-python/blob/main/dropbox/base.py)
+means mirror success is not proof that Dropbox history was purged.
+
+For fixtures, both commands accept `--root`; backup also accepts `--repository`,
+`--stage`, `--cold-repository` and Dropbox destination overrides. `--local-only`
+explicitly limits backup verification to the local replica/repo and skips cold
+archive/Dropbox. Never use that flag to claim a production incident is removed
+from every store. SQLite 3.47+, restic with `rewrite`, and zstd for compressed
+transcripts are required. Fixture tests: `python3 -m pytest tests/test_redact.py`.

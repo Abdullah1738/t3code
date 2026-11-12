@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import sqlite3
+import redact_guard
 import stat
 import sys
 import time
@@ -237,6 +238,7 @@ class ClaudeSync:
             [e for e in transcript_roots.load() if e["driver"] == DRIVER])
         self.all_roots = [r for r in transcript_roots.resolve() if r["driver"] == DRIVER]
         self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         schema_migrations.migrate(self.mem)
         tc.ensure_schema(self.mem)
         self.seed_roots = list(self.roots) + list(self.all_roots)
@@ -351,15 +353,18 @@ class ClaudeSync:
             if raw:
                 self.mem.executemany(
                     "INSERT INTO native_capture_raw(source, path, rep_id, line_no, sha1, raw) VALUES(?,?,?,?,?,?)",
-                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(line), sqlite3.Binary(line)) for line, ln in raw],
+                    [(SOURCE, path, rep["rep_id"], ln, tc.raw_sha1(safe_line), sqlite3.Binary(safe_line))
+                     for line, ln in raw for safe_line in [self.redactor.raw(line, session=session_key, capture_id=(SOURCE,tc.raw_sha1(line)))]],
                 )
             if events:
                 self.mem.executemany(
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, key, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
-                     for tid, ts, spk, ctype, content, model, m, key in events],
+                    [(SOURCE, key, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                     for tid, ts, spk, ctype, content, model, m, key in events
+                     for safe_content, safe_meta in [self.redactor.event(
+                         SOURCE, key, tid, content, json.dumps(m, ensure_ascii=False))]],
                 )
             tc.record_ok(self.mem, rep["rep_id"], pos, st.st_size, st.st_mtime, lines_total,
                          tail=tc.tail_sha1(path, pos) if pos else None,

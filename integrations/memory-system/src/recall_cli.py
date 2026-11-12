@@ -169,9 +169,47 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source-session", default="")
     p.add_argument("--rules-db", default=os.environ.get("RECALL_RULES_DB", str(rc.DATA / "recall_rules.db")))
 
+    for command in ('redact', 'redact-backups'):
+        p = sub.add_parser(command, help='count-only redaction; requires approved --yes to write')
+        p.add_argument('--needle-file', required=command == 'redact-backups')
+        p.add_argument('--root', default=os.environ.get('MEMORY_ROOT', str(rc.ROOT)))
+        p.add_argument('--dry-run', action='store_true')
+        p.add_argument('--yes', action='store_true')
+        if command == 'redact':
+            p.add_argument('--session')
+            p.add_argument('--item')
+            p.add_argument('--reason', required=True, help='incident identifier; no secret text')
+        else:
+            backup_root = '/Volumes/ExternalSSD/memory-system-backup'
+            p.add_argument('--repository', default=backup_root+'/restic/live')
+            p.add_argument('--stage', default=backup_root+'/replica')
+            p.add_argument('--paths-from')
+            p.add_argument('--cold-repository', default=backup_root+'/restic/cold-archive')
+            p.add_argument('--dropbox-destination', default='/Backups/memory-system/live')
+            p.add_argument('--cold-destination', default='/Backups/memory-system/cold-archive')
+            p.add_argument('--local-only', action='store_true', help='fixtures/local repo only; excludes Dropbox and cold archive')
+
     a = ap.parse_args(argv)
+    if a.cmd in ('redact', 'redact-backups'):
+        try:
+            if a.cmd == 'redact':
+                from redact import run
+            else:
+                from redact_backups import run
+            result = run(a)
+            print(json.dumps(result))
+            return 0 if result['verify'] or a.dry_run else 1
+        except Exception:
+            # Even a SQLite/path/JSON error can contain the needle. No traceback,
+            # payload, reason, hash, length or subprocess output may escape.
+            print(json.dumps({'verify': False, 'errors': 1}), file=sys.stderr)
+            return 2
+
     out = lambda obj, text: print(json.dumps(obj, indent=1, default=str) if a.json else text)  # noqa: E731
 
+    from redact_lock import fence
+    lease = fence(rc.ROOT)
+    lease.__enter__()
     try:
         if a.cmd == "remember":
             from recall_rules import RuleIndex
@@ -237,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except BrokenPipeError:
         return 0
+    finally:
+        lease.__exit__(None, None, None)
     return 0
 
 

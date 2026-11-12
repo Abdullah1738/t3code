@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recall_ask as ra  # noqa: E402
 import recall_cli as cli  # noqa: E402
 import recall_core as rc  # noqa: E402
+from redact_lock import fence  # noqa: E402
 from recall_admission import OptionalLane, CheckLane, DirectToolLane, cheap_note  # noqa: E402
 from recall_engine import CheckEngine  # noqa: E402
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
@@ -63,10 +64,26 @@ def _err(e: Exception) -> str:
     return f"error: {e}"
 
 
+def _fenced_work(work):
+    # Executor work can outlive its HTTP timeout. Hold the fence in the worker
+    # too so maintenance cannot race a late log write or cached result.
+    with fence(rc.ROOT):
+        rc.close_readers()
+        generation_path = rc.ROOT / 'logs/state/redaction.generation'
+        generation = generation_path.read_bytes() if generation_path.exists() else b''
+        with _engine.lock:
+            if getattr(_engine, '_redaction_generation', None) != generation:
+                _engine.cache.clear()
+                _engine.verdicts.clear()
+                rc._df_cache.clear()
+                _engine._redaction_generation = generation
+        return work()
+
+
 def _async_tool(fn, lane):
     @functools.wraps(fn)
     async def call(*args, **kwargs):
-        return await lane.run(lambda: fn(*args, **kwargs))
+        return await lane.run(lambda: _fenced_work(lambda: fn(*args, **kwargs)))
     return call
 
 
@@ -292,10 +309,10 @@ async def api_check(request: Request) -> Response:
     try:
         # Preflight is never shed behind optional transcript jobs. Message fact
         # checks may use Jev; keep that bounded I/O off the server event loop.
-        preflight = await asyncio.to_thread(_engine.preflight, body)
+        preflight = await asyncio.to_thread(_fenced_work, lambda: _engine.preflight(body))
         if preflight[2]:
             return JSONResponse(preflight[2])
-        result = await _check_lane.run(lambda: _engine.cached_check(body, preflight))
+        result = await _check_lane.run(lambda: _fenced_work(lambda: _engine.cached_check(body, preflight)))
     except Exception as exc:
         preflight = ([], None, None)
         result = {"decision": "allow", "note": None, "sources": [], "skipped": f"engine error: {type(exc).__name__}"}
@@ -374,7 +391,7 @@ async def api_inject(request: Request) -> Response:
         elif common["parent_id"] or body.get("automation") or body.get("thread_kind") in ("board", "review", "evaluator", "subagent"):
             res = {"note": None, "sources": [], "skipped": "automation or child"}
         else:
-            res = await _optional.run(sid, work)
+            res = await _optional.run(sid, lambda: _fenced_work(work))
     except Exception as e:  # noqa: BLE001
         res = {"note": None, "skipped": f"error: {str(e)[:200]}", "sources": []}
     return JSONResponse(res)
@@ -440,15 +457,16 @@ async def api_health(request: Request) -> Response:
 def _refresh_loop(every: float) -> None:
     while True:
         try:
-            if rc.HOT_DB:
-                from recall_storage import build_index
-                _status["index_refresh"] = build_index(rc.MEM_DB, rc.HOT_DB, max_rows=5000, seconds=2)
-            # Watermark advances per window, so a deadline only defers the rest.
-            @rc.bounded(2.0)
-            def refresh():
-                return rc.refresh_catalog(deadline=rc.Deadline(2.0))
-            res = refresh()
-            _status["catalog_refresh"] = {"at": int(time.time()), **res}
+            with fence(rc.ROOT, blocking=False):
+                if rc.HOT_DB:
+                    from recall_storage import build_index
+                    _status["index_refresh"] = build_index(rc.MEM_DB, rc.HOT_DB, max_rows=5000, seconds=2)
+                # Watermark advances per window, so a deadline only defers the rest.
+                @rc.bounded(2.0)
+                def refresh():
+                    return rc.refresh_catalog(deadline=rc.Deadline(2.0))
+                res = refresh()
+                _status["catalog_refresh"] = {"at": int(time.time()), **res}
         except Exception as e:  # noqa: BLE001
             _status["catalog_refresh"] = {"at": int(time.time()), "error": str(e)[:300]}
         finally:
@@ -471,7 +489,20 @@ def _no_standalone_sse(app, path: str = "/mcp"):
             await send({"type": "http.response.start", "status": 405, "headers": [(b"allow", b"POST"), (b"content-length", b"0")]})
             await send({"type": "http.response.body", "body": b""})
             return
-        await app(scope, receive, send)
+        if scope['type'] != 'http':
+            await app(scope, receive, send)
+            return
+        try:
+            lease = fence(rc.ROOT, blocking=False)
+            lease.__enter__()
+        except BlockingIOError:
+            await send({'type':'http.response.start', 'status':503, 'headers':[(b'content-length',b'0')]})
+            await send({'type':'http.response.body', 'body':b''})
+            return
+        try:
+            await app(scope, receive, send)
+        finally:
+            lease.__exit__(None, None, None)
 
     return wrapped
 

@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import redact_guard
 import sys
 import time
 
@@ -347,6 +348,7 @@ class MuseSync:
         self.args = args
         self.budget = Budget(args.deadline)
         self.mem = setup_writer(sqlite3.connect(MEM_DB, timeout=0.1), self.budget)
+        self.redactor = redact_guard.CaptureGuard(self.mem)
         self.mem.executescript(SCHEMA)
         cols = {r[1] for r in self.mem.execute("PRAGMA table_info(muse_sync_files)")}
         if "ino" not in cols:
@@ -462,8 +464,10 @@ class MuseSync:
                     "INSERT INTO episodic_events(source,session_id,turn_id,timestamp,speaker,content,"
                     "content_type,model,tokens_used,metadata_json) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
                     " ON CONFLICT(source,session_id,turn_id) DO NOTHING",
-                    [(SOURCE, sid, tid, ts, spk, content, ctype, model, json.dumps(m, ensure_ascii=False))
-                     for tid, ts, spk, ctype, content, model, m in rows],
+                    [(SOURCE, sid, tid, ts, spk, safe_content, ctype, model, safe_meta)
+                     for tid, ts, spk, ctype, content, model, m in rows
+                     for safe_content, safe_meta in [self.redactor.event(
+                         SOURCE, sid, tid, content, json.dumps(m, ensure_ascii=False))]],
                 )
             self.mem.execute(
                 "INSERT OR REPLACE INTO muse_sync_files(path, session_id, root_id, offset, size, mtime_ns, head_sha,"

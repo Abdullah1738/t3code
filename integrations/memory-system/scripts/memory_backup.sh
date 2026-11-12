@@ -11,6 +11,9 @@
 # Status goes to logs/backup_last.json; the health check reads it.
 set -u
 ROOT="$HOME/.local/share/memory-system"
+if [ "${RECALL_FENCED:-}" != 1 ]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/src/redact_lock.py" /bin/bash "$0" "$@"
+fi
 DATA="$ROOT/data"
 LOGDIR="$ROOT/logs"
 STAGE="${MEMORY_BACKUP_STAGE:-/Volumes/ExternalSSD/memory-system-backup/replica}"

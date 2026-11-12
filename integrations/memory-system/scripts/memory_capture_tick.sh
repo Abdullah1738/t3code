@@ -15,6 +15,9 @@ if [ -z "${MEMORY_TICK_IOPOL:-}" ] && [ -x /usr/sbin/taskpolicy ]; then
   exec /usr/sbin/taskpolicy -d default /bin/bash "$0" "$@"
 fi
 ROOT="$HOME/.local/share/memory-system"
+if [ "${RECALL_FENCED:-}" != 1 ]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/src/redact_lock.py" /bin/bash "$0" "$@"
+fi
 cd "$ROOT" || exit 1
 STAGE_LOG="$ROOT/logs/capture-$(date +%Y%m%d).log"
 . "$ROOT/scripts/stage_lib.sh"
