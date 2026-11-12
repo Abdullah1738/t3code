@@ -1096,6 +1096,8 @@ def ask(data, question, text=None, sender='', at=None, qid=None, now=None, deadl
             return 4, '\n'.join(f"UNVERIFIED: source {e.split(':', 1)[0]} unreadable ({q['id']})" for e in r['errors'])
         if r['verdict'] in ('receipt', 'owner'):
             settle(q, r['why'], 'ask', now)
+            if q['owner'] == 'moni':
+                return DONT_ASK, f"{q['id']}: explained for Moni (owner: moni); {r['why']}."
             return DONT_ASK, (f"{q['id']} is explained: {r['why']}. Don't ask; if he was asked about it before, "
                               'tell him in one line.')
         if q['owner'] == 'moni':

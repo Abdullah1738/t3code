@@ -289,3 +289,101 @@ class Accuracy(Base):
                 if card == '2792':
                     self.assertEqual(q['owner'], 'moni')
                     self.assertIsNone(q['outcome'])
+
+    def test_verified_orders_survive_bounds_and_later_read_failures(self):
+        import sys
+        from types import SimpleNamespace
+        # Stop/failure form       Orders listed  Accepted rows retained
+        forms = [('detail_limit', 9, 8), ('between_lanes_timeout', 1, 1),
+                 ('between_details_timeout', 2, 1), ('late_detail', 2, 1),
+                 ('late_lane', 1, 1), ('lane_failure', 1, 1), ('partial_lane', 1, 1),
+                 ('detail_failure', 2, 1), ('detail_binding', 2, 1), ('detail_unverified', 2, 1),
+                 ('detail_missing_amount', 2, 1), ('detail_bad_amount', 2, 1),
+                 ('detail_nan_amount', 2, 1), ('detail_infinite_amount', 2, 1),
+                 ('detail_missing_currency', 2, 1), ('detail_missing_time', 2, 1)]
+        for stop, count, expected in forms:
+            with self.subTest(stop=stop):
+                clock, calls = [100.0], []
+                def orders(app, service, timeout):
+                    if service == 'minutes':
+                        return {'ok': True, 'orders': [
+                            {'order': f'N{i}', 'placed_at': None if i == 1 and stop == 'detail_missing_time'
+                             else '2026-10-23T23:45:00+04:00', 'status': 'delivered'}
+                            for i in range(count)], 'coverage': {'minutes': {'page': 1, 'total_pages': 2}}}
+                    if stop == 'lane_failure':
+                        raise ValueError('unrelated lane unavailable')
+                    if stop == 'late_lane':
+                        clock[0] = 109.0
+                    return {'ok': True, 'orders': [], 'partial': stop == 'partial_lane'}
+                def details(oid, service, timeout):
+                    calls.append(oid)
+                    if oid == 'N0' and stop in ('between_lanes_timeout', 'between_details_timeout'):
+                        clock[0] = 107.5
+                    if oid == 'N1' and stop == 'detail_failure':
+                        raise ValueError('second detail unavailable')
+                    if oid == 'N1' and stop == 'late_detail':
+                        clock[0] = 109.0
+                    detail = {'ok': True, 'account_verified': not (oid == 'N1' and stop == 'detail_unverified'),
+                            'order': 'OTHER' if oid == 'N1' and stop == 'detail_binding' else oid,
+                            'total': '12.34' if oid == 'N0' else '19.99', 'currency': 'EUR'}
+                    bad_amounts = {'detail_missing_amount': None, 'detail_bad_amount': 'not-money',
+                                   'detail_nan_amount': 'NaN', 'detail_infinite_amount': 'Infinity'}
+                    if oid == 'N1' and stop in bad_amounts:
+                        detail['total'] = bad_amounts[stop]
+                    if oid == 'N1' and stop == 'detail_missing_currency':
+                        detail['currency'] = None
+                    return detail
+                modules = {'native_orders': SimpleNamespace(orders=orders),
+                           'noon_order_details': SimpleNamespace(details=details)}
+                with patch.dict(sys.modules, modules), patch.object(mc.charges.order_lookup.time, 'monotonic',
+                                                                   side_effect=lambda: clock[0]):
+                    result = mc.charges.order_lookup.native('noon', '/unused-test-path')
+                self.assertFalse(result['complete'])
+                self.assertEqual(len(result['orders']), expected)
+                self.assertEqual(result['orders'][0]['order'], 'N0')
+                self.assertEqual(len(calls), 8 if stop == 'detail_limit' else 2 if stop.startswith('detail_')
+                                 or stop == 'late_detail' else 1)
+                for amount, expected_rc in [('12.34', mc.DONT_ASK), ('99.99', 4)]:
+                    with patch.object(mc.charges.order_lookup, 'read', return_value=result):
+                        rc, msg = mc.ask(self.tmp / f'{stop}-{amount}', 'yours?',
+                                         ALERT.replace('ACME * EATS PENDING', 'NOON').replace('12.34', amount),
+                                         BANK, at('2026-10-23T23:47'), now=at('2026-10-24T10:00'),
+                                         find=finder(), said=nobody)
+                    self.assertEqual(rc, expected_rc)
+                    self.assertIn('noon order N0' if amount == '12.34' else 'UNVERIFIED:', msg)
+
+    def test_historical_moni_question_settles_without_notification_instructions(self):
+        forms = [('receipt', 'Acme'), ('order', 'NOON')]
+        for evidence, merchant in forms:
+            with self.subTest(evidence=evidence):
+                self.data = self.tmp / f'historical-moni-{evidence}'
+                q = self.seed(card='2792')
+                with mc.Locked(self.data, 'questions') as book:
+                    live = mc.find_question(book, q['id'])
+                    live.update(merchant=merchant, mkey=mc.merchant_key(merchant), passed=True,
+                                asks=[{'at': '2026-10-24T01:00:00+04:00', 'question': 'historical ask'}])
+                order = {'order': 'NEXAMPLE', 'total': '12.34', 'currency': 'EUR',
+                         'placed_at': '2026-10-23T23:45:00+04:00', 'status': 'delivered'}
+                with patch.object(mc.charges.order_lookup, 'read', return_value={'orders': [order], 'complete': False}):
+                    rc, msg = mc.ask(self.data, 'yours?', qid=q['id'], now=at('2026-10-24T11:00'),
+                                     find=finder(RECEIPT) if evidence == 'receipt' else finder(), said=nobody)
+                self.assertEqual(rc, mc.DONT_ASK)
+                self.assertIn('Moni', msg)
+                self.assertNotIn('tell him', msg.lower())
+                self.assertNotIn('notify', msg.lower())
+                live = mc.load_questions(self.data)['questions'][0]
+                self.assertEqual((live['status'], live['owner'], len(live['asks'])), ('closed', 'moni', 1))
+                self.assertEqual(self.fire(0), '')
+
+    def test_order_reader_inherits_callers_deadline_and_preserves_partial_output(self):
+        import subprocess
+        lookup = mc.charges.order_lookup
+        result = {'orders': [{'order': 'N1', 'total': '12.34', 'currency': 'EUR',
+                              'placed_at': '2026-10-23T23:45:00+04:00'}], 'complete': False}
+        with patch.object(lookup.time, 'time', return_value=1000.0), \
+                patch.object(lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(result), '')) as run:
+            self.assertEqual(lookup.read('noon', deadline=1003.0), result)
+        argv = run.call_args.args[0]
+        self.assertEqual(float(argv[-1]), 1002.5)
+        self.assertEqual(run.call_args.kwargs['timeout'], 3.0)
