@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from zoneinfo import ZoneInfo
+import order_lookup
 
 TZ = ZoneInfo('Asia/Dubai')
 MSGS = os.environ.get('MONEY_CASES_MSGS', str(Path('~/.local/bin/msgs').expanduser()))
@@ -109,6 +110,52 @@ class Lookup(Exception):
     """A source couldn't be read; the charge is then not explained by it."""
 
 
+def card_owner(charge):
+    path = Path(os.environ.get('MONEY_CASES_SETTINGS', Path(__file__).with_name('settings.json')))
+    try:
+        owners = json.loads(path.read_text())['card_owners']
+        if not isinstance(owners, dict) or any(value not in ('abdullah', 'moni') for value in owners.values()):
+            raise ValueError('invalid card owners')
+        return owners.get(charge['card'], owners.get('Wio', 'abdullah'))
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Lookup('card owners: settings unreadable') from e
+
+
+def order_receipt(charge, at, now, deadline=None, lookup=None):
+    merchant = charge['merchant'].lower()
+    app = 'careem' if 'careem' in merchant else 'noon' if 'noon' in merchant else None
+    if not app:
+        return None
+    try:
+        result = (lookup or order_lookup.read)(app, deadline=deadline)
+        complete = result.get('complete') is True if isinstance(result, dict) else True
+        rows = result.get('orders') if isinstance(result, dict) else result
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid order list')
+        matches = {}
+        for row in rows:
+            placed = dt.datetime.fromisoformat(str(row.get('placed_at')).replace('Z', '+00:00'))
+            if placed.tzinfo is None:
+                raise ValueError('order time missing zone')
+            total = Decimal(str(row.get('total')))
+            if not total.is_finite() or not row.get('currency') or not row.get('order'):
+                raise ValueError('order amount missing')
+            if row.get('status') in ('cancelled', 'canceled', 'failed') or row.get('raw_status') in ('cancelled', 'canceled', 'failed'):
+                continue
+            if (total == Decimal(charge['amount']) and row['currency'] == charge['currency']
+                    and abs(placed - at) <= SAME_TIME and placed <= now):
+                matches[row['order']] = row
+        if len(matches) == 1:
+            return {'verdict': 'receipt', 'why': f'{app} order {next(iter(matches))}: amount and time match', 'errors': []}
+        if len(matches) > 1:
+            raise ValueError('ambiguous orders')
+        if not complete:
+            raise ValueError('incomplete history cannot authorize an ask')
+    except (ValueError, TypeError, KeyError, InvalidOperation, OSError) as e:
+        raise Lookup(f'{app} orders: lookup unavailable or incomplete') from e
+    return None
+
+
 def parse(text, sender=''):
     """The charge in a bank alert, or None when the text isn't a card charge or decline we read."""
     if sender and not BANKS.search(sender):
@@ -196,7 +243,13 @@ def search(query, since, until=None, source=None, n=20, deadline=None, memo=None
     done = msgs(cmd, deadline, 15, memo, stats)
     # split on '\n' only: msgs prints ensure_ascii=False JSON, so a snippet can hold
     # U+2028, \x85 or \x1c-\x1e, which str.splitlines() would treat as line breaks.
-    return [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
+    try:
+        rows = [json.loads(line) for line in done.stdout.split('\n') if line.strip()]
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError('invalid search row')
+        return rows
+    except ValueError as e:
+        raise Lookup('msgs: unreadable search output') from e
 
 
 def iso(t):
@@ -502,6 +555,14 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
                     'msgs': row.get('id'), 'errors': errors}
     except Lookup as e:
         errors.append(f'receipt: {e}')
+    try:
+        hit = order_receipt(charge, at, now, deadline)
+        if hit:
+            return {**hit, 'errors': errors}
+    except Lookup as e:
+        errors.append(f'orders: {e}')
+    if card_owner(charge) == 'moni':
+        return None
     return owner_found(charge, at, now, deadline, said, errors)
 
 
@@ -521,11 +582,18 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
 def explain(charge, at, now, deadline=None, find=None, said=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
     errors = []
+    owner = card_owner(charge)
+    if charge['kind'] != 'charge' and owner == 'moni':
+        return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
     hit = found(charge, at, now, deadline, find, said, errors)
     if hit:
         return hit
+    if errors:
+        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors}
+    if owner == 'moni':
+        return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:
         try:
             how = known(charge, at, find, deadline)
@@ -538,4 +606,6 @@ def explain(charge, at, now, deadline=None, find=None, said=None):
                         'until': until.isoformat(timespec='seconds'), 'errors': errors}
         except Lookup as e:
             errors.append(f'merchant history: {e}')
-    return {'verdict': 'ask', 'why': 'no receipt, nothing he wrote, and nothing to wait for', 'errors': errors}
+    return {'verdict': 'unverified' if errors else 'ask',
+            'why': 'sources unreadable; do not ask' if errors else 'no receipt, nothing he wrote, and nothing to wait for',
+            'errors': errors}

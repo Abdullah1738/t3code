@@ -215,30 +215,23 @@ class Pings(Base):
     def sent(self):
         return json.loads((self.wd / 'pings.json').read_text())['sent']
 
-    def test_an_old_outbox_without_its_event_text_is_rebuilt(self):
-        # An outbox written before the event text was kept can't be matched to the runner's pending event.
+    def test_old_outbox_keys_are_migrated_to_built_without_repeating(self):
         self.case(deadline='2026-10-25')
-        (self.wd / 'state.json').write_text(json.dumps({'fires': 3}))
         (self.wd / 'pings.json').write_text(json.dumps({'sent': {}, 'outbox': {
-            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3, 'clock': {}}}))
-        self.assertIn('acme', self.check('2026-10-24T10:00', 'r1'))
-        self.assertEqual(self.check('2026-10-24T10:30', 'r2'), '')
-        self.assertIn('acme|r0|soon', self.sent())
-
-    def test_unrecorded_output_is_rebuilt_before_new_work(self):
-        self.case(deadline='2026-10-25')
-        first = self.check('2026-10-24T10:00', 'r1', ack=False)
-        self.assertTrue(first)
-        # The runner never took it (no state.pending), so the r2 check rebuilds the event rather than holding it.
-        rebuilt = self.check('2026-10-24T10:15', 'r2', ack=False)
-        self.assertEqual(rebuilt, first)
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+            'run': 'old', 'keys': ['acme|r0|soon'], 'at': '2026-10-24T09:30:00+04:00', 'fires': 3}}))
+        self.assertEqual(self.check('2026-10-24T10:00', 'r1'), '')
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('acme|r0|soon', state['built'])
         self.assertEqual(self.sent(), {})
-        # Once the runner takes it and delivers, the reminder is recorded as sent at its delivery time.
-        (self.wd / '.run-ok').write_text('r2')
-        self.deliver('2026-10-24T10:20')
-        self.assertEqual(self.check('2026-10-24T10:30', 'r3'), '')
-        self.assertIn('acme|r0|soon', self.sent())
+
+    def test_unacked_output_is_built_once_and_new_deadlines_can_fire(self):
+        self.case(deadline='2026-10-25')
+        self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
+        self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
+        self.assertEqual(self.check('2026-10-24T10:30', 'r3', ack=False), '')
+        self.assertEqual(self.sent(), {})
+        mc.update(self.data, 'acme', {'deadline': '2026-10-26'}, because='new date', at=at('2026-10-24T11:00'))
+        self.assertIn('acme', self.check('2026-10-25T10:00', 'r4', ack=False))
 
     def test_unrecorded_output_respects_quiet_hours_and_current_cases(self):
         self.case(deadline='2026-10-25T10:00:00+04:00')
@@ -440,19 +433,21 @@ class CheckEntry(Base):
 
     def test_watchdog_dumps_and_exits_during_a_c_level_hang(self):
         script = Path(__file__).with_name('cases.py')
-        code = ('import ctypes, runpy; '
-                f'ns = runpy.run_path({str(script)!r}); '
-                'ns["main"].__globals__["run_check"] = lambda *a: ctypes.CDLL(None).sleep(3); '
+        code = (f'import ctypes, runpy, time\nns = runpy.run_path({str(script)!r})\n'
+                'def hang(*args):\n'
+                '    print(time.time(), flush=True)\n'
+                '    ctypes.CDLL(None).sleep(3)\n'
+                'ns["main"].__globals__["run_check"] = hang\n'
                 'raise SystemExit(ns["main"](["check"]))')
         env = {'HOME': str(self.tmp), 'PATH': '/usr/bin:/bin', 'LANG': 'en_US.UTF-8',
                'WATCH_DIR': str(self.wd), 'MONEY_CASES_DIR': str(self.data), 'MONEY_CASES_HARD_STOP': '0.15'}
-        started = time.monotonic()
         done = subprocess.run(['/usr/bin/python3', '-B', '-c', code], env=env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, start_new_session=True, timeout=2)
-        self.assertLess(time.monotonic() - started, 1)
+                              capture_output=True, text=True, start_new_session=True, timeout=5)
+        # The watchdog is armed inside main; imports on the checkout mount are outside its budget.
+        self.assertLess(time.time() - float(done.stdout.strip()), 1)
         self.assertEqual(done.returncode, 1)
         self.assertIn('Timeout', done.stderr)
-        self.assertIn('<lambda>', done.stderr)
+        self.assertIn('hang', done.stderr)
 
     def test_check_runs_in_runner_environment_with_fake_msgs_and_temp_state(self):
         home = self.tmp / 'home'
@@ -544,18 +539,14 @@ class Rules(Base):
         self.assertEqual(len([k for k in json.loads((self.wd / 'pings.json').read_text())['sent']
                               if '|ask|' in k]), 1)
 
-    def test_output_lost_before_the_runner_accepted_it_is_rebuilt_not_stuck(self):
-        # The check printed and wrote its outbox, then died before the runner saved state.pending: the
-        # runner never took it, state.json has no pending and fires never rose.
+    def test_output_lost_before_runner_acceptance_is_not_emitted_again(self):
         self.case(deadline='2026-10-25')
         self.assertTrue(self.check('2026-10-24T10:00', 'r1', ack=False))
-        self.assertFalse((self.wd / 'state.json').exists())
-        # A later check must not stay silent forever: it drops the lost output and shows the reminder again.
-        event = self.check('2026-10-24T10:30', 'r2', ack=False)
-        self.assertIn('acme', event)
-        # Nothing is recorded as sent until a delivery is confirmed.
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text()).get('sent', {}), {})
-        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r2')
+        self.assertEqual(self.check('2026-10-24T10:30', 'r2', ack=False), '')
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertEqual(state['sent'], {})
+        self.assertIn('acme|r0|soon', state['built'])
+        self.assertNotIn('outbox', state)
 
     def test_a_pending_event_the_runner_owns_is_waited_for_not_rebuilt(self):
         # The runner saved the event as its pending event, so it will deliver it: the check does not rebuild.
@@ -782,8 +773,8 @@ class Questions(Base):
         code, msg = self.ask('2026-10-25T13:00', known)
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('re-ask waits until', msg)
-        self.assertEqual(self.ask('2026-10-25T18:00', known)[0], 0)
-        code, msg = self.ask('2026-10-26T09:00', known)
+        self.assertEqual(self.ask('2026-10-26T12:00', known)[0], 0)
+        code, msg = self.ask('2026-10-26T13:00', known)
         self.assertEqual(code, mc.DONT_ASK)
         self.assertIn('never a third ask', msg)
         q = self.questions()[0]
@@ -823,12 +814,12 @@ class Questions(Base):
 
     def test_the_check_turns_a_question_asked_twice_into_a_case_and_says_so_once(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
-        self.assertEqual(self.follow('2026-10-24T12:00', finder()), '')
-        event = self.follow('2026-10-24T20:30', finder())
+        self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
+        self.assertEqual(self.follow('2026-10-25T12:00', finder()), '')
+        event = self.follow('2026-10-25T20:30', finder())
         self.assertIn("he didn't answer, so it is now money case charge-", event)
         self.assertEqual(len(mc.load(self.data)['cases']), 1)
-        later = self.follow('2026-10-24T21:00', finder(), 'r2')
+        later = self.follow('2026-10-25T21:00', finder(), 'r2')
         self.assertNotIn("he didn't answer", later)
 
     def test_a_wait_with_no_receipt_is_raised_once(self):
@@ -941,8 +932,8 @@ class Questions(Base):
 
     def test_a_late_receipt_settles_a_question_that_became_a_case(self):
         self.assertEqual(self.ask('2026-10-24T00:37', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T08:00', finder())[0], 0)
-        self.assertEqual(self.ask('2026-10-24T20:00', finder())[0], mc.DONT_ASK)
+        self.assertEqual(self.ask('2026-10-25T01:00', finder())[0], 0)
+        self.assertEqual(self.ask('2026-10-25T02:00', finder())[0], mc.DONT_ASK)
         q = self.questions()[0]
         self.assertEqual(q['status'], 'case')
         event = self.follow('2026-10-25T09:00', finder(dict(RECEIPT, ts=at('2026-10-25T08:00').timestamp())))
@@ -951,7 +942,7 @@ class Questions(Base):
         self.assertEqual(self.questions()[0]['status'], 'closed')
 
     def test_his_answer_to_a_case_question_is_noted_on_the_case(self):
-        for now in ('2026-10-24T00:37', '2026-10-24T08:00', '2026-10-24T20:00'):
+        for now in ('2026-10-24T00:37', '2026-10-25T01:00', '2026-10-25T02:00'):
             self.ask(now, finder())
         q = self.questions()[0]
         mc.answered(self.data, q['id'], 'not mine', now=at('2026-10-24T21:00'))
