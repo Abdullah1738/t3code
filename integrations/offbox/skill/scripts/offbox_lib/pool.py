@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+from pathlib import Path
 import time
 
 from . import capacity, prepare
@@ -12,7 +13,7 @@ from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, RU
                      kv_get, kv_set, now, say)
 from .common import backend
 from .common import mine as token_mine  # `mine` is a local name here (the caller's own boxes)
-from .identity import remote_dir_for
+from .identity import normalize_repo_name, remote_dir_for
 
 WAIT_DEFAULT_S = 600
 WAIT_MAX_S = 1200
@@ -75,6 +76,21 @@ def queue_state(con, key, run_id=None):
         AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.box_id=h.box_id AND r.status IN ('starting','running'))""",
                        (key,)).fetchone()[0]
     return busy, cap, waiting, held
+
+
+def split_pool_notice(con, me) -> str:
+    """Name legacy basename-pool boxes without transferring ownership or bypassing either pool's cap."""
+    root = me['repo_root']
+    fallback = normalize_repo_name(Path(root).name)
+    if fallback == me['repo_key']:
+        return ''
+    rows = con.execute("""SELECT l.box_id, l.state FROM leases l JOIN pool_members p USING(box_id)
+        WHERE l.repo_root=? AND l.repo_key=? AND p.pool_key=? AND l.state IN ('running','stopped')
+        ORDER BY l.box_id""", (root, fallback, fallback)).fetchall()
+    if not rows:
+        return ''
+    boxes = ', '.join(f"{r['box_id']} (pool {fallback}, {r['state']})" for r in rows)
+    return f". Split-off boxes for this checkout: {boxes}"
 
 
 def lock_name(key: str) -> str:
@@ -412,7 +428,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         f"this run needs a new {key} pool box ({source}), but the pool is full "
                         f"({len(members(con, key))}/{cap} boxes, none from {source}), so waiting can't help. Nothing ran. "
                         "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
-                        "offbox list --all, then offbox release <id> --delete.", code=2)
+                        "offbox list --all, then offbox release <id> --delete." + split_pool_notice(con, me), code=2)
                 for r in rows:
                     if r["box_id"] in tried or allocation.resume_inflight(con, r['box_id']):
                         continue
@@ -648,7 +664,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
             busy, cap, waiting, held = queue_state(con, key, run_id)
             raise PoolBusyError(f"repository pool busy/full for {key}: {busy}/{cap} busy, {held} held by checkout cleanup for "
                                 f"{int(t-started)}s; remote queue timed out. Nothing ran (exit {EXIT_BUSY}, not an "
-                                f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})")
+                                f"infra failure): retry, or raise OFFBOX_POOL_WAIT_SECONDS (max {wait_max()})" +
+                                split_pool_notice(con, me))
         if isinstance(last_error, api.BoatAtCapacity):
             raise last_error
         if t >= next_progress:
@@ -658,11 +675,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     f"will wait up to {_span(wait)}" + (f" ({last_error})" if last_error else "") +
                     (". It starts by itself when a box is free: leave it waiting, do not retry or kill it. For a long "
                      "wait use --bg and `offbox wait <run>`." if at_home() else
-                     f". Use a tool timeout above {wait}s or run this in a background shell."))
+                     f". Use a tool timeout above {wait}s or run this in a background shell.") + split_pool_notice(con, me))
                 said = True
             else:
                 say(f"still queued for a {key} pool box: waited {_span(t-started)} of {_span(wait)}, "
-                    f"{busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting")
+                    f"{busy}/{cap} busy, {held} held by checkout cleanup, {waiting} other caller(s) waiting" +
+                    split_pool_notice(con, me))
             next_progress = t + PROGRESS_EVERY_S
         time.sleep(min(2, max(0, deadline-time.monotonic())))
 

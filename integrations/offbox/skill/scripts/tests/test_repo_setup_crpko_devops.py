@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from offbox_lib import bases, identity, runs
+from test_capacity import Isolated
 
 TEMPLATES = runs.REPO_RECIPES_DIR.parent
 KEY = 'crpko-devops'
@@ -432,7 +434,7 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn('offbox_crpko_tools\n',body)
 
 
-class RepoKeyTests(unittest.TestCase):
+class RepoKeyTests(Isolated):
     def test_origin_defines_key_for_main_ovnfs_and_tmp_clones(self):
         urls=['https://github.com/Equicom-Crypto/crpko-devops.git',
               'git@github.com:Equicom-Crypto/crpko-devops.git',
