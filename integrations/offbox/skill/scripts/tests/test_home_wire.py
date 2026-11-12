@@ -13,7 +13,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "tests"))
 sys.path.insert(0, str(SCRIPTS.parents[1] / "tests"))
-from offbox_lib import api, common, runs  # noqa: E402
+from offbox_lib import api, common, lease, misc, reap, runs, ssh_sync  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
 import test_boatd  # noqa: E402
 
@@ -122,6 +122,57 @@ class Wire(Isolated):
             api.call("GET", f"/sandboxes/{box}", retries=0)
         self.assertEqual((cm.exception.status, cm.exception.api_code), (503, "server_not_ready"))
         self.assertTrue(cm.exception.outage)
+
+    def test_unfollowed_background_run_keeps_full_server_output_at_settlement(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                box = self.srv.box(bid=f'bx_{code:08d}')
+                pid = self.srv.cmd(box)
+                stdout = 'start\n' + 'x' * (1 << 20) + '\nfinished\n'
+                stderr = 'diagnostic\n'
+                (boatd.cmd_dir(box) / f'{pid}.out').write_text(stdout)
+                (boatd.cmd_dir(box) / f'{pid}.err').write_text(stderr)
+                self.end(box, pid, code)
+                run_id = f'run-home-{code}'
+                log = common.LOGS_DIR / f'{run_id}.log'
+                self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,pulls,start_at,log_path) "
+                                 "VALUES (?,?,?,?,'running','bg','[]',?,?)",
+                                 (run_id, box, f'cmd_{pid}', pid, common.now(), str(log)))
+                self.con.commit()
+                self.assertFalse(log.exists())
+                with patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), patch.object(runs, 'settle_docker'), \
+                        patch.object(api, 'get', side_effect=AssertionError('history needs no live box inspection')), \
+                        patch.object(ssh_sync, 'ssh', side_effect=AssertionError('history needs no SSH')):
+                    reap._check_stale_runs(self.con, box, 'running', False, [])
+                    row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+                    self.assertEqual((row['status'], row['exit_code']), ('failed' if code else 'done', code))
+                    self.assertEqual(log.read_text(), stdout + stderr)
+                    self.assertEqual(common.checkpoint(log),
+                                     dict(stdoutOffset=len(stdout), stderrOffset=len(stderr), logBytes=len(stdout + stderr)))
+                    for _ in range(2):
+                        out, err = io.StringIO(), io.StringIO()
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            self.assertEqual(misc.logs(run_id, False), 0)
+                        self.assertEqual((out.getvalue(), err.getvalue()), (stdout + stderr, ''))
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(misc.wait(run_id, None), code)
+
+    def test_empty_home_history_reports_no_output_without_inspecting_the_container(self):
+        box = self.srv.box()
+        pid = self.srv.cmd(box)
+        self.end(box, pid, 0)
+        self.con.execute("INSERT INTO runs(run_id,box_id,command_id,process_id,status,mode,exit_code) "
+                         "VALUES ('run-silent',?,?,?,'done','bg',0)", (box, f'cmd_{pid}', pid))
+        self.con.commit()
+        with patch.object(api, 'get', side_effect=AssertionError('full history is on the host disk')):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(misc.logs('run-silent', False), 1)
+            self.assertEqual(out.getvalue(), '')
+            self.assertIn('offbox server history empty', err.getvalue())
+            self.assertEqual(len(err.getvalue().splitlines()), 1)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(misc.wait('run-silent', None), 0)
 
 
 if __name__ == "__main__":
