@@ -135,6 +135,7 @@ const makeThreads = Effect.gen(function* () {
           }
         }),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {
           counts.interrupts += 1;

@@ -3,10 +3,75 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Cause from "effect/Cause";
 import * as Semaphore from "effect/Semaphore";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as BoardLocks from "./boardLocks.ts";
+
+it.effect("#566 a committed re-acquire timeout never advertises a safe retry", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const finishCall = yield* Deferred.make<void>();
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finishCall))),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    const writer = yield* Effect.forkChild(
+      locks.board(
+        "a",
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      ),
+    );
+    yield* Deferred.await(held);
+    yield* Deferred.succeed(finishCall, undefined);
+    yield* TestClock.adjust(BoardLocks.WRITE_WAIT_MS + 1);
+    const result = yield* Fiber.join(first);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const message = String(Cause.squash(result.cause));
+      assert.include(message, "may have been applied");
+      assert.notInclude(message, "Safe to retry");
+    }
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(writer);
+  }),
+);
+
+it.effect("#566 reconciliation still fences a migration during the external call", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const first = yield* Effect.forkChild(
+      locks
+        .board(
+          "a",
+          locks.outside(
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            undefined,
+            false,
+            Effect.succeed(true),
+          ),
+        )
+        .pipe(Effect.exit),
+    );
+    yield* Deferred.await(entered);
+    yield* locks.exclusive(Effect.void);
+    yield* Deferred.succeed(release, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(first)));
+  }),
+);
 
 it.effect("unrelated boards and single-card writes do not share a permit", () =>
   Effect.gen(function* () {
@@ -260,6 +325,72 @@ it.effect(
         .pipe(Effect.ignore);
       assert.deepStrictEqual(cleaned, ["orphan"]);
       yield* locks.board("a", Effect.void);
+    }),
+);
+
+it.effect("#638 retries an uncommitted stale snapshot with new versions", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    yield* locks.board("a", Effect.void);
+    let attempts = 0;
+    const result = yield* locks.run(
+      Effect.gen(function* () {
+        attempts++;
+        yield* locks.observe(Effect.void);
+        if (attempts === 1) yield* locks.exclusive(Effect.void);
+        return yield* locks.access("a", Effect.succeed("saved"), true);
+      }),
+      undefined,
+    );
+    assert.strictEqual(result, "saved");
+    assert.strictEqual(attempts, 2);
+    attempts = 0;
+    const failed = yield* Effect.exit(
+      locks.run(
+        Effect.gen(function* () {
+          attempts++;
+          yield* locks.observe(Effect.void);
+          yield* locks.exclusive(Effect.void);
+          yield* locks.access("a", Effect.void, true);
+        }),
+        undefined,
+      ),
+    );
+    assert.isTrue(Exit.isFailure(failed));
+    assert.strictEqual(attempts, 9);
+  }),
+);
+
+it.effect.each(["saved", "external"] as const)(
+  "#638 never retries after %s work and a stale permit",
+  (kind) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let attempts = 0;
+      const result = yield* Effect.exit(
+        locks.run(
+          Effect.gen(function* () {
+            attempts++;
+            if (kind === "saved") yield* locks.access("a", Effect.void, true);
+            else yield* locks.outside(Effect.void);
+            // Even an incorrectly classified later defect cannot override the operation's commit state.
+            return yield* Effect.die(new BoardLocks.BoardStateChanged(false));
+          }),
+          undefined,
+        ),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      assert.strictEqual(attempts, 1);
+      attempts = 0;
+      yield* Effect.exit(
+        locks.run(
+          Effect.sync(() => {
+            attempts++;
+          }).pipe(Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged(true)))),
+          undefined,
+        ),
+      );
+      assert.strictEqual(attempts, 1);
     }),
 );
 

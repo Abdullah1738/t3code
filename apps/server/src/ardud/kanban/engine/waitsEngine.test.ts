@@ -200,6 +200,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );
@@ -451,8 +452,8 @@ it.effect("a woken reviewer reads the wake note once: the next review round does
 
       // The verdict is where the note has been read. The PR is still open, so the card stays in review.
       const cleared = yield* kanban.reviewResult(reviewer, "clear", []);
-      assert.isNull(cleared.wakeNote);
-      assert.strictEqual(cleared.stage, "in_review");
+      assert.isNull(cleared.card.wakeNote);
+      assert.strictEqual(cleared.card.stage, "in_review");
 
       // A second round on the same review thread: only its own note.
       yield* kanban.waitCard(

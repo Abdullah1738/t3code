@@ -56,7 +56,14 @@ const ancestor = Context.Reference<Operation | undefined>("KanbanParentOperation
 
 export class BoardStateChanged {
   readonly _tag = "BoardStateChanged";
+  readonly committed: boolean;
+  constructor(committed = false) {
+    this.committed = committed;
+  }
 }
+
+export const MAY_HAVE_APPLIED =
+  "Board changed after this call started work; it may have been applied. Check t3_thread_list / card_get before retrying.";
 
 export const WRITE_WAIT_MS = 120_000;
 
@@ -73,6 +80,7 @@ export const REPLAY_MAX_MS = 30_000;
 /** State locks are never held across another service's I/O. A stale continuation cannot write. */
 export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const boards = new Map<string, BoardLock>();
+  let migrationGeneration = 0;
   // Only selection migration takes every permit; ordinary boards never exclude each other here.
   const migration = yield* Semaphore.make(BOARD_PERMITS);
   const boardOf = (id: string) => {
@@ -95,7 +103,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     const op = yield* current;
     return op?.fiberId === (yield* Effect.fiberId) ? op : undefined;
   });
-  const check = (op: Operation) => (op.stale ? Effect.die(new BoardStateChanged()) : Effect.void);
+  const check = (op: Operation) =>
+    op.stale ? Effect.die(new BoardStateChanged(op.committed)) : Effect.void;
   const wait = <A>(op: Operation, effect: Effect.Effect<A>) =>
     effect.pipe(
       Effect.timeoutOrElse({
@@ -105,7 +114,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             new KanbanError({
               code: "conflict",
               detail: op.committed
-                ? "Board changed while this operation was waiting. Re-read its state before retrying."
+                ? MAY_HAVE_APPLIED
                 : "Board busy: not written. Safe to retry once.",
             }),
           ),
@@ -139,9 +148,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     yield* held.board.gate.release(held.permits);
     yield* migration.release(1);
   });
-  const acquire = (op: Operation, boardId: string) =>
+  const acquire = (op: Operation, boardId: string, reconcile = false) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
+        if (reconcile) op.stale = false;
         yield* check(op);
         if (op.held?.boardId === boardId) return;
         yield* release(op);
@@ -168,9 +178,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         op.held = held;
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
-        if (expected !== undefined && expected !== version(held)) op.stale = true;
-        for (const [key, value] of op.dependencies.get(boardId) ?? []) {
-          if ((board.resources.get(key) ?? 0) !== value) op.stale = true;
+        if (!reconcile) {
+          if (expected !== undefined && expected !== version(held)) op.stale = true;
+          for (const [key, value] of op.dependencies.get(boardId) ?? []) {
+            if ((board.resources.get(key) ?? 0) !== value) op.stale = true;
+          }
+        } else {
+          // The explicit continuation validates its inputs under this new snapshot.
+          op.dependencies.delete(boardId);
         }
         if (expected !== undefined || !op.dependencies.has(boardId))
           seen.set(boardId, version(held));
@@ -229,6 +244,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           ),
           Effect.catchDefect((defect) =>
             defect instanceof BoardStateChanged &&
+            !defect.committed &&
             !op.committed &&
             !op.sideEffect &&
             attempt < policy.reruns
@@ -318,10 +334,11 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       }),
     );
 
-  const outside = <A, E, R>(
+  const outside = <A, E, R, E2 = never, R2 = never>(
     effect: Effect.Effect<A, E, R>,
     abandoned?: (value: A) => Effect.Effect<void>,
     readOnly = false,
+    reconcile?: Effect.Effect<boolean, E2, R2>,
   ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -329,6 +346,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         if (!op) return yield* restore(effect);
         yield* check(op);
         const held = op.held;
+        const migrationBefore = migrationGeneration;
         yield* release(op);
         // Even a failed call may already have sent/launched. Never advertise a later
         // permit timeout as "not written" after crossing an external boundary.
@@ -339,8 +357,32 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const result = yield* Effect.exit(restore(Effect.interruptible(effect)));
         // Re-acquire on failures too: a caller may catch one and continue changing state.
         if (held) {
-          const resumed = yield* Effect.exit(acquire(op, held.boardId));
+          const resumed = yield* Effect.exit(
+            acquire(
+              op,
+              held.boardId,
+              reconcile !== undefined &&
+                Exit.isSuccess(result) &&
+                migrationBefore === migrationGeneration,
+            ).pipe(
+              Effect.andThen(() => {
+                if (migrationBefore !== migrationGeneration) {
+                  op.stale = true;
+                  return check(op);
+                }
+                return reconcile === undefined
+                  ? Effect.void
+                  : reconcile.pipe(
+                      Effect.flatMap((valid) => {
+                        if (!valid) op.stale = true;
+                        return check(op);
+                      }),
+                    );
+              }),
+            ),
+          );
           if (Exit.isFailure(resumed)) {
+            op.stale = true;
             yield* release(op);
             if (Exit.isSuccess(result) && abandoned) yield* abandoned(result.value);
             return yield* Effect.failCause(resumed.cause);
@@ -459,6 +501,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           Effect.ensuring(
             Effect.sync(() => {
               // Migration uses the raw store. In-flight I/O must not commit pre-migration models.
+              migrationGeneration += 1;
               for (const board of boards.values()) {
                 board.generation += 1;
                 board.boardGeneration += 1;
