@@ -631,34 +631,34 @@ class SpendTests(Isolated):
             self.assertEqual(spend.compute()['spend'],0.05)
 
     def test_cap_trips_and_keeps_alert_key_shape(self):
-        with patch.object(api,'limits',return_value=self.limits(90100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=2):
             out=spend.check()
             self.assertTrue(out['cap_state']['capped'])
             self.assertEqual(out['stopped'],2)
             self.assertTrue(any(c.args[1]=='offbox-spend-2026-10-500' for c in self.tg.call_args_list))
 
-    def test_cap_is_900_and_a_500_trip_clears_after_the_raise(self):
-        self.assertEqual(spend.CAP_DOLLARS,900.0)
+    def test_cap_is_1200_and_a_500_trip_clears_after_the_raise(self):
+        self.assertEqual(spend.CAP_DOLLARS,1200.0)
         common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':500.25})
         with patch.object(api,'limits',return_value=self.limits(50025000,remaining=0)), patch.object(spend,'stop_all') as stop:
             out=spend.check()
             self.assertFalse(out['cap_state']['capped'])
             stop.assert_not_called()
 
-    def test_a_750_trip_clears_after_the_raise_to_900(self):
-        common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':750.10,'cap':750.0})
-        with patch.object(api,'limits',return_value=self.limits(75010000,remaining=0)), patch.object(spend,'stop_all') as stop:
+    def test_a_900_trip_clears_after_the_raise_to_1200(self):
+        common.atomic_write_json(spend.CAP_PATH,{'capped':True,'month':'2026-10','period_end':'2026-11-13T19:02:12Z','spend':900.10,'cap':900.0})
+        with patch.object(api,'limits',return_value=self.limits(90010000,remaining=0)), patch.object(spend,'stop_all') as stop:
             out=spend.check()
             self.assertFalse(out['cap_state']['capped'])
-            self.assertEqual(out['cap_state']['cap'],900.0)
+            self.assertEqual(out['cap_state']['cap'],1200.0)
             stop.assert_not_called()
 
     def test_trip_at_the_current_cap_stays_until_the_period_ends(self):
-        with patch.object(api,'limits',return_value=self.limits(90100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
             self.assertTrue(spend.check()['cap_state']['capped'])
-        with patch.object(api,'limits',return_value=self.limits(90100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
+        with patch.object(api,'limits',return_value=self.limits(120100000,remaining=0)), patch.object(spend,'stop_all',return_value=0):
             self.assertTrue(spend.check()['cap_state']['capped'])
-            self.assertTrue(any(c.args[1]=='offbox-cap-2026-10-900' for c in self.tg.call_args_list))
+            self.assertTrue(any(c.args[1]=='offbox-cap-2026-10-1200' for c in self.tg.call_args_list))
 
 if __name__ == '__main__':
     unittest.main()
