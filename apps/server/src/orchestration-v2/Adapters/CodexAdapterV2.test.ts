@@ -925,7 +925,8 @@ describe("CodexAdapterV2 process spawning", () => {
           'config {"api_key":"dummy-api-key","access_token":"dummy-access-token"}',
           `{"password":"dummy'password-suffix"}`,
           String.raw`{"client_secret":"dummy\"escaped-suffix"}`,
-          "fatal: refresh_token=dummy-refresh rejected",
+          "retrying with password=dummy'unquoted-suffix and refresh_token=dummy-token'refresh-suffix",
+          "fatal: refresh_token=dummy-refresh'last-line-suffix rejected",
           "",
         ].join("\n"),
       );
@@ -950,6 +951,9 @@ describe("CodexAdapterV2 process spawning", () => {
         "dummy-refresh",
         "password-suffix",
         "escaped-suffix",
+        "unquoted-suffix",
+        "refresh-suffix",
+        "last-line-suffix",
       ]) {
         assert.notInclude(releaseDetail, secret);
         assert.notInclude(failureMessage, secret);

@@ -244,7 +244,16 @@ export function codexUsageLimitResetAt(
     }
   } else {
     resetMs = wallTime(exited!.year, exited!.month, exited!.day);
-    if (resetMs !== null && resetMs < exitedMs) resetMs += DAY_MS;
+    if (resetMs !== null && resetMs < exitedMs) {
+      // The next local calendar day, not +24 h, so DST changes keep the wall time.
+      const next = DateTime.toPartsUtc(
+        DateTime.add(
+          DateTime.makeUnsafe({ year: exited!.year, month: exited!.month, day: exited!.day }),
+          { days: 1 },
+        ),
+      );
+      resetMs = wallTime(next.year, next.month, next.day);
+    }
   }
   return resetMs === null ? null : DateTime.formatIso(DateTime.makeUnsafe(resetMs));
 }

@@ -61,15 +61,16 @@ export const appendStderrTail = (current: string, chunk: string): string => {
 
 const CREDENTIAL_KEY =
   "(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization|credential|password|passwd|secret|token)";
-// A quoted value runs to its own closing quote, skipping escapes; an
-// unterminated one runs to the end of the line.
+// A quote delimits a value only when it opens it: a quoted value runs to its
+// own closing quote, skipping escapes, or to the end of the line when
+// unterminated; an unquoted value keeps any quotes inside it.
 const QUOTED_VALUE = String.raw`"(?:\\.|[^"\\\n])*(?:"|$)|'(?:\\.|[^'\\\n])*(?:'|$)`;
 const QUOTED_KEY_CREDENTIAL_PATTERN = new RegExp(
   String.raw`(["'])(${CREDENTIAL_KEY})\1(\s*:\s*)(?:${QUOTED_VALUE}|[^\s,}\]]+)`,
   "gim",
 );
 const ASSIGNED_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`(\b${CREDENTIAL_KEY}\b\s*[:=]\s*)(?:${QUOTED_VALUE}|[^\s,;&"']+)`,
+  String.raw`(\b${CREDENTIAL_KEY}\b\s*[:=]\s*)(?:${QUOTED_VALUE}|[^\s,;&]+)`,
   "gim",
 );
 const redactQuotedKeyValue = (

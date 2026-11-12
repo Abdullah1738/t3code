@@ -251,6 +251,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
           "GET https://user:dummy-pass@example.test/v1?token=dummy-query-token failed",
           `{"password":"dummy'password-suffix"}`,
           String.raw`{"api_key":"dummy\"escaped-suffix"}`,
+          "retrying with password=dummy'unquoted-suffix and refresh_token=dummy-token'refresh-suffix",
           'fatal: {"client_secret": "dummy-client-secret"}',
           "",
         ].join("\n"),
@@ -266,6 +267,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         "dummy-client-secret",
         "password-suffix",
         "escaped-suffix",
+        "unquoted-suffix",
+        "refresh-suffix",
       ]) {
         assert.notInclude(rendered, secret);
       }
@@ -320,7 +323,11 @@ it.each([
   [`password="S1'pw-suffix" next`, "password=[redacted] next"],
   [String.raw`secret="S1\"escaped-suffix" next`, "secret=[redacted] next"],
   [String.raw`token='S1\'escaped-suffix' next`, "token=[redacted] next"],
-  ["refresh_token=S1-unterminated'suffix", "refresh_token=[redacted]'suffix"],
+  ["refresh_token=S1-unterminated'suffix", "refresh_token=[redacted]"],
+  ["password=S1'password-suffix", "password=[redacted]"],
+  ["refresh_token=S1-token'suffix next", "refresh_token=[redacted] next"],
+  [`api_key: S1"dq-suffix; next`, "api_key: [redacted]; next"],
+  [`{"token": S1'x-suffix, "id": 7}`, '{"token": [redacted], "id": 7}'],
 ])("redacts %s from the stderr tail", (line, expected) => {
   assert.equal(boundStderrTail(line), expected);
 });
@@ -380,6 +387,28 @@ it.each([
     expected,
   );
 });
+
+const NEW_YORK = DateTime.zoneMakeNamedUnsafe("America/New_York");
+it.each([
+  // Fall back: Sun 1 Nov 2026 02:00 EDT -> 01:00 EST; 9:00 AM next day is EST.
+  ["9:00 AM", "2026-10-31T22:00:00.000Z", "2026-11-01T14:00:00.000Z"],
+  // Spring forward: Sun 8 Mar 2026 02:00 EST -> 03:00 EDT; 9:00 AM next day is EDT.
+  ["9:00 AM", "2026-03-07T23:00:00.000Z", "2026-03-08T13:00:00.000Z"],
+  // Same day, before the change, stays on today's offset.
+  ["11:00 PM", "2026-10-31T22:00:00.000Z", "2026-11-01T03:00:00.000Z"],
+])(
+  "rolls 'try again at %s' (exited %s) to the next local day across DST as %s",
+  (when, exitedAt, expected) => {
+    assert.equal(
+      CodexError.codexUsageLimitResetAt(
+        `You've hit your usage limit. Try again at ${when}.`,
+        exitedAt,
+        NEW_YORK,
+      ),
+      expected,
+    );
+  },
+);
 
 it("anchors a yearless reset notice on the exit time, not an invented year", () => {
   const stderrTail = "You've hit your usage limit. Try again at Nov 16th 9:47 AM.";
