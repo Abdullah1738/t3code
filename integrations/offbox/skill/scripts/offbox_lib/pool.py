@@ -220,7 +220,7 @@ def acquire(me, size=None, template=None, base=None, fresh=False, run_id=None, e
     from . import allocation
     con = db()
     try:
-        with allocation.scope(me['repo_key']), prepare.attempts():
+        with allocation.scope(me['repo_key']), allocation.queue(), prepare.attempts():
             while True:
                 try:
                     return _acquire(con, me, size, template, base, fresh, run_id, exclude)
@@ -254,12 +254,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
     allocation.recover_resumes(con, key)
     source = ("fresh" if fresh else f"base:{base if ':' in base else key+':'+base}" if base else
               f"template:{template}" if template else None)
-    wait = wait_seconds()
-    allocation_left = outage.allocation_left()
-    if allocation_left is not None:
-        wait = min(wait, allocation_left)
-    started = time.monotonic()
-    deadline = started + wait
+    queue = allocation._QUEUE.get()
+    wait = queue['wait']
+    deadline = queue['end']
+    started = deadline - wait
     said, last_error = False, None
     next_refresh = 0
     next_progress = 0
@@ -267,6 +265,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
     resume_stall = None
     unusable = set(exclude or ())
     pending_retries = set()
+    pending_busy = {}
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
     mine = own_boxes(con, me)
@@ -298,12 +297,19 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
         pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
                               "AND COALESCE(l.note,'') NOT LIKE ? LIMIT 1", (key, WEDGED_LIKE)).fetchone()
-        if create_first or (pending and pending['box_id'] in unusable):
+        if create_first or (pending and (pending['box_id'] in unusable or
+                                            pending_busy.get(pending['box_id'], 0) > time.monotonic())):
+            pending = None
+        if pending and allocation.resume_inflight(con, pending['box_id']):
             pending = None
         if pending:
             bid = pending["box_id"]
             guard = file_lock("box-" + bid, timeout=0)
-            guard.__enter__()
+            try:
+                guard.__enter__()
+            except OffboxError:
+                pending = None  # the sender/another reconciler owns this box; choose a peer or queue
+        if pending:
             try:
                 pending = con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                                       "WHERE l.box_id=? AND l.state IN ('running','stopped') "
@@ -319,10 +325,12 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     readiness_failed(pending, e)
                     guard.__exit__(None, None, None)
                     continue
-                except lease.ResumeStopped as e:
-                    pending_retries.add(bid)
+                except (lease.ArchivingSkip, allocation.Busy, allocation.Fenced) as e:
+                    if isinstance(e, lease.ResumeStopped) or getattr(e, 'resume_retry_box', None) == bid:
+                        pending_retries.add(bid)
                     guard.__exit__(None, None, None)
                     say(str(e))
+                    pending_busy[bid] = time.monotonic() + 2
                     continue
                 except (lease.ResumeProvisionStalled, prepare.Stalled) as e:
                     con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
@@ -371,22 +379,29 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     for sibling in siblings:
                         pending_sibling = con.execute("SELECT 1 FROM kv WHERE k=?",
                                                      (f"resume_unanswered:{sibling['box_id']}",)).fetchone()
+                        if allocation.resume_inflight(con, sibling['box_id']):
+                            continue
                         if sibling['state'] == 'stopped' or pending_sibling:
-                            con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
-                                        ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
+                            sibling_guard = file_lock('box-' + sibling['box_id'], timeout=0)
+                            try:
+                                sibling_guard.__enter__()
+                            except OffboxError:
+                                continue
+                            try:
+                                con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?",
+                                            ('unanswered-resume: set aside after sibling provisioning stall', sibling['box_id']))
+                                con.commit()
+                            finally:
+                                sibling_guard.__exit__(None, None, None)
                     con.commit()
                     rows, can_create = [], True
-                pending = con.execute("SELECT l.box_id FROM leases l JOIN kv k "
-                                      f"ON k.k='resume_unanswered:' || l.box_id WHERE l.repo_key=? AND {token_mine('l')} "
-                                      "AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ? "
-                                      "LIMIT 1", (key, WEDGED_LIKE)).fetchone()
-                if pending:
-                    raise lease.ResumeUnresolved(f"{pending[0]} has an unanswered resume; "
-                                                 "retry once it has been checked; nothing ran")
+                pending = allocation.abandoned_resumes(con, key)
+                # Abandoned sends must be reconciled before any new start. Locked/in-flight markers are busy.
+                can_create = can_create and not pending
                 if con.execute("SELECT 1 FROM kv WHERE k=?", ("create_unanswered:" + key,)).fetchone():
                     # Replaying the retained key resolves the old allocation; it is not a new pool slot.
                     rows, can_create = [], True
-                if source and not rows and not can_create and not _source_member(con, key, source):
+                if source and not rows and not can_create and not pending and not _source_member(con, key, source):
                     busy, cap, _, _ = queue_state(con, key, run_id)
                     raise OffboxError(
                         f"this run needs a new {key} pool box ({source}), but the pool is full "
@@ -394,7 +409,9 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         "Run without --fresh/--base/--template (a dead box is set aside by itself), or free a slot: "
                         "offbox list --all, then offbox release <id> --delete.", code=2)
                 for r in rows:
-                    if r["box_id"] in tried:
+                    if r["box_id"] in tried or allocation.resume_inflight(con, r['box_id']):
+                        continue
+                    if pending and any(p['box_id'] != r['box_id'] for p in pending) and r['state'] != 'running':
                         continue
                     needs_grow = (r['state'] == 'running' and bool(size)
                                   and SIZES.index(r['size'] or 'default') < SIZES.index(size))
@@ -477,6 +494,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         if wait_for_own:
                             needs_start = grow or row['state'] != 'running'
                             budget = max(0, min(AFFINITY_WAIT_S, deadline - time.monotonic()))
+                            if time.monotonic() < affinity_deadline:
+                                budget = min(budget, affinity_deadline - time.monotonic())
                             if not wait and not needs_start:
                                 budget = AFFINITY_WAIT_S  # a zero queue wait still permits a ready box's health check
                             with api.budget(budget):
@@ -497,8 +516,14 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         readiness_failed(row, e)
                         stopped_error, stopped_failed = e, True
                         continue
+                    except (allocation.Busy, allocation.Fenced) as error:
+                        if getattr(error, 'resume_retry_box', None) == row['box_id']:
+                            pending_retries.add(row['box_id'])
+                        if row['state'] != 'running':
+                            stopped_tries -= 1
+                        continue
                     except (lease.ResumeUnresolved, allocation.Unresolved):
-                        # Do not create another machine while this resume may still have been accepted.
+                        # This attempt itself was unanswered; retain its reconciliation failure.
                         raise
                     except api.BoatAtCapacity as e:
                         # Try every other eligible stopped box, but keep this one in the pool for the next round.
@@ -520,6 +545,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                     except lease.ArchivingSkip as e:
                         if isinstance(e, lease.ResumeStuck):
                             unusable.add(row['box_id'])
+                        elif row['box_id'] in mine and time.monotonic() < affinity_deadline:
+                            # Yield readiness/box guards into the queue while preserving the caller's cache affinity.
+                            say(str(e))
+                            break
                         # Busy-like: the box is still archiving, so try the next member. It does not
                         # make the pool look full, so a create still runs when under cap.
                         if row['state'] != 'running':
@@ -562,6 +591,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
                         with prepare.guard('new allocation') as budget:
                             got = creator(shared, size, template, base, fresh)
                             got['_prepare_end'] = budget.end
+                    except (allocation.Busy, allocation.Fenced):
+                        break
                     except capacity.CapacityError as e:
                         if resume_stall is not None:
                             e.args = (f"{e} Earlier cause: {resume_stall}",)
