@@ -102,6 +102,7 @@ const testLayer = () => {
       send: () => Effect.void,
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );

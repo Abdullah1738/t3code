@@ -101,6 +101,44 @@ export interface AskOutcome {
   readonly evaluatorThreadId: string | null;
 }
 
+/** One of History's "Today" figures: its name, what is shown and what is read out. */
+export interface AskHistoryFact {
+  readonly name: string;
+  readonly value: string;
+  readonly spoken: string;
+}
+
+/**
+ * History's "Today" figures. `incomplete`: some closed asks could not be read
+ * in this build, so the figures counted from his answers are a floor, not a
+ * count. They are shown as "3+" and read out as "at least 3": never as an
+ * exact number, and never as "nothing". The two figures that come from the
+ * open queue are exact either way.
+ */
+export function askHistoryFacts(input: {
+  readonly today: ReadonlyArray<{ readonly outcome: Pick<AskOutcome, "note" | "draft"> }>;
+  readonly waiting: number;
+  readonly toAnswer: number;
+  readonly incomplete: boolean;
+}): ReadonlyArray<AskHistoryFact> {
+  const counted = (name: string, count: number): AskHistoryFact =>
+    input.incomplete
+      ? { name, value: `${count}+`, spoken: `at least ${count}` }
+      : { name, value: String(count), spoken: String(count) };
+  const exact = (name: string, count: number): AskHistoryFact => ({
+    name,
+    value: String(count),
+    spoken: String(count),
+  });
+  return [
+    counted("Answered", input.today.length),
+    counted("With a note", input.today.filter((row) => row.outcome.note !== null).length),
+    counted("Drafts you edited", input.today.filter((row) => row.outcome.draft !== null).length),
+    exact("Waiting on agents", input.waiting),
+    exact("Still to answer", input.toAnswer),
+  ];
+}
+
 const VERDICT_LABELS: Readonly<Record<string, string>> = {
   approved: "Approved",
   rejected: "Rejected",

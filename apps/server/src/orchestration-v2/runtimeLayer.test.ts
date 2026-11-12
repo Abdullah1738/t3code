@@ -2914,16 +2914,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         yield* reactor.sweep;
         assert.equal(reads, 21);
         for (const threadId of threadIds) {
-          assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
+          assert.deepEqual(yield* summaries(threadId), []);
         }
 
         yield* reactor.sweep;
         assert.equal(reads, 21);
+        yield* TestClock.adjust("10 minutes");
+        yield* reactor.sweep;
+        assert.equal(reads, 22);
+        for (const threadId of threadIds) {
+          assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
+        }
 
         const late = ThreadId.make("runtime-pull-request-watch-shared-late");
         yield* watchFrom(late);
         yield* reactor.sweep;
-        assert.equal(reads, 22);
+        assert.equal(reads, 23);
+        assert.deepEqual(yield* summaries(late), []);
+        yield* TestClock.adjust("10 minutes");
+        yield* reactor.sweep;
+        assert.equal(reads, 24);
         assert.deepEqual(yield* summaries(late), ["#9: checks passed"]);
         for (const threadId of threadIds) {
           assert.deepEqual(yield* summaries(threadId), ["#9: checks passed"]);
@@ -2933,7 +2943,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         host = "closed";
         yield* TestClock.adjust("10 minutes");
         yield* reactor.sweep;
-        assert.equal(reads, 23);
+        assert.equal(reads, 25);
         for (const threadId of threadIds) {
           assert.isFalse(yield* watching(threadId));
           assert.deepEqual(yield* summaries(threadId), [

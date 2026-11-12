@@ -24,6 +24,7 @@ import * as GitHubPullRequestProvider from "./GitHubPullRequestProvider.ts";
 import { KnownWorkflowRuns } from "./gitHubConditionalChecks.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const coreResponse = (pullRequest: Readonly<Record<string, unknown>> = {}) => ({
   data: {
@@ -582,6 +583,9 @@ const workflowRuns = (ids: ReadonlyArray<number>) => ({
     id,
     name: id === 10 ? "build" : `run ${id}`,
     html_url: `https://example.com/${id}`,
+    status: "completed",
+    conclusion: "action_required",
+    head_branch: "feat/page",
   })),
 });
 
@@ -704,6 +708,591 @@ it.effect(
 );
 
 layer("GitHubPullRequestApi.layer", (it) => {
+  it.effect("keeps a queued run pending when an older run shares its workflow name", () =>
+    Effect.gen(function* () {
+      route(
+        [
+          "query PullRequestCore",
+          coreResponse({
+            commits: {
+              nodes: [
+                {
+                  commit: {
+                    statusCheckRollup: {
+                      contexts: {
+                        nodes: [
+                          checkRun({
+                            name: "broker-rights",
+                            conclusion: "SUCCESS",
+                            detailsUrl: "https://github.com/acme/web/actions/runs/1/job/4",
+                            checkSuite: {
+                              workflowRun: { workflow: { name: "Kafka broker-rights" } },
+                            },
+                          }),
+                        ],
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        ],
+        [
+          "/actions/runs?",
+          {
+            workflow_runs: [
+              {
+                id: 2,
+                name: "Kafka broker-rights",
+                status: "queued",
+                html_url: "https://github.com/acme/web/actions/runs/2",
+              },
+            ],
+          },
+        ],
+      );
+      const provider = yield* GitHubPullRequestProvider.make;
+      const read = provider.getChangeRequestChecks;
+      if (read === undefined) return yield* Effect.die("checks read missing");
+      const result = yield* read({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+      });
+      expect(result.checks).toContainEqual(
+        expect.objectContaining({
+          status: "pending",
+          url: "https://github.com/acme/web/actions/runs/2",
+        }),
+      );
+    }),
+  );
+
+  it.effect("finds approvals beyond the unfiltered first workflow page", () =>
+    Effect.gen(function* () {
+      const newerRuns = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 100,
+        name: `completed ${index}`,
+        status: "completed",
+        conclusion: "success",
+        head_branch: "feat/page",
+        event: "pull_request",
+      }));
+      mockedExecute.mockImplementation((call) => {
+        if (call.kind === "graphql")
+          return Effect.succeed(
+            output(
+              encodeJson(
+                call.operationName === "PullRequestHeads" ? heads([7]) : crossRepositoryDetail(),
+              ),
+            ),
+          );
+        const filtered = call.path.includes("status=action_required");
+        const second = call.path.includes("page=2");
+        return Effect.succeed(
+          output(
+            encodeJson(filtered || second ? workflowRuns([10]) : { workflow_runs: newerRuns }),
+            false,
+            false,
+            filtered || second ? {} : { link: '<https://api.github.com/next>; rel="next"' },
+          ),
+        );
+      });
+      const provider = yield* GitHubPullRequestProvider.make;
+      const read = provider.getChangeRequestChecks;
+      if (read === undefined) return yield* Effect.die("checks read missing");
+      const result = yield* read({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+      });
+      expect(result.checks).toContainEqual(
+        expect.objectContaining({ name: "build", status: "action-required" }),
+      );
+    }),
+  );
+
+  const workflowIdentityCases = [
+    {
+      label: "same run and workflow",
+      url: "https://github.com/acme/web/actions/runs/2/job/4",
+      workflow: "CI",
+      pending: false,
+    },
+    {
+      label: "older run with same workflow",
+      url: "https://github.com/acme/web/actions/runs/1/job/4",
+      workflow: "CI",
+      pending: true,
+    },
+    {
+      label: "same run with a different workflow name",
+      url: "https://github.com/acme/web/actions/runs/2/job/4",
+      workflow: "other",
+      pending: false,
+    },
+    {
+      label: "same run without a workflow name",
+      url: "https://github.com/acme/web/actions/runs/2/job/4",
+      workflow: null,
+      pending: false,
+    },
+    {
+      label: "same run URL with query",
+      url: "https://github.com/acme/web/actions/runs/2?attempt=1",
+      workflow: "CI",
+      pending: false,
+    },
+    {
+      label: "same run URL with fragment",
+      url: "https://github.com/acme/web/actions/runs/2#jobs",
+      workflow: "CI",
+      pending: false,
+    },
+    {
+      label: "same run URL without suffix",
+      url: "https://github.com/acme/web/actions/runs/2",
+      workflow: "CI",
+      pending: false,
+    },
+    { label: "unknown identity and matching workflow", url: null, workflow: "CI", pending: false },
+    {
+      label: "custom URL and matching workflow",
+      url: "https://ci.example/jobs/4",
+      workflow: "CI",
+      pending: false,
+    },
+    { label: "unknown identity and another workflow", url: null, workflow: "other", pending: true },
+    {
+      label: "older run and another workflow",
+      url: "https://github.com/acme/web/actions/runs/1/job/4",
+      workflow: "other",
+      pending: true,
+    },
+    {
+      label: "status context URL is not a check run",
+      url: "https://github.com/acme/web/actions/runs/2",
+      workflow: null,
+      pending: true,
+      statusContext: true,
+    },
+  ].flatMap((scenario) => [false, true].map((paginated) => ({ ...scenario, paginated })));
+  it.effect.each(workflowIdentityCases)(
+    "workflow identity: $label, paginated=$paginated",
+    (scenario) =>
+      Effect.gen(function* () {
+        const paginated = scenario.paginated;
+        const node = scenario.statusContext
+          ? {
+              __typename: "StatusContext",
+              context: "commit status",
+              state: "SUCCESS",
+              targetUrl: scenario.url,
+              createdAt: "2026-01-01T00:00:00Z",
+              description: null,
+            }
+          : checkRun({
+              name: "job",
+              conclusion: "SUCCESS",
+              detailsUrl: scenario.url,
+              checkSuite: {
+                workflowRun:
+                  scenario.workflow === null ? null : { workflow: { name: scenario.workflow } },
+              },
+            });
+        route(
+          [
+            "query PullRequestCore",
+            coreResponse({
+              commits: {
+                nodes: [
+                  {
+                    commit: {
+                      statusCheckRollup: {
+                        contexts: {
+                          nodes: paginated ? [] : [node],
+                          pageInfo: {
+                            hasNextPage: paginated,
+                            endCursor: paginated ? "next" : null,
+                          },
+                        },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+          ],
+          ["query PullRequestCheckContexts", decodeJson(checkContextsPage([node], null))],
+          [
+            "/actions/runs?",
+            {
+              workflow_runs: [
+                {
+                  id: 2,
+                  name: "CI",
+                  status: "queued",
+                  html_url: "https://github.com/acme/web/actions/runs/2",
+                },
+              ],
+            },
+          ],
+        );
+        const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+        const result = yield* cli.getPullRequestDetail({
+          cwd: "/w",
+          repository: "acme/web",
+          host: "github.com",
+          number: 7,
+          includeActiveWorkflows: true,
+        });
+        expect(result.checks.some((check) => check.status === "pending")).toBe(scenario.pending);
+      }),
+  );
+
+  const workflowCompletenessCases = [
+    { label: "100 runs with next page", count: 100, next: true, approvals: 1 },
+    { label: "100 runs without a next link", count: 100, next: false, approvals: 1 },
+    { label: "short page with a next link", count: 1, next: true, approvals: 1 },
+    { label: "filtered approvals span two pages", count: 100, next: true, approvals: 101 },
+    { label: "filtered read confirms zero", count: 100, next: true, approvals: 0 },
+    { label: "filtered read fails", count: 100, next: true, approvals: 0, unavailable: true },
+  ].flatMap((scenario) => (["detail", "checks"] as const).map((read) => ({ ...scenario, read })));
+  it.effect.each(workflowCompletenessCases)("workflow completeness: $label, $read", (scenario) =>
+    Effect.gen(function* () {
+      const read = scenario.read;
+      const newer = Array.from({ length: scenario.count }, (_, index) => ({
+        id: index + 1000,
+        name: `completed ${index}`,
+        status: "completed",
+        conclusion: "success",
+        head_branch: "feat/page",
+        event: "pull_request",
+      }));
+      mockedExecute.mockImplementation((call) => {
+        if (call.kind === "graphql")
+          return Effect.succeed(
+            output(
+              encodeJson(
+                call.operationName === "PullRequestHeads" ? heads([7]) : crossRepositoryDetail(),
+              ),
+            ),
+          );
+        if (!call.path.includes("status=action_required"))
+          return Effect.succeed(
+            output(
+              encodeJson({ workflow_runs: newer }),
+              false,
+              false,
+              scenario.next ? { link: '<https://api.github.com/next>; rel="next"' } : {},
+            ),
+          );
+        if (scenario.unavailable) return Effect.succeed(output("unavailable"));
+        const lastPage = call.path.includes("page=2");
+        const ids = Array.from(
+          {
+            length: Math.min(
+              lastPage ? Math.max(0, scenario.approvals - 100) : scenario.approvals,
+              100,
+            ),
+          },
+          (_, index) => index + (lastPage ? 101 : 1),
+        );
+        return Effect.succeed(output(encodeJson(workflowRuns(ids))));
+      });
+      const provider = yield* GitHubPullRequestProvider.make;
+      const input = { cwd: "/w", repository: "acme/web", host: "github.com", number: 7 };
+      const checksRead = provider.getChangeRequestChecks;
+      if (checksRead === undefined) return yield* Effect.die("checks read missing");
+      const result = yield* read === "detail"
+        ? provider.getChangeRequest(input)
+        : checksRead(input);
+      expect(result.checks.filter((check) => check.status === "action-required")).toHaveLength(
+        scenario.unavailable ? 1 : scenario.approvals,
+      );
+      expect(result.checks.some((check) => check.name === "Workflow approval status")).toBe(
+        scenario.unavailable === true,
+      );
+      const filtered = restCallsTo("status=action_required");
+      expect(filtered).toHaveLength(scenario.approvals > 100 ? 2 : 1);
+      expect(
+        restCallsTo("/actions/runs").filter(
+          (call) => !call.path.includes("status=action_required"),
+        ),
+      ).toHaveLength(1);
+      if (read === "detail")
+        expect(
+          "workflowApprovalsRequired" in result ? result.workflowApprovalsRequired : undefined,
+        ).toBe(scenario.unavailable ? undefined : scenario.approvals);
+    }),
+  );
+
+  it.effect.each([false, true])("workflow completeness: known runs complete=%s", (complete) =>
+    Effect.gen(function* () {
+      route(
+        ["query PullRequestCore", crossRepositoryDetail()],
+        ["query PullRequestHeads", heads([7])],
+        ["status=action_required", workflowRuns([10])],
+      );
+      const newer = Array.from({ length: 100 }, (_, index) => ({
+        id: index + 100,
+        name: `completed ${index}`,
+        status: "completed",
+        conclusion: "success",
+        head_branch: "feat/page",
+        event: "pull_request",
+      }));
+      const provider = yield* GitHubPullRequestProvider.make;
+      const read = provider.getChangeRequestChecks;
+      if (read === undefined) return yield* Effect.die("checks read missing");
+      const result = yield* read({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+      }).pipe(
+        Effect.provideService(KnownWorkflowRuns, {
+          headSha: "abc123",
+          complete,
+          runs: complete ? [...newer, ...workflowRuns([10]).workflow_runs] : newer,
+        }),
+      );
+      expect(result.checks.filter((check) => check.status === "action-required")).toHaveLength(1);
+      expect(restCallsTo("/actions/runs")).toHaveLength(complete ? 0 : 1);
+    }),
+  );
+
+  it.effect("keeps 217c50a checks pending while Terraform has no check runs", () =>
+    Effect.gen(function* () {
+      const sha = "217c50acf103b1add10865275cc20dd692b04c42";
+      const kafka = checkRun({
+        name: "broker-rights",
+        conclusion: "SUCCESS",
+        checkSuite: { workflowRun: { workflow: { name: "Kafka broker-rights" } } },
+      });
+      const core = (checks: ReadonlyArray<Record<string, unknown>>) =>
+        coreResponse({
+          headRefOid: sha,
+          commits: {
+            nodes: [
+              {
+                commit: {
+                  statusCheckRollup: {
+                    contexts: { nodes: checks, pageInfo: { hasNextPage: false, endCursor: null } },
+                  },
+                },
+              },
+            ],
+          },
+        });
+      const provider = yield* GitHubPullRequestProvider.make;
+      const read = provider.getChangeRequestChecks;
+      if (read === undefined) return yield* Effect.die("checks read missing");
+      const input = { cwd: "/w", repository: "acme/web", host: "github.com", number: 7 };
+      for (const status of ["queued", "in_progress", "waiting", "requested", "pending"]) {
+        route(
+          ["query PullRequestCore", core([kafka])],
+          [
+            "/actions/runs?",
+            {
+              workflow_runs: [
+                {
+                  id: 42502148278,
+                  name: " Terraform ",
+                  status,
+                  html_url: "https://github.com/acme/web/actions/runs/42502148278",
+                },
+              ],
+            },
+          ],
+        );
+        const result = yield* read(input);
+        expect(result.checks).toEqual([
+          { name: "broker-rights", status: "success", description: null, url: null },
+          {
+            name: "Terraform",
+            status: "pending",
+            description: null,
+            url: "https://github.com/acme/web/actions/runs/42502148278",
+            required: false,
+          },
+        ]);
+      }
+      const terraform = checkRun({
+        name: "unit 1/9",
+        status: "IN_PROGRESS",
+        checkSuite: { workflowRun: { workflow: { name: "Terraform" } } },
+      });
+      route(
+        ["query PullRequestCore", core([kafka, terraform])],
+        [
+          "/actions/runs?",
+          { workflow_runs: [{ id: 42502148278, name: "Terraform", status: "in_progress" }] },
+        ],
+      );
+      expect((yield* read(input)).checks.map((check) => check.name)).toEqual([
+        "broker-rights",
+        "unit 1/9",
+      ]);
+      route(
+        ["query PullRequestCore", core([kafka])],
+        [
+          "/actions/runs?",
+          {
+            workflow_runs: [
+              { id: 42502148278, name: "Terraform", status: "completed", conclusion: "success" },
+            ],
+          },
+        ],
+      );
+      expect((yield* read(input)).checks).toHaveLength(1);
+    }),
+  );
+
+  it.effect("reuses known head runs, ignores another head, and matches run URLs", () =>
+    Effect.gen(function* () {
+      const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      const input = {
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+        includeActiveWorkflows: true,
+      };
+      route(
+        ["query PullRequestCore", coreResponse()],
+        ["/actions/runs?", { workflow_runs: [{ id: 2, status: "pending", name: " " }] }],
+      );
+      const known = {
+        headSha: "abc123",
+        complete: true,
+        runs: [{ id: 1, name: "Terraform", status: "queued" }],
+      };
+      const result = yield* cli
+        .getPullRequestDetail(input)
+        .pipe(Effect.provideService(KnownWorkflowRuns, known));
+      expect(result.checks).toContainEqual({
+        name: "Terraform",
+        status: "pending",
+        description: null,
+        url: null,
+        required: false,
+      });
+      expect(result.checksState).toBe("pending");
+      expect(restCallsTo("/actions/runs")).toHaveLength(0);
+      const other = yield* cli
+        .getPullRequestDetail(input)
+        .pipe(Effect.provideService(KnownWorkflowRuns, { ...known, headSha: "other" }));
+      expect(other.checks.map((check) => check.name)).toContain("Workflow run 2");
+      expect(restCallsTo("/actions/runs")).toHaveLength(1);
+      route([
+        "query PullRequestCore",
+        coreResponse({
+          commits: {
+            nodes: [
+              {
+                commit: {
+                  statusCheckRollup: {
+                    contexts: {
+                      nodes: [
+                        checkRun({
+                          name: "unit",
+                          status: "IN_PROGRESS",
+                          detailsUrl: "https://github.com/acme/web/actions/runs/1/job/4",
+                        }),
+                      ],
+                      pageInfo: { hasNextPage: false },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        }),
+      ]);
+      const represented = yield* cli
+        .getPullRequestDetail(input)
+        .pipe(Effect.provideService(KnownWorkflowRuns, known));
+      expect(represented.checks.map((check) => check.name)).toEqual(["unit"]);
+    }),
+  );
+
+  it.effect("shares the head run read with workflow approval checks", () =>
+    Effect.gen(function* () {
+      route(
+        ["query PullRequestCore", crossRepositoryDetail()],
+        ["query PullRequestHeads", heads([7])],
+        [
+          "/actions/runs?",
+          {
+            workflow_runs: [
+              {
+                id: 10,
+                name: "approval",
+                status: "completed",
+                conclusion: "action_required",
+                head_branch: "feat/page",
+                event: "pull_request",
+              },
+              {
+                id: 11,
+                name: "Terraform",
+                status: "queued",
+                head_branch: "feat/page",
+                event: "push",
+              },
+              {
+                id: 12,
+                name: "push approval",
+                status: "completed",
+                conclusion: "action_required",
+                head_branch: "feat/page",
+                event: "push",
+              },
+            ],
+          },
+        ],
+      );
+      const provider = yield* GitHubPullRequestProvider.make;
+      const read = provider.getChangeRequestChecks;
+      if (read === undefined) return yield* Effect.die("checks read missing");
+      const result = yield* read({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+      });
+      expect(result.checks.map(({ name, status }) => ({ name, status }))).toEqual([
+        { name: "Terraform", status: "pending" },
+        { name: "approval", status: "action-required" },
+      ]);
+      expect(restCallsTo("/actions/runs")).toHaveLength(1);
+    }),
+  );
+
+  it.effect("leaves checks intact when the head workflow read fails", () =>
+    Effect.gen(function* () {
+      route(
+        ["query PullRequestCore", coreResponse()],
+        ["/actions/runs?", { message: "unavailable" }],
+      );
+      const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      const detail = yield* cli.getPullRequestDetail({
+        cwd: "/w",
+        repository: "acme/web",
+        host: "github.com",
+        number: 7,
+        includeActiveWorkflows: true,
+      });
+      expect(detail.checks).toEqual([]);
+      expect(detail.headWorkflowRuns).toBeUndefined();
+    }),
+  );
+
   it.effect("holds background previews once an answer reports the reserve, until it resets", () =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
@@ -2975,6 +3564,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
         })
         .pipe(
           Effect.provideService(KnownWorkflowRuns, {
+            complete: true,
             headSha: "abc123",
             runs: [
               {

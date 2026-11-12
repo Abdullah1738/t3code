@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, lease, outage, pool, ssh_sync
-from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
+from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, month_key, now,
                      offsets_path, out, read_json, say, silence)
 from .identity import require_proven
@@ -359,9 +359,9 @@ def _run_row(run_id: str):
     return r
 
 
-def _catch_up_log(r, budget: float | None = None, *, locked: bool = False) -> str:
-    """Complete a settled log using retained history only. Maintenance callers already own the box lock."""
-    if r['status'] in ('starting', 'running') or not (r['box_id'] and r['command_id']):
+def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live: bool = False) -> str:
+    """Fetch history under the writer's box lock; live reads stop at each stream's observed size."""
+    if (r['status'] in ('starting', 'running') and not live) or not (r['box_id'] and r['command_id']):
         return 'n/a'
     path = LOGS_DIR / f"{r['run_id']}.log"
     guard = contextlib.nullcontext() if locked else file_lock('box-' + r['box_id'], timeout=0)
@@ -374,14 +374,14 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False) -> st
             # A detached run may never have had a follower. Its missing log has a known empty prefix.
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-        return _catch_up_log_locked(r, path, budget)
+        return _catch_up_log_locked(r, path, budget, live=live)
     except OSError as e:
         return 'incomplete:' + str(e)
     finally:
         guard.__exit__(None, None, None)
 
 
-def _catch_up_log_locked(r, path, budget) -> str:
+def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
     started = time.time()
     deadline = started + (30 if budget is None else budget)
     tmp = None
@@ -412,6 +412,7 @@ def _catch_up_log_locked(r, path, budget) -> str:
                     dst.write(chunk)
                     left -= len(chunk)
             for i, which in enumerate(('stdout', 'stderr')):
+                snapshot = None
                 while True:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
@@ -420,17 +421,29 @@ def _catch_up_log_locked(r, path, budget) -> str:
                         return 'incomplete:timeout'
                     if page.get('size') is not None:
                         sizes[i] = max(sizes[i], int(page['size']) - ck[which + 'Offset'])
+                        if snapshot is None:
+                            snapshot = int(page['size'])
                     if budget is None:
                         deadline = started + min(180, 30 + sum(sizes) / 1_000_000)
                     data = (page.get('data') or '').encode()
                     nxt = page.get('nextOffset')
                     nxt = offsets[i] + len(data) if nxt is None else int(nxt)
-                    if nxt <= offsets[i] and not page.get('done'):
+                    if nxt <= offsets[i] and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
                         return 'incomplete:no progress'
                     if nxt != offsets[i] + len(data):
                         return 'incomplete:invalid history offset'
                     dst.write(data)
                     offsets[i] = nxt
+                    if live and dst.tell() >= length:
+                        # Publish each validated page before fetching more: a later failure must keep this progress.
+                        dst.flush()
+                        if tmp is not None:
+                            os.replace(tmp, path)
+                            tmp = None
+                        atomic_write_json(offsets_path(path),
+                                          dict(stdoutOffset=offsets[0], stderrOffset=offsets[1], logBytes=dst.tell()))
+                    if live and (snapshot is None or nxt >= snapshot):
+                        break
                     if page.get('done'):
                         if page.get('size') is not None and nxt < int(page['size']):
                             return 'incomplete:history ended early'
@@ -438,10 +451,13 @@ def _catch_up_log_locked(r, path, budget) -> str:
             log_bytes = dst.tell()
         if time.time() >= deadline:
             return 'incomplete:timeout'
+        if live and log_bytes < length:
+            return 'incomplete:history behind local log'
         if offsets == [ck['stdoutOffset'], ck['stderrOffset']] and length == keep and checkpoint(path) is not None:
             return 'complete'
-        os.replace(tmp, path)
-        tmp = None
+        if tmp is not None:
+            os.replace(tmp, path)
+            tmp = None
         atomic_write_json(offsets_path(path),
                           dict(stdoutOffset=offsets[0], stderrOffset=offsets[1], logBytes=log_bytes))
         # No follower can own these under the box lock. Discard abandoned replay files so a stale replay cannot
@@ -480,6 +496,21 @@ def _incomplete_log(r, result) -> None:
             f"({result.split(':', 1)[1]}); this output is incomplete")
 
 
+def _refresh_running_ttl(r, until=None) -> None:
+    if r['status'] != 'running' or r['mode'] == 'local' or not (r['box_id'] and r['process_id']):
+        return
+    seconds = 5 if until is None else min(5, max(0, until - now()))
+    if seconds <= 0:
+        return
+    try:
+        with api.budget(seconds):
+            box = api.get(r['box_id'])
+            if box and box.get('state') in api.LIVE_STATES:
+                lease.ensure_ttl(r['box_id'], RUN_TTL_S, box)
+    except OffboxError:
+        pass
+
+
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     p = LOGS_DIR / f"{r['run_id']}.log"
@@ -493,14 +524,17 @@ def logs(run_id: str, do_follow: bool) -> int:
     if r['status'] in ('starting', 'running'):
         if do_follow:
             return _wait_locked(r, echo=True)
+        _refresh_running_ttl(r)
+        result = _catch_up_log(r, budget=10, live=True) if r['status'] == 'running' else 'n/a'
         _tail(p, 0, True)
+        _incomplete_log(r, result)
         if r['mode'] != 'local':
             if not r['box_id'] or not r['process_id']:
                 say(f"{_not_started(r)}; no output yet. Follow it with: offbox logs {r['run_id']} --follow")
             st = p.stat() if p.exists() else None
             written = time.strftime('%H:%M:%S', time.localtime(st.st_mtime)) if st else 'never'
             say(f"{r['run_id']} is still running; this local copy ({st.st_size if st else 0} bytes, last written "
-                f"{written}) only grows while someone follows it. Use `offbox logs --follow {r['run_id']}` "
+                f"{written}) includes the output fetched so far. Use `offbox logs --follow {r['run_id']}` "
                 f"or `offbox wait {r['run_id']} --timeout <s>` for current output.")
         return 0
     result = _catch_up_log(r)
@@ -594,6 +628,7 @@ def _wait_locked(r, echo, timeout=None):
         r = _wait_for_start(r, deadline)
     if r['status'] not in ('starting', 'running', 'lost') or not r['box_id']:
         return _settled(r, echo=echo, until=deadline)
+    _refresh_running_ttl(r, deadline)
     pos, said = 0, False
     polled, ended_at = None, None
     # The row we poll: refreshed each loop, so a PID the holder records later (it starts with NULL) is picked up.

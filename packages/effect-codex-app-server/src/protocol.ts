@@ -55,6 +55,8 @@ export interface CodexAppServerPatchedProtocolOptions {
 
 export interface CodexAppServerPatchedProtocol {
   readonly awaitInputEnd: Effect.Effect<void>;
+  /** Completes with the classified error once the transport has terminated. */
+  readonly termination: Effect.Effect<CodexError.CodexAppServerError>;
   readonly incomingNotifications: Stream.Stream<CodexAppServerIncomingNotification>;
   readonly incomingRequests: Stream.Stream<CodexAppServerIncomingRequest>;
   readonly request: (
@@ -491,6 +493,15 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
 
     return {
       awaitInputEnd: Deferred.await(inputEnded),
+      termination: Deferred.await(terminationSignal).pipe(
+        Effect.andThen(Ref.get(terminationFailure)),
+        Effect.map(
+          Option.getOrElse(
+            (): CodexError.CodexAppServerError =>
+              new CodexError.CodexAppServerInputStreamEndedError({}),
+          ),
+        ),
+      ),
       incomingNotifications: Stream.fromQueue(incomingNotifications),
       incomingRequests: Stream.fromQueue(incomingRequests),
       request,

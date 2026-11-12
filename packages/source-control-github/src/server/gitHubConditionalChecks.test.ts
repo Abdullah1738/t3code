@@ -86,6 +86,7 @@ it.effect(
 
       expect(known[0]).toEqual({
         headSha: sha,
+        complete: true,
         runs: [{ id: 9, status: "completed", conclusion: "action_required" }],
       });
       requests.length = 0;
@@ -242,5 +243,120 @@ it.effect("falls back when REST checks are unavailable without retrying unsuppor
       );
     expect(probes).toBe(1);
     expect(reads).toBe(2);
+  }),
+);
+
+it.effect(
+  "does not reuse all-green checks through 304s while a same-repository workflow is active",
+  () =>
+    Effect.gen(function* () {
+      const sha = "a".repeat(40);
+      let reads = 0;
+      const requests: string[] = [];
+      const revalidate = yield* makeChecksRevalidator.pipe(
+        Effect.provide(
+          Layer.mock(GitHubRest.GitHubRest)({
+            rest: ({ path, ifNoneMatch }) =>
+              Effect.sync(() => {
+                requests.push(path);
+                return {
+                  status: ifNoneMatch ? 304 : 200,
+                  headers: { etag: '"one"' },
+                  body: ifNoneMatch
+                    ? ""
+                    : path.endsWith("/pulls/1")
+                      ? encodeJson({ head: { sha, repo: { id: 1 } }, base: { repo: { id: 1 } } })
+                      : path.includes("/actions/runs")
+                        ? encodeJson({
+                            workflow_runs: [{ id: 9, name: "Terraform", status: "queued" }],
+                          })
+                        : "{}",
+                  truncated: false,
+                  invalidUtf8: false,
+                };
+              }),
+          }),
+        ),
+      );
+      const read = Effect.gen(function* () {
+        expect((yield* KnownWorkflowRuns)?.runs[0]?.status).toBe("queued");
+        reads++;
+        return {
+          state: "open" as const,
+          headSha: sha,
+          workflowApprovalsRequired: 0,
+          checks: [
+            {
+              name: "Kafka",
+              status: reads < 3 ? ("success" as const) : ("pending" as const),
+              description: null,
+              url: null,
+            },
+          ],
+        };
+      });
+      const poll = () =>
+        revalidate(reference, read).pipe(
+          Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, credential),
+        );
+      yield* poll();
+      yield* poll();
+      expect(reads).toBe(2);
+      yield* poll();
+      yield* poll();
+      expect(reads).toBe(3);
+      expect(requests.filter((path) => path.includes("/actions/runs"))).toHaveLength(4);
+    }),
+);
+
+it.effect.each([false, true])("marks workflow completeness, fork=%s", (fork) =>
+  Effect.gen(function* () {
+    const sha = "a".repeat(40);
+    const requests: string[] = [];
+    const revalidate = yield* makeChecksRevalidator.pipe(
+      Effect.provide(
+        Layer.mock(GitHubRest.GitHubRest)({
+          rest: ({ path }) =>
+            Effect.sync(() => {
+              requests.push(path);
+              const runs = path.includes("/actions/runs");
+              const second = path.includes("page=2");
+              return {
+                status: 200,
+                headers:
+                  runs && !second ? { link: '<https://api.github.com/next>; rel="next"' } : {},
+                body: path.endsWith("/pulls/1")
+                  ? encodeJson({
+                      head: { sha, repo: { id: fork ? 2 : 1 } },
+                      base: { repo: { id: 1 } },
+                    })
+                  : runs
+                    ? encodeJson({
+                        workflow_runs: second
+                          ? [{ id: 1, status: "completed", conclusion: "action_required" }]
+                          : Array.from({ length: 100 }, (_, index) => ({
+                              id: index + 100,
+                              status: "completed",
+                              conclusion: "success",
+                            })),
+                      })
+                    : "{}",
+                truncated: false,
+                invalidUtf8: false,
+              };
+            }),
+        }),
+      ),
+    );
+    const read = Effect.gen(function* () {
+      const known = yield* KnownWorkflowRuns;
+      expect(known?.complete).toBe(fork);
+      expect(known?.runs).toHaveLength(fork ? 101 : 100);
+      return { state: "open" as const, headSha: sha, checks: [], workflowApprovalsRequired: 0 };
+    });
+    yield* revalidate(reference, read).pipe(
+      Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, credential),
+    );
+    expect(requests.filter((path) => path.includes("/actions/runs"))).toHaveLength(fork ? 2 : 1);
   }),
 );

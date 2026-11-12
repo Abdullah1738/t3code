@@ -163,6 +163,8 @@ test("a wake watcher failing 15+ min wakes the agent once per failure run, caps 
   const flag = join(sandbox, "esc-ok");
   expect(cli("add", "--id", "esc", "--title", "Esc", "--check", `[[ -f ${flag} ]] || { echo "wacli sync daemon is not running" >&2; exit 1; }`,
     "--interval", "30", "--context", "Owner waits for a reply.", "--no-prime").exitCode).toBe(0);
+  const definition = join(sandbox, "root/watchers/esc/watcher.json");
+  writeFileSync(definition, JSON.stringify({ ...JSON.parse(readFileSync(definition, "utf8")), max_consecutive_failures: 0 }));
   const file = join(sandbox, "root/watchers/esc/state.json");
   // Failing 5 min: no escalation yet.
   writeFileSync(file, JSON.stringify({ status: "active", fires: 0, consecutive_failures: 7, failure_alerted: true,

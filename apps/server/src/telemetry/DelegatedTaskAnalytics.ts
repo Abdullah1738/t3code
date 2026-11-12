@@ -70,6 +70,7 @@ const make = Effect.gen(function* () {
           : undefined;
       yield* analytics.record("mcp.delegated_task.finished", {
         status: task.status,
+        ...(task.failureReason === undefined ? {} : { outcome: task.failureReason }),
         callerProvider: parentDimensions.provider,
         ...(parentDimensions.model === undefined ? {} : { callerModel: parentDimensions.model }),
         targetProvider: child.provider,

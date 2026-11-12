@@ -53,6 +53,8 @@ type Turn = Route & {
   steered?: string[];
   /** When the last steer was sent, bounding how long a steer that never shows up holds the reply. */
   steeredAt?: number;
+  /** A person's text was steered into this watcher turn, so it owes them an answer like a typed turn does. */
+  typed?: boolean;
   /** The first reply already queued while this turn was still running, including a matching /send. */
   earlySent?: string;
   earlyText?: string;
@@ -337,9 +339,27 @@ const ERRORED_RETRY_MS = 120_000;
 const DROPPED_BATCH_MS = 10 * 60_000;
 /** One idempotent retry, then hold the batch until the route can accept it. */
 export const ACCEPT_WAIT_MS = 60_000;
+/**
+ * How long a backend read may take before the tick moves on. A slow backend is
+ * not a dead one: on 12 Nov 2026 Robob answered thread reads in 2-25 s, the old
+ * 10 s bound called that an outage, and texts waited for hours.
+ */
+export const READ_WAIT_MS = 30_000;
+/**
+ * Prompt and steer POSTs carry a 60 s budget in the client, after up to 25 s
+ * resolving the thread. The router waits that out instead of walking away from
+ * a send that is still in flight and then having to guess whether it landed.
+ */
+export const SEND_WAIT_MS = 90_000;
+/** A control (/new, an answer) waiting to be handled is not kept behind one backend call longer than this. */
+const CONTROL_WAIT_MS = 10_000;
 const OUTAGE_TEXT = "I'm having a technical problem; I'll answer this as soon as I'm back.";
 type Outage = { id: string; probeAt: number; replayAt?: number };
-type PreparingDelivery = { id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean };
+type PreparingDelivery = {
+  id: string; startedAt: number; attemptAt: number; attempt: number; held?: boolean;
+  /** Rebuilt from a turn that was already POSTed: its members are fixed, so it is never unsealed. */
+  posted?: boolean;
+};
 /** A prompt POSTed for a synthetic row. It is checked again before any further POST for that row. */
 type SentPrompt = { sessionId: string; directory: string; generation?: number; messageId: string; startedAt: number };
 type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason };
@@ -550,6 +570,12 @@ export class Router {
   /** Sendblue mode: queued rows already marked read, so each is marked once rather than every tick. */
   private readIds = new Set<string>();
   private steerRefusedAt = 0;
+  /** Rows this tick has already consumed, so a backend read knows whether a control is still waiting. */
+  private handledNow: Set<string> = new Set();
+  /** Prompt ids whose POST has not settled yet, even if the router stopped waiting for it. */
+  private inflight = new Set<string>();
+  /** The control row being handled right now; it is not waiting on anything. */
+  private controlNow?: string;
   /** Sendblue: the machine-wide busy list, refreshed off the hot path because Robob takes seconds to list threads. */
   private listed?: { at: number; statuses: Record<string, SessionStatus> };
   private listing?: Promise<void>;
@@ -652,6 +678,23 @@ export class Router {
   private owns(id: string): boolean {
     const turn = this.store.get<Turn | null>("activeTurn");
     return turn?.inboundId === id && !(turn.phase === "failed" && synthetic(id));
+  }
+
+  /** A batch of watcher wakes and reply reminders only: rows nobody typed and nobody asked for by hand. */
+  private wakeBatch(id: string | undefined): boolean {
+    return this.syntheticBatch(id)?.every(member => member.startsWith("wake:")) === true;
+  }
+
+  /** A person's text was confirmed into this turn, including one confirmed after the caller read it. */
+  private typedInto(turn: Turn): boolean {
+    if (turn.typed) return true;
+    const live = this.store.get<Turn | null>("activeTurn");
+    return live?.messageId === turn.messageId && live.typed === true;
+  }
+
+  /** A person's text is queued and not yet taken. */
+  private someoneWaiting(): boolean {
+    return this.store.pendingInbound().some(row => row.state === "pending" && !synthetic(row.id));
   }
 
   /** The rows of a batch led by `id` when every one is synthetic, else undefined. */
@@ -830,6 +873,7 @@ export class Router {
       const sendblue = this.options.context !== undefined;
       if (sendblue) await this.markRead(rows);
       const preceding = new Set<string>();
+      this.handledNow = preceding;
       // Do not wait for a conversational turn before consuming controls and answers.
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
@@ -839,14 +883,15 @@ export class Router {
             this.acknowledge(row.id, "Something interrupted that one before I could get to it. Mind sending it again?", "unknown");
           }
         } else {
-          await this.control(row, input, preceding);
+          this.controlNow = row.id;
+          try { await this.control(row, input, preceding); } finally { this.controlNow = undefined; }
         }
         preceding.add(row.id);
       }
       await this.deliveryWatchdog(preceding);
       await this.preparationWatchdog(preceding);
       await this.poll();
-      for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row);
+      for (const row of this.store.pendingInbound()) if (row.state === "processing" && this.steering(row.id)) await this.steer(row, preceding);
       await this.watch();
       await this.nudgeDue();
       await this.nudgeDeferredNew();
@@ -866,7 +911,7 @@ export class Router {
         const working = sendblue ? turn?.phase !== undefined && turn.phase !== "failed" && turn.phase !== "held" : turn?.phase === "running";
         // A reset nudge is bookkeeping, not an answer the owner is waiting on.
         active = completed && working && !!turn && !turn.background && this.current(turn)
-          && !(turn.inboundId && (sendblue ? !this.typingFor(turn.inboundId) : resetRow(turn.inboundId)))
+          && !(turn.inboundId && (sendblue ? !(this.typingFor(turn.inboundId) || turn.typed) : resetRow(turn.inboundId)))
           && !this.pending().some(p => p.state !== "expired" && p.state !== "answered");
       } finally {
         await this.updateTyping(active);
@@ -903,11 +948,19 @@ export class Router {
       // row waiting out a retry backoff does not hold up anything behind it.
       // A reset nudge goes first, so texts sent right after /new reach the fresh context.
       // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
+      // What a person typed goes ahead of watcher wakes queued before it: nobody waits behind an event they never sent.
+      const sendable = (row: InboundRecord) => row.state === "pending" && !this.backingOff(row.id, now)
+        && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart());
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
-        ?? rows.find(row => row.state === "pending" && !this.backingOff(row.id, now)
-          && !/^\/(?!(?:notification|context)(?:\s|$))/.test((row.payload as NormalizedInbound).text.trimStart()));
+        ?? rows.find(row => sendable(row) && !row.id.startsWith("wake:"))
+        ?? rows.find(sendable);
       if (!leader || (steer && !steerText(leader))) return;
+      // A "you texted nothing" reminder overtaken by a new text is stale: that text's turn answers.
+      if (!synthetic(leader.id)) for (const row of rows) if (row.state === "pending" && replyNudgeRow(row.id)) {
+        this.store.updateInbound(row.id, "failed");
+        this.options.log?.("reply-nudge-dropped", "overtaken");
+      }
       // A prompt ID already used for a steer can only carry its original sealed members.
       if (this.store.get(`batch-phase:${leader.id}`) === "queued-steer") {
         const batch = this.store.get<NormalizedInbound | null>(`batch:${leader.id}`);
@@ -930,6 +983,8 @@ export class Router {
           // Group lines kept as context only never split a batch of addressed ones.
           if (row.state === "observed") continue;
           const next = JSON.parse(row.payload) as NormalizedInbound;
+          // A wake queued between two typed texts keeps its own turn and does not split them.
+          if (row.id.startsWith("wake:") && !leader.id.startsWith("wake:")) continue;
           // Watcher events travel alone, so owner text is never read as part of one (or the reverse).
           // Sendblue's reply_to is not the swiped message, so two swipes never share a batch.
           if (this.store.get(`batch-phase:${row.id}`) === "queued-steer"
@@ -972,12 +1027,53 @@ export class Router {
   }
 
   /**
-   * Only an owner-or-person text turn in the foreground takes follow-ups; watcher,
-   * reset and background turns, and a turn waiting on an answer, keep today's queue.
+   * Waits for a prompt or steer POST for the client's whole budget, so a slow
+   * backend gets to answer instead of being written off after ten seconds. A
+   * control arriving meanwhile still cuts the wait short after the old bound.
+   * Either way a send cut short is ambiguous, exactly like a timeout.
+   */
+  private async sending<T>(operation: Promise<T>, handled: Set<string> = new Set(), promptId?: string): Promise<T> {
+    if (promptId !== undefined) {
+      this.inflight.add(promptId);
+      const settle = () => { this.inflight.delete(promptId); };
+      operation.then(settle, settle);
+    }
+    const started = Date.now();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    try {
+      return await Promise.race([operation, new Promise<never>((_, reject) => {
+        timer = setInterval(() => {
+          const waited = Date.now() - started;
+          if (waited >= SEND_WAIT_MS || (waited >= CONTROL_WAIT_MS && this.controlArrived(handled))) reject(new Error("Router request timed out"));
+        }, 250);
+      })]);
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  /**
+   * Backend reads wait READ_WAIT_MS, so a slow Robob gets to answer. Once a
+   * control is waiting to be handled they fall back to the old ten seconds, so
+   * /new and answers are not kept behind a string of slow reads.
+   */
+  private reading<T>(operation: Promise<T>): Promise<T> {
+    const handled = this.controlNow === undefined ? this.handledNow : new Set(this.handledNow).add(this.controlNow);
+    return bounded(operation, this.controlArrived(handled) ? CONTROL_WAIT_MS : READ_WAIT_MS);
+  }
+
+  /**
+   * A foreground turn a person's text started takes follow-ups. In tool mode a
+   * running watcher wake takes them too (outside groups): the agent answers with
+   * imessage_send, so what someone types never waits out a wake they did not
+   * ask for. Reset and background turns, reply reminders, and a turn waiting on
+   * an answer keep the queue.
    */
   private steerable(turn: Turn): boolean {
+    const id = turn.inboundId;
+    const wake = id !== undefined && this.toolMode && !this.isGroup() && id.startsWith("wake:") && !replyNudgeRow(id);
     return this.backend.steer !== undefined && turn.phase === "running" && !turn.background && turn.origin === undefined
-      && turn.inboundId !== undefined && !synthetic(turn.inboundId) && this.current(turn)
+      && id !== undefined && (!synthetic(id) || wake) && this.current(turn)
       && Date.now() - this.steerRefusedAt >= STEER_RETRY_MS
       && !this.pending().some(p => p.state !== "expired" && p.state !== "answered");
   }
@@ -1005,8 +1101,11 @@ export class Router {
         return;
       }
       // Several uncertain steers can settle together; one tracked turn forwards each run's answer in order.
-      if (turn.messageId !== messageId && !turn.steered?.includes(messageId)) this.store.set("activeTurn", {
-        ...turn, steered: [...turn.steered ?? [], messageId], steeredAt: Date.now(),
+      const add = turn.messageId !== messageId && !turn.steered?.includes(messageId);
+      // A person's text confirmed inside a watcher turn: that turn now owes them an answer.
+      const typed = !turn.typed && turn.inboundId !== undefined && synthetic(turn.inboundId) && !synthetic(id);
+      if (add || typed) this.store.set("activeTurn", {
+        ...turn, ...(add ? { steered: [...turn.steered ?? [], messageId], steeredAt: Date.now() } : {}), ...(typed ? { typed: true } : {}),
       });
       for (const member of this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds ?? [id]) this.store.updateInbound(member, "done");
       this.store.set(`batch:${id}`, null);
@@ -1027,7 +1126,7 @@ export class Router {
     }).immediate();
   }
 
-  private async steer(row: InboundRecord): Promise<void> {
+  private async steer(row: InboundRecord, handled: Set<string> = new Set()): Promise<void> {
     if (this.store.get(`batch-phase:${row.id}`) !== "steering"
       || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing") return;
     const turn = this.store.get<Turn | null>("activeTurn");
@@ -1036,7 +1135,7 @@ export class Router {
     const attempt: SteerAttempt | undefined = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`)
       ?? (turn?.steered?.includes(messageId) ? turn : undefined);
     if (attempt) {
-      const accepted = await bounded(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => undefined);
+      const accepted = await this.reading(this.backend.promptAccepted(attempt.id, attempt.directory, messageId)).catch(() => undefined);
       if (accepted === undefined) return;
       if (accepted) { this.consumeSteer(row.id, attempt); return; }
     }
@@ -1077,7 +1176,7 @@ export class Router {
     this.store.set(`steer-attempt:${row.id}`, sent);
     let delivery: SteerDelivery;
     try {
-      delivery = await bounded(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance));
+      delivery = await this.sending(this.backend.steer!(turn.id, turn.directory, messageId, body, guidance), handled);
     } catch {
       // Uncertain: the next tick sends again under the same id, which replays if this one landed.
       this.options.log?.("steer-uncertain");
@@ -1085,7 +1184,7 @@ export class Router {
     }
     if (delivery === "refused") {
       // A replayed send can be refused after its first try landed; only then is the text already in.
-      const accepted = await bounded(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => undefined);
+      const accepted = await this.reading(this.backend.promptAccepted(turn.id, turn.directory, messageId)).catch(() => undefined);
       if (accepted === undefined) return;
       if (accepted) this.consumeSteer(row.id, sent);
       else {
@@ -1102,6 +1201,9 @@ export class Router {
   private unsealBatch(id: string): boolean {
     return this.store.db.transaction(() => {
       if (this.store.get(`batch-phase:${id}`) !== "preparing" || this.owns(id)) return false;
+      // Its prompt id may already have landed with exactly these members.
+      const preparing = this.store.get<PreparingDelivery | null>("preparingDelivery");
+      if (preparing?.id === id && preparing.posted) return false;
       const ids = this.store.get<NormalizedInbound | null>(`batch:${id}`)?.batchIds;
       if (!ids?.length || ids[0] !== id) return false;
       const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
@@ -1141,7 +1243,7 @@ export class Router {
     const next = this.sealBatch(handled);
     if (!next) return;
     this.stage("batch-sealed", next.id);
-    if (this.steering(next.id)) await this.steer(next);
+    if (this.steering(next.id)) await this.steer(next, handled);
     else {
       this.store.set("preparingDelivery", { id: next.id, startedAt: Date.now(), attemptAt: Date.now(), attempt: 1 } satisfies PreparingDelivery);
       await this.submit(next, handled);
@@ -1156,13 +1258,13 @@ export class Router {
    */
   private async statusesFor(route: Pick<Route, "id" | "directory">): Promise<Record<string, SessionStatus>> {
     const busy = this.backend.sessionBusy;
-    if (!this.options.context || !busy) return bounded(this.backend.statuses());
+    if (!this.options.context || !busy) return this.reading(this.backend.statuses());
     if (!this.listing && (!this.listed || Date.now() - this.listed.at >= STATUS_LIST_MS)) {
       this.listing = bounded(this.backend.statuses(), 30_000)
         .then(statuses => { this.listed = { at: Date.now(), statuses }; }, () => {})
         .finally(() => { this.listing = undefined; });
     }
-    const own = await bounded(busy.call(this.backend, route.id, route.directory));
+    const own = await this.reading(busy.call(this.backend, route.id, route.directory));
     const statuses = { ...this.listed?.statuses };
     delete statuses[route.id];
     if (own) statuses[route.id] = { type: "busy", root: null };
@@ -1334,7 +1436,7 @@ export class Router {
    */
   private nudgeReply(turn: Turn): void {
     const inboundId = turn.inboundId;
-    if (!inboundId || synthetic(inboundId) || turn.background || turn.origin !== undefined) return;
+    if (!inboundId || (synthetic(inboundId) && !this.typedInto(turn)) || replyNudgeRow(inboundId) || turn.background || turn.origin !== undefined) return;
     if (this.store.get<boolean>(`reply-nudged:${inboundId}`)) return;
     this.store.set(`reply-nudged:${inboundId}`, true);
     const id = `${REPLY_NUDGE_PREFIX}${hash(`${turn.generation}:${inboundId}`)}`;
@@ -1443,7 +1545,7 @@ export class Router {
     const mark = this.store.get<Watermark | null>("watermark");
     if (!mark || mark.sessionId !== route.id) return false;
     try {
-      const messages = await bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
+      const messages = await this.reading(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 }));
       return messages.at(-1)?.id === mark.id;
     } catch {
       return false;
@@ -1454,7 +1556,7 @@ export class Router {
   private async familyBusy(route: Route): Promise<boolean> {
     // A waiting root can still owe background work (commands, monitors) with no child session,
     // which statuses() and sessionBusy() both call idle, so the reset check asks resetBlocked.
-    const blocked = await bounded(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => undefined);
+    const blocked = await this.reading(this.backend.resetBlocked?.(route.id, route.directory) ?? Promise.resolve(false)).catch(() => undefined);
     if (blocked === undefined || blocked) return true;
     const statuses = await this.statusesFor(route).catch(() => undefined);
     if (!statuses) return true;
@@ -1464,7 +1566,7 @@ export class Router {
     for (let depth = 0; parents.length && depth < MAX_SUBAGENT_DEPTH; depth++) {
       const next: Pick<Route, "id" | "directory">[] = [];
       for (const parent of parents) {
-        const children = await bounded(this.backend.children(parent.id, parent.directory)).catch(() => undefined);
+        const children = await this.reading(this.backend.children(parent.id, parent.directory)).catch(() => undefined);
         // A family we can't list counts as busy: the deferral waits instead of repeating the refusal.
         if (!children) return true;
         for (const child of children) {
@@ -1525,7 +1627,7 @@ export class Router {
     await this.updateTyping(false);
     if (old && turn && turn.id === old.id && turn.generation === old.generation && turn.directory === old.directory) {
       // A turn that won't stop can't take the nudge, so that /new escapes to a new thread.
-      await bounded(this.backend.abort(old.id, old.directory)).catch(() => { inPlace = false; });
+      await this.reading(this.backend.abort(old.id, old.directory)).catch(() => { inPlace = false; });
     }
     if (old && inPlace) {
       this.store.db.transaction(() => {
@@ -1544,7 +1646,7 @@ export class Router {
       return;
     }
     try {
-      const created = await bounded(this.backend.createChat());
+      const created = await this.reading(this.backend.createChat());
       this.store.db.transaction(() => {
         this.store.set("route", { ...created, generation, createdAt: Date.now(), threadAt: Date.now() });
         this.acknowledge(inboundId, "Fresh start. What's up?");
@@ -1706,7 +1808,7 @@ export class Router {
     const directory = pending.requestDirectory ?? route.directory;
     let request: QuestionRequest | undefined;
     try {
-      request = (await bounded(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
+      request = (await this.reading(this.backend.questions(sessionId, directory)))?.find(r => r.id === pending.id && r.sessionID === sessionId);
     } catch {
       this.acknowledge(inboundId, "Couldn't check that question just now. Try again in a moment.");
       return;
@@ -1734,7 +1836,7 @@ export class Router {
       this.store.updateInbound(inboundId, "processing");
     }).immediate();
     try {
-      if (await bounded(this.backend.questionReply(request, directory, answers)) === false) throw new Error();
+      if (await this.reading(this.backend.questionReply(request, directory, answers)) === false) throw new Error();
       if (!this.current(route)) return;
       this.store.db.transaction(() => {
         entry.state = "answered";
@@ -1864,12 +1966,22 @@ export class Router {
   }
 
   /** How a group line reads in a prompt: the sender's name, plus the address for guests. */
-  private groupLine(input: NormalizedInbound): string {
+  private groupLine(input: NormalizedInbound, swipe?: Swipe): string {
     const context = this.options.context!;
     const who = input.sender ? context.roleOf(input.sender) : undefined;
     const name = who ? `${who.name}${who.role === "guest" ? ` (${input.sender})` : ""}` : "Someone";
     const words = input.text.trim() || (input.attachments.length ? `[sent ${input.attachments.length === 1 ? "a file" : `${input.attachments.length} files`}]` : "");
-    return `${name}: ${words}`;
+    const line = `${name}: ${words}`;
+    if (!swipe) return line;
+    if (swipe.kind === "unknown") return `${line} [swipe reply to an earlier message the bridge could not identify]`;
+    const nameOf = (address: string) => speakerName(context.roleOf(address), address);
+    const target = swipe.kind === "robob" ? "your message" : `${nameOf(swipe.kind === "owner" ? this.options.owner : swipe.sender)}'s message`;
+    const text = clipQuote(swipe.text, 200);
+    const quote = text ? JSON.stringify(text) : "(no text: a file, card or link)";
+    const newest = swipe.kind !== "robob" ? swipe.thread?.at(-1) : undefined;
+    const thread = newest ? `; your newest reply in that thread: ${JSON.stringify(clipQuote(formatText(newest.text).text, 200))}` : "";
+    const root = swipe.kind !== "robob" ? "; thread root, not necessarily the swiped bubble" : "";
+    return `${line} [swipe reply to ${target}: ${quote}${thread}${root}]`;
   }
 
   /**
@@ -1947,14 +2059,14 @@ export class Router {
         }
       }
     }
-    for (const { row, input } of todo) {
+    for (const { row, input, swipe } of todo) {
       const gate = gates.get(row.id)!;
       const applied = this.store.db.transaction(() => {
         // The judge is awaited, so the row may have moved on (or been gated) meanwhile.
         const current = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (current?.state !== "pending" || this.store.get<string>(`group-gate:${row.id}`)) return false;
         if (gate.verdict === "observe") {
-          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input)]));
+          this.store.set("group-observed", appendObserved(this.store.get<string[] | null>("group-observed") ?? [], [this.groupLine(input, swipe)]));
           this.store.updateInbound(row.id, "observed");
         }
         this.store.set(`group-gate:${row.id}`, gate.verdict);
@@ -2429,7 +2541,7 @@ export class Router {
       }).immediate();
       try {
         const now = Date.now();
-        activeRoute = { ...await bounded(this.backend.createChat()), generation, createdAt: now, threadAt: now };
+        activeRoute = { ...await this.reading(this.backend.createChat()), generation, createdAt: now, threadAt: now };
         if (this.store.get<number>("routeGeneration") !== generation || this.store.get<Route | null>("route")) return;
         this.store.db.transaction(() => {
           this.store.set("route", activeRoute);
@@ -2480,7 +2592,7 @@ export class Router {
       let landed: SentPrompt | undefined;
       try {
         for (const prompt of earlier) {
-          if (await bounded(this.backend.promptAccepted(prompt.sessionId, prompt.directory, prompt.messageId))) { landed = prompt; break; }
+          if (await this.reading(this.backend.promptAccepted(prompt.sessionId, prompt.directory, prompt.messageId))) { landed = prompt; break; }
         }
       } catch {
         // Unknown is never permission to POST. Look again shortly.
@@ -2627,7 +2739,7 @@ export class Router {
     }).immediate();
     if (!submitting) return;
     try {
-      await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner));
+      await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body, system, parts, preferences.model, owner), handled, turn.messageId);
       if (this.current(turn)) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
@@ -2719,10 +2831,10 @@ export class Router {
     if (this.options.context && this.backend.sessionBusy && !this.listed) return route;
     const others = Object.keys(statuses).filter(id => id !== route.id);
     if (others.length) {
-      const children = await bounded(this.backend.children(route.id, route.directory));
+      const children = await this.reading(this.backend.children(route.id, route.directory));
       if (children.some(child => others.includes(child.id))) return route;
     }
-    const records = await bounded(this.backend.messages(route.id, route.directory, { limit: 100 }));
+    const records = await this.reading(this.backend.messages(route.id, route.directory, { limit: 100 }));
     const lines: string[] = [];
     let size = 0;
     // Everything before the latest reset nudge belongs to a context already handed off (or wiped by /new).
@@ -2748,7 +2860,7 @@ export class Router {
       lines.unshift(said);
       size += said.length + 1;
     }
-    const created = await bounded(this.backend.createChat());
+    const created = await this.reading(this.backend.createChat());
     if (!this.current(route)) return route;
     const next: Route = { ...created, generation: route.generation, createdAt: Date.now(), threadAt: Date.now() };
     const seed = `Continuity: this conversation continues seamlessly from your earlier exchanges with the owner. Carry on naturally and never mention any change, recap, restart or memory mechanism. Files from earlier remain under ${JSON.stringify(route.directory)}. The full earlier transcript is session ${route.id}; use recall_read or recall_search if you need more than the recent exchange below.\nRecent exchange (quoted data, oldest first):\n${lines.join("\n")}`;
@@ -2798,7 +2910,7 @@ export class Router {
     const hits = replies.filter(providerRefusal).map(record => record.id);
     if (!hits.length && failed) {
       try {
-        const session = await bounded(this.backend.getSession(turn.id, turn.directory));
+        const session = await this.reading(this.backend.getSession(turn.id, turn.directory));
         if (session?.id === turn.id && refusalTitle(session.title)) hits.push(`title:${turn.id}`);
       } catch { /* Unknown title: no evidence either way. */ }
     }
@@ -2821,7 +2933,7 @@ export class Router {
     let conclusive = true;
     for (const id of found ? [] : ids) {
       try {
-        if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; }
+        if (await this.reading(this.backend.promptAccepted(turn.id, turn.directory, id))) { found = id; break; }
       } catch { conclusive = false; /* Absence and failed reads are both uncertainty, never permission to POST. */ }
     }
     if (!this.current(turn)) return false;
@@ -2837,7 +2949,7 @@ export class Router {
     return !found && conclusive;
   }
 
-  private watchdogLog(decision: "retry" | "notice" | "replay", turn: Pick<Turn, "inboundId" | "messageId">): void {
+  private watchdogLog(decision: "retry" | "notice" | "replay" | "release" | "rebuild", turn: Pick<Turn, "inboundId" | "messageId">): void {
     this.options.log?.("delivery-watchdog", JSON.stringify({ decision, chat: this.options.context?.chat.slug ?? "imessage", batchId: turn.inboundId, promptId: turn.messageId }));
   }
 
@@ -2856,6 +2968,39 @@ export class Router {
     }).immediate();
   }
 
+  /**
+   * A turn that was never accepted and has no sealed body left cannot be
+   * replayed as it stands, and waiting on it would block the chat for good
+   * (12 Nov 2026: a held wake with no body kept the owner's texts queued for
+   * two hours). Its batch goes back through preparation under the same prompt
+   * id, which rebuilds the body; when its rows are already settled there is
+   * nothing to replay and the turn is closed so the queue behind it moves.
+   */
+  private rebuildDelivery(turn: Turn): void {
+    this.store.db.transaction(() => {
+      const id = turn.inboundId;
+      const state = id === undefined ? undefined
+        : this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
+      if (id !== undefined && state === "processing") {
+        this.store.set(`batch-phase:${id}`, "preparing");
+        // Held from here on, so the sender is told once, exactly as a held turn tells them.
+        this.outageNotice(id);
+        // The rebuilt send may go out on this very tick; replays stay paced by replayAt.
+        this.store.set("deliveryOutage", { ...this.store.get<Outage>("deliveryOutage")!, probeAt: 0 });
+        this.store.set("preparingDelivery", {
+          id, startedAt: turn.startedAt, attemptAt: Date.now(), attempt: Math.max(turn.attempt ?? 1, 2), held: true, posted: true,
+        } satisfies PreparingDelivery);
+        this.store.set("activeTurn", null);
+      } else {
+        this.store.set("activeTurn", { ...turn, phase: "failed" });
+        this.store.set("deliveryOutage", null);
+        if (id !== undefined && this.store.get(`batch-phase:${id}`) === "submitting") this.store.set(`batch-phase:${id}`, null);
+      }
+      this.store.set("resendBody", null);
+    }).immediate();
+    this.watchdogLog("rebuild", turn);
+  }
+
   private delayNote(input: NormalizedInbound | null | undefined, fallback: number): string {
     return `\n[Bridge note, not typed by anyone.] This batch was delayed by a technical outage. It was sent at ${new Date(input?.sentAt ?? input?.receivedAt ?? fallback).toISOString()}. Answer the held messages now.`;
   }
@@ -2866,14 +3011,30 @@ export class Router {
     const row = this.store.pendingInbound().find(row => row.id === preparing.id);
     if (!row || row.state !== "processing") { this.store.set("preparingDelivery", null); return; }
     const turn = { inboundId: preparing.id, messageId: `msg_${hash(preparing.id)}` };
+    if (this.wakeBatch(preparing.id)) {
+      // Same rule as a POSTed wake: it never holds the chat or earns the outage
+      // text. No prompt has been sent for it yet, so a person waiting takes its place at once.
+      const stuck = preparing.held || (preparing.attempt >= 2 && Date.now() - preparing.attemptAt >= ACCEPT_WAIT_MS);
+      if (stuck || this.someoneWaiting()) {
+        this.store.db.transaction(() => {
+          // Making way for a person costs the wake nothing; only a stuck one spends an attempt.
+          if (stuck || !this.unsealBatch(preparing.id)) this.retrySynthetic(preparing.id, "undelivered");
+          this.store.set("preparingDelivery", null);
+        }).immediate();
+        this.watchdogLog("release", turn);
+        return;
+      }
+    }
     if (preparing.held) {
-      const outage = this.store.get<Outage | null>("deliveryOutage");
-      if (!outage || Date.now() - outage.probeAt < 5_000) return;
-      const health = await bounded(this.backend.health()).catch(() => undefined);
-      const healthy = health?.status === "ok";
-      if (this.controlArrived(handled)) return;
-      this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
-      if (!healthy || (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS)) return;
+      // A held batch is tried again once a minute. The attempt itself is the
+      // probe: it is idempotent, and a health endpoint that answers slower than
+      // the thread it speaks for must never keep a batch waiting.
+      const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(preparing.id)}`, probeAt: 0 };
+      if (Date.now() - outage.probeAt < 5_000 || this.controlArrived(handled)) return;
+      if (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS) {
+        this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
+        return;
+      }
       this.store.set("deliveryOutage", { ...outage, probeAt: Date.now(), replayAt: Date.now() });
       this.watchdogLog("replay", turn);
     } else {
@@ -2897,7 +3058,7 @@ export class Router {
     const input = this.store.get<NormalizedInbound | null>(`batch:${body.inboundId}`);
     const system = replay ? body.system + this.delayNote(input, turn.startedAt) : body.system;
     try {
-      await bounded(this.backend.prompt(turn.id, turn.directory, turn.messageId, body.text, system, body.parts, body.model, body.owner));
+      await this.sending(this.backend.prompt(turn.id, turn.directory, turn.messageId, body.text, system, body.parts, body.model, body.owner), handled, turn.messageId);
       if (this.current(turn) && this.store.get<Turn | null>("activeTurn")?.messageId === turn.messageId) this.store.db.transaction(() => {
         this.store.set("activeTurn", { ...turn, phase: "running" });
         this.store.set(`seed:${turn.id}`, null);
@@ -2918,34 +3079,49 @@ export class Router {
     const absent = await this.reconcile(turn);
     turn = this.store.get<Turn | null>("activeTurn");
     if (!turn || !this.current(turn) || turn.phase === "running" || this.controlArrived(handled)) return;
-    const body = this.store.get<ResendBody | null>("resendBody");
+    const stored = this.store.get<ResendBody | null>("resendBody");
+    const body = stored && stored.inboundId === turn.inboundId ? stored : undefined;
     const elapsed = Date.now() - (turn.attemptAt ?? turn.startedAt);
-    if (turn.phase !== "held") {
-      if ((turn.attempt ?? 1) < 2 && elapsed >= ACCEPT_WAIT_MS && absent && body && body.inboundId === turn.inboundId) {
-        const retry: Turn = { ...turn, phase: "submitting", attempt: 2, attemptAt: Date.now() };
-        this.store.set("activeTurn", retry);
-        this.watchdogLog("retry", retry);
-        await this.sendDelivery(retry, body, handled);
-      } else if (elapsed >= ACCEPT_WAIT_MS && ((turn.attempt ?? 1) >= 2 || Date.now() - turn.startedAt >= 2 * ACCEPT_WAIT_MS)) {
-        if (turn.inboundId && replyNudgeRow(turn.inboundId)) this.fail(turn, "", undefined, "undelivered");
-        else this.holdDelivery(turn);
-      }
+    // The one retry is spent, or was never possible, and the wait is over.
+    const spent = elapsed >= ACCEPT_WAIT_MS && ((turn.attempt ?? 1) >= 2 || Date.now() - turn.startedAt >= 2 * ACCEPT_WAIT_MS);
+    const retry = async () => {
+      const next: Turn = { ...turn!, phase: "submitting", attempt: 2, attemptAt: Date.now() };
+      this.store.set("activeTurn", next);
+      this.watchdogLog("retry", next);
+      await this.sendDelivery(next, body!, handled);
+    };
+    const retryDue = turn.phase !== "held" && (turn.attempt ?? 1) < 2 && elapsed >= ACCEPT_WAIT_MS && absent && body !== undefined;
+    if (this.wakeBatch(turn.inboundId)) {
+      // A watcher wake or reply reminder never holds the chat and never earns
+      // the outage text: nobody typed it. It goes back to the queue with its
+      // backoff, at once when a person is waiting behind it and it provably did
+      // not land, otherwise after its one retry. A POST still in flight may yet
+      // land, so it is never released under it. A /new reset or a form notice
+      // keeps the person path: dropping one would lose what its sender asked for.
+      const someoneWaiting = this.someoneWaiting();
+      if (this.inflight.has(turn.messageId)) return;
+      if (turn.phase === "held" || spent || (absent && (someoneWaiting || (!body && elapsed >= ACCEPT_WAIT_MS)))) {
+        this.fail(turn, "", undefined, "undelivered");
+        // An outage record left by an older build must not mute the notice for the next person's batch.
+        this.store.set("deliveryOutage", null);
+        this.watchdogLog("release", turn);
+      } else if (retryDue && !someoneWaiting) await retry();
       return;
     }
-    const outage = this.store.get<Outage | null>("deliveryOutage");
-    if (!outage || Date.now() - outage.probeAt < 5_000) return;
-    const messages = await bounded(this.backend.messages(turn.id, turn.directory, { since: turn.startedAt, limit: 20 })).catch(() => []);
-    await this.reconcile(turn, messages);
-    if (this.store.get<Turn | null>("activeTurn")?.phase === "running") return;
-    const recoveredPrompt = [...messages].reverse().find(message => message.type === "user" && message.id !== turn!.messageId
-      && !turn!.earlier?.includes(message.id) && message.time.created >= turn!.startedAt)?.id;
-    const health = await bounded(this.backend.health()).catch(() => undefined);
-    const healthy = health?.status === "ok";
-    if (this.controlArrived(handled)) return;
+    // Nothing left to send for this turn: rebuild it or close it, never wait on it.
+    if (!body && (spent || (absent && elapsed >= ACCEPT_WAIT_MS))) { this.rebuildDelivery(turn); return; }
+    if (turn.phase !== "held") {
+      if (retryDue) await retry();
+      else if (spent) this.holdDelivery(turn);
+      return;
+    }
+    const outage = this.store.get<Outage | null>("deliveryOutage") ?? { id: `outage:${hash(turn.inboundId ?? turn.messageId)}`, probeAt: 0 };
+    if (Date.now() - outage.probeAt < 5_000) return;
     this.store.set("deliveryOutage", { ...outage, probeAt: Date.now() });
-    const recovered = healthy || recoveredPrompt !== undefined;
-    if (!recovered || !absent || !body || body.inboundId !== turn.inboundId
-      || (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS)) return;
+    // `absent` means the route just answered every read about this prompt and
+    // none had landed. That is the recovery signal: Robob's global health
+    // endpoint can lag far behind the thread itself and is not consulted.
+    if (!absent || !body || (outage.replayAt !== undefined && Date.now() - outage.replayAt < ACCEPT_WAIT_MS)) return;
     // A crash after this fence delays the next try by one minute; the batch keeps its idempotency key.
     this.store.set("deliveryOutage", { ...outage, probeAt: Date.now(), replayAt: Date.now() });
     this.watchdogLog("replay", turn);
@@ -2962,7 +3138,7 @@ export class Router {
    */
   private async requests(turn: Turn, statuses: Record<string, SessionStatus>): Promise<{ request: PermissionRequest | QuestionRequest; directory?: string }[]> {
     const own = await Promise.all([
-      bounded(this.backend.permissions(turn.id, turn.directory)), bounded(this.backend.questions(turn.id, turn.directory)),
+      this.reading(this.backend.permissions(turn.id, turn.directory)), this.reading(this.backend.questions(turn.id, turn.directory)),
     ]);
     if (!own[0] || !own[1]) throw new Error("Unavailable requests");
     const found: { request: PermissionRequest | QuestionRequest; directory?: string }[] = [...own[0], ...own[1]]
@@ -2976,13 +3152,13 @@ export class Router {
     for (let depth = 0; parents.length && running.size && depth < MAX_SUBAGENT_DEPTH; depth++) {
       const next: { id: string; directory: string }[] = [];
       for (const parent of parents) {
-        const children = (await bounded(this.backend.children(parent.id, parent.directory)))
+        const children = (await this.reading(this.backend.children(parent.id, parent.directory)))
           .filter(child => running.has(child.id) && !seen.has(child.id));
         for (const child of children) {
           seen.add(child.id);
           next.push({ id: child.id, directory: child.directory });
           const [permissions, questions] = await Promise.all([
-            bounded(this.backend.permissions(child.id, child.directory)), bounded(this.backend.questions(child.id, child.directory)),
+            this.reading(this.backend.permissions(child.id, child.directory)), this.reading(this.backend.questions(child.id, child.directory)),
           ]);
           for (const request of [...permissions ?? [], ...questions ?? []]) {
             if (request.sessionID === child.id) found.push({ request, directory: child.directory });
@@ -2999,7 +3175,7 @@ export class Router {
     if (!turn || !this.current(turn) || turn.phase === "failed") return;
     // Work has no deadline: a turn runs for as long as the agent needs.
     try {
-      let messages = await bounded(this.backend.messages(turn.id, turn.directory, turn.background
+      let messages = await this.reading(this.backend.messages(turn.id, turn.directory, turn.background
         ? { until: turn.messageId, limit: 20 } : { until: turn.messageId, since: turn.startedAt - 60_000 }));
       if (!this.current(turn)) return;
       if (turn.phase === "submitting" || turn.phase === "unknown" || turn.phase === "held") {
@@ -3072,7 +3248,7 @@ export class Router {
       try {
         for (const id of [turn.messageId, ...turn.steered ?? []]) {
           if (messages.some(record => record.id === id)) continue;
-          const extended = await bounded(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
+          const extended = await this.reading(this.backend.messages(turn.id, turn.directory, { until: id, since: turn.startedAt - 60_000 }));
           if (!this.current(turn)) return;
           if (extended.some(record => record.id === id)) {
             const owned = new Set([turn.messageId, ...turn.steered ?? []]);
@@ -3082,7 +3258,7 @@ export class Router {
               break;
             }
             messages = extended;
-          } else if (await bounded(this.backend.promptAccepted(turn.id, turn.directory, id))) {
+          } else if (await this.reading(this.backend.promptAccepted(turn.id, turn.directory, id))) {
             // Acceptance without a readable record is not permission to discard its reply after the grace period.
             expansionHeld = true;
             break;
@@ -3375,14 +3551,14 @@ export class Router {
     try {
       const mark = this.store.get<Watermark | null>("watermark");
       if (!mark || mark.sessionId !== route.id) {
-        const [last] = (await bounded(this.backend.messages(route.id, route.directory, { limit: 1 }))).slice(-1);
+        const [last] = (await this.reading(this.backend.messages(route.id, route.directory, { limit: 1 }))).slice(-1);
         if (last && this.current(route) && !this.store.get<Turn | null>("activeTurn")?.phase?.match(/^(submitting|running|unknown)$/)) {
           this.store.set("watermark", { sessionId: route.id, id: last.id } satisfies Watermark);
         }
         return;
       }
       const [statuses, messages] = await Promise.all([
-        this.statusesFor(route), bounded(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 })),
+        this.statusesFor(route), this.reading(this.backend.messages(route.id, route.directory, { until: mark.id, limit: 20 })),
       ]);
       const next = this.store.get<Turn | null>("activeTurn");
       if (!this.current(route) || (next && next.phase !== "failed" && this.current(next))) return;
@@ -3440,7 +3616,16 @@ export class Router {
         this.notice(turn, "failed", text);
       }
       // Nobody typed a synthetic row: it is retried, and never answered with a request to resend.
-      else if (this.syntheticBatch(turn.inboundId)) this.retrySynthetic(turn.inboundId!, reason);
+      else if (this.syntheticBatch(turn.inboundId)) {
+        const typed = this.typedInto(turn);
+        this.retrySynthetic(turn.inboundId!, reason);
+        // A person's text was steered into this watcher turn: they hear about it like any typed turn.
+        // An errored wake is retried within the notice's grace and would cancel it, so that one goes out now.
+        if (typed && !turn.background && reason !== "undelivered" && text) {
+          if (reason === "errored") this.notice(turn, "failed", text);
+          else this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
+        }
+      }
       else {
         if (!turn.background && reason !== "undelivered") this.store.set("deferredNotice", { turn, text, at: Date.now() } satisfies DeferredNotice);
         else if (!turn.background) this.notice(turn, "failed", text);

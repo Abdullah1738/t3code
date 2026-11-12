@@ -80,10 +80,12 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexSchema from "effect-codex-app-server/schema";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1648,6 +1650,21 @@ function isSensitiveCodexProtocolKey(key: string): boolean {
   );
 }
 
+// An app-server that exits soon after it started is likely to do so again, so
+// respawns back off instead of hot-looping on every queued request.
+const CODEX_APP_SERVER_STABLE_LIFETIME_MS = 60_000;
+const CODEX_APP_SERVER_RESPAWN_MAX_DELAY_MS = 30_000;
+
+export const codexAppServerRespawnDelayMs = (quickExits: number): number =>
+  quickExits <= 0
+    ? 0
+    : Math.min(1_000 * 2 ** (quickExits - 1), CODEX_APP_SERVER_RESPAWN_MAX_DELAY_MS);
+
+interface CodexAppServerQuickExits {
+  readonly count: number;
+  readonly lastExitAtMs: number;
+}
+
 export const layerAppServerClientFactory: Layer.Layer<
   CodexAppServerClientFactory,
   never,
@@ -1658,10 +1675,20 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const quickExitsByInstance = yield* Ref.make(
+      new Map<ProviderInstanceId, CodexAppServerQuickExits>(),
+    );
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
         const scope = yield* Scope.Scope;
+        const quickExits = (yield* Ref.get(quickExitsByInstance)).get(input.instanceId);
+        if (quickExits !== undefined) {
+          const waitMs =
+            codexAppServerRespawnDelayMs(quickExits.count) -
+            ((yield* Clock.currentTimeMillis) - quickExits.lastExitAtMs);
+          if (waitMs > 0) yield* Effect.sleep(Duration.millis(waitMs));
+        }
         const environment = {
           ...codexAppServerEnvironment(input.environment),
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
@@ -1684,6 +1711,28 @@ export const layerAppServerClientFactory: Layer.Layer<
                 cause,
               }),
           ),
+        );
+        const spawnedAtMs = yield* Clock.currentTimeMillis;
+        // Closing the session interrupts this watcher. Should it still see the
+        // kill, a session under a minute old costs the next spawn one second.
+        yield* handle.exitCode.pipe(
+          Effect.ignore,
+          Effect.andThen(Clock.currentTimeMillis),
+          Effect.flatMap((exitAtMs) =>
+            Ref.update(quickExitsByInstance, (current) => {
+              const next = new Map(current);
+              if (exitAtMs - spawnedAtMs >= CODEX_APP_SERVER_STABLE_LIFETIME_MS) {
+                next.delete(input.instanceId);
+              } else {
+                next.set(input.instanceId, {
+                  count: (current.get(input.instanceId)?.count ?? 0) + 1,
+                  lastExitAtMs: exitAtMs,
+                });
+              }
+              return next;
+            }),
+          ),
+          Effect.forkIn(scope),
         );
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
@@ -1959,7 +2008,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           model: input.modelSelection.model,
           now,
         });
-        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const events = yield* Queue.unbounded<
+          ProviderAdapter.ProviderAdapterV2Event,
+          ProviderAdapter.ProviderAdapterEventStreamError
+        >();
         const rateLimitSnapshot = yield* Ref.make<CodexRateLimitSnapshot | undefined>(undefined);
         const limitedTurnItems = yield* Ref.make(
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),
@@ -5904,7 +5956,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   failure.class === "usage_limit"
                     ? {
                         ...failure,
-                        resetAt: codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot)),
+                        resetAt:
+                          failure.resetAt ??
+                          codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot)),
                       }
                     : failure,
                 ...(input.providerRetry === undefined
@@ -6889,16 +6943,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             );
 
         let exitedSessionSettlementStarted = false;
-        const settleExitedSession = Effect.fn("CodexAdapterV2.settleExitedSession")(function* () {
+        const settleExitedSession = Effect.fn("CodexAdapterV2.settleExitedSession")(function* (
+          error: CodexErrors.CodexAppServerError,
+        ) {
           if (exitedSessionSettlementStarted) return;
           exitedSessionSettlementStarted = true;
+          const failure = makeProviderFailure({ cause: error, class: "provider_error" });
           for (const context of Array.from((yield* Ref.get(activeTurns)).values()).toReversed()) {
+            context.latestProviderFailure = { nativeMessage: failure.message, failure };
             yield* finalizeCodexTurn({
               context,
               nativeTurnId: context.nativeTurnId,
               status: "failed",
               completedAt: yield* DateTime.now,
-              failureMessage: "Codex app-server exited.",
+              failureMessage: failure.message,
             });
           }
           for (const context of (yield* Ref.get(settledTurns)).values()) {
@@ -6931,31 +6989,44 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
-        // The event queue outlives the transport, so process exit must be observed
-        // even outside Stop recovery. Drain buffered notifications before fallback
-        // settlement; process exit can precede stdout EOF and native completion.
+        const failSessionEvents = Effect.fn("CodexAdapterV2.failSessionEvents")(
+          (error: CodexErrors.CodexAppServerError) =>
+            Queue.fail(
+              events,
+              new ProviderAdapter.ProviderAdapterEventStreamError({
+                driver: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                cause: error,
+              }),
+            ),
+        );
+        // Drain and settle before failing the queue: session release closes this
+        // scope, and process exit can precede buffered native completion frames.
         const sessionExitObserver =
           client.awaitSessionExit === undefined
             ? undefined
             : yield* client.awaitSessionExit.pipe(
                 Effect.retry({ schedule: Schedule.spaced("1 second") }),
                 Effect.andThen(client.awaitInputEnd),
-                Effect.andThen(settleExitedSession()),
+                Effect.andThen(client.awaitTermination),
+                Effect.flatMap((error) =>
+                  settleExitedSession(error).pipe(Effect.andThen(failSessionEvents(error))),
+                ),
                 Effect.forkIn(scope),
               );
+        if (sessionExitObserver === undefined) {
+          yield* client.awaitTermination.pipe(
+            Effect.flatMap(failSessionEvents),
+            Effect.forkIn(scope),
+          );
+        }
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
-          events: Stream.fromEffectRepeat(Queue.take(events)).pipe(
-            Stream.takeUntil(
-              (event) =>
-                event.type === "provider_session.updated" &&
-                event.providerSession.status === "stopped",
-            ),
-          ),
+          events: Stream.fromQueue(events),
           ...(sessionExitObserver === undefined
             ? {}
             : {
@@ -7350,7 +7421,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
+              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
+                // An exited app-server holds no subscriptions left to drop.
+                Effect.catchTags({
+                  CodexAppServerProcessExitedError: () => Effect.void,
+                  CodexAppServerInputStreamEndedError: () => Effect.void,
+                }),
+              );
             },
             (effect, unloadInput) =>
               effect.pipe(

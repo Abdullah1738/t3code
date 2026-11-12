@@ -1,3 +1,4 @@
+import * as DelegatedTaskProgressGuard from "./orchestration-v2/DelegatedTaskProgressGuard.ts";
 import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
@@ -600,6 +601,11 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   layerThreadPullRequestWorker,
   DelegatedTaskAnalytics.layer,
+  Layer.effectDiscard(
+    Effect.flatMap(DelegatedTaskProgressGuard.DelegatedTaskProgressGuard, (service) =>
+      service.start(),
+    ),
+  ),
   Layer.effectDiscard(
     Effect.gen(function* () {
       const service = yield* PullRequestSyncReactor.PullRequestSyncReactor;

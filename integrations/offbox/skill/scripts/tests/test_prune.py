@@ -1339,7 +1339,7 @@ class RunnerHookTests(NoNetwork):
         rn = runs.Runner(cli.build_parser().parse_args(["run", "--", "go", "test", "./..."]), self.me)
         rn.a.steps = []
         row = {"box_id": "bx", "remote_dir": "w/r", "size": "large"}
-        with patch.object(runs.pool, "acquire", return_value=row), \
+        with patch.object(runs.pool, "acquire", return_value=row), patch.object(runs, '_ttl_keeper'), \
                 patch.object(runs.ssh_sync, "put_file"), \
                 patch.object(runs.ssh_sync, "push", side_effect=lambda *a, **k: order.append("push") or {}), \
                 patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \

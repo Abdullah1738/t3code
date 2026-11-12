@@ -144,10 +144,13 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
+  /** Cancels only this queued brief; false means it may already be acting. */
+  readonly cancelQueued: (threadId: ThreadId, runId: string) => Effect.Effect<boolean>;
   /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
   readonly interrupt: (
     threadId: ThreadId,
     reason: string,
+    cancelQueued?: boolean,
   ) => Effect.Effect<void, KanbanThreadError>;
 }
 
@@ -436,16 +439,57 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const cancelQueued: KanbanThreadsShape["cancelQueued"] = Effect.fn("KanbanThreads.cancelQueued")(
+    function* (threadId, runId) {
+      const run = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      if (run?.status !== "queued") return false;
+      yield* threads.dispatch({
+        type: "queued-run.cancel",
+        commandId: commandId("cancel"),
+        threadId,
+        runId: run.id,
+      });
+      const after = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
+        (row) => row.id === runId,
+      );
+      return after?.status === "cancelled";
+    },
+    Effect.catchCause(() => Effect.succeed(false)),
+  );
+
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
-    function* (threadId, reason) {
+    function* (threadId, reason, cancelQueued = false) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null) return;
-      yield* threads.interruptThread({
-        projectId: shell.projectId,
+      if (!cancelQueued) {
+        yield* threads.interruptThread({
+          projectId: shell.projectId,
+          commandId: commandId("stop"),
+          threadId,
+          reason,
+        });
+        return;
+      }
+      // Stop holds the queue atomically with the interrupt. interruptThread alone
+      // ignores queued runs, allowing an abandoned launch to start afterwards.
+      yield* threads.dispatch({
+        type: "thread.stop",
         commandId: commandId("stop"),
         threadId,
         reason,
       });
+      const stopped = yield* threads.getThreadRecords(threadId, ["runs"]);
+      for (const run of stopped.runs) {
+        if (run.status !== "queued") continue;
+        yield* threads.dispatch({
+          type: "queued-run.cancel",
+          commandId: commandId("cancel"),
+          threadId,
+          runId: run.id,
+        });
+      }
     },
     Effect.mapError((error) =>
       isKanbanThreadError(error)
@@ -465,6 +509,7 @@ const make = Effect.gen(function* () {
     launch,
     send,
     setModel,
+    cancelQueued,
     interrupt,
   });
 });

@@ -46,7 +46,14 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       Effect.as(
         new McpSchema.CallToolResult({
           isError: tool === "discussion_post" && receipt === undefined,
-          structuredContent: { saved: receipt === undefined ? null : true, message, ...details },
+          structuredContent: {
+            saved: receipt === undefined ? null : true,
+            message,
+            ...details,
+            ...(tool === "card_review_result" && receipt?.kind === "card"
+              ? { recorded: true }
+              : {}),
+          },
           content: [{ type: "text", text: message }],
         }),
       ),

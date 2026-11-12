@@ -89,6 +89,8 @@ export const ThreadPullRequestWatch = Schema.Struct({
   passedChecks: Schema.Array(TrimmedNonEmptyString).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Gate names that looked all-green on the last pass with no required checks; told on the next matching pass. */
+  passedPending: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   remarksThrough: IsoDateTime,
   /** Remarks created exactly at `remarksThrough` that were reported, so a late one still counts. */
   remarkIds: Schema.Array(TrimmedNonEmptyString),

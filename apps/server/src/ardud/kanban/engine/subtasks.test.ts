@@ -63,7 +63,7 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }])).toMatchObject({
       ok: false,
-      reason: "the card has no subtask s9",
+      reason: "the card has no subtask s9. Existing subtask ids: none",
     });
     const subtasks = planned();
     expect(
@@ -241,7 +241,9 @@ describe("board script subtasks", () => {
     });
     const unnamed = planSubtasks([], [{ text: "Anything", owner: "script" }]);
     if (!unnamed.ok) throw new Error(unnamed.reason);
-    expect(checkMark({ number: 2, subtasks: unnamed.subtasks }, "s1", "done", "script", null, "any")).toEqual({
+    expect(
+      checkMark({ number: 2, subtasks: unnamed.subtasks }, "s1", "done", "script", null, "any"),
+    ).toEqual({
       ok: true,
     });
   });
@@ -250,12 +252,27 @@ describe("board script subtasks", () => {
     const card = {
       number: 3,
       subtasks: [
-        { id: "s1", step: 1, text: "Tell", owner: "evaluator", script: undefined, state: "open", note: null, doneBy: null, doneAt: null },
+        {
+          id: "s1",
+          step: 1,
+          text: "Tell",
+          owner: "evaluator",
+          script: undefined,
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
       ] as const,
     };
     expect(checkMark(card, "s1", "done", "script", null, "land").ok).toBe(false);
     const done = scriptCard();
-    const marked = { ...done, subtasks: done.subtasks.map((subtask, index) => (index === 0 ? { ...subtask, state: "done" as const } : subtask)) };
+    const marked = {
+      ...done,
+      subtasks: done.subtasks.map((subtask, index) =>
+        index === 0 ? { ...subtask, state: "done" as const } : subtask,
+      ),
+    };
     expect(checkMark(marked, "s1", "open", "script", null, "land")).toEqual({
       ok: false,
       reason: "only an evaluator reopens a subtask",
@@ -271,7 +288,16 @@ describe("board script subtasks", () => {
     const evaluatorCard = {
       number: 4,
       subtasks: [
-        { id: "s1", step: 1, text: "Tell", owner: "evaluator", state: "open", note: null, doneBy: null, doneAt: null },
+        {
+          id: "s1",
+          step: 1,
+          text: "Tell",
+          owner: "evaluator",
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
       ] as const,
     };
     expect(checkHandBack(evaluatorCard, "s1", "land", "x")).toEqual({
@@ -280,7 +306,9 @@ describe("board script subtasks", () => {
     });
     const finished = {
       ...card,
-      subtasks: card.subtasks.map((subtask) => (subtask.id === "s1" ? { ...subtask, state: "done" as const } : subtask)),
+      subtasks: card.subtasks.map((subtask) =>
+        subtask.id === "s1" ? { ...subtask, state: "done" as const } : subtask,
+      ),
     };
     expect(checkHandBack(finished, "s1", "land", "x")).toEqual({
       ok: false,
@@ -307,7 +335,7 @@ describe("board script subtasks", () => {
     expect(handed[0]).not.toHaveProperty("script");
   });
 
-  it("subtaskLines shows a named script as script \"land\"", () => {
+  it('subtaskLines shows a named script as script "land"', () => {
     const lines = subtaskLines(scriptCard());
     expect(lines).toContain('- s1 step 1, script "land" (now): Merge the PR');
   });

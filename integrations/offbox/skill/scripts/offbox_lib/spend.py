@@ -1,4 +1,4 @@
-"""Billing-period spend from one account meter request, $100 alerts and the $900 cap."""
+"""Billing-period spend from one account meter request, $100 alerts and the $1200 cap."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .common import (CAP_PATH, OffboxError, atomic_write_json, db, event, file_l
                      now, read_json, say)
 from .identity import telegram
 
-CAP_DOLLARS = 900.0
+CAP_DOLLARS = 1200.0
 STEP_DOLLARS = 100.0
 
 

@@ -5,12 +5,15 @@ boat's 14 days (bases.upkeep). Every action is logged to events + offbox.log."""
 from __future__ import annotations
 
 from . import api, bases, capacity, lease
-from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
+from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S, RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
                      iso_ts, now, say)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
 REAP_BUDGET_S = 100
+# Leave cleanup time after a fair, bounded pass over run keepalives.
+RENEW_BUDGET_S = 60
+RENEW_BOX_BUDGET_S = 5
 
 
 def _protected(con) -> set[str]:
@@ -144,6 +147,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
     rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
                        "OR box_id IN (SELECT box_id FROM prune_holds)").fetchall()
+    _renew_live_runs(con, rows, live, protected, dry)
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -290,9 +294,63 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     return actions
 
 
+def _renew_live_runs(con, rows, live: dict, protected: set[str], dry: bool) -> None:
+    if dry:
+        return
+    running = {r[0] for r in con.execute("SELECT DISTINCT box_id FROM runs WHERE status='running'")}
+    boxes = sorted(r['box_id'] for r in rows if r['box_id'] in running and r['box_id'] not in protected
+                   and (b := live.get(r['box_id'])) and b.get('state') in api.LIVE_STATES
+                   and not b.get('dataExpiredAt') and not con.execute(
+                       "SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{r['box_id']}",)).fetchone())
+    cursor = con.execute("SELECT v FROM kv WHERE k='reap:renew_cursor'").fetchone()
+    if cursor:
+        boxes = [bid for bid in boxes if bid > cursor[0]] + [bid for bid in boxes if bid <= cursor[0]]
+    with api.budget(RENEW_BUDGET_S):
+        for bid in boxes:
+            if api.left() < RENEW_BOX_BUDGET_S:
+                break
+            # Persist before I/O so timeouts or a killed pass cannot restart at the same slow prefix forever.
+            con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('reap:renew_cursor',?)", (bid,))
+            con.commit()
+            with api.budget(RENEW_BOX_BUDGET_S):
+                _keep_live_runs(con, bid, live[bid], dry)
+
+
+def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
+    from .runs import remote_alive
+    if dry or box.get('state') not in api.LIVE_STATES:
+        return
+    for run in con.execute("SELECT * FROM runs WHERE box_id=? AND status='running'", (bid,)).fetchall():
+        if now() - (run['start_at'] or 0) >= ORPHAN_RUN_MAX_S:
+            inserted = con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
+                                   (f"run_orphan_cap:{run['run_id']}", '1')).rowcount
+            con.commit()
+            if inserted:
+                event(con, bid, 'run_orphan_cap', run['run_id'])
+            continue
+        if not run['process_id']:
+            continue
+        try:
+            with api.budget(10):
+                st = api.cmd_status(bid, run['process_id'], timeout=5, retries=0)
+                alive = bool(st and st.get('running') is True)
+                # A missing/lost tracker is not evidence of death; #770's wrapper marker is independent.
+                if not alive and (st is None or st.get('status') == 'lost'):
+                    left = api.left()
+                    alive = bool(left and left > 0 and remote_alive(bid, run['run_id'], timeout=min(5, left)) == 'alive')
+                if alive:
+                    # Background startup may have extended the deadline since list_boxes() took its snapshot.
+                    current = api.get(bid)
+                    if current and current.get('state') in api.LIVE_STATES:
+                        lease.ensure_ttl(bid, RUN_TTL_S, current)
+                    return
+        except OffboxError:
+            continue
+
+
 def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
     try:
-        with file_lock('box-'+bid, timeout=0):
+        with file_lock('box-'+bid, timeout=0), api.budget(RENEW_BOX_BUDGET_S):
             _check_unlocked(con, bid, state, dry, actions)
     except OffboxError:
         pass

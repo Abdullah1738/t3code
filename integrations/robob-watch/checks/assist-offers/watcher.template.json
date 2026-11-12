@@ -1,0 +1,10 @@
+{
+  "id": "assist-offers",
+  "title": "Assist offers",
+  "check": "/usr/bin/python3 ./offers.py",
+  "interval_s": 900,
+  "mode": "wake",
+  "context": "Read the batch, verify each offer in its real thread, and offer to help. Never message others, pay or book without approval.",
+  "depends": ["ssd"],
+  "max_fires": 0
+}

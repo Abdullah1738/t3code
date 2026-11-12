@@ -142,9 +142,15 @@ export const ArdudKanbanLive = Layer.effectDiscard(
     yield* forkParked(
       service.tick.pipe(
         Effect.catchCause(warnUnlessInterrupted("missions board tick failed")),
-        Effect.andThen(
-          scripts.tick.pipe(Effect.catchCause(warnUnlessInterrupted("board scripts tick failed"))),
-        ),
+        // Each interval visits free boards even while another board is still ticking.
+        Effect.forkScoped,
+        Effect.repeat(Schedule.spaced(TICK)),
+        Effect.asVoid,
+      ),
+    );
+    yield* forkParked(
+      scripts.tick.pipe(
+        Effect.catchCause(warnUnlessInterrupted("board scripts tick failed")),
         Effect.repeat(Schedule.spaced(TICK)),
         Effect.asVoid,
       ),

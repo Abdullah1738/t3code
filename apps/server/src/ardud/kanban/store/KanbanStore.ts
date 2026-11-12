@@ -182,6 +182,9 @@ export interface KanbanStoreShape {
   readonly discussionByEvaluator: (
     threadId: string,
   ) => Effect.Effect<KanbanDiscussion | null, KanbanStoreError>;
+  readonly discussionBoardIdsByEvaluator: (
+    threadId: string,
+  ) => Effect.Effect<ReadonlyArray<KanbanBoardId>, KanbanStoreError>;
   readonly putDiscussion: (discussion: KanbanDiscussion) => Effect.Effect<void, KanbanStoreError>;
   /** The newest `limit` (default 200) after `afterSeq` and before `beforeSeq`, oldest first. */
   readonly messages: (
@@ -676,6 +679,17 @@ const make = Effect.gen(function* () {
         (rows) => Effect.map(decodeAll(rows, Discussion.decode), first),
       ),
     );
+  const discussionBoardIdsByEvaluator = (threadId: string) =>
+    runRead(
+      "read discussion boards by evaluator",
+      Effect.map(
+        sql<{ readonly board_id: KanbanBoardId }>`
+          SELECT DISTINCT board_id FROM ardud_kanban_discussions
+          WHERE evaluator_thread_id = ${threadId} ORDER BY board_id
+        `,
+        (rows) => rows.map((row) => row.board_id),
+      ),
+    );
   const putDiscussion = (value: KanbanDiscussion) =>
     run(
       "write discussion",
@@ -983,6 +997,7 @@ const make = Effect.gen(function* () {
     discussions,
     discussion,
     discussionByEvaluator,
+    discussionBoardIdsByEvaluator,
     putDiscussion,
     messages,
     ownerWait,

@@ -1,5 +1,6 @@
 import * as NodeOS from "node:os";
 
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import {
   codexHistoryItems,
@@ -47,6 +48,7 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Exit from "effect/Exit";
 import * as Predicate from "effect/Predicate";
 import * as FileSystem from "effect/FileSystem";
@@ -847,6 +849,143 @@ describe("CodexAdapterV2 process spawning", () => {
         ["app-server", "--enable", "env-feature"],
       ]);
     }).pipe(Effect.provideService(HostProcess.Platform, "linux")),
+  );
+
+  it.effect("backs off respawns of an app-server that keeps exiting soon after start", () =>
+    Effect.sync(() => {
+      assert.deepEqual(
+        [0, 1, 2, 3, 5, 6, 20].map(CodexAdapterV2.codexAppServerRespawnDelayMs),
+        [0, 1_000, 2_000, 4_000, 16_000, 30_000, 30_000],
+      );
+    }),
+  );
+
+  const mockAppServerFactory = Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped();
+    const mockPeer = path.resolve(
+      import.meta.dirname,
+      "../../../../../packages/effect-codex-app-server/test/fixtures/codex-app-server-mock-peer.ts",
+    );
+    const binaryPath = path.join(directory, "codex");
+    yield* fileSystem.writeFileString(
+      binaryPath,
+      `#!/bin/sh\nexec "${process.execPath}" "${mockPeer}"\n`,
+    );
+    yield* fileSystem.chmod(binaryPath, 0o755);
+    const factory = yield* CodexAdapterV2.CodexAppServerClientFactory.pipe(
+      Effect.provide(CodexAdapterV2.layerAppServerClientFactory),
+      Effect.provideService(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    );
+    const open = (environment: NodeJS.ProcessEnv) =>
+      factory.open({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        threadId: ThreadId.make("thread-respawn"),
+        providerSessionId: ProviderSessionId.make("provider-session-respawn"),
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        settings: { ...DEFAULT_CODEX_SETTINGS, binaryPath },
+        environment: { CODEX_APP_SERVER_TEST_EXIT_ON_METHOD: "thread/resume", ...environment },
+      });
+    const initialize = (client: CodexClient.CodexAppServerClient["Service"]) =>
+      client.request("initialize", {
+        clientInfo: { name: "respawn-test", title: "Respawn Test", version: "0.0.0" },
+        capabilities: { experimentalApi: true, optOutNotificationMethods: null },
+      });
+    const exitDuringResume = (stderr: string) =>
+      Effect.gen(function* () {
+        const client = yield* open({ CODEX_APP_SERVER_TEST_EXIT_STDERR: stderr });
+        yield* initialize(client);
+        yield* client.raw.request("thread/resume", { threadId: "thread-1" }).pipe(Effect.ignore);
+        return yield* client.awaitTermination;
+      }).pipe(Effect.scoped);
+    return { open, initialize, exitDuringResume };
+  });
+
+  it.live("spawns a fresh app-server, after a short backoff, once the last one exited", () =>
+    Effect.gen(function* () {
+      const { open, initialize, exitDuringResume } = yield* mockAppServerFactory;
+      const exited = yield* exitDuringResume("");
+      assert.equal(exited._tag, "CodexAppServerProcessExitedError");
+
+      const reopenedAt = yield* Clock.currentTimeMillis;
+      const initialized = yield* open({}).pipe(Effect.flatMap(initialize), Effect.scoped);
+      assert.equal(initialized.userAgent, "mock-codex-app-server");
+      assert.isAtLeast((yield* Clock.currentTimeMillis) - reopenedAt, 900);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("20 seconds")),
+  );
+
+  it.live("keeps credentials Codex printed before exiting out of the persisted session error", () =>
+    Effect.gen(function* () {
+      const { exitDuringResume } = yield* mockAppServerFactory;
+      const exited = yield* exitDuringResume(
+        [
+          'config {"api_key":"dummy-api-key","access_token":"dummy-access-token"}',
+          `{"password":"dummy'password-suffix"}`,
+          String.raw`{"client_secret":"dummy\"escaped-suffix"}`,
+          "retrying with password=dummy'unquoted-suffix and refresh_token=dummy-token'refresh-suffix",
+          "fatal: refresh_token=dummy-refresh'last-line-suffix rejected",
+          "",
+        ].join("\n"),
+      );
+      // ProviderSessionManager persists Cause.pretty of the failed event stream
+      // as the released session's lastError.
+      const releaseDetail = Cause.pretty(
+        Cause.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            providerSessionId: ProviderSessionId.make("provider-session-respawn"),
+            cause: exited,
+          }),
+        ),
+      );
+      const failureMessage = makeProviderFailure({
+        cause: Cause.fail(exited),
+        class: "provider_error",
+      }).message;
+      for (const secret of [
+        "dummy-api-key",
+        "dummy-access-token",
+        "dummy-refresh",
+        "password-suffix",
+        "escaped-suffix",
+        "unquoted-suffix",
+        "refresh-suffix",
+        "last-line-suffix",
+      ]) {
+        assert.notInclude(releaseDetail, secret);
+        assert.notInclude(failureMessage, secret);
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("20 seconds")),
+  );
+
+  it.live("reports a Codex usage-limit exit as usage_limit with its reset time", () =>
+    Effect.gen(function* () {
+      const { exitDuringResume } = yield* mockAppServerFactory;
+      const exited = yield* exitDuringResume(
+        "You've hit your usage limit. Upgrade to Pro or try again at Nov 16th, 2026 9:47 AM.\n",
+      );
+      const resetAt = DateTime.formatIso(DateTime.makeUnsafe(Date.parse("2026-11-16T09:47:00")));
+      for (const cause of [
+        new ProviderAdapter.ProviderAdapterEventStreamError({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          providerSessionId: ProviderSessionId.make("provider-session-respawn"),
+          cause: exited,
+        }),
+        new ProviderAdapter.ProviderAdapterEnsureThreadError({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          threadId: ThreadId.make("thread-respawn"),
+          cause: exited,
+        }),
+      ]) {
+        const failure = makeProviderFailure({ cause, class: "provider_error" });
+        assert.equal(failure.class, "usage_limit");
+        assert.equal(failure.resetAt, resetAt);
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("20 seconds")),
   );
 
   it.effect("expands ~ in the configured binary path before spawning", () =>
@@ -2470,6 +2609,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     environment: NodeJS.ProcessEnv = {},
     awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"],
     beforeNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
+    additionalSessions: ReadonlyArray<{
+      readonly transcript: CodexReplay.CodexAppServerReplayTranscript;
+      readonly awaitSessionExit: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
+    }> = [],
+    terminationError?: CodexError.CodexAppServerError,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2478,9 +2622,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
         [];
       const inputEnd = yield* Deferred.make<Effect.Effect<void>>();
+      const sessions = [{ transcript, awaitSessionExit }, ...additionalSessions];
+      let nextSession = 0;
       const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
-        open: (openInput) =>
-          Layer.build(CodexReplay.layerReplay(transcript)).pipe(
+        open: (openInput) => {
+          const replaySession = sessions[nextSession++]!;
+          return Layer.build(CodexReplay.layerReplay(replaySession.transcript)).pipe(
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterOpenSessionError({
@@ -2493,13 +2640,19 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               Effect.service(CodexClient.CodexAppServerClient).pipe(
                 Effect.tap((client) => Deferred.succeed(inputEnd, client.awaitInputEnd)),
                 Effect.map((client) =>
-                  withCodexReplayChildMetadata(client, transcript, readChildMetadata),
+                  withCodexReplayChildMetadata(client, replaySession.transcript, readChildMetadata),
                 ),
                 Effect.map(
                   (client) =>
                     ({
                       ...client,
-                      ...(awaitSessionExit === undefined ? {} : { awaitSessionExit }),
+                      awaitTermination:
+                        terminationError === undefined
+                          ? client.awaitTermination
+                          : client.awaitTermination.pipe(Effect.as(terminationError)),
+                      ...(replaySession.awaitSessionExit === undefined
+                        ? {}
+                        : { awaitSessionExit: replaySession.awaitSessionExit }),
                       handleServerNotification: (method, handler) =>
                         client.handleServerNotification(method, (payload) =>
                           beforeNotification(method).pipe(Effect.andThen(handler(payload))),
@@ -2520,7 +2673,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 Effect.provide(context),
               ),
             ),
-          ),
+          );
+        },
       };
       const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
@@ -2556,6 +2710,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       });
       const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
       const firstTerminal = yield* Deferred.make<void>();
+      const streamExit =
+        yield* Deferred.make<Exit.Exit<void, Stream.Error<typeof runtime.events>>>();
       yield* runtime.events.pipe(
         Stream.runForEach((event) =>
           Effect.sync(() => {
@@ -2569,6 +2725,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             Effect.andThen(onEvent(event)),
           ),
         ),
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(streamExit, exit)),
         Effect.forkScoped,
       );
       if (runtime.hasPendingBackgroundWork === undefined) {
@@ -2592,6 +2750,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           > => event.type === "subagent.updated",
         );
       return {
+        adapter,
         runtime,
         providerThread,
         threadId,
@@ -2602,6 +2761,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         subagentUpdates,
         hasPendingBackgroundWork,
         awaitInputEnd: Deferred.await(inputEnd).pipe(Effect.flatten),
+        eventStreamExit: Deferred.await(streamExit),
         firstTerminal: Deferred.await(firstTerminal),
       };
     });
@@ -3007,6 +3167,56 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isDefined(harness.runtime.unloadThread);
       yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
       assert.deepEqual(requests, ["initialize", "thread/start", "thread/unsubscribe"]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  const exitedAppServerHarness = (scenario: string) => {
+    const preamble = codexReplayPreamble({
+      nativeThreadId: scenario,
+      nativeTurnId: "unused",
+      prompt: "unused",
+    });
+    return makeCodexReplayHarness(
+      makeCodexReplayTranscript({
+        scenario,
+        entries: [...preamble.slice(0, 5), { type: "runtime_exit", status: "success" }],
+      }),
+    );
+  };
+
+  it.effect("ends the shared session with the exit reason once the app-server exits", () =>
+    Effect.gen(function* () {
+      const harness = yield* exitedAppServerHarness("app-server-exit");
+      const failure = yield* harness.runtime.events.pipe(
+        Stream.runDrain,
+        Effect.flip,
+        Effect.timeout("5 seconds"),
+      );
+      assert.equal(failure._tag, "ProviderAdapterEventStreamError");
+      const cause = (failure as { cause?: { _tag?: string } }).cause;
+      assert.equal(cause?._tag, "CodexAppServerProcessExitedError");
+      assert.equal(
+        makeProviderFailure({ cause: failure }).message,
+        "The provider event stream closed unexpectedly: Codex App Server process exited with code 0. Retry the turn; if it keeps failing, check the provider and server logs.",
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("treats unloading a thread from an exited app-server as done", () =>
+    Effect.gen(function* () {
+      const harness = yield* exitedAppServerHarness("app-server-exit-unload");
+      yield* harness.runtime.events.pipe(Stream.runDrain, Effect.ignore);
+      yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
     }).pipe(
       Effect.scoped,
       Effect.provide(
@@ -3724,6 +3934,238 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+
+  it.effect("preserves classified exit diagnostics and reset time in the fallback terminal", () =>
+    Effect.gen(function* () {
+      const processExited = yield* Deferred.make<void>();
+      const error = new CodexError.CodexAppServerProcessExitedError({
+        pid: 801,
+        code: 1,
+        stderrTail: "You've hit your usage limit. Try again at Nov 16th, 2026 9:47 AM.",
+      });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "classified-process-exit",
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId: "classified-thread",
+              nativeTurnId: "classified-turn",
+              prompt: "Continue.",
+            }),
+            { type: "runtime_exit", status: "success" },
+          ],
+        }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {},
+        Deferred.await(processExited),
+        undefined,
+        [],
+        error,
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          text: "Continue.",
+          attemptId: RunAttemptId.make("classified-exit"),
+        }),
+      );
+      yield* harness.awaitInputEnd;
+      yield* Deferred.succeed(processExited, undefined);
+      yield* harness.eventStreamExit;
+      const terminal = harness.terminalEvents()[0];
+      assert.lengthOf(harness.terminalEvents(), 1);
+      assert.equal(terminal?.status, "failed");
+      if (terminal?.status !== "failed") return;
+      assert.deepEqual(
+        terminal.failure,
+        makeProviderFailure({ cause: error, class: "provider_error" }),
+      );
+      assert.equal(terminal.failure.class, "usage_limit");
+      assert.equal(
+        terminal.failure.resetAt,
+        DateTime.formatIso(DateTime.makeUnsafe(Date.parse("2026-11-16T09:47:00"))),
+      );
+      assert.include(terminal.failure.message, "process 801 exited with code 1");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect(
+    "settles an exited process without touching a replacement using the same native IDs",
+    () =>
+      Effect.gen(function* () {
+        const nativeThreadId = "reused-process-thread";
+        const nativeTurnId = "reused-process-turn";
+        const oldProcessExited = yield* Deferred.make<void>();
+        const replacementExited = yield* Deferred.make<void>();
+        const replacementTerminal = yield* Deferred.make<void>();
+        const replacementStreamEnded = yield* Deferred.make<void>();
+        const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." });
+        const old = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "old-process",
+            entries: [
+              ...preamble,
+              {
+                type: "expect_outbound",
+                label: "thread/read",
+                frame: {
+                  id: 4,
+                  method: "thread/read",
+                  params: { threadId: nativeThreadId, includeTurns: true },
+                },
+              },
+              { type: "runtime_exit", status: "success" },
+            ],
+          }),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {},
+          Deferred.await(oldProcessExited),
+          undefined,
+          [
+            {
+              transcript: makeCodexReplayTranscript({
+                scenario: "replacement-process",
+                entries: [
+                  ...preamble,
+                  {
+                    type: "expect_outbound",
+                    label: "turn/steer",
+                    frame: {
+                      id: 4,
+                      method: "turn/steer",
+                      params: {
+                        threadId: nativeThreadId,
+                        expectedTurnId: nativeTurnId,
+                        input: [{ type: "text", text: "Still running." }],
+                      },
+                    },
+                  },
+                  {
+                    type: "emit_inbound",
+                    label: "turn/steer",
+                    frame: { id: 4, result: { turnId: nativeTurnId } },
+                  },
+                  {
+                    type: "emit_inbound",
+                    label: "turn/completed",
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                      },
+                    },
+                  },
+                ],
+              }),
+              awaitSessionExit: Deferred.await(replacementExited),
+            },
+          ],
+        );
+        yield* old.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: old.threadId,
+            providerThread: old.providerThread,
+            now: yield* DateTime.now,
+            text: "Continue.",
+            attemptId: RunAttemptId.make("old-process"),
+          }),
+        );
+        const threadId = ThreadId.make("replacement-thread");
+        const replacement = yield* old.adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("replacement-session"),
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* replacement.ensureThread({
+          threadId,
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        });
+        const replacementEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        yield* replacement.events.pipe(
+          Stream.runForEach((event) =>
+            Effect.sync(() => replacementEvents.push(event)).pipe(
+              Effect.andThen(
+                event.type === "turn.terminal"
+                  ? Deferred.succeed(replacementTerminal, undefined)
+                  : Effect.void,
+              ),
+            ),
+          ),
+          Effect.ensuring(Deferred.succeed(replacementStreamEnded, undefined)),
+          Effect.forkScoped,
+        );
+        const replacementTurn = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          text: "Continue.",
+          attemptId: RunAttemptId.make("replacement-process"),
+        });
+        yield* replacement.startTurn(replacementTurn);
+        assert.equal(
+          (yield* old.runtime
+            .readThreadSnapshot({ providerThread: old.providerThread })
+            .pipe(Effect.exit))._tag,
+          "Failure",
+        );
+        yield* old.awaitInputEnd;
+        yield* Deferred.succeed(oldProcessExited, undefined);
+        yield* old.runtime.awaitSessionExit!;
+        const oldStreamExit = yield* old.eventStreamExit;
+        assert.isTrue(Exit.isFailure(oldStreamExit));
+        if (Exit.isFailure(oldStreamExit)) {
+          const failure = Cause.squash(oldStreamExit.cause);
+          assert.instanceOf(failure, ProviderAdapter.ProviderAdapterEventStreamError);
+          assert.instanceOf(failure.cause, CodexError.CodexAppServerProcessExitedError);
+        }
+        assert.lengthOf(old.terminalEvents(), 1);
+        assert.equal(old.terminalEvents()[0]?.status, "failed");
+        assert.isFalse(yield* Deferred.isDone(replacementTerminal));
+        assert.isFalse(yield* Deferred.isDone(replacementStreamEnded));
+        yield* replacement.steerTurn({
+          threadId,
+          runId: replacementTurn.runId,
+          providerThread,
+          providerTurnId: (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            nativeTurnId,
+          }),
+          message: {
+            ...replacementTurn.message,
+            messageId: MessageId.make("replacement-steer"),
+            text: "Still running.",
+          },
+        });
+        yield* Deferred.await(replacementTerminal);
+        const terminals = replacementEvents.filter((event) => event.type === "turn.terminal");
+        assert.lengthOf(terminals, 1);
+        assert.equal(terminals[0]?.status, "completed");
+        yield* old.runtime.awaitSessionExit!;
+        assert.lengthOf(old.terminalEvents(), 1);
+        assert.isFalse(yield* Deferred.isDone(replacementStreamEnded));
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("sends currency-sigil skill mentions to Codex as $ mentions", () =>

@@ -23,6 +23,7 @@ class ColdHomeTests(Isolated):
     def setUp(self):
         super().setUp()
         self.output = io.StringIO()
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(contextlib.redirect_stderr(self.output))
         self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_COLD_HOME_SECONDS': '5'}))
         self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: boat called')))

@@ -338,6 +338,44 @@ def money_books(wd, mc):
     return data
 
 
+def payment_notice(item, text):
+    try:
+        parser = load_module('triage_payments', MONEY_CASES.with_name('payments.py'))
+        return parser.parse(text, item.get('sender', ''), dt.datetime.fromtimestamp(item['ts'], DUBAI))
+    except (OSError, ImportError, ValueError, KeyError):
+        return None
+
+
+def payment_checks(items, now, dry, deadline=None, wd=None):
+    reasons, errors = {}, []
+    try:
+        mc = load_module('triage_money_cases', MONEY_CASES)
+        # Dry runs exercise detection only and never mutate the live books.
+        data = None if dry else money_books(wd, mc)
+        for item in sorted(items, key=lambda i: i.get('ts', 0)):
+            if item.get('source') not in ('imessage', 'email') or not isinstance(item.get('ts'), (float, int)):
+                continue
+            text = f"{item.get('subject', '')} {item.get('preview', '')}"
+            notice = item.get('payment_notice') or mc.payments.parse(text, item.get('sender', ''), dt.datetime.fromtimestamp(item['ts'], mc.TZ))
+            if not notice:
+                continue
+            item['payment_notice'] = notice
+            if dry:
+                continue
+            if late(deadline):
+                errors.append('payment tracking out of time; retry next check')
+                continue
+            try:
+                with mc.within(deadline, mc.CheckTimeout('payment tracking out of time')):
+                    mc.record_payment(data, notice, item['id'], dt.datetime.fromtimestamp(now, mc.TZ), end=deadline)
+                reasons[item['id']] = notice['kind'] + '_tracked'
+            except Exception as e:
+                errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    except Exception as e:
+        errors.append(f'{type(e).__name__}: {str(e)[:100]}')
+    return reasons, '; '.join(dict.fromkeys(errors))[:300] or None
+
+
 def charge_checks(items, now, dry, deadline=None, wd=None):
     """Card alerts money-cases settles before anyone asks him (owner rule, nightly 2026-10-24:
     find the receipt or his own words first, and wait for the receipt from a merchant he already
@@ -430,6 +468,12 @@ def prefilter(item, now, rules):
             return 'learned_noise'
     if OTP.search(subject + ' ' + preview) and now - item['ts'] > 300:
         return 'stale_otp'
+    if item['source'] in ('email', 'imessage') and (item.get('payment_notice') or re.search(r'auto[ -]?pay|payment|repay|late fee|interest', subject + ' ' + preview, re.I)):
+        try:
+            if item.get('payment_notice') or payment_notice(item, subject + ' ' + preview):
+                return None
+        except Exception:
+            pass  # Tracking errors are reported by payment_checks; preserve normal filtering here.
     if item['source'] == 'email':
         if 'talabat.com' in sender.lower() and re.fullmatch(r'your service charges receipt', subject, re.I):
             return 'routine_receipt'
@@ -505,6 +549,13 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
             'preview': '', 'list_unsubscribe': bool(msg.get('List-Unsubscribe')),
             'precedence': str(msg.get('Precedence', '')).lower()}
     reason = prefilter(item, now, request['rules'])
+    if reason in ('bulk', 'promotion'):
+        try:
+            parser = load_module('triage_payments', MONEY_CASES.with_name('payments.py'))
+            if parser.institution(item['sender']):
+                reason = None  # Read bank mail before deciding whether a bulk header hides a deadline.
+        except (OSError, ImportError):
+            pass
     if reason:
         return None, reason
     fetched = fetch_verified(M, [uid], '(UID BODY.PEEK[]<0.32768>)')
@@ -526,6 +577,9 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
         except (ValueError, LookupError, UnicodeError):
             pass
     text = '\n'.join(plain) or mail.html_to_text('\n'.join(html))
+    notice = payment_notice(item, str(msg.get('Subject', '')) + ' ' + text)
+    if notice:
+        item['payment_notice'] = notice
     item['preview'] = clean(text)
     item['attachments'] = [clean(a, 100) for a in attachments[:5]]
     redact_item(item, ' '.join([str(msg.get('Subject', '')), text, *attachments]))
@@ -755,9 +809,13 @@ def collect_imessage(cursor, now, initialized_at=None, since=None):
             text = r['text'] or attributed(r['attributedBody'])
             if r['cache_has_attachments']:
                 text += ' [attachment]'
-            items.append({'id': f'imsg:{r["ROWID"]}', 'source': 'imessage', 'ts': ts,
+            item = {'id': f'imsg:{r["ROWID"]}', 'source': 'imessage', 'ts': ts,
                           'chat_id': chats[0]['ROWID'] if chats else None, 'guid': r['guid'],
-                          'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)})
+                          'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)}
+            notice = payment_notice(item, str(r['subject'] or '') + ' ' + text)
+            if notice:
+                item['payment_notice'] = notice
+            items.append(item)
         return {'items': items, 'cursor': rows[-1]['ROWID'] if rows else cursor,
                 'drops': dict(drops), 'dropped': dropped, 'scanned': len(rows)}
 
@@ -1355,7 +1413,11 @@ def run(args):
             dropped.append([item['id'], reason])
         else:
             kept.append(item)
-    charged, held, charge_error = charge_checks(kept, now, dry, None if dry else now + CHARGE_BY, wd)
+    paid, payment_error = payment_checks(kept, now, dry, None if dry else now + CHARGE_BY, wd)
+    charged, held, charge_error = charge_checks([i for i in kept if i['id'] not in paid], now, dry, None if dry else now + CHARGE_BY, wd)
+    charged = {**paid, **charged}
+    held |= {i['id'] for i in kept if i.get('payment_notice') and i['id'] not in paid} if not dry else set()
+    charge_error = '; '.join(filter(None, [payment_error, charge_error])) or None
     done, answer_errors = handled([i for i in kept if i['id'] not in charged], None if dry else now + EARLY_BY)
     done = {**charged, **done}
     for i, reason in sorted(done.items()):

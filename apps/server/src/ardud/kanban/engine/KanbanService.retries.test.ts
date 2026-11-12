@@ -100,6 +100,7 @@ const makeFake = () => {
           threads.get(input.threadId)?.messages.push(input.text);
         }),
       setModel: () => Effect.void,
+      cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
   );
@@ -789,8 +790,8 @@ it.effect("a verdict ends the review's retry: the next step starts with a clean 
       yield* kanban.dispatchNow;
       assert.deepStrictEqual(retriesOf((yield* now).card), ["no_verdict/review/restarted"]);
       const done = yield* kanban.reviewResult(reviewer, "findings", ["Rounding drops a cent"]);
-      assert.strictEqual(done.stage, "todo");
-      assert.isUndefined(done.retries);
+      assert.strictEqual(done.card.stage, "todo");
+      assert.isUndefined(done.card.retries);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
