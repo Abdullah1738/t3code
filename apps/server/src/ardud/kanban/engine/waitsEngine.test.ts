@@ -159,6 +159,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         updatedAt: iso(nowMs),
         quietSince: iso(T0),
         runStartedAt: null,
+            lastActivityAt: null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],

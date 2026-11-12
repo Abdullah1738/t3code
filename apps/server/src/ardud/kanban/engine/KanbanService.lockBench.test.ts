@@ -92,6 +92,7 @@ const makeThreads = Effect.gen(function* () {
         updatedAt: at,
         quietSince: at,
         runStartedAt: thread.running ? at : null,
+        lastActivityAt: thread.running ? at : null,
         backgroundWork: 0,
         prWatches: 0,
         prs: [],

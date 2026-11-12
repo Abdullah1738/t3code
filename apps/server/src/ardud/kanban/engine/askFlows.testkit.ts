@@ -59,6 +59,7 @@ export const makeFake = Effect.gen(function* () {
           updatedAt: "2026-11-10T10:00:00.000Z",
           quietSince: "2026-11-10T10:00:00.000Z",
           runStartedAt: null,
+          lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],

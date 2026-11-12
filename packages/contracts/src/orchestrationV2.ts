@@ -581,6 +581,7 @@ export const OrchestrationV2Run = Schema.Struct({
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
+  lastActivityAt: Schema.optional(Schema.DateTimeUtc),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
   ),
@@ -2104,6 +2105,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
+  lastActivityAt: Schema.optional(Schema.DateTimeUtcFromString),
   // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWorkJson),

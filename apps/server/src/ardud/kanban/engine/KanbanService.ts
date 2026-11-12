@@ -1237,6 +1237,7 @@ const effectSink = Context.Reference<EffectSink | undefined>("KanbanEffectSink",
 interface TickKicks {
   held: boolean;
   asked: boolean;
+  stoppedCards: Set<string>;
 }
 const tickKicks = Context.Reference<TickKicks | undefined>("KanbanTickKicks", {
   defaultValue: () => undefined,
@@ -1518,12 +1519,12 @@ const make = Effect.gen(function* () {
       ),
   );
   const interruptThread = Effect.fn("KanbanService.interruptThread")(
-    (id: ThreadId, reason: string, cancelQueued?: boolean) =>
+    (id: ThreadId, reason: string, cancelQueued?: boolean, runId?: string) =>
       Effect.acquireUseRelease(
         Effect.sync(() => {
           inFlightStops.set(id, (inFlightStops.get(id) ?? 0) + 1);
         }),
-        () => touching(id, threadIo.interrupt(id, reason, cancelQueued)),
+        () => locks.outside(touching(id, threadIo.interrupt(id, reason, cancelQueued, runId))),
         () =>
           Effect.sync(() => {
             const left = (inFlightStops.get(id) ?? 1) - 1;
@@ -1626,8 +1627,8 @@ const make = Effect.gen(function* () {
       locks.outside(withThreadModel(id, touching(id, threadIo.setModel(id, model)))),
     cancelQueued: (id, run) => locks.outside(touching(id, threadIo.cancelQueued(id, run))),
     // Best effort, as before, for the board's own inline stops; saved stops use `runPendingStops`.
-    interrupt: (id, reason, cancelQueued) =>
-      locks.outside(interruptThread(id, reason, cancelQueued).pipe(Effect.ignore)),
+    interrupt: (id, reason, cancelQueued, runId) =>
+      interruptThread(id, reason, cancelQueued, runId).pipe(Effect.ignore),
   };
   /** Thread reads that confirm the current run: always read, never replayed. */
   const freshThreads = {
@@ -1855,6 +1856,8 @@ const make = Effect.gen(function* () {
   const outageGeneration = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
   const deferredNudges = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
   const unresolvedTurnEnds = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  // History survives a reattachment (which resets nudgedAt); cache it after one read.
+  const silentStops = new Map<string, { threadId: string; runId: string; at: string } | null>();
   const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
@@ -5570,6 +5573,7 @@ const make = Effect.gen(function* () {
 
   const dispatchUnlocked = Effect.fn("KanbanService.dispatchUnlocked")(function* (
     boardId?: string,
+    stoppedCards: ReadonlySet<string> = new Set(),
   ) {
     if (boardId === undefined) yield* Ref.set(kickPending, false);
     const random = yield* Random.Random;
@@ -5584,7 +5588,7 @@ const make = Effect.gen(function* () {
             dispatching,
             candidate.id,
             Effect.gen(function* () {
-              const attempted = new Set<string>();
+              const attempted = new Set(stoppedCards);
               while (true) {
                 // Replan after each attempt so a failed head leaves room for lower cards.
                 const planned = yield* locks.run(
@@ -7146,6 +7150,127 @@ const make = Effect.gen(function* () {
                 initial.id,
               );
             }
+            // The same backstop covers a running thread even after its card was detached.
+            for (const initial of yield* cardsForPlan) {
+              const threadFor = (card: KanbanCard) =>
+                card.activeThreadId ??
+                (card.stage === "todo"
+                  ? card.workThreadId
+                  : card.stage === "needs_review"
+                    ? card.reviewThreadId
+                    : null);
+              const threadId = threadFor(initial);
+              if (threadId === null || initial.stalled !== null) continue;
+              yield* step(
+                "silentRunBackstop",
+                Effect.gen(function* () {
+                  const view = yield* planView(threadId);
+                  if (view?.state !== "running") return;
+                  const card = yield* store.card(initial.id);
+                  if (!card || card.stalled !== null || threadFor(card) !== threadId) return;
+                  if (board.pause && !board.pause.keep.includes(card.id)) return;
+                  if (
+                    (yield* Ref.get(unresolvedTurnEnds)).has(threadId) ||
+                    discussionWakes.has(threadId) ||
+                    (yield* store.threadLink(threadId))?.paused
+                  )
+                    return;
+                  // Detached cards must never stop another card's worker, even across boards.
+                  if (
+                    card.activeThreadId === null &&
+                    (yield* store.cardsByThread(threadId)).some((other) => other.id !== card.id)
+                  )
+                    return;
+                  const due = Rules.runSilentDue(card, view, now);
+                  if (!silentStops.has(card.id)) {
+                    const event = (yield* store.cardEvents(card.id)).findLast(
+                      (event) =>
+                        event.kind === "thread" && event.body?.startsWith("No activity for "),
+                    );
+                    const match = event?.body?.match(/\nThread: ([^\n]+)\nRun: ([^\n]+)$/);
+                    silentStops.set(
+                      card.id,
+                      event && match
+                        ? { threadId: match[1]!, runId: match[2]!, at: event.at }
+                        : null,
+                    );
+                  }
+                  const previous = silentStops.get(card.id);
+                  // Keep queue ownership in orchestration (#618/#812). A pre-clear wake
+                  // promoted after our interrupt needs evaluator recovery, not queue deletion.
+                  const stale =
+                    previous != null &&
+                    previous.threadId === threadId &&
+                    view.runId != null &&
+                    previous.runId !== view.runId &&
+                    view.runRequestedAt != null &&
+                    Date.parse(view.runRequestedAt) < Date.parse(previous.at);
+                  if (!due && !stale) return;
+                  const fresh = yield* freshFind(threadId);
+                  const current = yield* store.card(card.id);
+                  if (
+                    Option.isNone(fresh) ||
+                    fresh.value === null ||
+                    !current ||
+                    current.stalled !== null ||
+                    threadFor(current) !== threadId ||
+                    (board.pause && !board.pause.keep.includes(current.id)) ||
+                    (yield* store.threadLink(threadId))?.paused ||
+                    fresh.value.runId !== view.runId ||
+                    fresh.value.state !== "running" ||
+                    (current.activeThreadId === null &&
+                      (yield* store.cardsByThread(threadId)).some(
+                        (other) => other.id !== current.id,
+                      ))
+                  )
+                    return;
+                  if (!stale && !Rules.runSilentDue(current, fresh.value, now)) return;
+                  const at = yield* nowIso;
+                  const system: KanbanActor = { _tag: "system", component: "dispatcher" };
+                  if (
+                    stale ||
+                    (previous != null && now - Date.parse(previous.at) <= 2 * Rules.RUN_SILENT_MS)
+                  ) {
+                    const reason = stale
+                      ? "Stale queued runs on the thread"
+                      : "Run went silent twice";
+                    const next = releaseStalled(
+                      { ...current, stalled: { reason, by: system, at } },
+                      at,
+                    );
+                    yield* logEvent(next, system, "flagged", {
+                      fromStage: current.stage,
+                      toStage: next.stage,
+                      body: reason,
+                    });
+                    yield* saveCard(next);
+                    updateCard(next);
+                    yield* kick;
+                    return;
+                  }
+                  const minutes = Math.floor(
+                    (now - Date.parse(fresh.value.lastActivityAt!)) / 60000,
+                  );
+                  const reason = `No activity for ${minutes} min; the board stopped the run`;
+                  yield* interruptThread(threadId, reason, false, fresh.value.runId ?? undefined);
+                  // Wait for the stop to settle before this tick can reattach the card.
+                  (yield* tickKicks)?.stoppedCards.add(current.id);
+                  yield* logEvent(current, system, "thread", {
+                    body: `${reason}\nThread: ${threadId}\nRun: ${fresh.value.runId ?? "unknown"}`,
+                  });
+                  const next = { ...current, nudgedAt: at, updatedAt: at };
+                  yield* saveCard(next);
+                  silentStops.set(current.id, {
+                    threadId,
+                    runId: fresh.value.runId ?? "unknown",
+                    at,
+                  });
+                  updateCard(next);
+                  views.delete(threadId);
+                }),
+                initial.id,
+              );
+            }
             // Backstop for a missed turn end, or a worker stuck on its own question.
             for (const initial of yield* cardsForPlan) {
               if (
@@ -7971,7 +8096,7 @@ const make = Effect.gen(function* () {
   const tickBoard = Effect.fn("KanbanService.tickBoard")(function* (boardId: string) {
     if (runningTicks.has(boardId)) return;
     runningTicks.add(boardId);
-    const kicks: TickKicks = { held: true, asked: false };
+    const kicks: TickKicks = { held: true, asked: false, stoppedCards: new Set() };
     yield* serialEach(ticking, boardId, tickSteps(boardId), false).pipe(
       Effect.provideService(tickKicks, kicks),
       Effect.ensuring(
@@ -7979,7 +8104,7 @@ const make = Effect.gen(function* () {
           kicks.held = false;
         }),
       ),
-      Effect.andThen(dispatchUnlocked(boardId)),
+      Effect.andThen(dispatchUnlocked(boardId, kicks.stoppedCards)),
       Effect.onExit((exit) =>
         Effect.suspend(() => (Exit.isSuccess(exit) || !kicks.asked ? Effect.void : kick)),
       ),
@@ -8665,6 +8790,11 @@ const make = Effect.gen(function* () {
       return failWith(
         "conflict",
         "This thread is withdrawing an abandoned assignment; try again after it has stopped.",
+      );
+    if (inFlightStops.has(ThreadId.make(threadId)))
+      return failWith(
+        "conflict",
+        "This thread is being stopped; it can't take another card until that stop has finished.",
       );
     const pending = [...(pendingStops.get(threadId)?.values() ?? [])];
     if (pending.length === 0) return Effect.void;
@@ -10516,6 +10646,31 @@ const make = Effect.gen(function* () {
           return current;
         }
         if (action === "stop") {
+          if (card.activeThreadId === null) {
+            const running = [];
+            for (const threadId of new Set([card.workThreadId, card.reviewThreadId])) {
+              if (threadId === null) continue;
+              const view = yield* threads.find(threadId);
+              if (view?.state !== "running" && view?.state !== "needs-input") continue;
+              const others = (yield* store.cardsByThread(threadId)).filter(
+                (other) => other.id !== card.id,
+              );
+              if (others.length > 0)
+                return yield* failWith(
+                  "denied",
+                  `Thread carries another attached card (#${others[0]!.number}); left it running`,
+                );
+              running.push({ threadId, runId: view.runId });
+            }
+            for (const { threadId, runId } of running) {
+              yield* interruptThread(
+                threadId,
+                text.trim() || `Card #${card.number} was stopped`,
+                false,
+                runId ?? undefined,
+              );
+            }
+          }
           const kept = yield* letGo(
             card,
             false,
