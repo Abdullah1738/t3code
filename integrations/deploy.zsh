@@ -30,3 +30,17 @@ rsync "${flags[@]}" \
   --exclude '*.sock' --exclude archive --exclude watchers --exclude HANDOFF.md --exclude tmp \
   --exclude 'verification*' --exclude bin --exclude .gitignore --exclude README.md --exclude docs \
   "$src" "$dst"
+
+if [[ "$name" == memory-system ]]; then
+  recall_src="${src}scripts/recall"
+  recall_dst="$HOME/.local/bin/recall"
+  if [[ -e "$recall_dst" ]] && ! cmp -s "$recall_src" "$recall_dst"; then
+    print "memory-system: ~/.local/bin/recall differs from scripts/recall"
+  fi
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    print "memory-system: would install -m 755 $recall_src $recall_dst"
+  else
+    mkdir -p "${recall_dst:h}"
+    install -m 755 "$recall_src" "$recall_dst"
+  fi
+fi
