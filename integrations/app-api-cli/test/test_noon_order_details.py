@@ -43,13 +43,14 @@ class DetailTests(unittest.TestCase):
         self.assertEqual((row['name'],row['detail'],row['price']),('Coffee','Oat milk',12))
 
     def test_minutes_does_not_guess_unit_price(self):
-        row={'orderNr':'ITEST','orderTotal':8,'items':[{'itemCode':'I1','title':'Item','qty':1,
+        row={'orderNr':'ITEST','createdAt':'2026-10-23T19:45:00Z','orderTotal':8,'items':[{'itemCode':'I1','title':'Item','qty':1,
              'price':10,'offerPrice':8,'salePrice':8}]}
         with patch.object(d.core,'verified_session',return_value={}), \
                 patch('noon_minutes_checkout.native_request',return_value=row):
             result=d.details('ITEST','minutes')
         self.assertIsNone(result['items'][0]['price'])
         self.assertEqual(result['total'],8)
+        self.assertEqual(result['placed_at'],'2026-10-23T19:45:00Z')
 
     def test_public_card_never_contains_notes_even_for_owner(self):
         data=d.food(self.food(),'FTEST');data['status']='delivered'
@@ -65,7 +66,9 @@ class DetailTests(unittest.TestCase):
                 'totalPrice':12,'modifiers':{'MD1':{'I2':1}},'notes':'Extra hot'}]}
 
     def test_food_snapshot_choices_notes_and_secret_exclusion(self):
-        result=d.food(self.food(),'FTEST');line=result['items'][0]
+        raw=self.food();raw['createdAt']='2026-10-23T19:45:00Z'
+        result=d.food(raw,'FTEST');line=result['items'][0]
+        self.assertEqual(result['placed_at'],'2026-10-23T19:45:00Z')
         self.assertEqual((line['name'],line['qty'],line['line_total']),('Coffee',2,12))
         self.assertEqual(line['options'][0]['name'],'Oat milk')
         self.assertEqual(line['notes'],'Extra hot')
@@ -95,3 +98,83 @@ class DetailTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class MoneyOrderCoverageTests(unittest.TestCase):
+    def test_native_paginated_empty_lists_cannot_authorize_a_money_question(self):
+        import importlib.util
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        import noon_http_orders as core
+        import noon_vertical_reads as vertical
+        source = Path(__file__).resolve().parents[2] / 'robob-watch/checks/money-cases/cases.py'
+        spec = importlib.util.spec_from_file_location('coverage_money_cases', source)
+        mc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mc)
+        def request(route, *args, **kwargs):
+            if route == 'minutes_list':
+                return {'orders': [], 'totalPages': 2}
+            return {'data': []}
+        with patch.object(core, 'verified_session', return_value={}), patch.object(core, 'request', request), \
+                patch.object(vertical, '_headers', return_value={}), \
+                patch.object(vertical, '_read', return_value={'status': 'success', 'data': {'orders': []}}):
+            result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]))
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['orders'], [])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mc, 'DATA', Path(tmp)), \
+                patch.object(mc.charges.order_lookup, 'read', return_value=result), \
+                patch.object(mc.charges, 'search', return_value=[]), \
+                patch.object(mc.charges, 'owner_texts', return_value=[]), redirect_stdout(io.StringIO()) as out:
+            rc = mc.main(['ask', 'Purchase of AED 1291.20 with Credit Card ending 2342 at NOON, Dubai.',
+                          '--at', '2026-10-23T23:47:00+04:00', '--said', 'Is this yours?'])
+        self.assertEqual(rc, 4)
+        self.assertIn('UNVERIFIED: source orders unreadable', out.getvalue())
+
+    def test_verified_minutes_match_survives_detail_limit_or_marketplace_failure(self):
+        import importlib.util
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        import noon_http_orders as core
+        import noon_minutes_checkout as minutes
+        import noon_vertical_reads as vertical
+        source = Path(__file__).resolve().parents[2] / 'robob-watch/checks/money-cases/cases.py'
+        spec = importlib.util.spec_from_file_location('partial_money_cases', source)
+        mc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mc)
+        for stop, count, expected in [('detail_limit', 9, 8), ('marketplace_failure', 1, 1)]:
+            with self.subTest(stop=stop):
+                detail_ids = []
+                def request(route, *args, **kwargs):
+                    if route == 'minutes_list':
+                        return {'orders': [{'orderNr': f'ITEST{i}', 'statusCode': 'delivered',
+                                            'placedAt': '2026-10-23T23:45:00'} for i in range(count)],
+                                'totalPages': 2}
+                    raise core.NoonError('UNRELATED_MARKETPLACE_FAILURE')
+                def detail(route, headers, deadline, payload, **kwargs):
+                    oid = payload['orderNr']
+                    detail_ids.append(oid)
+                    return {'orderNr': oid, 'orderTotal': 1291.20 if oid == 'ITEST0' else 99,
+                            'items': [{'itemCode': 'I1', 'title': 'Item', 'qty': 1}]}
+                with patch.object(core, 'verified_session', return_value={}), patch.object(core, 'request', request), \
+                        patch.object(minutes, 'native_request', detail), \
+                        patch.object(vertical, '_headers', return_value={}) as other_headers:
+                    result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]))
+                self.assertFalse(result['complete'])
+                self.assertEqual(len(result['orders']), expected)
+                self.assertEqual(len(detail_ids), expected)
+                self.assertEqual(result['orders'][0]['order'], 'ITEST0')
+                other_headers.assert_not_called()
+                for amount, expected_rc in [('1291.20', mc.DONT_ASK), ('1.11', 4)]:
+                    with tempfile.TemporaryDirectory() as tmp, patch.object(mc, 'DATA', Path(tmp)), \
+                            patch.object(mc.charges.order_lookup, 'read', return_value=result), \
+                            patch.object(mc.charges, 'search', return_value=[]), \
+                            patch.object(mc.charges, 'owner_texts', return_value=[]), \
+                            redirect_stdout(io.StringIO()) as out:
+                        rc = mc.main(['ask', f'Purchase of AED {amount} with Credit Card ending 2342 at NOON, Dubai.',
+                                      '--at', '2026-10-23T23:47:00+04:00', '--said', 'Is this yours?'])
+                    self.assertEqual(rc, expected_rc)
+                    self.assertIn('noon order ITEST0' if amount == '1291.20' else 'UNVERIFIED:', out.getvalue())
