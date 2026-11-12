@@ -1331,9 +1331,9 @@ test("owner, Moni and group outages each get one notice, with held messages orde
     await h.router.tick();
     expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
     h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
-    h.backend.health = async () => ({ status: "ok", timestamp: "", openchamberVersion: "test" });
   }
-  setSystemTime(start + 185_000);
+  // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.
+  setSystemTime(start + 240_000);
   for (const h of chats) {
     await h.router.tick();
     await h.router.tick();
