@@ -72,6 +72,17 @@ export const RecordedModelSelection = modelSelectionSchema(false);
 export const ModelSelection = modelSelectionSchema(true);
 export type ModelSelection = typeof ModelSelection.Type;
 
+export const ModelSelectionRouting = Schema.Struct({
+  requested: Schema.Struct({
+    providerInstanceId: ProviderInstanceId,
+    model: TrimmedNonEmptyString,
+    options: Schema.optionalKey(ProviderOptionSelections),
+  }),
+  reason: Schema.Literal("harness-migration"),
+  message: Schema.String,
+});
+export type ModelSelectionRouting = typeof ModelSelectionRouting.Type;
+
 /** Standard mode is mandatory, including when a catalog defaults to priority. */
 export function standardModelSelection(
   selection: typeof ModelSelectionWire.Type,

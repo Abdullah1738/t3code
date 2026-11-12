@@ -136,6 +136,7 @@ const DEFAULT_THREAD_ITEM_MAX_CHARS = 20_000;
 
 interface ResolvedTarget {
   readonly modelSelection: ModelSelection;
+  readonly selectionRouting?: NonNullable<OrchestratorMcpDelegateTaskResult["selectionRouting"]>;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
 }
 
@@ -1677,9 +1678,44 @@ const make = Effect.gen(function* () {
         );
       }
     }
+    const requestedProviderInstanceId = requestedWasMapped
+      ? ("opencode" as ProviderInstanceId)
+      : (input.target?.providerInstanceId ??
+        (input.target?.driverKind === undefined || input.target.driverKind === "opencode"
+          ? originalSelection.instanceId
+          : instanceId));
+    const sourceModel = input.target?.model ?? originalSelection.model;
+    const sourceOptions =
+      requestedOptions ??
+      (requestedProviderInstanceId === originalSelection.instanceId &&
+      sourceModel === originalSelection.model
+        ? originalSelection.options
+        : undefined);
+    const requested = {
+      providerInstanceId: requestedProviderInstanceId,
+      model: sourceModel,
+      ...(sourceOptions === undefined ? {} : { options: sourceOptions }),
+    };
+    const describeOptions = (selections: ModelSelection["options"]) =>
+      selections?.length
+        ? ` (${selections.map(({ id, value }) => `${id} ${value}`).join(", ")})`
+        : "";
+    const selectionRouting =
+      mappedDestination &&
+      resolveSelection({
+        instanceId: requestedProviderInstanceId,
+        model: sourceModel,
+      }).kind === "mapped"
+        ? {
+            requested,
+            reason: "harness-migration" as const,
+            message: `Routed ${requestedProviderInstanceId}/${sourceModel}${describeOptions(sourceOptions)} → ${instanceId}/${model}${describeOptions(options)} by harness migration; this is the same route as ${instanceId}/${model}, not a separate fallback.`,
+          }
+        : undefined;
     return {
       modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
       supportedRuntimeModes: provider.supportedRuntimeModes,
+      ...(selectionRouting === undefined ? {} : { selectionRouting }),
     };
   });
 
@@ -1927,6 +1963,7 @@ const make = Effect.gen(function* () {
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,
       options: modelSelection.options ?? [],
+      ...(task.selectionRouting === undefined ? {} : { selectionRouting: task.selectionRouting }),
       ...(Option.isSome(progressGuard)
         ? progressGuard.value.status(task.childThreadId)
         : { lastProgressAt: null, lastProgressKind: null, thinkingSince: null }),
@@ -2564,6 +2601,9 @@ const make = Effect.gen(function* () {
           ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
+          ...(target.selectionRouting === undefined
+            ? {}
+            : { selectionRouting: target.selectionRouting }),
           runtimeMode,
           interactionMode,
           ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
