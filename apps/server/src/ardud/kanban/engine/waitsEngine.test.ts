@@ -212,7 +212,9 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         Effect.sync(() => {
           host.asked.push(requests.map((request) => request.url));
           const wanted = new Set(requests.map((request) => Waits.prKey(request.url)));
-          const read = host.readings.filter((reading) => wanted.has(Waits.prKey(reading.url)));
+          const read = host.readings
+            .filter((reading) => wanted.has(Waits.prKey(reading.url)))
+            .map((reading) => ({ ...reading, failedChecks: reading.failedChecks ?? [] }));
           return {
             readings: Waits.mergePrReadings(
               requests.flatMap((request) => (request.live === null ? [] : [request.live])),

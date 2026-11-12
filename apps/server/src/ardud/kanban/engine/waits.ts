@@ -40,6 +40,12 @@ import * as DateTime from "effect/DateTime";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
+import {
+  failedCheckLabel,
+  headCiState,
+  isFailedCheck,
+} from "../../../orchestration-v2/pullRequestWatch.ts";
+
 /** How long each kind may hold before the card shows as stuck (shared with the clients). */
 export const WAIT_LIMIT_MS = KANBAN_WAIT_LIMIT_MS;
 
@@ -113,6 +119,8 @@ export interface WaitPrFacts {
   readonly commitsSince?: number | null | undefined;
   /** Checks on the head commit. Absent or null: none reported. */
   readonly checks?: "passing" | "failing" | "pending" | null | undefined;
+  /** Present only after reading head checks, including active workflow placeholders. */
+  readonly failedChecks?: ReadonlyArray<PullRequestCheck>;
 }
 
 export interface WaitFacts {
@@ -416,9 +424,17 @@ const prCheck: WaitChecker = (input) => {
       if (pr.state === "closed") {
         return wake(`${name} was closed while this waited for CI`, evaluator);
       }
+      // Thread snapshots have only an aggregate; they can omit active runs and failure names.
+      if (pr.failedChecks === undefined) return HOLD;
       if (pr.checks === "passing") return wake(`CI passed on ${name}${at}`);
       // Failed CI goes to whoever would fix it: the next actor, like a pass.
-      if (pr.checks === "failing") return wake(`CI failed on ${name}${at}`);
+      if (pr.checks === "failing") {
+        const listed = pr.failedChecks.slice(0, 5).map(failedCheckLabel);
+        if (pr.failedChecks.length > 5) listed.push(`and ${pr.failedChecks.length - 5} more`);
+        return wake(
+          `CI failed on ${name}${at}${listed.length > 0 ? `: ${listed.join(", ")}` : ""}`,
+        );
+      }
       return HOLD;
     default:
       return HOLD;
@@ -986,27 +1002,7 @@ export function waitSatisfied(
 // wait can point at one no thread watches (an outside author's PR, a parent
 // PR), so the tick asks the wait PR reader (`waitPrs.ts`) for those.
 
-const FAILED_CHECKS: ReadonlySet<PullRequestCheck["status"]> = new Set([
-  "failure",
-  "cancelled",
-  "action-required",
-]);
-
-/**
- * One word for a PR's checks, by the rule the PR watch uses: any failed,
- * cancelled or action-required check fails it; otherwise the required checks
- * decide (all of them when none is marked required), pending while one still
- * runs. Null when nothing was reported.
- */
-export function checksSummary(
-  checks: ReadonlyArray<Pick<PullRequestCheck, "status" | "required">>,
-): "passing" | "failing" | "pending" | null {
-  if (checks.length === 0) return null;
-  if (checks.some((check) => FAILED_CHECKS.has(check.status))) return "failing";
-  const required = checks.filter((check) => check.required === true);
-  const gate = required.length > 0 ? required : checks;
-  return gate.some((check) => check.status === "pending") ? "pending" : "passing";
-}
+export const checksSummary = headCiState;
 
 /** A host's answer about one PR as a reading, dated when the host was asked. */
 export function readingFromDetail(
@@ -1020,6 +1016,7 @@ export function readingFromDetail(
     at: DateTime.formatIso(DateTime.makeUnsafe(detail.observedAt ?? nowMs)),
     head: detail.headSha ?? null,
     checks: checksSummary(detail.checks),
+    failedChecks: detail.checks.filter(isFailedCheck),
   };
 }
 
@@ -1030,6 +1027,8 @@ export interface WaitPrRequest {
   readonly projectId: ProjectId | null;
   /** A push wait points at it: a reading without a head can't end that. */
   readonly needsHead: boolean;
+  /** CI waits need head checks rather than a thread snapshot's aggregate. */
+  readonly needsChecks?: boolean;
   /** The work threads' own reading of it this pass, when one tracks it. */
   readonly live: WaitPrFacts | null;
 }
@@ -1064,6 +1063,7 @@ export function waitPrRequests(
         url: held?.url ?? url,
         projectId: held?.projectId ?? card.projectId ?? board.defaultProjectId,
         needsHead: (held?.needsHead ?? false) || byScript || wait.on === "push",
+        ...(held?.needsChecks || wait.on === "ci" ? { needsChecks: true } : {}),
         live: liveByKey.get(key) ?? null,
       });
     }

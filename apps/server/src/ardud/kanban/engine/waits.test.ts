@@ -1,4 +1,4 @@
-import type { KanbanActor, KanbanCard, KanbanWait } from "@t3tools/contracts";
+import type { KanbanActor, KanbanCard, KanbanWait, PullRequestCheck } from "@t3tools/contracts";
 import { KANBAN_WAIT_CHECK_FAILURES, KANBAN_WAIT_LIMIT_MS } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -231,6 +231,7 @@ describe("the board's own checks, through the check contract", () => {
       state: "open" as const,
       head: "a1b2c3d4e5",
       checks,
+      failedChecks: [],
     });
     expect(answer(waiting, facts({ prs: [pr("pending")] }))).toEqual(hold);
     expect(answer(waiting, facts({ prs: [pr(null)] }))).toEqual(hold);
@@ -246,6 +247,51 @@ describe("the board's own checks, through the check contract", () => {
     expect(
       answer(waiting, facts({ prs: [{ url: PR, state: "merged", checks: "pending" }] })),
     ).toMatchObject({ result: "wake", to: "evaluator" });
+  });
+
+  it("ci: reads required green with optional pending, settled green, and any failure", () => {
+    const waiting = card(1, { wait: wait({ on: "ci", sinceHead: null }) });
+    const check = (
+      name: string,
+      status: PullRequestCheck["status"],
+      required = false,
+    ): PullRequestCheck => ({ name, status, required, description: null, url: null });
+    const required = ["Lockfile Validation", "Code Quality", "Build Check", "Security Audit"].map(
+      (name) => check(name, "success", true),
+    );
+    const reading = (checks: ReadonlyArray<PullRequestCheck>) =>
+      readingFromDetail(PR, { state: "open", isDraft: false, headSha: "26c6f35abc", checks }, NOW);
+    const pending = reading([...required, check("Test shard 1/4", "pending")]);
+    expect(answer(waiting, facts({ prs: [pending] }))).toEqual(hold);
+    expect(
+      answer(
+        waiting,
+        facts({ prs: [reading([...required, check("CI workflow run 43042659234", "pending")])] }),
+      ),
+    ).toEqual(hold);
+    expect(
+      answer(waiting, facts({ prs: [reading([...required, check("Test shard 1/4", "success")])] })),
+    ).toEqual({ result: "wake", note: "CI passed on trading-core#512 at 26c6f35" });
+    const failures = [check("Test shard 3/4", "failure"), check("Test shard 2/4", "cancelled")];
+    for (const rest of [[], [check("Tests", "pending")]]) {
+      expect(
+        answer(waiting, facts({ prs: [reading([...required, ...failures, ...rest])] })),
+      ).toEqual({
+        result: "wake",
+        note: "CI failed on trading-core#512 at 26c6f35: Test shard 3/4 (failure, not required), Test shard 2/4 (cancelled, not required)",
+      });
+    }
+    expect(
+      answer(
+        waiting,
+        facts({
+          prs: [reading([check("Code Quality", "failure", true), check("Tests", "pending")])],
+        }),
+      ),
+    ).toEqual({
+      result: "wake",
+      note: "CI failed on trading-core#512 at 26c6f35: Code Quality (failure)",
+    });
   });
 
   it("card: read from the board's cards on every pass, so no completion hook is needed", () => {
@@ -339,9 +385,7 @@ describe("PR readings from the reader and the work thread", () => {
       { url: PR, title: "Fix", state: "open", head: "ffee00112233", checks: "passing", at: LATER },
     ];
     expect(answer(card(1, { wait: wait() }), facts({ prs }))).toMatchObject({ result: "wake" });
-    expect(answer(card(1, { wait: wait({ on: "ci" }) }), facts({ prs }))).toMatchObject({
-      result: "wake",
-    });
+    expect(answer(card(1, { wait: wait({ on: "ci" }) }), facts({ prs }))).toEqual(hold);
     const untracked: ReadonlyArray<KanbanThreadPr> = [{ url: PR, title: null, state: "open" }];
     expect(answer(card(1, { wait: wait() }), facts({ prs: untracked }))).toEqual(hold);
   });
@@ -543,8 +587,7 @@ describe("PR readings from the reader and the work thread", () => {
     expect(checksSummary([check("success"), check("failure")])).toBe("failing");
     expect(checksSummary([check("cancelled"), check("pending")])).toBe("failing");
     expect(checksSummary([check("action-required")])).toBe("failing");
-    // Required checks decide when any are marked; an optional one still running doesn't hold it.
-    expect(checksSummary([check("success", true), check("pending", false)])).toBe("passing");
+    expect(checksSummary([check("success", true), check("pending", false)])).toBe("pending");
     expect(checksSummary([check("pending", true), check("success", false)])).toBe("pending");
   });
 
@@ -562,10 +605,11 @@ describe("PR readings from the reader and the work thread", () => {
       at: LATER,
       head: HEAD,
       checks: "passing",
+      failedChecks: [],
     });
     expect(
       readingFromDetail(PR, { state: "merged", isDraft: false, checks: [] } as never, NOW),
-    ).toEqual({ url: PR, state: "merged", at: AT, head: null, checks: null });
+    ).toEqual({ url: PR, state: "merged", at: AT, head: null, checks: null, failedChecks: [] });
   });
 
   it("asks for each pull request once, however many cards wait on it", () => {
@@ -585,7 +629,13 @@ describe("PR readings from the reader and the work thread", () => {
     );
     expect(requests).toEqual([
       { url: PR, projectId: "project-default", needsHead: true, live: live[0] },
-      { url: OTHER_PR, projectId: "project-default", needsHead: false, live: null },
+      {
+        url: OTHER_PR,
+        projectId: "project-default",
+        needsHead: false,
+        needsChecks: true,
+        live: null,
+      },
     ]);
     // A script's check is given every PR its card links, so those are read too, in full.
     const linked = card(7, {

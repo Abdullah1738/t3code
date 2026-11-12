@@ -27,7 +27,7 @@ export interface PullRequestWatchReport {
 }
 
 // "action-required" is a finished check that needs someone, so the agent hears about it.
-const isFailedCheck = (check: PullRequestCheck) =>
+export const isFailedCheck = (check: Pick<PullRequestCheck, "status">) =>
   check.status === "failure" || check.status === "cancelled" || check.status === "action-required";
 
 export const pullRequestChecksSettling = (
@@ -35,6 +35,18 @@ export const pullRequestChecksSettling = (
 ): boolean =>
   (detail.headBranchSha != null && detail.headBranchSha !== detail.headSha) ||
   (detail.checksHeadSha != null && detail.checksHeadSha !== detail.headSha);
+
+export function headCiState(
+  checks: ReadonlyArray<Pick<PullRequestCheck, "status" | "required">>,
+): "passing" | "failing" | "pending" | null {
+  if (checks.length === 0) return null;
+  if (checks.some(isFailedCheck)) return "failing";
+  return checks.some((check) => check.status === "pending") ? "pending" : "passing";
+}
+
+export function failedCheckLabel(check: PullRequestCheck): string {
+  return `${check.name} (${check.status}${check.required === true ? "" : ", not required"})`;
+}
 
 export function evaluatePullRequestWatch(
   watch: ThreadPullRequestWatch,
@@ -72,7 +84,7 @@ export function evaluatePullRequestWatch(
 
     const required = detail.checks.filter((check) => check.required === true);
     const gate = required.length > 0 ? required : detail.checks;
-    const passedNow = gate.every((check) => check.status !== "pending" && !isFailedCheck(check));
+    const passedNow = headCiState(detail.checks) === "passing";
     const gateNames = gate.map((check) => check.name);
     const told = passed && passedChecks.length === 0 ? gateNames : passedChecks;
     // A required job created and finished between two passes is never seen pending. Without
@@ -184,8 +196,7 @@ function changeLines(
         `- Checks failed${context.commit}:`,
         ...listed(
           change.failed,
-          (check) =>
-            `  - ${check.name}${check.status === "failure" ? "" : ` (${check.status})`}${check.url ? ` ${check.url}` : ""}`,
+          (check) => `  - ${failedCheckLabel(check)}${check.url ? ` ${check.url}` : ""}`,
         ),
       ];
     case "checks-passed":
