@@ -96,6 +96,8 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   you installed (`node_modules`, Go module cache, files in ~, Docker named volumes). Docker images are kept too:
   boat drops image layers on stop, so offbox archives them into ~ before every stop and reloads them at boot
   (a few seconds to ~20 s for big stacks; runs wait for it automatically).
+- Before each command, pooled boxes report and remove containers left by earlier runs (best effort); boxes pinned with `offbox keep`, saved bases and private leases only report them.
+- Crpko ClickHouse 24.8 alert fixtures need `max_threads=8` on large and xlarge boxes: ClickHouse's own 10000-thread pool runs out on 32 CPUs, and raising OS limits doesn't help.
 - Warm runs avoid a sandbox start; queueing and synchronization can add latency.
 - Put install and command together: `offbox run -- 'npm ci && npx jest ...'` or
   `offbox run --step 'npm ci' --step 'npx jest ...'`; repeating an install on a box with deps is quick.
