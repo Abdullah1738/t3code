@@ -92,6 +92,7 @@ export const makeFake = Effect.gen(function* () {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,

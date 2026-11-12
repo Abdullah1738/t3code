@@ -749,3 +749,65 @@ it.effect.each([
     );
   },
 );
+
+it.effect(
+  "interrupt distinguishes a real already-terminal result and reads target settlement",
+  () => {
+    const db = Sqlite.layerMemory;
+    const instanceId = ProviderInstanceId.make("codex");
+    const threadId = ThreadId.make("thread:interrupt-noop");
+    const projectId = ProjectId.make("project:interrupt-noop");
+    const adapter = {
+      instanceId,
+      driver: ProviderDriverKind.make("codex"),
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+      openSession: () => Effect.die("Provider execution is disabled in this test"),
+    } as ProviderAdapter.ProviderAdapterV2["Service"];
+    const runtime = ProviderReplayHarness.layerWithRegistry(
+      { name: "kanban-interrupt-noop" },
+      ProviderAdapterRegistry.layerFromAdapters([adapter]),
+      { databaseLayer: db, runEffectWorker: false },
+    );
+    const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+    const management = ThreadManagementService.layer.pipe(
+      Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+    );
+    const dependencies = Layer.mergeAll(
+      management,
+      receipts,
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+    );
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("interrupt-noop:create"),
+        threadId,
+        projectId,
+        title: "Interrupt outcome",
+        modelSelection: { instanceId, model: "gpt-5.1-codex" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        yield* threads.send({ threadId, text: "Start", key: "interrupt-noop:start" });
+        const run = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        expect(yield* threads.runSettled(threadId, run.id)).toBe(false);
+        expect(yield* threads.interrupt(threadId, "Stop", false, run.id)).toEqual({
+          outcome: "requested",
+          runId: run.id,
+        });
+        expect(yield* threads.runSettled(threadId, run.id)).toBe(true);
+        expect(yield* threads.interrupt(threadId, "Already ended", false, run.id)).toEqual({
+          outcome: "noop",
+        });
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(dependencies));
+  },
+);

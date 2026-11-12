@@ -98,6 +98,7 @@ const testLayer = () => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
       send: () => Effect.void,

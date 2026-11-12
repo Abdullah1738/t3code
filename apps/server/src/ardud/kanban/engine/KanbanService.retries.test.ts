@@ -88,6 +88,7 @@ const makeFake = () => {
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.sync(() => {

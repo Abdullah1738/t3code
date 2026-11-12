@@ -159,7 +159,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
         updatedAt: iso(nowMs),
         quietSince: iso(T0),
         runStartedAt: null,
-            lastActivityAt: null,
+        lastActivityAt: null,
         backgroundWork: 0,
         prWatches: 0,
         prs: prs.get(threadId) ?? [],
@@ -175,6 +175,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
         Effect.gen(function* () {

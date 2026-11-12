@@ -1323,6 +1323,8 @@ const make = Effect.gen(function* () {
   // Drop and pause notes (`release`) are pending the same way.
   const pendingStops = new Map<string, Map<string, PendingRelease>>();
   const inFlightStops = new Map<ThreadId, number>();
+  // An interrupt acknowledgement only commits an effect; its provider may still be running.
+  const pendingRunStops = new Map<ThreadId, string>();
   const pendingWithdrawals = new Map<string, Map<string, Effect.Effect<void>>>();
   const withdrawing = new Map<string, number>();
   const drainWithdrawals = Effect.fn("KanbanService.drainWithdrawals")(function* (id: ThreadId) {
@@ -1523,8 +1525,18 @@ const make = Effect.gen(function* () {
       Effect.acquireUseRelease(
         Effect.sync(() => {
           inFlightStops.set(id, (inFlightStops.get(id) ?? 0) + 1);
+          if (runId !== undefined) pendingRunStops.set(id, runId);
         }),
-        () => locks.outside(touching(id, threadIo.interrupt(id, reason, cancelQueued, runId))),
+        () =>
+          locks.outside(touching(id, threadIo.interrupt(id, reason, cancelQueued, runId))).pipe(
+            Effect.tap((result) =>
+              Effect.sync(() => {
+                if (result?.outcome === "requested") pendingRunStops.set(id, result.runId);
+                else if (runId !== undefined && pendingRunStops.get(id) === runId)
+                  pendingRunStops.delete(id);
+              }),
+            ),
+          ),
         () =>
           Effect.sync(() => {
             const left = (inFlightStops.get(id) ?? 1) - 1;
@@ -1549,6 +1561,7 @@ const make = Effect.gen(function* () {
     findLastFailure: (id) => threadRead("findLastFailure", id, threadIo.findLastFailure(id)),
     latestRun: (id) => threadRead("latestRun", id, threadIo.latestRun(id)),
     compactRun: (id, run) => locks.outside(touching(id, threadIo.compactRun(id, run))),
+    runSettled: (id, run) => locks.outside(threadIo.runSettled(id, run), undefined, true),
     launch: (input) =>
       Effect.flatMap(launchReconcile, (reconcile) => {
         let launched: ThreadId | undefined;
@@ -7252,7 +7265,13 @@ const make = Effect.gen(function* () {
                     (now - Date.parse(fresh.value.lastActivityAt!)) / 60000,
                   );
                   const reason = `No activity for ${minutes} min; the board stopped the run`;
-                  yield* interruptThread(threadId, reason, false, fresh.value.runId ?? undefined);
+                  const result = yield* interruptThread(
+                    threadId,
+                    reason,
+                    false,
+                    fresh.value.runId ?? undefined,
+                  );
+                  if (result?.outcome === "noop") return;
                   // Wait for the stop to settle before this tick can reattach the card.
                   (yield* tickKicks)?.stoppedCards.add(current.id);
                   yield* logEvent(current, system, "thread", {
@@ -8785,20 +8804,30 @@ const make = Effect.gen(function* () {
    * follow-ups, cutover restores). Checked under the board gate before any
    * write; stops are only registered in board-wide operations.
    */
-  const refusePendingStop = (threadId: string) => {
+  const refusePendingStop = Effect.fn("KanbanService.refusePendingStop")(function* (
+    threadId: string,
+  ) {
     if (withdrawing.has(threadId))
-      return failWith(
+      return yield* failWith(
         "conflict",
         "This thread is withdrawing an abandoned assignment; try again after it has stopped.",
       );
-    if (inFlightStops.has(ThreadId.make(threadId)))
-      return failWith(
+    const id = ThreadId.make(threadId);
+    const stoppedRun = pendingRunStops.get(id);
+    if (stoppedRun !== undefined) {
+      const settled = yield* threads
+        .runSettled(id, stoppedRun)
+        .pipe(Effect.orElseSucceed(() => false));
+      if (settled && pendingRunStops.get(id) === stoppedRun) pendingRunStops.delete(id);
+    }
+    if (inFlightStops.has(id) || pendingRunStops.has(id))
+      return yield* failWith(
         "conflict",
         "This thread is being stopped; it can't take another card until that stop has finished.",
       );
     const pending = [...(pendingStops.get(threadId)?.values() ?? [])];
-    if (pending.length === 0) return Effect.void;
-    return pending.some((entry) => entry.kind === "interrupt")
+    if (pending.length === 0) return;
+    return yield* pending.some((entry) => entry.kind === "interrupt")
       ? failWith(
           "conflict",
           "This thread is being stopped (the board let it go of a card); it can't take another card until that stop has run.",
@@ -8807,7 +8836,7 @@ const make = Effect.gen(function* () {
           "conflict",
           "The board is still telling this thread to let go of a card; try again in a moment.",
         );
-  };
+  });
   /**
    * A thread taking a card first gets the drop and pause notes still pending
    * for it (outside the gate, as dispatch does before reusing a thread). A

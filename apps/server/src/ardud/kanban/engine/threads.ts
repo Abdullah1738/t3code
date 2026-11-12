@@ -95,6 +95,10 @@ export interface KanbanSendInput {
   readonly mode?: "steer";
 }
 
+type KanbanInterruptResult =
+  | { readonly outcome: "noop" }
+  | { readonly outcome: "requested"; readonly runId: string };
+
 /**
  * The few thread operations the board needs. Every message is delivered as a
  * steer when a run is live, otherwise it starts a turn; nothing is queued.
@@ -123,6 +127,10 @@ export interface KanbanThreadsShape {
     } | null,
     KanbanThreadError
   >;
+  readonly runSettled: (
+    threadId: ThreadId,
+    runId: string,
+  ) => Effect.Effect<boolean, KanbanThreadError>;
   readonly compactRun: (
     threadId: ThreadId,
     runId: string,
@@ -156,7 +164,7 @@ export interface KanbanThreadsShape {
     reason: string,
     cancelQueued?: boolean,
     runId?: string,
-  ) => Effect.Effect<void, KanbanThreadError>;
+  ) => Effect.Effect<KanbanInterruptResult | void, KanbanThreadError>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -339,6 +347,23 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const runSettled: KanbanThreadsShape["runSettled"] = Effect.fn("KanbanThreads.runSettled")(
+    function* (threadId, runId) {
+      const shell = yield* threads.getThreadShell(threadId);
+      if (shell === null || shell.deletedAt !== null) return true;
+      const { runs } = yield* threads.getThreadRecords(threadId, ["runs"], {
+        runIds: [RunId.make(runId)],
+      });
+      return (
+        runs[0] !== undefined &&
+        ["completed", "interrupted", "failed", "cancelled", "rolled_back"].includes(runs[0].status)
+      );
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "runSettled", detail: detailOf(error) }),
+    ),
+  );
+
   const compactRun: KanbanThreadsShape["compactRun"] = (threadId, runId) =>
     threads.getThreadRecords(threadId, ["runs"]).pipe(
       Effect.flatMap((records) => {
@@ -483,16 +508,18 @@ const make = Effect.gen(function* () {
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
     function* (threadId, reason, cancelQueued = false, runId) {
       const shell = yield* threads.getThreadShell(threadId);
-      if (shell === null) return;
+      if (shell === null) return { outcome: "noop" } as const;
       if (!cancelQueued) {
-        yield* threads.interruptThread({
+        const result = yield* threads.interruptThread({
           projectId: shell.projectId,
           commandId: commandId("stop"),
           threadId,
           reason,
           ...(runId === undefined ? {} : { runId: RunId.make(runId) }),
         });
-        return;
+        return result.type === "interrupt_requested"
+          ? ({ outcome: "requested", runId: result.run.id } as const)
+          : ({ outcome: "noop" } as const);
       }
       // Stop holds the queue atomically with the interrupt. interruptThread alone
       // ignores queued runs, allowing an abandoned launch to start afterwards.
@@ -528,6 +555,7 @@ const make = Effect.gen(function* () {
     findLastFailure,
     latestRun,
     compactRun,
+    runSettled,
     launch,
     send,
     setModel,
