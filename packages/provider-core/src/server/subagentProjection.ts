@@ -221,7 +221,8 @@ export function subagentResultForRun(
           .toSorted((left, right) => right.ordinal - left.ordinal)[0];
   const finish = lastTurn?.finish;
   const reasons: string[] = [];
-  if (finish != null && finish !== "stop") {
+  // OpenCode normalizes clean stops; native Claude preserves Anthropic's stop reasons.
+  if (finish != null && finish !== "stop" && finish !== "end_turn" && finish !== "stop_sequence") {
     reasons.push(
       finish === "length"
         ? "the child's last step stopped at the output limit (finish=length)"

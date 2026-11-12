@@ -69,13 +69,20 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 
 describe("OrchestratorMcpService", () => {
   it.effect.each([
-    { finish: "stop", followup: null },
-    { finish: "length", followup: null },
-    { finish: "length", followup: "stop" },
-    { finish: "stop", followup: "length" },
+    { finish: "stop", followup: null, incomplete: false },
+    { finish: "length", followup: null, incomplete: true },
+    { finish: "length", followup: "stop", incomplete: true },
+    { finish: "stop", followup: "length", incomplete: false },
+    { finish: "end_turn", followup: null, incomplete: false },
+    { finish: "stop_sequence", followup: null, incomplete: false },
+    { finish: "max_tokens", followup: null, incomplete: true },
+    { finish: "end_turn", followup: "length", incomplete: false },
+    { finish: "length", followup: "end_turn", incomplete: true },
+    { finish: "stop_sequence", followup: "length", incomplete: false },
+    { finish: "length", followup: "stop_sequence", incomplete: true },
   ] as const)(
     "reports incomplete metadata for stored finish=$finish with followup=$followup",
-    ({ finish, followup }) =>
+    ({ finish, followup, incomplete }) =>
       Effect.gen(function* () {
         const parentId = ThreadId.make("parent:incomplete");
         const childId = ThreadId.make("child:incomplete");
@@ -83,10 +90,13 @@ describe("OrchestratorMcpService", () => {
         const runId = RunId.make("run:incomplete");
         const attemptId = RunAttemptId.make("attempt:incomplete");
         const now = DateTime.makeUnsafe("2026-11-05T17:52:25Z");
-        const storedResult =
-          finish === "length"
-            ? "[Result looks incomplete: original output limit]\nOriginal answer."
-            : "Original answer.";
+        const nativeClaude =
+          finish === "end_turn" || finish === "stop_sequence" || finish === "max_tokens";
+        const childInstanceId = ProviderInstanceId.make(nativeClaude ? "claudeAgent" : "codex");
+        const childModel = nativeClaude ? "claude-haiku-5-5" : "gpt-5.4";
+        const storedResult = incomplete
+          ? "[Result looks incomplete: original output limit]\nOriginal answer."
+          : "Original answer.";
         let parent = {
           ...idleThreadProjection(liveThreadShell(parentId)),
           subagents: [
@@ -95,8 +105,8 @@ describe("OrchestratorMcpService", () => {
               threadId: parentId,
               origin: "app_owned",
               childThreadId: childId,
-              providerInstanceId: ProviderInstanceId.make("codex"),
-              model: "gpt-5.4",
+              providerInstanceId: childInstanceId,
+              model: childModel,
               status: "completed",
               result: followup === null ? null : storedResult,
             },
@@ -111,6 +121,7 @@ describe("OrchestratorMcpService", () => {
               status: "completed",
               startedAt: now,
               completedAt: now,
+              modelSelection: { instanceId: childInstanceId, model: childModel },
               activeAttemptId: attemptId,
               rootNodeId: NodeId.make("root:incomplete"),
             },
@@ -225,10 +236,13 @@ describe("OrchestratorMcpService", () => {
             taskId,
           );
           assert.equal(result.status, "completed");
-          assert.equal(result.resultLooksIncomplete, finish === "length");
+          assert.equal(result.resultLooksIncomplete, incomplete);
           if (followup !== null) assert.equal(result.summary, storedResult);
-          if (finish === "length") {
-            assert.include(result.incompleteReason!, "output limit (finish=length)");
+          if (incomplete) {
+            assert.include(
+              result.incompleteReason!,
+              finish === "length" ? "output limit (finish=length)" : `finish=${finish}`,
+            );
             assert.isTrue(result.summary!.startsWith("[Result looks incomplete:"));
           } else {
             assert.equal(result.summary, followup === null ? "All checks passed." : storedResult);
