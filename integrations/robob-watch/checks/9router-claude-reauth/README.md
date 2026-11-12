@@ -86,8 +86,8 @@ before retry, it checks the outbox but does not send a stale alert; a missing
 row stays UNKNOWN. Service failures exit nonzero for robob-watch
 backoff, not healthy. robob-watch has its own failure alerts in addition to
 incident attention when a service stays down. Per-tick queueing is limited to
-three new incidents so all health, enqueue, and outbox calls fit the runner's
-60-second check budget; remaining incidents are persisted and processed on
+three new incidents. The detector stops itself at 45 seconds, before the
+runner's 60-second limit; remaining incidents are persisted and processed on
 later ticks.
 
 If a future fenced implementation enables recovery, the worker is instructed to verify the real account identity independent of
@@ -180,7 +180,7 @@ else
 fi
 ```
 
-No source copy or Robob engine installation is modified. The JSON includes
+Registration does not install or restart the Robob engine. The JSON includes
 `paused: true` before the runner can observe it; `--no-prime` avoids a real
 check during registration. Keep `ENABLE_REQUIRED` throughout registration.
 The parent alone may remove the hold and resume **the detector** after review.
@@ -204,3 +204,54 @@ bridge. Detector-only operation does not load the Robob control client or
 require the ExternalSSD. A future recovery implementation would also need the
 checked-in control client and `watchers` credential. Do not change these
 components as part of enabling this watcher.
+
+
+## Source, timing and installation
+
+The source of truth is `integrations/robob-watch/checks/9router-claude-reauth/`
+in the Robob fork. From the repo root, run the isolated tests with:
+
+```sh
+node --test integrations/robob-watch/checks/9router-claude-reauth/supervisor.test.mjs
+```
+
+The shell records `sh` in `.phase`, retaining the previous marker for Node to
+report. Node records `start`, `load`, `providers`, `save`, `telegram:<command>`
+and `done`. Provider subphases distinguish credential reads, response headers,
+and response body parsing. Each marker is a best-effort plain write without
+fsync; it is diagnostic state, not a journal or a recovery lease. A failed or
+killed run leaves its last phase for the next run to report, with its age.
+Failure messages and phase durations use synchronous stderr writes so the
+runner can retain them even when it kills a slow check. The error summary is
+last so it survives the runner's 500-character stderr tail. Because the runner
+discards successful stderr, a previous-stall warning is also appended directly
+to the watcher log. Recovery remains a successful exit: reporting evidence must
+not spend another failure or pause the watcher at its failure limit. The `done`
+marker prevents the warning from repeating after recovery.
+
+The 45-second timer includes shell-to-Node startup when invoked by `check.sh`.
+It does not unref; an unresolved provider promise still fails with the phase
+name. Fetch retains a six-second abort across headers and JSON body. Telegram
+commands retain an eight-second cap, kill their own spawned process group and
+resolve on child exit without waiting for inherited stdout pipes. The whole-run
+deadline also cancels an active command. A blocked synchronous filesystem call
+or a process starved by the OS cannot run a Node timer: the phase marker is the
+backstop when the runner kills that process. No global runner timeout changes.
+
+After review and explicit owner approval, update this existing watcher using:
+
+```sh
+/usr/bin/python3 -B integrations/robob-watch/checks/9router-claude-reauth/install.py
+```
+
+The installer holds the existing `supervisor.lock` inode and atomically copies
+only its allowlisted code, tests, installer and README. It never replaces the
+watcher definition, journal, marker, lock, lease, deployment hold or runtime
+state. It neither registers/resumes the watcher nor restarts the runner.
+`watcher.json` and `watcher-definition.json` are imported reference definitions;
+registration remains a separate owner-approved operation. `deploy.zsh
+robob-watch` excludes live `watchers/`, so it does not install this check.
+Verify code readback and observe natural runner executions after installation;
+the refusal of a copied `check.sh` during `robob-watch test` is intentional.
+The identity fence and future recovery work in #290 still apply on top of this
+notification-only build.

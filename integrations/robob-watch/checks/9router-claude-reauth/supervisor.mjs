@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -433,29 +433,120 @@ export async function tick(ctx) {
   }
 }
 
-async function liveProviders() {
-  const data = join(homedir(), '.9router');
+export async function liveProviders({ data = join(homedir(), '.9router'), url = 'http://127.0.0.1:20128/api/providers', timeoutMs = 6_000, phase = () => {} } = {}) {
+  phase('providers:credentials');
   const raw = readFileSync(join(data, 'machine-id'), 'utf8').trim();
   const secret = readFileSync(join(data, 'auth', 'cli-secret'), 'utf8').trim();
   if (!raw || !secret) throw new Error('router auth unavailable');
   const token = createHash('sha256').update(raw + '9r-cli-auth' + secret).digest('hex').substring(0, 16);
-  const r = await fetch('http://127.0.0.1:20128/api/providers', { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(6_000) });
+  phase('providers:fetch');
+  const signal = AbortSignal.timeout(timeoutMs);
+  const r = await fetch(url, { headers: { 'x-9r-cli-token': token, accept: 'application/json' }, cache: 'no-store', signal });
   if (!r.ok || !(r.headers.get('content-type') ?? '').includes('application/json')) throw new Error('router unavailable');
+  phase('providers:body');
   return await r.json();
 }
 
-async function liveNotify(key, text) {
-  return telegramCommand(['notify', '--source', '9router Claude recovery', '--severity', 'attention', '--text', text, '--key', key]);
+// Resolve on exit, never on pipe close: a descendant may inherit stdout.
+export function runBoundedCommand(command, args, { timeoutMs = 8_000, signal, env = { HOME: homedir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin' } } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: ['ignore', 'pipe', 'ignore'], env });
+    let output = '', bytes = 0, settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      // Only the process group created by this spawn is ours to terminate.
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      child.stdout.destroy();
+      child.unref();
+      if (error) reject(error); else resolve(output);
+    };
+    const abort = () => finish(new Error('notification service aborted'));
+    const timer = setTimeout(() => finish(new Error('notification service timed out')), timeoutMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 256 * 1024) finish(new Error('notification response too large'));
+      else output += chunk;
+    });
+    child.on('error', () => finish(new Error('notification service unavailable')));
+    child.on('exit', code => finish(code === 0 ? null : new Error('notification service unavailable')));
+  });
 }
 
-function telegramCommand(args) {
-  const p = spawnSync(join(homedir(), '.bun/bin/bun'), [join(homedir(), '.local/share/telegram-bridge/src/cli.ts'), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024, timeout: 8_000, env: { HOME: homedir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin' } });
-  if (p.status !== 0 || p.error) throw new Error('notification service unavailable');
-  try { return JSON.parse(p.stdout); } catch { throw new Error('notification response invalid'); }
+export async function telegramCommand(args, { phase = () => {}, signal } = {}) {
+  phase(`telegram:${args[0]}`);
+  const output = await runBoundedCommand(join(homedir(), '.bun/bin/bun'), [join(homedir(), '.local/share/telegram-bridge/src/cli.ts'), ...args], { signal });
+  try { return JSON.parse(output); } catch { throw new Error('notification response invalid'); }
 }
-async function liveNotificationAvailable() { return telegramHealthy(telegramCommand(['health'])); }
-async function liveNotificationState(key) { return notificationState(telegramCommand(['notifications']), key); }
-async function liveNotificationSnapshot() { return telegramCommand(['notifications']); }
+
+function stderrLine(line) {
+  // process.stderr.write can be buffered and lost when the runner SIGKILLs us.
+  try { writeSync(2, line + '\n'); } catch { /* marker still survives */ }
+}
+
+export function phaseReporter(watchDir, { previous = process.env.WATCH_PREVIOUS_PHASE, stderr = stderrLine } = {}) {
+  const path = join(watchDir, '.phase');
+  let phase = 'start', since = performance.now();
+  const durations = [];
+  let previousStall;
+  try {
+    const old = JSON.parse(previous ?? readFileSync(path, 'utf8'));
+    if (typeof old.phase === 'string' && /^[a-z:-]{1,80}$/.test(old.phase) && Number.isFinite(old.t) && old.phase !== 'done') {
+      previousStall = `previous run stalled in ${old.phase} (${Math.max(0, (Date.now() - old.t) / 1000).toFixed(1)}s)`;
+      stderr(previousStall);
+    }
+  } catch { /* no valid previous marker */ }
+  const mark = next => {
+    const now = performance.now();
+    durations.push(`${phase}=${(now - since).toFixed(1)}ms`);
+    phase = next; since = now;
+    try { writeFileSync(path, JSON.stringify({ phase, t: Date.now() }) + '\n', { mode: 0o600 }); } catch { /* observability must not change detector safety */ }
+  };
+  mark('start');
+  // Successful stderr is discarded by robob-watch. Preserve killed-run evidence
+  // in its log without spending another failure or changing recovery/backoff.
+  if (previousStall) {
+    try { appendFileSync(join(watchDir, 'log'), `${new Date().toISOString()} 9router Claude detector: ${previousStall}\n`, { mode: 0o600 }); } catch { /* stderr remains available */ }
+  }
+  return {
+    mark, previousStall,
+    failure: reason => {
+      stderr(`phase durations: ${[...durations, `${phase}=${(performance.now() - since).toFixed(1)}ms`].join(', ')}`);
+      // The runner keeps only the last 500 stderr characters on failure.
+      if (previousStall) stderr(previousStall);
+      stderr(`9router Claude detector: ${phase} ${reason}`);
+    },
+  };
+}
+
+// Synthetic callers inject IO; live() retains all deployment and identity fences.
+export async function runObserved(ctx, { watchDir, deadlineMs = 45_000, previous, stderr, phase, onDeadline = () => {} } = {}) {
+  const report = phase ?? phaseReporter(watchDir, { previous, stderr });
+  const started = performance.now();
+  const deadline = () => {
+    report.failure('exceeded deadline');
+    try { onDeadline(); } finally { process.exit(1); }
+  };
+  const timer = setTimeout(deadline, deadlineMs);
+  try {
+    await tick({
+      ...ctx,
+      load: () => { report.mark('load'); return ctx.load(); },
+      providers: () => { report.mark('providers'); return ctx.providers(report.mark); },
+      save: state => { report.mark('save'); return ctx.save(state); },
+    });
+    if (performance.now() - started >= deadlineMs) deadline();
+    report.mark('done');
+  } catch (error) {
+    report.failure('failed; router, notification delivery, journal or prior-worker state unavailable.');
+    throw error;
+  } finally { clearTimeout(timer); }
+}
 
 // Import and instantiate only if a future, explicitly fenced recovery path
 // actually calls control. Notification-only operation needs no ExternalSSD.
@@ -471,18 +562,26 @@ async function live() {
   if (process.env.WATCH_DIR !== ROOT || process.env.WATCH_ID !== '9router-claude-reauth' || !process.env.WATCH_RUN || ROOT !== join(homedir(), '.local/share/robob-watch/watchers/9router-claude-reauth') || existsSync(join(ROOT, 'ENABLE_REQUIRED'))) throw new Error('live execution refused');
   // This exported function can also be imported for synthetic tests: the
   // live side additionally checks the runner-only environment and hold.
+  const report = phaseReporter(process.env.WATCH_DIR);
+  const commands = new AbortController();
+  const command = args => telegramCommand(args, { phase: report.mark, signal: commands.signal });
   const control = lazyControlClient();
-  await tick({
+  // The shell timestamp includes interpreter startup; it never extends 45s.
+  const startedAt = Number(process.env.WATCH_STARTED_AT);
+  const deadlineMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.min(45_000, Math.max(1, 45_000 - (Date.now() - startedAt))) : 45_000;
+  await runObserved({
     enforceSafetyFence: true,
-    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: liveProviders,
+    now: Date.now, load: () => readState(STATE), save: s => writeState(STATE, s), providers: phase => liveProviders({ phase }),
     leasePath: DEFAULT_LEASE, leaseOwner: () => leaseOwner(DEFAULT_LEASE),
     acquireLease: id => acquireLease(DEFAULT_LEASE, 'auto', id), releaseLease: o => releaseLease(DEFAULT_LEASE, o),
     available: async () => (await (await control()).health())?.ok === true,
-    notificationAvailable: liveNotificationAvailable,
+    notificationAvailable: async () => telegramHealthy(await command(['health'])),
     thread: async id => (await control()).thread(id), create: async body => (await control()).createThread(body),
     lastAssistant: async (id, runId) => (await (await control()).messages(id, { runId, limit: 1, role: 'assistant' })).lastAssistant?.text ?? null,
-    notify: liveNotify, notificationState: liveNotificationState, notificationSnapshot: liveNotificationSnapshot,
-  });
+    notify: (key, text) => command(['notify', '--source', '9router Claude recovery', '--severity', 'attention', '--text', text, '--key', key]),
+    notificationState: async key => notificationState(await command(['notifications']), key),
+    notificationSnapshot: () => command(['notifications']),
+  }, { phase: report, deadlineMs, onDeadline: () => commands.abort() });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
@@ -501,6 +600,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   } else if (process.argv[2] !== '--live' || process.env.WATCH_DIR !== ROOT || process.env.WATCH_ID !== '9router-claude-reauth' || !process.env.WATCH_RUN || ROOT !== join(homedir(), '.local/share/robob-watch/watchers/9router-claude-reauth') || existsSync(join(ROOT, 'ENABLE_REQUIRED'))) {
     process.stderr.write('Live check refused; run the synthetic tests instead.\n'); process.exitCode = 2;
   } else {
-    live().catch(() => { process.stderr.write('9router Claude detector: router, notification delivery, journal or prior-worker state unavailable.\n'); process.exitCode = 1; });
+    live().catch(() => { process.exitCode = 1; });
   }
 }

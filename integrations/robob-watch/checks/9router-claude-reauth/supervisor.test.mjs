@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { acquireLease, leaseOwner, releaseLease } from './lease.mjs';
-import { assertCleared, assertIncident, lazyControlClient, notificationId, notificationState, pendingConnections, readState, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
+import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, runBoundedCommand, runObserved, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
 
 const MODEL = { instanceId: 'opencode', model: 'opus/cx/gpt-6.1-terra', variant: 'max' };
 const good = (id = 'alpha') => ({ id, provider: 'claude', authType: 'oauth', isActive: true });
@@ -565,4 +567,206 @@ test('marker clears then changes while disabled; budget and cooldown still apply
   h.sim.rows = [{ ...bad('alpha', '2026-11-01T00:01:00.000Z'), isActive: false }]; await h.tick();
   h.sim.rows = [bad('alpha', '2026-11-01T00:01:00.000Z')]; await h.tick(); assert.equal(h.sim.creates.length, 1);
   h.sim.time += 5 * 60_000; await h.tick(); assert.equal(h.sim.creates.length, 2); assert.equal(h.state().incidents[0].attempts, 2);
+});
+
+
+const supervisorUrl = new URL('./supervisor.mjs', import.meta.url).href;
+const watcherPath = [join(process.env.HOME, '.local/share/robob-watch/helpers'), join(process.env.HOME, '.local/bin'), join(process.env.HOME, '.bun/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':');
+
+function syntheticProcess(t, body, { dir, previous, minimal = true } = {}) {
+  dir ??= mkdtempSync(join(tmpdir(), 'reauth-entry-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const entry = join(dir, 'entry.mjs');
+  const started = Date.now();
+  writeFileSync(entry, `import { runObserved, phaseReporter, liveProviders, readState, writeState } from ${JSON.stringify(supervisorUrl)};\n${body}`);
+  const child = spawn('/bin/zsh', ['-c', 'exec /usr/bin/env node "$1"', 'synthetic-check', entry], {
+    cwd: dir, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...(minimal ? {} : process.env), HOME: dir, PATH: watcherPath, LANG: 'en_US.UTF-8', WATCH_DIR: dir, WATCH_ID: '9router-claude-reauth', WATCH_RUN: 'synthetic', ...(previous === undefined ? {} : { WATCH_PREVIOUS_PHASE: previous }) },
+  });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
+  const guard = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 5_000);
+  const result = once(child, 'close').then(([code, signal]) => {
+    clearTimeout(guard);
+    return { code, signal, stdout, stderr, ms: Date.now() - started, dir };
+  });
+  return { result, dir };
+}
+
+function observedBody(providers, options = '') {
+  return `const watchDir = process.env.WATCH_DIR;
+const phase = phaseReporter(watchDir);
+console.log(JSON.stringify({ startupMs: Date.now() - ${Date.now()}, first: JSON.parse((await import('node:fs')).readFileSync(watchDir + '/.phase', 'utf8')) }));
+try {
+  await runObserved({ enforceSafetyFence: true, now: Date.now,
+    load: () => readState(watchDir + '/supervisor-state.json'),
+    save: s => writeState(watchDir + '/supervisor-state.json', s),
+    providers: ${providers},
+  }, { phase, ${options} });
+} catch { process.exitCode = 1; }`;
+}
+
+test('hung provider exits itself with providers and phase durations before runner timeout', async t => {
+  const { result, dir } = syntheticProcess(t, observedBody('() => new Promise(() => {})', 'deadlineMs: 80'));
+  const r = await result;
+  assert.equal(r.code, 1); assert.equal(r.signal, null); assert.ok(r.ms < 2_000, r.ms);
+  assert.match(r.stderr, /9router Claude detector: providers exceeded deadline/);
+  assert.match(r.stderr, /phase durations: .*load=.*providers=/);
+  assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'providers');
+});
+
+test('previous save/sh markers survive shell handoff; done and malformed markers are quiet', async t => {
+  for (const phase of ['save', 'sh', 'done', 'malformed']) {
+    const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-'));
+    const previous = phase === 'malformed' ? '{' : JSON.stringify({ phase, t: Date.now() - 5_000 });
+    // The shell has replaced .phase with sh; its env preserves the prior run.
+    writeFileSync(join(dir, '.phase'), JSON.stringify({ phase: 'sh', t: Date.now() }));
+    const r = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir, previous }).result;
+    assert.equal(r.code, 0, r.stderr);
+    if (phase === 'save' || phase === 'sh') assert.match(r.stderr, new RegExp(`previous run stalled in ${phase} [(]`));
+    else assert.equal(r.stderr, '');
+    assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'reauth-stale-direct-'));
+  writeFileSync(join(dir, '.phase'), JSON.stringify({ phase: 'save', t: Date.now() - 5_000 }));
+  const r = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
+  assert.equal(r.code, 0);
+  assert.match(r.stderr.slice(-500), /previous run stalled in save/);
+  assert.match(readFileSync(join(dir, 'log'), 'utf8'), /previous run stalled in save/);
+  const next = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
+  assert.equal(next.code, 0); assert.equal(next.stderr, '');
+});
+
+test('failure logs load/save timings, leaves failing marker, and never logs provider data', async t => {
+  const h = harness(t), lines = [];
+  h.ctx.enforceSafetyFence = true;
+  h.ctx.save = () => { throw new Error('private payload'); };
+  await assert.rejects(runObserved(h.ctx, { watchDir: h.path + '-missing', stderr: line => lines.push(line) }));
+  assert.match(lines.join('\n'), /detector: save failed/);
+  assert.match(lines.join('\n'), /phase durations: .*load=.*providers=.*save=/);
+  assert.doesNotMatch(lines.join('\n'), /private payload/);
+});
+
+test('telegram bound survives a SIGTERM-ignoring child and grandchild holding stdout', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'reauth-command-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, 'fake.mjs');
+  for (const parentExits of [false, true]) {
+    writeFileSync(fake, `import { spawn } from 'node:child_process';
+process.on('SIGTERM', () => {});
+spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: ['ignore', 1, 2] });
+process.stdout.write('{"ok":true}');
+${parentExits ? 'process.exit(0);' : 'setInterval(() => {}, 1000);'}`);
+    const started = performance.now();
+    const call = runBoundedCommand(process.execPath, [fake], { timeoutMs: 400 });
+    if (parentExits) assert.deepEqual(JSON.parse(await call), { ok: true });
+    else await assert.rejects(call, /timed out/);
+    assert.ok(performance.now() - started < 1_500);
+  }
+  await assert.rejects(runBoundedCommand(join(dir, 'missing'), []), /unavailable/);
+  await assert.rejects(runBoundedCommand(process.execPath, ['-e', "process.stdout.write('x'.repeat(300000))"]), /too large/);
+});
+
+async function routerStub(t, respond) {
+  const server = createServer(respond);
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return `http://127.0.0.1:${server.address().port}/api/providers`;
+}
+
+function fakeAuth(dir) {
+  mkdirSync(join(dir, 'auth'));
+  writeFileSync(join(dir, 'machine-id'), 'synthetic-machine'); writeFileSync(join(dir, 'auth/cli-secret'), 'synthetic-secret');
+}
+
+test('fetch abort includes a body that stalls after successful response headers', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'reauth-body-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true })); fakeAuth(dir);
+  const url = await routerStub(t, (_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.write('{"connections":'); });
+  const phases = [], started = performance.now();
+  await assert.rejects(liveProviders({ data: dir, url, timeoutMs: 150, phase: p => phases.push(p) }), /abort|timeout/i);
+  assert.equal(phases.at(-1), 'providers:body'); assert.ok(performance.now() - started < 1_500);
+});
+
+test('runner minimal env, ignored stdin, detached process and piped output finish within budget', async t => {
+  const url = await routerStub(t, (req, res) => {
+    assert.equal(req.url, '/api/providers'); assert.ok(req.headers['x-9r-cli-token']);
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ connections: [], padding: 'x'.repeat(70_000) }));
+  });
+  const timings = [];
+  for (const minimal of [true, false]) {
+   for (let i = 0; i < 3; i++) {
+    const dir = mkdtempSync(join(tmpdir(), 'reauth-parity-')); fakeAuth(dir);
+    const r = await syntheticProcess(t, observedBody(`phase => liveProviders({ data: process.env.WATCH_DIR, url: ${JSON.stringify(url)}, phase })`, 'deadlineMs: 2_000'), { dir, minimal }).result;
+    assert.equal(r.code, 0, r.stderr); assert.ok(r.ms < 2_000, r.ms); assert.equal(r.stderr, '');
+    const first = JSON.parse(r.stdout.trim()); assert.equal(first.first.phase, 'start');
+    timings.push({ minimal, startupMs: first.startupMs, totalMs: r.ms });
+   }
+  }
+  t.diagnostic(`runner-env startup/total ms: ${JSON.stringify(timings)}`);
+});
+
+
+test('telegram output remains complete across pipe buffers, unicode, and child exit', async () => {
+  const text = 'é'.repeat(100_000);
+  const output = await runBoundedCommand(process.execPath, ['-e', `process.stdout.write(JSON.stringify({ text: 'é'.repeat(100000) }))`]);
+  assert.deepEqual(JSON.parse(output), { text });
+  const controller = new AbortController();
+  const call = runBoundedCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(call, /aborted/);
+});
+
+test('code-only installer preserves definition, state, lease, lock inode and phase marker', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'reauth-install-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const names = ['watcher.json', 'supervisor-state.json', 'state.json', 'log', '.run-ok', 'supervisor.lock', 'recovery.lease.guard', 'ENABLE_REQUIRED', '.phase'];
+  for (const name of names) writeFileSync(join(dir, name), `keep ${name}`);
+  const py = `import importlib.util, pathlib, os
+spec = importlib.util.spec_from_file_location('installer', ${JSON.stringify(fileURLToPath(new URL('./install.py', import.meta.url)))})
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+live = pathlib.Path(${JSON.stringify(dir)})
+os.symlink('manual-owner', live / 'recovery.lease')
+before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in live.iterdir() if not p.is_symlink()}
+m.install(live=live)
+assert before == {name: ((live / name).stat().st_ino, (live / name).read_bytes()) for name in before}
+assert os.readlink(live / 'recovery.lease') == 'manual-owner'
+assert (live / 'check.sh').read_bytes() == (m.SOURCE / 'check.sh').read_bytes()
+assert (live / 'supervisor.mjs').read_bytes() == (m.SOURCE / 'supervisor.mjs').read_bytes()
+assert (live / 'check.sh').stat().st_mode & 0o777 == 0o700
+assert (live / 'supervisor.mjs').stat().st_mode & 0o777 == 0o600
+`;
+  const r = spawnSync('/usr/bin/python3', ['-B', '-c', py], { encoding: 'utf8', timeout: 5_000 });
+  assert.equal(r.status, 0, r.stderr);
+});
+
+
+test('runner stderr tail retains stalled phase after many phase timings', t => {
+  const h = harness(t), lines = [];
+  const report = phaseReporter(h.path + '-missing', { previous: JSON.stringify({ phase: 'save', t: Date.now() - 10000 }), stderr: s => lines.push(s) });
+  for (let i = 0; i < 100; i++) report.mark('save');
+  report.mark('telegram:notifications');
+  report.failure('exceeded deadline');
+  const tail = lines.join('\n').slice(-500);
+  assert.match(tail, /previous run stalled in save/);
+  assert.match(tail, /9router Claude detector: telegram:notifications exceeded deadline/);
+});
+
+
+test('four failures followed by recovery remains successful and retains the stalled phase in log', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'reauth-recovery-'));
+  const codes = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await syntheticProcess(t, observedBody('async () => { throw new Error("down"); }'), { dir }).result;
+    codes.push(r.code);
+    assert.match(r.stderr.slice(-500), /providers failed/);
+  }
+  const recovered = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
+  codes.push(recovered.code);
+  assert.deepEqual(codes, [1, 1, 1, 1, 0]);
+  assert.match(recovered.stderr, /previous run stalled in providers/);
+  assert.match(readFileSync(join(dir, 'log'), 'utf8'), /previous run stalled in providers/);
+  assert.equal(JSON.parse(readFileSync(join(dir, '.phase'))).phase, 'done');
+  const next = await syntheticProcess(t, observedBody('async () => ({ connections: [] })'), { dir }).result;
+  assert.equal(next.code, 0); assert.equal(next.stderr, '');
 });
