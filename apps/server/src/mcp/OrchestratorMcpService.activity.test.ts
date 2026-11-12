@@ -15,7 +15,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
-import { expect, it } from "vite-plus/test";
+import { expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
@@ -35,6 +38,60 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
+
+it.effect.each(["caller", "idle target", "dispatch"] as const)(
+  "bounds thread sends waiting on %s before saving",
+  (blocked) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const wait = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+      const projection = (id: ThreadId) => idleThreadProjection(liveThreadShell(id));
+      let sends = 0;
+      const layer = layerOrchestratorService.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: (id) =>
+                blocked === "caller" ? wait : Effect.succeed(projection(id)),
+              getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+              getProjectThreadRecords: ({ threadId }) =>
+                blocked === "idle target" ? wait : Effect.succeed(projection(threadId)),
+              sendToThread: () =>
+                Effect.sync(() => {
+                  sends += 1;
+                }).pipe(Effect.andThen(wait)),
+            }),
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+            NodeCrypto.layer,
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const send = yield* service
+          .sendToThread(makeScope(), {
+            threadId: childThreadId,
+            message: "Follow up on an idle child",
+            clientRequestId: "bounded-send",
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("15 seconds");
+        const result = yield* Fiber.join(send);
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: { code: "send_timeout" },
+        });
+        if (result._tag === "Failure") expect(result.failure.message).toContain("not save");
+        expect(sends).toBe(blocked === "dispatch" ? 1 : 0);
+      }).pipe(Effect.provide(layer));
+    }),
+);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),

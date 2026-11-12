@@ -76,6 +76,7 @@ import {
 } from "@t3tools/client-runtime/ardud/models/harnessRouting";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as Clock from "effect/Clock";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -3216,50 +3217,61 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadReadResult;
     }),
     sendToThread: Effect.fn("OrchestratorMcpService.sendToThread")(function* (scope, input) {
-      const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
-      yield* assertLiveCallerForOtherThread(scope, parent, target);
-      yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
-      yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
+      return yield* SendAcknowledgement.bounded(
+        (clientRequestId) =>
+          Effect.gen(function* () {
+            const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
+            yield* assertLiveCallerForOtherThread(scope, parent, target);
+            yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
+            yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
 
-      const mode = input.mode ?? "auto";
-      const key = yield* requestKey(input.clientRequestId);
-      const messageId = stableOperationMessageId({
-        scope,
-        requestKey: key,
-        operation: "thread-send",
-      });
-      const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-send" });
-      const result = yield* threadManagement
-        .sendToThread({
-          projectId: target.thread.projectId,
-          commandId,
-          threadId: input.threadId,
-          ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
-          messageId,
-          text: input.message,
-          attachments: [],
-          mode,
-          createdBy: "agent",
-          creationSource: "mcp",
-        })
-        .pipe(
-          Effect.mapError((error) =>
-            isThreadManagementError(error)
-              ? threadManagementFailure(error)
-              : failure(
-                  "orchestration_error",
-                  `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+            const mode = input.mode ?? "auto";
+            const key = yield* requestKey(clientRequestId);
+            const messageId = stableOperationMessageId({
+              scope,
+              requestKey: key,
+              operation: "thread-send",
+            });
+            const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-send" });
+            const result = yield* threadManagement
+              .sendToThread({
+                projectId: target.thread.projectId,
+                commandId,
+                threadId: input.threadId,
+                ...(parent === undefined ? {} : { senderThreadId: parent.thread.id }),
+                messageId,
+                text: input.message,
+                attachments: [],
+                mode,
+                createdBy: "agent",
+                creationSource: "mcp",
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  isThreadManagementError(error)
+                    ? threadManagementFailure(error)
+                    : failure(
+                        "orchestration_error",
+                        `Unable to send to thread ${input.threadId}: ${errorMessage(error)}`,
+                      ),
                 ),
-          ),
-        );
-      return {
-        threadId: input.threadId,
-        messageId,
-        runId: result.run.id,
-        ...(result.run.delegatedTaskId === undefined ? {} : { taskId: result.run.delegatedTaskId }),
-        status: result.run.status,
-        delivery: result.delivery,
-      } satisfies OrchestratorMcpThreadSendResult;
+              );
+            // Delivery is the committed route, not provider acceptance. Claude's priority-next
+            // steer may wait for a tool boundary; that wait must never hold the MCP reply.
+            return {
+              threadId: input.threadId,
+              messageId,
+              runId: result.run.id,
+              ...(result.run.delegatedTaskId === undefined
+                ? {}
+                : { taskId: result.run.delegatedTaskId }),
+              status: result.run.status,
+              delivery: result.delivery,
+            } satisfies OrchestratorMcpThreadSendResult;
+          }),
+        serviceScope,
+        input.clientRequestId,
+      ).pipe(Effect.provideService(Crypto.Crypto, crypto));
     }),
     waitForThread: Effect.fn("OrchestratorMcpService.waitForThread")(function* (scope, input) {
       const { target } = yield* loadScopedThread(scope, input.threadId);

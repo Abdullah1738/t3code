@@ -25,6 +25,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 
 import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
@@ -281,6 +283,10 @@ const layerBase: Layer.Layer<
       events: ReadonlyArray<{ readonly type: string }>,
       transaction: (timing: WriteTiming) => Effect.Effect<A, E, R>,
       publish: (committed: A) => Effect.Effect<void>,
+      acceptance?: {
+        readonly check: () => boolean;
+        readonly prepare: (value: A) => () => void;
+      },
     ) {
       const clock = yield* Clock.Clock;
       const now = () => clock.monotonicTimeNanosUnsafe();
@@ -356,11 +362,23 @@ const layerBase: Layer.Layer<
         );
       });
       const started = performance.now();
+      let accepted: (() => void) | undefined;
       return yield* sql
         .withTransaction(
           Effect.suspend(() => {
             txStart = now();
-            return Effect.tap(transaction(timing), () => takeLane);
+            return transaction(timing).pipe(
+              Effect.tap(() => takeLane),
+              Effect.tap((value) =>
+                Effect.suspend(() => {
+                  // The lane wait is masked. A timed-out sender must roll back when it resumes.
+                  if (acceptance !== undefined && !acceptance.check()) return Effect.interrupt;
+                  return Effect.sync(() => {
+                    accepted = acceptance?.prepare(value);
+                  });
+                }),
+              ),
+            );
           }),
         )
         .pipe(
@@ -374,6 +392,14 @@ const layerBase: Layer.Layer<
           // Keep synchronous writer work from yielding behind the saturated run queue.
           // A real wait (including the publish lane) still suspends.
           Effect.provideService(Scheduler.PreventSchedulerYield, true),
+          Effect.provideService(
+            NodeSqliteClient.TransactionCommitObserver,
+            acceptance === undefined
+              ? undefined
+              : () => {
+                  accepted?.();
+                },
+          ),
           Effect.tap(() =>
             Effect.annotateCurrentSpan(
               "orchestration_v2.transaction_ms",
@@ -840,6 +866,8 @@ const layerBase: Layer.Layer<
     const commitCommandEffect = Effect.fn("orchestrationV2.EventSink.commitCommand")(function* (
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
+      const observer = yield* SendAcknowledgement.command;
+      const acceptance = observer?.id === input.commandId ? observer : undefined;
       const result = yield* commitThenPublish(
         input.events,
         (timing) =>
@@ -905,6 +933,25 @@ const layerBase: Layer.Layer<
             }
             if (result.committed) yield* publishStoredEvents(result.storedEvents);
           }),
+        acceptance === undefined
+          ? undefined
+          : {
+              check: acceptance.check,
+              prepare: (result) => {
+                // Another thread can win the command-id reservation after planning.
+                // The orchestrator checks the receipt before returning its refusal.
+                if (
+                  result.receipt.threadId !== input.threadId ||
+                  result.receipt.status !== "accepted" ||
+                  result.receipt.commandType !== input.commandType
+                )
+                  return () => {};
+                const reply = acceptance.result(result.storedEvents);
+                if (reply === undefined)
+                  throw new Error("Message commit has no acknowledgement result.");
+                return () => acceptance.accept(reply);
+              },
+            },
       );
       return {
         receipt: result.receipt,
@@ -917,26 +964,29 @@ const layerBase: Layer.Layer<
     const commitRejectedCommandEffect = Effect.fn(
       "orchestrationV2.EventSink.commitRejectedCommand",
     )(function* (input: Parameters<EventSinkV2Shape["commitRejectedCommand"]>[0]) {
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const sequence = yield* eventStore.latestSequence({ threadId: input.threadId });
-          const receipt: CommandReceiptStore.CommandReceiptV2 = {
-            commandId: input.commandId,
-            threadId: input.threadId,
-            commandType: input.commandType,
-            acceptedAt: input.rejectedAt,
-            resultSequence: sequence,
-            status: "rejected",
-            error: input.error,
-          };
-          const inserted = yield* commandReceipts.insertIfAbsent(receipt);
-          if (inserted) {
-            return receipt;
-          }
-          const existing = yield* commandReceipts.getByCommandId(input.commandId);
-          return Option.getOrElse(existing, () => receipt);
-        }),
-      );
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const sequence = yield* eventStore.latestSequence({ threadId: input.threadId });
+            const receipt: CommandReceiptStore.CommandReceiptV2 = {
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.rejectedAt,
+              resultSequence: sequence,
+              status: "rejected",
+              error: input.error,
+            };
+            const inserted = yield* commandReceipts.insertIfAbsent(receipt);
+            yield* SendAcknowledgement.check(input.commandId);
+            if (inserted) {
+              return receipt;
+            }
+            const existing = yield* commandReceipts.getByCommandId(input.commandId);
+            return Option.getOrElse(existing, () => receipt);
+          }),
+        )
+        .pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true));
     });
 
     const existingProjectReceipt = (commandId: CommandId) =>

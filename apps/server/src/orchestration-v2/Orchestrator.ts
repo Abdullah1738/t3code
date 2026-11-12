@@ -3,6 +3,7 @@ import {
   type DelegatedRecoveryCounts,
 } from "../ardud/observability/StartupPhaseLog.ts";
 import * as Clock from "effect/Clock";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type {
   OrchestrationV2SearchThreadInput,
@@ -4955,6 +4956,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    // A concurrent restart can attach a task after intake's unlocked preflight read.
+    yield* SendAcknowledgement.captureRuns(command.commandId, projection.runs);
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -12367,6 +12370,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      const acknowledgement = yield* SendAcknowledgement.command;
+      if (command.type === "message.dispatch" && acknowledgement?.id === command.commandId) {
+        const snapshot = yield* loadProjectionForCommand(command, ["runs"]);
+        acknowledgement.captureRuns(snapshot.runs);
+      }
+      yield* SendAcknowledgement.replay(command.commandId, storedEvents);
       if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
         yield* mapDispatchError(command)(
           startNextQueuedRun(command.threadId, {
@@ -12681,6 +12690,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: command.commandId,
         commandType: command.type,
         detail: committed.receipt.error ?? "Previously rejected.",
+      });
+    }
+    // Thread locks are independent: another target can reserve this id after the first lookup.
+    const dispatchThreadId = commandThreadId(command);
+    if (!canReplayCommandReceipt(committed.receipt.threadId, dispatchThreadId)) {
+      return yield* new OrchestratorCommandIdConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+        receiptThreadId: committed.receipt.threadId,
+        commandThreadId: dispatchThreadId,
       });
     }
     if (command.type === "queue.resume" || command.type === "queue.cutover-release") {

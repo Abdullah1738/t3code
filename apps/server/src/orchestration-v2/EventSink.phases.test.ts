@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   EventId,
   ProjectId,
   ProviderInstanceId,
@@ -34,6 +35,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as SendAcknowledgement from "../ardud/orchestration/ThreadSendAcknowledgement.ts";
 
 const threadId = ThreadId.make("thread:phases");
 const now = DateTime.makeUnsafe("2026-11-12T12:00:00.000Z");
@@ -526,3 +528,242 @@ it.effect("freezes transaction duration before post-commit reporting can be dela
     Effect.provide(Logger.layer([trace.logger])),
   );
 });
+
+it.effect("acknowledges a command at COMMIT while its publication is blocked", () =>
+  Effect.gen(function* () {
+    const publishing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let acknowledged = false;
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const id = CommandId.make("command:ack");
+      const sending = yield* sink
+        .commitCommand({
+          commandId: id,
+          threadId,
+          commandType: "message.dispatch",
+          acceptedAt: now,
+          events: [created],
+          effects: [],
+        })
+        .pipe(
+          Effect.provideService(SendAcknowledgement.command, {
+            id,
+            check: () => true,
+            captureRuns: () => {},
+            result: () => ({
+              threadId,
+              messageId: MessageId.make("message:ack"),
+              runId: RunId.make("run:ack"),
+              status: "queued",
+              delivery: "queued",
+            }),
+            accept: () => {
+              acknowledged = true;
+            },
+          }),
+          Effect.forkChild,
+        );
+      yield* Deferred.await(publishing);
+      assert.isTrue(acknowledged);
+      assert.isUndefined(sending.pollUnsafe());
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      assert.isTrue((yield* receipts.getByCommandId(id))._tag === "Some");
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(sending);
+    }).pipe(
+      Effect.provide(
+        testLayer({
+          publish: () =>
+            Deferred.succeed(publishing, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("an expired send waiting for the publication lane rolls back and can retry its id", () =>
+  Effect.gen(function* () {
+    const publishing = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const enqueued = yield* Deferred.make<void>();
+    let writes = 0;
+    let expired = false;
+    let accepted = 0;
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const first = yield* sink.write({ events: [created] }).pipe(Effect.forkChild);
+      yield* Deferred.await(publishing);
+      const id = CommandId.make("command:expired");
+      const input = {
+        commandId: id,
+        threadId,
+        commandType: "message.dispatch",
+        acceptedAt: now,
+        events: [item(1)],
+        effects: [],
+      };
+      const observer = {
+        id,
+        check: () => !expired,
+        captureRuns: () => {},
+        result: () => ({
+          threadId,
+          messageId: MessageId.make("message:expired"),
+          runId: RunId.make("run:expired"),
+          status: "queued" as const,
+          delivery: "queued" as const,
+        }),
+        accept: () => {
+          accepted += 1;
+        },
+      };
+      const sending = yield* sink
+        .commitCommand(input)
+        .pipe(
+          Effect.provideService(SendAcknowledgement.command, observer),
+          Effect.exit,
+          Effect.forkChild,
+        );
+      yield* Deferred.await(enqueued);
+      expired = true;
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(first);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(sending)));
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      assert.isTrue((yield* receipts.getByCommandId(id))._tag === "None");
+      const store = yield* EventStore.EventStoreV2;
+      assert.lengthOf(yield* store.readByCommandId({ commandId: id }).pipe(Stream.runCollect), 0);
+      assert.equal(accepted, 0);
+      expired = false;
+      yield* sink
+        .commitCommand(input)
+        .pipe(Effect.provideService(SendAcknowledgement.command, observer));
+      assert.equal(accepted, 1);
+      assert.lengthOf(yield* store.readByCommandId({ commandId: id }).pipe(Stream.runCollect), 1);
+    }).pipe(
+      Effect.provide(
+        testLayer({
+          publish: (events) =>
+            events[0] !== undefined &&
+            "event" in events[0] &&
+            events[0].event.type === "thread.created"
+              ? Deferred.succeed(publishing, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                )
+              : Effect.void,
+          outbox: Effect.suspend(() =>
+            ++writes === 2
+              ? Deferred.succeed(enqueued, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("expiry while a rejection waits for the writer leaves no poisoned receipt", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const attempted = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let expired = false;
+    const sql = yield* SqlClient.SqlClient;
+    const sink = yield* EventSink.EventSinkV2;
+    const holder = yield* sql
+      .withTransaction(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    const id = CommandId.make("command:expired-rejection");
+    const rejecting = yield* Deferred.succeed(attempted, undefined).pipe(
+      Effect.andThen(
+        sink.commitRejectedCommand({
+          commandId: id,
+          threadId,
+          commandType: "message.dispatch",
+          rejectedAt: now,
+          error: "rejected",
+        }),
+      ),
+      Effect.provideService(SendAcknowledgement.command, {
+        id,
+        check: () => !expired,
+        captureRuns: () => {},
+        result: () => undefined,
+        accept: () => {},
+      }),
+      Effect.exit,
+      Effect.forkChild,
+    );
+    yield* Deferred.await(attempted);
+    expired = true;
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(rejecting)));
+    const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+    assert.isTrue((yield* receipts.getByCommandId(id))._tag === "None");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each([
+  { target: "same", status: "accepted", acknowledgements: 1 },
+  { target: "different", status: "accepted", acknowledgements: 0 },
+  { target: "same", status: "rejected", acknowledgements: 0 },
+  { target: "different", status: "rejected", acknowledgements: 0 },
+] as const)(
+  "reservation replay for $target target and $status receipt",
+  ({ target, status, acknowledgements }) =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const id = CommandId.make("command:reservation-race");
+      if (status === "accepted") {
+        yield* sink.commitCommand({
+          commandId: id,
+          threadId,
+          commandType: "message.dispatch",
+          acceptedAt: now,
+          events: [created],
+          effects: [],
+        });
+      } else {
+        yield* sink.commitRejectedCommand({
+          commandId: id,
+          threadId,
+          commandType: "message.dispatch",
+          rejectedAt: now,
+          error: "previously rejected",
+        });
+      }
+      let accepted = 0;
+      yield* sink
+        .commitCommand({
+          commandId: id,
+          threadId: target === "same" ? threadId : ThreadId.make("thread:other-target"),
+          commandType: "message.dispatch",
+          acceptedAt: now,
+          events: [item(1)],
+          effects: [],
+        })
+        .pipe(
+          Effect.provideService(SendAcknowledgement.command, {
+            id,
+            check: () => true,
+            captureRuns: () => {},
+            result: () => ({
+              threadId,
+              messageId: MessageId.make("message:winner"),
+              runId: RunId.make("run:winner"),
+              status: "queued",
+              delivery: "queued",
+            }),
+            accept: () => {
+              accepted += 1;
+            },
+          }),
+        );
+      assert.equal(accepted, acknowledgements);
+    }).pipe(Effect.provide(testLayer())),
+);

@@ -2,12 +2,19 @@ import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   OrchestratorMcpFailure,
+  OrchestratorMcpThreadSendInput,
+  OrchestratorMcpThreadSendResult,
   ProviderInstanceId,
   ProviderInteractionMode,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as Crypto from "effect/Crypto";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
@@ -344,4 +351,67 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
       ),
     ),
   ),
+);
+
+it.effect.each(["caller", "target"] as const)(
+  "starts the send deadline before the registered tool's %s access read",
+  (blocked) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const target = ThreadId.make("thread:bounded-send-target");
+      const toolkit = Toolkit.make(
+        Tool.make("bounded_send", {
+          parameters: OrchestratorMcpThreadSendInput,
+          success: OrchestratorMcpThreadSendResult,
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+          dependencies: [
+            McpInvocationContext.McpInvocationContext,
+            ThreadManagement.ThreadManagementService,
+            Crypto.Crypto,
+          ],
+        }),
+      );
+      let ran = false;
+      const handlers = McpToolAccess.toLayer(
+        toolkit,
+        Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          return {
+            bounded_send: McpToolAccess.boundedThreadSend(
+              McpToolAccess.writesThreads(
+                (input: typeof OrchestratorMcpThreadSendInput.Type) => [input.threadId],
+                () =>
+                  Effect.sync(() => {
+                    ran = true;
+                  }).pipe(Effect.andThen(Effect.die("access read must still be waiting"))),
+              ),
+              scope,
+            ),
+          };
+        }),
+      );
+      const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: (id) =>
+          id === (blocked === "caller" ? fullAccessThreadId : target)
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.succeed(liveThreadShell(id)),
+      });
+      const server = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(threads),
+        Layer.provide(NodeCrypto.layer),
+      );
+      yield* Effect.gen(function* () {
+        const request = yield* call("bounded_send", fullAccess, {
+          threadId: target,
+          message: "hello",
+          clientRequestId: "bounded-access",
+        }).pipe(Effect.provide(NodeCrypto.layer), Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("15 seconds");
+        expect(yield* Fiber.join(request)).toBe("send_timeout");
+        expect(ran).toBe(false);
+      }).pipe(Effect.provide(server));
+    }),
 );
