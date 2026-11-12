@@ -98,13 +98,71 @@ def _dollar(s: str, i: int, buf: list, subs: list) -> int:
     return i + 1
 
 
-def _word(s: str, i: int, subs: list) -> tuple[str, int]:
+def _ansi_quote(s, i):
+    buf = []
+    escapes = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+    i += 2
+    while i < len(s) and s[i] != "'":
+        if s[i] == "\\" and i + 1 < len(s):
+            c = s[i + 1]
+            patterns = {"x": r"[0-9a-fA-F]{1,2}", "u": r"[0-9a-fA-F]{1,4}", "U": r"[0-9a-fA-F]{1,8}"}
+            m = re.match(patterns[c], s[i + 2:]) if c in patterns else re.match(r"[0-7]{1,3}", s[i + 1:]) if c in "01234567" else None
+            if m:
+                value = int(m.group(0), 16 if c in patterns else 8)
+                buf.append(chr(value) if value <= 0x10ffff else "\\" + c + m.group(0))
+                i += len(m.group(0)) + (2 if c in patterns else 1)
+                continue
+            buf.append(escapes.get(c, "\\" + c))
+            i += 2
+        else:
+            buf.append(s[i])
+            i += 1
+    return "".join(buf).split("\x00", 1)[0], min(i + 1, len(s))
+
+
+def _brace_expands(s, i):
+    depth, comma, plain = 1, False, []
+    i += 1
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            plain.append("\x00")
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+            plain.append("\x00")
+            i += 1
+            while i < len(s) and s[i] != quote:
+                i += 2 if quote == '"' and s[i] == "\\" else 1
+        elif c == "{":
+            depth += 1
+            plain.append("\x00")
+        elif c == "}":
+            depth -= 1
+            if not depth:
+                return comma or re.fullmatch(r"(?:-?\d+\.\.-?\d+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.-?\d+)?", "".join(plain)) is not None
+        elif depth == 1:
+            comma = comma or c == ","
+            plain.append(c)
+        i += 1
+    return False
+
+
+def _word(s: str, i: int, subs: list, expansions=None) -> tuple[str, int]:
     n, buf = len(s), []
+    start, dynamic = i, False
     if s[i] == "~" and (i + 1 == n or s[i + 1] in "/ \t\n;&|)"):
         buf.append(HOME)
         i += 1
     while i < n:
         c = s[i]
+        qualifier = re.match(r"\([ND./@]+\)", s[i:]) if c == "(" and buf else None
+        if qualifier:
+            dynamic = True
+            buf.append(qualifier.group(0))
+            i += qualifier.end()
+            continue
         if c in " \t\r\n" or c in OPCH:
             break
         if c == "\\":
@@ -123,26 +181,39 @@ def _word(s: str, i: int, subs: list) -> tuple[str, int]:
                     buf.append(s[i + 1] if s[i + 1] in '"\\$`' else s[i:i + 2])
                     i += 2
                 elif s[i] == "$":
+                    dynamic = True
                     i = _dollar(s, i, buf, subs)
                 elif s[i] == "`":
+                    dynamic = True
                     j = s.find("`", i + 1)
                     j = n if j < 0 else j
                     subs.append(s[i + 1:j])
+                    buf.append(s[i:j + 1])
                     i = j + 1
                 else:
                     buf.append(s[i])
                     i += 1
             i += 1
+        elif c == "$" and s.startswith("$'", i):
+            literal, i = _ansi_quote(s, i)
+            buf.append(literal)
         elif c == "$":
+            dynamic = True
             i = _dollar(s, i, buf, subs)
         elif c == "`":
+            dynamic = True
             j = s.find("`", i + 1)
             j = n if j < 0 else j
             subs.append(s[i + 1:j])
+            buf.append(s[i:j + 1])
             i = j + 1
         else:
+            if c in "*?[" or (c == "{" and _brace_expands(s, i)):
+                dynamic = True
             buf.append(c)
             i += 1
+    if dynamic and expansions is not None:
+        expansions.add(start)
     return "".join(buf), i
 
 
@@ -168,7 +239,7 @@ def _redirect(s: str, i: int, heredocs: list, subs: list) -> int:
     return i
 
 
-def lex(s: str):
+def lex(s: str, expansions=None):
     """-> (segments, subs). A segment is a list of (word, start_offset)."""
     segs, cur, subs, heredocs = [], [], [], []
     i, n = 0, len(s)
@@ -204,7 +275,7 @@ def lex(s: str):
             i += 2 if s[i:i + 2] in ("&&", "||", ";;", "|&") else 1
         else:
             start = i
-            w, i = _word(s, i, subs)
+            w, i = _word(s, i, subs, expansions)
             cur.append((w, start))
     if cur:
         segs.append(cur)
@@ -344,37 +415,43 @@ def _pkg_mentions(cwd, pos, c) -> bool:
     return False
 
 
-def _cond(c: dict, flags, pos, cwd) -> bool:
+def _miss(c: dict, flags, pos, cwd, expanded=()) -> str | None:
     sp = spec()
     if "has_flag" in c and not _has(flags, c["has_flag"]):
-        return False
+        return "requires " + " or ".join(c["has_flag"]) + " for a local run"
     if "lacks_flag" in c and _has(flags, c["lacks_flag"]):
-        return False
+        return "uses " + next(f for f in flags if _has([f], c["lacks_flag"])) + "; that flag is excluded from local runs"
     if "min_pos" in c and len(pos) < c["min_pos"]:
-        return False
+        return "no test file named; a bare run selects the whole suite" if not pos else f"names {len(pos)} targets; at least {c['min_pos']} required locally"
     if "max_pos" in c and len(pos) > c["max_pos"]:
-        return False
+        return f"names {len(pos)} test files; up to {c['max_pos']} run on this Mac"
+    if "pos_all_re" in c and expanded:
+        return "glob or expansion in positional " + json.dumps(expanded[0], ensure_ascii=False) + "; name test files explicitly"
     if "pos_all_re" in c and not all(re.search(c["pos_all_re"], p) for p in pos):
-        return False
+        return "positional " + json.dumps(next(p for p in pos if not re.search(c["pos_all_re"], p)), ensure_ascii=False) + " is a directory or is not a named test file/node id"
     if "pos_none_re" in c and any(re.search(c["pos_none_re"], p) for p in pos):
-        return False
+        return "a positional matches an excluded target pattern"
     if "pos_any_re" in c and not any(re.search(c["pos_any_re"], p) for p in pos):
-        return False
+        return "no positional matches the required target pattern"
     if "cwd_re" in c:
         rx = sp["_thr"] if c["cwd_re"] == "$throwaway" else re.compile(c["cwd_re"])
         if not cwd or not rx.search(cwd):
-            return False
+            return "working directory does not meet the local-run condition"
     if "repo_file" in c and not _repo_file(cwd, c["repo_file"]["file"], c["repo_file"]["re"]):
-        return False
+        return "repository does not meet the local-run condition"
     if "pkg_mentions" in c and not _pkg_mentions(cwd, pos, c["pkg_mentions"]):
-        return False
-    return True
+        return "target packages do not meet the local-run condition"
+    return None
 
 
-def _match(rule, base, argv):
+def _cond(c: dict, flags, pos, cwd) -> bool:
+    return _miss(c, flags, pos, cwd) is None
+
+
+def _match(rule, base, argv, dynamic):
     if not rule["_cmd"].fullmatch(base):
         return None
-    flags, pos, i = [], [], 1
+    flags, pos, expanded, i = [], [], [], 1
     while i < len(argv):
         a = argv[i]
         if a == "--":
@@ -385,22 +462,42 @@ def _match(rule, base, argv):
             i += 2 if a in rule["_vf"] else 1
             continue
         pos.append(a)
+        expanded.append(dynamic[i])
         i += 1
     subs = rule["_sub"]
     if len(pos) < len(subs) or any(not r.fullmatch(p) for r, p in zip(subs, pos)):
         return None
     skip = rule.get("_skip")
-    rest = [p for p in pos[len(subs):] if not ASSIGN.match(p) and not (skip and skip.fullmatch(p))]
-    return flags, rest
+    rest = [(p, d) for p, d in zip(pos[len(subs):], expanded[len(subs):])
+            if not ASSIGN.match(p) and not (skip and skip.fullmatch(p))]
+    return flags, [p for p, _ in rest], [p for p, d in rest if d]
 
 
-def _heavy(rule, flags, pos, cwd) -> bool:
+def _heavy(rule, flags, pos, cwd, expanded, argv) -> str | None:
+    args = argv[1 + len(rule["_sub"]):]
+    diagnostic = rule.get("diagnostic_flags", [])
+    base = os.path.basename(argv[0])
+    diagnostic_cmd = re.fullmatch(rule.get("diagnostic_cmd", ".*"), base)
+    if diagnostic_cmd and args and all(a in diagnostic or (a == "-V" and re.fullmatch(rule.get("version_short_cmd", "$^"), base)) for a in args):
+        return None
     if any(_cond(c, flags, pos, cwd) for c in rule.get("force_heavy_when", [])):
-        return True
+        return rule["why"]
     hw = rule.get("heavy_when")
     if hw is not None and not any(_cond(c, flags, pos, cwd) for c in hw):
-        return False
-    return not any(_cond(c, flags, pos, cwd) for c in rule.get("local_when", []))
+        return None
+    misses = [_miss(c, flags, pos, cwd, expanded) for c in rule.get("local_when", [])]
+    if None in misses:
+        return None
+    return "; or ".join(misses) if misses else rule["why"]
+
+
+def _lookup(args):
+    for a in args:
+        if a == "--" or not a.startswith("-"):
+            break
+        if a in ("-v", "-V", "-pv", "-pV", "-vp", "-Vp"):
+            return True
+    return False
 
 
 def _peel(argv, ctx, start, out, depth):
@@ -410,6 +507,8 @@ def _peel(argv, ctx, start, out, depth):
         if not argv:
             return None
         base = os.path.basename(argv[0])
+        if base in ("which", "type", "hash") or (base == "command" and _lookup(argv[1:])):
+            return None
         w = next((w for w in spec()["wrappers"] if w["_cmd"].fullmatch(base)
                   and len(argv) > len(w["_sub"]) and all(r.fullmatch(a) for r, a in zip(w["_sub"], argv[1:]))), None)
         if not w:
@@ -449,7 +548,8 @@ def _peel(argv, ctx, start, out, depth):
 def _analyze(src, ctx, depth, out, outer_start):
     if depth > 5 or not src:
         return
-    segs, subs = lex(src)
+    expansions = set()
+    segs, subs = lex(src, expansions)
     env = ctx["env"]
     for seg in segs:
         words = [(_expand(w, env), s) for w, s in seg]
@@ -466,6 +566,7 @@ def _analyze(src, ctx, depth, out, outer_start):
                 env[k.rstrip("+")] = v
             continue
         argv = [w for w, _ in words[j:]]
+        dynamic = [s in expansions for _, s in words[j:]]
         start = words[j][1] if outer_start is None else outer_start
         envs = [w.partition("=")[0].rstrip("+") for w, _ in words[:j]] if outer_start is None else []
         base = os.path.basename(argv[0])
@@ -483,9 +584,11 @@ def _analyze(src, ctx, depth, out, outer_start):
             continue
         base = os.path.basename(argv[0])
         for rule in spec()["rules"]:
-            m = _match(rule, base, argv)
-            if m and _heavy(rule, m[0], m[1], ctx["cwd"]):
-                out.append({"rule": rule["id"], "class": rule["class"], "size": rule["size"], "why": rule["why"],
+            # Peeling keeps the argument suffix (node wrappers replace only argv0).
+            m = _match(rule, base, argv, dynamic[-len(argv):])
+            why = _heavy(rule, m[0], m[1], ctx["cwd"], m[2], argv) if m else None
+            if why:
+                out.append({"rule": rule["id"], "class": rule["class"], "size": rule["size"], "why": why,
                             "start": start, "envs": envs, "argv": " ".join(argv)[:200]})
                 break
     for s in subs:
@@ -528,6 +631,7 @@ def run_vectors() -> int:
         r = classify(v["cmd"], cwd.replace("$FIXTURES", fixtures, 1) if cwd else cwd)
         ok = r["heavy"] == v["heavy"] and (not v["heavy"] or "rule" not in v or r.get("rule") == v["rule"])
         ok = ok and ("rewrite" not in v or r.get("rewrite") == v["rewrite"])
+        ok = ok and ("why" not in v or r.get("why") == v["why"])
         if not ok:
             bad += 1
             print(f"FAIL {v['cmd'][:120]!r} cwd={v.get('cwd')} want heavy={v['heavy']} rule={v.get('rule')} got {r}")

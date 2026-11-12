@@ -88,12 +88,61 @@ function dollar(s: string, i: number, buf: string[], subs: string[]): number {
   return i + 1
 }
 
-function word(s: string, i: number, subs: string[]): [string, number] {
+function ansiQuote(s: string, i: number): [string, number] {
+  const buf: string[] = []
+  const escapes: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" }
+  i += 2
+  while (i < s.length && s[i] !== "'") {
+    if (s[i] === "\\" && i + 1 < s.length) {
+      const c = s[i + 1]
+      const patterns: Record<string, RegExp> = { x: /^[0-9a-fA-F]{1,2}/, u: /^[0-9a-fA-F]{1,4}/, U: /^[0-9a-fA-F]{1,8}/ }
+      const m = patterns[c] ? patterns[c].exec(s.slice(i + 2)) : /[0-7]/.test(c) ? /^[0-7]{1,3}/.exec(s.slice(i + 1)) : null
+      if (m) {
+        const value = Number.parseInt(m[0], patterns[c] ? 16 : 8)
+        buf.push(value <= 0x10ffff ? String.fromCodePoint(value) : "\\" + c + m[0])
+        i += m[0].length + (patterns[c] ? 2 : 1)
+        continue
+      }
+      buf.push(escapes[c] ?? "\\" + c)
+      i += 2
+    } else { buf.push(s[i]); i++ }
+  }
+  return [buf.join("").split("\x00")[0], Math.min(i + 1, s.length)]
+}
+
+function braceExpands(s: string, i: number): boolean {
+  let depth = 1
+  let comma = false
+  const plain: string[] = []
+  i++
+  while (i < s.length) {
+    const c = s[i]
+    if (c === "\\") { plain.push("\x00"); i += 2; continue }
+    if (c === "'" || c === '"') {
+      const quote = c
+      plain.push("\x00")
+      i++
+      while (i < s.length && s[i] !== quote) i += quote === '"' && s[i] === "\\" ? 2 : 1
+    } else if (c === "{") { depth++; plain.push("\x00") }
+    else if (c === "}") {
+      depth--
+      if (!depth) return comma || /^(?:-?\d+\.\.-?\d+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.-?\d+)?$/.test(plain.join(""))
+    } else if (depth === 1) { comma ||= c === ","; plain.push(c) }
+    i++
+  }
+  return false
+}
+
+function word(s: string, i: number, subs: string[], expansions?: Set<number>): [string, number] {
   const n = s.length
   const buf: string[] = []
+  const start = i
+  let dynamic = false
   if (s[i] === "~" && (i + 1 === n || " \t\n;&|)/".includes(s[i + 1]))) { buf.push(HOME); i++ }
   while (i < n) {
     const c = s[i]
+    const qualifier = c === "(" && buf.length ? /^\([ND./@]+\)/.exec(s.slice(i)) : null
+    if (qualifier) { dynamic = true; buf.push(qualifier[0]); i += qualifier[0].length; continue }
     if (c === " " || c === "\t" || c === "\r" || c === "\n" || OPCH.has(c)) break
     if (c === "\\") {
       if (i + 1 < n && s[i + 1] !== "\n") buf.push(s[i + 1])
@@ -109,23 +158,34 @@ function word(s: string, i: number, subs: string[]): [string, number] {
         if (s[i] === "\\" && i + 1 < n) {
           buf.push('"\\$`'.includes(s[i + 1]) ? s[i + 1] : s.slice(i, i + 2))
           i += 2
-        } else if (s[i] === "$") i = dollar(s, i, buf, subs)
+        } else if (s[i] === "$") { dynamic = true; i = dollar(s, i, buf, subs) }
         else if (s[i] === "`") {
+          dynamic = true
           let j = s.indexOf("`", i + 1)
           if (j < 0) j = n
           subs.push(s.slice(i + 1, j))
+          buf.push(s.slice(i, j + 1))
           i = j + 1
         } else { buf.push(s[i]); i++ }
       }
       i++
-    } else if (c === "$") i = dollar(s, i, buf, subs)
+    } else if (c === "$" && s.startsWith("$'", i)) {
+      const [literal, end] = ansiQuote(s, i)
+      buf.push(literal); i = end
+    } else if (c === "$") { dynamic = true; i = dollar(s, i, buf, subs) }
     else if (c === "`") {
+      dynamic = true
       let j = s.indexOf("`", i + 1)
       if (j < 0) j = n
       subs.push(s.slice(i + 1, j))
+      buf.push(s.slice(i, j + 1))
       i = j + 1
-    } else { buf.push(c); i++ }
+    } else {
+      if ("*?[".includes(c) || (c === "{" && braceExpands(s, i))) dynamic = true
+      buf.push(c); i++
+    }
   }
+  if (dynamic) expansions?.add(start)
   return [buf.join(""), i]
 }
 
@@ -148,7 +208,7 @@ function redirect(s: string, i: number, heredocs: [string, boolean][], subs: str
   return j
 }
 
-export function lex(s: string): [Word[][], string[]] {
+export function lex(s: string, expansions?: Set<number>): [Word[][], string[]] {
   const segs: Word[][] = []
   const subs: string[] = []
   let cur: Word[] = []
@@ -182,7 +242,7 @@ export function lex(s: string): [Word[][], string[]] {
       i += ["&&", "||", ";;", "|&"].includes(s.slice(i, i + 2)) ? 2 : 1
     } else {
       const start = i
-      const [w, j] = word(s, i, subs)
+      const [w, j] = word(s, i, subs, expansions)
       i = j
       cur.push([w, start])
     }
@@ -305,46 +365,66 @@ function pkgMentions(cwd: string | null, pos: string[], c: any): boolean {
   return false
 }
 
-function cond(c: any, flags: string[], pos: string[], cwd: string | null): boolean {
-  if (c.has_flag && !has(flags, c.has_flag)) return false
-  if (c.lacks_flag && has(flags, c.lacks_flag)) return false
-  if (c.min_pos !== undefined && pos.length < c.min_pos) return false
-  if (c.max_pos !== undefined && pos.length > c.max_pos) return false
-  if (c.pos_all_re && !pos.every((p) => new RegExp(c.pos_all_re).test(p))) return false
-  if (c.pos_none_re && pos.some((p) => new RegExp(c.pos_none_re).test(p))) return false
-  if (c.pos_any_re && !pos.some((p) => new RegExp(c.pos_any_re).test(p))) return false
+function miss(c: any, flags: string[], pos: string[], cwd: string | null, expanded: string[] = []): string | null {
+  if (c.has_flag && !has(flags, c.has_flag)) return "requires " + c.has_flag.join(" or ") + " for a local run"
+  if (c.lacks_flag && has(flags, c.lacks_flag)) return "uses " + flags.find((f) => has([f], c.lacks_flag)) + "; that flag is excluded from local runs"
+  if (c.min_pos !== undefined && pos.length < c.min_pos) return !pos.length ? "no test file named; a bare run selects the whole suite" : `names ${pos.length} targets; at least ${c.min_pos} required locally`
+  if (c.max_pos !== undefined && pos.length > c.max_pos) return `names ${pos.length} test files; up to ${c.max_pos} run on this Mac`
+  if (c.pos_all_re && expanded.length) return "glob or expansion in positional " + JSON.stringify(expanded[0]) + "; name test files explicitly"
+  if (c.pos_all_re && !pos.every((p) => new RegExp(c.pos_all_re).test(p))) return "positional " + JSON.stringify(pos.find((p) => !new RegExp(c.pos_all_re).test(p))) + " is a directory or is not a named test file/node id"
+  if (c.pos_none_re && pos.some((p) => new RegExp(c.pos_none_re).test(p))) return "a positional matches an excluded target pattern"
+  if (c.pos_any_re && !pos.some((p) => new RegExp(c.pos_any_re).test(p))) return "no positional matches the required target pattern"
   if (c.cwd_re) {
     const rx = c.cwd_re === "$throwaway" ? SPEC._thr : new RegExp(c.cwd_re)
-    if (!cwd || !rx.test(cwd)) return false
+    if (!cwd || !rx.test(cwd)) return "working directory does not meet the local-run condition"
   }
-  if (c.repo_file && !repoFile(cwd, c.repo_file.file, c.repo_file.re)) return false
-  if (c.pkg_mentions && !pkgMentions(cwd, pos, c.pkg_mentions)) return false
-  return true
+  if (c.repo_file && !repoFile(cwd, c.repo_file.file, c.repo_file.re)) return "repository does not meet the local-run condition"
+  if (c.pkg_mentions && !pkgMentions(cwd, pos, c.pkg_mentions)) return "target packages do not meet the local-run condition"
+  return null
 }
 
-function match(rule: any, base: string, argv: string[]): [string[], string[]] | null {
+const cond = (c: any, flags: string[], pos: string[], cwd: string | null) => miss(c, flags, pos, cwd) === null
+
+function match(rule: any, base: string, argv: string[], dynamic: boolean[]): [string[], string[], string[]] | null {
   if (!rule._cmd.test(base)) return null
   const flags: string[] = []
   const pos: string[] = []
+  const expanded: boolean[] = []
   let i = 1
   while (i < argv.length) {
     const a = argv[i]
     if (a === "--") { i++; continue }
     if (a.startsWith("-") && a.length > 1) { flags.push(a); i += rule._vf.has(a) ? 2 : 1; continue }
     pos.push(a)
+    expanded.push(dynamic[i])
     i++
   }
   const subs: RegExp[] = rule._sub
   if (pos.length < subs.length || subs.some((r, k) => !r.test(pos[k]))) return null
-  const rest = pos.slice(subs.length).filter((p) => !ASSIGN.test(p) && !(rule._skip && rule._skip.test(p)))
-  return [flags, rest]
+  const rest = pos.slice(subs.length).map((p, i) => ({ p, dynamic: expanded[i + subs.length] }))
+    .filter(({ p }) => !ASSIGN.test(p) && !(rule._skip && rule._skip.test(p)))
+  return [flags, rest.map(({ p }) => p), rest.filter(({ dynamic }) => dynamic).map(({ p }) => p)]
 }
 
-function heavy(rule: any, flags: string[], pos: string[], cwd: string | null): boolean {
-  if ((rule.force_heavy_when ?? []).some((c: any) => cond(c, flags, pos, cwd))) return true
+function heavy(rule: any, flags: string[], pos: string[], cwd: string | null, expanded: string[], argv: string[]): string | null {
+  const args = argv.slice(1 + rule._sub.length)
+  const base = basename(argv[0])
+  const diagnosticCmd = full(rule.diagnostic_cmd ?? ".*").test(base)
+  if (diagnosticCmd && args.length && args.every((a) => (rule.diagnostic_flags ?? []).includes(a) || (a === "-V" && full(rule.version_short_cmd ?? "$^").test(base)))) return null
+  if ((rule.force_heavy_when ?? []).some((c: any) => cond(c, flags, pos, cwd))) return rule.why
   const hw = rule.heavy_when
-  if (hw !== undefined && !hw.some((c: any) => cond(c, flags, pos, cwd))) return false
-  return !(rule.local_when ?? []).some((c: any) => cond(c, flags, pos, cwd))
+  if (hw !== undefined && !hw.some((c: any) => cond(c, flags, pos, cwd))) return null
+  const misses: (string | null)[] = (rule.local_when ?? []).map((c: any) => miss(c, flags, pos, cwd, expanded))
+  if (misses.includes(null)) return null
+  return misses.length ? misses.join("; or ") : rule.why
+}
+
+function lookup(args: string[]): boolean {
+  for (const a of args) {
+    if (a === "--" || !a.startsWith("-")) break
+    if (["-v", "-V", "-pv", "-pV", "-vp", "-Vp"].includes(a)) return true
+  }
+  return false
 }
 
 function peel(argv: string[], ctx: Ctx, start: number | null, out: Hit[], depth: number): string[] | null {
@@ -352,6 +432,7 @@ function peel(argv: string[], ctx: Ctx, start: number | null, out: Hit[], depth:
     while (argv.length && ASSIGN.test(argv[0])) argv = argv.slice(1)
     if (!argv.length) return null
     const base = basename(argv[0])
+    if (["which", "type", "hash"].includes(base) || (base === "command" && lookup(argv.slice(1)))) return null
     const w = SPEC.wrappers.find(
       (w: any) => w._cmd.test(base) && argv.length > w._sub.length && w._sub.every((r: RegExp, k: number) => r.test(argv[k + 1])),
     )
@@ -390,7 +471,8 @@ function peel(argv: string[], ctx: Ctx, start: number | null, out: Hit[], depth:
 
 function analyze(src: string, ctx: Ctx, depth: number, out: Hit[], outerStart: number | null) {
   if (depth > 5 || !src) return
-  const [segs, subs] = lex(src)
+  const expansions = new Set<number>()
+  const [segs, subs] = lex(src, expansions)
   const env = ctx.env
   for (const seg of segs) {
     let words: Word[] = seg.map(([w, s]) => [expand(w, env), s])
@@ -406,6 +488,7 @@ function analyze(src: string, ctx: Ctx, depth: number, out: Hit[], outerStart: n
       continue
     }
     let argv: string[] | null = words.slice(j).map(([w]) => w)
+    const dynamic = words.slice(j).map(([, s]) => expansions.has(s))
     const start = outerStart === null ? words[j][1] : outerStart
     const envs = outerStart === null ? words.slice(0, j).map(([w]) => w.slice(0, w.indexOf("=")).replace(/\+$/, "")) : []
     let base = basename(argv[0])
@@ -418,9 +501,11 @@ function analyze(src: string, ctx: Ctx, depth: number, out: Hit[], outerStart: n
     if (!argv || !argv.length || basename(argv[0]) === "offbox") continue
     base = basename(argv[0])
     for (const rule of SPEC.rules) {
-      const m = match(rule, base, argv)
-      if (m && heavy(rule, m[0], m[1], ctx.cwd)) {
-        out.push({ rule: rule.id, class: rule.class, size: rule.size, why: rule.why, start, envs })
+      // Peeling keeps the argument suffix (node wrappers replace only argv0).
+      const m = match(rule, base, argv, dynamic.slice(-argv.length))
+      const why = m ? heavy(rule, m[0], m[1], ctx.cwd, m[2], argv) : null
+      if (why) {
+        out.push({ rule: rule.id, class: rule.class, size: rule.size, why, start, envs })
         break
       }
     }
