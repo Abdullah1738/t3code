@@ -75,7 +75,8 @@ export interface ControlStoreShape {
    * so callers widen it and compare `updatedAt` exactly.
    */
   readonly threadsUpdatedSince: (
-    sinceIso: string,
+    /** `null` lists every live thread's light row (no time filter). */
+    sinceIso: string | null,
   ) => Effect.Effect<ReadonlyArray<ControlThreadRow>, ControlStoreError>;
 }
 
@@ -291,7 +292,7 @@ export const make = Effect.gen(function* () {
         json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
         json_extract(payload_json, '$.creationSource') AS creation_source
       FROM orchestration_v2_projection_threads
-      WHERE deleted_at IS NULL AND updated_at > ${sinceIso}
+      WHERE deleted_at IS NULL${sinceIso === null ? sql`` : sql` AND updated_at > ${sinceIso}`}
       ORDER BY updated_at DESC, thread_id ASC
     `.pipe(
       NodeSqliteClient.readOnly,

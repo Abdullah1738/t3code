@@ -977,7 +977,8 @@ const makeRoutes = Effect.gen(function* () {
    */
   const listUpdatedSince = Effect.fn("ControlApi.listUpdatedSince")(function* (input: {
     readonly location: "active" | "archive";
-    readonly since: number;
+    /** `null`: no time filter (a parentThreadId listing without updatedSince). */
+    readonly since: number | null;
     readonly active: boolean | undefined;
     readonly states: ReadonlyArray<string> | undefined;
     readonly projectId: string | null;
@@ -991,12 +992,14 @@ const makeRoutes = Effect.gen(function* () {
     // updated_at is an ISO string; widen by a second so precision differences can't drop a
     // row at the edge, then compare instants exactly.
     const rows = yield* store
-      .threadsUpdatedSince(DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)))
+      .threadsUpdatedSince(
+        since === null ? null : DateTime.formatIso(DateTime.makeUnsafe(since - 1_000)),
+      )
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     let matched = rows.filter(
       (row) =>
         row.archived === (location === "archive") &&
-        Date.parse(row.updatedAt) > since &&
+        (since === null || Date.parse(row.updatedAt) > since) &&
         (input.includeSubagents ||
           parentThreadId !== null ||
           row.relationshipToParent !== "subagent") &&
@@ -1018,7 +1021,7 @@ const makeRoutes = Effect.gen(function* () {
     const needsState = active !== undefined || states !== undefined;
     // Shells are re-read, so a thread that moved since the range read is filtered again.
     const stillMatches = (shell: OrchestrationV2ThreadShell) =>
-      DateTime.toEpochMillis(shell.updatedAt) > since &&
+      (since === null || DateTime.toEpochMillis(shell.updatedAt) > since) &&
       (input.includeSubagents ||
         parentThreadId !== null ||
         shell.lineage.relationshipToParent !== "subagent") &&
@@ -1081,10 +1084,15 @@ const makeRoutes = Effect.gen(function* () {
     const liveOnly = active === true || (states !== undefined && !states.includes("idle"));
     const origin = params.get("origin");
     const limit = clampInt(params.get("limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-    if (since !== undefined && !liveOnly && ids === undefined) {
+    // ardud: a parentThreadId listing (an agent polling its children) used to build every
+    // shell ever made inside one background reader transaction: 54-89 s on 11 Nov 2026.
+    // That snapshot pinned the WAL, the checkpoint worker hit its backpressure ceiling and
+    // held every writer BEGIN until the read ended (56-87 s writer holds). The range read
+    // takes the light rows in one statement and builds shells only for the children.
+    if ((since !== undefined || parentThreadId !== null) && !liveOnly && ids === undefined) {
       return yield* listUpdatedSince({
         location,
-        since,
+        since: since ?? null,
         active,
         states,
         projectId,
