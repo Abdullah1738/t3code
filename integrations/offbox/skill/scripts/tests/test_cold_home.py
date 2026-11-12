@@ -1,6 +1,8 @@
 """Offline cold-disk detection and first-push handoff regressions (#529)."""
 import contextlib
+import http.client
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -31,6 +33,8 @@ class ColdHomeTests(Isolated):
         self.stack.enter_context(patch.object(runs, 'new_checkout_hint'))
         self.image_wait = self.stack.enter_context(patch.object(runs, 'needs_image_wait', return_value=False))
         self.ttl = self.stack.enter_context(patch.object(lease, 'ensure_ttl', return_value=True))
+        self.peer = self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'ready', 'type': 'large'}))
+        self.peer_ssh = completed()
         self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7}))
         self.home_s = {'a': 8, 'b': 0.2, 'c': 0.3}
         self.home_failure = self.docker_failure = None
@@ -47,6 +51,10 @@ class ColdHomeTests(Isolated):
         return dict(row, remote_dir='w/new-abcdef', _guard=self.guard, **self.initial_extra)
 
     def fake_ssh(self, bid, command, **kwargs):
+        if command == 'true':
+            if isinstance(self.peer_ssh, Exception):
+                raise self.peer_ssh
+            return self.peer_ssh
         if command == 'bash -s' and self.prune_timeout:
             raise subprocess.TimeoutExpired('ssh', kwargs['timeout'])
         if command.startswith('for i in $(seq'):
@@ -204,6 +212,95 @@ class ColdHomeTests(Isolated):
         with common.file_lock('box-b', timeout=0):
             pass
         self.assertIn('5-25 min', self.output.getvalue())
+
+    def assert_stayed_on_original(self, rn, row):
+        self.assertEqual(row['box_id'], 'a')
+        self.assertFalse(rn.cold_moved)
+        self.assertEqual(self.push.call_args.args[0], 'a')
+        self.assertEqual(self.con.execute("SELECT box_id FROM runs WHERE run_id=?", (rn.run_id,)).fetchone()[0], 'a')
+        self.assertIsNone(self.con.execute("SELECT 1 FROM pool_callers WHERE owner=? AND repo_root=? AND box_id='b'",
+                                           (self.me['owner'], self.me['repo_root'])).fetchone())
+        with common.file_lock('box-b', timeout=0):
+            pass
+        self.assertIn('5-25 min', self.output.getvalue())
+        self.assertNotIn('using running box', self.output.getvalue())
+
+    def test_successful_ttl_but_unavailable_ssh_retains_original(self):
+        self.box('b', member=True)
+        for failure in (completed(255, err=b'stale SSH endpoint'), subprocess.TimeoutExpired('ssh', 10),
+                        OSError('SSH unavailable')):
+            with self.subTest(failure=failure):
+                self.peer_ssh = failure
+                rn, row = self.start()
+                self.assert_stayed_on_original(rn, row)
+        self.assertEqual(self.ttl.call_count, 3)
+
+    def test_non_live_missing_expired_or_wrong_size_peer_retains_original(self):
+        self.box('b', member=True)
+        states = [None, 'invalid response', ['ready'], {'state': 'ready', 'type': 'large', 'dataExpiredAt': 'expired'},
+                  {'state': 'ready', 'type': 'default'}, {'state': 'ready'}]
+        states += [dict(state=state, type='large') for state in (*api.STOPPED_STATES, *api.STARTING_STATES,
+                                                               'archiving', 'error', 'cancelled')]
+        for state in states:
+            with self.subTest(state=state):
+                self.peer.return_value = state
+                rn, row = self.start()
+                self.assert_stayed_on_original(rn, row)
+        self.assertFalse(any(c.args[1] == 'true' for c in self.ssh.call_args_list))
+
+    def test_peer_state_errors_retain_original(self):
+        self.box('b', member=True)
+        for error in (common.OffboxError('state unavailable'), OSError('network error'),
+                      subprocess.TimeoutExpired('state', 10), json.JSONDecodeError('invalid response', 'x', 0),
+                      http.client.IncompleteRead(b'partial response'),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid response')):
+            with self.subTest(error=error):
+                self.peer.side_effect = error
+                rn, row = self.start()
+                self.assert_stayed_on_original(rn, row)
+
+    def test_all_live_states_can_handoff(self):
+        self.box('b', member=True)
+        for state in api.LIVE_STATES:
+            with self.subTest(state=state):
+                self.peer.return_value = dict(state=state, type='large')
+                rn, row = self.start()
+                self.assertEqual(row['box_id'], 'b')
+                pool.release_guard(row)
+                self.con.execute("UPDATE runs SET status='done' WHERE run_id=?", (rn.run_id,))
+                self.con.commit()
+
+    def test_peer_readiness_is_guarded_and_precedes_claim(self):
+        self.box('b', member=True)
+        def check_guard():
+            with self.assertRaises(common.OffboxError):
+                with common.file_lock('box-b', timeout=0):
+                    pass
+            with common.file_lock(pool.lock_name('repo'), timeout=0):
+                pass
+            self.assertEqual(self.con.execute("SELECT box_id FROM runs WHERE status='starting'").fetchone()[0], 'a')
+        def state(bid, *, deadline):
+            check_guard()
+            self.ttl.assert_called_once_with('b', common.RUN_TTL_S)
+            return {'state': 'ready', 'type': 'large'}
+        def ssh(bid, command, **kwargs):
+            if command == 'true':
+                check_guard()
+                self.peer.assert_called_once()
+                self.assertGreater(kwargs['timeout'], 0)
+                self.assertLessEqual(kwargs['timeout'], 10)
+            return self.fake_ssh(bid, command, **kwargs)
+        self.peer.side_effect = state
+        self.ssh.side_effect = ssh
+        _, row = self.start()
+        self.assertEqual(row['box_id'], 'b')
+
+    def test_exhausted_peer_readiness_budget_retains_original(self):
+        self.box('b', member=True)
+        with patch.object(api, 'left', return_value=0):
+            rn, row = self.start()
+        self.assert_stayed_on_original(rn, row)
+        self.assertFalse(any(c.args[1] == 'true' for c in self.ssh.call_args_list))
 
     def test_ttl_refresh_error_stays_on_original_and_releases_peer(self):
         self.box('b', member=True)

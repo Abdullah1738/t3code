@@ -568,7 +568,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None):
 
 def try_warm(me, size, source, exclude, run_id):
     """Claim a free running peer once, without resuming, growing or creating a box."""
-    from . import lease
+    from . import api, lease, ssh_sync
     con = db()
     try:
         capacity.schema(con)
@@ -613,7 +613,22 @@ def try_warm(me, size, source, exclude, run_id):
             try:
                 # The peer's idle TTL can expire during a first push. Refresh outside the pool lock,
                 # still holding its box guard, before changing the run's assignment.
-                if not lease.ensure_ttl(got['box_id'], RUN_TTL_S):
+                try:
+                    with api.budget(10):
+                        if not lease.ensure_ttl(got['box_id'], RUN_TTL_S):
+                            return None
+                        # A cached running lease and a successful TTL update can both outlive its machine.
+                        peer = api.get(got['box_id'], deadline=time.time() + 10)
+                        if not peer or peer.get('state') not in api.LIVE_STATES or peer.get('dataExpiredAt') \
+                                or peer.get('type') != got['size']:
+                            return None
+                        left = api.left()
+                        if left is not None and left <= 0:
+                            return None
+                        ready = ssh_sync.ssh(got['box_id'], 'true', timeout=min(10, left) if left is not None else 10)
+                        if ready.returncode != 0:
+                            return None
+                except Exception:  # noqa: BLE001 - malformed API responses also make this optional peer unusable
                     return None
                 _claim(con, me, got, run_id)
                 claimed = True
