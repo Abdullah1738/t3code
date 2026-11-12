@@ -923,6 +923,124 @@ it.effect("board_open gives a board its icon only while it has none", () => {
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("wiki_read lists metadata by default and reads requested page bodies", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const thread = ThreadId.make("thread-evaluator");
+    const empty = yield* call(thread, "wiki_read", {});
+    assert.isFalse(empty.isError, empty.text);
+    assert.deepStrictEqual(empty.structured, {
+      pages: [],
+      index: [],
+      hint: "Pass slug to read a page.",
+    });
+
+    const charlie = yield* kanban.writeWiki(
+      board.id,
+      { slug: "charlie", title: "Charlie", body: "Full Charlie body" },
+      owner,
+    );
+    const alpha = yield* kanban.writeWiki(
+      board.id,
+      { slug: "alpha", title: "Alpha", body: "café" },
+      owner,
+    );
+    const bravo = yield* kanban.writeWiki(
+      board.id,
+      { slug: "bravo", title: "Bravo", body: "Full Bravo body" },
+      owner,
+    );
+    const index = yield* call(thread, "wiki_read", {});
+    assert.isFalse(index.isError, index.text);
+    assert.deepStrictEqual(index.structured, {
+      pages: [],
+      index: [
+        { slug: "alpha", title: "Alpha", updatedAt: alpha.updatedAt, bytes: 5 },
+        { slug: "bravo", title: "Bravo", updatedAt: bravo.updatedAt, bytes: 15 },
+        { slug: "charlie", title: "Charlie", updatedAt: charlie.updatedAt, bytes: 17 },
+      ],
+      hint: "Pass slug to read a page.",
+    });
+    assert.notInclude(index.text, '"body"');
+    assert.notInclude(index.text, alpha.body);
+    assert.deepStrictEqual(JSON.parse(index.text), index.structured);
+
+    const single = yield* call(thread, "wiki_read", { slug: " alpha " });
+    assert.isFalse(single.isError, single.text);
+    assert.deepStrictEqual(single.structured, { pages: [alpha] });
+    const unknown = yield* call(thread, "wiki_read", { slug: "missing" });
+    assert.isFalse(unknown.isError, unknown.text);
+    assert.deepStrictEqual(unknown.structured, { pages: [] });
+
+    const batch = yield* call(thread, "wiki_read", {
+      slugs: [" charlie ", "missing", "alpha"],
+    });
+    assert.isFalse(batch.isError, batch.text);
+    assert.deepStrictEqual(batch.structured, {
+      pages: [charlie, alpha],
+      missing: ["missing"],
+    });
+    const missing = yield* call(thread, "wiki_read", { slugs: ["missing"] });
+    assert.isFalse(missing.isError, missing.text);
+    assert.deepStrictEqual(missing.structured, { pages: [], missing: ["missing"] });
+    const maximum = yield* call(thread, "wiki_read", { slugs: Array(20).fill("alpha") });
+    assert.isFalse(maximum.isError, maximum.text);
+    assert.deepStrictEqual(maximum.structured, { pages: Array(20).fill(alpha), missing: [] });
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("wiki_read refuses conflicting selectors and invalid slug batches", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    yield* kanban.ensureBoard({
+      slug: "wiki",
+      name: "Wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const thread = ThreadId.make("thread-evaluator");
+    const both = yield* call(thread, "wiki_read", { slug: "a", slugs: ["b"] });
+    assert.isTrue(both.isError, both.text);
+    assert.include(both.text, "Pass slug or slugs, not both.");
+    for (const slugs of [[], Array(21).fill("a"), [""], ["   "], [1]]) {
+      const error = yield* call(thread, "wiki_read", { slugs }).pipe(Effect.flip);
+      assert.include(String(error), "Invalid parameters");
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("wiki_read keeps a 230-page board's index below 50 KB", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "large-wiki",
+      name: "Large wiki",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const body = "A shared lesson. ".repeat(440);
+    for (let i = 0; i < 230; i++) {
+      yield* kanban.writeWiki(
+        board.id,
+        { slug: `lesson-${i}`, title: `Shared lesson ${i}`, body },
+        owner,
+      );
+    }
+    const result = yield* call(ThreadId.make("thread-evaluator"), "wiki_read", {});
+    assert.isFalse(result.isError, result.text);
+    assert.deepStrictEqual(result.structured.pages, []);
+    assert.lengthOf(result.structured.index as unknown[], 230);
+    assert.notInclude(result.text, '"body"');
+    assert.isBelow(Buffer.byteLength(result.text, "utf8"), 50_000);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect("board helpers resolve delegated ancestry without widening role-bound tools", () => {
   const { layer, parents, missing, deleted, unreadable } = fakeThreads();
   return Effect.gen(function* () {
@@ -949,6 +1067,8 @@ it.effect("board helpers resolve delegated ancestry without widening role-bound 
     assert.isNotNull(workerB);
     const pageA = yield* kanban.writeWiki(boardA.id, { slug: "a", title: "A", body: "A" }, owner);
     const pageB = yield* kanban.writeWiki(boardB.id, { slug: "b", title: "B", body: "B" }, owner);
+    const indexA = { slug: "a", title: "A", updatedAt: pageA.updatedAt, bytes: 1 };
+    const indexB = { slug: "b", title: "B", updatedAt: pageB.updatedAt, bytes: 1 };
     const child = ThreadId.make("first-child");
     const grandchild = ThreadId.make("first-grandchild");
     const root = ThreadId.make("linkless-root");
@@ -962,7 +1082,8 @@ it.effect("board helpers resolve delegated ancestry without widening role-bound 
     for (const thread of [child, grandchild, delegated]) {
       const wiki = yield* call(thread, "wiki_read", {});
       assert.isFalse(wiki.isError, wiki.text);
-      assert.deepStrictEqual(wiki.structured.pages, [pageA]);
+      assert.deepStrictEqual(wiki.structured.pages, []);
+      assert.deepStrictEqual(wiki.structured.index, [indexA]);
       const board = yield* call(thread, "board_get", {});
       assert.isFalse(board.isError, board.text);
       assert.strictEqual((board.structured.board as { board: { id: string } }).board.id, boardA.id);
@@ -1082,7 +1203,8 @@ it.effect("board helpers resolve delegated ancestry without widening role-bound 
     for (const thread of [root, workerA, child]) {
       const explicit = yield* call(thread, "wiki_read", { boardId: "second" });
       assert.isFalse(explicit.isError, explicit.text);
-      assert.deepStrictEqual(explicit.structured.pages, [pageB]);
+      assert.deepStrictEqual(explicit.structured.pages, []);
+      assert.deepStrictEqual(explicit.structured.index, [indexB]);
     }
     const filtered = yield* call(child, "wiki_read", { boardId: boardB.id, slug: "a" });
     assert.isFalse(filtered.isError, filtered.text);
@@ -1101,7 +1223,8 @@ it.effect("board helpers resolve delegated ancestry without widening role-bound 
     parents.set(nested, workerB);
     const nearest = yield* call(nested, "wiki_read", {});
     assert.isFalse(nearest.isError, nearest.text);
-    assert.deepStrictEqual(nearest.structured.pages, [pageB]);
+    assert.deepStrictEqual(nearest.structured.pages, []);
+    assert.deepStrictEqual(nearest.structured.index, [indexB]);
 
     for (const [kind, broken] of [
       ["missing", missing],
@@ -1149,7 +1272,10 @@ it.effect("an unreadable ancestry still falls back to the only open board", () =
     unreadable.add(parent);
     const result = yield* call(child, "wiki_read", {});
     assert.isFalse(result.isError, result.text);
-    assert.deepStrictEqual(result.structured.pages, [page]);
+    assert.deepStrictEqual(result.structured.pages, []);
+    assert.deepStrictEqual(result.structured.index, [
+      { slug: "one", title: "One", updatedAt: page.updatedAt, bytes: 3 },
+    ]);
   }).pipe(Effect.provide(layer));
 });
 
@@ -1210,7 +1336,10 @@ it.effect("board_pause is evaluator-only and resolves kept numbers on the select
     );
     const reviewWiki = yield* call(reviewChild, "wiki_read", {});
     assert.isFalse(reviewWiki.isError, reviewWiki.text);
-    assert.deepStrictEqual(reviewWiki.structured.pages, [page]);
+    assert.deepStrictEqual(reviewWiki.structured.pages, []);
+    assert.deepStrictEqual(reviewWiki.structured.index, [
+      { slug: "review", title: "Review", updatedAt: page.updatedAt, bytes: 22 },
+    ]);
     const reviewCard = yield* call(reviewChild, "card_get", { card: `#${workerCard.number}` });
     assert.isFalse(reviewCard.isError, reviewCard.text);
     assert.strictEqual((reviewCard.structured.card as { id: string }).id, workerCard.id);
