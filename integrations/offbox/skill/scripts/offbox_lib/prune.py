@@ -7,6 +7,7 @@ import secrets
 import shlex
 import subprocess
 import time
+from typing import NamedTuple
 
 from . import capacity, common, ssh_sync
 from .common import event, kv_get, kv_set, log, now, say
@@ -123,8 +124,14 @@ def _protected(con, box_id: str) -> bool:
                        (box_id, box_id)).fetchone() is not None
 
 
-def run(con, box_id: str, current: str) -> int:
-    """Move old checkouts on box_id out of ~/w. Returns how many moved. Never raises."""
+class Result(NamedTuple):
+    pruned: int = 0
+    timed_out: bool = False
+
+
+def run(con, box_id: str, current: str) -> Result:
+    """Move old checkouts out of ~/w; report the count and this pass's SSH timeout. Never raises."""
+    timed_out = False
     try:
         key = f"prune:{box_id}"
         # The throttle reads the record fresh; the settled list is read without the age limit, so a failed or
@@ -132,9 +139,9 @@ def run(con, box_id: str, current: str) -> int:
         raw = kv_get(con, key)
         prev = kv_get(con, key, max_age=EVERY_S)
         if prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
-            return 0
+            return Result()
         if _protected(con, box_id):
-            return 0
+            return Result()
         # settled maps dir -> the last-used time it was settled at. It only suppresses that generation: a recreated
         # checkout that is used and goes stale again has a newer last-used time, so it is offered again.
         settled = _settled_map((raw or {}).get("settled"))
@@ -143,7 +150,7 @@ def run(con, box_id: str, current: str) -> int:
         # Every path below keeps the settled map, so a failed pass never replays settled dirs on the next one.
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": settled})
         if not dirs:
-            return 0
+            return Result()
         run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
         # The hold is taken before the remote script can start and released only when its worker is confirmed gone.
         # While held, the allocator never hands this box to anyone (pool.candidates, lease resume).
@@ -159,6 +166,7 @@ def run(con, box_id: str, current: str) -> int:
             rc = p.returncode
             finished = rc == 0 and f"done {run_id}" in out  # the script prints this only after its last child is gone
         except (subprocess.TimeoutExpired, OSError) as e:
+            timed_out = isinstance(e, subprocess.TimeoutExpired)
             # The remote script may still be running. Only a seen done marker releases the hold.
             log(f"prune {box_id} ssh failed ({type(e).__name__}); checking the remote worker")
             finished = _quiesced(box_id, run_id, deadline - time.monotonic())
@@ -182,7 +190,7 @@ def run(con, box_id: str, current: str) -> int:
             con.commit()
             event(con, box_id, "box_prune", f"{len(done)} of {len(dirs)} stale: " + " ".join(done))
             say(f"pruned {len(done)} old checkout(s) on {box_id} (OFFBOX_PRUNE_KEEP / OFFBOX_PRUNE_DAYS)")
-        return len(done)
+        return Result(len(done), timed_out)
     except Exception as e:  # noqa: BLE001 - housekeeping must never fail a run
         log(f"prune {box_id} skipped: {e}")
-        return 0
+        return Result(0, timed_out)

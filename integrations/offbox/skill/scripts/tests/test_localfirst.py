@@ -702,7 +702,7 @@ class CmdStartRejectedTests(Isolated):
         with patch.object(runs.pool, "acquire", return_value=row), \
                 patch.object(runs.ssh_sync, "put_file"), patch.object(runs.ssh_sync, "push", return_value={}), \
                 patch.object(runs.ssh_sync, "tracked_secret_matches", return_value=[]), \
-                patch.object(runs.ssh_sync, "probe_home", return_value=None), \
+                patch.object(runs.ssh_sync, "probe_home", return_value=(None, None)), \
                 patch.object(api, "cmd_start", side_effect=err), \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(OffboxError) as cm:
