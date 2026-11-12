@@ -175,6 +175,7 @@ def _kill_group_quietly(pid: int) -> None:
 
 class WorkerGoneTests(NoNetwork):
     def test_worker_states_and_marker_cleanup(self):
+        run_id = prune.WORKER_ID_PREFIX + 'r1'
         cases = [
             ('done', '123', 30, True),
             (None, '234', 30, True),
@@ -187,8 +188,8 @@ class WorkerGoneTests(NoNetwork):
         ]
         for done, pid, age, expected in cases:
             with self.subTest(done=done, pid=pid, age=age), tempfile.TemporaryDirectory() as home:
-                started = Path(home) / '.offbox/started/r1'
-                marker = Path(home) / '.offbox/done/r1'
+                started = Path(home) / '.offbox/started' / run_id
+                marker = Path(home) / '.offbox/done' / run_id
                 started.parent.mkdir(parents=True)
                 marker.parent.mkdir(parents=True)
                 if pid is not None:
@@ -201,7 +202,7 @@ class WorkerGoneTests(NoNetwork):
                     return subprocess.run(['bash', '-c', 'kill() { [ "$2" = 123 ]; }; ' + cmd],
                                           env={'HOME': home, 'PATH': '/usr/bin:/bin'}, capture_output=True, timeout=5)
                 with patch.object(prune.ssh_sync, 'ssh', side_effect=ssh) as probe:
-                    self.assertIs(prune.worker_gone('bx', 'r1', age, timeout_s=7), expected)
+                    self.assertIs(prune.worker_gone('bx', run_id, age, timeout_s=7), expected)
                 probe.assert_called_once()
                 if expected is True:
                     self.assertFalse(started.exists())
@@ -215,6 +216,27 @@ class WorkerGoneTests(NoNetwork):
                 self.assertIsNone(prune.worker_gone('bx', 'r1', 10000))
         with patch.object(prune.ssh_sync, 'ssh', return_value=subprocess.CompletedProcess('ssh', 255)):
             self.assertIsNone(prune.worker_gone('bx', 'r1', 10000))
+
+    def test_legacy_and_unknown_protocols_require_done_markers(self):
+        ids = ['1794434000.1-12345-abcdef', 'r1', 'prune-v20-r1', 'prune-v3-r1']
+        for run_id in ids:
+            for done, pid in ((False, None), (False, '234'), (True, None), (True, '123')):
+                with self.subTest(run_id=run_id, done=done, pid=pid), tempfile.TemporaryDirectory() as home:
+                    started = Path(home) / '.offbox/started' / run_id
+                    marker = Path(home) / '.offbox/done' / run_id
+                    started.parent.mkdir(parents=True)
+                    marker.parent.mkdir(parents=True)
+                    if pid is not None:
+                        started.write_text(pid)
+                    if done:
+                        marker.write_text('ok')
+                    def ssh(box_id, cmd, timeout):
+                        return subprocess.run(['bash', '-c', cmd], env={'HOME': home, 'PATH': '/usr/bin:/bin'},
+                                              capture_output=True, timeout=timeout)
+                    with patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
+                        self.assertIs(prune.worker_gone('bx', run_id, 10000), True if done else None)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(started.exists(), pid is not None and not done)
 
 
 class RunTests(NoNetwork):
@@ -578,6 +600,30 @@ class RunTests(NoNetwork):
             if "p" in worker and worker["p"].poll() is None:
                 worker["p"].kill()
                 worker["p"].wait(timeout=5)
+
+    def test_new_hold_that_never_started_recovers_only_after_120_seconds(self):
+        from offbox_lib import lease
+        self._lease_row_for_bx()
+        def not_started(box_id, cmd, input=None, **kwargs):
+            if input is not None:
+                raise subprocess.TimeoutExpired('ssh', 20)
+            return subprocess.CompletedProcess('ssh', 1, b'', b'')
+        with patch.object(prune.ssh_sync, 'ssh', side_effect=not_started):
+            prune.run(self.con, 'bx', 'w/keep-cccccc')
+        hold = self.con.execute("SELECT run_id, created_at FROM prune_holds WHERE box_id='bx'").fetchone()
+        self.assertTrue(hold['run_id'].startswith('prune-v2-'))
+        def ssh(box_id, cmd, timeout):
+            return subprocess.run(['bash', '-c', cmd], env={'HOME': self.home.name, 'PATH': '/usr/bin:/bin'},
+                                  capture_output=True, timeout=timeout)
+        with patch.object(api, 'get', return_value={'state': 'running'}), \
+                patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
+            for age in (30, 120):
+                with self.subTest(age=age), patch.object(lease, 'now', return_value=hold['created_at'] + age):
+                    self.assertFalse(lease.release_hold_if_worker_gone(self.con, 'bx'))
+                    self.assertIsNotNone(self.con.execute("SELECT 1 FROM prune_holds WHERE box_id='bx'").fetchone())
+            with patch.object(lease, 'now', return_value=hold['created_at'] + 200):
+                self.assertTrue(lease.release_hold_if_worker_gone(self.con, 'bx'))
+        self.assertIsNone(self.con.execute("SELECT 1 FROM prune_holds WHERE box_id='bx'").fetchone())
 
     def test_timeout_and_unconfirmed_return_free_after_late_done_marker(self):
         from offbox_lib import lease
@@ -1232,8 +1278,9 @@ class HoldClearTests(NoNetwork):
     def test_busy_script_writes_no_marker_and_no_done_line(self):
         from offbox_lib import lease
         self._hold()
-        self.con.execute("UPDATE prune_holds SET run_id='rbusy', created_at=? WHERE box_id='bx'",
-                         (common.now() - 200,))
+        run_id = prune.WORKER_ID_PREFIX + 'rbusy'
+        self.con.execute("UPDATE prune_holds SET run_id=?, created_at=? WHERE box_id='bx'",
+                         (run_id, common.now() - 200))
         self.con.commit()
         with tempfile.TemporaryDirectory() as home:
             h = Path(home)
@@ -1245,7 +1292,7 @@ class HoldClearTests(NoNetwork):
             kill = ("kill() { case \"$*\" in '-0 -- -'*) [ -f \"$HOME/group-alive\" ];; "
                     "'-KILL -- -'*) return 0;; *) builtin kill \"$@\";; esac; };\n")
             with patch.object(prune, 'BACKGROUND', 'true'):
-                body = prune.script(['w/a-aaaaaa', 'w/b-bbbbbb'], 'rbusy')
+                body = prune.script(['w/a-aaaaaa', 'w/b-bbbbbb'], run_id)
             body = body.replace(f'if [ \"$SECONDS\" -ge {prune.BUDGET_S} ]; then kill', 'if true; then kill', 1)
             body = body.replace('[ \"$k\" -lt 25 ]', '[ \"$k\" -lt 0 ]', 1)
             env = {'HOME': home, 'PATH': '/usr/bin:/bin'}
@@ -1260,26 +1307,26 @@ class HoldClearTests(NoNetwork):
                     p.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     pass
-                self.assertFalse((h / '.offbox/done/rbusy').exists())
+                self.assertFalse((h / '.offbox/done' / run_id).exists())
                 with patch.object(api, 'get', return_value={'state': 'running'}), \
                         patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
-                    gone = prune.worker_gone('bx', 'rbusy', 200)
+                    gone = prune.worker_gone('bx', run_id, 200)
                     released = lease.release_hold_if_worker_gone(self.con, 'bx')
                     self.assertIs(gone, False, 'a surviving child group must keep the supervisor alive')
                     self.assertFalse(released)
                     self.assertEqual(self._held(), 1)
-                    self.assertTrue((h / '.offbox/started/rbusy').exists())
+                    self.assertTrue((h / '.offbox/started' / run_id).exists())
                     self.assertIsNone(p.poll())
                     # Once every member is gone, the same worker can confirm completion and free the hold.
                     alive.unlink()
                     stdout, stderr = p.communicate(timeout=5)
                     self.assertEqual(p.returncode, 0, stderr)
-                    self.assertEqual(stdout.splitlines(), ['done rbusy'])
-                    self.assertTrue((h / '.offbox/done/rbusy').is_file())
+                    self.assertEqual(stdout.splitlines(), [f'done {run_id}'])
+                    self.assertTrue((h / '.offbox/done' / run_id).is_file())
                     self.assertTrue(lease.release_hold_if_worker_gone(self.con, 'bx'))
                     self.assertEqual(self._held(), 0)
-                    self.assertFalse((h / '.offbox/started/rbusy').exists())
-                    self.assertFalse((h / '.offbox/done/rbusy').exists())
+                    self.assertFalse((h / '.offbox/started' / run_id).exists())
+                    self.assertFalse((h / '.offbox/done' / run_id).exists())
             finally:
                 if p.poll() is None:
                     p.kill()
@@ -1304,3 +1351,79 @@ class RunnerHookTests(NoNetwork):
                 rn.start()
         self.assertEqual(pr.call_count, 1)
         self.assertEqual(order[0], ("prune", "bx", "w/r"))
+
+
+class LegacyWorkerTests(NoNetwork):
+    _hold = HoldClearTests._hold
+    _held = HoldClearTests._held
+    def test_legacy_live_worker_without_started_marker_keeps_hold(self):
+        from offbox_lib import lease
+        self._hold()
+        self.con.execute("UPDATE prune_holds SET run_id='rlegacy', created_at=? WHERE box_id='bx'", (common.now() - 200,))
+        self.con.commit()
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as bindir:
+            h = Path(home)
+            (h / 'w/a-aaaaaa').mkdir(parents=True)
+            gate = h / 'gate'
+            os.mkfifo(gate)
+            shim = Path(bindir) / 'mv'
+            shim.write_text('#!/bin/sh\necho MV_STARTED\nread signal < "$HOME/gate"\nexec /bin/mv "$@"\n')
+            shim.chmod(0o755)
+            env = {'HOME': home, 'PATH': bindir + ':/usr/bin:/bin'}
+            # Simulate an uninterruptible move; actual PID/group probes still use the process table.
+            prefix = 'kill() { SECONDS=200; case "$1" in -KILL) return 0;; *) builtin kill "$@";; esac; };\n'
+            # Frozen pre-marker script: using the current generator here would hide rollout incompatibilities.
+            body = """set -m
+trap '' PIPE HUP
+busy=
+mkdir -p "$HOME/.offbox/trash" "$HOME/.offbox/done" || exit 0
+t="$HOME/.offbox/trash/rlegacy"
+mkdir -p "$t" || exit 0
+one() { ( if [ ! -d "$1" ] || [ -L "$1" ]; then exit 5; fi; mv "$1" "$2"; exit $? ) & p=$!; while kill -0 -- -"$p" 2>/dev/null; do if [ "$SECONDS" -ge 8 ]; then kill -KILL -- -"$p" 2>/dev/null; k=0; while kill -0 -- -"$p" 2>/dev/null && [ "$k" -lt 25 ]; do sleep 0.2; k=$((k+1)); done; wait "$p" 2>/dev/null; if kill -0 -- -"$p" 2>/dev/null; then return 4; fi; return 3; fi; sleep 0.2; done; wait "$p"; }
+if [ -n "$busy" ] || [ "$SECONDS" -ge 8 ]; then echo "left "w/a-aaaaaa; else one "$HOME"/w/a-aaaaaa "$t/0"; rc=$?; case "$rc" in 0) echo "pruned "w/a-aaaaaa;; 5) echo "skip "w/a-aaaaaa;; 4) echo "busy "w/a-aaaaaa; busy=1;; *) echo "left "w/a-aaaaaa;; esac; fi
+if [ -z "$busy" ]; then
+  echo ok > "$HOME/.offbox/done/rlegacy"; echo "done rlegacy"
+fi
+true
+exit 0
+"""
+            worker = subprocess.Popen(['bash', '-c', prefix + body], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            observed = None
+            try:
+                self.assertEqual(worker.stdout.readline().strip(), 'MV_STARTED')
+                self.assertIsNone(worker.poll())
+                self.assertFalse((h / '.offbox/started/rlegacy').exists())
+                self.assertFalse((h / '.offbox/done/rlegacy').exists())
+                def ssh(box_id, cmd, timeout):
+                    return subprocess.run(['bash', '-c', cmd], env=env, capture_output=True, timeout=timeout)
+                with patch.object(api, 'get', return_value={'state': 'running'}), patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
+                    observed = lease.release_hold_if_worker_gone(self.con, 'bx')
+                self.assertIsNone(worker.poll(), 'legacy prune really is still running')
+                (h / 'w/a-aaaaaa/new-caller.txt').write_text('new work')
+            finally:
+                with gate.open('w') as stream:
+                    stream.write('go\n')
+                stdout, stderr = worker.communicate(timeout=10)
+            self.assertEqual(worker.returncode, 0, stderr)
+            self.assertFalse((h / 'w/a-aaaaaa').exists())
+            self.assertTrue((h / '.offbox/trash/rlegacy/0/new-caller.txt').exists())
+            self.assertIs(observed, False, 'a pre-deploy worker has no started marker even while it can still move a checkout')
+
+            self.assertEqual(self._held(), 1)
+            self.assertTrue((h / '.offbox/done/rlegacy').exists())
+            with patch.object(api, 'get', return_value={'state': 'running'}), patch.object(prune.ssh_sync, 'ssh', side_effect=ssh):
+                self.assertTrue(lease.release_hold_if_worker_gone(self.con, 'bx'))
+            self.assertEqual(self._held(), 0)
+
+    def test_legacy_hold_without_done_releases_only_on_confirmed_stopped_or_gone_box(self):
+        from offbox_lib import lease
+        for state in ({'state': 'archived'}, None):
+            with self.subTest(state=state):
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM prune_holds')
+                self.con.commit()
+                self._hold()
+                with patch.object(api, 'get', return_value=state), patch.object(prune.ssh_sync, 'ssh') as ssh:
+                    self.assertTrue(lease.release_hold_if_worker_gone(self.con, 'bx'))
+                ssh.assert_not_called()
+                self.assertEqual(self._held(), 0)

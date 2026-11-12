@@ -14,6 +14,9 @@ from .common import event, kv_get, kv_set, log, now, say
 
 # Checkout dirs offbox itself makes (identity.remote_dir_for). Anything else on the box is left alone.
 DIR_RE = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
+# Unversioned workers predate started markers and can survive deployment while still moving checkouts.
+# Version the hold before SSH starts, so only this protocol can recover a missing start marker by age.
+WORKER_ID_PREFIX = 'prune-v2-'
 EVERY_S = 6 * 3600
 # A box that ran out of budget (slow FUSE home, heavy load) is tried again this soon, not after 6 h.
 RETRY_S = 20 * 60
@@ -118,6 +121,7 @@ def worker_gone(box_id: str, run_id: str, hold_age_s: float, timeout_s: float = 
         rid = shlex.quote(run_id)
         command = (f'done_file="$HOME/.offbox/done/"{rid}; started="$HOME/.offbox/started/"{rid}; '
                    'if [ -f "$done_file" ]; then :; '
+                   f'elif {"false" if run_id.startswith(WORKER_ID_PREFIX) else "true"}; then exit 2; '
                    'elif [ -f "$started" ]; then '
                    'pid=$(cat "$started") || exit 2; '
                    'case "$pid" in ""|*[!0-9]*|0) exit 2;; esac; '
@@ -173,7 +177,7 @@ def run(con, box_id: str, current: str) -> Result:
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": settled})
         if not dirs:
             return Result()
-        run_id = f"{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
+        run_id = f"{WORKER_ID_PREFIX}{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
         # The hold is taken before the remote script can start and released only when its worker is confirmed gone.
         # While held, the allocator never hands this box to anyone (pool.candidates, lease resume).
         con.execute("INSERT OR REPLACE INTO prune_holds(box_id, run_id, created_at) VALUES (?,?,?)",
