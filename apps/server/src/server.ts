@@ -1,3 +1,6 @@
+import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import { redactionRouteLayer } from "./ardud/redaction/http.ts";
 import { canServeBeforeRecovery } from "./ardud/fast-install/readiness.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
@@ -242,7 +245,11 @@ const layerProviderEventLoggers = Layer.effect(
     );
     if (!store) return ProviderEventLoggers.NoOpProviderEventLoggers;
     yield* Effect.addFinalizer(() => store.close());
-    return { native: store.logger("native"), canonical: store.logger("canonical") };
+    return {
+      native: store.logger("native"),
+      canonical: store.logger("canonical"),
+      withMaintenance: store.withMaintenance,
+    };
   }),
 );
 
@@ -759,6 +766,8 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     // ardud fork: local control API for bridges, crw and CLIs.
     controlRouteLayer,
+    redactionRouteLayer,
+    McpHttpServer.layerRedactionToolkit,
     desktopLeaseRouteLayer,
     harnessCutoverRouteLayer,
     openCodeImportRouteLayer,
@@ -772,6 +781,17 @@ const layerMakeRoutes = Layer.mergeAll(
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
 ).pipe(
+  Layer.provide(
+    ThreadRedaction.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ThreadCommandExecutor.layer,
+          EventStoreV2.layerFromOrchestrationEventStore,
+          RuntimeLayer.layerEventSink,
+        ),
+      ),
+    ),
+  ),
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
   ),

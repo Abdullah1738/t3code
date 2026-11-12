@@ -1,3 +1,4 @@
+import { ThreadItemRedacted } from "./ardud/threadRedaction.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1813,6 +1814,11 @@ export const OrchestrationV2DomainEvent = Schema.Union([
   }),
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("turn-item.updated"),
     payload: OrchestrationV2TurnItem,
   }),
@@ -2642,6 +2648,11 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
     ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("message.updated"),
     payload: OrchestrationV2ConversationMessageJson,
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("thread.item-redacted"),
+    payload: ThreadItemRedacted,
   }),
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,

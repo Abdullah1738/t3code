@@ -264,12 +264,16 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
   });
   const persistence = yield* Queue.sliding<OrchestrationV2ThreadDetailSnapshot>(1);
+  const persistenceLock = yield* Semaphore.make(1);
+  let redactionSequence = 0;
+  const redactionResubscriptions = yield* Queue.sliding<void>(1);
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationV2ThreadDetailSnapshot,
   ) {
     if (resumeCache !== undefined && resumeCache.owner !== owner) return;
-    if (committed.state.status === "deleted") return;
+    if (committed.state.status === "deleted" || snapshot.snapshotSequence < redactionSequence)
+      return;
     if (
       committed.persisted &&
       matchesThreadSnapshot(
@@ -280,32 +284,40 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       )
     )
       return;
-    yield* cache.saveThread(environmentId, snapshot).pipe(
-      Effect.tap(() =>
-        Effect.sync(() => {
-          if (
-            !matchesThreadSnapshot(
-              committed,
-              snapshot.projection,
-              snapshot.snapshotSequence,
-              historyMetaFromCachedSnapshot(snapshot),
+    yield* persistenceLock
+      .withPermits(1)(
+        Effect.suspend(() =>
+          snapshot.snapshotSequence < redactionSequence
+            ? Effect.void
+            : cache.saveThread(environmentId, snapshot),
+        ),
+      )
+      .pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (
+              !matchesThreadSnapshot(
+                committed,
+                snapshot.projection,
+                snapshot.snapshotSequence,
+                historyMetaFromCachedSnapshot(snapshot),
+              )
             )
-          )
-            return;
-          committed = { ...committed, persisted: true };
-          if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
-        }),
-      ),
-      Effect.catch((error) =>
-        Effect.logWarning("Could not persist the thread cache.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            threadId,
-            error: error.message,
+              return;
+            committed = { ...committed, persisted: true };
+            if (resumeCache?.owner === owner) resumeCache.snapshot = committed;
           }),
         ),
-      ),
-    );
+        Effect.catch((error) =>
+          Effect.logWarning("Could not persist the thread cache.").pipe(
+            Effect.annotateLogs({
+              environmentId,
+              threadId,
+              error: error.message,
+            }),
+          ),
+        ),
+      );
   });
 
   yield* Effect.addFinalizer(() =>
@@ -561,6 +573,52 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (sequence === appliedSequence) return;
     yield* SubscriptionRef.set(lastSequence, sequence);
     if (fresh.length === 0) return;
+    const redaction = fresh.findLast((item) => item.event.type === "thread.item-redacted");
+    if (redaction !== undefined) {
+      // A needle sweep can affect any field. Drop the whole snapshot, including
+      // queued saves, before refetching so no client-specific disk cache retains it.
+      redactionSequence = redaction.sequence;
+      yield* Queue.poll(persistence);
+      yield* SubscriptionRef.update(state, (current) => ({
+        ...current,
+        data: Option.none(),
+        status: "synchronizing" as const,
+      }));
+      yield* remember;
+      yield* persistenceLock.withPermits(1)(cache.removeThread(environmentId, threadId));
+      const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+      if (Option.isNone(prepared)) {
+        yield* Queue.offer(redactionResubscriptions, undefined);
+        return;
+      }
+      const refreshed = yield* snapshotLoader.load(prepared.value, threadId);
+      if (refreshed._tag === "present") {
+        yield* clearMiss;
+        if (canLoadHistory && refreshed.history !== undefined)
+          yield* Ref.set(acceptsBoundedSocketSnapshots, true);
+        yield* SubscriptionRef.set(lastSequence, refreshed.snapshot.snapshotSequence);
+        const history = historyMetaFromCachedSnapshot({
+          ...refreshed.snapshot,
+          ...refreshed.history,
+        });
+        yield* setThread(refreshed.snapshot.projection, { history });
+        yield* remember;
+      } else if (refreshed._tag === "denied") {
+        yield* SubscriptionRef.set(state, {
+          data: Option.none(),
+          status: "no-access",
+          error: Option.none(),
+          history: EMPTY_THREAD_HISTORY_META,
+        });
+        yield* remember;
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      } else {
+        // Reopen without a resume cursor so the normal HTTP/WS snapshot path
+        // recovers even if this socket itself stayed healthy.
+        yield* Queue.offer(redactionResubscriptions, undefined);
+      }
+      return;
+    }
 
     const waiting = yield* Ref.get(awaitingCompletion);
     // Apply against the latest projection/history in one update so a concurrent
@@ -671,6 +729,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
 
     if (item.kind === "snapshot") {
+      if (item.snapshotSequence < redactionSequence) return;
       yield* SubscriptionRef.set(lastSequence, item.snapshotSequence);
       const hasProgressiveHistory =
         item.historyCursor !== undefined ||
@@ -1019,7 +1078,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         },
         retryExpectedFailureAfter: "250 millis",
         retryDefects: true,
-        resubscribe: foregroundResubscriptions,
+        resubscribe: Stream.merge(
+          foregroundResubscriptions,
+          Stream.fromQueue(redactionResubscriptions),
+        ),
       },
     ).pipe(Stream.runForEachArray(applyItems)),
   );

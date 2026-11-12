@@ -68,6 +68,10 @@ export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStre
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
+  /** Publish an already-committed maintenance rewrite to application and live thread subscribers. */
+  readonly publishCommitted: (
+    events: ReadonlyArray<OrchestrationV2StoredEvent>,
+  ) => Effect.Effect<void>;
   readonly write: (input: {
     /** Restate still-bound canonical session rows inside the write transaction. */
     readonly refreshBoundProviderSessions?: true;
@@ -277,27 +281,23 @@ const layerBase: Layer.Layer<
           Effect.uninterruptible,
         );
         const started = performance.now();
-        return sql
-          .withTransaction(Effect.tap(transaction, () => takeLane))
-          .pipe(
-            // ardud: the writer is a synchronous connection, yet single-event writes
-            // held it for 99-267 s on 11 Nov 2026 with no SQL running and no event-loop
-            // stall over 6 s. The body yields to Effect's scheduler every 2,048 ops, and
-            // each yield waited a full round of a saturated run queue while every other
-            // write queued behind it. Run the transaction body without cooperative yields;
-            // a real wait (the publish lane) still suspends.
-            Effect.provideService(Scheduler.PreventSchedulerYield, true),
-            Effect.tap(() =>
-              Effect.annotateCurrentSpan(
-                "orchestration_v2.transaction_ms",
-                Math.round(performance.now() - started),
-              ),
+        return sql.withTransaction(Effect.tap(transaction, () => takeLane)).pipe(
+          // ardud: the writer is a synchronous connection, yet single-event writes
+          // held it for 99-267 s on 11 Nov 2026 with no SQL running and no event-loop
+          // stall over 6 s. The body yields to Effect's scheduler every 2,048 ops, and
+          // each yield waited a full round of a saturated run queue while every other
+          // write queued behind it. Run the transaction body without cooperative yields;
+          // a real wait (the publish lane) still suspends.
+          Effect.provideService(Scheduler.PreventSchedulerYield, true),
+          Effect.tap(() =>
+            Effect.annotateCurrentSpan(
+              "orchestration_v2.transaction_ms",
+              Math.round(performance.now() - started),
             ),
-            Effect.tap(publish),
-            Effect.ensuring(
-              Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void)),
-            ),
-          );
+          ),
+          Effect.tap(publish),
+          Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+        );
       });
 
     // A user can answer after terminal normalization reads the pending request.
@@ -951,6 +951,9 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      publishCommitted: Effect.fn("orchestrationV2.EventSink.publishCommitted")((events) =>
+        publishLane.withPermit(publishStoredEvents(events)).pipe(Effect.uninterruptible),
+      ),
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(

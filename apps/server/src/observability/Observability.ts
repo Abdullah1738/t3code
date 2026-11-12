@@ -75,6 +75,9 @@ export const layer = Layer.unwrap(
 
         return Layer.mergeAll(
           Layer.succeed(Tracer.Tracer, tracer),
+          Layer.succeed(SharedObservability.TraceStorageMaintenance, {
+            withMaintenance: sink.withMaintenance,
+          }),
           BrowserTraceCollector.layer(sink),
         );
       }),

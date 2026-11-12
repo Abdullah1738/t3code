@@ -898,6 +898,9 @@ export function applyToProjection(
   };
 
   switch (event.type) {
+    case "thread.item-redacted":
+      // Source events are scrubbed before replay reaches this audit record.
+      return base;
     case "thread.pull-request-link-updated":
       return {
         ...projection,
