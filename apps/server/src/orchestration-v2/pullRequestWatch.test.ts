@@ -161,6 +161,26 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(second.next, green, noRemarks).changes, []);
   });
 
+  it("compares gate names as sets even when a host repeats a name", () => {
+    const first = evaluatePullRequestWatch(
+      watch(),
+      detail({ checks: [check("A", "success"), check("B", "success")] }),
+      noRemarks,
+    );
+    const repeated = evaluatePullRequestWatch(
+      first.next,
+      detail({ checks: [check("A", "success"), check("A", "success")] }),
+      noRemarks,
+    );
+    assert.deepEqual(repeated.changes, []);
+    const confirmed = evaluatePullRequestWatch(
+      repeated.next,
+      detail({ checks: [check("A", "success")] }),
+      noRemarks,
+    );
+    assert.deepEqual(confirmed.changes, [{ kind: "checks-passed", count: 1, required: false }]);
+  });
+
   it("does not report passed on 217c50a while Terraform is queued", () => {
     const queued = detail({
       headSha: "217c50acf103b1add10865275cc20dd692b04c42",

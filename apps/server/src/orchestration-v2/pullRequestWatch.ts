@@ -58,10 +58,11 @@ export function evaluatePullRequestWatch(
     // A required job created and finished between two passes is never seen pending. Without
     // required checks, any check counts, and advisory bots keep adding passed ones: no wake.
     const gateGrew = required.length > 0 && gateNames.some((name) => !told.includes(name));
+    const previousGate = new Set(passedPending);
     const confirmed =
       required.length > 0 ||
-      (gateNames.length === passedPending.length &&
-        gateNames.every((name) => passedPending.includes(name)));
+      (new Set(gateNames).size === previousGate.size &&
+        gateNames.every((name) => previousGate.has(name)));
     if (passedNow && confirmed && (!passed || gateGrew)) {
       changes.push({ kind: "checks-passed", count: gate.length, required: required.length > 0 });
     }
