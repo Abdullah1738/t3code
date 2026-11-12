@@ -60,6 +60,10 @@ export class BoardStateChanged {
 
 export const WRITE_WAIT_MS = 120_000;
 
+const retryPolicy = Context.Reference("KanbanBoardRetryPolicy", {
+  defaultValue: () => ({ reruns: 8, backoffMs: 0 }),
+});
+
 /**
  * A stale rerun may reuse a read its earlier attempt made outside the gate for
  * this long, when the read's fence has not moved (see `outsideRead`).
@@ -180,11 +184,13 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     attempt = 0,
     // Only a stale rerun passes this in: every new execution starts with its own empty map.
     replayOf?: Map<string, Array<ReplayEntry>>,
+    retry?: { readonly reruns: number; readonly backoffMs: number },
   ): Effect.Effect<A, E, R> =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const parent = yield* operation;
         if (parent) return yield* restore(effect);
+        const policy = retry ?? (yield* retryPolicy);
         const replay = replayOf ?? new Map<string, Array<ReplayEntry>>();
         const op: Operation = {
           fiberId: yield* Effect.fiberId,
@@ -222,8 +228,15 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             ),
           ),
           Effect.catchDefect((defect) =>
-            defect instanceof BoardStateChanged && !op.committed && !op.sideEffect && attempt < 8
-              ? run(effect, cardId, attempt + 1, replay)
+            defect instanceof BoardStateChanged &&
+            !op.committed &&
+            !op.sideEffect &&
+            attempt < policy.reruns
+              ? restore(
+                  policy.backoffMs > 0
+                    ? Effect.sleep(policy.backoffMs * 2 ** attempt)
+                    : Effect.void,
+                ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy)))
               : Effect.die(defect),
           ),
         );
@@ -392,6 +405,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
 
   return {
     run,
+    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string) =>
+      run(effect, cardId).pipe(Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 })),
     access,
     outside,
     // Compensation must run without permits even after the snapshot became stale.

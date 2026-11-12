@@ -542,3 +542,56 @@ it.effect("reads within one attempt and in separate operations are never replaye
     assert.deepStrictEqual([...pair].sort(), [7, 8]);
   }),
 );
+
+it.effect(
+  "a tick step backs off twice, releases its gate, and never retries a saved or sent action",
+  () =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      let attempts = 0;
+      const conflict = locks
+        .step(
+          Effect.gen(function* () {
+            attempts += 1;
+            yield* locks.access("a", Effect.void);
+            yield* locks.outside(
+              Effect.forkChild(locks.run(locks.access("a", Effect.void, true), "x")).pipe(
+                Effect.flatMap(Fiber.join),
+              ),
+              undefined,
+              true,
+            );
+          }),
+          "x",
+        )
+        .pipe(Effect.exit);
+      const fiber = yield* Effect.forkChild(conflict);
+      yield* TestClock.adjust(10);
+      assert.strictEqual(attempts, 2);
+      yield* locks.board("a", Effect.void);
+      yield* TestClock.adjust(20);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(fiber)));
+      assert.strictEqual(attempts, 3);
+      for (const committed of [true, false]) {
+        let calls = 0;
+        const exit = yield* locks
+          .step(
+            Effect.gen(function* () {
+              calls += 1;
+              yield* locks.access("a", Effect.void, committed);
+              yield* locks.outside(
+                Effect.forkChild(locks.run(locks.access("a", Effect.void, true), "x")).pipe(
+                  Effect.flatMap(Fiber.join),
+                ),
+                undefined,
+                committed,
+              );
+            }),
+            "x",
+          )
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(exit));
+        assert.strictEqual(calls, 1);
+      }
+    }),
+);
