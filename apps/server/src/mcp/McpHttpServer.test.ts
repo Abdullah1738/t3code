@@ -466,7 +466,7 @@ it.effect.each([
           tabId: alternateTabId,
           threadId,
         });
-        expect(event.request.input).toEqual({});
+        expect(event.request.input).toEqual({ captureImage: requests <= 6 ? images : false });
         return broker.respond({
           clientId: "mcp-image-option-client",
           connectionId: event.connectionId,
@@ -592,7 +592,7 @@ it.effect("saves the snapshot PNG on request and reports its path", () =>
       const snapshot = yield* callSnapshot({ save: true, includeImage: true });
 
       expect(snapshot.isError).toBe(false);
-      expect(inputs).toEqual([{}]);
+      expect(inputs).toEqual([{ captureImage: true }]);
       expect(snapshot.content.map((content) => content.type)).toContain("image");
       const structured = snapshot.structuredContent as { readonly screenshotPath?: string };
       const screenshotPath = structured.screenshotPath;
@@ -628,7 +628,7 @@ it.effect("treats null snapshot options like omitted ones", () =>
       const nulls = yield* callSnapshot({ tabId: null, includeImage: null, save: null });
 
       expect(nulls).toEqual(omitted);
-      expect(inputs).toEqual([{}, {}]);
+      expect(inputs).toEqual([{ captureImage: false }, { captureImage: false }]);
     }),
   ).pipe(Effect.provide(layerTest)),
 );
@@ -1459,4 +1459,18 @@ it.effect("preserves missing and OAuth-shaped token responses when OAuth is unav
       });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("returns a text-only snapshot without requiring screenshot bytes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { screenshot: _screenshot, ...text } = snapshotResult;
+      const inputs = yield* serveSnapshots("mcp-text-only", text);
+      const result = yield* callSnapshot({ includeImage: false });
+      expect(result.isError).toBe(false);
+      expect(inputs).toEqual([{ captureImage: false }]);
+      expect(result.structuredContent).not.toHaveProperty("screenshot");
+      expect(result.content.some((entry) => entry.type === "image")).toBe(false);
+    }),
+  ).pipe(Effect.provide(layerTest)),
 );

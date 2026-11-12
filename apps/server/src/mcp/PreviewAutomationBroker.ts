@@ -266,6 +266,7 @@ const classifyResponseError = (
       return new PreviewAutomationTimeoutError({
         ...context,
         ...remoteDiagnostics,
+        reason: error.message.slice(0, MAX_REASON_CHARS),
         ...(remoteTimeoutMs === undefined
           ? {}
           : { timeoutMs: Math.min(context.timeoutMs, remoteTimeoutMs) }),
@@ -670,7 +671,11 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
             if (input.updateCurrentTab !== false) {
               yield* disconnect(connection.clientId, connection.queue, true);
             }
-            return yield* new PreviewAutomationTimeoutError(requestContext);
+            return yield* new PreviewAutomationTimeoutError({
+              ...requestContext,
+              timeoutMs: responseTimeoutMs,
+              reason: `Browser host did not respond within ${responseTimeoutMs}ms (request budget ${timeoutMs}ms, delivery grace ${responseTimeoutMs - timeoutMs}ms); the operation may still be running.`,
+            });
           }),
         onSome: (value) => Effect.succeed(value as A),
       });
