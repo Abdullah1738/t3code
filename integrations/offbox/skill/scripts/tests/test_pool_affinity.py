@@ -485,7 +485,7 @@ class HintAndPullTests(Isolated):
         (root/'package.json').write_text('{}')
         row = {'box_id': 'B', '_new_checkout': True}
         for lock, install in (('pnpm-lock.yaml','pnpm install --frozen-lockfile'),
-                              ('yarn.lock','yarn install'), ('package-lock.json','npm ci')):
+                              ('yarn.lock','yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
             with self.subTest(lock=lock):
                 (root/lock).touch()
                 err=io.StringIO()
@@ -493,11 +493,12 @@ class HintAndPullTests(Isolated):
                     runs.new_checkout_hint(row, root)
                 self.assertIn(f'node_modules missing on new box B; prefix your command with {install} &&',err.getvalue())
                 (root/lock).unlink()
-        (root / 'package.json').write_text('{"devDependencies":{"vite-plus":"1.0.0"}}')
+        (root / 'package.json').write_text('{"packageManager":"pnpm@11.10.0","devDependencies":{"vite-plus":"1.0.0"}}')
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             runs.new_checkout_hint(row, root)
-        self.assertIn('with vp i &&', err.getvalue())
+        self.assertIn('with pnpm install --frozen-lockfile &&', err.getvalue())
+        self.assertNotIn('vp i &&', err.getvalue())
         (root / 'package.json').write_text('{}')
         (root / 'vite.config.ts').touch()
         err = io.StringIO()
