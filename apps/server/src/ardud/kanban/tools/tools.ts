@@ -640,12 +640,20 @@ const DiscussionRead = tool(
 const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
-  "The board's shared lessons. Without slug: every page.",
+  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them.",
   {
     slug: Schema.optional(TrimmedNonEmptyString),
+    slugs: Schema.optional(
+      Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
+    ),
     boardId: BoardRef,
   },
-  { pages: Records },
+  {
+    pages: Records,
+    index: Schema.optional(Records),
+    missing: Schema.optional(Schema.Array(Schema.String)),
+    hint: Schema.optional(Schema.String),
+  },
   { readonly: true },
 );
 
