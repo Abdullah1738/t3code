@@ -1,3 +1,4 @@
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -11,6 +12,9 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RunAttemptId,
+  RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2DomainEvent,
@@ -52,7 +56,24 @@ const driver = ProviderDriverKind.make("claudeAgent");
 const instanceId = ProviderInstanceId.make("claudeAgent");
 const modelSelection = { instanceId, model: "claude-test" };
 
-it.effect("a silent delegated child stalls, notifies its parent, and can be cancelled again", () =>
+it.effect.each([
+  "silent",
+  "command_execution",
+  "dynamic_tool",
+  "file_change",
+  "file_search",
+  "web_search",
+  "subagent",
+  "compaction",
+  "assistant_text",
+  "finished_tool",
+  "approval",
+  "question",
+  "resolved_request",
+  "new_attempt",
+  "ended_run",
+  "new_current_run",
+] as const)("delegated stall commit: %s", (race) =>
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("task-cancel-native-subagent");
@@ -60,6 +81,7 @@ it.effect("a silent delegated child stalls, notifies its parent, and can be canc
         readonly turn: ProviderAdapter.ProviderAdapterV2TurnInput;
         readonly events: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>;
       }> = [];
+      let interrupts = 0;
       const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
         instanceId,
         driver,
@@ -127,6 +149,7 @@ it.effect("a silent delegated child stalls, notifies its parent, and can be canc
               steerTurn: () => Effect.void,
               interruptTurn: ({ providerTurnId, providerThread }) =>
                 Effect.gen(function* () {
+                  interrupts += 1;
                   const entry = turns.find(
                     (entry) => entry.turn.threadId === providerThread.appThreadId,
                   )!;
@@ -334,6 +357,154 @@ it.effect("a silent delegated child stalls, notifies its parent, and can be canc
         assert.equal(before.lastProgressKind, "assistant_text");
         assert.equal(before.lastProgressAt, DateTime.formatIso(now));
         yield* TestClock.adjust("16 minutes");
+        if (race !== "silent") {
+          const sink = yield* EventSink.EventSinkV2;
+          const originalCommit = sink.commitCommand;
+          let injected = false;
+          let attemptedCommand: CommandId | undefined;
+          Object.assign(sink, {
+            commitCommand: (input: Parameters<typeof originalCommit>[0]) =>
+              Effect.gen(function* () {
+                if (!injected && input.commandType === "run.interrupt") {
+                  injected = true;
+                  attemptedCommand = input.commandId;
+                  const racedAt = yield* DateTime.now;
+                  const childRuntime = turns.find(
+                    (entry) => entry.turn.threadId === task.childThreadId,
+                  )!;
+                  if (
+                    race === "new_attempt" ||
+                    race === "ended_run" ||
+                    race === "new_current_run"
+                  ) {
+                    const nextRun =
+                      race === "new_attempt"
+                        ? { ...childRun, activeAttemptId: RunAttemptId.make("new-attempt") }
+                        : race === "ended_run"
+                          ? { ...childRun, status: "completed" as const, completedAt: racedAt }
+                          : {
+                              ...childRun,
+                              id: RunId.make("new-current-run"),
+                              ordinal: childRun.ordinal + 1,
+                            };
+                    yield* sink.write({
+                      events: [
+                        {
+                          id: EventId.make("racing-run"),
+                          type: race === "new_current_run" ? "run.created" : "run.updated",
+                          threadId: task.childThreadId!,
+                          runId: nextRun.id,
+                          occurredAt: racedAt,
+                          payload: nextRun,
+                        },
+                      ],
+                    });
+                  } else if (
+                    race === "approval" ||
+                    race === "question" ||
+                    race === "resolved_request"
+                  ) {
+                    const requestId = RuntimeRequestId.make("racing-request");
+                    const stored = yield* watch(
+                      (event) =>
+                        event.type === "runtime-request.updated" && event.payload.id === requestId,
+                    );
+                    yield* Queue.offer(childRuntime.events, {
+                      type: "runtime_request.updated",
+                      driver,
+                      threadId: task.childThreadId!,
+                      runtimeRequest: {
+                        id: requestId,
+                        nodeId: childRuntime.turn.rootNodeId,
+                        providerTurnId: partial.providerTurnId,
+                        nativeRequestRef: null,
+                        kind: race === "approval" ? "command" : "user_input",
+                        status: race === "resolved_request" ? "resolved" : "pending",
+                        responseCapability: {
+                          type: "live",
+                          providerSessionId: childProjection.providerThreads[0]!.providerSessionId!,
+                        },
+                        createdAt: racedAt,
+                        resolvedAt: race === "resolved_request" ? racedAt : null,
+                      },
+                    });
+                    yield* Fiber.join(stored);
+                  } else {
+                    const base = {
+                      ...partial,
+                      id: TurnItemId.make("racing-item"),
+                      status: "running" as const,
+                      startedAt: racedAt,
+                      completedAt: null,
+                      updatedAt: racedAt,
+                    };
+                    const item =
+                      race === "assistant_text"
+                        ? {
+                            ...base,
+                            type: "assistant_message" as const,
+                            text: "New assistant text",
+                          }
+                        : race === "dynamic_tool"
+                          ? {
+                              ...base,
+                              type: "dynamic_tool" as const,
+                              toolName: "long_task",
+                              input: {},
+                            }
+                          : race === "file_change"
+                            ? { ...base, type: "file_change" as const, fileName: "result.txt" }
+                            : race === "file_search"
+                              ? { ...base, type: "file_search" as const }
+                              : race === "web_search"
+                                ? { ...base, type: "web_search" as const }
+                                : race === "compaction"
+                                  ? { ...base, type: "compaction" as const, driver }
+                                  : race === "subagent"
+                                    ? {
+                                        ...base,
+                                        type: "subagent" as const,
+                                        subagentId: childRun.delegatedTaskId!,
+                                        origin: "provider_native" as const,
+                                        driver,
+                                        providerInstanceId: instanceId,
+                                        childThreadId: null,
+                                        prompt: "Long native call",
+                                        result: null,
+                                      }
+                                    : {
+                                        ...base,
+                                        type: "command_execution" as const,
+                                        input: "offbox run -- long-test",
+                                        ...(race === "finished_tool"
+                                          ? { status: "completed" as const, completedAt: racedAt }
+                                          : {}),
+                                      };
+                    const stored = yield* watch(
+                      (event) => event.type === "turn-item.updated" && event.payload.id === item.id,
+                    );
+                    yield* Queue.offer(childRuntime.events, {
+                      type: "turn_item.updated",
+                      driver,
+                      turnItem: item,
+                    });
+                    yield* Fiber.join(stored);
+                  }
+                }
+                return yield* originalCommit(input);
+              }),
+          });
+          yield* guard.check();
+          assert.isTrue(injected);
+          const after = yield* orchestrator.getThreadProjection(task.childThreadId!);
+          assert.isUndefined(after.runs.find((run) => run.id === childRun.id)!.delegatedTaskStall);
+          assert.isDefined(attemptedCommand);
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          assert.isFalse(yield* threads.hasReceipt(attemptedCommand!));
+          yield* worker.drain();
+          assert.equal(interrupts, 0);
+          return;
+        }
         const wake = yield* watch(
           (event) =>
             event.type === "message.updated" &&

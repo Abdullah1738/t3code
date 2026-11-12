@@ -10103,6 +10103,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return;
   });
 
+  const recheckDelegatedTaskStall = Effect.fn("Orchestrator.recheckDelegatedTaskStall")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "run.interrupt" }>,
+    plannedRun: OrchestrationV2Run,
+  ) {
+    const stall = command.delegatedTaskStall;
+    if (stall === undefined) return;
+    const current = yield* projectionStore
+      .getThreadRecords(command.threadId, ["runs", "turnItems", "runtimeRequests", "messages"], {
+        turnItemRunId: plannedRun.id,
+        messageRunIds: [plannedRun.id],
+        messageRoles: ["assistant"],
+      })
+      .pipe(mapDispatchError(command));
+    const run = current.runs.find((candidate) => candidate.id === plannedRun.id);
+    if (
+      run === undefined ||
+      run.status !== "running" ||
+      run.activeAttemptId !== plannedRun.activeAttemptId ||
+      run.providerThreadId !== plannedRun.providerThreadId ||
+      current.runs.findLast((candidate) => candidate.status !== "queued")?.id !== plannedRun.id ||
+      progressBlockers(current, plannedRun.id) ||
+      latestQualifyingProgress(current, plannedRun.id) >
+        DateTime.toEpochMillis(stall.lastProgressAt)
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Delegated task progressed or changed before the stall interrupt committed.",
+      });
+    }
+  });
+
   const dispatchRunInterrupt = Effect.fn("Orchestrator.dispatchRunInterrupt")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "run.interrupt" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -12529,6 +12561,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }
             })
           : undefined;
+    const plannedStall =
+      command.type === "run.interrupt" && command.delegatedTaskStall !== undefined
+        ? plan.events.find(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === command.runId &&
+              event.payload.delegatedTaskStall !== undefined,
+          )
+        : undefined;
+    // Provider ingestion bypasses thread dispatch locks. Read again under the
+    // sink's write transaction so progress and the interrupt have one ordering.
+    const commitRecheck =
+      command.type === "run.interrupt" && plannedStall?.type === "run.updated"
+        ? recheckDelegatedTaskStall(command, plannedStall.payload)
+        : recheck;
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
@@ -12540,7 +12587,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
-        ...(recheck === undefined ? {} : { recheck }),
+        ...(commitRecheck === undefined ? {} : { recheck: commitRecheck }),
       })
       .pipe(
         Effect.catch((cause) =>
