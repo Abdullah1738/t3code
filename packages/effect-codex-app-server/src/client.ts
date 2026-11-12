@@ -40,6 +40,7 @@ export class CodexAppServerClient extends Context.Service<
   CodexAppServerClient,
   {
     readonly raw: CodexAppServerClientRaw;
+    readonly awaitInputEnd: Effect.Effect<void>;
     readonly request: <M extends CodexRpc.ClientRequestMethod>(
       method: M,
       payload: CodexRpc.ClientRequestParamsByMethod[M],
@@ -230,6 +231,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     );
 
   return CodexAppServerClient.of({
+    awaitInputEnd: transport.awaitInputEnd,
     raw: {
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,

@@ -43,6 +43,7 @@ import * as CodexError from "effect-codex-app-server/errors";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 import * as DateTime from "effect/DateTime";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -2468,6 +2469,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ) => Effect.Effect<void> = () => Effect.void,
     environment: NodeJS.ProcessEnv = {},
     awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"],
+    beforeNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2475,6 +2477,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       const serverConfig = yield* makeReplayServerConfig(transcript.scenario).pipe(Effect.orDie);
       const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
         [];
+      const inputEnd = yield* Deferred.make<Effect.Effect<void>>();
       const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
         open: (openInput) =>
           Layer.build(CodexReplay.layerReplay(transcript)).pipe(
@@ -2488,6 +2491,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ),
             Effect.flatMap((context) =>
               Effect.service(CodexClient.CodexAppServerClient).pipe(
+                Effect.tap((client) => Deferred.succeed(inputEnd, client.awaitInputEnd)),
                 Effect.map((client) =>
                   withCodexReplayChildMetadata(client, transcript, readChildMetadata),
                 ),
@@ -2496,6 +2500,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                     ({
                       ...client,
                       ...(awaitSessionExit === undefined ? {} : { awaitSessionExit }),
+                      handleServerNotification: (method, handler) =>
+                        client.handleServerNotification(method, (payload) =>
+                          beforeNotification(method).pipe(Effect.andThen(handler(payload))),
+                        ),
                       request: (method, params) =>
                         onRequest(method, params).pipe(
                           Effect.andThen(client.request(method, params)),
@@ -2593,6 +2601,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         terminalEvents,
         subagentUpdates,
         hasPendingBackgroundWork,
+        awaitInputEnd: Deferred.await(inputEnd).pipe(Effect.flatten),
         firstTerminal: Deferred.await(firstTerminal),
       };
     });
@@ -3416,6 +3425,244 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect(
+    "review801r3: settles a live turn when the app-server exits without an ingestion error",
+    () =>
+      Effect.gen(function* () {
+        const transcript = makeCodexReplayTranscript({
+          scenario: "review801r3-unsolicited-process-exit",
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId: "review801r3-process-thread",
+              nativeTurnId: "review801r3-process-turn",
+              prompt: "Continue.",
+            }),
+            { type: "runtime_exit", status: "success" },
+          ],
+        });
+        const processExited = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          {},
+          Deferred.await(processExited),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            text: "Continue.",
+            attemptId: RunAttemptId.make("review801r3-process-exit"),
+          }),
+        );
+        yield* Effect.yieldNow;
+        // The read resolves with the process-exited error, establishing that the
+        // protocol has observed EOF rather than racing a live process.
+        const read = yield* Effect.exit(
+          harness.runtime.readThreadSnapshot({
+            providerThread: harness.providerThread,
+          }),
+        );
+        assert.equal(read._tag, "Failure");
+        if (Exit.isFailure(read)) {
+          const failure = Cause.squash(read.cause);
+          assert.instanceOf(failure, ProviderAdapter.ProviderAdapterReadThreadSnapshotError);
+          assert.instanceOf(failure.cause, CodexError.CodexAppServerProcessExitedError);
+        }
+        yield* harness.awaitInputEnd;
+        yield* Deferred.succeed(processExited, undefined);
+        yield* Effect.yieldNow;
+        assert.lengthOf(harness.terminalEvents(), 1, "Process EOF left the native turn active");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect("review801r3: settles exactly once when exit overlaps Stop recovery", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "review801r3-stop-process-thread";
+      const nativeTurnId = "review801r3-stop-process-turn";
+      const processExited = yield* Deferred.make<void>();
+      const interruptSent = yield* Deferred.make<void>();
+      const sessionStopped = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "review801r3-stop-process-exit",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+            {
+              type: "expect_outbound",
+              label: "turn/interrupt",
+              frame: {
+                id: 4,
+                method: "turn/interrupt",
+                params: { threadId: nativeThreadId, turnId: nativeTurnId },
+              },
+            },
+            { type: "runtime_exit", status: "success" },
+          ],
+        }),
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped"
+            ? Deferred.succeed(sessionStopped, undefined)
+            : Effect.void,
+        (method) =>
+          method === "turn/interrupt" ? Deferred.succeed(interruptSent, undefined) : Effect.void,
+        undefined,
+        undefined,
+        {},
+        Deferred.await(processExited),
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          text: "Continue.",
+          attemptId: RunAttemptId.make("review801r3-stop-exit"),
+        }),
+      );
+      const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+        driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+        nativeTurnId,
+      });
+      const interrupt = yield* harness.runtime
+        .interruptTurn({ providerThread: harness.providerThread, providerTurnId })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(interruptSent);
+      assert.equal((yield* Fiber.join(interrupt))._tag, "Failure");
+      const recoveryWait = yield* harness.runtime.awaitSessionExit!.pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(recoveryWait);
+      yield* harness.awaitInputEnd;
+      yield* Deferred.succeed(processExited, undefined);
+      yield* Effect.yieldNow;
+      assert.lengthOf(
+        harness.terminalEvents(),
+        1,
+        "Cancelling Stop recovery must not abandon process-exit observation",
+      );
+      yield* Effect.all([harness.runtime.awaitSessionExit!, harness.runtime.awaitSessionExit!]);
+      yield* Deferred.await(sessionStopped);
+      assert.lengthOf(harness.terminalEvents(), 1);
+      assert.equal(harness.terminalEvents()[0]?.status, "failed");
+      assert.lengthOf(
+        harness.events.filter(
+          (event) =>
+            event.type === "provider_session.updated" && event.providerSession.status === "stopped",
+        ),
+        1,
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("review801r3: drains buffered completion before settling process exit", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "buffered-exit-thread";
+      const nativeTurnId = "buffered-exit-turn";
+      const processExited = yield* Deferred.make<void>();
+      const exitObserved = yield* Deferred.make<void>();
+      const dispatchStarted = yield* Deferred.make<void>();
+      const allowDispatch = yield* Deferred.make<void>();
+      const sessionStopped = yield* Deferred.make<void>();
+      const answer = {
+        type: "agentMessage" as const,
+        id: "buffered-exit-answer",
+        text: "Final output before exit.",
+        phase: "final_answer" as const,
+        memoryCitation: null,
+      };
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "buffered-completion-process-exit",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
+            ...["item/started", "item/completed"].map(
+              (method): CodexReplay.CodexAppServerReplayEntry => ({
+                type: "emit_inbound",
+                label: method,
+                frame: {
+                  method,
+                  params: { item: answer, threadId: nativeThreadId, turnId: nativeTurnId },
+                },
+              }),
+            ),
+            {
+              type: "emit_inbound",
+              label: "turn/completed",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+            { type: "runtime_exit", status: "success" },
+          ],
+        }),
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped"
+            ? Deferred.succeed(sessionStopped, undefined)
+            : Effect.void,
+        undefined,
+        undefined,
+        undefined,
+        {},
+        Deferred.await(processExited).pipe(
+          Effect.andThen(Deferred.succeed(exitObserved, undefined)),
+        ),
+        (method) =>
+          method === "item/started"
+            ? Deferred.succeed(dispatchStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(allowDispatch)),
+              )
+            : Effect.void,
+      );
+      yield* harness.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          text: "Continue.",
+          attemptId: RunAttemptId.make("buffered-exit"),
+        }),
+      );
+      yield* Deferred.await(dispatchStarted);
+      yield* Deferred.succeed(processExited, undefined);
+      yield* Deferred.await(exitObserved);
+      yield* Effect.yieldNow;
+      assert.lengthOf(harness.terminalEvents(), 0, "Process exit overtook buffered completion");
+      assert.isFalse(yield* Deferred.isDone(sessionStopped));
+      yield* Deferred.succeed(allowDispatch, undefined);
+      yield* Deferred.await(sessionStopped);
+      yield* harness.runtime.awaitSessionExit!;
+      assert.deepEqual(
+        assistantMessages(harness.events).map((event) => event.message.text),
+        [answer.text],
+      );
+      assert.lengthOf(harness.terminalEvents(), 1);
+      assert.equal(harness.terminalEvents()[0]?.status, "completed");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect("confirms process exit before ending every turn on a failed app-server", () =>
     Effect.gen(function* () {
       const nativeThreadId = "process-stop-thread";
@@ -3431,7 +3678,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       });
       const transcript = makeCodexReplayTranscript({
         scenario: "process-stop-two-turns",
-        entries: [...preamble, ...second.slice(-3).map((entry) => withReplayRequestId(entry, 4))],
+        entries: [
+          ...preamble,
+          ...second.slice(-3).map((entry) => withReplayRequestId(entry, 4)),
+          { type: "runtime_exit", status: "success" },
+        ],
       });
       const stopping = yield* Deferred.make<void>();
       const exited = yield* Deferred.make<void>();
@@ -6896,10 +7147,14 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   it.effect("settles retained command cards before confirmed session exit closes ingestion", () =>
     Effect.gen(function* () {
       const stopped = yield* Deferred.make<void>();
+      const processExited = yield* Deferred.make<void>();
       const harness = yield* makeCodexReplayHarness(
         makeCodexReplayTranscript({
           scenario: "completed-turn-session-exit",
-          entries: completedTurnWithRunningCommand,
+          entries: [
+            ...completedTurnWithRunningCommand,
+            { type: "runtime_exit", status: "success" },
+          ],
         }),
         (event) =>
           event.type === "provider_session.updated" && event.providerSession.status === "stopped"
@@ -6909,7 +7164,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         undefined,
         undefined,
         {},
-        Effect.void,
+        Deferred.await(processExited),
       );
       yield* harness.runtime.startTurn(
         makeCodexTestTurnInput({
@@ -6922,6 +7177,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       );
       yield* harness.firstTerminal;
       assert.isTrue(yield* harness.hasPendingBackgroundWork);
+      yield* Deferred.succeed(processExited, undefined);
       yield* harness.runtime.awaitSessionExit!;
       yield* Deferred.await(stopped);
       const commandEvents = harness.events.filter(

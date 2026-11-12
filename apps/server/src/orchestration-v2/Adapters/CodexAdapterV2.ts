@@ -6931,6 +6931,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
+        // The event queue outlives the transport, so process exit must be observed
+        // even outside Stop recovery. Drain buffered notifications before fallback
+        // settlement; process exit can precede stdout EOF and native completion.
+        const sessionExitObserver =
+          client.awaitSessionExit === undefined
+            ? undefined
+            : yield* client.awaitSessionExit.pipe(
+                Effect.retry({ schedule: Schedule.spaced("1 second") }),
+                Effect.andThen(client.awaitInputEnd),
+                Effect.andThen(settleExitedSession()),
+                Effect.forkIn(scope),
+              );
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
@@ -6943,13 +6956,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 event.providerSession.status === "stopped",
             ),
           ),
-          ...(client.awaitSessionExit === undefined
+          ...(sessionExitObserver === undefined
             ? {}
             : {
-                awaitSessionExit: client.awaitSessionExit.pipe(
-                  // Artifact settlement must survive cancellation of the caller's bounded exit wait.
-                  Effect.andThen(settleExitedSession().pipe(Effect.forkIn(scope), Effect.asVoid)),
-                ),
+                awaitSessionExit: Fiber.join(sessionExitObserver),
               }),
           canReuseContextUsage: canReuseCodexContextUsage,
           // Known gap: a subagent that Codex resumes later reads as completed
