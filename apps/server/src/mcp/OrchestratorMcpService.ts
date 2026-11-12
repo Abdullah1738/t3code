@@ -102,6 +102,8 @@ import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingEr
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+// ardud: who is redeeming a secretRef
+import { SecretRedeemer } from "../ardud/auth/heldSecrets.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
   clientRuntimeModeCeiling,
@@ -318,6 +320,7 @@ function supportedInheritedOptions(
   return options?.filter((option) => {
     // Legacy variants are canonicalized and checked by the selection resolver.
     if (option.id === "variant") return true;
+    if (option.id === "fastMode" && option.value === false) return true;
     const descriptor = descriptors.find((candidate) => candidate.id === option.id);
     return (
       descriptor !== undefined &&
@@ -344,6 +347,8 @@ function invalidOptionSelections(
       continue;
     }
     seen.add(selection.id);
+    // Legacy selections retain this enforced marker after fast mode leaves the catalog.
+    if (selection.id === "fastMode" && selection.value === false) continue;
     if (descriptors === undefined) continue;
     const descriptor = descriptors.find((candidate) => candidate.id === selection.id);
     if (descriptor === undefined) {
@@ -2078,13 +2083,13 @@ const make = Effect.gen(function* () {
               }),
             }),
       };
-      const { task } = yield* scheduledTasks
-        .upsert(upsertInput)
-        .pipe(
-          Effect.mapError((error) =>
-            failure("orchestration_error", `Could not schedule task: ${error.message}`),
-          ),
-        );
+      const { task } = yield* scheduledTasks.upsert(upsertInput).pipe(
+        // ardud: a secretRef from a board ask is only for the thread it was given to.
+        Effect.provideService(SecretRedeemer, parent?.thread.id ?? null),
+        Effect.mapError((error) =>
+          failure("orchestration_error", `Could not schedule task: ${error.message}`),
+        ),
+      );
       return yield* summarizeScheduledTask(scope, { parent, limits }, task);
     }),
     listScheduledTasks: Effect.fn("OrchestratorMcpService.listScheduledTasks")(
@@ -2154,13 +2159,13 @@ const make = Effect.gen(function* () {
           createdBy: existing.createdBy,
           creationSource: existing.creationSource,
         };
-        const { task } = yield* scheduledTasks
-          .upsert(upsertInput)
-          .pipe(
-            Effect.mapError((error) =>
-              failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
-            ),
-          );
+        const { task } = yield* scheduledTasks.upsert(upsertInput).pipe(
+          // ardud: a secretRef from a board ask is only for the thread it was given to.
+          Effect.provideService(SecretRedeemer, parent?.thread.id ?? null),
+          Effect.mapError((error) =>
+            failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
+          ),
+        );
         return yield* summarizeScheduledTask(scope, { parent, limits }, task);
       },
     ),

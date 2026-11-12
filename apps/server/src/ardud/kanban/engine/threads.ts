@@ -45,6 +45,12 @@ export interface KanbanThreadPr {
   readonly url: string;
   readonly title: string | null;
   readonly state: "open" | "draft" | "merged" | "closed";
+  /** Its head commit while the thread watches the PR (the watch keeps it current); null otherwise. */
+  readonly head?: string | null;
+  /** Checks on the head as last synced; null when none were reported. */
+  readonly checks?: "passing" | "failing" | "pending" | null;
+  /** When its state and checks were last synced from the host; null when never. */
+  readonly at?: string | null;
 }
 
 export interface KanbanThreadView {
@@ -136,7 +142,11 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     model: ModelSelection,
   ) => Effect.Effect<void, KanbanThreadError>;
-  readonly interrupt: (threadId: ThreadId, reason: string) => Effect.Effect<void>;
+  /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
+  readonly interrupt: (
+    threadId: ThreadId,
+    reason: string,
+  ) => Effect.Effect<void, KanbanThreadError>;
 }
 
 export class KanbanThreads extends Context.Service<KanbanThreads, KanbanThreadsShape>()(
@@ -205,6 +215,10 @@ const make = Effect.gen(function* () {
                     : pr.snapshot.state === "open" && pr.snapshot.isDraft
                       ? "draft"
                       : pr.snapshot.state,
+                // Only a live watch: an ended one's head may be commits behind.
+                head: pr.watch?.headSha ?? null,
+                checks: pr.snapshot?.checksState ?? null,
+                at: pr.snapshot?.syncedAt ?? null,
               })),
             },
       ),
@@ -422,7 +436,11 @@ const make = Effect.gen(function* () {
         reason,
       });
     },
-    Effect.catchCause(() => Effect.void),
+    Effect.mapError((error) =>
+      isKanbanThreadError(error)
+        ? error
+        : new KanbanThreadError({ operation: "interrupt", detail: detailOf(error) }),
+    ),
   );
 
   return KanbanThreads.of({

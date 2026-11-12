@@ -2692,22 +2692,27 @@ describe("OrchestratorMcpService provider resolution", () => {
       const claude = ProviderInstanceId.make("claudeAgent");
       const high = { id: "effort", value: "high" } as const;
       const xhigh = { id: "effort", value: "xhigh" } as const;
-      const stale = { id: "fastMode", value: false } as const;
+      const stale = { id: "retiredOption", value: false } as const;
       const cases = [
         { name: "object override", target: { options: { effort: "xhigh" } }, expected: [xhigh] },
         { name: "array override", target: { options: [xhigh] }, expected: [xhigh] },
         { name: "no override", expected: [high] },
+        {
+          name: "explicit standard marker",
+          target: { options: { fastMode: false } },
+          expected: [high, { id: "fastMode", value: false }],
+        },
         { name: "array clear", target: { options: [] }, expected: [] },
         { name: "object clear", target: { options: {} }, expected: [] },
         {
           name: "explicit true",
-          target: { options: [{ id: "fastMode", value: true }] },
-          error: "Unknown option fastMode",
+          target: { options: [{ id: "retiredOption", value: true }] },
+          error: "Unknown option retiredOption",
         },
         {
           name: "explicit false",
-          target: { options: { fastMode: false } },
-          error: "Unknown option fastMode",
+          target: { options: { retiredOption: false } },
+          error: "Unknown option retiredOption",
         },
         {
           name: "obsolete select",
@@ -2875,10 +2880,14 @@ describe("OrchestratorMcpService provider resolution", () => {
         instanceId: ProviderInstanceId,
         driver: string,
         model: string,
-        optionDescriptors: NonNullable<NonNullable<ServerProvider["models"][number]["capabilities"]>["optionDescriptors"]>,
+        optionDescriptors: NonNullable<
+          NonNullable<ServerProvider["models"][number]["capabilities"]>["optionDescriptors"]
+        >,
       ): ServerProvider => ({
         ...providerSnapshot({ instanceId, driver: ProviderDriverKind.make(driver), model }),
-        models: [{ slug: model, name: model, isCustom: false, capabilities: { optionDescriptors } }],
+        models: [
+          { slug: model, name: model, isCustom: false, capabilities: { optionDescriptors } },
+        ],
       });
       const legacyProvider = snapshot(opencode, "opencode", "opus/claude-opus-5-5#high", [
         select("variant"),
@@ -2896,6 +2905,21 @@ describe("OrchestratorMcpService provider resolution", () => {
       ];
       const fast = { id: "fastMode", value: true } as const;
       const cases = [
+        {
+          name: "inherits a saved standard marker without a fast catalog option",
+          mode: "apply",
+          hideFastDescriptor: true,
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: false }],
+          },
+        },
         {
           name: "missing flag keeps legacy",
           mode: undefined,
@@ -2918,13 +2942,25 @@ describe("OrchestratorMcpService provider resolution", () => {
           name: "apply routes suffix without source catalog lookup",
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [fast] },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "high" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "high" }, fast],
+          },
         },
         {
           name: "mapped source suffix and option agree",
           mode: "apply",
-          parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [{ id: "variant", value: "high" }, fast] },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "high" }, fast] },
+          parent: {
+            instanceId: opencode,
+            model: "opus/claude-opus-5-5#high",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "high" }, fast],
+          },
         },
         {
           name: "explicit empty options clear an inherited suffix",
@@ -2938,7 +2974,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high" },
           target: { model: "opus/cx/gpt-6.1-sol#max", options: { reasoningEffort: "max" } },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "max" }],
+          },
         },
         {
           name: "a requested suffix conflicts with a different effort",
@@ -2952,46 +2992,96 @@ describe("OrchestratorMcpService provider resolution", () => {
           mode: "apply",
           parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high" },
           target: { model: "opus/cx/gpt-6.1-sol#max" },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "max" }],
+          },
         },
         {
           name: "native override replaces inherited variant and retains secondary setting",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
           target: { options: { effort: "max" } },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "max" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "max" }, fast],
+          },
         },
         {
           name: "codex explicit effort replaces inherited variant and retains tier",
           mode: "apply",
-          parent: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "variant", value: "high" }, { id: "serviceTier", value: "high" }] },
+          parent: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [
+              { id: "variant", value: "high" },
+              { id: "serviceTier", value: "high" },
+            ],
+          },
           target: { options: { reasoningEffort: "max" } },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "max" }, { id: "serviceTier", value: "high" }] },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [
+              { id: "reasoningEffort", value: "max" },
+              { id: "serviceTier", value: "high" },
+            ],
+          },
         },
         {
           name: "native clear",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, fast],
+          },
           target: { options: [] },
           expected: { instanceId: claude, model: "claude-opus-5-5", options: [] },
         },
         {
           name: "explicit effort replaces conflicting inherited efforts",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, fast] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "variant", value: "high" }, { id: "effort", value: "max" }, fast],
+          },
           target: { options: { effort: "max" } },
-          expected: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "effort", value: "max" }, fast] },
+          expected: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "effort", value: "max" }, fast],
+          },
         },
         {
           name: "codex variant canonicalizes",
           mode: "apply",
-          parent: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "variant", value: "high" }] },
-          expected: { instanceId: codexInstanceId, model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "high" }] },
+          parent: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "variant", value: "high" }],
+          },
+          expected: {
+            instanceId: codexInstanceId,
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
         {
           name: "invalid inherited option is rejected",
           mode: "apply",
-          parent: { instanceId: claude, model: "claude-opus-5-5", options: [{ id: "fastMode", value: "yes" }] },
+          parent: {
+            instanceId: claude,
+            model: "claude-opus-5-5",
+            options: [{ id: "fastMode", value: "yes" }],
+          },
           error: "expects a boolean",
         },
         {
@@ -3005,39 +3095,84 @@ describe("OrchestratorMcpService provider resolution", () => {
           name: "duplicate requested options are rejected",
           mode: "apply",
           parent: { instanceId: claude, model: "claude-opus-5-5" },
-          target: { options: [{ id: "effort", value: "max" }, { id: "effort", value: "max" }] },
+          target: {
+            options: [
+              { id: "effort", value: "max" },
+              { id: "effort", value: "max" },
+            ],
+          },
           error: "specified more than once",
         },
         {
           name: "conflicting stored suffix fails closed",
           mode: "apply",
-          parent: { instanceId: opencode, model: "opus/claude-opus-5-5#high", options: [{ id: "variant", value: "max" }] },
+          parent: {
+            instanceId: opencode,
+            model: "opus/claude-opus-5-5#high",
+            options: [{ id: "variant", value: "max" }],
+          },
           error: "conflicts with its effort",
         },
       ] as const;
       for (const testCase of cases) {
         const commands: Array<{ modelSelection: ModelSelection }> = [];
         const task = {
-          id: taskId, threadId: parentThreadId, origin: "app_owned", childThreadId,
-          providerInstanceId: testCase.parent.instanceId, model: testCase.parent.model,
-          status: "running", result: null,
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: testCase.parent.instanceId,
+          model: testCase.parent.model,
+          status: "running",
+          result: null,
         };
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             hasReceipt: () => Effect.succeed(false),
-            getThreadRecords: ((threadId: ThreadId) => Effect.succeed(
-              threadId === parentThreadId
-                ? parentProjection(commands.length > 0 ? [task] : [], testCase.parent)
-                : { ...childProjection, thread: { ...childProjection.thread, modelSelection: commands[0]?.modelSelection } },
-            )) as never,
-            dispatch: (command) => Effect.sync(() => {
-              commands.push(command as unknown as { modelSelection: ModelSelection });
-              return { storedEvents: [{ event: { type: "subagent.updated", payload: task } }] } as never;
-            }),
+            getThreadRecords: ((threadId: ThreadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? parentProjection(commands.length > 0 ? [task] : [], testCase.parent)
+                  : {
+                      ...childProjection,
+                      thread: {
+                        ...childProjection.thread,
+                        modelSelection: commands[0]?.modelSelection,
+                      },
+                    },
+              )) as never,
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command as unknown as { modelSelection: ModelSelection });
+                return {
+                  storedEvents: [{ event: { type: "subagent.updated", payload: task } }],
+                } as never;
+              }),
           }),
-          ServerSettings.layerTest(testCase.mode === undefined ? {} : { ardudHarnessMigration: { selections: testCase.mode } }),
-          providerRegistryLayer(testCase.mode === "apply" ? providers : [legacyProvider, ...providers]),
+          ServerSettings.layerTest(
+            testCase.mode === undefined
+              ? {}
+              : { ardudHarnessMigration: { selections: testCase.mode } },
+          ),
+          providerRegistryLayer(
+            testCase.mode === "apply"
+              ? "hideFastDescriptor" in testCase
+                ? providers.map((provider) => ({
+                    ...provider,
+                    models: provider.models.map((model) => ({
+                      ...model,
+                      capabilities: {
+                        ...model.capabilities,
+                        optionDescriptors: model.capabilities?.optionDescriptors?.filter(
+                          (option) => option.id !== "fastMode",
+                        ),
+                      },
+                    })),
+                  }))
+                : providers
+              : [legacyProvider, ...providers],
+          ),
           adapterRegistryLayer([opencode, claude, codexInstanceId]),
           Layer.mock(ProjectService.ProjectService)({}),
           Layer.mock(SecretRequests.SecretRequests)({}),
@@ -3046,7 +3181,12 @@ describe("OrchestratorMcpService provider resolution", () => {
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const target = "target" in testCase ? yield* decodeTarget(testCase.target) : undefined;
-          const call = service.delegateTask(scope, { task: "Review.", target, mode: "async", clientRequestId: testCase.name });
+          const call = service.delegateTask(scope, {
+            task: "Review.",
+            target,
+            mode: "async",
+            clientRequestId: testCase.name,
+          });
           if ("error" in testCase) {
             const error = yield* call.pipe(Effect.flip);
             assert.equal(error.code, "invalid_request", testCase.name);
@@ -3065,9 +3205,13 @@ describe("OrchestratorMcpService provider resolution", () => {
         NodeServices.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)({
           hasReceipt: () => Effect.succeed(false),
-          getThreadRecords: () => Effect.succeed(parentProjection([], {
-            instanceId: opencode, model: "opus/claude-opus-5-5#high",
-          })),
+          getThreadRecords: () =>
+            Effect.succeed(
+              parentProjection([], {
+                instanceId: opencode,
+                model: "opus/claude-opus-5-5#high",
+              }),
+            ),
         }),
         ServerSettings.layerTest({ ardudHarnessMigration: { selections: "apply" } }),
         providerRegistryLayer([legacyProvider]),
@@ -3078,9 +3222,13 @@ describe("OrchestratorMcpService provider resolution", () => {
       );
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const error = yield* service.delegateTask(scope, {
-            task: "Review.", mode: "async", clientRequestId: "mapped-provider-missing",
-        }).pipe(Effect.flip);
+        const error = yield* service
+          .delegateTask(scope, {
+            task: "Review.",
+            mode: "async",
+            clientRequestId: "mapped-provider-missing",
+          })
+          .pipe(Effect.flip);
         assert.equal(error.code, "provider_unavailable");
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(missingDestination))));
     }),

@@ -3,6 +3,11 @@ import { describe, expect, it } from "vite-plus/test";
 import { subagentCardDetail, subagentCardElapsed } from "./subagent-card-presentation";
 
 describe("subagent card", () => {
+  it("preserves provider-managed results because there is no child thread to open", () => {
+    const result = "First finding.\n\nSecond finding with [evidence](https://example.com).";
+    expect(subagentCardDetail(result, true)).toBe(result);
+    expect(subagentCardDetail("  ", true)).toBeNull();
+  });
   it("shows readable result text and suppresses generic completion messages", () => {
     expect(
       subagentCardDetail(

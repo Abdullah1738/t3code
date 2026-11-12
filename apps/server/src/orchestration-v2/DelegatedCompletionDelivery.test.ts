@@ -1045,7 +1045,7 @@ const seedRestartCancelledChild = (input: {
   readonly name: string;
   readonly completionWake: "always" | "settled_only";
   readonly continuationPending: boolean;
-  readonly runStatus?: "cancelled" | "completed";
+  readonly runStatus?: "cancelled" | "completed" | "interrupted";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
   readonly now: DateTime.Utc;
 }) =>
@@ -1844,7 +1844,7 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
       const child = (
         name: string,
         continuationPending: boolean,
-        runStatus?: "cancelled" | "completed",
+        runStatus?: "cancelled" | "completed" | "interrupted",
       ) =>
         seedRestartCancelledChild({
           parentThreadId: threadId,
@@ -1858,6 +1858,7 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
           now,
         });
       const resumed = yield* child("restart-resumed-child", true);
+      const interrupted = yield* child("restart-interrupted-child", true, "interrupted");
       const stopped = yield* child("restart-stopped-child", false);
       const backgrounded = yield* child("restart-backgrounded-child", true, "completed");
       const recut = yield* child("restart-recut-child", false);
@@ -1899,6 +1900,9 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
       assert.equal(task(stopped.taskId)?.status, "cancelled");
       assert.equal(task(stopped.taskId)?.completionDelivery?.state, "claimed");
       assert.equal(task(resumed.taskId)?.status, "running");
+      assert.equal(task(interrupted.taskId)?.status, "running");
+      assert.isNull(task(interrupted.taskId)?.result ?? null);
+      assert.isTrue(yield* orchestrator.delegatedTaskResultPending(interrupted.childThreadId));
       assert.isNull(task(resumed.taskId)?.result ?? null);
       assert.equal(task(backgrounded.taskId)?.status, "running");
       assert.isNull(task(backgrounded.taskId)?.result ?? null);

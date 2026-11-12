@@ -1,3 +1,4 @@
+import { carryActionValue } from "../actionTelemetry.ts";
 import { Atom } from "effect/reactivity";
 import {
   KANBAN_WS_METHODS as M,
@@ -149,7 +150,10 @@ export interface KanbanClient {
   watchPreviews(boardId: string): Unsubscribe;
 }
 
-const PREVIEW_FETCH_LIMIT = 40;
+// Every preview read queues on the server's one board-database reader ahead of
+// whatever the owner opens next (a discussion's messages, a card). A board holds
+// hundreds of discussions; 40 at a time kept that queue full for minutes.
+const PREVIEW_FETCH_LIMIT = 4;
 const MESSAGE_PAGE = 50;
 const RETRY_MIN_MS = 5_000;
 const RETRY_MAX_MS = 60_000;
@@ -240,6 +244,22 @@ export function createKanbanClient(
   const feeds = new Map<string, BoardFeed>();
   // Followers (see `follow`) waiting to join a board's next feed.
   const rejoins = new Map<string, Set<() => void>>();
+  // Previews a closed feed held. A board reopened after its keepalive (or a
+  // failed feed) starts from these, so only discussions with newer messages are
+  // read again instead of one read per discussion on the board.
+  const retainedPreviews = new Map<string, ReadonlyMap<string, KanbanMessage>>();
+  const retainPreviews = (boardId: string, feed: BoardFeed) => {
+    const previews = feed.state?.lastMessages;
+    if (previews !== undefined && previews.size > 0) retainedPreviews.set(boardId, previews);
+  };
+  const withRetainedPreviews = (
+    boardId: string,
+    state: KanbanBoardState | undefined,
+  ): KanbanBoardState | undefined => {
+    const retained = retainedPreviews.get(boardId);
+    if (state === undefined || retained === undefined || state.lastMessages.size > 0) return state;
+    return { ...state, lastMessages: retained };
+  };
   // Board state is written by the feed and by optimistic updates; the board
   // store re-emits whenever either changes it.
   const stateListeners = new Map<string, Set<() => void>>();
@@ -310,8 +330,11 @@ export function createKanbanClient(
         M.subscribe,
         { boardId: boardId as never },
         (event) => {
-          const next = applyKanbanWatchEvent(created.state, event);
+          const opened = created.state === undefined;
+          const applied = applyKanbanWatchEvent(created.state, event);
+          const next = opened ? withRetainedPreviews(boardId, applied) : applied;
           created.state = next === undefined ? next : withPendingReads(boardId, next);
+          carryActionValue(event, created.state);
           for (const listener of Array.from(created.events)) listener(event);
           if (event._tag === "snapshot") resendReads(boardId);
         },
@@ -321,6 +344,7 @@ export function createKanbanClient(
           if (created.failed) return;
           created.failed = true;
           created.error = error;
+          retainPreviews(boardId, created);
           if (feeds.get(boardId) === created) feeds.delete(boardId);
           const close = created.close;
           created.close = null;
@@ -349,6 +373,7 @@ export function createKanbanClient(
       own.events.delete(onEvent);
       own.failures.delete(onFailure);
       if (own.events.size > 0) return;
+      retainPreviews(boardId, own);
       if (feeds.get(boardId) === own) feeds.delete(boardId);
       const close = own.close;
       own.close = null;
@@ -523,8 +548,12 @@ export function createKanbanClient(
         }
         return full;
       };
-      const show = () => {
-        if (loaded) emit(list.map(view));
+      const show = (trigger?: unknown) => {
+        if (loaded) {
+          const value = list.map(view);
+          carryActionValue(trigger, value);
+          emit(value);
+        }
       };
       // Messages a live change brought while a read was out; they are newer
       // than the read's copies (answers only grow).
@@ -565,7 +594,7 @@ export function createKanbanClient(
         const base = oldestRead > newestHeld + 1 ? [] : list;
         list = mergeMessages(mergeMessages(base, page), [...during.values()]);
         loaded = true;
-        show();
+        show(page);
       });
       let earlier: Promise<void> | null = null;
       const loadEarlier = () => {

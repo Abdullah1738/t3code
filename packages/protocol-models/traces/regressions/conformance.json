@@ -1,0 +1,21 @@
+{
+  "failed": false,
+  "seed": 20261108,
+  "runs": 100,
+  "shrinks": 0,
+  "path": null,
+  "trace": [
+    "rollback(0)",
+    "rollback(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)",
+    "claim(0)",
+    "deliver(0)",
+    "complete(0)"
+  ],
+  "error": null
+}

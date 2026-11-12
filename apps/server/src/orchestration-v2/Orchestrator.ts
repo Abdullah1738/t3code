@@ -1408,7 +1408,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const startNextQueuedRun = Effect.fn("Orchestrator.startNextQueuedRun")(
     function* (
       threadId: ThreadId,
-      options?: { readonly failedRunId?: RunId; readonly endedRunId?: RunId },
+      options?: {
+        readonly failedRunId?: RunId;
+        readonly endedRunId?: RunId;
+        readonly allowPendingContinuation?: boolean;
+      },
     ) {
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
       const projection = yield* readCommandProjection(threadId);
@@ -1419,6 +1423,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ) {
         return;
       }
+
+      // Recovery commits the cancelled source and its continuation together.
+      // Its terminal-event listener must not run follow-ups ahead of that effect.
+      // Explicit Resume lets the user run the queue ahead of automatic recovery.
+      if (
+        !options?.allowPendingContinuation &&
+        (yield* effectOutbox.hasPendingRunContinuation(threadId))
+      ) return;
 
       // The limit already stopped this thread. Starting the queue would send
       // every waiting message and drop it from the queue as each one fails.
@@ -12207,7 +12219,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
       if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
-        yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
+        yield* mapDispatchError(command)(
+          startNextQueuedRun(command.threadId, { allowPendingContinuation: command.type === "queue.resume" }),
+        );
       }
       return {
         sequence: receipt.resultSequence,
@@ -12504,7 +12518,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
-      yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
+      yield* mapDispatchError(command)(
+          startNextQueuedRun(command.threadId, { allowPendingContinuation: command.type === "queue.resume" }),
+        );
     }
     if (command.type === "notification.delivery.accept") {
       yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));

@@ -383,11 +383,15 @@ export interface ThreadManagementServiceShape {
   }) => Effect.Effect<OrchestrationV2ThreadProjection, ThreadManagementError>;
   readonly getShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
+    /** Only these threads, read with one indexed IN list (control live lists). */
+    readonly threadIds?: ReadonlyArray<string>;
   }) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly readShellSnapshot: (options?: {
     readonly location?: "active" | "archive";
     readonly afterThreadId?: string;
+    readonly recentFirst?: boolean;
     readonly limit?: number;
+    readonly omitIdleSubagents?: boolean;
   }) => Effect.Effect<
     Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>,
     Orchestrator.OrchestratorV2Error
@@ -708,8 +712,6 @@ const make = Effect.gen(function* () {
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "message.dispatch" }>,
     options: { readonly migrate: boolean; readonly cutoverComplete: boolean },
   ) {
-    yield* ensureCommandTranscripts(command);
-
     // Neither an accepted nor a rejected command may acquire new side effects
     // on replay, including when its id belongs to a different aggregate.
     const readReceipt = <A>(
@@ -729,6 +731,8 @@ const make = Effect.gen(function* () {
     if (Option.isSome(receipt)) return yield* orchestrator.dispatch(command);
     const projectReceipt = yield* readReceipt(receipts.getProjectByCommandId(command.commandId));
     if (Option.isSome(projectReceipt)) return yield* orchestrator.dispatch(command);
+
+    yield* ensureCommandTranscripts(command);
 
     if (options.cutoverComplete && command.modelSelection !== undefined) {
       const reason = postCutoverSelectionProblem(command.modelSelection);

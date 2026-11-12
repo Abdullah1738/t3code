@@ -206,6 +206,40 @@ it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
     }),
 );
 
+it.effect("interrupt fails on a failed shell read and treats a missing thread as stopped", () =>
+  Effect.gen(function* () {
+    const failedId = ThreadId.make("thread-stop-read-failed");
+    const missingId = ThreadId.make("thread-stop-missing");
+    const readError = new Orchestrator.OrchestratorProjectionError({
+      threadId: failedId,
+      cause: "injected shell read failure",
+    });
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: (threadId) =>
+        threadId === failedId ? Effect.fail(readError) : Effect.succeed(null),
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      // A saved stop retries on this instead of closing as delivered.
+      const result = yield* Effect.result(threads.interrupt(failedId, "Card moved"));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toBeInstanceOf(KanbanThreadError);
+        expect(result.failure.operation).toBe("interrupt");
+      }
+      yield* threads.interrupt(missingId, "Card moved");
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);
+
 it.effect("a keyed send passes stable command and message ids to thread management", () =>
   Effect.gen(function* () {
     const sent: Array<ThreadManagementService.ThreadManagementSendInput> = [];

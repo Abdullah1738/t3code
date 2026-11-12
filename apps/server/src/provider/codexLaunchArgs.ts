@@ -7,7 +7,10 @@ export const resolveCodexLaunchArgs = (
   environment: NodeJS.ProcessEnv = process.env,
 ) => environment[T3CODE_CODEX_LAUNCH_ARGS_ENV]?.trim() || launchArgs?.trim() || "";
 
-const codexLaunchArgv = (launchArgs?: string): ReadonlyArray<string> => tokenizeCliArgs(launchArgs);
+const codexLaunchArgv = (launchArgs?: string): ReadonlyArray<string> =>
+  tokenizeCliArgs(launchArgs).map((arg) =>
+    arg.replace(/^((?:--config=|-c=)?service_tier\s*=).*$/, '$1"default"'),
+  );
 
 export const codexAppServerArgs = (launchArgs?: string) => [
   "app-server",

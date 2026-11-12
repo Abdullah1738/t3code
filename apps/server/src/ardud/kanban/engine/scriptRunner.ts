@@ -70,10 +70,13 @@ export interface ProcessSpec {
   readonly timeoutMs: number;
   /** stdout past this many bytes stops the run (`overflow`). */
   readonly outputBytes: number;
+  /** Written to the program's stdin, which is then closed; without it stdin is closed from the start. */
+  readonly stdin?: string | undefined;
 }
 
 /**
- * Runs one program with stdin closed in its own process group, and kills
+ * Runs one program in its own process group, with stdin closed unless the
+ * spec gives it something to read, and kills
  * the whole group on timeout, on too much output, or when the run is
  * interrupted.
  */
@@ -105,9 +108,14 @@ export const runProcess = (spec: ProcessSpec) =>
     const child = NodeChildProcess.spawn("nice", ["-n", "10", ...spec.argv], {
       cwd: spec.cwd,
       env: spec.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [spec.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: true,
     });
+    if (spec.stdin !== undefined && child.stdin !== null) {
+      // A program that never reads its input closes the pipe early; that is not a failed run.
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(spec.stdin);
+    }
     // Something outside the group (a setsid daemon) can hold our pipes forever,
     // so a stopped run closes its ends instead of waiting for `close`. Once the
     // leader exited its group was already killed and its id may be reused.

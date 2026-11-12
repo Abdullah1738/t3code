@@ -1,3 +1,4 @@
+import { continuationReport, markQueuedRunRecovered } from "../ardud/fast-install/report.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
@@ -193,6 +194,15 @@ function startWithMissingWorktree(
               new ProjectionStore.ProjectionStoreReadError({
                 threadId,
                 cause: "simulated inherited-background projection failure",
+              }),
+            );
+          },
+          getRunControlState: () => {
+            projectionReadCount += 1;
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreReadError({
+                threadId,
+                cause: "simulated run-control read failure",
               }),
             );
           },
@@ -766,6 +776,16 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
+          getRunControlState: (_threadId, wantedRunId) =>
+            Effect.as(
+              failReadIfRunning,
+              (() => {
+                const run = projection.runs.find((candidate) => candidate.id === wantedRunId);
+                return run === undefined
+                  ? null
+                  : { activeAttemptId: run.activeAttemptId, status: run.status };
+              })(),
+            ),
           getTurnStartHistory: () =>
             input.nativeDelivery === true
               ? Effect.succeed(projection.turnItems)
@@ -842,6 +862,22 @@ const startPreparedTurn = (controls: RunExecutionService.RunExecutionServiceV2St
     modelSelection: controls.modelSelection,
     runtimePolicy: controls.runtimePolicy,
   });
+
+effectIt.effect("attributes a recovered original queue run only at its actual provider request", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue queued work", nativeDelivery: true });
+    const run = harness.projection().runs.at(-1)!;
+    expect(run.restartContinuationOfRunId).toBeUndefined();
+    const before = continuationReport().firstResumedProviderRequestAt;
+    markQueuedRunRecovered(run.id);
+    yield* harness.start;
+    expect(continuationReport().firstResumedProviderRequestAt).toBe(before);
+    expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+    yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+    expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+    expect(continuationReport().firstResumedProviderRequestAt).not.toBeNull();
+  }),
+);
 
 effectIt.effect(
   "delivers the normal native switch history once and resumes it on the second turn",

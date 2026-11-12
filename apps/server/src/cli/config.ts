@@ -25,6 +25,11 @@ import { readBootstrapEnvelope } from "../bootstrap.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
+import {
+  boundedTraceRetention,
+  DEFAULT_TRACE_MAX_BYTES,
+  DEFAULT_TRACE_MAX_FILES,
+} from "../ardud/observability/traceRetention.ts";
 
 const modeFlag = Flag.Literals("mode", ServerConfig.RuntimeMode.literals).pipe(
   Flag.withDescription("Runtime mode. `desktop` keeps loopback defaults unless overridden."),
@@ -89,7 +94,7 @@ export const traceFileConfig = Config.String("T3CODE_TRACE_FILE").pipe(
   Config.map(Option.getOrUndefined),
 );
 export const traceMaxFilesConfig = Config.Int("T3CODE_TRACE_MAX_FILES").pipe(
-  Config.withDefault(10),
+  Config.withDefault(DEFAULT_TRACE_MAX_FILES),
 );
 
 const EnvServerConfig = Config.all({
@@ -97,7 +102,9 @@ const EnvServerConfig = Config.all({
   traceMinLevel: Config.LogLevel("T3CODE_TRACE_MIN_LEVEL").pipe(Config.withDefault("Info")),
   traceTimingEnabled: Config.Boolean("T3CODE_TRACE_TIMING_ENABLED").pipe(Config.withDefault(true)),
   traceFile: traceFileConfig,
-  traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
+  traceMaxBytes: Config.Int("T3CODE_TRACE_MAX_BYTES").pipe(
+    Config.withDefault(DEFAULT_TRACE_MAX_BYTES),
+  ),
   traceMaxFiles: traceMaxFilesConfig,
   traceBatchWindowMs: Config.Int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
   otlpTracesUrl: Config.String("T3CODE_OTLP_TRACES_URL").pipe(
@@ -441,14 +448,15 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     bootstrap?.otlpLogsUrl,
     persistedObservabilitySettings.otlpLogsUrl,
   );
+  const retention = boundedTraceRetention(env.traceMaxBytes, env.traceMaxFiles);
 
   const config: ServerConfig.ServerConfig["Service"] = {
     logLevel,
     traceMinLevel: env.traceMinLevel,
     traceTimingEnabled: env.traceTimingEnabled,
     traceBatchWindowMs: env.traceBatchWindowMs,
-    traceMaxBytes: env.traceMaxBytes,
-    traceMaxFiles: env.traceMaxFiles,
+    traceMaxBytes: retention.maxBytes,
+    traceMaxFiles: retention.maxFiles,
     otlpTracesUrl: traces?.url,
     otlpMetricsUrl: metrics?.url,
     otlpLogsUrl: logs?.url,

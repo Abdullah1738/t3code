@@ -46,6 +46,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Predicate from "effect/Predicate";
 import * as FileSystem from "effect/FileSystem";
 import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp";
@@ -625,7 +626,7 @@ describe("CodexAdapterV2 runtime policy", () => {
 
         assert.equal(params.model, "gpt-5.4");
         assert.equal(params.effort, "xhigh");
-        assert.equal(params.serviceTier, "priority");
+        assert.equal(params.serviceTier, "default");
         assert.equal(params.cwd, "/workspace/model-options");
         assert.equal(params.collaborationMode?.settings.model, "gpt-5.4");
         assert.equal(params.collaborationMode?.mode, interactionMode);
@@ -650,7 +651,7 @@ describe("CodexAdapterV2 runtime policy", () => {
           },
           omitServiceTier: true,
         });
-        assert.equal(managed.serviceTier, undefined);
+        assert.equal(managed.serviceTier, "default");
 
         for (const tier of [undefined, "default"]) {
           const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
@@ -663,8 +664,7 @@ describe("CodexAdapterV2 runtime policy", () => {
               options: tier === undefined ? [] : [{ id: "serviceTier", value: tier }],
             },
           });
-          if (tier === undefined) assert.notProperty(params, "serviceTier");
-          else assert.equal(params.serviceTier, "default");
+          assert.equal(params.serviceTier, "default");
         }
       }),
   );
@@ -1766,6 +1766,7 @@ function codexReplayPreamble(input: {
           input: [{ type: "text", text: input.sentPrompt ?? input.prompt }],
           cwd: "/workspace",
           model: "gpt-5.4",
+          serviceTier: "default",
           approvalPolicy: "never",
           approvalsReviewer: "user",
           sandboxPolicy: { type: "dangerFullAccess" },
@@ -1962,6 +1963,27 @@ describe("CodexAdapterV2 session initialize", () => {
                   },
                 ]
               : []),
+            ...(scenario === "success"
+              ? []
+              : [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "cleanup",
+                    frame: {
+                      id: injectExpected ? 4 : 3,
+                      method: "thread/unsubscribe",
+                      params: { threadId: nativeThreadId },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "cleanup-result",
+                    frame: {
+                      id: injectExpected ? 4 : 3,
+                      result: {},
+                    },
+                  },
+                ]),
           ],
         }),
       );
@@ -1998,7 +2020,12 @@ describe("CodexAdapterV2 session initialize", () => {
       const result = yield* session.ensureThread(threadId, existing).pipe(Effect.result);
       assert.deepEqual(
         session.requests.map((request) => request.method),
-        ["initialize", "thread/start", ...(injectExpected ? ["thread/inject_items"] : [])],
+        [
+          "initialize",
+          "thread/start",
+          ...(injectExpected ? ["thread/inject_items"] : []),
+          ...(scenario === "success" ? [] : ["thread/unsubscribe"]),
+        ],
       );
       if (scenario === "success") {
         assert.equal(result._tag, "Success");
@@ -2041,6 +2068,104 @@ describe("CodexAdapterV2 session initialize", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+
+  it.effect.each([
+    { operation: "start", lateReply: true },
+    { operation: "fork", lateReply: true },
+    { operation: "start", lateReply: false },
+    { operation: "fork", lateReply: false },
+  ] as const)(
+    "cancels native $operation allocation with lateReply=$lateReply",
+    ({ operation, lateReply }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const dispatched = yield* Deferred.make<void>();
+          const reply = yield* Deferred.make<void>();
+          const cleaned = yield* Deferred.make<void>();
+          const nativeThreadId = `cancelled-${operation}`;
+          const allocatedId = operation === "start" ? nativeThreadId : "late-fork";
+          const preamble = replayPreamble(nativeThreadId);
+          const allocation =
+            operation === "start"
+              ? preamble.slice(0, 5)
+              : [
+                  ...preamble.slice(0, 5),
+                  {
+                    type: "expect_outbound" as const,
+                    label: "thread/fork",
+                    frame: {
+                      id: 3,
+                      method: "thread/fork",
+                      params: {
+                        threadId: nativeThreadId,
+                        config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                      },
+                    },
+                  },
+                  {
+                    ...withReplayRequestId(replayPreamble(allocatedId)[4]!, 3),
+                    label: "thread/fork",
+                  },
+                ];
+          const session = yield* openReplaySession(
+            makeCodexReplayTranscript({
+              scenario: `cancelled-allocation-${operation}`,
+              entries: [
+                ...allocation,
+                {
+                  type: "expect_outbound",
+                  label: "cleanup",
+                  frame: {
+                    id: operation === "start" ? 3 : 4,
+                    method: "thread/unsubscribe",
+                    params: { threadId: allocatedId },
+                  },
+                },
+                {
+                  type: "emit_inbound",
+                  label: "cleanup-result",
+                  frame: { id: operation === "start" ? 3 : 4, result: {} },
+                },
+              ],
+            }),
+            (entry) =>
+              entry.label === `thread/${operation}`
+                ? Deferred.succeed(dispatched, undefined).pipe(
+                    Effect.andThen(Deferred.await(reply)),
+                  )
+                : entry.label === "cleanup-result"
+                  ? Deferred.succeed(cleaned, undefined)
+                  : Effect.void,
+          );
+          const source = operation === "fork" ? yield* session.ensureThread("source") : undefined;
+          const loading = yield* (
+            operation === "start"
+              ? session.ensureThread("target")
+              : session.runtime.forkThread({
+                  sourceProviderThread: source!,
+                  targetThreadId: ThreadId.make("target"),
+                })
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(dispatched);
+          yield* Fiber.interrupt(loading);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(loading)));
+          assert.notInclude(
+            session.requests.map((request) => request.method),
+            "thread/unsubscribe",
+          );
+          if (lateReply) {
+            yield* Deferred.succeed(reply, undefined);
+            yield* Deferred.await(cleaned);
+            assert.equal(session.requests.at(-1)?.method, "thread/unsubscribe");
+            assert.deepEqual(session.requests.at(-1)?.params, { threadId: allocatedId });
+          }
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("resumes an already injected row without starting or injecting again", () =>
@@ -2545,9 +2670,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           model: "gpt-5.4",
           config: {
             "tools.update_plan.enabled": true,
+            service_tier: "default",
             mcp_optional_startup_grace_ms: 10_000,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               tool_timeout_sec: 3_900,
               http_headers: { Authorization: "Bearer secret-codex-token" },
             },
@@ -2626,11 +2754,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...CodexAdapterV2.CODEX_THREAD_CONFIG,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               tool_timeout_sec: 3_900,
               http_headers: { Authorization: "Bearer secret-codex-token" },
             },
             "mcp_servers.recall": {
               url: "http://127.0.0.1:18765/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               http_headers: { "X-Robob-Thread": threadId, "X-Robob-Driver": "codex" },
             },
           },
@@ -2642,6 +2774,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...CodexAdapterV2.CODEX_THREAD_CONFIG,
             "mcp_servers.recall": {
               url: "http://127.0.0.1:18765/mcp",
+              required: false,
+              startup_timeout_sec: 5,
               http_headers: { "X-Robob-Thread": childThreadId, "X-Robob-Driver": "codex" },
             },
           },
@@ -2955,6 +3089,95 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       );
       assert.lengthOf(harness.terminalEvents(), 1);
       assert.isFalse(yield* harness.hasPendingBackgroundWork);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("interrupts the native turn when its start is abandoned before Codex replies", () =>
+    Effect.gen(function* () {
+      // Live 2026-11-11: a board Stop landed 67ms after turn/start was sent.
+      // Codex started the turn anyway and it worked unseen for 30+ minutes.
+      const nativeThreadId = "abandoned-start-thread";
+      const nativeTurnId = "abandoned-start-turn";
+      const prompt = "Work the card.";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const transcript = makeCodexReplayTranscript({
+        scenario: "abandoned-turn-start-interrupt",
+        entries: [
+          ...preamble.slice(0, -2),
+          {
+            type: "emit_inbound",
+            label: "turn/start/late-reply",
+            afterMs: 1000,
+            frame: {
+              id: 3,
+              result: { turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }) },
+            },
+          },
+          {
+            type: "emit_inbound",
+            label: "turn/started",
+            frame: {
+              method: "turn/started",
+              params: {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+              },
+            },
+          },
+          {
+            type: "expect_outbound",
+            label: "turn/interrupt",
+            frame: {
+              id: 4,
+              method: "turn/interrupt",
+              params: { threadId: nativeThreadId, turnId: nativeTurnId },
+            },
+          },
+          { type: "emit_inbound", label: "turn/interrupt", frame: { id: 4, result: {} } },
+        ],
+      });
+      const turnStartSent = yield* Deferred.make<void>();
+      const interruptSent = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        transcript,
+        () => Effect.void,
+        (method) =>
+          method === "turn/start"
+            ? Deferred.succeed(turnStartSent, undefined)
+            : method === "turn/interrupt"
+              ? Deferred.succeed(interruptSent, undefined)
+              : Effect.void,
+      );
+      const start = yield* harness.runtime
+        .startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("abandoned-start-attempt"),
+            text: prompt,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(turnStartSent);
+      // The run is stopped while turn/start is still waiting for its reply.
+      yield* Fiber.interrupt(start);
+      assert.isFalse(yield* Deferred.isDone(interruptSent));
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(interruptSent);
+      // The abandoned turn is never adopted as this run's turn.
+      assert.isUndefined(
+        harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+        ),
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(
@@ -3380,6 +3603,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 input: [{ type: "text", text: turnText(index) }],
                 cwd: "/workspace",
                 model: "gpt-5.4",
+                serviceTier: "default",
                 ...turnPolicies[turnModes[index]!],
                 summary: "detailed",
               },
@@ -4121,6 +4345,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   input: [],
                   cwd: "/workspace",
                   model: "gpt-5.4",
+                  serviceTier: "default",
                   approvalPolicy: "never",
                   approvalsReviewer: "user",
                   sandboxPolicy: { type: "dangerFullAccess" },
@@ -9115,10 +9340,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         if (model) {
           assert.deepEqual(harness.subagentUpdates().at(-1)?.subagent.modelSelection?.options, [
             { id: "reasoningEffort", value: "high" },
-            ...(name.startsWith("current Codex") ? [] : [{ id: "serviceTier", value: "priority" }]),
+            { id: "serviceTier", value: "priority" },
           ]);
         }
-        assert.equal(metadataRequests, name === "current Codex Sol" ? 1 : 2);
+        assert.equal(metadataRequests, 1);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -9128,26 +9353,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   );
 
   it.effect.each(["failed", "malformed", "wrong child", "blank model"] as const)(
-    "resumes child metadata after a %s read",
+    "does not load a child for metadata after a %s read",
     (readResult) =>
       Effect.scoped(
         Effect.gen(function* () {
-          const modelReported = yield* Deferred.make<void>();
-          const model = "gpt-6-sol";
           const metadataRequests: Array<string> = [];
           const harness = yield* makeCodexReplayHarness(
             resumeSubagentTranscript,
-            (event) =>
-              event.type === "subagent.updated" && event.subagent.model === model
-                ? Deferred.succeed(modelReported, undefined)
-                : Effect.void,
+            () => Effect.void,
             undefined,
             (threadId, method) => {
               assert.equal(threadId, RESUME_CHILD_THREAD);
               metadataRequests.push(method);
-              if (method === "thread/resume") {
-                return Effect.succeed({ thread: { id: threadId }, model });
-              }
               switch (readResult) {
                 case "failed":
                   return Effect.fail(
@@ -9175,11 +9392,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               text: RESUME_PROMPT,
             }),
           );
-          yield* Deferred.await(modelReported);
           yield* TestClock.adjust("100 millis");
           yield* harness.firstTerminal;
-          assert.equal(harness.subagentUpdates().at(-1)?.subagent.model, model);
-          assert.deepEqual(metadataRequests, ["thread/read", "thread/resume"]);
+          assert.equal(harness.subagentUpdates().at(-1)?.subagent.model, null);
+          assert.deepEqual(metadataRequests, ["thread/read"]);
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),

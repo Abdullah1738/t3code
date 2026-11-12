@@ -2,7 +2,7 @@ import {
   KANBAN_BACKLOG,
   KANBAN_DONE_STAGES,
   kanbanHeldUpBy,
-  kanbanNeedsOwner,
+  kanbanCardNeedsOwner,
   kanbanOpenAsks,
   kanbanOpenStep,
   kanbanPickOrder,
@@ -481,7 +481,12 @@ export interface StageBoard {
   readonly active: ReadonlyArray<StageColumn>;
   /** Completed, Deployed and Verified, stacked in one column. */
   readonly shipped: ReadonlyArray<StageColumn>;
-  readonly owner: StageColumn;
+  /**
+   * Cards held in Needs Owner, then cards with an ask he can answer now.
+   * `count` is the number to show: held cards whose asks all wait on someone
+   * else (handed over, waiting on their asker, expired) are listed, not counted.
+   */
+  readonly owner: StageColumn & { readonly count: number };
   readonly total: number;
 }
 
@@ -500,21 +505,24 @@ export function stageBoard(
       .sort(order)
       .map((card) => cardView(card, state, nowMs)),
   });
+  const held = column("needs_owner").cards;
+  const asking = cards
+    .filter((card) => card.stage !== "needs_owner" && kanbanCardNeedsOwner(card, nowMs))
+    .sort(oldestAskFirst);
+  const ownerColumn = {
+    stage: "needs_owner" as const,
+    label: STAGE_LABELS.needs_owner,
+    cards: [...held, ...asking.map((card) => cardView(card, state, nowMs))],
+    count:
+      asking.length +
+      cards.filter((card) => card.stage === "needs_owner" && kanbanCardNeedsOwner(card, nowMs))
+        .length,
+  };
   return {
     active: ACTIVE_STAGES.map((stage) => column(stage)),
     shipped: SHIPPED_STAGES.map((stage) => column(stage, newestFirst)),
     // Waiting cards first, then cards whose open asks don't block them.
-    owner: {
-      stage: "needs_owner",
-      label: STAGE_LABELS.needs_owner,
-      cards: [
-        ...column("needs_owner").cards,
-        ...cards
-          .filter((card) => card.stage !== "needs_owner" && kanbanNeedsOwner(card))
-          .sort(oldestAskFirst)
-          .map((card) => cardView(card, state, nowMs)),
-      ],
-    },
+    owner: ownerColumn,
     total: cards.length,
   };
 }
@@ -683,14 +691,15 @@ export interface GoalSummary {
   readonly needsOwner: number;
 }
 
-export function activeGoals(state: KanbanBoardState): GoalSummary[] {
+/** `nowMs` leaves expired asks out of `needsOwner`; without it none count as expired. */
+export function activeGoals(state: KanbanBoardState, nowMs = 0): GoalSummary[] {
   return [...state.goals.values()]
     .filter((goal) => goal.status === "active")
     .map((goal) => ({
       goal,
       progress: goalProgress(state, goal.id),
       needsOwner: [...state.cards.values()].filter(
-        (card) => card.goalId === goal.id && kanbanNeedsOwner(card),
+        (card) => card.goalId === goal.id && kanbanCardNeedsOwner(card, nowMs),
       ).length,
     }))
     .sort((a, b) => a.goal.createdAt.localeCompare(b.goal.createdAt));

@@ -222,6 +222,22 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
+  it("overrides fast options, SDK settings and launch flags with standard mode", () => {
+    const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: {
+        ...CLAUDE_TEST_MODEL_SELECTION,
+        options: [{ id: "fastMode", value: true }],
+      },
+      nativeThreadId: "standard-thread",
+      resume: true,
+      cwd: "/workspace",
+      sdkSettings: { fastMode: true },
+      settings: { ...DEFAULT_CLAUDE_SETTINGS, launchArgs: '--fast --settings {"fastMode":true}' },
+    });
+    assert.include(options.settings, { fastMode: false });
+    assert.notProperty(options.extraArgs ?? {}, "fast");
+    assert.notProperty(options.extraArgs ?? {}, "settings");
+  });
   it.each([false, true])("requests thinking summaries with resume=%s", (resume) => {
     const options = ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: CLAUDE_TEST_MODEL_SELECTION,
@@ -2379,15 +2395,18 @@ describe("ClaudeAdapterV2 native fork", () => {
   );
 });
 
-function makeFakeClaudeCli(answerSetServers = true) {
+function makeFakeClaudeCli(answerSetServers: boolean | "recall-error" | "reject" = true) {
   const spawns: Array<SpawnOptions> = [];
   const controlRequests: Array<object> = [];
+  const stdouts: NodeStream.PassThrough[] = [];
+  let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
     const stdout = new NodeStream.PassThrough();
     stdins.push(stdin);
+    stdouts.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
       stdin,
       stdout,
@@ -2407,12 +2426,32 @@ function makeFakeClaudeCli(answerSetServers = true) {
         pending = pending.slice(end + 1);
         if (frame.type !== "control_request") continue;
         controlRequests.push(frame.request);
+        if (frame.request.subtype === "mcp_reconnect") homeConnected = true;
         const setServers = frame.request.subtype === "mcp_set_servers";
         if (setServers && !answerSetServers) continue;
         const response = {
-          subtype: "success",
+          subtype: setServers && answerSetServers === "reject" ? "error" : "success",
           request_id: frame.request_id,
-          response: setServers ? { added: [], removed: [], errors: {} } : {},
+          ...(setServers && answerSetServers === "reject"
+            ? { error: "registration rejected" }
+            : {}),
+          response:
+            frame.request.subtype === "mcp_status"
+              ? {
+                  mcpServers: [
+                    { name: "t3-code", status: "connected" },
+                    { name: "recall", status: "failed" },
+                    { name: "dia", status: homeConnected ? "connected" : "failed" },
+                  ],
+                }
+              : setServers
+                ? {
+                    added: [],
+                    removed: [],
+                    errors:
+                      answerSetServers === "recall-error" ? { recall: "connection refused" } : {},
+                  }
+                : {},
         };
         stdout.write(`${JSON.stringify({ type: "control_response", response })}\n`);
       }
@@ -2425,7 +2464,16 @@ function makeFakeClaudeCli(answerSetServers = true) {
   };
   // The SDK closes the CLI by ending its stdin.
   const closed = () => stdins.length > 0 && stdins.every((stdin) => stdin.writableEnded);
-  return { spawn, spawns, controlRequests, closed };
+  return {
+    spawn,
+    spawns,
+    controlRequests,
+    closed,
+    emitHomeFailure: () =>
+      stdouts[0]!.write(
+        `${JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "dia", status: "failed" }] })}\n`,
+      ),
+  };
 }
 
 describe("ClaudeAdapterV2 MCP credential channel", () => {
@@ -2434,12 +2482,20 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
     url: "http://127.0.0.1:43123/mcp",
     headers: { Authorization: "Bearer dummy-mcp-credential" },
   };
-  const openWith = (cli: ReturnType<typeof makeFakeClaudeCli>) =>
+  const openWith = (
+    cli: ReturnType<typeof makeFakeClaudeCli>,
+    statuses: Array<{ server: string; status: string }> = [],
+    recall = false,
+  ) =>
     Effect.gen(function* () {
       const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner;
       return yield* runner.open({
         threadId: ThreadId.make("thread-claude-mcp-channel"),
         providerSessionId: ProviderSessionId.make("provider-session-claude-mcp-channel"),
+        onMcpStatus: (status) =>
+          Effect.sync(() => {
+            statuses.push(status);
+          }),
         options: {
           ...ClaudeAdapterV2.makeClaudeQueryOptions({
             modelSelection: CLAUDE_TEST_MODEL_SELECTION,
@@ -2447,7 +2503,12 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
             resume: false,
             cwd: null,
             environment: { PATH: "/usr/bin" },
-            mcpServers: { "t3-code": t3McpServer },
+            mcpServers: {
+              "t3-code": t3McpServer,
+              ...(recall
+                ? { recall: { ...t3McpServer, headers: { "X-Robob-Thread": "isolated-test" } } }
+                : {}),
+            },
           }),
           pathToClaudeCodeExecutable: "/opt/claude/cli.js",
           spawnClaudeCodeProcess: cli.spawn,
@@ -2478,15 +2539,64 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
     }),
   );
 
-  it.effect("closes the CLI when it never answers the MCP registration", () =>
+  it.effect("reconnects failed home-configured servers on the next turn", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli();
+      const statuses: Array<{ server: string; status: string }> = [];
+      const session = yield* openWith(cli, statuses);
+      const initialized = yield* Deferred.make<void>();
+      const pump = yield* session.messages.pipe(
+        Stream.runForEach(() => Deferred.succeed(initialized, undefined)),
+        Effect.forkChild,
+      );
+      cli.emitHomeFailure();
+      yield* Deferred.await(initialized);
+      assert.equal(statuses.find((status) => status.server === "dia")?.status, "unavailable");
+      yield* session.retryMcp ?? Effect.void;
+      assert.equal(
+        statuses.filter((status) => status.server === "dia").at(-1)?.status,
+        "available",
+      );
+      assert.isTrue(
+        cli.controlRequests.some((request) => Reflect.get(request, "subtype") === "mcp_reconnect"),
+      );
+      yield* session.close;
+      yield* Fiber.interrupt(pump);
+    }),
+  );
+
+  for (const mode of ["recall-error", "reject"] as const) {
+    it.effect(`continues after ${mode} with unavailable status`, () =>
+      Effect.gen(function* () {
+        const cli = makeFakeClaudeCli(mode);
+        const statuses: Array<{ server: string; status: string }> = [];
+        const session = yield* openWith(cli, statuses, true);
+        assert.equal(statuses.find((status) => status.server === "recall")?.status, "unavailable");
+        assert.equal(
+          statuses.find((status) => status.server === "t3-code")?.status,
+          mode === "reject" ? "unavailable" : "available",
+        );
+        yield* session.setModel("claude-sonnet-4-6");
+        yield* session.close;
+        assert.isTrue(cli.closed());
+      }),
+    );
+  }
+
+  it.effect("keeps the CLI usable when MCP registration never answers", () =>
     Effect.gen(function* () {
       const cli = makeFakeClaudeCli(false);
       const opening = yield* openWith(cli).pipe(Effect.result, Effect.forkChild);
-      yield* TestClock.adjust("90 seconds");
+      yield* TestClock.adjust("6 seconds");
       const opened = yield* Fiber.join(opening);
 
-      assert.equal(opened._tag, "Failure");
-      assert.isTrue(cli.closed());
+      assert.equal(opened._tag, "Success");
+      if (opened._tag === "Success") {
+        yield* opened.success.setModel("claude-sonnet-4-6");
+        assert.isFalse(cli.closed());
+        yield* opened.success.close;
+        assert.isTrue(cli.closed());
+      }
     }),
   );
 });
@@ -3586,9 +3696,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* settle;
           assert.deepEqual(harness.liveSelectionChanges, [
             { model: "claude-opus-5-5" },
-            { effortLevel: "xhigh", fastMode: true, ultracode: true },
+            { effortLevel: "xhigh", fastMode: false, ultracode: true },
             { model: "claude-sonnet-4-6" },
-            { effortLevel: "high", fastMode: null, ultracode: null },
+            { effortLevel: "high", fastMode: false, ultracode: null },
           ]);
           assert.strictEqual(harness.getOpenedOptions(), originalOptions);
           assert.lengthOf(harness.offeredMessages, 4);
@@ -6749,7 +6859,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 tools: { type: "preset", preset: "claude_code" },
                 permissionMode: "bypassPermissions",
                 allowDangerouslySkipPermissions: true,
-                settings: { showThinkingSummaries: true },
+                settings: { showThinkingSummaries: true, fastMode: false },
                 sessionId: WAKE_NATIVE_SESSION,
               },
             },

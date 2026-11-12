@@ -7,6 +7,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { makeStaleWhileRevalidate } from "../ardud/perf/staleWhileRevalidate.ts";
+
 const SSH_PORT = 22;
 
 export class RemoteOpenTargets extends Context.Service<
@@ -80,7 +82,10 @@ export const make = Effect.gen(function* () {
     return targets;
   });
 
-  return RemoteOpenTargets.of({ resolveTargets: () => resolveTargets });
+  // ardud: resolved on every WebSocket connect (tailscale CLI, sshd probes).
+  // Serve the last answer and refresh it in the background after a minute.
+  const cachedTargets = makeStaleWhileRevalidate(resolveTargets, 60_000);
+  return RemoteOpenTargets.of({ resolveTargets: () => cachedTargets });
 });
 
 export const layer = Layer.effect(RemoteOpenTargets, make);

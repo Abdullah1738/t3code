@@ -1,17 +1,20 @@
 import {
   KANBAN_BACKLOG,
+  KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardId,
   KanbanCardId,
   KanbanDiscussionId,
   ThreadId,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardRetry,
   type KanbanDiscussion,
   type KanbanPool,
   type ModelSelection,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 
 import {
   applyReviewResult,
@@ -40,7 +43,12 @@ import {
   reviewerQuietDue,
   waitingOnBackground,
   BACKGROUND_GRACE_MS,
+  AGING_STEP_MS,
+  cardFlow,
+  schedule,
 } from "./rules.ts";
+
+const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
 
 const model = (name: string): ModelSelection => ({
   instanceId: ProviderInstanceId.make("opencode"),
@@ -112,7 +120,10 @@ const card = (patch: Partial<KanbanCard> = {}): KanbanCard => {
     createdBy: { _tag: "owner" },
     createdAt: "2026-10-25T00:00:00Z",
     updatedAt: "2026-10-25T00:00:00Z",
-    movedAt: `2026-10-25T00:00:${String(n).padStart(2, "0")}Z`,
+    // One second apart, and still a real time past the 99th card.
+    movedAt: `2026-10-25T${[Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":")}Z`,
     ...patch,
   };
 };
@@ -259,6 +270,7 @@ describe("planDispatch", () => {
         pools([[opus, 1]]),
         new Map(),
         () => 0,
+        undefined,
         attempted,
       ),
     ).toMatchObject([{ cardId: next.id }]);
@@ -276,6 +288,7 @@ describe("planDispatch", () => {
         pools([[opus, 1]]),
         new Map(),
         () => 0,
+        undefined,
         attempted,
       ),
     ).toEqual([]);
@@ -522,6 +535,330 @@ describe("planDispatch", () => {
     const urgent = card({ priority: 1, blockedBy: [blocker.id] });
     const plan = planDispatch(board, [routine, blocker, urgent], pools([[opus, 1]]));
     expect(plan.map((d) => d.cardId)).toEqual([blocker.id]);
+  });
+
+  it("ranks a P3 card that unblocks a P1 card, even through a chain, as P1", () => {
+    const routine = card({ priority: 2 });
+    const root = card({ priority: 3 });
+    const middle = card({ priority: 4, blockedBy: [root.id] });
+    const urgent = card({ priority: 1, blockedBy: [middle.id] });
+    const cards = [routine, root, middle, urgent];
+    expect(schedule(cards).get(root.id)).toMatchObject({ urgency: 1, rank: 1, holds: 2 });
+    const plan = planDispatch(board, cards, pools([[opus, 1]]));
+    expect(plan.map((d) => d.cardId)).toEqual([root.id]);
+  });
+
+  it("lifts a low card that unblocks many: one step at 10 cards, two at 100, never to P1", () => {
+    const fan = (count: number, priority: number) => {
+      const root = card({ priority });
+      return [
+        root,
+        ...Array.from({ length: count }, () => card({ priority: 4, blockedBy: [root.id] })),
+      ];
+    };
+    const [hundred, ...hundredWaiters] = fan(100, 4);
+    const [ten, ...tenWaiters] = fan(10, 4);
+    const [nine, ...nineWaiters] = fan(9, 4);
+    const p1 = card({ priority: 1 });
+    const p2 = card({ priority: 2 });
+    const p3 = card({ priority: 3 });
+    const cards = [
+      nine!,
+      ten!,
+      hundred!,
+      p3,
+      p2,
+      p1,
+      ...hundredWaiters,
+      ...tenWaiters,
+      ...nineWaiters,
+    ];
+    const ranks = schedule(cards);
+    expect(ranks.get(hundred!.id)).toMatchObject({ holds: 100, rank: 2 });
+    expect(ranks.get(ten!.id)).toMatchObject({ holds: 10, rank: 3 });
+    expect(ranks.get(nine!.id)).toMatchObject({ holds: 9, rank: 4 });
+    const plan = planDispatch(board, cards, pools([[opus, 6]]));
+    // P1 stays first; at P2 and P3 the card that unblocks more goes before the plain one.
+    expect(plan.map((d) => d.cardId)).toEqual([
+      p1.id,
+      hundred!.id,
+      p2.id,
+      ten!.id,
+      p3.id,
+      nine!.id,
+    ]);
+  });
+
+  it("ages a waiting card one step per 3 days so it cannot starve, but never past P1 work", () => {
+    const start = Date.parse("2026-10-25T00:00:00Z");
+    const at = (ms: number) => iso(start + ms);
+    const old = card({ priority: 4, movedAt: at(0) });
+    // The others arrive after every check below, so only `old` ages.
+    const p3 = card({ priority: 3, movedAt: at(30 * AGING_STEP_MS) });
+    const p2 = card({ priority: 2, movedAt: at(30 * AGING_STEP_MS) });
+    const p1 = card({ priority: 1, movedAt: at(30 * AGING_STEP_MS) });
+    const cards = [old, p3, p2, p1];
+    const first = (nowMs: number) =>
+      planDispatch(board, cards, pools([[opus, 4]]), new Map(), () => 0, nowMs).map(
+        (d) => d.cardId,
+      );
+    expect(first(start + AGING_STEP_MS - 1)).toEqual([p1.id, p2.id, p3.id, old.id]);
+    // One step: it ties with the P3 card and is older.
+    expect(first(start + AGING_STEP_MS)).toEqual([p1.id, p2.id, old.id, p3.id]);
+    // Two steps: it ties with the P2 card and is older. It never passes P1.
+    expect(first(start + 2 * AGING_STEP_MS)).toEqual([p1.id, old.id, p2.id, p3.id]);
+    expect(first(start + 20 * AGING_STEP_MS)).toEqual([p1.id, old.id, p2.id, p3.id]);
+  });
+
+  it("with no clock ages against the board's newest card stamp", () => {
+    const start = Date.parse("2026-10-25T00:00:00Z");
+    const old = card({ priority: 4, movedAt: iso(start) });
+    const p3 = card({ priority: 3, movedAt: iso(start + 1) });
+    const busy = card({
+      stage: "completed",
+      updatedAt: iso(start + AGING_STEP_MS),
+    });
+    const order = (cards: ReadonlyArray<KanbanCard>) =>
+      planDispatch(board, cards, pools([[opus, 1]])).map((d) => d.cardId);
+    expect(order([old, p3])).toEqual([p3.id]);
+    expect(order([old, p3, busy])).toEqual([old.id]);
+  });
+
+  it("at the same rank and unblock count takes the card waiting longest, then the lowest number", () => {
+    const late = card({ movedAt: "2026-10-25T03:00:00Z" });
+    const early = card({ movedAt: "2026-10-25T01:00:00Z" });
+    const twin = card({ movedAt: "2026-10-25T01:00:00Z" });
+    const plan = planDispatch(board, [late, twin, early], pools([[opus, 3]]));
+    expect(plan.map((d) => d.cardId)).toEqual([early.id, twin.id, late.id]);
+  });
+
+  it("ranks through a loop of blocks without looping, and starts none of its cards", () => {
+    const head = card({ priority: 3 });
+    const x: KanbanCard = card({ priority: 4, blockedBy: [head.id] });
+    const y = card({ priority: 4, blockedBy: [x.id] });
+    const z = card({ priority: 1, blockedBy: [y.id] });
+    const loopX = { ...x, blockedBy: [head.id, z.id] };
+    const self: KanbanCard = card({ priority: 2 });
+    const selfBlocked = { ...self, blockedBy: [self.id] };
+    const cards = [head, loopX, y, z, selfBlocked];
+    const ranks = schedule(cards);
+    // The head unblocks the whole loop and takes its most urgent card's priority.
+    expect(ranks.get(head.id)).toMatchObject({ holds: 3, rank: 1 });
+    expect(ranks.get(y.id)).toMatchObject({ holds: 2, urgency: 1 });
+    expect(ranks.get(selfBlocked.id)).toMatchObject({ holds: 0 });
+    const plan = planDispatch(board, cards, pools([[opus, 5]]));
+    expect(plan.map((d) => d.cardId)).toEqual([head.id]);
+  });
+
+  it("gives a board the numbers to show: what a card unblocks, if it is ready, what it waits on", () => {
+    const root = card();
+    const waiter = card({ blockedBy: [root.id] });
+    const cards = [root, waiter];
+    const byId = new Map(cards.map((c) => [c.id as string, c]));
+    const ranks = schedule(cards);
+    expect(cardFlow(root, byId, ranks)).toMatchObject({ unblocks: 1, ready: true, waitsOn: [] });
+    expect(cardFlow(waiter, byId, ranks)).toMatchObject({
+      unblocks: 0,
+      ready: false,
+      waitsOn: [root],
+      heldUpBy: root,
+    });
+  });
+
+  describe("a failed run waiting for its one retry", () => {
+    const failedAt = Date.parse("2026-10-25T12:00:00Z");
+    const due = failedAt + KANBAN_RETRY_BACKOFF_MS;
+    const retry = (role: "work" | "review" = "work"): KanbanCardRetry => ({
+      kind: "run_failed",
+      role,
+      runId: "run-1",
+      reason: "upstream closed the stream",
+      at: iso(failedAt),
+      state: "waiting",
+    });
+    const failed = (patch: Partial<KanbanCard> = {}) =>
+      card({
+        workThreadId: ThreadId.make("t-failed"),
+        retries: [retry()],
+        updatedAt: iso(failedAt),
+        ...patch,
+      });
+    const planAt = (
+      cards: ReadonlyArray<KanbanCard>,
+      available: ReadonlyArray<KanbanPool>,
+      nowMs: number,
+    ) => planDispatch(board, cards, available, new Map(), () => 0, nowMs).map((e) => e.cardId);
+
+    it("is not started before its backoff is over, and holds no slot meanwhile", () => {
+      const waiting = failed({ priority: 1 });
+      const other = card({ priority: 4 });
+      const one = pools([[opus, 1]]);
+      // The slot it gave up goes to another card, however low its priority.
+      expect(planAt([waiting, other], one, failedAt)).toEqual([other.id]);
+      expect(planAt([waiting, other], one, due - 1)).toEqual([other.id]);
+      // Due: a card like any other, started again on its own thread.
+      const plan = planDispatch(board, [waiting, other], one, new Map(), () => 0, due);
+      expect(plan.map((entry) => entry.cardId)).toEqual([waiting.id]);
+      expect(plan[0]).toMatchObject({ role: "work", joins: false, fresh: false });
+    });
+
+    it("competes at its own priority once due: no jump ahead, and its age still counts", () => {
+      const waiting = failed({ priority: 3 });
+      const urgent = card({ priority: 1 });
+      const younger = card({ priority: 3 });
+      const cards = [younger, urgent, waiting];
+      expect(planAt(cards, pools([[opus, 1]]), due)).toEqual([urgent.id]);
+      // Among equals the older card goes first, and the retry is the older one here.
+      expect(planAt(cards, pools([[opus, 2]]), due)).toEqual([urgent.id, waiting.id]);
+      expect(planAt(cards, pools([[opus, 3]]), due)).toEqual([urgent.id, waiting.id, younger.id]);
+      // With every slot taken it waits like any other card, for as long as it takes.
+      expect(planAt(cards, pools([[opus, 0]]), due + 24 * 60 * 60_000)).toEqual([]);
+    });
+
+    it("measures the backoff and the aging of waiting cards against the one clock it is given", () => {
+      const waiting = failed({ priority: 4 });
+      // Startable for six days by the clock passed in: two aging steps, P4 to P2.
+      const old = card({ priority: 4, movedAt: iso(due - 6 * 24 * 60 * 60_000) });
+      const fresh = card({ priority: 3, movedAt: iso(due - 60_000) });
+      const cards = [fresh, old, waiting];
+      const three = pools([[opus, 3]]);
+      expect(planAt(cards, three, due - 1)).toEqual([old.id, fresh.id]);
+      expect(planAt(cards, three, due)).toEqual([old.id, fresh.id, waiting.id]);
+      // Held slots are only slots: they carry no clock.
+      expect(
+        planDispatch(
+          board,
+          [waiting],
+          pools([[opus, 1]]),
+          new Map([["t-held", poolKey(opus)]]),
+          () => 0,
+          due,
+        ),
+      ).toEqual([]);
+    });
+
+    it("with no clock at all, measures against the board's newest card stamp", () => {
+      const waiting = failed();
+      const one = pools([[opus, 1]]);
+      expect(planDispatch(board, [waiting], one)).toEqual([]);
+      const touched = card({ stage: "verified", updatedAt: iso(due) });
+      expect(planDispatch(board, [waiting, touched], one).map((e) => e.cardId)).toEqual([
+        waiting.id,
+      ]);
+    });
+
+    it("holds a failed review back the same way", () => {
+      const review = card({
+        stage: "needs_review",
+        retries: [retry("review")],
+        updatedAt: iso(failedAt),
+      });
+      const todo = card();
+      const two = pools([[opus, 2]]);
+      expect(planAt([review, todo], two, due - 1)).toEqual([todo.id]);
+      expect(planAt([review, todo], two, due)).toEqual([review.id, todo.id]);
+    });
+
+    it("holds nothing back for a review started again at once, or a stamp that does not parse", () => {
+      const noVerdict = card({
+        stage: "needs_review",
+        retries: [{ ...retry("review"), kind: "no_verdict", runId: null, state: "restarted" }],
+      });
+      const broken = failed({ retries: [{ ...retry(), at: "not a time" }] });
+      expect(planAt([noVerdict, broken], pools([[opus, 2]]), failedAt)).toEqual([
+        noVerdict.id,
+        broken.id,
+      ]);
+    });
+  });
+
+  it("plans a 4,000-card board with a dense blocker graph in well under a tick", () => {
+    // The shape of the biggest real board, denser: 2,400 done cards, 1,100 To-Do of
+    // which about three in four wait on others, 400 in flight, and 12 blockers per
+    // waiting card drawn from every open card before it (so chains run hundreds deep).
+    let seed = 20261110;
+    const random = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const big: Array<KanbanCard> = [];
+    const openIds: Array<KanbanCard["id"]> = [];
+    for (let i = 0; i < 4000; i += 1) {
+      const done = i < 2400;
+      const flight = !done && i < 2800;
+      const blockedBy =
+        !done && openIds.length > 0 && random() < 0.75
+          ? Array.from({ length: 12 }, () => openIds[Math.floor(random() * openIds.length)]!)
+          : [];
+      const next = card({
+        stage: done ? "verified" : flight ? (i % 3 === 0 ? "in_review" : "working") : "todo",
+        priority: 1 + Math.floor(random() * 4),
+        blockedBy,
+        ...(flight
+          ? {
+              activeThreadId: ThreadId.make(`t-big-${i}`),
+              activeRole: i % 3 === 0 ? ("review" as const) : ("work" as const),
+              activePool: poolKey(opus),
+            }
+          : {}),
+      });
+      big.push(next);
+      if (!done) openIds.push(next.id);
+    }
+    const run = () => planDispatch(board, big, pools([[opus, 440]]));
+    const plan = run();
+    expect(plan.length).toBeGreaterThan(0);
+    expect(plan.length).toBeLessThanOrEqual(40);
+    const byId = new Map(big.map((c) => [c.id as string, c]));
+    for (const dispatch of plan) expect(isBlocked(byId.get(dispatch.cardId)!, byId)).toBe(false);
+
+    // The rule this replaced: one walk over the waiters per open card.
+    const walkPerCard = () => {
+      const waiters = new Map<string, Array<string>>();
+      for (const c of big) {
+        if (c.stage === "verified") continue;
+        for (const id of c.blockedBy) {
+          const list = waiters.get(id) ?? [];
+          list.push(c.id);
+          waiters.set(id, list);
+        }
+      }
+      let total = 0;
+      for (const c of big) {
+        if (c.stage === "verified") continue;
+        const seen = new Set<string>([c.id]);
+        const queue: Array<string> = [c.id];
+        for (let i = 0; i < queue.length; i += 1) {
+          for (const id of waiters.get(queue[i]!) ?? []) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+            queue.push(id);
+          }
+        }
+        total += seen.size - 1;
+      }
+      return total;
+    };
+    const ranks = schedule(big);
+    let held = 0;
+    for (const entry of ranks.values()) held += entry.holds;
+    expect(held).toBe(walkPerCard());
+
+    const median = (work: () => unknown) => {
+      const times: Array<number> = [];
+      for (let i = 0; i < 5; i += 1) {
+        const from = performance.now();
+        work();
+        times.push(performance.now() - from);
+      }
+      return times.toSorted((a, b) => a - b)[2]!;
+    };
+    const planMs = median(run);
+    const walkMs = median(walkPerCard);
+    // Measured on an M4: the whole plan about 5 ms, the walk per card alone about
+    // 95 ms. The ratio holds on a slow or busy machine where a fixed number would not.
+    expect(planMs * 4).toBeLessThan(walkMs);
+    expect(planMs).toBeLessThan(250);
   });
 
   it("doesn't count done or settled cards as held up, and survives a loop of blocks", () => {
