@@ -6948,7 +6948,61 @@ it.effect("the same title is allowed once the first card is verified", () =>
   }),
 );
 
-it.effect("shared t3-context and PR links don't count as a twin", () =>
+it.effect.each([null, "open"] as const)(
+  "upgrades legacy Forgejo card links when syncing state %s",
+  (state) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Legacy PR", prompt: "Legacy PR" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const current = (yield* kanban.card(card.id)).card;
+        const threadId = current.workThreadId!;
+        const url = "https://forgejo.internal.jingmi.com.tw/abdullah/torssh/pulls/9";
+        yield* store.putCard({
+          ...current,
+          links: [
+            {
+              kind: "url",
+              url,
+              label: "PR",
+              state,
+              checkedAt: null,
+            },
+          ],
+        });
+        fake.prs.set(threadId, [{ url, title: "PR", state: "open" }]);
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", { _tag: "thread", threadId });
+        const link = (yield* kanban.card(card.id)).card.links[0];
+        assert.strictEqual(link?.kind, "pr");
+        assert.strictEqual(link?.state, "open");
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.each([
+  ["https://github.com/acme/app/pull/12", "pr"],
+  ["https://forgejo.internal.jingmi.com.tw/abdullah/torssh/pulls/9", "pr"],
+  ["http://forgejo.test:3000/team/repo/pulls/12/files?view=diff", "pr"],
+  ["https://gitlab.test/team/repo/-/merge_requests/12", "pr"],
+  ["https://bitbucket.org/team/repo/pull-requests/12", "pr"],
+  ["https://dev.azure.com/org/project/_git/repo/pullrequest/12", "pr"],
+  ["https://linear.app/team/issue/TEAM-12", "linear"],
+  ["https://example.com/report", "url"],
+] as const)("classifies card change request link %s as %s", (url, kind) => {
+  assert.strictEqual(KanbanService.mergeLinks([], [{ url }])[0]?.kind, kind);
+});
+
+it.effect.each([
+  "https://github.com/acme/app/pull/12",
+  "https://forgejo.internal.jingmi.com.tw/abdullah/torssh/pulls/9",
+])("shared t3-context and PR links don't count as a twin: %s", (url) =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -6956,7 +7010,7 @@ it.effect("shared t3-context and PR links don't count as a twin", () =>
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
       const links = [
         { url: "t3-context://v1/kanban-card/card-parent" },
-        { url: "https://github.com/acme/app/pull/12" },
+        { url },
         { url: "https://linear.app/acme/issue/ACM-1" },
       ];
       yield* kanban.createCard(board.id, { prompt: "A", title: "Follow-up one", links }, evaluator);

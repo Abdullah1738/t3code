@@ -65,6 +65,12 @@ const remark = (
 const noRemarks: ReadonlyArray<PullRequestComment> = [];
 
 describe("evaluatePullRequestWatch", () => {
+  it("never reports a zero-status Forgejo head as checks passed", () => {
+    const result = evaluatePullRequestWatch(watch(), detail({ checks: [] }), noRemarks);
+    assert.isFalse(result.next.passed);
+    assert.deepEqual(result.changes, []);
+  });
+
   it("reports each failure at once, even while another check never finishes", () => {
     const bot = check("CodeRabbit", "pending");
     const first = detail({ checks: [check("lint", "failure"), check("test", "pending"), bot] });
