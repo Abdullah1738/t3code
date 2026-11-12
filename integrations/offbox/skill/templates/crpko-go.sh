@@ -16,20 +16,9 @@ export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
 go version
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync ca-certificates ruby >/dev/null
+sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config jq rsync ca-certificates >/dev/null
 
-# crpko-devops tests execute Vector VRL and call /usr/bin/ruby directly.
-VECTOR_VERSION=0.50.0
-if ! vector --version 2>/dev/null | grep -q "^vector ${VECTOR_VERSION} "; then
-  vector_dir=$(mktemp -d)
-  curl -fsSL --retry 5 "https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector-${VECTOR_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-    -o "$vector_dir/vector.tar.gz"
-  tar -xzf "$vector_dir/vector.tar.gz" -C "$vector_dir"
-  sudo install -m 0755 "$vector_dir/vector-x86_64-unknown-linux-gnu/bin/vector" /usr/local/bin/vector
-  rm -rf "$vector_dir"
-fi
-vector --version
-/usr/bin/ruby --version
+offbox_crpko_tools
 
 # FoundationDB client library (crpko services link github.com/apple/foundationdb/bindings/go via cgo).
 FDB_VERSION="${OFFBOX_FDB_VERSION:-7.3.63}"
