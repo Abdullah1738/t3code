@@ -679,16 +679,26 @@ def _refresh_background(con, key, pull_artifacts=True):
     from . import api, runs
     from .misc import _catch_up_finished
     rows = con.execute("""SELECT r.* FROM runs r JOIN leases l USING(box_id)
-        WHERE l.repo_key=? AND r.mode='bg' AND r.status='running' AND r.process_id IS NOT NULL""", (key,)).fetchall()
+        WHERE l.repo_key=? AND r.mode='bg' AND r.status IN ('running','lost') AND r.process_id IS NOT NULL""", (key,)).fetchall()
     for row in rows:
         if api.left() is not None and api.left() <= 0:
             break
         try:
             with file_lock('box-'+row['box_id'], timeout=0):
+                runs.reconcile_lost(con, row['box_id'])
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+                if row['status'] != 'running':
+                    _catch_up_finished(con, row['run_id'])
+                    continue
                 left = api.left()
                 options = {} if left is None else {"deadline": time.time() + left, "retries": 0}
                 st = api.cmd_status(row['box_id'], row['process_id'], **options)
                 if st and not st.get('running') and st.get('status') in ('exited', 'lost'):
+                    if st.get('status') == 'lost':
+                        confirmed = runs.confirmed_lost(row['box_id'], row['run_id'], timeout=min(20, api.left() or 20))
+                        if confirmed is None:
+                            continue
+                        st = {**st, **confirmed}
                     code = st.get('exitCode')
                     if code is None and row['command_id']:
                         code = (api.history_get(row['box_id'], row['command_id']) or {}).get('exitCode')

@@ -718,7 +718,7 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist = '\n'.join([
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
-        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" \\) -mtime +2 -delete',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -726,6 +726,8 @@ def exit_recording_command(script: str, run_id: str) -> str:
                      + f"\nbounded(['bash', '-c', {persist!r}, 'offbox-exit-record', sys.argv[1]], 2)\n"
                      + 'OFFBOX_EXIT_RECORD')
     outer = "\n".join([
+        'mkdir -p "$HOME/.offbox/exit" || exit 1',
+        f'echo $$ > "$HOME/.offbox/exit/{run_id}.pid" || exit 1',
         '__offbox_t0=$(date +%s)',
         'bash -lc "$0"',
         '__offbox_rc=$?',
@@ -751,17 +753,151 @@ def exit_recording_command(script: str, run_id: str) -> str:
 
 
 def recorded_exit(box_id: str, run_id: str, timeout: float = 20) -> int | None:
-    """The exit code the run's wrapper left on the box, or None if the file is missing or unreadable."""
+    """None means no file. Failed SSH or an unreadable exit is unknown and must not free the box."""
     try:
-        p = ssh_sync.ssh(box_id, f'cat "$HOME/.offbox/exit/{run_id}.rc"', timeout=timeout)
+        p = ssh_sync.ssh(box_id, f'if test -e "$HOME/.offbox/exit/{run_id}.rc"; then '
+                        f'cat "$HOME/.offbox/exit/{run_id}.rc"; else exit 44; fi', timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired, OffboxError) as e:
+        raise OffboxError(f"exit file unreadable on {box_id}: {e}", started=True) from e
+    if p.returncode == 44:
+        return None
+    if p.returncode == 0:
+        try:
+            return int(p.stdout.decode(errors="replace").strip())
+        except ValueError:
+            pass
+    raise OffboxError(f"exit file unreadable on {box_id} (ssh exit {p.returncode})", started=True)
+
+
+def remote_alive(box_id: str, run_id: str, timeout: float = 20) -> str | None:
+    """One bounded SSH read; missing legacy markers and failed SSH remain unknown."""
+    base = f'"$HOME/.offbox/exit/{run_id}'
+    cmd = (f'if test -f {base}.rc"; then echo ended; '
+           f'elif p=$(cat {base}.pid" 2>/dev/null); then '
+           'case "$p" in ""|*[!0-9]*|0|1) echo unknown;; *) '
+           'if kill -0 "$p" 2>/dev/null; then echo alive; else echo gone; fi;; esac; '
+           'else echo unknown; fi')
+    try:
+        p = ssh_sync.ssh(box_id, cmd, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, OffboxError):
         return None
-    if p.returncode != 0:
-        return None
+    result = p.stdout.decode(errors="replace").strip()
+    return result if p.returncode == 0 and result in ("ended", "alive", "gone") else None
+
+
+def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True) -> dict | None:
+    """Check retained history, then .rc, then liveness. None keeps the run reserved (alive or unknown)."""
+    deadline = now() + timeout
+
+    def left():
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise OffboxError(f"lost confirmation timed out on {box_id}", started=True)
+        return remaining
+
+    con = db()
     try:
-        return int(p.stdout.decode(errors="replace").strip())
-    except ValueError:
+        if record:
+            con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_checked:{run_id}', '1'))
+            con.commit()
+        row = con.execute('SELECT command_id FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        history_unknown = False
+        if row and row['command_id']:
+            try:
+                # Leave time for the independent SSH evidence even if the tracker hangs.
+                with api.budget(min(5, left() / 2)):
+                    code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+            except OffboxError:
+                history_unknown, code = True, None
+            left()
+            if code is not None:
+                return dict(status='exited', running=False, exitCode=code)
+        code = recorded_exit(box_id, run_id, timeout=left())
+        left()
+        if code is not None:
+            return dict(status='exited', running=False, exitCode=code)
+        alive = remote_alive(box_id, run_id, timeout=left())
+        left()
+        if alive == 'gone':
+            if history_unknown:
+                return None
+            if record:
+                con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', '1'))
+                con.commit()
+            return dict(status='lost', running=False, exitCode=None)
+        if alive == 'alive' and record:
+            cur = con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_spurious:{run_id}', '1'))
+            con.commit()
+            if cur.rowcount:
+                event(con, box_id, 'run_lost_spurious', run_id)
+        # 'ended' can race the first read: leave it active and read .rc on the next probe.
         return None
+    finally:
+        con.close()
+
+
+def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
+                   until: float | None = None) -> None:
+    """Under box-<id>: repair old lost rows before following or handing their box to another run."""
+    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
+                       "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
+                       (box_id,)).fetchall()
+    if not rows:
+        return
+    deadline = now() + timeout
+    if state is None:
+        try:
+            with api.budget(timeout):
+                box = api.get(box_id)
+            state = box.get('state') if box else None
+        except OffboxError:
+            state = 'unknown'
+    if state == 'unknown':
+        # A formerly lost row must reserve the lease while its box cannot be checked.
+        con.execute("UPDATE runs SET status='running',end_at=NULL WHERE box_id=? AND status='lost' "
+                    "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)", (box_id,))
+        con.commit()
+        return
+    if state in (*api.STOPPED_STATES, 'error', 'cancelled') or state is None:
+        con.executemany('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
+                        [(f"lost_confirmed:{r['run_id']}", '1') for r in rows])
+        con.commit()
+        return
+    if state not in api.LIVE_STATES:
+        return
+    for row in rows:
+        try:
+            st = confirmed_lost(box_id, row['run_id'], max(0, deadline - now()))
+        except OffboxError:
+            st = None
+        if st and st['status'] == 'lost':
+            con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f"lost_confirmed:{row['run_id']}", '1'))
+        else:
+            code = st['exitCode'] if st else None
+            status = ('done' if code == 0 else 'failed') if st else 'running'
+            if code == 97:
+                # The quarantine service only settles active rows, so restore its reservation first.
+                con.execute("UPDATE runs SET status='running',end_at=NULL WHERE run_id=? AND status='lost'",
+                            (row['run_id'],))
+                con.commit()
+                with api.budget(max(0, deadline-now())):
+                    wedged = settle_box_wedged(con, row, code)
+                if wedged:
+                    say(wedged_message(box_id, *wedged))
+                    continue
+            if st and row['pulls']:
+                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until)
+            if until is not None and now() >= until:
+                raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
+            con.execute("UPDATE runs SET status=?,exit_code=?,end_at=?,error=NULL WHERE run_id=? "
+                        "AND status IN ('lost','running')",
+                        (status, code, now() if st else None, row['run_id']))
+            event(con, box_id, 'run_reattached', f"{row['run_id']} {status} exit={code}")
+        con.commit()
+        if st and st.get('exitCode') is not None:
+            settle_docker(con, row, status, timeout=10 if until is None else max(0, until-now()))
+            from .misc import _catch_up_finished
+            _catch_up_finished(con, row['run_id'], budget=10 if until is None else max(0, until-now()))
 
 
 def steps_exit(log_path: Path | None, planned: int) -> int | None:
@@ -783,11 +919,11 @@ def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
     return not (p.returncode == 0 and p.stdout.decode(errors="replace").strip() == "0")
 
 
-def settle_docker(con, run, status: str) -> None:
+def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
-    if run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(run["box_id"],
-                                                                                                 run["run_id"]):
+    if timeout > 0 and run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(
+            run["box_id"], run["run_id"], timeout=min(10, timeout)):
         con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
         con.commit()
 
@@ -817,7 +953,7 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
 
 
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
-                where: str = "remote", deps_hint: str = "") -> None:
+                where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
     if step_res is not None:
         say(steps_summary(step_res, planned))
@@ -828,7 +964,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
     if where == "remote" and deps_hint and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or []))):
         say(deps_hint)
     if code is None:
-        say("remote exit unknown (process lost); offbox exits 90")
+        hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
+        say("remote exit unknown (process lost); offbox exits 90" + hint)
     else:
         say(f"{where} exit {code}" + (masked_status_hint(cmd) if code == 0 else ""))
 
@@ -1150,7 +1287,7 @@ def _status_code(st: dict) -> int | None:
     return 128 + 15 if st.get("signal") else None
 
 
-def _ended(box_id: str, pid: int, until: float | None) -> dict | None:
+def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None) -> dict | None:
     """boat's status for the process when it says the process has ended (exited or lost), else None. One bounded
     request, no retries, never past the caller's deadline; any error counts as not ended."""
     try:
@@ -1159,6 +1296,11 @@ def _ended(box_id: str, pid: int, until: float | None) -> dict | None:
     except OffboxError:
         return None
     if st and not st.get("running") and st.get("status") in ("exited", "lost"):
+        if st.get('status') == 'lost' and run_id:
+            try:
+                return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())))
+            except OffboxError:
+                return None
         return st
     return None
 
@@ -1225,6 +1367,25 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
         ended["n"] += 1
         return ended["n"]
 
+    def follow_lost():
+        if not run_id:
+            return None
+        while not stop_evt.is_set():
+            if until is not None and now() >= until:
+                raise timed_out()
+            budget = 20 if until is None else min(20, max(0, left()))
+            try:
+                st = confirmed_lost(box_id, run_id, budget)
+            except OffboxError:
+                st = None
+            if until is not None and now() >= until:
+                raise timed_out()
+            if st is not None:
+                return _status_code(st)
+            pause = QUIET_PROBE_S if until is None else min(QUIET_PROBE_S, max(0, left()))
+            stop_evt.wait(pause)
+        return None
+
     def probe_end():
         """On a reconnect or a long run of heartbeats: boat's exit code once its status has said the process ended
         twice with no output in between (None when boat lost it), else _RUNNING."""
@@ -1235,6 +1396,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
             raise timed_out()
         if st is None or ended_again() < 2:
             return _RUNNING
+        if st.get('status') == 'lost':
+            return follow_lost()
         return _status_code(st)
 
     def timed_out() -> OffboxError:
@@ -1303,6 +1466,8 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                         if code is not _RUNNING:
                             return code
                     elif t == "exit":
+                        if fr.get('exitCode') is None and not fr.get('signal'):
+                            return follow_lost()
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
                             128 + 15 if fr.get("signal") else None)
                     elif t == "error":
@@ -1356,7 +1521,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
                 down_from = (down_from or failed_at) if boat_down else None
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
-                        return None
+                        return follow_lost()
                     if ended_again() > 3:
                         return _status_code(st)
                 if failures > 20 and (down_from is None or now() - down_from >= OUTAGE_FOLLOW_S):
@@ -1399,9 +1564,22 @@ def new_checkout_hint(row: dict, root: Path) -> None:
     say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
 
 
-def do_pulls(box_id: str, row: dict, pulls: list[str]) -> None:
+def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None) -> None:
     for p in pulls:
-        st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]))
+        opts = {}
+        if until is not None:
+            remaining = until - now()
+            if remaining <= 0:
+                raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
+            opts['timeout'] = min(1800, remaining)
+        try:
+            st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
+        except subprocess.TimeoutExpired:
+            if until is None:
+                raise
+            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
+        if until is not None and now() >= until:
+            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
         if st.get("missing"):
             say(f"pull {p}: not created on the box")
         elif st.get("ok"):
@@ -1429,7 +1607,8 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
     return True
 
 
-def finish(run_id: str, code: int | None, status: str | None = None) -> None:
+def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
+           until: float | None = None) -> None:
     con = db()
     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if not r:
@@ -1439,10 +1618,17 @@ def finish(run_id: str, code: int | None, status: str | None = None) -> None:
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
-        settle_docker(con, r, st)
+        if catch_up and con.execute('SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone():
+            from .misc import _catch_up_finished
+            _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))
+        settle_docker(con, r, st, timeout=10 if until is None else max(0, until-now()))
         # Extend auto-stop as well as the reaper threshold when the start budget is tight.
         lease.touch(r["box_id"])
-        lease.idle_ttl(r['box_id'])
+        if until is None:
+            lease.idle_ttl(r['box_id'])
+        elif now() < until:
+            with api.budget(until-now()):
+                lease.idle_ttl(r['box_id'])
         event(con, r["box_id"], "run_end", f"{run_id} status={st} exit={code} {round(now() - (r['start_at'] or now()))}s")
 
 
@@ -1568,7 +1754,7 @@ def _run_remote(a, rn) -> int:
     if steps:
         res = step_results(rn.log_path)
         failed = next((n for n, rc in res if rc != 0), None)
-        report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint)
+        report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:
-        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint)
+        report_exit(a.cmd[0] if len(a.cmd) == 1 else shlex.join(a.cmd), code, deps_hint=deps_hint, box_id=rn.box)
     return 90 if code is None else code
