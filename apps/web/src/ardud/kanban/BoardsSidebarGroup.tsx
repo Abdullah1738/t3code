@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { CircleHelpIcon, InboxIcon, MessageCircleIcon } from "lucide-react";
 import { memo, type ReactNode, useEffect, useState } from "react";
 
+import { askQueueFigures, askRowFigure } from "@t3tools/client-runtime/ardud/kanban";
 import type { KanbanBoardSummary } from "@t3tools/contracts";
 
 import { CollapsibleSectionHeader } from "../../components/ui/collapsible-section-header";
@@ -15,6 +16,7 @@ import { useBoards } from "./kanbanStore";
 import { askKey, useAskStore, watchAsks } from "./needsYou/askStore";
 import { Count } from "./parts";
 import { BOARD_VIEW_LABELS, BOARD_VIEWS, type BoardView } from "./search";
+import { useNowMs } from "./useNowMs";
 import "./tokens.css";
 import "./kanban.css";
 
@@ -103,6 +105,13 @@ function NeedsYouRow(props: { onNavigate: () => void }) {
     return owed;
   });
   useEffect(() => watchAsks(false), []);
+  // No badge means "nothing to answer": only for a read that said so (`askRowFigure`).
+  // Each part is selected by itself so the selectors stay stable.
+  const feed = useAskStore((state) => state.feed);
+  const status = useAskStore((state) => state.status);
+  const error = useAskStore((state) => state.error);
+  const nowMs = useNowMs();
+  const shown = askRowFigure(askQueueFigures({ feed, status, error }), count, nowMs);
   return (
     <Link
       to="/needs-you"
@@ -113,7 +122,17 @@ function NeedsYouRow(props: { onNavigate: () => void }) {
     >
       <InboxIcon aria-hidden className="size-4 shrink-0 text-sidebar-muted-foreground" />
       <span className="min-w-0 flex-1 truncate">Needs you</span>
-      <Count count={count} tone="warn" label={`${count} asks to answer`} />
+      {shown.note !== null ? (
+        <span
+          className="shrink-0 text-xs text-sidebar-muted-foreground"
+          // With a badge beside it, the badge's label says all of it.
+          aria-label={shown.count === null ? shown.label : undefined}
+          aria-hidden={shown.count === null ? undefined : true}
+        >
+          {shown.note}
+        </span>
+      ) : null}
+      <Count count={shown.count ?? 0} tone="warn" label={shown.label} />
     </Link>
   );
 }

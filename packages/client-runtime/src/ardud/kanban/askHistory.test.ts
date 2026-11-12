@@ -7,6 +7,7 @@ import {
   askOutcome,
   askRepliedOnCard,
   askThread,
+  askHistoryFacts,
 } from "./askHistory.ts";
 
 const ask = (patch: Record<string, unknown>): KanbanOwnerAsk =>
@@ -275,5 +276,38 @@ describe("askRepliedOnCard", () => {
     expect(askRepliedOnCard(entry({}, []))).toBe(false);
     expect(askRepliedOnCard(entry({ clarifyAskedAt: asked, handedAt: asked }, []))).toBe(false);
     expect(askRepliedOnCard(entry({ clarifyAskedAt: asked, closedAt: asked }, []))).toBe(false);
+  });
+});
+
+describe("askHistoryFacts", () => {
+  const row = (note: string | null, draft: boolean) => ({
+    outcome: { note, draft: draft ? { before: "a", after: "b" } : null },
+  });
+  const today = [row("why", false), row(null, true), row(null, false)];
+
+  it("counts today's answers exactly when all of History could be read", () => {
+    expect(askHistoryFacts({ today, waiting: 2, toAnswer: 5, incomplete: false })).toEqual([
+      { name: "Answered", value: "3", spoken: "3" },
+      { name: "With a note", value: "1", spoken: "1" },
+      { name: "Drafts you edited", value: "1", spoken: "1" },
+      { name: "Waiting on agents", value: "2", spoken: "2" },
+      { name: "Still to answer", value: "5", spoken: "5" },
+    ]);
+  });
+
+  it("gives a floor, never an exact count or a zero, when some answers can't be read", () => {
+    expect(askHistoryFacts({ today, waiting: 2, toAnswer: 5, incomplete: true })).toEqual([
+      { name: "Answered", value: "3+", spoken: "at least 3" },
+      { name: "With a note", value: "1+", spoken: "at least 1" },
+      { name: "Drafts you edited", value: "1+", spoken: "at least 1" },
+      // These come from the open queue, not from the closed asks.
+      { name: "Waiting on agents", value: "2", spoken: "2" },
+      { name: "Still to answer", value: "5", spoken: "5" },
+    ]);
+    expect(askHistoryFacts({ today: [], waiting: 0, toAnswer: 0, incomplete: true })[0]).toEqual({
+      name: "Answered",
+      value: "0+",
+      spoken: "at least 0",
+    });
   });
 });

@@ -29,6 +29,15 @@ import { FileMarkdownPreview } from "./FileMarkdownPreview";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { SourceFileSurface } from "./SourceFileSurface";
 import { WorkspaceFileWebPreview } from "./WorkspaceFileWebPreview";
+// ardud: video plays in the app, and the system viewer is waited for a limited time
+import { AttachmentVideoPreview } from "../../ardud/common/AttachmentVideoPreview";
+import {
+  attachmentVideoKey,
+  fileLoadStalled,
+  fileViewerStall,
+  fileViewerTimeLimitMs,
+  systemViewerKind,
+} from "../../ardud/common/fileViewer";
 import { HtmlRenderWebView } from "../threads/HtmlRenderWebView";
 
 export type AttachmentFileRouteParams = {
@@ -44,31 +53,46 @@ export type AttachmentFileRouteParams = {
 
 type AttachmentFileScreenProps = StaticScreenProps<AttachmentFileRouteParams>;
 
-function nativeViewerKind(kind: ReturnType<typeof useAttachmentDocument>["kind"]) {
-  if (kind === "image") return "image" as const;
-  if (kind === "pdf") return "pdf" as const;
-  if (kind === "video" || kind === "unsupported") return "document" as const;
-  return null;
-}
+// ardud: `systemViewerKind` decides (video is no longer handed to the system viewer)
+const nativeViewerKind = systemViewerKind;
+
+/** ardud: `stalled` is a viewer that has not come up within its time limit. */
+type NativeViewerState = "pending" | "open" | "stalled" | "unavailable" | null;
 
 function AttachmentDocumentBody(props: {
   readonly document: ReturnType<typeof useAttachmentDocument>;
   readonly name: string;
   readonly environmentId: EnvironmentId | null;
   readonly htmlRender: boolean;
-  readonly nativeViewer: "pending" | "open" | "unavailable" | null;
+  readonly nativeViewer: NativeViewerState;
   readonly nativeError: string | null;
   readonly onOpenNative: () => void;
+  // ardud: what the video player goes by
+  readonly video: { readonly key: string; readonly local: boolean; readonly sizeBytes: number };
 }) {
   const { document } = props;
   if (document.error) {
     return (
       <View className="flex-1 items-center justify-center bg-sheet px-6">
         <EmptyState
-          title="File unavailable"
+          // ardud: a wait that ran out is not a file that can't be had
+          title={fileLoadStalled(document.error) ? "The file hasn't loaded" : "File unavailable"}
           detail={document.error}
           actionLabel="Try again"
           onAction={document.retry}
+        />
+      </View>
+    );
+  }
+  // ardud: the wait for the system viewer ends with a plain error and a way to try again
+  if (props.nativeViewer === "stalled") {
+    return (
+      <View className="flex-1 items-center justify-center bg-sheet px-6">
+        <EmptyState
+          title="The file hasn't opened"
+          detail="The file viewer is taking too long. Try again, or use Save or share to open the file in another app."
+          actionLabel="Try again"
+          onAction={props.onOpenNative}
         />
       </View>
     );
@@ -142,6 +166,20 @@ function AttachmentDocumentBody(props: {
   if (document.kind === "audio") {
     return <AudioFilePreview key={document.revision} uri={document.uri} onRetry={document.retry} />;
   }
+  // ardud: the app's own player, the one that plays videos in a thread
+  if (document.kind === "video") {
+    return (
+      <AttachmentVideoPreview
+        name={props.name}
+        uri={document.uri}
+        local={props.video.local}
+        environmentId={props.environmentId}
+        resource={document.resource}
+        videoKey={props.video.key}
+        sizeBytes={props.video.sizeBytes}
+      />
+    );
+  }
   if (document.kind === "html") {
     return props.htmlRender ? (
       <HtmlRenderWebView key={document.uri} uri={document.uri} title={props.name} nested={false} />
@@ -191,9 +229,28 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
   });
   const [nativeOpen, setNativeOpen] = useState(false);
   const nativeKind = nativeViewerKind(document.kind);
-  const [nativeViewer, setNativeViewer] = useState<"pending" | "open" | "unavailable" | null>(
+  const [nativeViewer, setNativeViewer] = useState<NativeViewerState>(
     nativeKind ? "pending" : null,
   );
+  // ardud: a new attempt presents the viewer afresh, dropping one that never came up
+  const [nativeAttempt, setNativeAttempt] = useState(0);
+  // The wait for the file itself (`pending`) has its own limit in `useAttachmentDocument`.
+  const waitingOnViewer = nativeViewer === "open";
+  const onStall = fileViewerStall(Platform.OS, nativeKind);
+  useEffect(() => {
+    if (!waitingOnViewer || onStall === "none") return;
+    const timer = setTimeout(() => {
+      setNativeViewer((current) => (current === "open" ? "stalled" : current));
+      if (onStall === "closeAndSay") setNativeOpen(false);
+    }, fileViewerTimeLimitMs(sizeBytes));
+    return () => clearTimeout(timer);
+  }, [waitingOnViewer, onStall, sizeBytes]);
+  const openNative = () => {
+    setNativeViewer((current) => (current === null ? null : "open"));
+    setNativeAttempt((attempt) => attempt + 1);
+    setNativeOpen(true);
+  };
+  // end ardud
   const [nativeError, setNativeError] = useState<string | null>(null);
   const pendingNativeError = useRef<string | null>(null);
   const handleBack = () => {
@@ -293,10 +350,7 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
           title: "Open in file viewer",
           icon: "arrow.up.left.and.arrow.down.right",
           inline: false,
-          onPress: () => {
-            setNativeViewer((current) => (current === null ? null : "open"));
-            setNativeOpen(true);
-          },
+          onPress: openNative,
         } as const)
       : null,
     draftKey
@@ -390,13 +444,22 @@ export function AttachmentFileScreen(props: AttachmentFileScreenProps) {
         htmlRender={params.htmlRender === "1"}
         nativeViewer={nativeViewer}
         nativeError={nativeError}
-        onOpenNative={() => {
-          setNativeViewer((current) => (current === null ? null : "open"));
-          setNativeOpen(true);
+        onOpenNative={openNative}
+        video={{
+          key: attachmentVideoKey({
+            attachmentId: params.attachmentId,
+            name: params.name,
+            mimeType: params.mimeType,
+            environmentId,
+            localDraftKey: localAttachment ? draftKey : null,
+          }),
+          local: localAttachment !== null,
+          sizeBytes,
         }}
       />
       {nativeOpen && nativeSource ? (
         <FilePreviewModal
+          key={nativeAttempt}
           source={nativeSource}
           onRequestClose={handleNativeClose}
           onOpenError={handleNativeOpenError}

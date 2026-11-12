@@ -8,6 +8,7 @@ import { SymbolView } from "../../components/ui/AppSymbol";
 import { Group, Row, SectionHead, Separator, Title } from "../common/parts";
 import { BoardIcon } from "./BoardIcon";
 import { useKanbanBoards } from "./kanbanStore";
+import { NeedsYouHomeRow } from "./needsYou/NeedsYouHomeRow";
 import { Glyph } from "./parts";
 
 /**
@@ -20,6 +21,7 @@ export function KanbanBoardsGroup() {
   // The group stays visible with no boards so "New board" is always reachable.
   return (
     <View className="gap-1.5 px-4 pb-1 pt-3">
+      <NeedsYouHomeRow />
       <SectionHead title="Boards" />
       <Group>
         {(boards ?? []).map((summary, index) => (
@@ -81,11 +83,7 @@ function BoardRow(props: { readonly summary: KanbanBoardSummary; readonly onOpen
     ...(owner > 0 ? [`${owner} questions for you`] : []),
   ];
   return (
-    <Row
-      accessibilityLabel={parts.join(", ")}
-      onPress={props.onOpen}
-      className="items-center"
-    >
+    <Row accessibilityLabel={parts.join(", ")} onPress={props.onOpen} className="items-center">
       <BoardIcon board={board} />
       <Title className="flex-1">{name}</Title>
       {owner === 0 && running > 0 ? <Glyph kind="ok" /> : null}

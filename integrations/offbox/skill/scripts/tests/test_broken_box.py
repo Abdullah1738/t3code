@@ -116,7 +116,7 @@ class RefusedStartTests(Isolated):
         a = cli.build_parser().parse_args(['run', '--remote', '--', 'go', 'test', './...'])
         a.steps, a.env, a.no_sync, a.git, a.bg, a.pull, a.size, a.template, a.base, a.fresh = None, [], True, False, False, None, 'large', None, None, False
         rn = runs.Runner(a, self.me)
-        with patch.object(pool, 'acquire', return_value=row), patch.object(ssh_sync, 'put_file'), \
+        with patch.object(pool, 'acquire', return_value=row), patch.object(runs, '_ttl_keeper'), patch.object(ssh_sync, 'put_file'), \
                 patch.object(ssh_sync, 'push'), patch.object(ssh_sync, 'tracked_secret_matches', return_value=[]), \
                 patch.object(runs.prune, 'run', return_value=runs.prune.Result()), patch.object(api, 'cmd_start', side_effect=err), \
                 patch.object(ssh_sync, 'probe_home', return_value=(None, None)), \

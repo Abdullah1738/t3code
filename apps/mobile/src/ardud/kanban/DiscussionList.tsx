@@ -92,11 +92,7 @@ export function DiscussionList(props: {
       {total === 0 ? (
         <EmptyLine
           label={
-            searching
-              ? "No matches"
-              : props.unreadOnly
-                ? "No unread discussions"
-                : "No discussions"
+            searching ? "No matches" : props.unreadOnly ? "No unread discussions" : "No discussions"
           }
         />
       ) : null}

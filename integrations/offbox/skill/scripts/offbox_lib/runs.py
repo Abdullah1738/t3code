@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -1120,7 +1121,8 @@ class Runner:
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
             try:
-                replacement = self._prepare_box(con, a, rdir, env_file, body)
+                with _keep_ttl(self.box):
+                    replacement = self._prepare_box(con, a, rdir, env_file, body)
                 if replacement is not None:
                     pool.release_guard(row)
                     self.lease_row, self.box = replacement, replacement['box_id']
@@ -1249,10 +1251,14 @@ class Runner:
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
             if reason:
                 raise lease.DeadMount(self.box, reason) from e
-        if push_exc is not None:
-            raise push_exc
-        if err:
-            raise err[0]
+        sync_exc = push_exc if push_exc is not None else err[0] if err else None
+        if sync_exc is not None:
+            if re.search(r"Broken pipe|code 255|\(255\)", str(sync_exc)):
+                state = _boat_state(self.box)
+                if state and state not in api.LIVE_STATES:
+                    raise OffboxError(f"box {self.box} was stopped by boat during the sync ({state}); nothing ran",
+                                      code=EXIT_INFRA) from sync_exc
+            raise sync_exc
 
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
@@ -1301,6 +1307,13 @@ def _safe(err: list, fn, *args):
         err.append(e if isinstance(e, OffboxError) else OffboxError(f"{type(e).__name__}: {e}"))
 
 
+def _boat_state(box_id: str) -> str | None:
+    try:
+        return (api.get(box_id) or {}).get("state")
+    except OffboxError:
+        return None
+
+
 def _ttl_keeper(box_id: str, stop_evt: threading.Event):
     """Keep the boat auto-stop deadline >= RUN_TTL_S away while attached. Never shortens a longer deadline."""
     while True:
@@ -1311,6 +1324,19 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             ok = False
         if stop_evt.wait(TTL_REFRESH_S if ok else TTL_RETRY_S):
             return
+
+
+@contextlib.contextmanager
+def _keep_ttl(box_id: str):
+    stop_evt = threading.Event()
+    keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
+    keeper.start()
+    try:
+        yield
+    finally:
+        stop_evt.set()
+        # GET/PATCH retries can outlive the follower's join bound. Drain them before handing off the TTL.
+        keeper.join()
 
 
 def _echo(stream, b: bytes) -> bool:

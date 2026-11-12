@@ -1,0 +1,348 @@
+/**
+ * The phone's Needs-you store: the same store the web page runs
+ * (`createAskStore` in the shared runtime), given the app's foreground signal
+ * and the board list feed. There is one store per server (`askScope.ts`): a
+ * screen takes the store of the server in use when it renders and keeps
+ * talking to that one, so an answer, a retry or a secret can only ever go to
+ * the server it was made for. When the server changes the old store is closed
+ * and emptied, and the screens start over on the new one.
+ *
+ * Nothing here is written to disk: forms, held answers and failed sends live
+ * in memory only, and a secret never enters the store at all.
+ */
+import { useAtomValue } from "@effect/atom-react";
+import {
+  AskApiError,
+  askHistoryFigures,
+  askKey,
+  askQueueFigures,
+  type AskFigures,
+  type AskSecretSendResult,
+  type AskState,
+  type AskStore,
+} from "@t3tools/client-runtime/ardud/kanban";
+import {
+  isAtomCommandInterrupted,
+  runAtomCommand,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import type { AuthSessionState, EnvironmentId } from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import { AsyncResult, Atom } from "effect/reactivity";
+import { useNavigation } from "@react-navigation/native";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { AppState } from "react-native";
+
+import { environmentCatalog } from "../../../connection/catalog";
+import { appAtomRegistry } from "../../../state/atom-registry";
+import { serverEnvironment } from "../../../state/server";
+import { environmentSession } from "../../../state/session";
+import { pairedEnvironmentIdAtom } from "../../common/environment";
+import { kanbanClient } from "../kanbanStore";
+import { createAskScopes, type AskConnection, type AskScope } from "./askScope";
+import {
+  askParamsFromKey,
+  askWhereabouts,
+  lateStanding,
+  ownerStanding,
+  type AskWhereabouts,
+  type LateStanding,
+  type OwnerStanding,
+  type SessionRead,
+} from "./logic";
+
+/** What the app holds of a server's session, as `ownerStanding` reads it. */
+const sessionRead = (result: AsyncResult.AsyncResult<AuthSessionState, unknown>): SessionRead => {
+  const session = Option.getOrNull(AsyncResult.value(result));
+  return session !== null
+    ? { state: "read", authenticated: session.authenticated, owner: session.owner }
+    : result._tag === "Failure" && !result.waiting
+      ? { state: "failed" }
+      : { state: "reading" };
+};
+
+const askScopes = createAskScopes({
+  paired: () => appAtomRegistry.get(pairedEnvironmentIdAtom),
+  onPairedChange: (run) => appAtomRegistry.subscribe(pairedEnvironmentIdAtom, run),
+  target: (environmentId) => {
+    const connection = Option.getOrNull(
+      appAtomRegistry.get(
+        environmentSession.preparedConnectionValueAtom(environmentId as EnvironmentId),
+      ),
+    );
+    if (connection === null) throw new AskApiError(0, "offline", "Not connected to Robob.");
+    const authorization = connection.httpAuthorization;
+    if (authorization !== null && authorization._tag === "Bearer") {
+      return {
+        base: connection.httpBaseUrl,
+        headers: { authorization: `Bearer ${authorization.token}` },
+        cookies: false,
+      };
+    }
+    throw new AskApiError(0, "unsupported", "This connection can't reach the ask routes.");
+  },
+  sendSecrets: async (environmentId, input): Promise<AskSecretSendResult> => {
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      serverEnvironment.answerAskSecrets,
+      { environmentId: environmentId as EnvironmentId, input },
+      // The failure cause holds the request; keep it out of the console and reports.
+      { label: "answer ask secrets", reportFailure: false, reportDefect: false },
+    );
+    if (result._tag === "Success") return { _tag: "sent" };
+    if (isAtomCommandInterrupted(result)) return { _tag: "interrupted" };
+    return { _tag: "failed", failure: squashAtomCommandFailure(result) };
+  },
+  watch: {
+    onBoardsChange: (run) => kanbanClient().boards.subscribe(run),
+    onForeground: (run) => {
+      const subscription = AppState.addEventListener("change", (state) => {
+        if (state === "active") run();
+      });
+      return () => subscription.remove();
+    },
+    isForeground: () => AppState.currentState === "active",
+  },
+  // The session as the app holds it at this moment. Subscribing keeps it read
+  // for as long as the server is the one in use, with or without a screen.
+  session: (environmentId) =>
+    sessionRead(
+      appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
+    ),
+  onSessionChange: (environmentId, run) =>
+    appAtomRegistry.subscribe(
+      environmentSession.sessionStateAtom(environmentId as EnvironmentId),
+      run,
+    ),
+  rereadSession: (environmentId) =>
+    appAtomRegistry.refresh(environmentSession.sessionStateAtom(environmentId as EnvironmentId)),
+  connection: (environmentId): AskConnection => {
+    const id = environmentId as EnvironmentId;
+    if (Option.isSome(appAtomRegistry.get(environmentSession.preparedConnectionValueAtom(id)))) {
+      return "live";
+    }
+    const state = Option.getOrNull(
+      AsyncResult.value(appAtomRegistry.get(environmentCatalog.stateAtom(id))),
+    );
+    // Wanted, and between two attempts: the only time a call may go to where it last went.
+    return state !== null && state.desired && state.phase === "backoff" ? "waiting" : "down";
+  },
+  onConnectionChange: (environmentId, run) => {
+    const id = environmentId as EnvironmentId;
+    const stops = [
+      appAtomRegistry.subscribe(environmentSession.preparedConnectionValueAtom(id), run),
+      appAtomRegistry.subscribe(environmentCatalog.stateAtom(id), run),
+    ];
+    return () => {
+      for (const stop of stops) stop();
+    };
+  },
+  // What "Retry" in Connections does: the next attempt starts now.
+  reconnect: (environmentId) =>
+    void runAtomCommand(
+      appAtomRegistry,
+      environmentCatalog.retryNow,
+      environmentId as EnvironmentId,
+      { label: "needs-you reconnect", reportFailure: false },
+    ),
+  // After the store update that asked for it has settled, not inside it.
+  defer: (run) => setTimeout(run, 0),
+  now: () => Date.now(),
+});
+
+// He leaves the app inside the six seconds an answer is held: it goes out now
+// rather than waiting on a timer the system may never run.
+AppState.addEventListener("change", (state) => {
+  if (state === "background" || state === "inactive") {
+    askScopes.current().asks.flushAskSends(true);
+  }
+});
+
+/**
+ * The store, state and server calls of the server in use. A component keeps
+ * the one it rendered with, so whatever it starts (a send, an upload that
+ * lands later, a secret) stays with that server; once the server changes
+ * those calls do nothing. `serial` is new for every server: key a screen's
+ * inner part on it so its own state starts over too.
+ */
+export function useAskScope(): AskScope {
+  return useSyncExternalStore(askScopes.subscribe, askScopes.current);
+}
+
+/** The ask store of the server in use; see `useAskScope`. */
+export function useAsks(): AskStore {
+  return useAskScope().asks;
+}
+
+/** The server the asks on screen were read from: their files and threads are fetched there. */
+export function useAskEnvironmentId(): EnvironmentId | null {
+  return useAskScope().environmentId as EnvironmentId | null;
+}
+
+/** Reads one thing from the store; `select` must return the same value for the same state. */
+export function useAsk<T>(select: (state: AskState) => T): T {
+  const { cell } = useAskScope();
+  return useSyncExternalStore(cell.subscribe, () => select(cell.getState()));
+}
+
+/**
+ * Whether the open asks' figures are known, held from an earlier read, or not
+ * known at all (`askQueueFigures`). A screen asks before it shows a count.
+ */
+export function useQueueFigures(): AskFigures {
+  const feed = useAsk((state) => state.feed);
+  const status = useAsk((state) => state.status);
+  const error = useAsk((state) => state.error);
+  return askQueueFigures({ feed, status, error });
+}
+
+/** The same for History's figures, which need the closed asks read too (`askHistoryFigures`). */
+export function useHistoryFigures(): AskFigures {
+  const feed = useAsk((state) => state.feed);
+  const status = useAsk((state) => state.status);
+  const error = useAsk((state) => state.error);
+  const closed = useAsk((state) => state.closed);
+  const closedStatus = useAsk((state) => state.closedStatus);
+  const closedAt = useAsk((state) => state.closedAt);
+  const closedError = useAsk((state) => state.closedError);
+  return askHistoryFigures({ feed, status, error, closed, closedStatus, closedAt, closedError });
+}
+
+/**
+ * For a screen that holds secrets in its own state: `drop` clears them. It is
+ * called first of all when the server changes, before the store is emptied.
+ */
+export function useAskSecretsHeld(drop: () => void): void {
+  useEffect(() => askScopes.holdSecrets(drop), [drop]);
+}
+
+/**
+ * For a screen that waits on a call: read it when the call comes back, before
+ * anything is done with the result. It answers for the server and the screen
+ * that started the call, not for whatever is in use or in front by then.
+ */
+export function useLateStanding(): () => LateStanding {
+  const scope = useAskScope();
+  const navigation = useNavigation();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  return useCallback(
+    () =>
+      lateStanding({
+        live: scope.live(),
+        mounted: mounted.current,
+        focused: navigation.isFocused(),
+      }),
+    [scope, navigation],
+  );
+}
+
+const NO_SESSION = Atom.make(AsyncResult.initial<AuthSessionState>());
+
+/**
+ * Whether this phone may answer, from the session the app already holds
+ * (`GET /api/auth/session` carries `owner`). Answering, replying, hand-over,
+ * snooze and batches are on only for `owner`: while the session is still being
+ * read, or could not be read, the asks can be read and nothing can be sent.
+ * A phone the session already confirmed as his stays `owner` while there is no
+ * connection to read it again, so he can answer and the answer waits as "Not
+ * sent"; a refusal from the server ends that. `recheck` reads the session again.
+ *
+ * Two standings come back. `standing` is the one to fill in and queue by; it
+ * keeps what an earlier connection's session said. `sends` is the one to send
+ * by: only what the session of the connection that is up now has said. Every
+ * control that writes at once (Retry, an Undo that writes, a reply) goes by
+ * `sends`; the scope's own gate holds whatever a control lets through.
+ */
+export function useOwnerStanding(): {
+  readonly standing: OwnerStanding;
+  readonly sends: OwnerStanding;
+  readonly recheck: () => void;
+} {
+  const { environmentId } = useAskScope();
+  const atom =
+    environmentId === null
+      ? NO_SESSION
+      : environmentSession.sessionStateAtom(environmentId as EnvironmentId);
+  const result = useAtomValue(atom);
+  const refused = useAsk((state) => state.notOwner !== null);
+  // Said owner before the connection went: it stands while the session can't be read.
+  // The scope tells the store what the session says (`askScope.ts`), screen or no screen.
+  const seen = useAsk((state) => state.ownerSeen);
+  const recheck = useCallback(() => appAtomRegistry.refresh(atom), [atom]);
+  const read = sessionRead(result);
+  return {
+    standing: ownerStanding(read, refused, seen),
+    sends: ownerStanding(read, refused),
+    recheck,
+  };
+}
+
+/**
+ * What is known of an ask that is not among the open ones (`missing`), so a
+ * screen says "closed" only of an ask known to have closed. What this phone
+ * holds answers first: an ask he answered here, or one History has read. If
+ * neither, the ask is read by itself from the server it would have come from.
+ * `retry` reads it again.
+ */
+export function useAskWhereabouts(
+  key: string | null,
+  missing: boolean,
+): { readonly where: AskWhereabouts; readonly retry: () => void } {
+  const { api, asks } = useAskScope();
+  const answeredHere = useAsk(
+    (state) =>
+      key !== null &&
+      (state.sent.some((send) => send.refs.some((ref) => ref.key === key)) ||
+        state.held?.payload.refs.some((ref) => ref.key === key) === true),
+  );
+  const inHistory = useAsk(
+    (state) => key !== null && state.closed?.some((entry) => askKey(entry) === key) === true,
+  );
+  const known = answeredHere || inHistory;
+  const [attempt, setAttempt] = useState(0);
+  const [found, setFound] = useState<{
+    readonly key: string;
+    readonly attempt: number;
+    readonly where: Exclude<AskWhereabouts, "looking">;
+  } | null>(null);
+  useEffect(() => {
+    if (!missing || known || key === null) return;
+    const params = askParamsFromKey(key);
+    if (params === null) return;
+    let current = true;
+    const settle = (where: Exclude<AskWhereabouts, "looking">) => {
+      if (!current) return;
+      setFound({ key, attempt, where });
+      // Open after all: the queue is behind, so it is read again.
+      if (where === "open") void asks.refreshAsks();
+    };
+    // The server takes a card's id where it takes its reference.
+    api.detail(params.cardId, params.askId).then(
+      (detail) => settle(askWhereabouts({ closedAt: detail.ask.closedAt })),
+      (error: unknown) =>
+        settle(askWhereabouts({ status: error instanceof AskApiError ? error.status : 0 })),
+    );
+    return () => {
+      current = false;
+    };
+  }, [api, asks, key, missing, known, attempt]);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  const where: AskWhereabouts = known
+    ? "closed"
+    : found !== null && found.key === key && found.attempt === attempt
+      ? found.where
+      : "looking";
+  return { where, retry };
+}
+
+/** Keeps the feed current while a screen shows it. `fast`: the queue or an ask is open. */
+export function useWatchAsks(fast: boolean): void {
+  const asks = useAsks();
+  useEffect(() => asks.watchAsks(fast), [asks, fast]);
+}
