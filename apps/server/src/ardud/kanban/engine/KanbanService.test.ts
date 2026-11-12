@@ -3742,8 +3742,8 @@ it.effect("new board defaults follow the migration setting without rewriting exi
       });
       assert.deepStrictEqual(mapped.managerModel, {
         instanceId: ProviderInstanceId.make("claudeAgent"),
-        model: "claude-haiku-5-5",
-        options: [{ id: "effort", value: "xhigh" }],
+        model: "claude-sonnet-5-5",
+        options: [{ id: "effort", value: "medium" }],
       });
       assert.deepStrictEqual(mapped.defaultCardModel, {
         instanceId: ProviderInstanceId.make("claudeAgent"),
@@ -3754,7 +3754,7 @@ it.effect("new board defaults follow the migration setting without rewriting exi
       const pools = (yield* kanban.snapshot(mapped.id)).pools;
       assert.deepStrictEqual(
         pools.map((pool) => pool.key),
-        ["claudeAgent/claude-haiku-5-5#xhigh", "claudeAgent/claude-opus-5-5#high"],
+        ["claudeAgent/claude-sonnet-5-5#medium", "claudeAgent/claude-opus-5-5#high"],
       );
       assert.deepStrictEqual(
         (yield* kanban.ensureBoard({ slug: "original", name: "Again", defaultProjectId: null }))
@@ -13386,7 +13386,7 @@ it.effect(
         const opus = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
         assert.deepStrictEqual(
           board.managerModel,
-          modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" }),
+          modelSelectionOf({ model: "opus/claude-sonnet-5-5", variant: "medium" }),
         );
         assert.deepStrictEqual(board.evaluatorModel, opus);
         assert.deepStrictEqual(board.defaultCardModel, opus);
@@ -13423,7 +13423,7 @@ it.effect("createBoard uses the same default models as ensureBoard", () =>
       const opus = modelSelectionOf({ model: "opus/claude-opus-5-5", variant: "high" });
       assert.deepStrictEqual(
         board.managerModel,
-        modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" }),
+        modelSelectionOf({ model: "opus/claude-sonnet-5-5", variant: "medium" }),
       );
       assert.deepStrictEqual(board.evaluatorModel, opus);
       assert.deepStrictEqual(board.defaultCardModel, opus);
@@ -14050,16 +14050,15 @@ it.effect("a level change refuses a level another pool of the model already has"
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      const haikuMax = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
-      // toyBoard already has the manager's Haiku xhigh pool.
-      yield* kanban.setPool(board.id, haikuMax, 2);
+      const sonnetMax = modelSelectionOf({ model: "opus/claude-sonnet-5-5", variant: "max" });
+      yield* kanban.setPool(board.id, sonnetMax, 2);
       const refused = yield* kanban
-        .setPool(board.id, haikuMax, undefined, { replaces: Rules.poolKey(board.managerModel) })
+        .setPool(board.id, sonnetMax, undefined, { replaces: Rules.poolKey(board.managerModel) })
         .pipe(Effect.flip);
       assert.strictEqual(refused.code, "conflict");
       assert.include(refused.detail, "already has a pool at max");
       const other = yield* kanban
-        .setPool(board.id, board.defaultCardModel, undefined, { replaces: Rules.poolKey(haikuMax) })
+        .setPool(board.id, board.defaultCardModel, undefined, { replaces: Rules.poolKey(sonnetMax) })
         .pipe(Effect.flip);
       assert.include(other.detail, "a level change keeps the model");
     }).pipe(Effect.provide(testLayer(fake.layer)));
@@ -14101,7 +14100,7 @@ it.effect("a level change keeps the composer's model check, as a plain setPool d
     const listed = yield* Ref.make<KanbanModels.ListedModels | null>(null);
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
-      const haikuMax = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "max" });
+      const sonnetMax = modelSelectionOf({ model: "opus/claude-sonnet-5-5", variant: "max" });
       // A pause (0 slots) is allowed while the model is listed; then the model leaves the list.
       yield* kanban.setPool(board.id, board.managerModel, 0);
       yield* Ref.set(
@@ -14118,7 +14117,7 @@ it.effect("a level change keeps the composer's model check, as a plain setPool d
       assert.include(sameKey.detail, "isn't in the model list");
       // Rekey: a level change to the hidden model is refused too.
       const rekey = yield* kanban
-        .setPool(board.id, haikuMax, 1, { replaces: Rules.poolKey(board.managerModel) })
+        .setPool(board.id, sonnetMax, 1, { replaces: Rules.poolKey(board.managerModel) })
         .pipe(Effect.flip);
       assert.strictEqual(rekey.code, "invalid");
       assert.include(rekey.detail, "isn't in the model list");
@@ -14315,8 +14314,12 @@ it.effect.each([false, true])(
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         const store = yield* KanbanStore.KanbanStore;
-        const { board } = yield* toyBoard.pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
         const haiku = modelSelectionOf({ model: "opus/cc/claude-haiku-5-5", variant: "xhigh" });
+        const { board } = yield* Effect.gen(function* () {
+          const { kanban, board } = yield* toyBoard;
+          yield* kanban.setPool(board.id, haiku, 0);
+          return { board };
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
         const oldKey = Rules.modelKey(haiku);
         const pool = (yield* store.pools(board.id)).find(
           (pool) => pool.key === Rules.poolKey(haiku),
