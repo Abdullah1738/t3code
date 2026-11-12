@@ -1540,3 +1540,34 @@ it.effect("keeps each thread's current tab when threads share a provider session
     }),
   ),
 );
+
+it.effect.each(["snapshot", "type", "click", "resize"] as const)(
+  "preserves the browser cutoff and reason for %s",
+  (operation) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const broker = yield* makeBroker;
+        const requests = requestsFrom(
+          yield* broker.connect(makeHost({ supportedOperations: [operation] })),
+        );
+        yield* Stream.runForEach(requests, (request) =>
+          broker.respond({
+            clientId: "client-1",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: false,
+            error: {
+              _tag: "PreviewAutomationTimeoutError",
+              message: "Renderer did not provide a fresh frame (cutoff 2000ms).",
+              detail: { timeoutMs: 2_000 },
+            },
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        const error = yield* broker.invoke<void>({ scope, operation, input: {} }).pipe(Effect.flip);
+        expect(error).toMatchObject({ _tag: "PreviewAutomationTimeoutError", timeoutMs: 2_000 });
+        expect(error.message).toContain("Renderer did not provide a fresh frame (cutoff 2000ms).");
+        expect(error.message).not.toContain("15000ms");
+      }),
+    ),
+);

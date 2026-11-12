@@ -16,6 +16,8 @@ export interface CdpRelayTarget {
   readonly targetId: () => Promise<string>;
   readonly url: () => string;
   readonly title: () => string;
+  /** The embedder's committed viewport mode and target CSS dimensions. */
+  readonly viewport?: () => Promise<unknown>;
   readonly userAgent: () => string;
   /**
    * The desktop app and the server it launched share a disk, so the server's
@@ -159,7 +161,15 @@ export function createCdpRelayConnection(
     }
     // Playwright asks for this on every page; the host emulates focus only while it is in use.
     if (command.method === "Emulation.setFocusEmulationEnabled") return Promise.resolve({});
-    return target.send(command.method, command.params ?? {}, child, owner);
+    const result = target.send(command.method, command.params ?? {}, child, owner);
+    if (command.method === "Page.getLayoutMetrics" && child === undefined && target.viewport) {
+      // Guest animation frames cannot acknowledge an asynchronously published host layout.
+      return Promise.all([result, target.viewport()]).then(([metrics, viewport]) => ({
+        ...(typeof metrics === "object" && metrics !== null ? metrics : {}),
+        t3Viewport: viewport,
+      }));
+    }
+    return result;
   };
 
   return {

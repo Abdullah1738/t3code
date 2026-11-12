@@ -89,6 +89,13 @@ function makeSession(frame?: ReturnType<typeof makeFrame>) {
     emit: (name: string) => events.emit(name),
     detach: vi.fn(async () => {}),
     send: vi.fn(async (method: string, input?: unknown): Promise<Record<string, unknown>> => {
+      if (
+        method === "Runtime.evaluate" &&
+        String((input as { expression?: string }).expression).startsWith(
+          "new Promise(resolve => requestAnimationFrame",
+        )
+      )
+        return { result: { value: true } };
       if (method === "Page.getNavigationHistory") return { currentIndex: 0, entries: [{}] };
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { pageX: 0, pageY: 0 } };
       if (method === "Page.captureScreenshot") {
@@ -394,7 +401,9 @@ it.live("preview_open reports its navigation timeout instead of the request budg
         _tag: "PreviewAutomationTimeoutError",
         timeoutMs: 15_000,
       });
-      expect(error.message).toBe("Preview automation open timed out after 15000ms.");
+      expect(error.message).toBe(
+        "Preview automation open failed: page.goto: Timeout 15000ms exceeded.",
+      );
     }),
   ).pipe(Effect.provide(layer)),
 );
@@ -787,7 +796,7 @@ it.live("streams to a read-only viewer without allowing takeover, input, or view
 it.live("applies any client's viewport, appearance, and zoom to a headless tab", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const { tabId } = yield* ready;
+      const { tabId, broker } = yield* ready;
       const manager = yield* Manager.PreviewManager;
       const page = contexts[0]!.page;
       const session = contexts[0]!.sessions[0]!;
@@ -811,6 +820,13 @@ it.live("applies any client's viewport, appearance, and zoom to a headless tab",
         deviceScaleFactor: 2.5,
         mobile: false,
       });
+      const resized = yield* broker.invoke<{ viewport: { width: number; height: number } }>({
+        scope,
+        tabId,
+        operation: "resize",
+        input: { mode: "freeform", width: 390, height: 844 },
+      });
+      expect(resized.viewport).toEqual({ width: 312, height: 675 });
     }),
   ).pipe(Effect.provide(layer)),
 );
@@ -2076,6 +2092,71 @@ it.live("a desktop page that comes back reconnects without waiting for a viewer"
       desktopDetaches.emit("attach", { threadId: scope.thread.threadId, tabId: opened.tabId });
       while (desktopConnections.length < 2) yield* Effect.yieldNow;
       expect(desktopConnections).toHaveLength(2);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live.each([false, true])(
+  "rejects a pending navigation before trying snapshot capture (committed=%s)",
+  (committed) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId } = yield* ready;
+        const page = contexts[0]!.page;
+        page.emit("request", {
+          isNavigationRequest: () => true,
+          frame: () => page,
+          url: () => "http://never-answers.test/",
+        });
+        if (committed) page.emit("framenavigated", page);
+        const error = yield* broker
+          .invoke<void>({ scope, tabId, operation: "snapshot", input: {} })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({ _tag: "PreviewAutomationTimeoutError" });
+        expect(error.message).toContain("page still loading http://never-answers.test/");
+        expect(error.message).toContain(
+          committed ? "waiting for load" : "waiting for main document response/commit",
+        );
+        expect(page.ariaSnapshot).not.toHaveBeenCalled();
+        page.emit("load");
+        const text = yield* broker.invoke<PreviewAutomationSnapshot>({
+          scope,
+          tabId,
+          operation: "snapshot",
+          input: { captureImage: false },
+        });
+        expect(text.screenshot).toBeUndefined();
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("rejects snapshots before the action queue of a navigation that never commits", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      const page = contexts[0]!.page;
+      const commit = Promise.withResolvers<void>();
+      page.goto.mockImplementationOnce(async () => {
+        page.emit("request", {
+          isNavigationRequest: () => true,
+          frame: () => page,
+          url: () => "http://never-commits.test/",
+        });
+        await commit.promise;
+      });
+      yield* Effect.gen(function* () {
+        yield* broker.invoke({
+          scope,
+          tabId,
+          operation: "navigate",
+          input: { url: "http://never-commits.test/", readiness: "none" },
+        });
+        const error = yield* broker
+          .invoke<void>({ scope, tabId, operation: "snapshot", input: {} })
+          .pipe(Effect.flip);
+        expect(error.message).toContain("waiting for main document response/commit");
+        expect(page.ariaSnapshot).not.toHaveBeenCalled();
+      }).pipe(Effect.ensuring(Effect.sync(() => commit.resolve())));
     }),
   ).pipe(Effect.provide(layer)),
 );
