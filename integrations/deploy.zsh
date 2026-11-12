@@ -30,3 +30,7 @@ rsync "${flags[@]}" \
   --exclude '*.sock' --exclude archive --exclude watchers --exclude HANDOFF.md --exclude tmp \
   --exclude 'verification*' --exclude bin --exclude .gitignore --exclude README.md --exclude docs \
   "$src" "$dst"
+
+if [[ "$name" == memory-system ]]; then
+  /bin/bash "${src}scripts/install_launchagent.sh" "$@"
+fi
