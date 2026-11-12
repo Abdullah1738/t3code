@@ -1,4 +1,6 @@
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Sink from "effect/Sink";
@@ -59,14 +61,28 @@ export const appendStderrTail = (current: string, chunk: string): string => {
 
 const CREDENTIAL_KEY =
   "(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|authorization|credential|password|passwd|secret|token)";
-const QUOTED_CREDENTIAL_PATTERN = new RegExp(
-  `(["']${CREDENTIAL_KEY}["']\\s*:\\s*["'])[^"']*(["'])`,
-  "gi",
+// A quoted value runs to its own closing quote, skipping escapes; an
+// unterminated one runs to the end of the line.
+const QUOTED_VALUE = String.raw`"(?:\\.|[^"\\\n])*(?:"|$)|'(?:\\.|[^'\\\n])*(?:'|$)`;
+const QUOTED_KEY_CREDENTIAL_PATTERN = new RegExp(
+  String.raw`(["'])(${CREDENTIAL_KEY})\1(\s*:\s*)(?:${QUOTED_VALUE}|[^\s,}\]]+)`,
+  "gim",
 );
 const ASSIGNED_CREDENTIAL_PATTERN = new RegExp(
-  `(\\b${CREDENTIAL_KEY}\\b\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;&"']+)`,
-  "gi",
+  String.raw`(\b${CREDENTIAL_KEY}\b\s*[:=]\s*)(?:${QUOTED_VALUE}|[^\s,;&"']+)`,
+  "gim",
 );
+const redactQuotedKeyValue = (
+  match: string,
+  keyQuote: string,
+  key: string,
+  separator: string,
+): string => {
+  const valueQuote = match.charAt(keyQuote.length * 2 + key.length + separator.length);
+  return valueQuote === '"' || valueQuote === "'"
+    ? `${keyQuote}${key}${keyQuote}${separator}${valueQuote}[redacted]${valueQuote}`
+    : `${keyQuote}${key}${keyQuote}${separator}[redacted]`;
+};
 const BEARER_TOKEN_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._\-+=/]+/gi;
 const URL_USERINFO_PATTERN = /\b(https?:\/\/)[^\s/@]+@/gi;
 const URL_QUERY_PATTERN = /\b(https?:\/\/[^\s?#]+)\?[^\s#]*/gi;
@@ -82,7 +98,7 @@ export const boundStderrTail = (tail: string): string =>
     .split("\n")
     .slice(-STDERR_TAIL_MAX_LINES)
     .join("\n")
-    .replace(QUOTED_CREDENTIAL_PATTERN, "$1[redacted]$2")
+    .replace(QUOTED_KEY_CREDENTIAL_PATTERN, redactQuotedKeyValue)
     .replace(BEARER_TOKEN_PATTERN, "$1 [redacted]")
     .replace(ASSIGNED_CREDENTIAL_PATTERN, "$1[redacted]")
     .replace(URL_USERINFO_PATTERN, "$1")
@@ -103,12 +119,16 @@ export const makeTerminationError = (
         }),
       ),
     onSuccess: (code) =>
-      (stderrTail ?? Effect.succeed<string | undefined>(undefined)).pipe(
+      Effect.all([
+        stderrTail ?? Effect.succeed<string | undefined>(undefined),
+        Clock.currentTimeMillis,
+      ]).pipe(
         Effect.map(
-          (tail) =>
+          ([tail, exitedAtMs]) =>
             new CodexError.CodexAppServerProcessExitedError({
               code,
               pid: handle.pid,
+              exitedAt: DateTime.formatIso(DateTime.makeUnsafe(exitedAtMs)),
               ...(tail === undefined ? {} : { stderrTail: tail }),
             }),
         ),

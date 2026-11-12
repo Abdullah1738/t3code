@@ -249,6 +249,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
           'request body {"api_key":"dummy-api-key","access_token":"dummy-access-token"}',
           "retrying with refresh_token=dummy-refresh password: dummy-password",
           "GET https://user:dummy-pass@example.test/v1?token=dummy-query-token failed",
+          `{"password":"dummy'password-suffix"}`,
+          String.raw`{"api_key":"dummy\"escaped-suffix"}`,
           'fatal: {"client_secret": "dummy-client-secret"}',
           "",
         ].join("\n"),
@@ -262,6 +264,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         "dummy-pass",
         "dummy-query-token",
         "dummy-client-secret",
+        "password-suffix",
+        "escaped-suffix",
       ]) {
         assert.notInclude(rendered, secret);
       }
@@ -307,6 +311,16 @@ it.each([
   ["GET https://host.test/p?key=S1#frag", "GET https://host.test/p#frag"],
   ["key sk-S1abcdefghij", "key [redacted]"],
   ["fatal: database is locked", "fatal: database is locked"],
+  [`{"password":"S1'password-suffix"}`, '{"password":"[redacted]"}'],
+  [String.raw`{"api_key":"S1\"escaped-suffix"}`, '{"api_key":"[redacted]"}'],
+  [`{'secret': 'S1"quote-suffix'}`, "{'secret': '[redacted]'}"],
+  [String.raw`{'token': 'S1\'escaped-suffix'}`, "{'token': '[redacted]'}"],
+  ['{"token": 12345, "id": 7}', '{"token": [redacted], "id": 7}'],
+  ['{"password":"S1-unterminated-suffix', '{"password":"[redacted]"'],
+  [`password="S1'pw-suffix" next`, "password=[redacted] next"],
+  [String.raw`secret="S1\"escaped-suffix" next`, "secret=[redacted] next"],
+  [String.raw`token='S1\'escaped-suffix' next`, "token=[redacted] next"],
+  ["refresh_token=S1-unterminated'suffix", "refresh_token=[redacted]'suffix"],
 ])("redacts %s from the stderr tail", (line, expected) => {
   assert.equal(boundStderrTail(line), expected);
 });
@@ -338,3 +352,46 @@ it.each(["usage limit is 80% used", "fatal: database is locked", ""])(
     assert.isUndefined(error.providerUsageLimit);
   },
 );
+
+const DUBAI = DateTime.zoneMakeNamedUnsafe("Asia/Dubai");
+it.each([
+  ["Nov 16th, 2026 9:47 AM", "2026-11-12T07:30:00.000Z", "2026-11-16T05:47:00.000Z"],
+  ["Nov 16th 9:47 AM", "2026-11-12T07:30:00.000Z", "2026-11-16T05:47:00.000Z"],
+  ["November 16 9:47 am", "2026-11-12T07:30:00.000Z", "2026-11-16T05:47:00.000Z"],
+  ["Jan 2nd 9:00 AM", "2026-12-30T10:00:00.000Z", "2027-01-02T05:00:00.000Z"],
+  ["Nov 12th 11:00 AM", "2026-11-12T07:30:00.000Z", "2026-11-12T07:00:00.000Z"],
+  ["3:05 PM", "2026-11-12T07:30:00.000Z", "2026-11-12T11:05:00.000Z"],
+  ["9:00 AM", "2026-11-12T07:30:00.000Z", "2026-11-13T05:00:00.000Z"],
+  ["21:15", "2026-11-12T07:30:00.000Z", "2026-11-12T17:15:00.000Z"],
+  ["Nov 16th, 2026 9:47 AM", undefined, "2026-11-16T05:47:00.000Z"],
+  ["Nov 16th 9:47 AM", undefined, null],
+  ["9:47 AM", undefined, null],
+  ["Feb 31st, 2026 9:00 AM", "2026-11-12T07:30:00.000Z", null],
+  ["Foo 3rd 9:00 AM", "2026-11-12T07:30:00.000Z", null],
+  ["13:05 PM", "2026-11-12T07:30:00.000Z", null],
+  ["someday", "2026-11-12T07:30:00.000Z", null],
+])("reads the reset in 'try again at %s' (exited %s) as %s", (when, exitedAt, expected) => {
+  assert.equal(
+    CodexError.codexUsageLimitResetAt(
+      `You've hit your usage limit. Upgrade to Pro or try again at ${when}.`,
+      exitedAt,
+      DUBAI,
+    ),
+    expected,
+  );
+});
+
+it("anchors a yearless reset notice on the exit time, not an invented year", () => {
+  const stderrTail = "You've hit your usage limit. Try again at Nov 16th 9:47 AM.";
+  const anchored = new CodexError.CodexAppServerProcessExitedError({
+    code: 1,
+    stderrTail,
+    exitedAt: "2026-11-12T07:30:00.000Z",
+  });
+  assert.equal(
+    anchored.providerUsageLimit?.resetAt,
+    DateTime.formatIso(DateTime.makeUnsafe(Date.parse("2026-11-16T09:47:00"))),
+  );
+  const unanchored = new CodexError.CodexAppServerProcessExitedError({ code: 1, stderrTail });
+  assert.deepEqual(unanchored.providerUsageLimit, { resetAt: null });
+});

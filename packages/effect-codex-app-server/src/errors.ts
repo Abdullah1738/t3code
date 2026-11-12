@@ -151,6 +151,8 @@ export class CodexAppServerProcessExitedError extends Schema.TaggedError<CodexAp
     pid: Schema.optionalKey(Schema.Int),
     /** Bounded, redacted tail of the process's stderr; never the whole stream. */
     stderrTail: Schema.optionalKey(Schema.String),
+    /** When the exit was observed (ISO); anchors reset times Codex prints without a year. */
+    exitedAt: Schema.optionalKey(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -173,20 +175,78 @@ export class CodexAppServerProcessExitedError extends Schema.TaggedError<CodexAp
     const line =
       this.stderrTail === undefined ? undefined : lastMeaningfulStderrLine(this.stderrTail);
     if (line === undefined || !USAGE_LIMIT_PATTERN.test(line)) return undefined;
-    return { resetAt: usageLimitResetAt(line) };
+    return {
+      resetAt: codexUsageLimitResetAt(line, this.exitedAt, DateTime.zoneMakeLocal()),
+    };
   }
 }
 
 const USAGE_LIMIT_PATTERN =
   /you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded)|\busageLimitExceeded\b/i;
-const RETRY_AT_PATTERN = /try again (?:at|after) (.+?)\.?$/i;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const RESET_PATTERN =
+  /try again (?:at|after) (?:([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(\d{4}),?\s+)?)?(\d{1,2}):(\d{2})\s*([ap])?\.?m?\b/i;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Codex prints the reset in this machine's local time, e.g. "Nov 16th, 2026 9:47 AM".
-function usageLimitResetAt(line: string): string | null {
-  const when = RETRY_AT_PATTERN.exec(line)?.[1]?.replace(/(\d+)(?:st|nd|rd|th)\b/gi, "$1");
-  if (when === undefined) return null;
-  const resetMs = Date.parse(when);
-  return Number.isFinite(resetMs) ? DateTime.formatIso(DateTime.makeUnsafe(resetMs)) : null;
+/**
+ * Reads the reset time from Codex's usage-limit notice, e.g. "try again at
+ * Nov 16th, 2026 9:47 AM", "Nov 16th 9:47 AM" or "9:47 AM". Codex prints wall
+ * time in `timeZone`; a missing year or date is taken from `exitedAt`, rolling
+ * forward when that lands in the past. Null when it cannot be determined.
+ */
+export function codexUsageLimitResetAt(
+  line: string,
+  exitedAt: string | undefined,
+  timeZone: DateTime.TimeZone,
+): string | null {
+  const match = RESET_PATTERN.exec(line);
+  if (match === null) return null;
+  const [, monthName, dayText, yearText, hourText, minuteText, meridiem] = match;
+  const minute = Number(minuteText);
+  let hour = Number(hourText);
+  if (minute > 59 || hour > 23) return null;
+  if (meridiem !== undefined) {
+    if (hour < 1 || hour > 12) return null;
+    hour = (hour % 12) + (meridiem.toLowerCase() === "p" ? 12 : 0);
+  }
+  const month = monthName === undefined ? undefined : MONTHS.indexOf(monthName.toLowerCase()) + 1;
+  if (month === 0) return null;
+  const day = dayText === undefined ? undefined : Number(dayText);
+  const exitedMs = exitedAt === undefined ? Number.NaN : Date.parse(exitedAt);
+  const exited = Number.isFinite(exitedMs)
+    ? DateTime.toParts(DateTime.makeZonedUnsafe(exitedMs, { timeZone }))
+    : undefined;
+  if (yearText === undefined && exited === undefined) return null;
+
+  const wallTime = (year: number, monthOfYear: number, dayOfMonth: number): number | null => {
+    const zoned = DateTime.makeZoned(
+      { year, month: monthOfYear, day: dayOfMonth, hour, minute, second: 0, millisecond: 0 },
+      { timeZone, adjustForTimeZone: true },
+    );
+    if (zoned._tag === "None") return null;
+    const parts = DateTime.toParts(zoned.value);
+    // Reject dates that roll over, like Feb 31st.
+    return parts.month === monthOfYear && parts.day === dayOfMonth
+      ? DateTime.toEpochMillis(zoned.value)
+      : null;
+  };
+
+  let resetMs: number | null;
+  if (month !== undefined && day !== undefined) {
+    if (yearText !== undefined) {
+      resetMs = wallTime(Number(yearText), month, day);
+    } else {
+      resetMs = wallTime(exited!.year, month, day);
+      // "Jan 2nd" seen on Dec 30th means next year; allow a day of clock skew.
+      if (resetMs !== null && resetMs < exitedMs - DAY_MS) {
+        resetMs = wallTime(exited!.year + 1, month, day);
+      }
+    }
+  } else {
+    resetMs = wallTime(exited!.year, exited!.month, exited!.day);
+    if (resetMs !== null && resetMs < exitedMs) resetMs += DAY_MS;
+  }
+  return resetMs === null ? null : DateTime.formatIso(DateTime.makeUnsafe(resetMs));
 }
 
 const MAX_STDERR_LINE_CHARS = 300;

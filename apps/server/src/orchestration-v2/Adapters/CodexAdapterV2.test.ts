@@ -921,7 +921,13 @@ describe("CodexAdapterV2 process spawning", () => {
     Effect.gen(function* () {
       const { exitDuringResume } = yield* mockAppServerFactory;
       const exited = yield* exitDuringResume(
-        'config {"api_key":"dummy-api-key","access_token":"dummy-access-token"}\nfatal: refresh_token=dummy-refresh rejected\n',
+        [
+          'config {"api_key":"dummy-api-key","access_token":"dummy-access-token"}',
+          `{"password":"dummy'password-suffix"}`,
+          String.raw`{"client_secret":"dummy\"escaped-suffix"}`,
+          "fatal: refresh_token=dummy-refresh rejected",
+          "",
+        ].join("\n"),
       );
       // ProviderSessionManager persists Cause.pretty of the failed event stream
       // as the released session's lastError.
@@ -934,8 +940,19 @@ describe("CodexAdapterV2 process spawning", () => {
           }),
         ),
       );
-      for (const secret of ["dummy-api-key", "dummy-access-token", "dummy-refresh"]) {
+      const failureMessage = makeProviderFailure({
+        cause: Cause.fail(exited),
+        class: "provider_error",
+      }).message;
+      for (const secret of [
+        "dummy-api-key",
+        "dummy-access-token",
+        "dummy-refresh",
+        "password-suffix",
+        "escaped-suffix",
+      ]) {
         assert.notInclude(releaseDetail, secret);
+        assert.notInclude(failureMessage, secret);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), Effect.timeout("20 seconds")),
   );
