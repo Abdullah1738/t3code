@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, TOO_BIG_NOTE,
@@ -488,6 +489,7 @@ def _settled(r, echo=False, pos=0, *, locked=False) -> int:
         return EXIT_INFRA
     if r['error'] == 'box wedged before the command':
         say(f"{r['box_id']} was wedged before the command and set aside. Nothing ran: retry")
+    _report_deps_hint(r, r['exit_code'], LOGS_DIR / f"{r['run_id']}.log")
     out(f"{r['run_id']}: {r['status']} exit={r['exit_code']}")
     return r["exit_code"] if r["exit_code"] is not None else 90
 
@@ -798,6 +800,14 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     return code
 
 
+def _report_deps_hint(r, code, log_path) -> None:
+    from .runs import box_deps_hint, step_results
+    if code not in (0, None) or any(rc != 0 for _, rc in step_results(log_path)):
+        hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
+        if hint:
+            say(hint)
+
+
 def _finalize(r, code, log_path) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
@@ -820,6 +830,7 @@ def _finalize(r, code, log_path) -> int:
         do_pulls(r["box_id"], row, pulls)
     finish(r['run_id'], code)
     go_std_glitch(r["box_id"], r["run_id"], log_path, code)
+    _report_deps_hint(r, code, log_path)
     out(f"{r['run_id']}: exit={code}")
     return 90 if code is None else code
 

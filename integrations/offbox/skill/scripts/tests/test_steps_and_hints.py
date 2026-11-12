@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import cli, lease, runs  # noqa: E402
+from offbox_lib import cli, lease, misc, runs  # noqa: E402
 from offbox_lib.common import EXIT_INFRA, OffboxError  # noqa: E402
 from offbox_lib.runs import GO_STD_GLITCH  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
@@ -80,6 +80,111 @@ class StepScriptTests(unittest.TestCase):
         rc, _, err = self.run_steps(['exit 2', 'echo still-running'])
         self.assertEqual(rc, 2)
         self.assertIn('offbox step 2 rc=0', err)
+
+
+class MissingDepsTests(unittest.TestCase):
+
+    def test_install_selection(self):
+        cases = [
+            ({'yarn.lock'}, 'pnpm@11.10.0', 'pnpm install --frozen-lockfile'),
+            ({'pnpm-lock.yaml'}, 'yarn@1.22.22', 'yarn install --frozen-lockfile'),
+            ({'pnpm-lock.yaml'}, 'bun@1.3.0', 'bun install'),
+            ({'pnpm-lock.yaml', 'package-lock.json'}, 'npm@11.0.0', 'npm ci'),
+            ({'pnpm-lock.yaml'}, 'npm@11.0.0', 'npm install'),
+            ({'pnpm-lock.yaml', 'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'pnpm install --frozen-lockfile'),
+            ({'bun.lock', 'yarn.lock', 'package-lock.json'}, None, 'bun install'),
+            ({'bun.lockb', 'yarn.lock'}, None, 'bun install'),
+            ({'yarn.lock', 'package-lock.json'}, None, 'yarn install --frozen-lockfile'),
+            ({'package-lock.json'}, None, 'npm ci'),
+            (set(), None, 'npm install'),
+            ({'pnpm-lock.yaml'}, 'unknown@1', 'pnpm install --frozen-lockfile'),
+            ({'package-lock.json'}, '', 'npm ci'),
+        ]
+        for files, manager, install in cases:
+            with self.subTest(files=files, manager=manager):
+                hint = runs.missing_deps_hint(files | {'package.json'}, manager)
+                self.assertIn(f"offbox run -- '{install} && <command>'", hint)
+                self.assertIn('offbox save --default', hint)
+
+    def test_marker_is_required_even_when_local_deps_are_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'package.json').write_text('{"packageManager":"bun@1.3.0"}')
+            log = root / 'run.log'
+            for text in ('FAIL\n', 'echo OFFBOX_NO_NODE_MODULES\n', 'OFFBOX_NO_NODE_MODULES extra\n'):
+                log.write_text(text)
+                self.assertEqual(runs.box_deps_hint(root, log), '')
+            self.assertEqual(runs.box_deps_hint(root, None), '')
+            self.assertEqual(runs.box_deps_hint(root, root / 'missing.log'), '')
+            (root / 'node_modules').mkdir()
+            log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+            self.assertIn('bun install', runs.box_deps_hint(root, log))
+
+    def test_bad_manifest_does_not_hide_remote_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            log = root / 'run.log'
+            log.write_text(runs.NO_NODE_MODULES_MARKER + '\n')
+            (root / 'package-lock.json').touch()
+            for manifest in ('{', '[]', '{"packageManager":42}'):
+                (root / 'package.json').write_text(manifest)
+                self.assertIn('npm ci', runs.box_deps_hint(root, log))
+
+    def test_box_marker_uses_repo_root_and_preserves_exit(self):
+        for code in (0, 1, 127, 254):
+            for state in ('absent', 'present', 'no-package', 'nested-only', 'symlink'):
+                with self.subTest(code=code, state=state), tempfile.TemporaryDirectory() as home:
+                    root = Path(home) / 'w/repo'
+                    (root / 'sub').mkdir(parents=True)
+                    if state != 'no-package':
+                        (root / 'package.json').write_text('{}')
+                    if state == 'present':
+                        (root / 'node_modules').mkdir()
+                    elif state == 'nested-only':
+                        (root / 'sub/node_modules').mkdir()
+                    elif state == 'symlink':
+                        (root / 'node_modules').symlink_to(root / 'sub', target_is_directory=True)
+                    with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                            patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                        script = runs.remote_script('w/repo', 'sub', [f'cd /; printf partial >&2; exit {code}'], None, 'r')
+                    p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                                       capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, code)
+                    self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER),
+                                     int(code != 0 and state in ('absent', 'nested-only')))
+
+    def test_steps_print_one_marker_even_if_last_step_passes(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home) / 'w/repo'
+            root.mkdir(parents=True)
+            (root / 'package.json').write_text('{}')
+            with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
+                    patch.object(runs, 'LDCACHE_REPAIR', ':'):
+                script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['exit 127', 'true'])
+            p = subprocess.run(['bash', '-c', script], env=dict(os.environ, HOME=home),
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(p.returncode, 127)
+            self.assertEqual(p.stderr.splitlines().count(runs.NO_NODE_MODULES_MARKER), 1)
+
+    def test_report_exit_hint_and_silent_cases(self):
+        hint = runs.missing_deps_hint({'package.json'}, None)
+        for code, steps, marker, where, expected in (
+                (1, None, True, 'remote', True), (127, None, True, 'remote', True),
+                (254, None, True, 'remote', True), (2, None, True, 'remote', True),
+                (0, [(1, 127)], True, 'remote', True), (None, [(1, 127)], True, 'remote', True),
+                (0, None, True, 'remote', False), (None, None, True, 'remote', False),
+                (127, None, False, 'remote', False), (1, None, True, 'local', False)):
+            with self.subTest(code=code, steps=steps, marker=marker, where=where):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    runs.report_exit('vitest', code, steps, len(steps or []), where=where,
+                                     deps_hint=hint if marker else '')
+                lines = err.getvalue().splitlines()
+                self.assertEqual(sum(hint in line for line in lines), int(expected))
+                if expected:
+                    self.assertEqual(lines[-2], 'offbox: ' + hint)
+                if code is not None:
+                    self.assertEqual(lines[-1], f'offbox: {where} exit {code}')
 
 
 class SummaryAndHintTests(unittest.TestCase):
@@ -156,6 +261,60 @@ class CliStepTests(Isolated):
         self.assertEqual(rc, 1)
         self.assertEqual(lines[-2], 'offbox: offbox steps: 1 ok, 1 failed (step 2 rc=1)')
         self.assertEqual(lines[-1], 'offbox: remote exit 1')
+
+    def test_missing_deps_hint_from_probes_log(self):
+        # Crpko #3816: probes.log, cf1569-a3 on bx_yy9mjenc after an install on another box.
+        log = ('offbox: reusing repository pool box bx_yy9mjenc (xlarge)\n'
+               'bash: line 1: ./node_modules/.bin/vitest: No such file or directory\n')
+        root = Path(self.tmp.name)
+        self.me['repo_root'] = str(root)
+        (root / 'package.json').write_text('{"packageManager":"pnpm@11.10.0"}')
+        (root / 'node_modules').mkdir()  # Local deps must not suppress box evidence.
+        for code in (1, 127, 254):
+            with self.subTest(code=code):
+                rc, lines = self.run_cli(['./node_modules/.bin/vitest'], code,
+                                         log + runs.NO_NODE_MODULES_MARKER + '\n')
+                self.assertEqual(rc, code)
+                self.assertIn("pnpm install --frozen-lockfile && <command>", lines[-2])
+                self.assertEqual(lines[-1], f'offbox: remote exit {code}')
+        rc, lines = self.run_cli(['./node_modules/.bin/vitest'], 127, log)
+        self.assertEqual(lines, ['offbox: remote exit 127'])
+
+    def test_background_completion_and_settled_wait_show_hint(self):
+        root = Path(self.tmp.name)
+        (root / 'package.json').write_text('{"packageManager":"bun@1.3.0"}')
+        log = runs.LOGS_DIR / 'bg.log'
+        row = dict(run_id='bg', box_id='B', repo_root=str(root), pulls='[]', exit_code=127,
+                   status='failed', error=None)
+        cases = [(1, '', True), (127, '', True), (254, '', True), (0, '', False),
+                 (None, '', False), (None, 'offbox step 1 rc=0: vitest\n', False),
+                 (None, 'offbox step 1 rc=127: vitest\n', True),
+                 (0, 'offbox step 1 rc=1: pnpm test\n', True)]
+        for code, steps, failed in cases:
+            row['exit_code'] = code
+            for marked in (True, False):
+                log.write_text(steps + (runs.NO_NODE_MODULES_MARKER + '\n' if marked else 'vitest: not found\n'))
+                for settled in (True, False):
+                    with self.subTest(code=code, steps=steps, marked=marked, settled=settled):
+                        err, out = io.StringIO(), io.StringIO()
+                        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+                                patch.object(runs, 'finish'), patch.object(runs, 'go_std_glitch'), \
+                                patch.object(runs, 'settle_box_wedged', return_value=None), \
+                                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                            rc = misc._settled(row) if settled else misc._finalize(row, code, log)
+                        self.assertEqual(rc, 90 if code is None else code)
+                        self.assertEqual('bun install' in err.getvalue(), marked and failed)
+                        self.assertIn(f'exit={code}', out.getvalue())
+
+    def test_background_legacy_run_without_repo_and_marker_keeps_exit(self):
+        row = dict(run_id='legacy', box_id='B', repo_root=None, pulls='[]', exit_code=127,
+                   status='failed', error=None)
+        err, out = io.StringIO(), io.StringIO()
+        with patch.object(misc, '_catch_up_log'), patch.object(misc, '_incomplete_log'), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.assertEqual(misc._settled(row), 127)
+        self.assertEqual(err.getvalue(), '')
+        self.assertIn('exit=127', out.getvalue())
 
     def glitch_events(self):
         return self.con.execute("SELECT box_id, detail FROM events WHERE kind='go_std_glitch'").fetchall()
