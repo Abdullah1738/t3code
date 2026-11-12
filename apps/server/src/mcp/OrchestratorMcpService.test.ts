@@ -204,6 +204,7 @@ describe("OrchestratorMcpService", () => {
         const dependencies = Layer.mergeAll(
           NodeServices.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
             getThreadRecords: (id, fields) => {
               const requestedFields: ReadonlyArray<string> = fields;
               if (id === childId && requestedFields.includes("runs"))
@@ -387,15 +388,18 @@ describe("OrchestratorMcpService", () => {
         assert.isNull(pending.summary);
         assert.equal(yield* Ref.get(acknowledgementAttempts), 0);
         hasNestedWork = false;
-        const reading = yield* service.taskStatus(scope, taskId).pipe(
-          Effect.timeoutOption("1 second"), Effect.forkChild,
-        );
+        const reading = yield* service
+          .taskStatus(scope, taskId)
+          .pipe(Effect.timeoutOption("1 second"), Effect.forkChild);
         yield* Deferred.await(commandQueued);
         yield* TestClock.adjust("1 second");
         const observed = yield* Fiber.join(reading);
         assert.isFalse(yield* Deferred.isDone(releaseQueue));
         yield* Deferred.succeed(releaseQueue, undefined);
-        assert.isTrue(Option.isSome(observed), "status must return while the command queue is held");
+        assert.isTrue(
+          Option.isSome(observed),
+          "status must return while the command queue is held",
+        );
         if (Option.isNone(observed)) return;
         assert.equal(observed.value.status, "completed");
         assert.equal(observed.value.partial, false);
