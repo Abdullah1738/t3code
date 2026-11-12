@@ -8753,6 +8753,157 @@ it.effect("a failed failure-state read keeps the deferred reminder until the rea
   }),
 );
 
+it.effect("turn end retries a concurrent card write before sending its evaluator note once", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+      yield* kanban.dispatchNow;
+      const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+      const discussion = yield* kanban.cardDiscussion(card.id);
+      const noteCount = () =>
+        Ref.get(fake.threads).pipe(
+          Effect.map(
+            (all) =>
+              [...all.values()]
+                .flatMap((entry) => entry.messages)
+                .filter((text) => text.includes(`Card #${card.number}'s work run failed:`)).length,
+          ),
+        );
+      fake.failures.set(thread, {
+        class: "provider_error",
+        code: "provider.invalid-request",
+        message: "Invalid request",
+        retryable: false,
+      });
+      let reads = 0;
+      fake.viewControl.beforeRead = (id) =>
+        id === thread && ++reads === 2
+          ? Effect.gen(function* () {
+              assert.strictEqual(yield* noteCount(), 0);
+              yield* Effect.forkChild(
+                kanban.editCard(card.id, { description: "Concurrent worker update" }, owner),
+              ).pipe(Effect.flatMap(Fiber.join), Effect.orDie);
+            })
+          : Effect.void;
+      yield* kanban.turnEnded(thread).pipe(Effect.withTracer(tracer));
+      const after = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(after.stage, "todo");
+      assert.isNull(after.activeThreadId);
+      assert.include(after.stalled?.reason ?? "", "Invalid request");
+      assert.strictEqual(after.description, "Concurrent worker update");
+      assert.strictEqual(yield* noteCount(), 1);
+      const ended = spans.filter((span) => span.name === "KanbanService.turnEndedUnlocked");
+      assert.isAtLeast(ended.length, 2);
+      for (const span of ended) {
+        assert.strictEqual(span.attributes.get("kanban.board_id"), board.id);
+        assert.strictEqual(span.attributes.get("kanban.card_id"), card.id);
+        assert.strictEqual(span.attributes.get("kanban.thread_id"), thread);
+      }
+      yield* kanban.turnEnded(thread);
+      assert.strictEqual(yield* noteCount(), 1);
+      assert.isNotNull((yield* kanban.discussion(discussion.id)).evaluatorThreadId);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect(
+  "unresolved turn end logs a conflict once until recovery and can report a later conflict",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const logs: Array<unknown> = [];
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        fake.failures.set(thread, {
+          class: "provider_error",
+          code: "provider.invalid-request",
+          message: "Invalid request",
+          retryable: false,
+        });
+        fake.failFailureReads.left = 1;
+        yield* kanban.turnEnded(thread);
+        let attempts = 0;
+        const reached = yield* Queue.unbounded<void>();
+        const conflictRead = (id: ThreadId) =>
+          id === thread
+            ? Effect.sync(() => {
+                attempts += 1;
+              }).pipe(
+                Effect.andThen(Queue.offer(reached, undefined)),
+                Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged())),
+              )
+            : Effect.void;
+        fake.viewControl.beforeRead = conflictRead;
+        const conflictingTick = Effect.gen(function* () {
+          const ticking = yield* Effect.forkChild(kanban.tick);
+          yield* Queue.take(reached);
+          yield* TestClock.adjust(10);
+          yield* Queue.take(reached);
+          yield* TestClock.adjust(20);
+          yield* Queue.take(reached);
+          yield* Fiber.join(ticking);
+        });
+        const tickConflicts = () =>
+          logs.filter((message) => {
+            const text = JSON.stringify(message);
+            return text.includes("kanban tick step skipped") && text.includes('"turnEnd"');
+          });
+        for (let tick = 0; tick < 2; tick += 1) {
+          yield* conflictingTick;
+        }
+        assert.isAtLeast(attempts, 6);
+        assert.lengthOf(tickConflicts(), 1);
+        assert.include(JSON.stringify(tickConflicts()[0]), board.id);
+        assert.include(JSON.stringify(tickConflicts()[0]), card.id);
+        assert.include(JSON.stringify(tickConflicts()[0]), thread);
+        delete fake.viewControl.beforeRead;
+        yield* kanban.tick;
+        const after = (yield* kanban.card(card.id)).card;
+        assert.strictEqual(after.stage, "todo");
+        assert.isNull(after.activeThreadId);
+        const notes = [...(yield* Ref.get(fake.threads)).values()]
+          .flatMap((entry) => entry.messages)
+          .filter((text) => text.includes(`Card #${card.number}'s work run failed:`));
+        assert.lengthOf(notes, 1);
+        yield* kanban.tick;
+        assert.lengthOf(
+          logs.filter((message) => JSON.stringify(message).includes("kanban turn end recovered")),
+          1,
+        );
+        // Another unresolved outcome on this thread must be observable after recovery.
+        fake.failFailureReads.left = 1;
+        yield* kanban.turnEnded(thread);
+        fake.viewControl.beforeRead = conflictRead;
+        yield* conflictingTick;
+        assert.lengthOf(tickConflicts(), 2);
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            testLayer(fake.layer),
+            Logger.layer([
+              Logger.make(({ message }) => {
+                logs.push(message);
+              }),
+            ]),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect("an unreadable failure on a delayed turn end never restarts the failed thread", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -19633,6 +19784,77 @@ it.effect(
         ),
       );
     }),
+);
+
+it.effect("a syncPrs conflict on one reviewed card does not stop another card's landed move", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    let blocked: KanbanCardId | undefined;
+    let conflicts = 0;
+    const conflicted = yield* Queue.unbounded<void>();
+    const conflictingStore = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          putCard: (card) =>
+            card.id === blocked && card.links.some((link) => link.state === "merged")
+              ? Effect.sync(() => {
+                  conflicts += 1;
+                }).pipe(
+                  Effect.andThen(Queue.offer(conflicted, undefined)),
+                  Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged())),
+                )
+              : real.putCard(card),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const reviewed = [];
+      for (const title of ["Conflicting PR", "Landed PR"]) {
+        const card = yield* kanban.createCard(board.id, { title, prompt: title }, owner);
+        yield* kanban.dispatchNow;
+        const work = (yield* kanban.card(card.id)).card.activeThreadId!;
+        const url = `https://github.com/o/r/pull/${card.number}`;
+        fake.prs.set(work, [{ url, title, state: "open" }]);
+        yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
+          _tag: "thread",
+          threadId: work,
+        });
+        yield* kanban.turnEnded(work);
+        yield* kanban.dispatchNow;
+        yield* kanban.reviewResult((yield* kanban.card(card.id)).card.activeThreadId!, "clear", []);
+        assert.strictEqual((yield* kanban.card(card.id)).card.stage, "in_review");
+        reviewed.push({ card, work, url, title });
+      }
+      blocked = reviewed[0]!.card.id;
+      for (const { work, url, title } of reviewed)
+        fake.prs.set(work, [{ url, title, state: "merged" }]);
+      const ticking = yield* Effect.forkChild(kanban.tick);
+      yield* Queue.take(conflicted);
+      yield* TestClock.adjust(10);
+      yield* Queue.take(conflicted);
+      yield* TestClock.adjust(20);
+      yield* Queue.take(conflicted);
+      yield* Fiber.join(ticking);
+      assert.strictEqual(conflicts, 3);
+      assert.strictEqual((yield* kanban.card(reviewed[0]!.card.id)).card.stage, "in_review");
+      assert.strictEqual((yield* kanban.card(reviewed[1]!.card.id)).card.stage, "completed");
+      blocked = undefined;
+      yield* kanban.tick;
+      assert.strictEqual((yield* kanban.card(reviewed[0]!.card.id)).card.stage, "completed");
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          fake.layer,
+          KanbanModels.layerTest(null),
+          [opencodeTestProvider()],
+          conflictingStore,
+        ),
+      ),
+    );
+  }),
 );
 
 it.effect.each(["grow", "replace"] as const)(

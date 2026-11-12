@@ -1856,6 +1856,9 @@ const make = Effect.gen(function* () {
   const outageGeneration = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
   const deferredNudges = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
   const unresolvedTurnEnds = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  const turnEndConflicts = yield* Ref.make<
+    ReadonlyMap<ThreadId, { readonly committed: boolean; readonly link: KanbanThreadLink }>
+  >(new Map());
   const scanned = yield* Ref.make(false);
   // Pools whose model was off the composer's list at the last tick, as
   // `${boardId}:${poolKey}`. A pool is zeroed only on the second miss in a row.
@@ -6199,8 +6202,11 @@ const make = Effect.gen(function* () {
     expectedFailedWorkRunId?: string,
     fromTick = false,
   ) {
+    yield* Effect.annotateCurrentSpan("kanban.thread_id", threadId);
     const link = yield* store.threadLink(threadId);
     if (!link) return;
+    yield* Effect.annotateCurrentSpan("kanban.board_id", link.boardId);
+    if (link.cardId !== null) yield* Effect.annotateCurrentSpan("kanban.card_id", link.cardId);
     const at = yield* nowIso;
     // Every board-thread turn end is announced, so the Threads view rereads the run
     // as finished even when the dispatcher leaves the card as it is (a worker that
@@ -6779,25 +6785,55 @@ const make = Effect.gen(function* () {
     yield* reviewerStopped(card, threadId);
   });
 
+  const turnEndRecovered = Effect.fn("KanbanService.turnEndRecovered")(function* (
+    threadId: ThreadId,
+  ) {
+    if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) return;
+    const previous = yield* Ref.modify(turnEndConflicts, (all) => {
+      const next = new Map(all);
+      next.delete(threadId);
+      return [all.get(threadId), next];
+    });
+    if (previous)
+      yield* Effect.logInfo("kanban turn end recovered", {
+        boardId: previous.link.boardId,
+        cardId: previous.link.cardId,
+        threadId,
+      });
+  });
+
   const turnEndedUnlocked = (threadId: ThreadId, runId?: string, retry = false) =>
-    serial(turnEnding, threadId, finishTurn(threadId, runId, retry));
+    serial(turnEnding, threadId, finishTurn(threadId, runId, retry)).pipe(
+      Effect.tap(() => turnEndRecovered(threadId)),
+    );
 
   const tickStep = Effect.fn("KanbanService.tickStep")(function* <A, E, R>(
     boardId: string,
     step: string,
     effect: Effect.Effect<A, E, R>,
     cardId?: string,
+    turnEnd?: KanbanThreadLink,
   ) {
     return yield* locks.step(effect, cardId).pipe(
       Effect.map(Option.some),
       Effect.catchDefect((defect) =>
-        defect instanceof BoardLocks.BoardStateChanged
-          ? Effect.logWarning("kanban tick step skipped", {
-              boardId,
-              step,
-              cardId: cardId ?? null,
-            }).pipe(Effect.as(Option.none<A>()))
-          : Effect.die(defect),
+        Effect.gen(function* () {
+          if (!(defect instanceof BoardLocks.BoardStateChanged)) return yield* Effect.die(defect);
+          if (turnEnd) {
+            const previous = (yield* Ref.get(turnEndConflicts)).get(turnEnd.threadId);
+            if (previous?.committed === defect.committed) return Option.none<A>();
+            yield* Ref.update(turnEndConflicts, (all) =>
+              new Map(all).set(turnEnd.threadId, { committed: defect.committed, link: turnEnd }),
+            );
+          }
+          yield* Effect.logWarning("kanban tick step skipped", {
+            boardId,
+            step,
+            cardId: cardId ?? turnEnd?.cardId ?? null,
+            ...(turnEnd ? { threadId: turnEnd.threadId, committed: defect.committed } : {}),
+          });
+          return Option.none<A>();
+        }),
       ),
     );
   });
@@ -6811,11 +6847,12 @@ const make = Effect.gen(function* () {
       const result = yield* serialEach(
         turnEnding,
         threadId,
-        tickStep(boardId, "turnEnd", finishTurn(threadId, undefined, true)),
+        tickStep(boardId, "turnEnd", finishTurn(threadId, undefined, true), undefined, link),
         false,
       );
       if (Option.isNone(result))
         yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
+      else yield* turnEndRecovered(threadId);
     }
     // This is planning data only. A failed read must remain distinct from a
     // successful absence, and nothing survives this invocation of the tick.
