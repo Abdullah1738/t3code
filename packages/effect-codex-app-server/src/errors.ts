@@ -148,14 +148,37 @@ export class CodexAppServerProcessExitedError extends Schema.TaggedError<CodexAp
   {
     code: Schema.optional(Schema.Number),
     pid: Schema.optionalKey(Schema.Int),
+    /** Bounded, redacted tail of the process's stderr; never the whole stream. */
+    stderrTail: Schema.optionalKey(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message() {
-    return this.code === undefined
-      ? "Codex App Server process exited"
-      : `Codex App Server process exited with code ${this.code}`;
+    const process = this.pid === undefined ? "process" : `process ${this.pid}`;
+    const base =
+      this.code === undefined
+        ? `Codex App Server ${process} exited`
+        : `Codex App Server ${process} exited with code ${this.code}`;
+    if (this.stderrTail === undefined) return base;
+    const line = lastMeaningfulStderrLine(this.stderrTail);
+    return line === undefined ? `${base} (no stderr output)` : `${base}: ${line}`;
   }
+}
+
+const MAX_STDERR_LINE_CHARS = 300;
+// oxlint-disable-next-line no-control-regex -- strips terminal color codes from stderr
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+
+export function lastMeaningfulStderrLine(tail: string): string | undefined {
+  const lines = tail.replace(ANSI_ESCAPE_PATTERN, "").split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!.trim();
+    if (line.length === 0) continue;
+    return line.length <= MAX_STDERR_LINE_CHARS
+      ? line
+      : `${line.slice(0, MAX_STDERR_LINE_CHARS - 1)}…`;
+  }
+  return undefined;
 }
 
 export class CodexAppServerProtocolParseError extends Schema.TaggedError<CodexAppServerProtocolParseError>()(

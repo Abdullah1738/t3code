@@ -155,4 +155,81 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       assert.equal(initialized.userAgent, "mock-codex-app-server");
     }),
   );
+  const initializeParams = {
+    clientInfo: {
+      name: "effect-codex-app-server-test",
+      title: "Effect Codex App Server Test",
+      version: "0.0.0",
+    },
+    capabilities: {
+      experimentalApi: true,
+      optOutNotificationMethods: null,
+    },
+  } as const;
+
+  const exitDuringResume = (env: Record<string, string>) =>
+    Effect.gen(function* () {
+      const handle = yield* makeHandle({ CODEX_APP_SERVER_TEST_EXIT_ON_METHOD: "thread/resume", ...env });
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(CodexClient.layerChildProcess(handle), scope);
+      return yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        yield* client.request("initialize", initializeParams);
+        const failure = yield* client.raw
+          .request("thread/resume", { threadId: "thread-1" })
+          .pipe(Effect.flip);
+        const terminated = yield* client.awaitTermination;
+        return { failure, terminated, pid: handle.pid };
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.provide(context),
+        Effect.ensuring(Scope.close(scope, Exit.void)),
+      );
+    });
+
+  it.effect("names the last stderr line when the App Server exits during a request", () =>
+    Effect.gen(function* () {
+      const { failure, terminated, pid } = yield* exitDuringResume({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR:
+          "starting\n\u001b[31mError: failed to open state db: database is locked\u001b[0m\n\n",
+      });
+      assert.equal(failure._tag, "CodexAppServerProcessExitedError");
+      assert.strictEqual(terminated, failure);
+      if (failure._tag !== "CodexAppServerProcessExitedError") return;
+      assert.equal(failure.code, 0);
+      assert.include(failure.stderrTail ?? "", "starting");
+      assert.equal(
+        failure.message,
+        `Codex App Server process ${pid} exited with code 0: Error: failed to open state db: database is locked`,
+      );
+    }),
+  );
+
+  it.effect("says when an exited App Server printed nothing to stderr", () =>
+    Effect.gen(function* () {
+      const { failure, pid } = yield* exitDuringResume({});
+      assert.equal(
+        failure.message,
+        `Codex App Server process ${pid} exited with code 0 (no stderr output)`,
+      );
+    }),
+  );
+
+  it.effect("keeps only a bounded, redacted stderr tail from a flooding App Server", () =>
+    Effect.gen(function* () {
+      const { failure } = yield* exitDuringResume({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR_FLOOD_BYTES: String(512 * 1024),
+        CODEX_APP_SERVER_TEST_EXIT_STDERR:
+          "\nrequest failed: Authorization: Bearer abc.def-123\nfatal: upstream returned 401 for sk-proj1234567890\n",
+      });
+      if (failure._tag !== "CodexAppServerProcessExitedError") {
+        return assert.fail(`unexpected ${failure._tag}`);
+      }
+      const tail = failure.stderrTail ?? "";
+      assert.isAtMost(tail.length, 8_192);
+      assert.notInclude(tail, "abc.def-123");
+      assert.notInclude(tail, "sk-proj1234567890");
+      assert.match(failure.message, /exited with code 0: fatal: upstream returned 401 for \[redacted\]$/);
+    }),
+  );
 });
