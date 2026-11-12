@@ -1,6 +1,7 @@
 """Offline keepalive after client loss, plus durable live-log snapshots."""
 import contextlib
 import io
+import types
 from unittest.mock import patch
 
 from test_capacity import Isolated
@@ -136,6 +137,121 @@ class OrphanTTLTests(Isolated):
 
 
 ENSURE_TTL = lease.ensure_ttl
+
+
+class RenewalFairnessTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.clock = 100000.0
+        self.boxes = {}
+        self.slow = set()
+        self.seen = []
+        self.renewed = []
+        self.failure_at = 'status'
+        self.stack.enter_context(patch.object(api, 'time', types.SimpleNamespace(time=lambda: self.clock)))
+        self.stack.enter_context(patch.object(reap, 'now', side_effect=lambda: self.clock))
+        self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline: no API calls')))
+        self.stack.enter_context(patch.object(api, 'list_boxes', side_effect=lambda: list(self.boxes.values())))
+        self.stack.enter_context(patch.object(api, 'cmd_status', side_effect=self.status))
+        self.stack.enter_context(patch.object(api, 'get', side_effect=self.get_box))
+        self.stack.enter_context(patch.object(lease, 'ensure_ttl', side_effect=self.renew))
+        self.stack.enter_context(patch.object(bases, 'upkeep'))
+        self.stop = self.stack.enter_context(patch.object(lease, 'stop_box'))
+
+    def add_run(self, bid, mode='bg', slow=False):
+        self.box(bid, used=self.clock - 60, member=True)
+        self.con.execute("INSERT INTO runs(run_id,box_id,process_id,status,mode,start_at,pulls) "
+                         "VALUES (?,?,7,'running',?,?,'[]')", ('run-' + bid, bid, mode, self.clock - 60))
+        self.con.commit()
+        self.boxes[bid] = dict(id=bid, state='running')
+        if slow:
+            self.slow.add(bid)
+
+    def call(self, bid, method):
+        left = api.left()
+        if left is not None and left <= 0:
+            raise common.OffboxError('pass budget exhausted')
+        self.seen.append((bid, method))
+        if bid in self.slow and method == self.failure_at:
+            # Honor the real nested API budget: default cmd_status would otherwise take 60 seconds.
+            self.clock += min(60, left) if left is not None else 60
+            raise common.OffboxError('timed out')
+
+    def status(self, bid, pid, **kwargs):
+        self.call(bid, 'status')
+        return dict(running=True)
+
+    def get_box(self, bid, **kwargs):
+        self.call(bid, 'box')
+        return self.boxes[bid]
+
+    def renew(self, bid, ttl, box):
+        self.call(bid, 'patch')
+        self.renewed.append((bid, self.clock, ttl))
+        return True
+
+    def pass_once(self):
+        started = self.clock
+        with api.budget(reap.REAP_BUDGET_S):
+            reap._reap(self.con, False, [])
+        self.assertLessEqual(self.clock - started, reap.REAP_BUDGET_S)
+
+    def test_seven_passes_with_two_timeouts_before_detached_live_run(self):
+        # Failure stage x run mode: each healthy run must be reached and renewed in every five-minute pass.
+        for failure_at in ('status', 'box', 'patch'):
+            for mode in ('fg', 'bg'):
+                with self.subTest(failure_at=failure_at, mode=mode):
+                    self.con.execute('DELETE FROM runs')
+                    self.con.execute('DELETE FROM leases')
+                    self.con.execute('DELETE FROM pool_members')
+                    self.con.execute("DELETE FROM kv WHERE k='reap:renew_cursor'")
+                    self.con.commit()
+                    self.boxes.clear()
+                    self.slow.clear()
+                    self.failure_at = failure_at
+                    self.add_run('a', slow=True)
+                    self.add_run('b', slow=True)
+                    self.add_run('c', mode=mode)
+                    start = self.clock
+                    for i in range(7):
+                        self.clock = start + i * 300
+                        self.seen.clear()
+                        self.renewed.clear()
+                        self.pass_once()
+                        self.assertIn(('c', 'status'), self.seen)
+                        self.assertEqual([(bid, ttl) for bid, _, ttl in self.renewed], [('c', common.RUN_TTL_S)])
+        self.stop.assert_not_called()
+
+    def test_cursor_survives_exhausted_passes_and_rotates_past_slow_prefix(self):
+        for i in range(30):
+            self.add_run(f'a{i:02}', slow=True)
+        self.add_run('z-live')
+        start = self.clock
+        deadline = start + common.RUN_TTL_S
+        cursors = set()
+        healthy_passes = 0
+        for i in range(7):
+            self.clock = start + i * 300
+            self.assertLess(self.clock, deadline, 'healthy detached box would have auto-stopped')
+            self.renewed.clear()
+            self.pass_once()
+            for bid, refreshed_at, ttl in self.renewed:
+                if bid == 'z-live':
+                    deadline = refreshed_at + ttl
+                    healthy_passes += 1
+            # Read through a new connection, as the next monitor invocation does.
+            with contextlib.closing(common.db()) as con:
+                cursors.add(con.execute("SELECT v FROM kv WHERE k='reap:renew_cursor'").fetchone()[0])
+        self.assertGreaterEqual(healthy_passes, 2)
+        self.assertGreater(len(cursors), 1)
+        self.stop.assert_not_called()
+
+    def test_dry_run_neither_renews_nor_advances_cursor(self):
+        self.add_run('live')
+        with patch.object(reap, '_check_stale_runs'):
+            reap._reap(self.con, True, [])
+        self.assertEqual(self.seen, [])
+        self.assertIsNone(self.con.execute("SELECT v FROM kv WHERE k='reap:renew_cursor'").fetchone())
 
 
 class LiveLogsTests(Isolated):

@@ -11,6 +11,9 @@ from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
 REAP_BUDGET_S = 100
+# Leave cleanup time after a fair, bounded pass over run keepalives.
+RENEW_BUDGET_S = 60
+RENEW_BOX_BUDGET_S = 5
 
 
 def _protected(con) -> set[str]:
@@ -144,6 +147,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     # after fresh confirmation, and a failed or busy release must be retried on a later pass.
     rows = con.execute("SELECT * FROM leases WHERE state IN ('running','stopped') "
                        "OR box_id IN (SELECT box_id FROM prune_holds)").fetchall()
+    _renew_live_runs(con, rows, live, protected, dry)
     for r in rows:
         bid = r["box_id"]
         b = live.get(bid)
@@ -191,7 +195,6 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
             running_runs = lease.active_runs(con, bid)
             # Failed history reconciliation must not be overwritten by release_if_confirmed's generic lost update.
             if running_runs:
-                _keep_live_runs(con, bid, b, dry)
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
@@ -291,6 +294,28 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     return actions
 
 
+def _renew_live_runs(con, rows, live: dict, protected: set[str], dry: bool) -> None:
+    if dry:
+        return
+    running = {r[0] for r in con.execute("SELECT DISTINCT box_id FROM runs WHERE status='running'")}
+    boxes = sorted(r['box_id'] for r in rows if r['box_id'] in running and r['box_id'] not in protected
+                   and (b := live.get(r['box_id'])) and b.get('state') in api.LIVE_STATES
+                   and not b.get('dataExpiredAt') and not con.execute(
+                       "SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{r['box_id']}",)).fetchone())
+    cursor = con.execute("SELECT v FROM kv WHERE k='reap:renew_cursor'").fetchone()
+    if cursor:
+        boxes = [bid for bid in boxes if bid > cursor[0]] + [bid for bid in boxes if bid <= cursor[0]]
+    with api.budget(RENEW_BUDGET_S):
+        for bid in boxes:
+            if api.left() < RENEW_BOX_BUDGET_S:
+                break
+            # Persist before I/O so timeouts or a killed pass cannot restart at the same slow prefix forever.
+            con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('reap:renew_cursor',?)", (bid,))
+            con.commit()
+            with api.budget(RENEW_BOX_BUDGET_S):
+                _keep_live_runs(con, bid, live[bid], dry)
+
+
 def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
     from .runs import remote_alive
     if dry or box.get('state') not in api.LIVE_STATES:
@@ -325,7 +350,7 @@ def _keep_live_runs(con, bid: str, box: dict, dry: bool) -> None:
 
 def _check_stale_runs(con, bid: str, state: str, dry: bool, actions: list[str]) -> None:
     try:
-        with file_lock('box-'+bid, timeout=0):
+        with file_lock('box-'+bid, timeout=0), api.budget(RENEW_BOX_BUDGET_S):
             _check_unlocked(con, bid, state, dry, actions)
     except OffboxError:
         pass
