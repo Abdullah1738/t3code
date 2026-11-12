@@ -3,9 +3,11 @@ import os
 import socket
 import sys
 import subprocess
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import recovery as r
@@ -75,6 +77,14 @@ class RecoveryTests(unittest.TestCase):
         self.w.log = Mock()
         self.w.status = Mock(return_value=("absent", {}))
         self.w.mounts = Mock(return_value=("/dev/disk5s1", "<" + r.STATE + "/nfs.sock>:/"))
+        self.w.remember_generation = Mock()
+        self.w.observe_generation = Mock()
+        self.w.peer_recovery_safe = Mock(return_value=True)
+        @contextmanager
+        def fence():
+            with r.lease(Path(self.tmp.name)/"start.lock") as lock:
+                yield (lock,[{"quiet":True,"holders":set()}]) if lock else None
+        self.w.start_fence = fence
         self.w.recover = Mock()
         self.w.mount_ready = Mock(side_effect=lambda data, source: source == "<" + r.STATE + "/nfs.sock>:/" and data.get("port") == 0)
         self.pause_patch = patch.object(r, "PAUSE", Path(self.tmp.name)/"pause")
@@ -266,7 +276,10 @@ class RecoveryTests(unittest.TestCase):
         self.w.owner_matches = Mock(return_value=True)
         self.w.data["old"] = {"pid":123,"birth":"before","port":53885}
         self.w.status.return_value = ("held", {})
-        with patch.object(r, "STATE", self.tmp.name), patch.object(r,"PAUSE",Path(self.tmp.name)/"pause"), patch.object(r,"run",return_value=(0,r.SUPPORTED_BUILD,"")), patch.object(r.os,"kill") as kill:
+        @contextmanager
+        def fence():yield (None,[{"quiet":False,"holders":{123}}])
+        self.w.start_fence=fence
+        with patch.object(r, "STATE", self.tmp.name), patch.object(r,"PAUSE",Path(self.tmp.name)/"pause"), patch.object(r,"run",return_value=(0,r.SUPPORTED_BUILD,"")), patch.object(r,"process_args",return_value=("ovnfs",[])), patch.object(r.os,"kill") as kill:
             self.w.recover("check-old-owner")
             self.w.recover("check-old-owner")
             kill.assert_called_once_with(123, r.signal.SIGTERM)
@@ -394,6 +407,423 @@ class RecoveryTests(unittest.TestCase):
                 self.assertTrue(first)
                 self.assertFalse(second)
         self.assertTrue(path.exists())
+
+
+class SurvivorProofTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform=="darwin","Darwin POSIX/flock domains")
+    def test_kernel_lock_domain_identity_and_busy_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            a=Path(root)/"a";a.touch()
+            b=Path(root)/"b";b.touch()
+            with open(a,"r+") as left,open(a,"r+") as same,open(b,"r+") as different:
+                self.assertTrue(r.same_lock_domain(left.fileno(),same.fileno()))
+                self.assertFalse(r.same_lock_domain(left.fileno(),different.fileno()))
+                with r.lease(a):
+                    self.assertIsNone(r.same_lock_domain(left.fileno(),same.fileno()))
+
+    def test_argument_corpus(self):
+        rows=[
+            (["ovnfs","serve","-state",r.STATE],True),
+            (["ovnfs","serve","--state="+r.STATE],True),
+            (["ovnfs","--state",r.STATE,"--mount",r.MOUNT,"serve"],True),
+            (["ovnfs","-state="+r.STATE,"--json","serve"],True),
+            (["ovnfs","serve","--state",r.STATE+"/./"],True),
+            (["ovnfs","serve"],False),
+            (["ovnfs","start","--state",r.STATE],False),
+            (["ovnfs","restart","--state",r.STATE],False),
+            (["ovnfs","new","--state",r.STATE],False),
+            (["ovnfs","serve","--state",r.STATE+"-other"],False),
+            (["ovnfs","serve","--state","relative"],False),
+            (["ovnfs","serve","--state"],False),
+            (["ovnfs","--unknown","serve","--state",r.STATE],False),
+        ]
+        for args,expected in rows:
+            with self.subTest(args=args):
+                process=("/exec/ovnfs",args)
+                self.assertEqual(r.serves_state(process),expected)
+
+    def test_kernel_argv_decoder_stops_before_environment(self):
+        args=["ovnfs","serve","--state="+r.STATE,""]
+        raw=len(args).to_bytes(4,"little",signed=True)+b"/exec/ovnfs\0\0"+b"\0".join(a.encode() for a in args)+b"\0PRIVATE_TEST=fixture\0"
+        self.assertEqual(r.decode_args(raw),("/exec/ovnfs",args))
+        for bad in [b"",b"\0"*4,(-1).to_bytes(4,"little",signed=True),b"\1\0\0\0unterminated"]:
+            with self.subTest(raw=bad),self.assertRaises(ValueError):r.decode_args(bad)
+
+@unittest.skipUnless(sys.platform=="darwin","macOS kernel argv and pinned CLI fixture")
+class NamespaceLossTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name)
+        self.state=self.root/"state"
+        self.state.mkdir()
+        self.mount=self.root/"mount"
+        self.mount.mkdir()
+        for attr,value in [("STATE",str(self.state)),("MOUNT",str(self.mount)),("PAUSE",self.root/"pause")]:
+            p=patch.object(r,attr,value);p.start();self.addCleanup(p.stop)
+        self.w=r.Recovery(self.root/"runtime")
+        self.w.runtime.mkdir()
+        self.w.log=Mock()
+        self.w.memguard_running=Mock(return_value=False)
+        self.w.mounts=Mock(return_value=("fixture-volume",None))
+        self.w.spawn=Mock()
+        (self.state/"start.lock").touch()
+        (self.state/"state.lock").touch()
+        self.w.remember_generation()
+        self.addCleanup(self.w.close_generations)
+        (self.root/"serve").write_text("import fcntl,socket,sys\nfrom pathlib import Path\ns=Path(sys.argv[sys.argv.index('--state')+1])\nf=open(s/'state.lock','w');fcntl.flock(f,fcntl.LOCK_EX)\na=socket.socket(socket.AF_UNIX);a.bind(str(s/'admin.sock'));a.listen()\nn=socket.socket(socket.AF_UNIX);n.bind(str(s/'nfs.sock'));n.listen()\nprint('ready',flush=True)\nsys.stdin.read()\n")
+
+    def fixture(self, renamed=False, phase="ready"):
+        if renamed:
+            executable=self.root/"peer-build"
+            if not executable.exists():
+                shutil.copyfile("/usr/bin/perl",executable)
+                executable.chmod(0o755)
+            script=self.root/"serve"
+            script.write_text('''use strict; use warnings;
+use Fcntl qw(:flock); use Socket qw(SOCK_STREAM); use IO::Socket::UNIX;
+my ($state,$phase); for(my $i=0;$i<@ARGV;$i++) {
+ if($ARGV[$i] eq '--state') {$state=$ARGV[++$i];}
+ if($ARGV[$i] eq '--phase') {$phase=$ARGV[++$i];}}
+my ($lock,$admin,$nfs);
+if($phase eq 'starting' || $phase eq 'ready') {
+ my $name=$phase eq 'starting' ? 'start.lock' : 'state.lock';
+ open($lock,'>',"$state/$name") or die $!; flock($lock,LOCK_EX) or die $!;}
+if($phase ne 'starting' && $phase ne 'nfs-only') {
+ $admin=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Local=>"$state/admin.sock",Listen=>1) or die $!;}
+if($phase eq 'ready' || $phase eq 'nfs-only') {
+ $nfs=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Local=>"$state/nfs.sock",Listen=>1) or die $!;}
+$|=1; print "ready\\n"; my $line=<STDIN>;
+''')
+            argv=[str(executable),"serve","--state",str(self.state),"--phase",phase]
+        else:
+            executable=sys.executable
+            argv=[r.BINARY,"serve","--state",str(self.state),"--mount",str(self.mount)]
+        child=subprocess.Popen(argv,executable=str(executable),cwd=self.root,stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        def close():
+            if child.poll() is None:
+                child.stdin.close();child.wait(timeout=5)
+            for f in [child.stdin,child.stdout,child.stderr]:
+                if f and not f.closed:f.close()
+        self.addCleanup(close)
+        self.assertEqual(child.stdout.readline(),"ready\n")
+        return child
+
+    def identity(self,child):
+        data=dict(READY,pid=child.pid,state=str(self.state),mount=str(self.mount))
+        result=self.w.identity(data)
+        self.assertIn("args_digest",result)
+        self.assertTrue(r.serves_state(r.process_args(child.pid)))
+        return result
+
+    def lose_namespace(self):
+        self.state.rename(self.root/("old-state-"+str(len(list(self.root.glob("old-state-*"))))))
+        self.state.mkdir()
+        (self.state/"state.json").write_text('{"proto":"nfs","port":0}')
+        (self.state/"start.lock").touch()
+        (self.state/"state.lock").touch()
+        kind,_=self.w.status()  # actual pinned CLI, explicit disposable state
+        self.assertEqual(kind,"absent")
+
+    def test_peer_restart_between_polls_then_drop_blocks_replacement(self):
+        a=self.fixture()
+        with patch.object(r.time,"monotonic",return_value=100):
+            self.w.status=Mock(return_value=("ready",dict(READY,pid=a.pid)))
+            self.w.mount_ready=Mock(return_value=True)
+            self.w.tick()
+        old=self.w.data["owner"]
+        a.stdin.close();a.wait(timeout=5)
+        for name in ["admin.sock","nfs.sock"]:(self.state/name).unlink()
+        b=self.fixture()
+        self.w.status.return_value=("ready",dict(READY,pid=b.pid))
+        with patch.object(r.time,"monotonic",return_value=101):self.w.tick()
+        self.assertEqual(self.w.data["owner"]["pid"],a.pid)
+        self.w.mounts.return_value=(None,None)
+        self.w.tick()
+        self.assertEqual(self.w.data["old"],old)
+        self.w.status=r.Recovery.status.__get__(self.w)
+        self.lose_namespace()
+        self.w.mounts.return_value=("fixture-volume",None)
+        with patch.object(r.os,"kill",wraps=os.kill) as signals:
+            self.w.recover("start")
+            self.w.spawn.assert_not_called()
+            self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+        self.assertIsNone(b.poll())
+
+    def test_absent_known_unix_owner_term_exit_then_exactly_one_start(self):
+        b=self.fixture()
+        self.w.data["old"]=self.identity(b)
+        self.lose_namespace()
+        real_kill=os.kill
+        terms=[]
+        def stop_fixture(pid,sig):
+            if sig==r.signal.SIGTERM:
+                self.assertEqual(pid,b.pid)
+                terms.append(pid)
+                b.stdin.close();b.wait(timeout=5)
+            else:return real_kill(pid,sig)
+        with patch.object(r.os,"kill",side_effect=stop_fixture):
+            self.w.recover("start")
+        self.assertEqual(terms,[b.pid])
+        self.w.spawn.assert_not_called()
+        self.assertIsNotNone(b.poll())
+        self.w.spawn.side_effect=lambda lock:setattr(self.w,"status",Mock(return_value=("loading",{})))
+        self.w.recover("start")
+        self.w.recover("start")
+        self.w.spawn.assert_called_once()
+
+    def test_concurrent_start_lease_also_excludes_term(self):
+        b=self.fixture()
+        self.w.data["old"]=self.identity(b)
+        self.lose_namespace()
+        with r.lease(self.state/"start.lock"),patch.object(r.os,"kill") as signals:
+            self.w.recover("start")
+            signals.assert_not_called()
+            self.w.spawn.assert_not_called()
+        self.assertIsNone(b.poll())
+
+    def test_mismatched_proof_or_concurrent_peer_cannot_receive_term(self):
+        b=self.fixture()
+        self.w.data["old"]=self.identity(b)
+        self.lose_namespace()
+        baseline=self.w.data["old"].copy()
+        for corrupt,extra in [(True,False),(False,True)]:
+            with self.subTest(corrupt=corrupt,extra=extra):
+                old=baseline.copy()
+                if corrupt:old["args_digest"]="different"
+                self.w.data["old"]=old
+                real_probe=r.directory_probe
+                def probe(fd):
+                    result=real_probe(fd)
+                    if extra:result["holders"].append(987654321)
+                    return result
+                with patch.object(r,"directory_probe",side_effect=probe),patch.object(r.os,"kill") as signals:
+                    self.w.recover("start")
+                    signals.assert_not_called()
+                    self.w.spawn.assert_not_called()
+        self.assertIsNone(b.poll())
+
+    def test_renamed_peer_is_excluded_at_every_startup_phase(self):
+        a=self.fixture()
+        self.w.data["old"]=self.identity(a)
+        a.stdin.close();a.wait(timeout=5)
+        for name in ("admin.sock","nfs.sock"):(self.state/name).unlink()
+        for phase in ("starting","listening","ready","nfs-only"):
+            with self.subTest(phase=phase):
+                b=self.fixture(renamed=True,phase=phase)
+                self.lose_namespace()
+                with patch.object(r.os,"kill",wraps=os.kill) as signals:
+                    self.w.recover("start")
+                self.w.spawn.assert_not_called()
+                self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+                self.assertIsNone(b.poll())
+                b.stdin.close();b.wait(timeout=5)
+
+    def test_second_drop_retains_intermediate_peer_generation(self):
+        a=self.fixture()
+        self.w.data["old"]=self.identity(a)
+        a.stdin.close();a.wait(timeout=5)
+        self.lose_namespace()
+        self.w.data.update(pending=True,stable=0)
+        self.w.tick()  # observe the first return before the five stable ticks
+        b=self.fixture(renamed=True)
+        self.lose_namespace()
+        with patch.object(r.os,"kill",wraps=os.kill) as signals:
+            self.w.recover("start")
+        self.assertEqual(len(self.w.generations),3)
+        self.w.spawn.assert_not_called()
+        self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+        self.assertIsNone(b.poll())
+
+    def test_watcher_restart_cannot_reconstruct_lost_generation_fence(self):
+        b=self.fixture()
+        self.w.data.update(old=self.identity(b),pending=True)
+        self.w.save()
+        self.lose_namespace()
+        restarted=r.Recovery(self.w.runtime)
+        self.addCleanup(restarted.close_generations)
+        restarted.log=Mock()
+        restarted.memguard_running=Mock(return_value=False)
+        restarted.mounts=self.w.mounts
+        restarted.spawn=Mock()
+        with patch.object(r.os,"kill",wraps=os.kill) as signals:
+            restarted.recover("start")
+        restarted.spawn.assert_not_called()
+        self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+
+    def test_healthy_journal_restart_before_sample_cannot_adopt_returned_generation(self):
+        a=self.fixture()
+        self.w.status=Mock(return_value=("ready",dict(READY,pid=a.pid)))
+        self.w.mount_ready=Mock(return_value=True)
+        self.w.tick()
+        old=self.w.data["owner"]
+        self.assertFalse(self.w.data.get("pending",False))
+        a.stdin.close();a.wait(timeout=5)
+        for name in ("admin.sock","nfs.sock"):(self.state/name).unlink()
+        b=self.fixture(renamed=True)
+        self.w.close_generations()
+        restarted=r.Recovery(self.w.runtime)
+        self.addCleanup(restarted.close_generations)
+        restarted.log=Mock()
+        restarted.memguard_running=Mock(return_value=False)
+        restarted.mounts=Mock(return_value=(None,None))
+        restarted.spawn=Mock()
+        self.assertTrue(restarted.unwitnessed)
+        restarted.tick()
+        self.w.status=r.Recovery.status.__get__(self.w)
+        self.lose_namespace()
+        restarted.mounts.return_value=("fixture-volume",None)
+        with patch.object(r.os,"kill",wraps=os.kill) as signals:
+            for _ in range(5):restarted.tick()
+        self.assertTrue(restarted.data["pending"])
+        self.assertTrue(restarted.unwitnessed)
+        self.assertEqual(restarted.data["old"],old)
+        self.assertEqual(len(restarted.generations),1)
+        self.assertTrue(r.recorded_exit(old))
+        self.assertEqual(restarted.status()[0],"absent")
+        restarted.spawn.assert_not_called()
+        self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+        self.assertIsNone(b.poll())
+
+    def test_fresh_healthy_sample_rearms_a_restarted_healthy_journal(self):
+        b=self.fixture()
+        self.w.status=Mock(return_value=("ready",dict(READY,pid=b.pid)))
+        self.w.mount_ready=Mock(return_value=True)
+        self.w.tick()
+        self.w.close_generations()
+        restarted=r.Recovery(self.w.runtime)
+        self.addCleanup(restarted.close_generations)
+        restarted.log=Mock()
+        restarted.mounts=self.w.mounts
+        restarted.status=self.w.status
+        restarted.mount_ready=self.w.mount_ready
+        self.assertTrue(restarted.unwitnessed)
+        restarted.tick()
+        self.assertFalse(restarted.unwitnessed)
+        self.assertEqual(len(restarted.generations),1)
+        self.assertEqual(restarted.data["owner"]["pid"],b.pid)
+
+    def test_pending_journal_restart_cannot_arm_from_a_ready_peer(self):
+        b=self.fixture()
+        self.w.data.update(seen=True,old=self.identity(b),pending=True,stable=4)
+        self.w.save()
+        self.w.close_generations()
+        restarted=r.Recovery(self.w.runtime)
+        self.addCleanup(restarted.close_generations)
+        restarted.log=Mock()
+        restarted.mounts=self.w.mounts
+        restarted.status=Mock(return_value=("ready",dict(READY,pid=b.pid)))
+        restarted.mount_ready=Mock(return_value=True)
+        restarted.tick()
+        self.assertTrue(restarted.unwitnessed)
+        self.assertTrue(restarted.data["pending"])
+
+    def test_closed_revoked_or_unreadable_witness_never_authorizes_start(self):
+        a=self.fixture()
+        self.w.data["old"]=self.identity(a)
+        a.stdin.close();a.wait(timeout=5)
+        self.lose_namespace()
+        for error in (OSError(r.errno.EBADF,"revoked"),PermissionError("unreadable"),RuntimeError("malformed probe")):
+            with self.subTest(error=error),patch.object(r,"directory_probe",side_effect=error):
+                with self.assertRaises(type(error)):self.w.recover("start")
+                self.w.spawn.assert_not_called()
+        self.w.generations[0].close()
+        with self.assertRaises(RuntimeError):self.w.recover("start")
+        self.w.spawn.assert_not_called()
+
+    def test_replaced_lock_inode_is_not_adopted(self):
+        a=self.fixture()
+        self.w.data["old"]=self.identity(a)
+        a.stdin.close();a.wait(timeout=5)
+        (self.state/"start.lock").rename(self.state/"original-start.lock")
+        (self.state/"start.lock").touch()
+        self.lose_namespace()
+        with self.assertRaises(RuntimeError):self.w.recover("start")
+        self.w.spawn.assert_not_called()
+
+    def test_current_peer_excludes_term_of_known_old_owner(self):
+        b=self.fixture()
+        self.w.data["old"]=self.identity(b)
+        self.lose_namespace()
+        self.w.status=Mock(return_value=("absent",{}))
+        for phase in ("ready","listening"):
+            with self.subTest(phase=phase):
+                c=self.fixture(renamed=True,phase=phase)
+                with patch.object(r.os,"kill",wraps=os.kill) as signals:
+                    self.w.recover("start")
+                self.w.spawn.assert_not_called()
+                self.assertFalse(any(call.args[1]==r.signal.SIGTERM for call in signals.call_args_list))
+                self.assertIsNone(b.poll());self.assertIsNone(c.poll())
+                c.stdin.close();c.wait(timeout=5)
+                for name in ("admin.sock","nfs.sock"):
+                    if (self.state/name).exists():(self.state/name).unlink()
+
+    def test_ready_current_peer_does_not_hide_surviving_old_generation(self):
+        b=self.fixture()
+        self.w.data["old"]=self.identity(b)
+        self.lose_namespace()
+        c=self.fixture(renamed=True)
+        self.w.data.update(pending=True,stable=4)
+        self.w.status=Mock(return_value=("ready",dict(READY,pid=c.pid)))
+        self.w.mount_ready=Mock(return_value=True)
+        self.w.tick()
+        self.assertTrue(self.w.data["pending"])
+        self.w.spawn.assert_not_called()
+
+    def test_missing_intermediate_witness_is_permanent_for_this_incident(self):
+        self.w.data.update(pending=True,stable=0)
+        (self.state/"state.lock").rename(self.state/"missing-state.lock")
+        self.lose_namespace()
+        (self.state/"state.lock").rename(self.state/"not-yet-created")
+        with self.assertRaises(OSError):self.w.tick()
+        (self.state/"not-yet-created").rename(self.state/"state.lock")
+        self.w.recover("start")
+        self.assertTrue(self.w.unwitnessed)
+        self.w.spawn.assert_not_called()
+
+    def test_equal_dev_inode_does_not_merge_distinct_lock_domains(self):
+        a=self.fixture()
+        self.w.data["old"]=self.identity(a)
+        a.stdin.close();a.wait(timeout=5)
+        for name in ("admin.sock","nfs.sock"):(self.state/name).unlink()
+        b=self.fixture(renamed=True)
+        self.lose_namespace()
+        self.w.generations[0].key=r.file_identity(os.stat(self.state))
+        self.w.returning=True
+        self.w.observe_generation()
+        self.assertEqual(self.w.generations[0].key,self.w.generations[1].key)
+        self.w.recover("start")
+        self.w.spawn.assert_not_called()
+        self.assertIsNone(b.poll())
+
+    def test_return_to_same_lock_domain_does_not_self_block(self):
+        a=self.fixture()
+        old=self.identity(a)
+        self.w.data.update(seen=True,owner=old)
+        a.stdin.close();a.wait(timeout=5)
+        self.w.mounts.return_value=(None,None)
+        self.w.tick()
+        self.w.mounts.return_value=("fixture-volume",None)
+        self.w.tick()
+        self.assertEqual(len(self.w.generations),2)
+        self.w.recover("start")
+        self.w.spawn.assert_called_once()
+
+    def test_ready_peer_on_same_domain_can_complete_recovery(self):
+        b=self.fixture()
+        old=self.identity(b)
+        self.w.data.update(seen=True,owner=old)
+        self.w.mounts.return_value=(None,None)
+        self.w.tick()
+        self.w.mounts.return_value=("fixture-volume",None)
+        self.w.tick()
+        self.w.data["stable"]=4
+        self.w.status=Mock(return_value=("ready",dict(READY,pid=b.pid)))
+        self.w.mount_ready=Mock(return_value=True)
+        self.w.tick()
+        self.assertFalse(self.w.data["pending"])
+        self.assertEqual(len(self.w.generations),1)
 
 
 if __name__ == "__main__":

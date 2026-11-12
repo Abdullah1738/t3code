@@ -1,15 +1,21 @@
 #!/usr/bin/python3
 """Recover only after an observed disappearance of the configured SSD mount."""
 import argparse
+import ctypes
+import errno
+import hashlib
 import fcntl
 import json
 import os
 from pathlib import Path
 import signal
+import socket
+import struct
 import subprocess
+import sys
 import time
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 
 
@@ -121,6 +127,194 @@ def recorded_exit(old):
     return False
 
 
+def process_args(pid):
+    # KERN_PROCARGS2 keeps argv attached to the process when its state-volume
+    # vnodes disappear. Never log/persist raw argv or the trailing environment.
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), "cannot inspect process arguments")
+    if not 4 < size.value <= 1024 * 1024:
+        raise ValueError("invalid kernel argument size")
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
+        raise OSError(ctypes.get_errno(), "cannot inspect process arguments")
+    return decode_args(buf.raw[:size.value])
+
+
+def decode_args(raw):
+    count = int.from_bytes(raw[:4], "little", signed=True)
+    if not 0 < count <= len(raw):
+        raise ValueError("invalid kernel argument count")
+    end = raw.index(b"\0", 4)
+    executable = os.fsdecode(raw[4:end])
+    rest = raw[end + 1:].lstrip(b"\0")
+    args = []
+    for _ in range(count):
+        end = rest.index(b"\0")
+        args.append(os.fsdecode(rest[:end]))
+        rest = rest[end + 1:]
+    return executable, args
+
+
+def state_arguments(args):
+    states = []
+    i = 1
+    while i < len(args):
+        flag, equal, value = args[i].partition("=")
+        if flag in ("--state", "-state"):
+            if not equal:
+                i += 1
+                if i >= len(args):
+                    return None
+                value = args[i]
+            states.append(value)
+        i += 1
+    return states
+
+
+def serves_state(process):
+    _, args = process
+    # Both forms are emitted by the pinned CLI: globals before `serve`, or
+    # `serve -state ...`. Unknown leading options cannot prove ownership.
+    i = 1
+    while i < len(args) and args[i].startswith("-"):
+        flag, equal, _ = args[i].partition("=")
+        if flag in ("--json", "-json"):
+            i += 1
+        elif flag in ("--state", "-state", "--mount", "-mount",
+                      "--daemon-timeout", "--color"):
+            i += 1 if equal else 2
+        else:
+            return False
+    states = state_arguments(args)
+    return (i < len(args) and args[i] == "serve" and bool(states)
+            and all(os.path.isabs(value) and os.path.normpath(value) == STATE for value in states))
+
+
+def args_digest(process):
+    return hashlib.sha256(json.dumps(process, ensure_ascii=True).encode()).hexdigest()
+
+
+def file_identity(stat):
+    return stat.st_dev, stat.st_ino
+
+
+def same_lock_domain(left, right):
+    # dev/inode can repeat across remounts. A temporary POSIX lock, queried by
+    # another process, proves that the two descriptors reach the same kernel
+    # lock domain. The pinned CLI uses flock, which also conflicts with this
+    # marker on Darwin. A busy marker is a veto, never an identity result.
+    try:
+        fcntl.lockf(left, fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+    except BlockingIOError:
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, __file__, "--lock-owner", str(right)], pass_fds=(right,),
+            capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL, cwd="/")
+        if result.returncode:
+            raise RuntimeError("lock domain could not be verified")
+        owner = int(result.stdout)
+        return owner == os.getpid()
+    finally:
+        fcntl.lockf(left, fcntl.LOCK_UN, 1)
+
+
+def directory_probe(fd):
+    # A subprocess can enter a retained directory vnode without changing the
+    # watcher's cwd. Relative sockets and exact-file lsof then address the old
+    # generation even when STATE names a newly mounted directory.
+    result = subprocess.run(
+        [sys.executable, __file__, "--probe-dir", str(fd)], pass_fds=(fd,),
+        capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL, cwd="/")
+    if result.returncode:
+        raise RuntimeError("retained state directory cannot be inspected")
+    data = json.loads(result.stdout)
+    if (not isinstance(data, dict) or type(data.get("live")) is not bool
+            or not isinstance(data.get("holders"), list)
+            or not all(type(pid) is int and pid > 1 for pid in data["holders"])):
+        raise RuntimeError("invalid directory probe")
+    return data
+
+
+def probe_directory(fd):
+    os.fchdir(fd)
+    live = False
+    peers = []
+    paths = ["state.lock"]
+    for path in ("admin.sock", "nfs.sock"):
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            continue
+        paths.append(path)
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(1)
+            try:
+                client.connect(path)
+                live = True
+                # Kernel peer identity is exclusion evidence only. It never
+                # supplies authority to signal a process not recorded by status.
+                peers.append(client.getsockopt(0, 2))  # Darwin LOCAL_PEERPID
+            except OSError as e:
+                if e.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+                    raise
+    result = subprocess.run(["/usr/sbin/lsof", "-nP", "-t", "--"] + paths,
+                            capture_output=True, text=True, timeout=5,
+                            stdin=subprocess.DEVNULL)
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        raise RuntimeError("exact-file owner probe unavailable")
+    print(json.dumps({"live": live, "holders": peers + [int(pid) for pid in result.stdout.split()]}))
+
+
+class Generation:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        self.witnesses = {}
+        try:
+            self.key = file_identity(os.fstat(self.fd))
+            for name in ("start.lock", "state.lock"):
+                self.witnesses[name] = os.open(name, os.O_RDWR, dir_fd=self.fd)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        for fd in self.witnesses.values():
+            os.close(fd)
+        self.witnesses = {}
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    @contextmanager
+    def lock(self, name):
+        if self.fd is None:
+            raise RuntimeError("retained state directory is closed; needs operator")
+        with os.fdopen(os.open(name, os.O_RDWR, dir_fd=self.fd), "r+") as file:
+            same = same_lock_domain(self.witnesses[name], file.fileno())
+            if same is None:
+                yield False
+                return
+            if not same:
+                raise RuntimeError("state lock generation changed; needs operator")
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            yield file
+
+    def probe(self):
+        with self.lock("state.lock") as free:
+            data = directory_probe(self.fd)
+            data["quiet"] = bool(free) and not data["live"]
+            data["holders"] = set(data["holders"]) - {os.getpid()}
+            return data
+
+
 @contextmanager
 def lease(path):
     # Do not unlink lock files: doing so permits two holders on different inodes.
@@ -169,6 +363,86 @@ class Recovery:
         self.data = json.loads(self.journal.read_text()) if self.journal.exists() else {}
         self.last_status = float("-inf")
         self.next_attempt = 0
+        self.generations = []
+        # A healthy journal cannot restore the previous process's open FDs.
+        # Only a fresh healthy observation can arm this watcher instance.
+        self.unwitnessed = True
+        self.returning = False
+
+    def close_generations(self):
+        for generation in self.generations:
+            generation.close()
+        self.generations = []
+
+    def remember_generation(self):
+        generation = Generation(STATE)
+        self.close_generations()
+        self.generations = [generation]
+        self.unwitnessed = False
+
+    def observe_generation(self):
+        try:
+            key = file_identity(os.stat(STATE))
+            if self.returning or not self.generations or self.generations[-1].key != key:
+                self.generations.append(Generation(STATE))
+                self.returning = False
+        except OSError:
+            self.unwitnessed = True
+            raise
+
+    @contextmanager
+    def start_fence(self):
+        if self.unwitnessed or not self.generations:
+            self.log("no retained pre-drop state generation; needs operator")
+            yield None
+            return
+        if any(generation.fd is None for generation in self.generations):
+            raise RuntimeError("retained state directory is closed; needs operator")
+        self.observe_generation()
+        current = Generation(STATE)
+        try:
+            same = same_lock_domain(self.generations[-1].witnesses["start.lock"],
+                                    current.witnesses["start.lock"])
+        except Exception:
+            current.close()
+            raise
+        if same is None:
+            current.close()
+            yield None
+            return
+        if same:
+            current.close()
+        else:
+            self.generations.append(current)
+        generations = self.generations
+        unique = []
+        groups = {}
+        for generation in reversed(generations):
+            for group, other in enumerate(unique):
+                same = same_lock_domain(generation.witnesses["start.lock"],
+                                        other.witnesses["start.lock"])
+                if same is None:
+                    yield None
+                    return
+                if same:
+                    groups[id(generation)] = group
+                    break
+            else:
+                groups[id(generation)] = len(unique)
+                unique.append(generation)
+        with ExitStack() as stack:
+            locks = [stack.enter_context(generation.lock("start.lock"))
+                     for generation in unique]
+            if not all(locks):
+                yield None
+                return
+            probes = [dict(generation.probe(), current=groups[id(generation)] == 0)
+                      for generation in generations]
+            yield locks[0], probes
+
+    def peer_recovery_safe(self):
+        with self.start_fence() as fence:
+            return bool(fence) and all(probe["quiet"] for probe in fence[1] if not probe["current"])
 
     def save(self):
         tmp = self.journal.with_suffix(".tmp")
@@ -196,12 +470,25 @@ class Recovery:
         if type(pid) is not int or pid <= 1:
             return None
         started = birth(pid)
-        return {"pid": pid, "birth": started, "port": data.get("port", 0)} if started else None
+        if not started:
+            return None
+        identity = {"pid": pid, "birth": started, "port": data.get("port", 0)}
+        try:
+            process = process_args(pid)
+            if serves_state(process) and birth(pid) == started:
+                identity["args_digest"] = args_digest(process)
+        except (OSError, ValueError):
+            pass
+        return identity
 
-    def owner_matches(self, old):
+    def owner_matches(self, old, process=None):
         if not old or not old.get("birth") or birth(old["pid"]) != old["birth"]:
             return False
-        # Exact descriptors or the exact persisted listener, never process names.
+        if (process is not None and serves_state(process)
+                and old.get("args_digest") == args_digest(process)):
+            return True
+        # Exact descriptors or the exact persisted listener remain sufficient
+        # for journals made before argument proofs were recorded.
         code, out, _ = run(["/usr/sbin/lsof", "-nP", "-a", "-p", str(old["pid"]), "-t",
                             STATE + "/state.lock"])
         if code == 0 and out.splitlines() == [str(old["pid"])]:
@@ -277,9 +564,10 @@ class Recovery:
         # under start.lock, then transfer the lease through the pinned build's
         # inherited-start descriptor, so no competing CLI can change the receipt
         # between this check and serve's own finishRecovery.
-        with lease(Path(STATE) / "start.lock") as lock:
-            if not lock:
+        with self.start_fence() as fence:
+            if not fence:
                 return
+            lock, probes = fence
             if not receipt_safe(Path(STATE) / "unmount.json"):
                 self.log("unfinished or unreadable unmount receipt; needs operator")
                 return
@@ -287,6 +575,9 @@ class Recovery:
             # status is not enough while our recorded daemon is still alive.
             if not recorded_exit(self.data.get("old")):
                 self.log("pre-drop daemon has not verifiably exited; needs operator")
+                return
+            if not all(probe["quiet"] for probe in probes):
+                self.log("a daemon or startup survives in a state generation; replacement refused")
                 return
             volume, source = self.mounts()
             if self.status()[0] != "absent" or not volume:
@@ -299,14 +590,17 @@ class Recovery:
                 if not isinstance(saved, dict) or not self.mount_ready(saved, source):
                     self.log("existing mount does not match saved NFS transport; needs operator")
                     return
-            with open(Path(STATE) / "serve.log", "ab") as log:
-                child = subprocess.Popen(
-                    [BINARY, "--state", STATE, "--mount", MOUNT, "serve", "--proto", "nfs",
-                     "--starter-pid", str(os.getpid()), "--starter-fd", str(lock.fileno())],
-                    pass_fds=(lock.fileno(),), start_new_session=True, cwd="/",
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=log)
-            threading.Thread(target=child.wait, daemon=True).start()
-            self.log("spawned ovnfs serve pid %s with inherited start lease" % child.pid)
+            self.spawn(lock)
+
+    def spawn(self, lock):
+        with open(Path(STATE) / "serve.log", "ab") as log:
+            child = subprocess.Popen(
+                [BINARY, "--state", STATE, "--mount", MOUNT, "serve", "--proto", "nfs",
+                 "--starter-pid", str(os.getpid()), "--starter-fd", str(lock.fileno())],
+                pass_fds=(lock.fileno(),), start_new_session=True, cwd="/",
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        threading.Thread(target=child.wait, daemon=True).start()
+        self.log("spawned ovnfs serve pid %s with inherited start lease" % child.pid)
 
     def recover(self, action):
         code, out, _ = run([BINARY, "version"])
@@ -319,37 +613,43 @@ class Recovery:
                 return
             if not self.mounts()[0]:
                 return
-            if action == "check-old-owner":
-                with lease(Path(STATE) / "start.lock") as locked:
-                    if not locked:
-                        return
-                    kind, _ = self.status()
-                    if kind not in ("held", "port"):
-                        return
-                    old = self.data.get("old")
-                    if not self.owner_matches(old):
-                        self.log("unresponsive holder is not the recorded pre-drop owner; needs operator")
+            with self.start_fence() as fence:
+                if not fence:
+                    return
+                _, probes = fence
+                kind, _ = self.status()
+                if kind not in ("absent", "held", "port"):
+                    return
+                old = self.data.get("old")
+                if not all(probe["quiet"] for probe in probes):
+                    holders = set().union(*(probe["holders"] for probe in probes))
+                    try:
+                        process = process_args(old["pid"]) if old else None
+                    except (OSError, ValueError):
+                        process = None
+                    if (not old or holders != {old.get("pid")}
+                            or not self.owner_matches(old, process)):
+                        self.log("surviving holder is not solely the verified pre-drop daemon; needs operator")
                         return
                     if self.data.get("signalled") == old:
                         self.log("recorded daemon still alive after TERM; needs operator (no force kill)")
                         return
-                    # Persist intent before signalling: a watcher crash must not send
-                    # another shutdown request to the same daemon after resumption.
                     self.data["signalled"] = old
                     self.save()
-                    self.log("TERM exact pre-drop daemon pid %s (keep-mount)" % old["pid"])
+                    self.log("TERM verified pre-drop daemon pid %s (keep-mount)" % old["pid"])
                     os.kill(old["pid"], signal.SIGTERM)
-                return
-            # The pinned serve owns stale socket cleanup. Never remove state,
-            # sockets, ports or checkout contents here.
-            kind, _ = self.status()
-            if kind == "absent" and self.mounts()[0]:
-                self.start()
+                    return
+                if kind != "absent":
+                    return
+            # Reacquire and repeat exclusion in start(): a peer may have won
+            # the lease after our observation. No historical PID alone fences it.
+            self.start()
 
     def tick(self):
         volume, mounted = self.mounts()
         if volume is None:
             if self.data.get("seen"):
+                self.returning = True
                 if not self.data.get("pending"):
                     self.data["old"] = self.data.get("owner")
                     self.data.pop("signalled", None)
@@ -361,6 +661,9 @@ class Recovery:
         self.data["seen"] = True
         pending = self.data.get("pending", False)
         if pending:
+            # Keep each returned generation, including a second drop before
+            # recovery completes. A later current pathname cannot exclude it.
+            self.observe_generation()
             self.data["stable"] = self.data.get("stable", 0) + 1
             if self.data["stable"] < 5:
                 self.save()
@@ -370,8 +673,12 @@ class Recovery:
         self.last_status = time.monotonic()
         kind, data = self.status()
         action = decide(pending, kind, kind == "ready" and self.mount_ready(data, mounted))
+        if action == "recovered" and not self.peer_recovery_safe():
+            action = "wait"
         if kind == "ready":
             self.data["owner"] = self.identity(data)
+            if not pending or action == "recovered":
+                self.remember_generation()
         if action == "recovered":
             self.data["pending"] = False
             self.release_pause()
@@ -385,7 +692,19 @@ class Recovery:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true", help="one monitor tick (may recover after recorded drop)")
+    parser.add_argument("--probe-dir", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--lock-owner", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.lock_owner is not None:
+        # Darwin struct flock: off_t, off_t, pid_t, short, short.
+        raw = fcntl.fcntl(args.lock_owner, fcntl.F_GETLK,
+                          struct.pack("@qqihh", 0, 1, 0, fcntl.F_WRLCK, os.SEEK_SET))
+        _, _, pid, kind, _ = struct.unpack("@qqihh", raw)
+        print(pid if kind != fcntl.F_UNLCK else 0)
+        return
+    if args.probe_dir is not None:
+        probe_directory(args.probe_dir)
+        return
     RUNTIME.mkdir(parents=True, exist_ok=True)
     with lease(RUNTIME / "watch.lock") as locked:
         if not locked:
