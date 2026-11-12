@@ -23,6 +23,7 @@ class DeadMountTests(Isolated):
     def setUp(self):
         super().setUp()
         self.quiet = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
 
         def no_boat(method, path, *a, **kw):
             raise AssertionError(f"offline test reached boat: {method} {path}")
