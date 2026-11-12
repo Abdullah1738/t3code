@@ -4,7 +4,12 @@
 # none. The cursor lives on her box (~/person/wa/watch/<WATCH_ID>, wa-db new), so no message text is stored on
 # the Mac beyond the runner's own pending event. WATCH_RUN / the watcher's .run-ok go along, so lines from a run
 # the runner never recorded are printed again (wa-db's outbox). Exit 1 if her sync service is down.
-# Each run touches her lease, so a watcher keeps her box running: see the offbox-person skill for the cost.
+# Exit 93: the home offbox server is down, so nothing ran (never sent to Boat). Exit 94: a server restart cut the
+# run short and it was not re-run. Both print nothing on stdout, so they are never a new message; the runner
+# counts a failed run, leaves .run-ok alone (nothing is lost or repeated: her phone holds new messages until the
+# box is back and the outbox replays an unrecorded run) and only alerts after 5 failures in a row. Don't turn 93
+# into exit 0 here: the runner would then ack a run her box never saw and the next real run would repeat lines.
+# Each run touches her lease, so a watcher keeps her box running: see the offbox-person skill.
 set -eu
 person=${1:?usage: offbox-person-wa-new <person> <jid>}
 jid=${2:?usage: offbox-person-wa-new <person> <jid>}

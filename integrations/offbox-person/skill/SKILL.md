@@ -1,14 +1,17 @@
 ---
 name: offbox-person
-description: Use for any login, sign-up, account, cookie or browser task for someone other than Abdullah (currently Moni), and for any build, script or project done for her. Runs her browser and her work on her own offbox VM so none of her data touches Abdullah's Mac.
+description: Use for any login, sign-up, account, cookie or browser task for someone other than Abdullah (currently Moni), and for any build, script or project done for her. Runs her browser and her work on her own box on the home offbox server so none of her data touches Abdullah's Mac.
 ---
 
 # offbox-person
 
+This version of the skill applies once her box lives on the home offbox server (go-live moves it there).
+
 One offbox lease per person. Her logins, cookies, browser profile, secrets, files,
-and anything built or run for her live on her box under `~/person/`. The Mac holds
-only small state files (tunnel and SOCKS pids, local ports, backup status) under
-`~/.local/share/offbox-person/state/` and the encrypted backup repo (see Backups).
+and anything built or run for her live on her box under `~/person/`, and stay there. The Mac
+holds only small state files (tunnel and SOCKS pids, local ports, tunnel logs) under
+`~/.local/share/offbox-person/state/`. There is no copy or backup of her data on the Mac, on
+Dropbox or on Boat (see "Her data stays on the box").
 
 ## When to use
 
@@ -24,17 +27,19 @@ only small state files (tunnel and SOCKS pids, local ports, backup status) under
 - Never use Dia, the owner's Keychain, or the owner's browser profiles for her accounts.
 - Never create or run her working data on the Mac. Build and run it with `offbox-person run`.
 - Never copy her box data (profile, cookies, secrets, files, outputs) to the Mac, the wiki,
-  or the owner's repos. Only results she asked for go back to chat. The encrypted Dropbox
-  backup below is the one exception.
+  or the owner's repos. Only results she asked for go back to chat. There is no exception:
+  backups are snapshots on the server itself, not copies.
 - Abdullah has full access to her box (owner, 2026-10-21): use it for him whenever he asks,
   no need to check with her first.
 - Don't put credentials in chat. Store them with `offbox-person secret set`, read them with
   `offbox-person secret get` only inside the box where they're needed.
 - Stop the box when the task is done: `offbox-person down <person>`. Keep it warm only while a
-  task needs it.
+  task needs it. A stopped box costs nothing and is kept.
+- Her work never goes to Boat. If the home server is down, her task waits (exit 93 below); don't
+  move it to another backend, the Mac or Dia to get it done.
 - `~/.local/share/offbox-person/<person>/config.json` is the only Mac-side setting and is optional:
-  `{"home": false}` (use the box's own EU IP), `{"proxy": "..."}` (another proxy), `{"locale": "..."}`
-  (browser language, default `en-US`). Change it only when the owner says so.
+  `{"home": false}` (use the box's own connection, the home line in Dubai), `{"proxy": "..."}` (another
+  proxy), `{"locale": "..."}` (browser language, default `en-US`). Change it only when the owner says so.
 
 ## Commands
 
@@ -49,7 +54,6 @@ offbox-person secret get|rm <person> <name>
 offbox-person secret list <person>
 offbox-person save <person>                        # closes browser, saves a default base, pins it; box stops
 offbox-person down <person>                        # close browser, tunnels and home route, release the lease
-offbox-person backup <person> [--force]            # back up the latest snapshot to Dropbox now
 offbox-person list
 ```
 
@@ -78,19 +82,31 @@ Screenshots are transient: `down` deletes `$TMPDIR/offbox-person/<person>/`. Don
   `cua-driver serve` daemon (telemetry off) and CloakBrowser (headed, CDP `127.0.0.1:9242`,
   accessibility tree on). `~/person/session.sh` starts whatever is missing; `~/person/session.env`
   holds `DISPLAY` and the bus address. Logs: `~/person/{xvfb,dbus,atspi,wm,cua,browser}.log` on the box.
-- Home route: her browser leaves through the owner's home connection (Dubai), not the box's EU IP.
+- Home route: her browser leaves through this Mac's internet connection, not the box's own.
   `up` starts `offbox-person-socks` on this Mac (127.0.0.1 only) and `offbox ports 1055 --reverse`
   exposes it on her box as `socks5://127.0.0.1:1055`. The SOCKS server refuses loopback, LAN,
   tailnet/CGNAT, link-local and multicast destinations, so her pages can't reach the Mac or tailnet.
   Timezone follows the exit IP. If the route is down the browser has no internet: that is intended,
-  it never falls back to the EU IP. apt/pip and `offbox-person run` on the box go out directly.
+  it never falls back to the box's own connection. apt/pip and `offbox-person run` on the box go
+  out directly, over the home line.
+  The route was built when her box was in an EU datacenter. Her box is now at home in Dubai, so with
+  the Mac at home both ways leave through the same home line, and the server's firewall already keeps
+  boxes off the LAN, the tailnet and the host. With the Mac away, her browser exits wherever the Mac
+  is. `{"home": false}` makes the browser use the box's own connection; that switch is the owner's call.
 - agent-browser on the Mac reaches CDP through an `offbox ports 9242` tunnel. A live tunnel keeps
   the lease warm. If the tunnels die the box auto-stops after its idle window; the next command
   (or `up`) brings everything back.
 - Every offbox call runs as thread `person:<person>` with a pool of one box and `--no-fallback
-  --remote`. A failed box call never re-runs on the Mac.
+  --remote`. A failed box call never re-runs on the Mac. The offbox client picks her API token by
+  itself; never pass, read or print a token.
 - `down` and `save` close the browser first so her cookies are flushed to disk, then stop the
   tunnels and the SOCKS server by the pids in the state file.
+- Exit codes: `run` returns her command's own exit. 90 = her box didn't start (try again in a few
+  minutes). 93 = the home offbox server is down or unreachable: nothing ran, nothing was sent to
+  Boat, her tasks wait until it is back. It is not retried; say so to whoever asked and try later.
+  94 = her command was interrupted by a server restart and was not re-run. Check what it already
+  did, then run it again only if that is safe (never blindly for a send, a payment or a form
+  submit). `down` still cleans up the Mac side before it reports 93.
 
 ## On her box (Moni)
 
@@ -134,8 +150,9 @@ offbox-person wa moni events 20               # connected / logged_out / warning
 offbox-person wa moni setup                   # (re)install wacli, wa, wa-db and the unit; idempotent
 ```
 
-- Exit 90 means her box didn't start; it says nothing about WhatsApp. 'offline (not linked)', 'not linked yet',
-  or 'not linked' from link-status indicate a not-linked state.
+- Exit 90 means her box didn't start and exit 93 that the home server is down; neither says anything about
+  WhatsApp. 'offline (not linked)', 'not linked yet', or 'not linked' from link-status indicate a not-linked
+  state. Read commands are retried once after a 90; nothing is retried after a 93 or a 94.
 - Sending: it's her account. Send only what she asked for, in her words or a draft she OKed in her chat.
   Never test-send to her contacts.
 - Linking or re-linking (her phone removed the device, `logged_out` in events): `offbox-person wa moni link
@@ -157,66 +174,48 @@ robob-watch add --id moni-wa-ana --title "Ana replied on Moni's WhatsApp" --chat
   --session CURRENT_SESSION_ID --context "Moni asked (date) to be told when Ana replies about X. Read the chat with offbox-person wa moni read <jid>, tell Moni in one line. Never send anything from her WhatsApp."
 ```
 
-- Cost (her box is `default`, $0.036/h; it stops after 10 min idle and stopped is free). Every `wa` call or
-  watcher run touches the lease and keeps it up for another 10 min. No watcher: the box only runs while an
-  agent uses it, about $0. A watcher at 5 min or less keeps the box on: about $0.86/day ($26/month). A
-  30 min interval lets it stop between runs, roughly $0.30/day, but a reply can wait up to 30 min. While the
-  box is stopped, her phone holds the new messages and hands them over on the next resume (offline sync), so
-  nothing is lost, only delayed. Pick the interval for the job, give watchers a short expiry, and don't run an
-  always-on watcher for her without a reason she gave. The owner's `msgs` doesn't index her WhatsApp, on
-  purpose; use `wa search` on her box.
-- Linked devices are dropped by WhatsApp after about 30 days without connecting. The box is pinned and boat
-  resumes it at least every 12 days, but if `wa status` says `not linked` or the events show `logged_out`, re-link
-  as above.
-- Her WhatsApp store (session keys and messages) is in the encrypted Dropbox backup with the rest of her
-  home.
+- Load, not cost: at home her box has no hourly price, and a stopped box costs nothing and is kept. Every
+  `wa` call or watcher run touches the lease and keeps the box running for another idle window, so a watcher
+  at a short interval keeps it on all the time, using memory on the home server that builds also need. With
+  a longer interval it stops between runs, but a reply can wait that long. While the box is stopped, her
+  phone holds the new messages and hands them over on the next resume (offline sync), so nothing is lost,
+  only delayed. Pick the interval for the job, give watchers a short expiry, and don't run an always-on
+  watcher for her without a reason she gave. The owner's `msgs` doesn't index her WhatsApp, on purpose; use
+  `wa search` on her box.
+- While the home server is down, the watcher check exits 93: a failed run, never a new message. robob-watch
+  retries, alerts once after 5 failures in a row (and wakes the watcher's chat once after 15 min of failing),
+  and catches up when the server is back (her phone held the messages). If you are woken for that, there is
+  nothing to repair on the Mac; don't move the watcher anywhere else.
+- Linked devices are dropped by WhatsApp after about 30 days without connecting, and a stopped box doesn't
+  connect. The box is pinned (never deleted) and offbox starts a pinned box that has been stopped for 12
+  days, but if `wa status` says `not linked` or the events show `logged_out`, re-link as above.
+- Her WhatsApp store (session keys and messages) lives only on her box and is covered by its snapshots like
+  the rest of her home.
 
-## Backups (Dropbox)
+## Her data stays on the box
 
-`offbox-person-backup <person>|--all` backs up her box home from its latest boat snapshot:
-- Skips when the content snapshot id is the one last backed up (`--force` overrides).
-- Pulls the home minus reinstallable runtimes and caches (`.cloakbrowser`, `.cua-driver`, caches,
-  `go/pkg`, `person/venv`, `person/wiki`) onto a fresh encrypted, case-sensitive disk image mounted at
-  `~/.local/share/offbox-person/stage/<person>`. Its key exists only in the running script; the image is
-  detached and deleted at the end of every run (also on failure or TERM), and a run killed outright
-  leaves only ciphertext that the next run deletes. `person/bin` (her himalaya and ortie) is backed up
-  because `box/setup.sh` doesn't reinstall it.
-- Writes a restic snapshot into `~/.local/share/offbox-person/restic/<person>` (password in Keychain
-  `restic-offbox-person`/`ardud`; it is the only copy of the key, Dropbox holds only ciphertext), then
-  mirrors the repo to Dropbox `/Backups/offbox-person/<person>/restic` (every file hash-checked). It runs
-  `restic check` first and never mirrors a damaged repo. Dropbox files are deleted only after the daily
-  prune (`--delete` on the next mirror); otherwise the mirror only adds.
-- Fails (never silently passes) if a listed file other than browser-profile caches/locks or Go
-  telemetry is missing from the pull. Every boat/offbox/restic/Dropbox call has a timeout that kills the
-  whole process group. A failed pull is retried twice from a fresh listing.
-- Never replaces Dropbox history: if the Mac repo is missing but a backup was made before, or Dropbox
-  already holds a repo, it stops and asks for a restore instead of starting a new repo; it won't
-  mirror over a Dropbox repo with a different `config`.
-- `down` and `save` start it in the background, in its own process group, once the box has stopped (it
-  waits for a running backup instead of skipping). One run per person (flock on
-  `state/<person>-backup.lock`). LaunchAgent `com.abdullah.offbox-person-backup` (installed by
-  `integrations/offbox-person/install.zsh`) runs `--all` at login and every 6 h. It runs a copy at
-  `~/.local/share/offbox-person/bin/` because launchd may not read the external drive, so re-run
-  `install.zsh` after changing the script.
-- Status: `~/.local/share/offbox-person/state/<person>-backup.json` (`ok`, `stage`,
-  `last_success_ts`, `last_boat_snapshot`, `last_restic_snapshot`), log
-  `<person>-backup-YYYYMM.log` (counts only; tool error lines that name a path are dropped). The state
-  dir is mode 700. A failure or a lock stuck over 6 h sends one Telegram per stage per day. Keeps 8
-  last, 14 daily, 8 weekly, 24 monthly, 5 yearly; `restic check --read-data-subset=10%` every 30 days.
-- Tests: `python3 tests/test_backup.py` (real restic, fake boat/offbox/Dropbox, about 4 min) and
-  `python3 tests/test_offbox_person.py`.
+Owner decision (Nov 2026): "we dont need to snapshot any of moni's offbox data locally, it can all stay on
+device." The old Mac job (`offbox-person-backup`: restic repo on the Mac, Dropbox mirror) is retired and
+`install.zsh` removes its LaunchAgent.
 
-Restore:
-
-```bash
-export RESTIC_REPOSITORY=~/.local/share/offbox-person/restic/moni
-export RESTIC_PASSWORD_COMMAND="security find-generic-password -s restic-offbox-person -a ardud -w"
-restic snapshots --tag person-moni
-restic restore latest --target "$TMPDIR/moni-restore" --include '*/person/files'   # or the whole snapshot
-```
-
-Copy the restored files back to her box (tar over `offbox ssh` from `~/.local/share/offbox-person/moni`
-with `OFFBOX_THREAD=person:moni OFFBOX_POOL_SIZE=1`) and delete the restored copy from the Mac right
-away. If the Mac repo is gone, download `/Backups/offbox-person/<person>/restic` from Dropbox to the repo
-path first (`dbxcli ls -R` then `dbxcli get` file by file; a folder `get` fails). The Keychain password
-is needed either way. Tested 21 Oct: a repo downloaded from Dropbox restored her files byte for byte.
+- Where it lives: her box is a container on the home offbox server (boatd on Incus/ZFS, at home in Dubai),
+  owner `moni`. offbox reaches it with her own API token (Keychain service `offbox-server-api`, account
+  `moni`), which sees only her boxes.
+- What protects it: the pool is a ZFS mirror on two NVMe disks. Every run ends with a snapshot, and her box
+  also gets hourly, daily and weekly snapshots. Kept: 48 hourly, 30 daily, 12 weekly, plus the newest 20
+  per-run snapshots and one per day for 14 days. A monthly scrub checks both disks. The numbers have one
+  source, `DEFAULTS["retention"]` in `integrations/offbox/server/boatd.py`; read them there if in doubt.
+- What there is not, on purpose: a copy on the Mac, on Dropbox or on Boat. The snapshots cover a bad change,
+  a deleted file and one dead disk, and they live on the same server. Don't pull her files to the Mac or
+  anywhere else "to be safe", and don't set up another backup unless Abdullah asks.
+- Restoring a file: done on the server from a snapshot, by Abdullah or an agent he asks. A snapshot is an
+  Incus snapshot of her container. To see them (read-only), on the server: `incus snapshot list <container>`
+  (`python3 /opt/boatd/boatd.py box list` as root shows which container is hers). The restored file stays on
+  her box.
+- Server down: her tasks wait. `offbox-person` exits 93 and nothing runs; person work is never sent to Boat.
+- Interrupted run: a server restart during her command gives exit 94. Her commands are never re-run
+  automatically, because a second login, send or payment can do harm.
+- Leftovers of the old backup on the Mac (`~/.local/share/offbox-person/restic/`, its Keychain password
+  `restic-offbox-person`, Dropbox `/Backups/offbox-person/`, `state/*backup*` files) are Abdullah's to
+  delete. Don't read, restore from or add to them.
+- Tests: `python3 tests/test_offbox_person.py` and `python3 tests/test_socks.py` (fake offbox, no real box).

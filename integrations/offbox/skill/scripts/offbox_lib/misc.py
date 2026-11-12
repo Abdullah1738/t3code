@@ -284,8 +284,20 @@ STATUS_CALL_S = 12   # `offbox status` answers fast even when boat's API hangs (
 
 
 def status(me: dict) -> None:
+    from . import common, home
     con = db()
     cap = read_json(CAP_PATH, {})
+    if common.home_config() is not None:
+        st = common.home_state()
+        since = f" since {iso(st['since'])}" if st.get("since") else ""
+        if api.BACKEND == "server":
+            print(f"backend: home offbox server ({st.get('state')}{since}); Boat is the standby")
+        else:
+            why = st.get("reason") or ("pinned to Boat" if common.backend_pinned() else "home unreachable")
+            print(f"backend: Boat, standing in for the home offbox server ({st.get('state')}{since}: {why}). "
+                  "Runs go back home after three good health checks")
+        if st.get("degraded"):
+            print(f"home server degraded: {'; '.join(str(x) for x in st['degraded'][:3])}")
     d = outage.current()
     if d:
         print(f"boat.dev: DOWN since {iso(d['since'])} ({d.get('reason')}), last failure {ago(d.get('seen'))} ago")
@@ -652,10 +664,15 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     stream was lost and no exit could be recovered). Nothing is recorded here: the caller decides what to publish.
     `echo` is the caller's choice: a quiet exit-code wait does not print the remote output. `mirror_path` (a takeover
     only) receives every committed chunk too, so a concurrent follower of the original log sees the output live."""
-    from .runs import follow
-    code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
-                  start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
-                  mirror_keep=mirror_keep)
+    from .runs import Interrupted, finish, follow
+    try:
+        code = follow(r["box_id"], r["process_id"], log_path, echo=echo, run_id=r["run_id"], until=until,
+                      start_offsets=start_offsets, replay_path=replay_path, mirror_path=mirror_path,
+                      mirror_keep=mirror_keep)
+    except Interrupted as e:
+        # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
+        finish(r["run_id"], e.code, "interrupted")
+        raise
     if code is None:
         code, how = _recover_by(r, log_path, until)
         if code is not None:

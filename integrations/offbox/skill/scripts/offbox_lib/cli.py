@@ -8,9 +8,12 @@ import os
 import sys
 import time
 
-from .common import EXIT_BUSY, EXIT_CAP, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now, say
+from . import common
+from .common import (EXIT_BUSY, EXIT_CAP, EXIT_HOME_DOWN, EXIT_INFRA, SIZES, TEMPLATES, OffboxError, db, log, new_id, now,
+                     say)
 
-HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM instead of the Mac.
+HELP = """offbox: run heavy work (tests, installs, docker) off the Mac: on the home offbox server when one is set up
+and up, else on a boat.dev VM.
   offbox run [opts] -- <cmd...>     sync repo, run in the same relative dir, stream, exit with its code
   offbox run [opts] --step 'CMD' [--step 'CMD' ...]   each step runs with pipefail; per-step rc; first nonzero rc wins
   offbox logs <run> [--follow] | wait <run> [--timeout S]     for --bg runs; also a run another shell follows
@@ -22,7 +25,9 @@ HELP = """offbox: run heavy work (tests, installs, docker) on a boat.dev VM inst
 Light Go checks (single-package go test -run, go vet of 1-3 packages, gofmt -l) run on this Mac in a sandbox;
 --remote forces the box.
 Exit codes: the command's code (last stderr line: "offbox: remote exit N" or "offbox: local exit N"); 90 infra/start-limit
-failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally."""
+failure; 91 spend cap; 92 pool busy for the whole queue wait (nothing ran; retry). Only small commands may fall back locally.
+With a home server: 93 a person's task while the home server is down (it waits; never sent to Boat; nothing ran);
+94 the home server restarted under the run and it was not run again (--no-retry, a person's task, or already retried once)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sync a repo-relative path the secret/ignore filters would skip (e.g. committed test certs)")
     r.add_argument("--bg", action="store_true")
     r.add_argument("--no-fallback", action="store_true")
+    r.add_argument("--no-retry", action="store_true",
+                   help="home server only: if the server restarts under this run, do not run it again by itself "
+                        "(exit 94 instead). For commands that must not run twice")
     r.add_argument("--remote", action="store_true",
                    help="always use the box, even for light Go checks that would otherwise run on this Mac")
     r.add_argument("--step", action="append", default=[], metavar="CMD",
@@ -169,6 +177,16 @@ def cmd_run(a, me) -> int:
         if not a.remote:
             why = "could not start locally"
     log(f"remote: {why}")
+    from . import home
+    if home.may_fail_over():
+        # One short look before any work: a home server that does not answer costs this run 3 s, not minutes.
+        down = home.probe()
+        if down:
+            home.fail_over(down, getattr(a, "argv", None) or sys.argv[1:])
+    elif home.on_standby() and not os.environ.get(home.FAILOVER_ENV):
+        st = common.home_state()
+        say(f"home offbox server is down ({st.get('reason') or 'marked down by the health monitor'}); "
+            "this run is on Boat")
     from . import api, outage, pool
     waited_from = None
     capacity_since = capacity_last_say = None
@@ -196,6 +214,15 @@ def cmd_run(a, me) -> int:
                 if isinstance(e, pool.PoolBusyError) and waited_from is not None and last_outage is not None and \
                         time.monotonic() - waited_from >= outage.window_seconds() and not e.started:
                     raise last_outage
+                if home.active() and home.unreachable(e):
+                    # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
+                    # person's work waits for the home server; a pinned backend keeps today's waiting.
+                    if home.may_fail_over():
+                        home.fail_over(str(e), getattr(a, "argv", None) or sys.argv[1:])
+                    if common.person():
+                        raise OffboxError(f"the home offbox server is down ({e}); {common.person()}'s tasks wait "
+                                          "until it is back. Nothing ran and nothing was sent to Boat",
+                                          code=EXIT_HOME_DOWN) from e
                 machine_capacity = isinstance(e, api.BoatAtCapacity)
                 if machine_capacity:
                     if e.started or not (a.no_fallback or a.remote or a.bg or
@@ -250,6 +277,27 @@ def cmd_run(a, me) -> int:
         return code
 
 
+# Commands that never talk to a box: they work for a person's lease even while the home server is down.
+LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases")
+
+
+def _reap_other_backend(dry_run: bool) -> None:
+    """With a home server configured, leases exist on both backends and both need the reaper (Boat boxes left
+    from a failover must still be stopped and deleted). The other one runs as its own process: one backend each."""
+    if common.home_config() is None or os.environ.get("OFFBOX_BACKEND") or os.environ.get("OFFBOX_REAP_CHILD"):
+        return
+    import subprocess
+    other = "boat" if common.backend() == "server" else "server"
+    if other == "server" and common.home_state().get("state") == "home_down":
+        return
+    env = dict(os.environ, OFFBOX_BACKEND=other, OFFBOX_REAP_CHILD="1")
+    try:
+        subprocess.run([sys.executable, os.path.realpath(sys.argv[0]), "reap", *(["--dry-run"] if dry_run else [])],
+                       env=env, timeout=110, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"reap of the {other} backend did not finish: {e}")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     p = build_parser()
@@ -257,14 +305,18 @@ def main(argv: list[str] | None = None) -> int:
     if not a.sub:
         p.print_help()
         return 2
-    from . import bases, misc, reap, spend
+    from . import bases, home, misc, reap, spend
     from .identity import whoami
     from .redact import redact_argv, warn_env_values
     try:
         me = whoami()
-        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} argv={redact_argv(argv)[:12]}")
+        log(f"cmd {a.sub} owner={me['owner']} repo={me['repo_root']} backend={common.backend()} "
+            f"argv={redact_argv(argv)[:12]}")
+        if a.sub not in LOCAL_ONLY:
+            home.person_gate()   # a person's box lives on the home server only: stop here while it is down
         if a.sub == "run":
             warn_env_values(a.env)
+            a.argv = list(argv)
             return cmd_run(a, me)
         if a.sub == "logs":
             return misc.logs(a.run_id, a.follow)
@@ -298,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
             misc.stats(a.days, a.json)
         elif a.sub == "reap":
             reap.print_actions(reap.reap(a.dry_run))
+            _reap_other_backend(a.dry_run)
         elif a.sub == "save":
             print(json.dumps(bases.save(me, a.name, a.make_default, a.note), indent=1))
         elif a.sub == "bases":

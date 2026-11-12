@@ -272,6 +272,8 @@ def idle_for(con, box_id: str, size: str | None, snap: dict | None = None) -> in
 
 
 def cap_check() -> None:
+    if api.BACKEND != "boat":
+        return   # the spend cap is about boat.dev's bill; runs on our own server cost nothing
     cap = read_json(CAP_PATH, {})
     if cap.get("capped"):
         raise OffboxError(f"spend cap hit: ${cap.get('spend', 0):.2f} this month (cap ${cap.get('cap', 500):.0f}). New leases are refused.",
@@ -409,11 +411,24 @@ def supply_size(want: str | None, floor: str = "large") -> str | None:
 def resume_size(con, row, size: str | None) -> str:
     """The size _reuse resumes a stopped row at: the requested size when it is bigger than the natural one."""
     nat = natural_size(con, row)
-    return size if _bigger(size, nat) else nat
+    return plan_size(con, size if _bigger(size, nat) else nat)
+
+
+def plan_size(con, sz: str | None) -> str | None:
+    """`sz`, or the biggest size below it that the current Boat plan has (the $20 plan has no xlarge)."""
+    if not sz or capacity.plan_allows(con, sz):
+        return sz
+    for n in reversed(SIZES):
+        if _rank(n) < _rank(sz) and capacity.plan_allows(con, n):
+            say(f"Boat's current plan has no {sz} machines; using {n}")
+            return n
+    return sz
 
 
 def _fit_new(sz: str, size: str | None) -> str:
     """A new box's size, one size smaller while boat has no machines of `sz`. Explicit --size waits instead."""
+    with contextlib.closing(db()) as pcon:
+        sz = plan_size(pcon, sz)
     fit = supply_size(sz, size or "large")
     if fit is None:
         raise api.SupplyOut(sz, None, f"supply for size {sz} is over until {iso(capacity.supply_until(sz))}",
@@ -428,20 +443,31 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 
     Source "recipe:<template>" is a fresh box that _bring_up builds from the template's recipe because boat
     deleted the template's data."""
+    from . import home
     root = Path(me["repo_root"])
     rk = me["repo_key"]
     idem = new_id("lease")
     name = box_name(me, rk)
+    fresh_on_standby = False
     if not fresh:
         brow = None
         if base:
             full = base if ":" in base else f"{rk}:{base}"
             brow = con.execute("SELECT * FROM bases WHERE name=?", (full,)).fetchone()
-            if not brow:
+            if not brow and home.only_on_home("bases", "name=?", (full,)):
+                # Saved on the home server, which is down: Boat never had it. One line, then a plain Boat box.
+                say(f"saved base '{full}' exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
+                base = None
+                fresh_on_standby = True
+            elif not brow:
                 raise OffboxError(f"no saved base '{full}'. See `offbox bases`.", code=2)
         elif not template:
             brow = con.execute("SELECT * FROM bases WHERE repo_key=? AND is_default=1 "
                                "AND (expired_at IS NULL OR saved IS NOT NULL)", (rk,)).fetchone()
+            if not brow and home.only_on_home("bases", "repo_key=? AND is_default=1", (rk,)):
+                say(f"the warm state saved for {rk} exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
         if brow:
             sz = _fit_new(size or brow["size"] or "large", size)
             s = _start_from(con, "bases", brow, sz, name, idem)
@@ -457,7 +483,10 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
         trow = con.execute("SELECT * FROM templates WHERE name=?", (tname,)).fetchone()
         if not trow and tname != "generic":
             trow = con.execute("SELECT * FROM templates WHERE name='generic'").fetchone()
-            if trow:
+            if home.only_on_home("templates", "name=?", (tname,)) and not fresh_on_standby:
+                say(f"template {tname} exists only on the home offbox server, which is down: "
+                    "using a plain Boat box for this run")
+            elif trow:
                 say(f"template {tname} not built yet; using generic")
         if trow:
             sz = _fit_new(size or DEFAULT_SIZE.get(tname, "default"), size)

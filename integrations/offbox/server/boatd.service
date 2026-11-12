@@ -1,8 +1,9 @@
 [Unit]
 Description=boatd: offbox server API (boat.dev-compatible) over Incus
-After=network-online.target tailscaled.service incus.service
-Wants=network-online.target
-Requires=incus.service
+After=network-online.target tailscaled.service zfs-mount.service zfs-import.target incus.service
+Wants=network-online.target incus.service
+# No Requires: without its pool or without Incus boatd serves /health and says why (degraded mode) instead of
+# failing, so boot never waits for it and nobody has to restart it.
 
 [Service]
 Environment=HOME=/root

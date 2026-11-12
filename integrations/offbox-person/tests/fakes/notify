@@ -1,3 +1,0 @@
-#!/bin/sh
-# Fake telegram-bridge cli: records each alert.
-printf '%s\n' "$*" >> "${FAKE_NOTIFY_LOG:-/dev/null}"

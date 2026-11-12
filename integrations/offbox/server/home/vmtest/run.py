@@ -9,8 +9,10 @@
 Results: ~/ohv/results/<case>/ (test.log, result.json, serial console, the stick's log volume).
 Exit code 0 only when every requested case passed.
 """
+import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -894,35 +896,111 @@ def c10(c):
     c.check(sshv(vm, "offbox-status | sed -n 's/.*booted_image=//p' | cut -d' ' -f1") == good, "next boot uses the promoted kernel by default")
 
 
+HOST_FILES = ("boatd.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh")
+
+# Runs inside the VM: one boatd API call with an owner's token (kept in a root-only file there), JSON out.
+API_PY = r'''#!/usr/bin/env python3
+import base64, json, sys, urllib.error, urllib.request
+who, method, path = sys.argv[1:4]
+body = base64.b64decode(sys.argv[4]) if len(sys.argv) > 4 else None
+h = {"Content-Type": "application/json"}
+if who != "none":
+    h["Authorization"] = "Bearer " + open("/root/tok." + who).read().strip()
+h.update(json.loads(base64.b64decode(sys.argv[5])) if len(sys.argv) > 5 else {})
+req = urllib.request.Request(open("/root/api.url").read().strip() + path, method=method, data=body, headers=h)
+try:
+    with urllib.request.urlopen(req, timeout=40) as r:
+        print(json.dumps({"http": r.status, **json.loads(r.read() or b"{}")}))
+except urllib.error.HTTPError as e:
+    print(json.dumps({"http": e.code, **json.loads(e.read() or b"{}")}))
+except Exception as e:
+    print(json.dumps({"http": 0, "error": str(e)}))
+'''
+
+
+def install_host(c, vm, label="install-host.sh"):
+    """Copy the server files and run install-host.sh the way bootstrap.zsh does. Returns the listen IP."""
+    vm.ssh("mkdir -p /root/offbox-server")
+    vm.scp([os.path.join(SERVER_DIR, f) for f in HOST_FILES], "/root/offbox-server/")
+    ip = sshv(vm, "hostname -I | awk '{print $1}'")
+    t0 = time.time()
+    rc, out = vm.ssh(f"OFFBOX_LISTEN_IP={ip} bash /root/offbox-server/install-host.sh > /root/install-host.log 2>&1; echo rc=$?; tail -5 /root/install-host.log",
+                     check=False, timeout=5400)
+    c.check("rc=0" in out, f"{label} ran to the end on the stick-installed system", f"{int(time.time() - t0)}s; {out.strip()[-200:]}")
+    with open(os.path.join(c.dir, f"install-host-{len(os.listdir(c.dir))}.log"), "w") as f:
+        f.write(sshv(vm, "cat /root/install-host.log", check=False))
+    with open(os.path.join(c.dir, "api.py"), "w") as f:
+        f.write(API_PY)
+    vm.scp([os.path.join(c.dir, "api.py")], "/root/api.py")
+    vm.ssh(f"echo http://{ip}:8443/api/v1 > /root/api.url; umask 077; for o in ardud moni; do "
+           "[ -s /root/tok.$o ] || boatd token create --owner $o --label vmtest > /root/tok.$o; done")
+    return ip
+
+
+def api(vm, who, method, path, body=None, headers=None):
+    """A boatd API call made inside the VM. who: ardud | moni | none. Returns the JSON with "http" added."""
+    args = [who, method, shlex.quote(path)]
+    if body is not None or headers:
+        args.append(base64.b64encode(json.dumps(body if body is not None else {}).encode()).decode())
+    if headers:
+        args.append(base64.b64encode(json.dumps(headers).encode()).decode())
+    rc, out = vm.ssh("python3 /root/api.py " + " ".join(args), check=False, timeout=90)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"http": 0, "error": out.strip()[-200:]}
+
+
+def wait_api(vm, timeout=900):
+    """Until boatd reports it can take runs again (pool there, reconcile done). Returns the last /health."""
+    t0, h = time.time(), {}
+    while time.time() - t0 < timeout:
+        h = api(vm, "none", "GET", "/health")
+        if h.get("http") == 200 and h.get("ok"):
+            return h
+        time.sleep(3)
+    return h
+
+
+def boatd_diag(c, vm, tag):
+    """Keep boatd's journal and the container list next to the results (nothing secret is logged there)."""
+    out = sshv(vm, "journalctl -u boatd -u incus --no-pager -n 400 2>&1; echo ---; incus list -c nsS4 2>&1; echo ---; "
+                   "zfs list -o name,used,mountpoint 2>&1 | head -60; echo ---; free -m; df -h / /var/lib/incus; "
+                   "for b in $(incus list -c n -f csv | head -2); do echo \"--- inside $b\"; incus exec $b -- bash -c '"
+                   "systemctl is-system-running; ss -Hltn; systemctl --failed --no-pager | head -20; "
+                   "systemctl status ssh ssh.socket --no-pager 2>&1 | head -40; ls -la /etc/ssh | head -30' 2>&1; done",
+               check=False, timeout=180)
+    with open(os.path.join(c.dir, f"boatd-diag-{tag}.log"), "w") as f:
+        f.write(out)
+
+
+def pool_healthy(c, vm, label):
+    z = sshv(vm, "zpool status -L offbox | grep -E 'state:|errors:|nvme|mirror' | tr -s ' \\t\\n' ' '", check=False)
+    c.check("state: ONLINE" in z and "No known data errors" in z and z.count("ONLINE") == 4
+            and "nvme0n1p4 ONLINE" in z and "nvme1n1p4 ONLINE" in z,
+            f"{label}: pool offbox is a healthy mirror", z[:260])
+
+
 def c11(c):
     g = need_golden()
     vm = c.vm(2221)
     vm.from_golden(g)
     vm.start(mem=12288, smp=8)
     boot = vm.wait_ssh("installed", 900)
-    vm.ssh("mkdir -p /root/offbox-server")
-    vm.scp([os.path.join(SERVER_DIR, f) for f in ("boatd.py", "boatd-wrap", "base-image.sh", "boatd.service", "install-host.sh")], "/root/offbox-server/")
-    ip = sshv(vm, "hostname -I | awk '{print $1}'")
-    t0 = time.time()
-    rc, out = vm.ssh(f"OFFBOX_LISTEN_IP={ip} bash /root/offbox-server/install-host.sh > /root/install-host.log 2>&1; echo rc=$?; tail -5 /root/install-host.log",
-                     check=False, timeout=5400)
-    c.check("rc=0" in out, "install-host.sh ran to the end on the stick-installed system", f"{int(time.time() - t0)}s; {out.strip()[-200:]}")
-    with open(os.path.join(c.dir, "install-host.log"), "w") as f:
-        f.write(sshv(vm, "cat /root/install-host.log", check=False))
+    ip = install_host(c, vm)
 
     def healthy(label):
-        z = sshv(vm, "zpool status -L offbox | grep -E 'state:|errors:|nvme|mirror' | tr -s ' \\t\\n' ' '", check=False)
-        c.check("state: ONLINE" in z and "No known data errors" in z and z.count("ONLINE") == 4
-                and "nvme0n1p4 ONLINE" in z and "nvme1n1p4 ONLINE" in z,
-                f"{label}: pool offbox is a healthy mirror", z[:260])
+        pool_healthy(c, vm, label)
         st = ""
         for _ in range(30):
             st = sshv(vm, "systemctl is-active incus boatd | tr '\\n' ' '; incus list -c ns --format csv 2>&1 | head -3 | tr '\\n' ' '", check=False)
             if st.startswith("active active"):
                 break
             time.sleep(5)
-        api = sshv(vm, f"curl -s -m 10 -o /dev/null -w '%{{http_code}}' -H \"Authorization: Bearer $(cat /etc/boatd/token)\" http://{ip}:8443/api/v1/limits", check=False)
-        c.check(st.startswith("active active") and api.startswith("2"), f"{label}: incus and boatd are up, boatd answers its API", f"{st} http={api}")
+        h = wait_api(vm, 300)
+        lim = api(vm, "ardud", "GET", "/limits")
+        c.check(st.startswith("active active") and h.get("ok") and lim.get("http") == 200,
+                f"{label}: incus and boatd are up, boatd is healthy and answers its API", f"{st} health={h.get('mode')} limits={lim.get('http')}")
 
     parts = sshv(vm, "zpool status -P offbox | grep -oE '/dev/[^ ]+' | xargs -n1 readlink -f | tr '\\n' ' '")
     c.check("nvme0n1p4" in parts and "nvme1n1p4" in parts, "the pool was created on the two offbox-zfs partitions", parts)
@@ -1281,6 +1359,264 @@ def err(c):
             "stick stage log tells the story: one failed install, then one finished")
 
 
+def c12(c):
+    """boatd picks up where it left off: a hard power cut with runs going and queued, boatd restarted alone
+    mid-run, the pool missing at start, and an OS reinstall (REINSTALL-OS) over the live pool."""
+    vm = c.vm(2222)
+    try:
+        _c12(c, vm)
+    except Exception:
+        if vm.running():
+            try:
+                boatd_diag(c, vm, "failure")
+            except Exception as e:  # noqa: BLE001
+                c.log(f"no boatd diagnostics: {e}")
+        raise
+
+
+def _c12(c, vm):
+    g = need_golden()
+    vm.from_golden(g)
+    vm.start(mem=12288, smp=8)
+    boot = vm.wait_ssh("installed", 900)
+    ip = install_host(c, vm)
+    mounts = sshv(vm, "findmnt -no SOURCE /var/lib/boatd; findmnt -no SOURCE /var/lib/incus; ls /var/lib/boatd | tr '\\n' ' '")
+    c.check("offbox/boatd" in mounts and "offbox/incus-var" in mounts and "boatd.db" in mounts,
+            "boatd's and Incus's state are on the pool (datasets offbox/boatd, offbox/incus-var), not on the OS disk", mounts.replace("\n", " "))
+    timers = sshv(vm, "systemctl is-enabled boatd-snap-hourly.timer boatd-snap-daily.timer boatd-snap-weekly.timer boatd-scrub.timer | tr '\\n' ' '; "
+                      "systemctl list-timers --all --no-legend 'boatd-*' | wc -l")
+    c.check(timers.startswith("enabled enabled enabled enabled") and timers.split()[-1] == "4",
+            "snapshot timers (hourly, daily, weekly) and the monthly scrub timer are installed and enabled", timers)
+    # Two runs at once, so one power cut catches: a retried run, a run that must not be retried, a queued run.
+    # The first boatd version had one shared token in a file: it must become ardud's, stored hashed.
+    vm.ssh("python3 - <<'EOF'\nimport json\np='/etc/boatd/config.json'\nc=json.load(open(p))\n"
+           "c.update(max_running=2, mem_reserve_gb=1, default_peak_gb=0.25)\njson.dump(c, open(p,'w'))\nEOF\n"
+           "umask 077; echo legacy-shared-token-of-v1 > /etc/boatd/token; cp /etc/boatd/token /root/tok.legacy; systemctl restart boatd")
+    h0 = wait_api(vm)
+    keys = sorted(k for k in h0 if k != "http")
+    c.check(h0.get("ok") and h0.get("mode") == "ok" and h0.get("pool") == {"name": "offbox", "state": "ONLINE"}
+            and h0.get("mdraid", {}).get("state") == "ok" and h0.get("queue") == 0
+            and keys == ["boatd_uptime_s", "boot_id", "mdraid", "mode", "ok", "pool", "queue", "reasons", "running", "up", "uptime_s", "version"],
+            "/health without a token: up, pool ONLINE, mdraid ok, queue 0, boot id, uptime, version, and nothing else", json.dumps(h0)[:300])
+    leg = api(vm, "legacy", "GET", "/limits")
+    gone = sshv(vm, "ls /etc/boatd/token 2>&1 | grep -c 'No such'; grep -c legacy-shared /dev/null /var/lib/boatd/boatd.db*", check=False).split()
+    c.check(leg.get("http") == 200 and gone[0] == "1" and all(x.endswith(":0") for x in gone[1:]),
+            "the old single token works as ardud's token; the clear-text file is gone and the database holds no clear token", f"http={leg.get('http')} {gone}")
+    box = api(vm, "ardud", "POST", "/sandboxes", {"type": "small", "name": "vmtest-ardud", "ttlSeconds": 7200})
+    bid = (box.get("sandbox") or {}).get("id")
+    hers = (api(vm, "moni", "POST", "/sandboxes", {"type": "small", "name": "vmtest-moni", "ttlSeconds": 7200}).get("sandbox") or {}).get("id")
+    if not bid or not hers:
+        raise Fail(f"could not create the test boxes: {json.dumps(box)[:300]}")
+
+    def box_state(who, b):
+        return (api(vm, who, "GET", f"/sandboxes/{b}").get("sandbox") or {}).get("state")
+
+    def wait_state(who, b, want, timeout=600):
+        t0, st = time.time(), None
+        while time.time() - t0 < timeout:
+            st = box_state(who, b)
+            if st in want or st == "error":
+                return st
+            time.sleep(3)
+        return st
+    if not c.check(wait_state("ardud", bid, ("ready", "running")) in ("ready", "running") and
+                   wait_state("moni", hers, ("ready", "running")) in ("ready", "running"), "a box per owner was created and is ready", f"{bid} {hers}"):
+        why = [(api(vm, w, "GET", f"/sandboxes/{b}").get("sandbox") or {}).get("error") for w, b in (("ardud", bid), ("moni", hers))]
+        boatd_diag(c, vm, "boxes")
+        raise Fail(f"the test boxes did not come up: {why}")
+    cross = [api(vm, "ardud", "GET", f"/sandboxes/{hers}").get("http"),
+             api(vm, "ardud", "POST", f"/sandboxes/{hers}/commands", {"command": "id", "detached": True}).get("http"),
+             api(vm, "moni", "GET", f"/sandboxes/{bid}").get("http"),
+             len(api(vm, "moni", "GET", "/sandboxes").get("sandboxes") or [])]
+    c.check(cross == [404, 404, 404, 1], "on the real server: each token sees only its owner's box, the other one answers 404", cross)
+
+    def start(b, cmd, retry=False, who="ardud"):
+        body = {"command": cmd, "detached": True}
+        if retry:
+            body["retry_interrupted"] = True
+        r = api(vm, who, "POST", f"/sandboxes/{b}/commands", body)
+        if r.get("http") != 200:
+            raise Fail(f"command not accepted: {json.dumps(r)[:300]}")
+        return r["processId"], r["commandId"]
+
+    def status(b, pid, who="ardud"):
+        return api(vm, who, "GET", f"/sandboxes/{b}/commands/{pid}?tailBytes=200")
+
+    def output(b, cid, which="stdout", who="ardud"):
+        return api(vm, who, "GET", f"/sandboxes/{b}/command-history/{cid}/logs?stream={which}&offset=0").get("data") or ""
+
+    def wait_done(b, pid, timeout=600, who="ardud"):
+        t0, st = time.time(), {}
+        while time.time() - t0 < timeout:
+            st = status(b, pid, who)
+            if st.get("http") == 200 and not st.get("running"):
+                return st
+            time.sleep(3)
+        return st
+
+    def wait_lines(b, cid, word, n, timeout=180):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if output(b, cid).count(word) >= n:
+                return True
+            time.sleep(2)
+        return False
+
+    # ---- 1. hard power cut: A runs (may be retried), D runs (must not be retried), B waits in the queue
+    a_pid, a_cid = start(bid, 'for i in $(seq 1 45); do echo "A tick $i"; sleep 1; done; echo A-DONE', retry=True)
+    d_pid, d_cid = start(bid, 'for i in $(seq 1 600); do echo "D tick $i"; sleep 1; done; echo D-DONE')
+    c.check(wait_lines(bid, a_cid, "A tick", 6) and wait_lines(bid, d_cid, "D tick", 3), "runs A (retry_interrupted) and D (no retry) are running and printing")
+    b_pid, b_cid = start(bid, "echo B-RAN; sleep 3; echo B-DONE")
+    time.sleep(4)
+    sb = status(bid, b_pid)
+    hq = api(vm, "none", "GET", "/health")
+    c.check(sb.get("queued") is True and hq.get("queue") == 1 and hq.get("running") == 2,
+            "run B waits in the queue behind them (2 running, 1 queued in /health)", f"B={sb.get('status')} queued={sb.get('queued')} health={hq.get('running')}/{hq.get('queue')}")
+    vm.ssh("sync", check=False)
+    vm.power_cut()
+    cut = time.time()
+    vm.start(mem=12288, smp=8)
+    boot = vm.wait_ssh("installed", 900, not_boot=boot)
+    h1 = wait_api(vm)
+    c.check(h1.get("ok") and h1.get("boot_id") and h1.get("boot_id") != h0.get("boot_id"),
+            "after the power cut the machine booted unattended and boatd reports healthy with a new boot id",
+            f"{int(time.time() - cut)}s after the cut; {h1.get('mode')} {h1.get('reasons')}")
+    sa = wait_done(bid, a_pid, 420)
+    oa = output(bid, a_cid)
+    ea = output(bid, a_cid, "stderr")
+    c.check(sa.get("status") == "exited" and sa.get("exitCode") == 0 and sa.get("attempt") == 2 and oa.count("A-DONE") == 1
+            and oa.count("A tick 1\n") == 2 and "A tick 45\n" in oa and "queued again as attempt 2" in ea,
+            "run A was retried exactly once as attempt 2 of the same run and finished (exit 0); the output of both attempts is there",
+            f"status={sa.get('status')} exit={sa.get('exitCode')} attempt={sa.get('attempt')} A-DONE x{oa.count('A-DONE')} 'tick 1' x{oa.count('A tick 1' + chr(10))}")
+    sd = status(bid, d_pid)
+    od = output(bid, d_cid)
+    c.check(sd.get("status") == "interrupted" and sd.get("running") is False and sd.get("exitCode") is None and sd.get("attempt") == 1
+            and "D-DONE" not in od and od.count("D tick 1\n") == 1 and "is not run again" in output(bid, d_cid, "stderr"),
+            "run D (no retry_interrupted) is marked interrupted, was not run again, and keeps the output it had",
+            f"status={sd.get('status')} exit={sd.get('exitCode')} attempt={sd.get('attempt')} lines={od.count('D tick')}")
+    sbd = wait_done(bid, b_pid, 300)
+    c.check(sbd.get("status") == "exited" and sbd.get("exitCode") == 0 and sbd.get("attempt") == 1 and "B-DONE" in output(bid, b_cid),
+            "run B, queued before the cut, started by itself after the restart and finished",
+            f"status={sbd.get('status')} exit={sbd.get('exitCode')} attempt={sbd.get('attempt')}")
+    snaps = api(vm, "ardud", "GET", f"/sandboxes/{bid}/snapshots").get("snapshots") or []
+    zs = sshv(vm, f"zfs list -H -t snapshot -o name -r offbox/incus/containers/{bid.replace('_', '-')} | wc -l", check=False)
+    c.check(len([x for x in snaps if x.get("kind") == "auto"]) >= 2 and int(zs or 0) >= 2,
+            "the runs that finished after the restart each left a snapshot (API and ZFS agree)", f"api={len(snaps)} zfs={zs}")
+    c.check(box_state("moni", hers) in ("ready", "running") and sshv(vm, "incus list -c s --format csv | grep -ci running") == "2",
+            "both boxes the database called live are running again after the restart")
+    pool_healthy(c, vm, "after the power cut with runs going")
+    jr = sshv(vm, "journalctl -u boatd -b --no-pager | grep -a 'reconciled:' | tail -1", check=False)
+    c.check('"retry": 1' in jr and '"interrupted": 1' in jr and '"requeue": 1' in jr, "boatd's journal records the reconcile (1 retried, 1 interrupted, 1 queued again)", jr[-260:])
+
+    # ---- 2. boatd alone restarts mid-run: the run is not touched and its output is complete
+    e_pid, e_cid = start(bid, 'for i in $(seq 1 60); do echo "E line $i"; sleep 0.5; done; echo E-DONE')
+    wait_lines(bid, e_cid, "E line", 8)
+    vm.ssh("systemctl kill -s KILL boatd; sleep 1; systemctl restart boatd", check=False)
+    wait_api(vm, 300)
+    se = wait_done(bid, e_pid, 240)
+    oe = output(bid, e_cid)
+    want = "".join(f"E line {i}\n" for i in range(1, 61)) + "E-DONE\n"
+    c.check(se.get("status") == "exited" and se.get("exitCode") == 0 and se.get("attempt") == 1 and oe == want,
+            "boatd killed and restarted mid-run: the run finished as attempt 1 and its output is complete, in order, nothing twice",
+            f"status={se.get('status')} attempt={se.get('attempt')} bytes={len(oe)}/{len(want)}")
+    f_pid, f_cid = start(bid, "sleep 8; echo F-DONE; exit 3")
+    time.sleep(2)
+    vm.ssh("systemctl stop boatd; sleep 16; systemctl start boatd", check=False, timeout=120)
+    wait_api(vm, 300)
+    sf = status(bid, f_pid)
+    n2 = len(api(vm, "ardud", "GET", f"/sandboxes/{bid}/snapshots").get("snapshots") or [])
+    c.check(sf.get("status") == "exited" and sf.get("exitCode") == 3 and "F-DONE" in output(bid, f_cid) and n2 > len(snaps),
+            "a run that ended while boatd was down has its real exit code (3) and its snapshot", f"status={sf.get('status')} exit={sf.get('exitCode')} snapshots={n2}")
+    nres = sshv(vm, "systemctl show boatd -p NRestarts --value")
+    # ---- 3. person-box snapshots: the timer's job, on her box only
+    rot = sshv(vm, "boatd snap-rotate hourly; boatd snap-rotate hourly", check=False)
+    hs = [x.get("kind") for x in api(vm, "moni", "GET", f"/sandboxes/{hers}/snapshots").get("snapshots") or []]
+    his = [x.get("kind") for x in api(vm, "ardud", "GET", f"/sandboxes/{bid}/snapshots").get("snapshots") or []]
+    c.check(hs.count("hourly") >= 1 and "hourly" not in his and hers in rot and bid not in rot,
+            "snap-rotate (the hourly timer's job) snapshots the person box and not the others", f"hers={hs} rotate={rot[:200]}")
+
+    # ---- 4. the pool is not there when boatd starts: degraded mode, no crash loop, and it comes back by itself
+    # Incus leaves its own mounts (shmounts, guestapi, the storage pool) under /var/lib/incus: they go first,
+    # or the pool is busy and cannot be exported.
+    holders = ("for p in /proc/[0-9]*; do { ls -l $p/cwd $p/root $p/exe $p/fd 2>/dev/null; cat $p/maps 2>/dev/null; } | "
+               "grep -q '/var/lib/incus' && echo \"holder ${p#/proc/} $(tr '\\0' ' ' < $p/cmdline | cut -c1-120)\"; done")
+    rc, exp_out = vm.ssh("cd /; systemctl stop boatd-snap-hourly.timer; systemctl stop boatd; incus stop --all --force; "
+                         "systemctl stop incus-user.socket incus-user.service incus.socket incus.service incus-startup.service 2>/dev/null; "
+                         "pkill -f '[d]nsmasq.*incus'; sleep 2; "
+                         "umount -R /var/lib/incus 2>/dev/null || { echo 'umount busy:'; " + holders + "; "
+                         "systemctl list-units --no-legend --state=active 'incus*' | cut -c1-80; findmnt -R -n -o TARGET /var/lib/incus; "
+                         "for p in $(" + holders + " | awk '{print $2}'); do kill -9 $p; done; sleep 2; umount -R /var/lib/incus 2>&1; }; "
+                         "zpool export offbox 2>&1 || { sleep 3; zpool export -f offbox 2>&1; }", check=False, timeout=300)
+    exported = sshv(vm, "zpool list -H -o name 2>/dev/null | grep -c offbox", check=False)
+    with open(os.path.join(c.dir, "pool-export.log"), "w") as f:
+        f.write(exp_out)
+    if exported != "0":
+        c.log(f"zpool export did not work: {exp_out.strip()[-600:]}")
+    # keep the pool away for a while: boatd must stay up and say why
+    vm.ssh("systemctl start boatd", check=False)
+    seen, refused = [], None
+    t0 = time.time()
+    while time.time() - t0 < 240:
+        h = api(vm, "none", "GET", "/health")
+        if h.get("http") == 200:
+            seen.append((h.get("ok"), " | ".join(h.get("reasons") or [])))
+            if h.get("ok"):
+                break
+            if refused is None:
+                refused = api(vm, "ardud", "GET", "/sandboxes").get("http")
+        time.sleep(1)
+    deg = [s for s in seen if s[0] is False]
+    c.check(exported == "0" and deg and any("state dataset" in s[1] or "pool offbox" in s[1] for s in deg),
+            "started without its pool, boatd stays up in degraded mode and /health says why", f"exported={exported} first={deg[:1]}")
+    c.check(bool(seen) and seen[-1][0] is True and sshv(vm, "systemctl show boatd -p NRestarts --value") == nres
+            and sshv(vm, "systemctl is-active boatd incus | tr '\\n' ' '").startswith("active active"),
+            "it imported the pool again by itself, started Incus, reconciled and went back to healthy without restarting",
+            f"{len(deg)} degraded answers (API calls answered {refused} meanwhile), then ok")
+    c.check(box_state("ardud", bid) in ("ready", "running") and sshv(vm, "findmnt -no SOURCE /var/lib/boatd") == "offbox/boatd",
+            "the box is back and the state is on its dataset after the pool returned")
+    vm.ssh("systemctl start boatd-snap-hourly.timer", check=False)
+
+    # ---- 5. OS reinstall from the stick over the live pool: runs, boxes, tokens and snapshots are all still there
+    old = sshv(vm, "cat /etc/offbox/installed")
+    tokens_before = sshv(vm, "boatd token list | wc -l")
+    vm.ssh("install -d -m 700 /offbox/vmtest-keep && cp /root/tok.* /root/api.url /offbox/vmtest-keep/ && sync && zpool sync offbox")
+    put_marker(vm, "REINSTALL-OS")
+    vm.ssh("systemctl reboot", check=False, timeout=20)
+    new = wait_new_install(c, vm, old)
+    c.check("mode=preserve" in new, "REINSTALL-OS: the OS was reinstalled by itself; /root and /var are new", new[:70])
+    c.check(sshv(vm, "ls /opt/boatd/boatd.py /root/tok.ardud 2>&1 | grep -c 'No such'") == "2", "the new OS has no boatd and no leftovers of the old root")
+    vm.ssh("zpool list offbox >/dev/null 2>&1 || zpool import -f offbox; cp /offbox/vmtest-keep/* /root/; chmod 600 /root/tok.*", check=False, timeout=300)
+    t0 = time.time()
+    install_host(c, vm, "install-host.sh on the reinstalled OS with the pool imported")
+    took = int(time.time() - t0)
+    h2 = wait_api(vm)
+    c.check(h2.get("ok") is True, "boatd is healthy on the reinstalled OS", f"{took}s; {h2.get('mode')} {h2.get('reasons')}")
+    mounts = sshv(vm, "findmnt -no SOURCE /var/lib/boatd; findmnt -no SOURCE /var/lib/incus")
+    c.check("offbox/boatd" in mounts and "offbox/incus-var" in mounts, "the state datasets were reused, not recreated", mounts.replace("\n", " "))
+    boxes = sorted(b.get("id") for b in api(vm, "ardud", "GET", "/sandboxes").get("sandboxes") or [])
+    mine = api(vm, "moni", "GET", f"/sandboxes/{hers}")
+    c.check(boxes == [bid] and mine.get("http") == 200 and api(vm, "legacy", "GET", "/limits").get("http") == 200
+            and sshv(vm, "boatd token list | wc -l") == tokens_before,
+            "after the reinstall the same tokens work and each owner still has exactly their box", f"{boxes} moni={mine.get('http')}")
+    c.check(output(bid, a_cid).count("A-DONE") == 1 and status(bid, d_pid).get("status") == "interrupted" and status(bid, f_pid).get("exitCode") == 3,
+            "run history and run logs from before the reinstall are intact")
+    img = sshv(vm, "incus image list --format csv -c l | tr '\\n' ' '; incus list --format csv -c n | tr '\\n' ' '", check=False)
+    c.check("offbox-base" in img and bid.replace("_", "-") in img and hers.replace("_", "-") in img,
+            "Incus still knows the base image and both boxes (its database is on the pool)", img[:200])
+    api(vm, "ardud", "POST", f"/sandboxes/{bid}/resume", {})
+    wait_state("ardud", bid, ("ready", "running"), 300)
+    g_pid, g_cid = start(bid, "cat /etc/hostname; echo G-DONE")
+    sg = wait_done(bid, g_pid, 180)
+    c.check(sg.get("exitCode") == 0 and "G-DONE" in output(bid, g_cid), "a run in the old box works on the reinstalled server",
+            f"status={sg.get('status')} exit={sg.get('exitCode')}")
+    n3 = len(api(vm, "ardud", "GET", f"/sandboxes/{bid}/snapshots").get("snapshots") or [])
+    c.check(n3 > n2, "its snapshots from before the reinstall are still listed, plus the new one", f"{n2} -> {n3}")
+    pool_healthy(c, vm, "after the OS reinstall")
+    vm.ssh("zpool scrub -w offbox", timeout=1800)
+    z = sshv(vm, "zpool status offbox | grep -E 'scan:|errors:' | tr -s ' \\n' ' '")
+    c.check("0 errors" in z or "No known data errors" in z, "scrub at the end: no errors", z)
+
+
 CASES = {
     "c1": (c1, "zero-touch fresh install, layout as specified"),
     "recheck-c1": (recheck_c1, "helper: repeat the c1 checks on the disks of the last c1 run"),
@@ -1295,6 +1631,7 @@ CASES = {
     "c9": (c9, "emergency mode is reachable over SSH and recovers"),
     "c10": (c10, "a kernel that fails its one-shot try falls back"),
     "c11": (c11, "install-host.sh on the stick install; 3 hard power cuts with a healthy pool"),
+    "c12": (c12, "boatd durability: power cut with runs going and queued, boatd restart mid-run, pool missing, OS reinstall"),
     "sb": (sb, "extra: Secure Boot enforced, install + the stick starting the installed system"),
     "err": (err, "extra: a failed install is logged, reachable and retried by itself"),
     "acc": (acc, "extra: acceptance.sh runs cleanly on an install and its watchdog test works"),

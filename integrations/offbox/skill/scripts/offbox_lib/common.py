@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 
 HOME = Path.home()
 STATE = HOME / ".local/share/offbox"
-DB_PATH = STATE / "offbox.db"
 LOG_PATH = STATE / "offbox.log"
 LOGS_DIR = STATE / "logs"
 LOCKS_DIR = STATE / "locks"
@@ -30,19 +29,158 @@ SKILL_DIR = HOME / ".config/opencode/skills/remote-compute"
 TEMPLATES_DIR = SKILL_DIR / "templates"
 TZ = ZoneInfo("Asia/Dubai")
 
-# Backend: "server" = our own offbox server (boatd on the Hetzner box, see integrations/offbox/server), "boat" =
-# boat.dev. Chosen by OFFBOX_BACKEND, else ~/.local/share/offbox/backend, else server. server.json holds the URL.
-BACKEND_PATH = STATE / "backend"
-SERVER_CFG = STATE / "server.json"
+# Backend: "boat" = boat.dev, "server" = our own offbox server at home (boatd, integrations/offbox/server).
+# One backend per process, chosen when the process starts (see backend()). With no home server configured the
+# answer is always "boat" and nothing below changes anything: that is how offbox ran before the home server.
+#   server.json          {"url": ".../api/v1", "disabled": false}  written by server/bootstrap.zsh client
+#   backend-state.json   {"state": "home_up"|"home_down", ...}     written by the health monitor (home_monitor.py)
+#   home-failures.jsonl  runs that could not reach home before they were accepted (read by the monitor)
+#   backend              optional manual pin: a file holding "boat" or "server"
+_HOME_STATE = Path(os.environ.get("OFFBOX_STATE_DIR") or STATE)   # the monitor's tests move these three files
+BACKEND_PATH = _HOME_STATE / "backend"
+SERVER_CFG = _HOME_STATE / "server.json"
+BACKEND_STATE = _HOME_STATE / "backend-state.json"
+HOME_FAILURES = _HOME_STATE / "home-failures.jsonl"
+PERSON_PREFIX = "person:"          # OFFBOX_THREAD=person:<name>, set by offbox-person for someone's own box
+DEFAULT_OWNER = "ardud"
+_BACKEND: str | None = None        # set by select_backend(); None = decide from the files and the environment
+
+
+def home_config() -> dict | None:
+    """The home server's settings, or None when there is no home server to use (no file, unreadable, no url,
+    or "disabled": true). None means: this is a Boat-only install."""
+    try:
+        c = json.loads(SERVER_CFG.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(c, dict) or not c.get("url") or c.get("disabled"):
+        return None
+    return c
+
+
+def home_state() -> dict:
+    """What the health monitor last wrote. A missing or unreadable file counts as home_up."""
+    try:
+        s = json.loads(BACKEND_STATE.read_text())
+    except (OSError, ValueError):
+        return {"state": "home_up"}
+    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down") else {"state": "home_up"}
+
+
+def person() -> str | None:
+    """The person this process works for (her own box, her own token), or None for ordinary work."""
+    t = os.environ.get("OFFBOX_THREAD") or ""
+    name = t[len(PERSON_PREFIX):] if t.startswith(PERSON_PREFIX) else ""
+    return name if name and name.replace("-", "").replace("_", "").isalnum() else None
+
+
+def token_owner() -> str:
+    """Whose token this process uses on the home server: the person's for person-box work, else ours."""
+    return person() or DEFAULT_OWNER
+
+
+def backend_pinned() -> str | None:
+    """A backend somebody chose on purpose (environment or the pin file); automatic choice and failover are off."""
+    b = os.environ.get("OFFBOX_BACKEND") or ""
+    if b not in ("server", "boat"):
+        try:
+            b = BACKEND_PATH.read_text().strip()
+        except OSError:
+            b = ""
+    return b if b in ("server", "boat") else None
+
+
+def default_backend() -> str:
+    """Where a new process sends its work:
+    - a pinned backend wins;
+    - no home server configured: boat (exactly as before the home server existed);
+    - person-box work: the home server, always. It never goes to Boat, up or down;
+    - the monitor says home is down: boat; otherwise the home server."""
+    pin = backend_pinned()
+    if pin:
+        return pin
+    if home_config() is None:
+        return "boat"
+    if person():
+        return "server"
+    return "boat" if home_state().get("state") == "home_down" else "server"
 
 
 def backend() -> str:
-    b = os.environ.get("OFFBOX_BACKEND") or (BACKEND_PATH.read_text().strip() if BACKEND_PATH.exists() else "")
-    return b if b in ("server", "boat") else "server"
+    return _BACKEND or default_backend()
+
+
+def db_path_for(name: str) -> Path:
+    """Leases, runs and bases belong to one backend (a box id means nothing on the other), so each has its own
+    database. Boat keeps the file it always had."""
+    return STATE / ("offbox.db" if name == "boat" else "offbox-home.db")
+
+
+def select_backend(name: str) -> str:
+    """Fix this process's backend. Call it before any other offbox_lib module is imported: api and capacity
+    read the backend once, at import."""
+    global _BACKEND, DB_PATH
+    if name not in ("server", "boat"):
+        raise ValueError(name)
+    _BACKEND = name
+    DB_PATH = db_path_for(name)
+    return name
+
+
+def entry_backend(argv: list[str]) -> str:
+    """The backend for one `offbox ...` call. Without a home server: boat, with no lookups at all.
+    Otherwise: spend is Boat's meter and stats is the home server's; a command that names a run or a box goes to
+    the backend that run or box lives on; everything else follows default_backend()."""
+    pin = backend_pinned()
+    if pin:
+        return pin
+    if home_config() is None:
+        return "boat"
+    sub = next((x for x in argv if not x.startswith("-")), "")
+    if sub == "spend":
+        return "boat"
+    if sub == "stats":
+        return "server"
+    first = default_backend()
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports"):
+        named = [x for x in argv if x.startswith(("run-", "bx_")) or (sub in ("logs", "wait", "kill") and x != sub
+                                                                      and not x.startswith("-"))]
+        for name in (first, "boat" if first == "server" else "server"):
+            if any(_known(name, x) for x in named):
+                return name
+    return first
+
+
+def _known(name: str, ident: str) -> bool:
+    """Does this backend's database know the run or box? Read-only; a missing database knows nothing."""
+    path = db_path_for(name)
+    if not path.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            if ident.startswith("bx_"):
+                return con.execute("SELECT 1 FROM leases WHERE box_id=?", (ident,)).fetchone() is not None
+            return con.execute("SELECT 1 FROM runs WHERE run_id=? OR run_id LIKE ?",
+                               (ident, f"%{ident}")).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def standby() -> bool:
+    """True when this process is on Boat only because the home server is configured but not usable right now."""
+    return backend() == "boat" and home_config() is not None and backend_pinned() is None
+
+
+DB_PATH = db_path_for(backend())
 
 EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
+EXIT_HOME_DOWN = 93            # person-box work while the home server is down: it waits, it never goes to Boat
+EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
 IDLE_STOP_S = 20 * 60          # a lease with no run for this long is stopped (boat ttl + reaper)

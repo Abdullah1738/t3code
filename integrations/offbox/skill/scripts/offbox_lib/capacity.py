@@ -15,6 +15,46 @@ from .common import backend
 # boat.dev start limits. Our own server has none (starts are free), so the local windows are effectively off there.
 WINDOWS = ((60, "MINUTE", 25), (3600, "HOUR", 180), (86400, "DAY", 760)) if backend() == "boat" else \
     ((60, "MINUTE", 100000), (3600, "HOUR", 1000000), (86400, "DAY", 10000000))
+# The numbers above sit under the $100 plan's limits (30 / 210 / 840). On a smaller plan (the $20 one allows
+# 12 / 60 / 200) the local windows follow the plan, with this much headroom for starts made outside offbox.
+PLAN_HEADROOM = 0.85
+PLAN_KEY = "boat_plan"      # kv: what /limits last said about the plan (written by spend.compute)
+
+
+def plan(con) -> dict:
+    """The Boat plan as last seen: {"dollars", "starts": {perMinute, perHour, perDay}, "types": {size: bool}}."""
+    try:
+        row = con.execute("SELECT v FROM kv WHERE k=?", (PLAN_KEY,)).fetchone()
+        d = json.loads(row[0]) if row else {}
+    except (sqlite3.Error, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def windows(con) -> tuple:
+    """WINDOWS, lowered where the current Boat plan allows fewer starts than our usual budget."""
+    if backend() != "boat":
+        return WINDOWS
+    starts = plan(con).get("starts") or {}
+    out = []
+    for (seconds, name, default), key in zip(WINDOWS, ("perMinute", "perHour", "perDay")):
+        lim = starts.get(key)
+        if isinstance(lim, (int, float)) and 0 < lim < default:
+            default = max(1, int(lim * PLAN_HEADROOM))
+        out.append((seconds, name, default))
+    return tuple(out)
+
+
+def plan_allows(con, size: str | None) -> bool:
+    """False when the current Boat plan has no machines of this size (xlarge needs the $100 plan or above)."""
+    if backend() != "boat" or not size:
+        return True
+    p = plan(con)
+    ok = (p.get("types") or {}).get(size)
+    if ok is not None:
+        return bool(ok)
+    dollars = p.get("dollars")
+    return not (size == "xlarge" and isinstance(dollars, (int, float)) and 0 < dollars < 100)
 
 
 class CapacityError(OffboxError):
@@ -87,7 +127,7 @@ def snapshot(con=None) -> dict:
     t = now()
     counts = []
     retry = t
-    for seconds, name, default in WINDOWS:
+    for seconds, name, default in windows(con):
         cap = setting("OFFBOX_STARTS_PER_" + name, default, maximum=default)
         n = con.execute("SELECT COUNT(*) FROM start_requests WHERE ts>?", (t-seconds,)).fetchone()[0]
         counts.append({"window": seconds, "used": n, "cap": cap})
@@ -120,7 +160,7 @@ def reserve(operation: str, box_id: str | None) -> int:
         row = con.execute("SELECT v FROM kv WHERE k='boat_start_cooldown'").fetchone()
         if row and json.loads(row[0]).get("until", 0) > t:
             raise CapacityError("boat start limit reached; shared 429 cooldown is active")
-        for seconds, name, default in WINDOWS:
+        for seconds, name, default in windows(con):
             cap = setting("OFFBOX_STARTS_PER_" + name, default, maximum=default)
             n = con.execute("SELECT COUNT(*) FROM start_requests WHERE ts>?", (t-seconds,)).fetchone()[0]
             if n >= cap:

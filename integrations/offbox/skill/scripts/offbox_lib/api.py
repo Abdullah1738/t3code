@@ -1,4 +1,5 @@
-"""boat.dev HTTP API client (stdlib). The key is read from Keychain at runtime and never printed or stored."""
+"""HTTP API client (stdlib) for boat.dev and for our own offbox server (boatd answers the same calls).
+The key is read from Keychain at runtime and never printed or stored."""
 
 from __future__ import annotations
 
@@ -14,10 +15,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .common import OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log
+from .common import OffboxError, EXIT_INFRA, SERVER_CFG, backend, db, iso_ts, log, token_owner
 from . import capacity
 
 BACKEND = backend()
+NAME = "offbox server" if BACKEND == "server" else "boat"
 
 
 def _server_url() -> str:
@@ -27,9 +29,12 @@ def _server_url() -> str:
         return "http://offbox-server:8443/api/v1"
 
 
-# Our own server (boatd) answers the same REST calls as boat.dev did; see integrations/offbox/server/boatd.py.
+# Our own server (boatd) answers the same REST calls as boat.dev; see integrations/offbox/server/boatd.py.
 API = os.environ.get("OFFBOX_BOAT_API") or (_server_url() if BACKEND == "server" else "https://boat.dev/api/v1")
 KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
+# On our server every owner has their own token (Keychain account = owner): person-box work uses that person's,
+# everything else ours. A token only opens its owner's boxes there. boat.dev has the one account.
+KEY_ACCOUNT = token_owner() if BACKEND == "server" else "ardud"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
@@ -40,11 +45,11 @@ REDACT_KEYS = ("url", "desktopUrl", "viewerUrl", "signedUrl")
 def _key() -> str:
     global _KEY
     if _KEY is None:
-        p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", "ardud", "-w"],
+        p = subprocess.run(["security", "find-generic-password", "-s", KEY_SERVICE, "-a", KEY_ACCOUNT, "-w"],
                            capture_output=True, text=True)
         k = p.stdout.strip()
         if p.returncode != 0 or not k:
-            raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/ardud)")
+            raise OffboxError(f"API key missing from Keychain ({KEY_SERVICE}/{KEY_ACCOUNT})")
         _KEY = k
     return _KEY
 
@@ -69,7 +74,9 @@ class ApiError(OffboxError):
     def __init__(self, status: int, code: str, message: str, retryable: bool = False):
         if status in CF_OUTAGE and not message:
             message = f"Cloudflare could not reach boat.dev ({CF_OUTAGE[status]})"
-        super().__init__(f"boat API {status} {code}: {message}", EXIT_INFRA, outage=status in CF_OUTAGE)
+        # server_not_ready: our server is up but still importing its pool or reconciling after a restart.
+        super().__init__(f"{NAME} API {status} {code}: {message}", EXIT_INFRA,
+                         outage=status in CF_OUTAGE or code == "server_not_ready")
         self.status, self.api_code, self.retryable = status, code, retryable
 
 
@@ -373,7 +380,7 @@ def _call(method: str, path: str, body=None, headers: dict | None = None, timeou
                 # Still a network failure (boat silent): keep the outage classification the caller's clock needs.
                 raise NetworkError(f"deadline passed during {method} {path}: {e}")
             log(f"api {method} {path} -> network {e}")
-            raise NetworkError(f"boat API unreachable ({method} {path}): {e}")
+            raise NetworkError(f"{NAME} API unreachable ({method} {path}): {e}")
 
 
 def probe(timeout: float = 15) -> str | None:
@@ -640,13 +647,17 @@ def cmd_sync(box_id: str, command: str, timeout: int = 60, cwd: str | None = Non
     return call("POST", f"/sandboxes/{box_id}/commands", body, timeout=timeout + 30, retries=0)
 
 
-def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | None = None) -> dict:
-    """meta (repo, kind, run_id) lets the server group per-run resource numbers; boat ignored unknown fields."""
+def cmd_start(box_id: str, command: str, cwd: str | None = None, meta: dict | None = None,
+              retry_interrupted: bool = False) -> dict:
+    """meta (repo, kind, run_id) lets the server group per-run resource numbers. retry_interrupted: if our
+    server loses power under the run, it queues the run again once by itself. Neither is sent to boat.dev."""
     body = {"command": command, "detached": True}
     if cwd:
         body["cwd"] = cwd
-    if meta and BACKEND == "server":
-        body["meta"] = meta
+    if BACKEND == "server":
+        if meta:
+            body["meta"] = meta
+        body["retry_interrupted"] = bool(retry_interrupted)
     return call("POST", f"/sandboxes/{box_id}/commands", body, retries=0)
 
 

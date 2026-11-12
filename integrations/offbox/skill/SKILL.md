@@ -1,6 +1,6 @@
 ---
 name: remote-compute
-description: Use for any heavy test suite, dependency install, build or Docker/compose/testcontainers work - it runs on a boat.dev VM via `offbox run -- <cmd>`, not on Abdullah's Mac.
+description: Use for any heavy test suite, dependency install, build or Docker/compose/testcontainers work - it runs on an offbox machine (the home offbox server when one is set up, else a boat.dev VM) via `offbox run -- <cmd>`, not on Abdullah's Mac.
 ---
 
 # remote-compute: heavy work runs on boat via offbox
@@ -26,6 +26,9 @@ offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs i
 gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
 file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
 dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
+
+**Where it runs.** With no home server set up (no `~/.local/share/offbox/server.json`, or `"disabled": true` in
+it), everything below is boat.dev, as it always was. With one, see "Home server, Boat standby".
 
 **Light Go checks run on the Mac (local-first, 2026-10-19).** Waking a box for a 5 s check was most of the bill, so
 `offbox run` itself runs these locally (niced, max 4 at once) and prints `offbox: light command: running on this Mac`:
@@ -147,6 +150,7 @@ The monitor ignores apps opened by LaunchServices (XPC_SERVICE_NAME=application.
 | `--no-fallback` | return 90/91 instead of falling back to a local run (does not stop local-first) |
 | `--remote` | always use the box, even for a light Go check that would run on the Mac; never falls back to the Mac |
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
+| `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
 
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For runs over ~30 min prefer `--bg` + `offbox wait`, so your own tool-call timeout doesn't kill the client.
@@ -219,6 +223,34 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
 - Before ending a long task you don't need to do anything: idle boxes stop themselves. Release explicitly if you
   are done with a big (xlarge) box.
 
+## Home server, Boat standby
+
+Once `bootstrap.zsh client` has written `server.json`, runs go to Abdullah's own server at home (boatd; same
+commands, same box model, no hourly price, no start limits, no spend cap). Boat stays as the standby. Each
+`offbox run` picks its backend once, when it starts:
+
+- A health monitor on the Mac checks the server every minute and writes `backend-state.json`. Up: the run goes
+  home. Down (2 failed checks): the run goes straight to Boat and says so in one line. Home again after 3 good
+  checks; nothing to switch by hand. `offbox status` shows which one is in use.
+- Marked up but not answering when your run starts (or while its box is being fetched): the run moves to Boat
+  before it is sent, with one line (`... this run goes to Boat instead`). **Once the server accepted a run it
+  never moves**, so nothing runs twice.
+- The server restarts under an accepted run (power cut, reboot, boatd restart): the client reconnects for up to
+  15 minutes and carries on from where the output stopped. If the machine itself restarted, the server runs the
+  command **again from the start, once**, and you get one line saying so (`... running it again from the start
+  (attempt 2)`). Runs the server had queued start after it. `--no-retry` turns the second run off; the run then
+  ends with **94**.
+- Each backend has its own boxes, saved states and templates (`offbox list`, `bases` show the backend in use;
+  `logs`, `wait`, `kill`, `release`, `ssh` find the right one from the run or box id). A saved state or template
+  that exists only at home is not on Boat: a standby run says so in one line and uses a plain Boat box, so the
+  first standby run of a repo is a cold one.
+- Person work (`offbox-person`, Moni's box) never goes to Boat. Server down = exit **93**, nothing ran; it waits.
+- The Boat cap, `offbox spend` and the start limits below apply to standby runs only. offbox reads Boat's plan
+  from its API: on a plan without xlarge machines a standby run that asks for `--size xlarge` gets `large` with
+  one line, and the start limits follow the plan (85% of what it includes).
+- Pin by hand only for maintenance: `OFFBOX_BACKEND=boat|server` for one command, or the one word in
+  `~/.local/share/offbox/backend`. A pin switches automatic failover off.
+
 ## Costs and the cap
 
 $100/month plan. default $0.036/h, large $0.072/h, xlarge $0.20/h; stopped boxes, auto snapshots and the plan's 50
@@ -252,6 +284,10 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   apply. A plain 97 without that line is your command's own exit code.
 - **92** = every pool box stayed busy for the whole queue wait (or other runs held the pool's lock that long). Nothing
   ran, not an infra failure: just retry. A slow box resume or create no longer holds up other runs of the same repo.
+- **93** = person work (`offbox-person`) while the home server is down. Nothing ran and nothing went to Boat. It
+  is not a failure of the command: the task waits for the server. Don't retry in a loop and don't route around it.
+- **94** = the home server restarted under the run and it was not run again (`--no-retry`, person work, or it
+  had already been retried once). The command ran partly: check what it did before running it again.
 - **124** from `offbox wait --timeout` = you stopped waiting; the run is still going. Wait again.
 - **90** = boat/infra failure or exhausted start budget; **91** = spend cap. Heavy commands
   and opaque project scripts **stay remote-only**, returning 90/91/92 with a clear retry message after bounded

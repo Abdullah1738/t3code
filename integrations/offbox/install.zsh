@@ -1,7 +1,7 @@
 #!/bin/zsh -f
 # Install offbox from this repo onto the Mac, or check that the Mac matches it.
 #
-#   install.zsh [--dry-run]         sync skill, gate plugin, boat wrapper, offbox link, LaunchAgent
+#   install.zsh [--dry-run]         sync skill, gate plugin, boat wrapper, offbox link, both LaunchAgents
 #   install.zsh --check             exit 1 if the live copy differs from this tree or HEAD is not on origin
 #   install.zsh --allow-unpushed    install even with uncommitted or unpushed offbox changes (testing only)
 #
@@ -17,6 +17,9 @@ boat="$HOME/.local/bin/boat"
 link="$HOME/.local/bin/offbox"
 label="com.ardud.offbox-monitor"
 plist="$HOME/Library/LaunchAgents/$label.plist"
+# Home server health monitor: a one-shot every minute, beside the load monitor (README: "Two monitors").
+home_label="com.ardud.offbox-home-monitor"
+home_plist="$HOME/Library/LaunchAgents/$home_label.plist"
 excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store)
 
 mode=install
@@ -53,6 +56,7 @@ if [[ $mode == check ]]; then
   cmp -s "$here/plugin/offbox-gate.ts" "$plugin" || { print -u2 "offbox: $plugin differs"; rc=1 }
   cmp -s "$here/bin/boat" "$boat" || { print -u2 "offbox: $boat differs"; rc=1 }
   cmp -s "$here/launchd/$label.plist" "$plist" || { print -u2 "offbox: $plist differs"; rc=1 }
+  cmp -s "$here/launchd/$home_label.plist" "$home_plist" || { print -u2 "offbox: $home_plist differs"; rc=1 }
   [[ "$(readlink "$link" 2>/dev/null)" == "$skill/scripts/offbox.py" ]] || { print -u2 "offbox: $link is not a link to the skill"; rc=1 }
   (( rc == 0 )) && print "offbox: live copy matches $(git -C "$repo" rev-parse --short HEAD) and it is on origin"
   exit $rc
@@ -65,11 +69,14 @@ fi
 
 # --delete keeps removed files from lingering; excluded files (tmp/, .bak, caches) on the live side are kept.
 rsync -a --delete --itemize-changes "${dry[@]}" "${excludes[@]}" "$here/skill/" "$skill/"
-for pair in "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist"; do
+home_plist_changed=0
+for pair in "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist" \
+            "launchd/$home_label.plist:$home_plist"; do
   src="$here/${pair%%:*}"
   dst="${pair#*:}"
   cmp -s "$src" "$dst" && continue
   print "update $dst"
+  [[ "$dst" == "$home_plist" ]] && home_plist_changed=1
   (( ${#dry} )) || { mkdir -p "${dst:h}"; cp -p "$src" "$dst" }
 done
 if [[ "$(readlink "$link" 2>/dev/null)" != "$skill/scripts/offbox.py" ]]; then
@@ -84,5 +91,20 @@ if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
 else
   launchctl bootstrap "gui/$(id -u)" "$plist"
 fi
-print "offbox: installed $(git -C "$repo" rev-parse --short HEAD); monitor restarted."
+# The home monitor is a new process every minute, so new code needs no restart. A changed plist does:
+# launchd keeps the definition it loaded. Otherwise just run one check now; no -k, a tick in flight finishes.
+if ! launchctl print "gui/$(id -u)/$home_label" >/dev/null 2>&1; then
+  launchctl bootstrap "gui/$(id -u)" "$home_plist"
+elif (( home_plist_changed )); then
+  launchctl bootout "gui/$(id -u)/$home_label" || true
+  # bootout returns before the job is gone; bootstrap answers "Input/output error" until it is.
+  for try in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$(id -u)" "$home_plist" 2>/dev/null && break
+    sleep 1
+  done
+  launchctl print "gui/$(id -u)/$home_label" >/dev/null 2>&1 || { print -u2 "offbox: could not reload $home_label"; exit 1 }
+else
+  launchctl kickstart "gui/$(id -u)/$home_label"
+fi
+print "offbox: installed $(git -C "$repo" rev-parse --short HEAD); monitor restarted, home monitor loaded."
 print "The gate plugin loads when OpenCode starts: a plugin change needs an OpenCode restart (ask Abdullah first)."

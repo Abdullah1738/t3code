@@ -16,6 +16,10 @@ import subprocess
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent / "bin" / "offbox-person"
 FAKES = HERE / "fakes"
+SERVER_DOWN = ("offbox-person: the home offbox server is down; moni's tasks wait until it is back "
+               "(nothing ran, nothing was sent to Boat)\n")
+INTERRUPTED = ("offbox-person: her command was interrupted by a server restart and was not re-run; "
+               "run it again if it is safe to\n")
 
 
 def pid_alive(pid: int) -> bool:
@@ -45,8 +49,6 @@ class OffboxPersonTest(unittest.TestCase):
             "OFFBOX_PERSON_ROOT": str(self.root),
             "OFFBOX_PERSON_OFFBOX": str(FAKES / "offbox"),
             "OFFBOX_PERSON_AGENT_BROWSER": str(FAKES / "agent-browser"),
-            "OFFBOX_PERSON_BACKUP": str(FAKES / "offbox-person-backup"),
-            "FAKE_BACKUP_LOG": str(self.tmp / "backup.log"),
             "FAKE_LOG": str(self.calls),
             "FAKE_BOXHOME": str(self.boxhome),
             "FAKE_AB_LOG": str(self.ab_log),
@@ -55,6 +57,8 @@ class OffboxPersonTest(unittest.TestCase):
         }
 
     def tearDown(self):
+        self.env.pop("FAKE_EXIT", None)
+        self.env.pop("FAKE_EXIT_MATCH", None)
         self.tool("down", "moni", check=False)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -78,6 +82,12 @@ class OffboxPersonTest(unittest.TestCase):
 
     def ssh_calls(self):
         return [c for c in self.offbox_calls() if c["args"][0] == "ssh"]
+
+    def offbox_exits(self, codes, match=""):
+        """Make the fake offbox exit with codes[subcommand] (or codes["*"]) for calls whose arguments contain match."""
+        self.env["FAKE_EXIT"] = json.dumps(codes)
+        self.env["FAKE_EXIT_MATCH"] = match
+        self.calls.write_text("")
 
     def ab_calls(self):
         if not self.ab_log.exists():
@@ -334,16 +344,170 @@ class OffboxPersonTest(unittest.TestCase):
     def test_person_slug_is_validated(self):
         self.assertNotEqual(self.tool("up", "Bad!", check=False).returncode, 0)
 
-    def test_down_and_save_start_a_background_backup(self):
+    # Her data stays on her box: nothing on the Mac copies it or backs it up.
+
+    def test_down_and_save_leave_no_backup_or_copy_on_the_mac(self):
         self.tool("up", "moni")
-        self.tool("down", "moni")
-        self.tool("save", "moni")
-        log = self.tmp / "backup.log"
-        for _ in range(50):
-            if log.exists() and len(log.read_text().splitlines()) >= 2:
-                break
-            time.sleep(0.1)
-        self.assertEqual(log.read_text().splitlines(), ["moni --after-stop", "moni --after-stop"])
+        down = self.tool("down", "moni")
+        save = self.tool("save", "moni")
+        self.assertNotIn("backup", (down.stderr + save.stderr).lower())
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["moni", "state"])
+        self.assertEqual(list((self.root / "moni").iterdir()), [])
+        names = sorted(p.name for p in (self.root / "state").iterdir())
+        self.assertEqual(names, ["moni-home.log", "moni-socks.log", "moni-tunnel.log"])
+        subs = {c["args"][0] for c in self.offbox_calls()}
+        self.assertEqual(subs, {"run", "ssh", "ports", "release", "save", "keep"})
+
+    def test_backup_command_and_script_are_gone(self):
+        for args in (("backup", "moni"), ("backup", "moni", "--force")):
+            result = self.tool(*args, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("usage:", result.stderr)
+            self.assertNotIn("backup", result.stderr.lower())
+        self.assertEqual(self.offbox_calls(), [])
+        self.assertFalse((TOOL.parent / "offbox-person-backup").exists())
+        self.assertFalse((HERE.parent / "launchd").exists())
+        for name in ("offbox-person", "offbox-person-wa-new"):
+            self.assertNotIn("offbox-person-backup", (TOOL.parent / name).read_text())
+        # install.zsh retires the old job and installs nothing in its place; what the old backup left is not deleted.
+        install = (HERE.parent / "install.zsh").read_text()
+        self.assertIn('launchctl bootout "$domain/$label"', install)
+        self.assertNotIn("launchctl bootstrap", install)
+        self.assertNotIn("ln -sfn \"$here/bin/offbox-person-backup\"", install)
+        removed = [line for line in install.splitlines() if line.lstrip().startswith(("rm ", "rmdir "))]
+        self.assertEqual(len(removed), 2)
+        self.assertFalse(any(word in " ".join(removed) for word in ("-r", "restic", "state", "stage")))
+
+    # Exit 93: the home offbox server is down, nothing ran and nothing went to Boat. Exit 94: a server restart
+    # interrupted her run and it was not re-run. Both come straight from the offbox client.
+
+    def test_server_down_stops_up_and_run_with_one_message_and_exit_93(self):
+        for args in (("up", "moni"), ("run", "moni", "--", "echo", "hi"), ("secret", "list", "moni"),
+                     ("cua", "moni", "list_windows"), ("shot", "moni"), ("save", "moni")):
+            with self.subTest(args=args):
+                self.offbox_exits({"*": 93})
+                result = self.tool(*args, check=False)
+                self.assertEqual(result.returncode, 93)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "person: moni: preparing box\noffbox: fake exit 93\n" + SERVER_DOWN)
+                # One attempt: no retry, no tunnel, no SOCKS server, nothing after the first refused call.
+                self.assertEqual([c["args"][0] for c in self.offbox_calls()], ["run"])
+                self.assertEqual(self.state(), {})
+
+    def test_server_down_reaches_browser_callers_even_though_up_output_is_dropped(self):
+        self.offbox_exits({"*": 93})
+        result = self.tool("browser", "moni", "--", "snapshot", "-i", check=False)
+        self.assertEqual(result.returncode, 93)
+        self.assertEqual(result.stderr, SERVER_DOWN)
+        self.assertEqual(self.ab_calls(), [])
+
+    def test_server_down_mid_task_is_not_reported_as_her_command_failing(self):
+        self.tool("up", "moni")
+        self.offbox_exits({"run": 93}, match="cd ~/person/work")
+        result = self.tool("run", "moni", "--", "echo", "hi", check=False)
+        self.assertEqual(result.returncode, 93)
+        self.assertEqual(result.stderr, "offbox: fake exit 93\n" + SERVER_DOWN)
+        self.assertEqual(len(self.offbox_calls()), 1)
+
+    def test_interrupted_run_is_reported_and_never_run_again(self):
+        self.tool("up", "moni")
+        self.offbox_exits({"run": 94}, match="cd ~/person/work")
+        result = self.tool("run", "moni", "--", "send-the-money", check=False)
+        self.assertEqual(result.returncode, 94)
+        self.assertEqual(result.stderr, "offbox: fake exit 94\n" + INTERRUPTED)
+        self.assertEqual(len(self.offbox_calls()), 1)
+
+    def test_her_own_commands_exit_code_still_passes_through(self):
+        self.tool("up", "moni")
+        self.offbox_exits({"run": 7}, match="cd ~/person/work")
+        result = self.tool("run", "moni", "--", "false", check=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stderr, "offbox: fake exit 7\n")
+
+    def test_shot_leaves_no_empty_file_when_the_server_goes_down(self):
+        self.tool("up", "moni")
+        self.offbox_exits({"ssh": 93}, match="get_desktop_state")
+        result = self.tool("shot", "moni", check=False)
+        self.assertEqual(result.returncode, 93)
+        self.assertEqual(result.stderr, "offbox: fake exit 93\n" + SERVER_DOWN)
+        self.assertEqual(list((self.mac_tmp / "offbox-person" / "moni").iterdir()), [])
+
+    def test_down_still_cleans_up_the_mac_when_the_server_is_down(self):
+        self.tool("up", "moni")
+        self.tool("shot", "moni")
+        st = self.state()
+        pids = [int(st[k]) for k in ("TUNNEL_PID", "HOME_PID", "SOCKS_PID")]
+        self.offbox_exits({"*": 93})
+        result = self.tool("down", "moni", check=False)
+        self.assertEqual(result.returncode, 93)
+        self.assertEqual(result.stderr, "offbox: fake exit 93\n" * 2 + SERVER_DOWN)
+        self.assertEqual([c["args"][0] for c in self.offbox_calls()], ["ssh", "release"])
+        self.assertFalse((self.root / "state" / "moni.env").exists())
+        self.assertFalse((self.mac_tmp / "offbox-person" / "moni").exists())
+        for pid in pids:
+            self.assertTrue(self.wait_dead(pid), pid)
+        self.assertIn(["--session", "person-moni", "close"], self.ab_calls())
+
+    def test_wa_server_down_is_never_retried_and_exits_93(self):
+        for command in (("status",), ("chats",), ("read", "jid"), ("send", "jid", "text"), ("new", "jid", "key"),
+                        ("link", "971500000000"), ("setup",)):
+            with self.subTest(command=command):
+                self.ssh_responses({"exit": 93, "stderr": "offbox: server down\n"}, {"exit": 0, "stdout": "ran\n"})
+                result = self.tool("wa", "moni", *command, check=False)
+                self.assertEqual(result.returncode, 93)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "offbox: server down\n" + SERVER_DOWN)
+                self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_wa_server_down_on_the_retry_after_a_slow_box_exits_93(self):
+        self.ssh_responses({"exit": 90}, {"exit": 93})
+        result = self.tool("wa", "moni", "status", check=False)
+        self.assertEqual(result.returncode, 93)
+        self.assertEqual(result.stderr,
+                         "offbox-person: her box didn't start in time (offbox exit 90); retrying once\n" + SERVER_DOWN)
+        self.assertEqual(len(self.ssh_calls()), 2)
+
+    def test_wa_interrupted_command_keeps_its_output_and_exits_94(self):
+        for command in (("read", "jid"), ("send", "jid", "text")):
+            with self.subTest(command=command):
+                self.ssh_responses({"exit": 94, "stdout": "partial.\n"}, {"exit": 0, "stdout": "ran again\n"})
+                result = self.tool("wa", "moni", *command, check=False)
+                self.assertEqual(result.returncode, 94)
+                self.assertEqual(result.stdout, "partial.\n")
+                self.assertEqual(result.stderr, INTERRUPTED)
+                self.assertEqual(len(self.ssh_calls()), 1)
+
+    def wa_new(self, watch_dir):
+        env = {**self.env, "WATCH_ID": "moni-wa-ana", "WATCH_DIR": str(watch_dir), "WATCH_RUN": "run2"}
+        return subprocess.run([str(TOOL.parent / "offbox-person-wa-new"), "moni", "971500000000"], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_watcher_check_passes_new_messages_and_the_run_ids_to_her_box(self):
+        watch_dir = self.tmp / "watch"
+        watch_dir.mkdir()
+        (watch_dir / ".run-ok").write_text("run1\n")
+        self.ssh_responses({"exit": 0, "stdout": "(12-11-26 10:00:00) Ana: hi\n"})
+        result = self.wa_new(watch_dir)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "(12-11-26 10:00:00) Ana: hi\n")
+        self.assertEqual(self.ssh_calls()[0]["args"][-1],
+                         "~/person/bin/wa 'new' '971500000000' 'moni-wa-ana' 'run2' 'run1'")
+
+    def test_watcher_check_server_down_or_interrupted_is_a_failed_run_never_a_new_message(self):
+        watch_dir = self.tmp / "watch"
+        watch_dir.mkdir()
+        (watch_dir / ".run-ok").write_text("run1\n")
+        for code, message in ((93, SERVER_DOWN), (94, INTERRUPTED)):
+            with self.subTest(code=code):
+                self.ssh_responses({"exit": code}, {"exit": 0, "stdout": "(12-11-26 10:00:00) Ana: hi\n"})
+                result = self.wa_new(watch_dir)
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, message)
+                self.assertEqual(len(self.ssh_calls()), 1)
+                # The check keeps nothing of its own on the Mac and leaves the runner's ack alone.
+                self.assertEqual([p.name for p in watch_dir.iterdir()], [".run-ok"])
+                self.assertEqual((watch_dir / ".run-ok").read_text(), "run1\n")
 
 
 if __name__ == "__main__":
