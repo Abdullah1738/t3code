@@ -1182,6 +1182,9 @@ class Runner:
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
         con.commit()
+        if a.bg:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_path.touch()
         say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
         event(con, None, "run_pending", self.run_id)
         t0 = now()
@@ -1991,7 +1994,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                 (st, code, now(), run_id))
     con.commit()
     if r["box_id"]:
-        if catch_up and con.execute('SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone():
+        if catch_up and (r['mode'] == 'bg' or con.execute(
+                'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()):
             from .misc import _catch_up_finished
             _catch_up_finished(con, run_id, budget=10 if until is None else max(0, until-now()))
         settle_docker(con, r, st, timeout=10 if until is None else max(0, until-now()))

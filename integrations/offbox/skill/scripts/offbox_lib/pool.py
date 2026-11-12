@@ -762,7 +762,6 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if (st.get('status') == 'exited' and code == runs.EXIT_REPO_SETUP
                             and runs.REPO_SETUP_FAILED_MARKER in (st.get('stderr') or '').splitlines()):
                         runs.finish(row['run_id'], EXIT_INFRA, 'infra')
-                        _catch_up_finished(con, row['run_id'])
                         continue
                     wedged = runs.settle_box_wedged(con, row, code)
                     if wedged:
@@ -775,7 +774,6 @@ def _refresh_background(con, key, pull_artifacts=True):
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
                         runs.do_pulls(row['box_id'], dict(row), pulls)
                     runs.finish(row['run_id'], code)
-                    _catch_up_finished(con, row['run_id'])
         except OffboxError:
             pass
 
