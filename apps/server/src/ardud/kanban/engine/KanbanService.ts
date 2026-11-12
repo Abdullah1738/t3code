@@ -913,6 +913,7 @@ const make = Effect.gen(function* () {
         : locks.outside(effect, abandoned, reconcile),
     );
   const threads: typeof threadIo = {
+    pendingUserInputs: (id) => locks.outside(threadIo.pendingUserInputs(id)),
     view: (id) => outside(threadIo.view(id)),
     find: (id) => locks.outside(threadIo.find(id)),
     model: (id) => locks.outside(threadIo.model(id)),
@@ -2038,8 +2039,13 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     text: string,
     note = false,
+    key?: string,
   ) {
-    yield* threads.send({ threadId, text });
+    yield* threads.send({
+      threadId,
+      text,
+      ...(key === undefined ? {} : { key, keyAcrossThreads: true }),
+    });
     const current = (yield* savedFollowup) ? yield* discussionOf(discussion.id) : discussion;
     const next = withParticipant(
       current,
@@ -2336,6 +2342,7 @@ const make = Effect.gen(function* () {
     discussion: KanbanDiscussion,
     text: string,
     note = false,
+    deliveryKey?: string,
   ) {
     const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
     if (discussion.evaluatorThreadId !== null) {
@@ -2348,6 +2355,7 @@ const make = Effect.gen(function* () {
           discussion.evaluatorThreadId,
           text,
           note,
+          deliveryKey,
         );
       }
       if (view) {
@@ -2362,6 +2370,7 @@ const make = Effect.gen(function* () {
     // One evaluator per card discussion: the evaluators that asked on the card
     // hear it is handed over, and stop typing there.
     const priors = card ? yield* liveEvaluatorAskers(card) : [];
+    const priorText = priors.length > 0 ? Briefs.priorAskerText(priors) : undefined;
     const threadId = yield* startEvaluatorUnlocked(
       board,
       {
@@ -2371,7 +2380,10 @@ const make = Effect.gen(function* () {
         cardNumber: card?.number ?? null,
       },
       {
-        text: priors.length > 0 ? `${text}\n\n${Briefs.priorAskerText(priors)}` : text,
+        // Keyed notes use the same idempotent send for both new and existing evaluators.
+        text: deliveryKey === undefined
+          ? priorText ? `${text}\n\n${priorText}` : text
+          : priorText,
         cardId: discussion.cardId,
       },
     );
@@ -2419,26 +2431,33 @@ const make = Effect.gen(function* () {
       yield* store.putBoard(running);
       yield* publish(running.id, { _tag: "board", board: running });
     }
-    return next;
+    return deliveryKey === undefined
+      ? next
+      : yield* deliver(next, actorOf(threadId), "Evaluator", threadId, text, note, deliveryKey);
   });
 
-  const toEvaluator = Effect.fn("KanbanService.routeEvaluatorSerial")(function* (
+  const toEvaluator = Effect.fn("KanbanService.routeEvaluatorSerial")(function* <E = never>(
     discussion: KanbanDiscussion,
     text: string,
     note = false,
+    deliveryKey?: string,
+    canRoute?: Effect.Effect<boolean, E>,
   ) {
     return yield* serial(
       routing,
       discussion.id,
       Effect.gen(function* () {
         let current = yield* discussionOf(discussion.id);
+        if (canRoute !== undefined && !(yield* canRoute)) {
+          return yield* failWith("conflict", "Card thread question routing changed");
+        }
         if (
           current.evaluatorThreadId !== null &&
           (yield* Ref.get(evaluatorFailures)).get(current.evaluatorThreadId)?.state === "gone"
         ) {
           current = yield* saveDiscussion({ ...current, evaluatorThreadId: null });
         }
-        return yield* routeEvaluator(current, text, note);
+        return yield* routeEvaluator(current, text, note, deliveryKey);
       }),
     );
   });
@@ -4663,6 +4682,85 @@ const make = Effect.gen(function* () {
                 yield* saveCard(next);
                 updateCard(next);
               }
+              const routedQuestionThreads = new Set<ThreadId>();
+              for (const plannedCard of yield* cardsForPlan) {
+                const card = cardsForAfterMutation(plannedCard);
+                if (!card || card.activeThreadId === null) continue;
+                if (card.activeRole !== "work" && card.activeRole !== "review") continue;
+                if (board.pause && !board.pause.keep.includes(card.id)) continue;
+                const threadId = card.activeThreadId;
+                if ((yield* store.threadLink(threadId))?.paused) continue;
+                const view = yield* planView(threadId);
+                if (view?.state !== "needs-input") continue;
+                const requests = yield* threads
+                  .pendingUserInputs(threadId)
+                  .pipe(Effect.catchCause(() => Effect.succeed([])));
+                if (requests.length === 0) continue;
+                const current = yield* store.card(card.id);
+                if (current?.activeThreadId !== threadId || current.activeRole !== card.activeRole)
+                  continue;
+                const events = yield* store.cardEvents(card.id);
+                for (const request of requests) {
+                  // Include the thread in the persisted marker: providers may reuse request ids.
+                  const body = `Asked its own question (request ${request.requestId}); sent to the evaluator\nThread: ${threadId}`;
+                  const routed = events.some(
+                    (event) =>
+                      event.kind === "thread" &&
+                      event.actor._tag === "system" &&
+                      event.actor.component === "dispatcher" &&
+                      event.body === body,
+                  );
+                  if (!routed) {
+                    const text = [
+                      `Card #${card.number}: ${card.title}`,
+                      `Role: ${card.activeRole}`,
+                      `Thread: [${view.title}](t3-thread://v1/${threadId})`,
+                      `Request id: ${request.requestId}`,
+                      ...request.questions.flatMap((question) => [
+                        `${question.header}: ${question.question}`,
+                        ...question.options.map(
+                          (option) => `- ${option.label}: ${option.description}`,
+                        ),
+                      ]),
+                      "This card's thread is waiting on its own question. Answer it with t3_pending_request_respond (threadId, requestId) when it's a call you can make. When it's Abdullah's call, ask him with card_ask and answer the thread with his reply. If the question no longer applies, steer the thread with card_thread.",
+                    ].join("\n\n");
+                    const key = `question:${NodeCrypto.createHash("sha256")
+                      .update(
+                        `${card.id.length}:${card.id}${threadId.length}:${threadId}${request.requestId}`,
+                      )
+                      .digest("hex")}`;
+                    // Unlike a saved-write follow-up, routing must stop on a concurrent pause or unbind.
+                    const sent = yield* Effect.result(
+                      cardDiscussionUnlocked(current.id).pipe(
+                        Effect.flatMap((discussion) => toEvaluator(
+                          discussion,
+                          text,
+                          true,
+                          key,
+                          Effect.gen(function* () {
+                            const latestBoard = yield* boardOf(card.boardId);
+                            const latestCard = yield* store.card(card.id);
+                            return latestCard?.activeThreadId === threadId &&
+                              latestCard.activeRole === card.activeRole &&
+                              (latestBoard.pause === null || latestBoard.pause.keep.includes(card.id)) &&
+                              !(yield* store.threadLink(threadId))?.paused;
+                          }),
+                        )),
+                      ),
+                    );
+                    if (Result.isFailure(sent)) continue;
+                    yield* logEvent(
+                      current,
+                      { _tag: "system", component: "dispatcher" },
+                      "thread",
+                      {
+                        body,
+                      },
+                    );
+                  }
+                  routedQuestionThreads.add(threadId);
+                }
+              }
               // Backstop for a missed turn end, or a worker stuck on its own question.
               for (const plannedCard of yield* cardsForPlan) {
                 // A failed-run helper can release several cards from this snapshot.
@@ -4745,6 +4843,7 @@ const make = Effect.gen(function* () {
                 }
                 views.delete(threadId);
                 if (fresh.value.state === "needs-input") {
+                  if (routedQuestionThreads.has(threadId)) continue;
                   // Its turn end after the interrupt brings the nudge.
                   yield* threads.interrupt(
                     threadId,

@@ -95,6 +95,7 @@ const fakeThreads = (
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      pendingUserInputs: () => Effect.succeed([]),
       view: (threadId) =>
         Effect.sync(() => {
           views.push(threadId);
