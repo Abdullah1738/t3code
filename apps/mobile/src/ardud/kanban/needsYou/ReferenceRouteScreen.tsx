@@ -247,6 +247,7 @@ function Reference() {
           <Part name="Folded detail">
             <View className="rounded-2xl bg-card p-1">
               <Collapse
+                stateKey="reference:review-notes"
                 title="Review notes"
                 text={"Opens in place, for what only some asks need read."}
                 resolveKanbanLink={NO_LINKS}

@@ -408,6 +408,7 @@ export function AskBlocks(props: {
           ) : (
             <View key={index} className="rounded-2xl bg-card p-1">
               <Collapse
+                stateKey={`ask:${props.ask.id}:${index}`}
                 title={block.title}
                 text={block.text}
                 resolveKanbanLink={resolveKanbanLink}
