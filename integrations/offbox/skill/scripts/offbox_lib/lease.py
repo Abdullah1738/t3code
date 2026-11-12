@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 
 from . import api, capacity, ssh_sync
-from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, IDLE_STOP_S, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
-                     file_lock, iso, log, mine, month_key, new_id, now, read_json, say, token_owner)
+from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
+                     file_lock, iso, log, mine, new_id, now, read_json, say, token_owner)
 from .identity import remote_dir_for
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
@@ -1153,12 +1153,22 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         if _bigger(size, want):
             raise ResumeUnresolved(f"resume of {box_id} came up as {want}; retry to resize to {size}; nothing ran")
         return _resumed_row(con, box_id, want, now() - t, prior_state)
-    # Fast path: lease marked running and the ssh master answers -> no API calls at all.
+    # A local master can outlive the remote machine, so verify a round trip before trusting the cached endpoint.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
-        p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-O", "check", box_id], capture_output=True, timeout=10)
-        if p.returncode == 0:
-            ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
-            return dict(row)
+        try:
+            p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-o", "ConnectTimeout=5", box_id, "true"],
+                               capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            reason = "timeout"
+        except OSError:
+            reason = "oserror"
+        else:
+            if p.returncode == 0:
+                ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
+                return dict(row)
+            reason = f"rc={p.returncode}"
+        ssh_sync.close_master(box_id)
+        event(con, box_id, "ssh_master_stale", reason)
     s = api.get(box_id)
     if s is None or s.get("state") in ("error", "cancelled"):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
