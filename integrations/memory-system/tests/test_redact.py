@@ -1,11 +1,14 @@
 """Synthetic-only fixtures; also runnable with unittest on the host."""
 import contextlib
 import importlib
+import gzip
+import zipfile
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +23,7 @@ sys.path.insert(0,str(SRC))
 import build_text_fts
 import redact
 import redact_backups
+import redact_inspect
 import recall_cli
 import redact_guard
 from redact_lock import fence
@@ -352,6 +356,45 @@ class RedactTest(unittest.TestCase):
                     self.assertNotIn(TOKEN.encode(),row[0])
                 self.assertNotIn(TOKEN,' '.join(r[0] for r in con.execute('SELECT content FROM episodic_events')))
 
+    def test_claude_record_tombstones_survive_block_reordering(self):
+        home=self.root/'claude';source=home/'projects/repo/session.jsonl';source.parent.mkdir(parents=True)
+        def record(blocks):
+            return {'uuid':'stable-record','sessionId':SID,'type':'assistant','message':{'role':'assistant','content':blocks}}
+        safe={'type':'text','text':'safe original block'}
+        sensitive={'type':'text','text':TOKEN}
+        with patch.dict(os.environ,{'MEMORY_DB':str(self.db),'HARNESS_SEEDED_MANIFEST':str(self.root/'absent')}):
+            import sync_claude
+            sync_claude=importlib.reload(sync_claude)
+            roots=[{'driver':'claudeAgent','instance':'fixture','root':str(home),'path':str(home),'exists':True}]
+            def sync():
+                worker=sync_claude.ClaudeSync(types.SimpleNamespace(deadline=0),roots=roots)
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):worker.run()
+                finally:worker.mem.close()
+            source.write_text(json.dumps(record([safe,sensitive]))+'\n')
+            sync()
+            with connect(self.db) as con:
+                con.execute("UPDATE episodic_events SET metadata_json=json_remove(metadata_json,'$.uuid') WHERE source='claude'")
+            source.write_text(json.dumps(record([safe,{'type':'text','text':'removed'}]))+'\n')
+            self.assertTrue(redact.run(self.args)['verify'])
+            # UUID identifies the record independently of block positions/types.
+            variants={
+                'unchanged':[safe,sensitive],
+                'prepend-text':[{'type':'text','text':'earlier'},safe,sensitive],
+                'prepend-thinking':[{'type':'thinking','thinking':'earlier reasoning'},safe,sensitive],
+                'prepend-tool':[{'type':'tool_use','id':'safe-call','name':'noop','input':{}},safe,sensitive],
+                'reorder':[sensitive,safe],
+            }
+            unrelated=dict(record([{'type':'text','text':'unrelated record stays'}]),uuid='unrelated-record')
+            for shape,blocks in variants.items():
+                with self.subTest(shape=shape):
+                    source.write_text(json.dumps(record(blocks))+'\n'+json.dumps(unrelated)+'\n')
+                    sync()
+                    with connect(self.db) as con:
+                        self.assertFalse(any(TOKEN in r[0] for r in con.execute('SELECT content FROM episodic_events')))
+                        self.assertFalse(any(TOKEN.encode() in r[0] for r in con.execute('SELECT raw FROM native_capture_raw')))
+                        self.assertEqual(con.execute("SELECT content FROM episodic_events WHERE turn_id='unrelated-record:0'").fetchone()[0],'unrelated record stays')
+
 
 @unittest.skipUnless(shutil.which('restic'),'restic not installed')
 class BackupTest(unittest.TestCase):
@@ -393,6 +436,243 @@ class BackupTest(unittest.TestCase):
                         else:
                             self.assertEqual(redact_backups.dump_hits(repo,snap['id'],node['path'],TOKEN.encode()),0)
                 self.assertEqual((stage/'keep.txt').read_text(),'keep')
+
+    def test_preserve_clean_historical_containers(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir()
+            payload=(json.dumps({'text':'clean transcript'})+'\n').encode()
+            dirty=(json.dumps({'text':TOKEN})+'\n').encode()
+            for name,text in (('clean.db.pre-codex-import','clean value'),('dirty.sqlite',TOKEN)):
+                with connect(files/name) as con:
+                    con.execute('CREATE TABLE raw_sessions(id TEXT PRIMARY KEY,row_json_zlib BLOB)')
+                    con.execute('INSERT INTO raw_sessions VALUES(?,?)',('fixture',zlib.compress(json.dumps({'text':text}).encode())))
+            for label,data in (('clean',payload),('dirty',dirty)):
+                (files/(label+'.jsonl.gz')).write_bytes(gzip.compress(data))
+                with zipfile.ZipFile(files/(label+'.zip'),'w',compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr('transcript.jsonl',data)
+                if shutil.which('zstd'):
+                    (files/(label+'.jsonl.zst')).write_bytes(subprocess.run(['zstd','-q','-c'],input=data,capture_output=True,check=True).stdout)
+            clean={str(p):p.read_bytes() for p in files.iterdir() if p.name.startswith('clean')}
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(files))
+            # Explicit path hints are discovery hints, never proof of a match.
+            result=redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(clean),dry_run=False)
+            self.assertEqual(result['remainingAfter'],0)
+            snapshots=redact_backups.restic(repo,'snapshots','--json',json_output=True)
+            self.assertEqual(len(snapshots),1)
+            actual={n['path'] for n in redact_backups.nodes(repo,snapshots[0]['id'])}
+            self.assertEqual(actual,set(clean))
+            for path,data in clean.items():
+                self.assertEqual(redact_backups.restic(repo,'dump',snapshots[0]['id'],path),data)
+
+    def test_inspection_budget_failure_preserves_snapshots_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';db=root/'large.db'
+            with connect(db) as con:
+                con.execute('CREATE TABLE sample(value TEXT)');con.execute('INSERT INTO sample VALUES(?)',('clean',))
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(db))
+            before=redact_backups.restic(repo,'snapshots','--json',json_output=True)
+            with patch.object(redact_inspect,'MAX_IMAGE_BYTES',1024),self.assertRaises(redact.RedactionError):
+                redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+            self.assertEqual(redact_backups.restic(repo,'snapshots','--json',json_output=True),before)
+            self.assertEqual(redact_backups.restic(repo,'list','locks').splitlines(),[])
+
+    def test_deleted_sqlite_payload_and_archive_metadata_are_matches(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir()
+            db=files/'deleted.db'
+            with connect(db) as con:
+                con.execute('PRAGMA secure_delete=OFF')
+                con.execute('CREATE TABLE payload(data_zlib BLOB)')
+                con.execute('INSERT INTO payload VALUES(?)',(zlib.compress(json.dumps({'text':TOKEN}).encode()),))
+                con.execute('DELETE FROM payload')
+            buffer=io.BytesIO()
+            with gzip.GzipFile(filename=TOKEN,fileobj=buffer,mode='wb') as encoded:encoded.write(b'clean body')
+            (files/'name.gz').write_bytes(buffer.getvalue())
+            base=gzip.compress(b'clean body')
+            escaped=''.join('\\u%04x'%ord(c) for c in TOKEN)
+            for label,flag,value in (('comment',16,TOKEN.encode()),('extra',4,TOKEN.encode()),
+                                     ('encoded-name',8,('padding'*2000+json.dumps({'text':escaped})).encode())):
+                # JSON itself contains a serialized JSON value in this variant.
+                if label=='encoded-name':value=('padding'*2000+'{"text":"'+escaped+'"}').encode()
+                metadata=(len(value).to_bytes(2,'little')+value) if flag==4 else value+b'\0'
+                (files/(label+'.gz')).write_bytes(base[:3]+bytes([flag])+base[4:10]+metadata+base[10:])
+            with zipfile.ZipFile(files/'comment.zip','w') as archive:
+                archive.writestr('clean.txt','clean body');archive.comment=TOKEN.encode()
+            with zipfile.ZipFile(files/'member-comment.zip','w') as archive:
+                member=zipfile.ZipInfo('clean.txt');member.comment=TOKEN.encode();archive.writestr(member,'clean body')
+            for path in files.iterdir():
+                with self.subTest(path=path.name),path.open('rb') as source:
+                    self.assertGreater(redact_inspect.inspect_stream(source,TOKEN.encode())[0],0)
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(files))
+            result=redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+            self.assertEqual(result['remainingAfter'],0)
+            for snap in redact_backups.restic(repo,'snapshots','--json',json_output=True):
+                self.assertFalse(redact_backups.nodes(repo,snap['id']))
+
+    def test_other_fts_names_are_inspected_semantically(self):
+        with connect(':memory:') as con:
+            con.execute("CREATE VIRTUAL TABLE custom_fts USING fts5(content,content='',contentless_delete=1)")
+            con.execute('INSERT INTO custom_fts(content) VALUES(?)',(TOKEN[:-1]+'4 '+TOKEN,))
+            con.commit();con.execute("INSERT INTO custom_fts(custom_fts) VALUES('optimize')");con.commit();con.execute('VACUUM')
+            image=con.serialize()
+        self.assertNotIn(TOKEN.encode(),image)
+        self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(image),TOKEN.encode())[0],0)
+
+    def test_nested_sidecars_and_unknown_free_bytes_fail_closed(self):
+        for form in ('zip-name','zip-gzip-header','zip-zstd-header'):
+            if form=='zip-zstd-header' and not shutil.which('zstd'):continue
+            buffer=io.BytesIO()
+            wal=b'\x37\x7f\x06\x82'+b'\0'*28+zlib.compress(TOKEN.encode())
+            with zipfile.ZipFile(buffer,'w') as archive:
+                if form=='zip-name':archive.writestr('state.db-wal',wal)
+                elif form=='zip-gzip-header':archive.writestr('opaque.gz',gzip.compress(wal))
+                else:archive.writestr('opaque.zst',subprocess.run(['zstd','-q','-c'],input=wal,capture_output=True,check=True).stdout)
+            with self.subTest(form=form),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(buffer.getvalue()),TOKEN.encode())
+        with tempfile.TemporaryDirectory() as tmp:
+            db=Path(tmp)/'unknown.db'
+            with connect(db) as con:
+                con.execute('PRAGMA secure_delete=OFF');con.execute('CREATE TABLE payload(value BLOB)')
+                con.execute('INSERT INTO payload VALUES(?)',(b'unclassified leftover bytes',));con.execute('DELETE FROM payload')
+            with db.open('rb') as source,self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(source,TOKEN.encode())
+
+    def test_trailing_sqlite_and_later_compression_frames_fail_closed(self):
+        with connect(':memory:') as con:
+            con.execute('CREATE TABLE sample(value TEXT)');con.execute("INSERT INTO sample VALUES('clean')");con.commit()
+            image=con.serialize()
+        for suffix in (b'x',zlib.compress(TOKEN.encode()).ljust(4096,b'\0')):
+            with self.subTest(kind='sqlite',suffix_bytes=len(suffix)),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(image+suffix),TOKEN.encode())
+        encoded=''.join('\\u%04x'%ord(c) for c in TOKEN)
+        later=io.BytesIO()
+        with gzip.GzipFile(filename='padding'*20000+'{"key":"'+encoded+'"}',fileobj=later,mode='wb') as zipped:zipped.write(b'clean')
+        gzip_cases=(gzip.compress(b'clean')+later.getvalue(),gzip.compress(b'clean')+b'\0')
+        for data in gzip_cases:
+            with self.subTest(kind='gzip'),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode())
+        if shutil.which('zstd'):
+            normal=subprocess.run(['zstd','-q','-c'],input=b'clean',capture_output=True,check=True).stdout
+            payload=zlib.compress(TOKEN.encode())
+            skippable=b'\x50\x2a\x4d\x18'+len(payload).to_bytes(4,'little')+payload
+            for tail in (skippable,normal):
+                with self.subTest(kind='zstd'),self.assertRaises(redact.RedactionError):
+                    redact_inspect.inspect_stream(io.BytesIO(normal+tail),TOKEN.encode())
+
+    def test_fresh_stage_sidecars_never_verify_clean(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';stage=root/'replica';stage.mkdir()
+            (stage/'clean.txt').write_text('clean')
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(stage))
+            args=types.SimpleNamespace(root=str(root),repository=str(repo),stage=str(stage),needle_file=str(root/'needle'),paths_from=None,dry_run=False,yes=True,local_only=True)
+            Path(args.needle_file).write_text(TOKEN);Path(args.needle_file).chmod(0o600)
+            original=redact_backups.restic
+            def racing_backup(repository,*command,**kwargs):
+                if command and command[0]=='backup':
+                    (stage/'orphan.db-journal').write_bytes(b'\0'*32+zlib.compress(TOKEN.encode()))
+                return original(repository,*command,**kwargs)
+            with patch('redact_backups.restic',side_effect=racing_backup),self.assertRaises(redact.RedactionError):
+                redact_backups.run(args)
+            snapshots=original(repo,'snapshots','--json',json_output=True)
+            self.assertTrue(any(n['path'].endswith('orphan.db-journal') for snap in snapshots for n in redact_backups.nodes(repo,snap['id'])))
+            with self.assertRaises(redact.RedactionError):
+                redact_backups.stage_sweep(stage,TOKEN.encode(),False)
+            self.assertEqual(original(repo,'list','locks').splitlines(),[])
+
+    def test_concatenated_zips_and_sidecar_case_forms_fail_closed(self):
+        def archive(value):
+            buffer=io.BytesIO()
+            with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as encoded:encoded.writestr('entry.txt',value)
+            return buffer.getvalue()
+        clean,dirty=archive('clean'),archive(TOKEN)
+        for data in (dirty+clean,clean+dirty,clean+b'prefix'+dirty,clean+b'trailer'):
+            with self.subTest(shape='concatenation'),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode())
+        for name in ('state.db-journal','state.db-JOURNAL','state.db-WAL','dir/State.Db-Journal/'):
+            buffer=io.BytesIO()
+            with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as encoded:
+                encoded.writestr(name,b'\0'*32+zlib.compress(TOKEN.encode()))
+            with self.subTest(name=name),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(buffer.getvalue()),TOKEN.encode())
+        # Descriptors from a streaming ZIP writer are allowed when fully covered.
+        class Nonseekable(io.BytesIO):
+            def seek(self,*args):raise io.UnsupportedOperation()
+        buffer=Nonseekable()
+        with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as encoded:
+            encoded.writestr('clean.txt','clean')
+        self.assertEqual(redact_inspect.inspect_stream(io.BytesIO(buffer.getvalue()),TOKEN.encode()),(0,True))
+
+    def test_zip_actual_payload_and_separate_extra_fields(self):
+        def archive(value,*,name='entry.txt',declared=None,tail=b'',local=b'',central=b''):
+            name=name.encode();declared=value if declared is None else declared
+            encoder=zlib.compressobj(wbits=-15);payload=encoder.compress(value)+encoder.flush()+tail
+            crc=zlib.crc32(declared);size=len(declared)
+            header=struct.pack('<4s5H3I2H',b'PK\x03\x04',20,0,8,0,0,crc,len(payload),size,len(name),len(local))
+            body=header+name+local+payload
+            directory=struct.pack('<4s6H3I5H2I',b'PK\x01\x02',20,20,0,8,0,0,crc,len(payload),size,len(name),len(central),0,0,0,0,0)+name+central
+            return body+directory+struct.pack('<4s4H2IH',b'PK\x05\x06',0,0,1,1,len(directory),len(body),0)
+        invalid={
+            'truncated-output':archive(b'clean-prefix '+TOKEN.encode(),declared=b'clean-prefix '),
+            'empty-directory-tail':archive(b'',name='empty/',tail=zlib.compress(TOKEN.encode())),
+            'directory-hidden-output':archive(TOKEN.encode(),name='empty/',declared=b''),
+            'malformed-local-extra':archive(b'clean',local=b'{"value":"'+TOKEN.encode()+b'"}'),
+        }
+        escaped=''.join('\\u%04x'%ord(c) for c in TOKEN)
+        metadata={}
+        for location in ('local','central','both'):
+            for representation,value in (('literal',TOKEN.encode()),('escaped',('{"value":"'+escaped+'"}').encode()),
+                                         ('nested',json.dumps(json.dumps({'value':TOKEN})).encode())):
+                for quoted,name in ((False,'entry.txt'),(True,'"entry.txt')):
+                    extra=b'\xfe\xca'+len(value).to_bytes(2,'little')+value
+                    metadata[f'{location}-{representation}-{quoted}.zip']=archive(b'clean',name=name,
+                        local=extra if location in ('local','both') else b'',central=extra if location in ('central','both') else b'')
+        for shape,data in invalid.items():
+            with self.subTest(shape=shape),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode())
+        for shape,data in metadata.items():
+            with self.subTest(shape=shape):
+                self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode())[0],0)
+        clean=archive(b'',name='empty/')
+        self.assertEqual(redact_inspect.inspect_stream(io.BytesIO(clean),TOKEN.encode()),(0,True))
+        for field in (0x7075,0x6375):
+            for location in ('local','central'):
+                # CRC32(entry-75.txt) contains a quote byte, independent of JSON.
+                payload=b'\x01'+zlib.crc32(b'entry-75.txt').to_bytes(4,'little')+('{"value":"'+escaped+'"}').encode()
+                extra=field.to_bytes(2,'little')+len(payload).to_bytes(2,'little')+payload
+                shape=f'unicode-{field}-{location}.zip'
+                metadata[shape]=archive(b'clean',name='entry-75.txt',**{location:extra})
+                with self.subTest(shape=shape):
+                    self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(metadata[shape]),TOKEN.encode())[0],0)
+        for prefix in (b'"',b'\0"\xff',b'"\\"',b'\x01\xa6\x22\x21\x26'):
+            payload=prefix+('{"value":"'+escaped+'"}').encode()
+            extra=b'\xfe\xca'+len(payload).to_bytes(2,'little')+payload
+            data=archive(b'clean',local=extra)
+            with self.subTest(binary_prefix=prefix.hex()):
+                self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode())[0],0)
+        for size in (8192,1048576,1048699,2097275):
+            data=archive(b'A'*size)
+            with self.subTest(clean_size=size):
+                self.assertEqual(redact_inspect.inspect_stream(io.BytesIO(data),TOKEN.encode()),(0,True))
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';files=root/'files';files.mkdir()
+            redact_backups.restic(repo,'init')
+            for shape,data in invalid.items():
+                path=files/(shape+'.zip');path.write_bytes(data)
+                redact_backups.restic(repo,'backup',str(path))
+                before=redact_backups.restic(repo,'snapshots','--json',json_output=True)
+                with self.subTest(snapshot=shape),self.assertRaises(redact.RedactionError):
+                    redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+                self.assertEqual(redact_backups.restic(repo,'snapshots','--json',json_output=True),before)
+                self.assertEqual(redact_backups.restic(repo,'list','locks').splitlines(),[])
+                redact_backups.restic(repo,'forget',*[s['id'] for s in before])
+            for name,data in metadata.items():(files/name).write_bytes(data)
+            path=files/'clean.zip';path.write_bytes(clean)
+            redact_backups.restic(repo,'backup',*[str(files/name) for name in metadata],str(path))
+            result=redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+            self.assertEqual(result['remainingAfter'],0)
+            for snap in redact_backups.restic(repo,'snapshots','--json',json_output=True):
+                self.assertEqual([n['path'] for n in redact_backups.nodes(repo,snap['id'])],[str(path)])
+                self.assertEqual(redact_backups.restic(repo,'dump',snap['id'],str(path)),clean)
 
     def test_container_inspection_releases_restic_read_lock(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):

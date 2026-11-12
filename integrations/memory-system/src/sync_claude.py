@@ -185,7 +185,7 @@ def project(rec, path, line_no):
     key = session_key(sid, agent)
     ts = parse_ts(rec.get("timestamp"))
     base = {"file": os.path.basename(path), "line": line_no, "cwd": rec.get("cwd"), "parent_session": sid,
-            "agent_id": agent, "sidechain": bool(rec.get("isSidechain"))}
+            "agent_id": agent, "sidechain": bool(rec.get("isSidechain")), "uuid": uuid}
     model = msg.get("model") if isinstance(msg.get("model"), str) else None
     rows = []
     for i, b in enumerate(_blocks(msg)):

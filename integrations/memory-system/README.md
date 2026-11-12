@@ -313,11 +313,23 @@ needle sweep; source cleanup must precede resumed capture and backups.
 
 `redact-backups` scrubs the replica stage, enumerates every restic snapshot,
 rewrites affected file paths with `--forget`, prunes with `--max-unused 0`, and
-rebuilds the transcript manifests and backs up the sanitized stage. Historical SQLite/WAL and compressed transcript
-containers are identified by headers as well as known sidecar names, and excluded
-conservatively: a byte search cannot prove absence
-inside compressed cells. This removes **whole historical files**, not just one
-item; inspect the dry-run snapshot counts. Unaffected plain files remain.
+rebuilds the transcript manifests and backs up the sanitized stage. Historical SQLite and compressed transcript
+containers are inspected semantically: SQLite rows (including zlib payloads and
+FTS), recoverable deleted payloads, decoded zstd/gzip streams, ZIP members,
+and archive metadata. Only files with matches are
+excluded; clean historical files remain byte-for-byte intact. Path hints never
+count as evidence of a match. Removal still affects whole matched historical
+files, followed by a sanitized stage backup.
+
+Inspection stays diskless. Concatenated compression frames, trailing data and
+unclassified SQLite pages are rejected rather than skipped. Seekable SQLite/ZIP images have a 128 MiB RAM budget;
+exceeding it, finding uncertain SQLite free/reserved space or unsupported virtual tables, or encountering a nonempty
+transactional WAL/journal (including inside an archive) stops before any
+snapshot rewrite or prune in that repository. It does not delete an uninspected container or report
+a successful purge. Large production SQLite snapshots therefore require a
+separately approved inspection strategy. The replica stage or earlier repositories may already have
+been sanitized when historical inspection fails. Dirty gzip/ZIP stage copies
+must be cleaned at their source; zstd transcript rewriting is supported.
 The cold archive is also a restic repo. If its local copy was finalized away,
 the command downloads and verifies the encrypted Dropbox copy to temporary
 storage, rewrites/prunes it, then mirrors both repos with remote deletion.
@@ -342,5 +354,5 @@ For fixtures, both commands accept `--root`; backup also accepts `--repository`,
 `--stage`, `--cold-repository` and Dropbox destination overrides. `--local-only`
 explicitly limits backup verification to the local replica/repo and skips cold
 archive/Dropbox. Never use that flag to claim a production incident is removed
-from every store. SQLite 3.47+, restic with `rewrite`, and zstd for compressed
+from every store. Python 3.11+ with SQLite 3.47+, restic with `rewrite`, and zstd for compressed
 transcripts are required. Fixture tests: `python3 -m pytest tests/test_redact.py`.

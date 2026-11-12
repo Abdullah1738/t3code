@@ -13,6 +13,7 @@ import urllib.request
 
 from redact import RedactionError, read_needle, redact_db, redact_file, contains, atomic_write
 from redact_lock import fence
+from redact_inspect import inspect_stream
 
 
 def restic_env():
@@ -36,28 +37,23 @@ def nodes(repo, snapshot):
             if (r := json.loads(line)).get('type') == 'file']
 
 
+def snapshot_members(repo,snapshot):
+    members=nodes(repo,snapshot)
+    if any(n['path'].lower().endswith(('-wal','-journal')) and n.get('size',0)>0 for n in members):
+        raise RedactionError('transactional sidecar needs seekable database inspection')
+    return members
+
+
 def inspect_dump(repo, snapshot, path, needle):
     proc = subprocess.Popen(['restic','--no-cache','-r',str(repo),'dump',snapshot,path],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=restic_env())
-    hits, container = 0, False
     try:
-        header = proc.stdout.read(16)
-        container = header == b'SQLite format 3\0' or header.startswith((b'\x28\xb5\x2f\xfd',b'\x1f\x8b',b'PK\x03\x04'))
-        if container:
-            # Drain without materializing the file. Killing dump after its header
-            # bypasses restic's deferred unlock and can strand a repository lock.
-            while proc.stdout.read(1 << 20):
-                pass
-        else:
-            line = header + proc.stdout.readline()
-            while line:
-                hits += int(contains(line,needle))
-                line = proc.stdout.readline()
+        result = inspect_stream(proc.stdout,needle)
         if proc.wait():
             raise RedactionError('restic dump failed')
-        return hits, container
+        return result
     finally:
-        # Parsing errors must also let the read-only child release its lock.
+        # A parser/budget error must also release restic's read lock normally.
         while proc.stdout.read(1 << 20):
             pass
         proc.stdout.close()
@@ -65,23 +61,29 @@ def inspect_dump(repo, snapshot, path, needle):
 
 
 def dump_hits(repo, snapshot, path, needle):
-    hits, container = inspect_dump(repo,snapshot,path,needle)
-    if container:
-        raise RedactionError('compressed container needs semantic verification')
-    return hits
+    return inspect_dump(repo,snapshot,path,needle)[0]
 
 
 def stage_sweep(stage, needle, dry_run):
     stores = {}
     for path in sorted(Path(stage).rglob('*')):
-        if path.is_symlink() or not path.is_file() or path.name.endswith(('-wal','-shm','-journal')):
+        if path.is_symlink() or not path.is_file():
             continue
+        if path.name.lower().endswith(('-wal','-journal')):
+            if path.stat().st_size:raise RedactionError('stage transactional sidecar needs database inspection')
+            continue
+        if path.name.lower().endswith('-shm'):continue
         with path.open('rb') as f:
             sqlite = f.read(16) == b'SQLite format 3\0'
         if sqlite:
             result, _ = redact_db(path,needle,'[redacted backup]',dry_run=dry_run)
         else:
-            result = redact_file(path,needle,'[redacted backup]',dry_run=dry_run)
+            with path.open('rb') as stream:
+                hits, container = inspect_stream(stream,needle)
+            if container and path.suffix != '.zst':
+                result = {'matchedBefore':hits,'replaced':0,'remainingAfter':hits}
+            else:
+                result = redact_file(path,needle,'[redacted backup]',dry_run=dry_run)
         stores[str(path)] = result
     return stores
 
@@ -116,16 +118,13 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
     for snap in snapshots:
         sid = snap['id']
         exclusions = set()
-        for node in nodes(repo, sid):
+        members = snapshot_members(repo,sid)
+        for node in members:
             path = node['path']
             if contains(path,needle):
                 raise RedactionError('snapshot path intersects redaction selector')
-            # SQLite may contain zlib-compressed payloads; zst may hold compressed
-            # transcripts. Exclude these historical files conservatively rather
-            # than declaring a byte grep of the container to be proof of absence.
-            n, header_container = inspect_dump(repo,sid,path,needle)
-            container = header_container or path.endswith(('-wal','-journal','-shm'))
-            if container or path in paths or n:
+            n, _ = inspect_dump(repo,sid,path,needle)
+            if n:
                 exclusions.add(path)
         if exclusions:
             affected.append((sid, sorted(exclusions)))
@@ -144,15 +143,12 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
             restic(repo,'backup','--host','ardud-mac','--tag','memory-live',str(stage))
     remaining = 0
     for snap in restic(repo,'snapshots','--json',json_output=True):
-        for node in nodes(repo,snap['id']):
+        for node in snapshot_members(repo,snap['id']):
             path = node['path']
             if contains(path,needle):
                 raise RedactionError('snapshot path intersects redaction selector')
-            n, container = inspect_dump(repo,snap['id'],path,needle)
-            if stage and path.startswith(str(Path(stage).resolve())+'/') and container:
-                # The replacement containers were semantically swept in stage.
-                continue
-            remaining += int(container or n>0 or path.endswith(('-wal','-journal','-shm')))
+            n, _ = inspect_dump(repo,snap['id'],path,needle)
+            remaining += int(n>0)
     after_packs = {str(p.relative_to(repo)) for p in (Path(repo)/'data').rglob('*') if p.is_file()}
     return {'matchedBefore':len(affected),'replaced':0 if dry_run else len(affected),
             'remainingAfter':remaining,'packsRemoved':len(before_packs-after_packs)}
