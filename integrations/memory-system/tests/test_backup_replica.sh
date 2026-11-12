@@ -94,6 +94,21 @@ else
 fi
 rm -rf "$T"
 
+# A failed kill must be distinguishable from an ordinary timeout, and cannot retry.
+setup fake
+cat > "$R/src/run_limited.py" <<'PYCODE'
+import sys
+print("run_limited: survivors after SIGKILL: 999999 fixture", file=sys.stderr)
+raise SystemExit(125)
+PYCODE
+run
+[ "$(st)" = "replica False" ] && grep -q 'replica memory.db: child survived kill:.*survivors after SIGKILL' "$R/logs/backup_last.json" \
+  && pass "surviving child fails replica with diagnostic" || fail "survivor status: $(cat "$R/logs/backup_last.json")"
+grep -q 'replica memory.db: child survived kill:' "$R"/logs/backup-*.log \
+  && pass "surviving child is logged" || fail "survivor diagnostic missing from log"
+[ ! -e "$R/logs/backup.lock" ] && pass "surviving child releases backup lock" || fail "survivor left lock"
+rm -rf "$T"
+
 # 2. SQLite backup stand-in -> replica stage passes (then fake repo fails).
 if [ -x "$REAL_RSYNC" ]; then
   setup real
