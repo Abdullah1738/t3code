@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import api, capacity, identity, lease, node_tools, node_version, pool, ssh_sync
-from . import prune, prepare
+from . import containers, prune, prepare
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
                      offsets_path, person, read_json, say, silence)
@@ -254,6 +254,18 @@ def image_wait_seconds() -> int:
     """The client sets the remote bound; it is not implicitly forwarded as command environment."""
     value = os.environ.get("OFFBOX_IMAGE_WAIT_SECONDS") or "180"
     return int(value) if re.fullmatch(r"[1-9][0-9]{0,3}", value) else 180
+
+
+def clickhouse_suite_warning(repo_key: str, size: str, cmd: str) -> str | None:
+    if repo_key != 'crpko-devops' or size not in ('large', 'xlarge'):
+        return None
+    words = [word.rsplit('/', 1)[-1] for word in re.findall(r'[A-Za-z0-9_./:+-]+', cmd)]
+    runner = any(re.fullmatch(r'python(?:[23](?:\.\d+)?)?|pytest|npm|pnpm|npx|node', word) for word in words)
+    suite = any(re.fullmatch(r'unittest|pytest|test(?:[-_:].*|\.py)?|run-static-test-shard\.mjs', word) for word in words)
+    if runner and suite:
+        return ('ClickHouse 24.8 alert fixtures can exhaust threads on large/xlarge boxes; '
+                'use fixture max_threads=8 (raising PID limits alone does not fix it; #915)')
+    return None
 
 
 GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
@@ -773,7 +785,8 @@ def exit_recording_command(script: str, run_id: str) -> str:
     persist = '\n'.join([
         'mkdir -p "$HOME/.offbox/exit" || exit 1',
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
-        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" \\) -mtime +2 -delete',
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
+        '-o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -1018,6 +1031,10 @@ def containers_seen(box_id: str, run_id: str, timeout: float = 10) -> bool:
 def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
+    started = time.monotonic()
+    if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
+        containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
+    timeout = max(0, timeout - (time.monotonic() - started))
     if timeout > 0 and run["docker"] and run["box_id"] and status in ("done", "failed") and not containers_seen(
             run["box_id"], run["run_id"], timeout=min(10, timeout)):
         con.execute("UPDATE runs SET docker=0 WHERE run_id=?", (run["run_id"],))
@@ -1096,7 +1113,8 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
-                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None) -> str:
+                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
+                  preserve_containers: str = 'private lease') -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
@@ -1112,6 +1130,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               WATCH_REPAIR,
               (f'OFFBOX_IMAGE_WAIT_SECONDS={image_wait}\n{IMAGE_WAIT}\nunset OFFBOX_IMAGE_WAIT_SECONDS'
                if wait_images else ':'),
+              containers.script(run_id, BOUNDED_PROCESS, preserve=preserve_containers),
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
               GO_REPAIR,
@@ -1246,9 +1265,15 @@ class Runner:
         except Exception:
             node_block = ""
         new_checkout_hint(row, self.root)
+        warning = clickhouse_suite_warning(me['repo_key'], row['size'], cmd_text)
+        if warning:
+            say(warning)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"], repo_root=self.root)
+                               repo_key=me["repo_key"], repo_root=self.root,
+                               preserve_containers=containers.preserve_reason(con, row))
+        con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', ('containers_expected:' + self.run_id, '1'))
+        con.commit()
         from . import start_check
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
