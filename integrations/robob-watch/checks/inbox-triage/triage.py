@@ -29,6 +29,13 @@ import sys
 import time
 import urllib.request
 
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact as redact_credentials, redact_fields
+
 HOME = Path.home()
 LIVE = HOME / '.local/share/robob-watch/watchers/inbox-triage'
 DATA = HOME / 'Documents/assistant/inbox-triage'
@@ -104,6 +111,7 @@ def stamp(ts=None):
 
 def clean(text, limit=300):
     text = re.sub(r'[\u200b-\u200f\u2060\ufeff\u034f\u00ad]', '', str(text or ''))
+    text = redact_credentials(text)
     text = re.sub(r'https?://[^\s\]<>]+', '[link]', text)
     text = re.sub(r'\s+', ' ', str(text or '')).strip()
     # Redact likely OTPs before persistence/classification, even if still fresh.
@@ -115,6 +123,7 @@ def clean(text, limit=300):
 def clean_lines(text, limit):
     # Like clean(), but keeps line breaks so the classifier sees one rule per line.
     text = re.sub(r'[\u200b-\u200f\u2060\ufeff\u034f\u00ad]', '', str(text or ''))
+    text = redact_credentials(text)
     text = re.sub(r'https?://[^\s\]<>]+', '[link]', text)
     lines = [re.sub(r'[ \t\r\f\v]+', ' ', line).strip() for line in text.splitlines()]
     text = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
@@ -125,6 +134,7 @@ def clean_lines(text, limit):
 
 
 def redact_item(item, context=''):
+    item.update(redact_fields(item))
     fields = ('sender', 'subject', 'preview')
     combined = ' '.join([context, *(str(item.get(k, '')) for k in fields), *item.get('attachments', [])])
     if OTP.search(combined):
@@ -1418,7 +1428,7 @@ def run(args):
         if replay is not None:
             log_run(wd, {'replay': True, 'cost_usd': 0})
             if replay:
-                print(replay, flush=True)
+                print(redact_credentials(replay), flush=True)
             return 0
         # Collection can take ~30 s by itself, so after a slow replay that cleared its batch
         # the next run collects instead of this one being killed half way.
@@ -1562,7 +1572,7 @@ def run(args):
                  **({'held_for_receipt': len(held)} if held else {}), **health, **urgent,
                  'ms': round((time.time() - now) * 1000), **meta})
     if event:
-        print(event, flush=True)
+        print(redact_credentials(event), flush=True)
     elif errors:
         print('inbox-triage source failure: ' + json.dumps(errors), file=sys.stderr)
         return 1

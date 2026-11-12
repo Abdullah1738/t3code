@@ -42,6 +42,13 @@ try:
 except Exception:  # pragma: no cover
     DUBAI = dt.timezone(dt.timedelta(hours=4))
 
+# robob-watch test copies the watcher into scratch, while helpers stay installed.
+REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
+if not (REDACT_HELPERS / 'redact.py').is_file():
+    REDACT_HELPERS = Path.home() / '.local/share/robob-watch/helpers'
+sys.path.insert(0, str(REDACT_HELPERS))
+from redact import redact as redact_credentials
+
 HOME = Path.home()
 LIVE = HOME / '.local/share/robob-watch/watchers/assist-offers'
 DATA = Path(os.environ.get('ASSIST_OFFERS_DATA', HOME / 'Documents/assistant/assist-offers'))
@@ -132,6 +139,7 @@ def dubai(ts):
 
 def clean(text, limit=400):
     text = re.sub(r'[\u200b-\u200f\u2060\ufeff\u034f\u00ad\ufffc]', '', str(text or ''))
+    text = redact_credentials(text)
     text = re.sub(r'https?://[^\s\]<>]+', '[link]', text)
     text = re.sub(r'\s+', ' ', text).strip()
     if OTP.search(text):
@@ -922,7 +930,7 @@ def run(args):
         replay = replay_outbox(state, wd)
         if replay:
             atomic(wd / 'state-offers.json', state)
-            print(replay, flush=True)
+            print(redact_credentials(replay), flush=True)
             return 0
         last = state.get('last_analysis_at', 0)
         due = in_day_window(now) and (args.force or now - last >= CADENCE_S)
@@ -1038,7 +1046,7 @@ def run(args):
                  'rejected': len(rejected), 'source_errors': errors, 'classifier_error': classifier_error,
                  'ms': round((time.time() - t0) * 1000), 'stage_s': STAGES, **meta})
     if event:
-        print(event, flush=True)
+        print(redact_credentials(event), flush=True)
     return 0
 
 

@@ -5,6 +5,8 @@
 # Prints subject/from/date of messages matching the query that were not seen on earlier runs.
 # First run records current matches as baseline. Uses himalaya (agent-mail skill); never marks mail read.
 set -u
+setopt pipefail
+REDACTOR="${0:A:h}/redact.py"
 acct=${1:?usage: email-new-message ACCOUNT QUERY [MAILBOX]}; query=${2:?query required}; mbox=${3:-Inbox}
 dir=${WATCH_DIR:-.}
 key=$(print -rn -- "$acct|$mbox|$query" | shasum -a 256 | cut -c1-16)
@@ -20,6 +22,8 @@ done
 (( ok )) || { echo "himalaya search failed" >&2; exit 1; }
 rows=$(print -r -- "$json" | /usr/bin/python3 -c '
 import json,sys
+sys.path.insert(0, sys.argv[1])
+from redact import redact
 d=json.load(sys.stdin)
 if isinstance(d,dict) and "error" in d: sys.exit(1)
 for e in (d.get("envelopes",[]) if isinstance(d,dict) else d):
@@ -27,13 +31,13 @@ for e in (d.get("envelopes",[]) if isinstance(d,dict) else d):
     f=f[0] if isinstance(f,list) and f else f
     who=(f.get("name") or f.get("email") or f.get("addr") or "") if isinstance(f,dict) else str(f)
     mid=e.get("message-id") or e.get("message_id") or e.get("id")
-    print("\t".join([str(mid), str(e.get("date") or ""), str(who or ""), (e.get("subject") or "").replace("\t"," ").replace("\n"," ")]))
-') || { echo "could not parse himalaya output" >&2; exit 1; }
+    print("\t".join([str(mid), str(e.get("date") or ""), redact(str(who or "")), redact(e.get("subject") or "").replace("\t"," ").replace("\n"," ")]))
+' "${0:A:h}") || { echo "could not parse himalaya output" >&2; exit 1; }
 setopt null_glob; touch $state
 if [[ ! -s $state && ! -f $state.init ]]; then print -r -- "$rows" | cut -f1 > $state; touch $state.init; exit 0; fi
 new=$(print -r -- "$rows" | while IFS=$'\t' read -r mid date who subj; do
   [[ -z $mid ]] && continue
   grep -qxF -- "$mid" $state || { print -r -- "$mid" >> $state; echo "$date | $who | $subj"; }
 done)
-[[ -n $new ]] && { echo "New email in $acct/$mbox matching \"$query\":"; print -r -- "$new"; }
+[[ -n $new ]] && { { echo "New email in $acct/$mbox matching \"$query\":"; print -r -- "$new"; } | /usr/bin/python3 "$REDACTOR" || exit 1; }
 exit 0

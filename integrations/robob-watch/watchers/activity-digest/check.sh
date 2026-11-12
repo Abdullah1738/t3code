@@ -6,6 +6,9 @@
 # $WATCH_DIR/marker holds the number of log lines already reported; $WATCH_DIR/last_fire the epoch of
 # the last fire. 2026-10-15: replaced a 40-line dump that dropped 30+ items on busy days (72/70 entries).
 set -u
+setopt pipefail
+REDACTOR="${0:A:h:h:h}/helpers/redact.py"
+[[ -f $REDACTOR ]] || REDACTOR="$HOME/.local/share/robob-watch/helpers/redact.py"
 LOG="${ACTIVITY_LOG:-$HOME/Documents/assistant/activity-log.md}"
 MARKER="$WATCH_DIR/marker"
 LAST_FIRE="$WATCH_DIR/last_fire"
@@ -59,7 +62,7 @@ full="$DIGESTS/$(TZ=Asia/Dubai date -r "$now" +%Y-%m-%d-%H%M).md"
   print -r -- "# Activity digest: ${#entries} unreported entries (log lines $((seen + 1))-$total of $LOG)"
   print -r -- ""
   print -rl -- "${entries[@]}"
-} > "$full"
+} | /usr/bin/python3 "$REDACTOR" > "$full" || exit 1
 summary=$(print -rl -- "${entries[@]}" | /usr/bin/python3 "${0:A:h}/summarize.py" "$full") || { print -r -- "digest summary failed" >&2; exit 1; }
 [[ -n $summary ]] || { print -r -- "digest summary empty" >&2; exit 1; }
 
