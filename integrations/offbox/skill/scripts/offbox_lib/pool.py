@@ -35,7 +35,7 @@ def wait_seconds() -> int:
 def queue_state(con, key, run_id=None):
     """(busy boxes, pool cap, other waiting callers, held idle boxes). Waiters are approximate: a
     'starting' run with no box yet whose checkout already maps to this pool."""
-    cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
+    cap = capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
     busy = con.execute("""SELECT COUNT(DISTINCT r.box_id) FROM runs r JOIN pool_members p USING(box_id)
         WHERE p.pool_key=? AND r.status IN ('starting','running')""", (key,)).fetchone()[0]
     waiting = con.execute("""SELECT COUNT(*) FROM runs r WHERE r.status='starting' AND r.box_id IS NULL
@@ -123,7 +123,7 @@ def _source_member(con, key, source) -> bool:
 
 
 def _room(con, key) -> bool:
-    return len(members(con, key)) + _pending(con, key) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=8)
+    return len(members(con, key)) + _pending(con, key) < capacity.setting("OFFBOX_POOL_SIZE", 4, maximum=16)
 
 
 def own_boxes(con, me):

@@ -93,7 +93,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   checkouts are deleted at run start: a box keeps the 10 most recent used in the last 3 days plus any used in the
   last 12 h (`OFFBOX_PRUNE_KEEP`, `OFFBOX_PRUNE_DAYS`), so a worktree idle for days may sync and install deps again.
 - A busy pool queues for **up to 600 seconds** (progress line every 60 s), then returns **92** (nothing ran; retry).
-  Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–8) and
+  Give the tool call a timeout above the wait, or use a background shell. `OFFBOX_POOL_SIZE` (1–16; raised from 8 for TorSSH by Abdullah, 12 Nov 2026) and
   `OFFBOX_POOL_WAIT_SECONDS` (0–1200) configure this. Sizes are minimums on pooled boxes; a larger warm box is reused.
 - Boxes stop after **5 min idle (xlarge) or 10 min (other sizes)**. 20 min if a run on the box started a container in
   the last 2 h (offbox checks `docker events` at the end of each run; a testcontainers manifest alone no longer
