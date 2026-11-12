@@ -16,9 +16,69 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, lease, misc, runs  # noqa: E402
+from offbox_lib import api, cli, common, lease, misc, pool, runs  # noqa: E402
 from offbox_lib.common import OffboxError, db  # noqa: E402
 from test_capacity import Isolated  # noqa: E402
+
+
+class PoolTakeDeadlineTests(Isolated):
+    def test_brief_final_lock_hold_reports_boxes_stayed_busy(self):
+        from test_exit_and_queue import FakeClock
+        self.box('full', member=True)
+        self.busy('full')
+        clock = FakeClock()
+        real_lock = common.file_lock
+        takes = []
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            if name == pool.lock_name('repo'):
+                takes.append(timeout)
+                if len(takes) == 2:
+                    clock.t += timeout
+                    raise OffboxError('timed out waiting for lock ' + name)
+            with real_lock(name, timeout=timeout):
+                yield
+        def sleep(seconds):
+            clock.t = 1599.5
+        clock.time.sleep = sleep
+        with patch.dict(os.environ, {'OFFBOX_POOL_WAIT_SECONDS': '600', 'OFFBOX_POOL_SIZE': '1'}), \
+                patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(pool.PoolBusyError) as caught:
+                pool.acquire(self.me)
+        self.assertEqual(takes, [30, .5])
+        self.assertEqual(caught.exception.code, 92)
+        self.assertIn('boxes stayed busy', str(caught.exception))
+        self.assertIn('1 busy', str(caught.exception))
+        self.assertNotIn('kept its pool lock', str(caught.exception))
+
+    def test_short_takes_retry_while_queue_has_time(self):
+        from test_exit_and_queue import FakeClock
+        clock, takes = FakeClock(), []
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            takes.append(timeout)
+            if len(takes) < 3:
+                clock.t += timeout
+                raise OffboxError('timed out waiting for lock ' + name)
+            yield
+        with patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock):
+            with pool._pool_lock('repo', 1120, 120):
+                self.assertEqual(clock.t, 1060)
+        self.assertEqual(takes, [30, 30, 30])
+
+    def test_lock_message_requires_a_full_short_take(self):
+        from test_exit_and_queue import FakeClock
+        clock = FakeClock()
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            clock.t += timeout
+            raise OffboxError('timed out waiting for lock ' + name)
+            yield
+        with patch.object(pool, 'time', clock.time), patch.object(pool, 'file_lock', lock):
+            with self.assertRaisesRegex(pool.PoolBusyError, 'kept its pool lock for 30s'):
+                with pool._pool_lock('repo', 1030, 30):
+                    self.fail('lock was not acquired')
 
 
 class FastEvent(threading.Event):
@@ -980,6 +1040,8 @@ class LockBlockedFollowerTests(Isolated):
         self.stack.enter_context(patch.object(runs, '_ttl_keeper'))
         self.stack.enter_context(patch.object(runs.api, 'cmd_status', return_value=None))
         self.stack.enter_context(patch.object(runs, 'finish'))
+        # logs --follow refreshes TTL even when a peer holds the lock; keep that API call offline too.
+        self.stack.enter_context(patch.object(api, 'set_ttl'))
         self.stack.enter_context(patch.object(runs, 'go_std_glitch'))
         # logs --follow only enters the lock-blocked path for a live box.
         self.stack.enter_context(patch.object(runs.api, 'get', return_value={'state': 'running'}))
