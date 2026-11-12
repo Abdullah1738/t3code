@@ -30,24 +30,41 @@ export interface PullRequestWatchReport {
 const isFailedCheck = (check: PullRequestCheck) =>
   check.status === "failure" || check.status === "cancelled" || check.status === "action-required";
 
+export const pullRequestChecksSettling = (
+  detail: Pick<PullRequestDetail, "headSha" | "headBranchSha" | "checksHeadSha">,
+): boolean =>
+  (detail.headBranchSha != null && detail.headBranchSha !== detail.headSha) ||
+  (detail.checksHeadSha != null && detail.checksHeadSha !== detail.headSha);
+
 export function evaluatePullRequestWatch(
   watch: ThreadPullRequestWatch,
   detail: Pick<
     PullRequestDetail,
-    "headSha" | "baseSha" | "checks" | "mergeability" | "viewer" | "author"
+    | "headSha"
+    | "headBranchSha"
+    | "checksHeadSha"
+    | "baseSha"
+    | "checks"
+    | "mergeability"
+    | "viewer"
+    | "author"
   >,
   remarks: ReadonlyArray<PullRequestComment> | null,
 ): PullRequestWatchReport {
   const changes: Array<PullRequestWatchChange> = [];
   const headSha = detail.headSha ?? null;
   const headMoved = headSha !== watch.headSha;
+  // GitHub's PR record and rollup can lag its branch ref after a push. Preserve the
+  // check watermark until these reads agree, so the settled head still gets its verdict.
+  const checksSettling = pullRequestChecksSettling(detail);
+  const checkHeadMoved = headMoved && !checksSettling;
 
   // An empty list keeps the last state: a host can answer with one when its check read fails.
-  let failedChecks = headMoved ? [] : watch.failedChecks;
-  let passed = headMoved ? false : watch.passed;
-  let passedChecks = headMoved ? [] : watch.passedChecks;
-  let passedPending = headMoved ? [] : watch.passedPending;
-  if (detail.checks.length > 0) {
+  let failedChecks = checkHeadMoved ? [] : watch.failedChecks;
+  let passed = checkHeadMoved ? false : watch.passed;
+  let passedChecks = checkHeadMoved ? [] : watch.passedChecks;
+  let passedPending = checkHeadMoved ? [] : watch.passedPending;
+  if (!checksSettling && detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
     const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
     if (newlyFailed.length > 0) changes.push({ kind: "checks-failed", failed: newlyFailed });
@@ -72,7 +89,7 @@ export function evaluatePullRequestWatch(
     passedPending = required.length === 0 && passedNow ? gateNames : [];
     passed = passedNow && (passed || confirmed);
     passedChecks = passed ? gateNames : [];
-  } else {
+  } else if (!checksSettling) {
     passedPending = [];
   }
 
@@ -121,13 +138,13 @@ export function evaluatePullRequestWatch(
   }
 
   const commentsOnly = changes.length > 0 && changes.every((change) => change.kind === "remarks");
-  const progress = headMoved || (changes.length > 0 && !commentsOnly);
+  const progress = checkHeadMoved || (changes.length > 0 && !commentsOnly);
   const wakes = (progress ? 0 : watch.wakes) + (commentsOnly ? 1 : 0);
   return {
     changes,
     next: {
       startedAt: watch.startedAt,
-      headSha,
+      headSha: checksSettling ? watch.headSha : headSha,
       failedChecks,
       passed,
       passedChecks,
