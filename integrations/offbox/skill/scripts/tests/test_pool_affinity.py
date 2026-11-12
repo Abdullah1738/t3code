@@ -184,7 +184,8 @@ class AffinityTests(Isolated):
         get = api.get.side_effect
         def stopping(bid, **kw):
             if bid == 'A' and not self.resumed:
-                return {'state': 'archiving', 'type': 'large'}
+                # Pooled stop waits yield to the queue and re-read, instead of blocking in wait_state.
+                return {'state': 'archiving' if self.clock.t < 1002 else 'archived', 'type': 'large'}
             return get(bid, **kw)
         with patch.object(api, 'get', side_effect=stopping), patch.object(api, 'wait_state', side_effect=wait):
             self.assertEqual(self.acquire(size='xlarge')['box_id'], 'A')
@@ -485,7 +486,7 @@ class HintAndPullTests(Isolated):
         (root/'package.json').write_text('{}')
         row = {'box_id': 'B', '_new_checkout': True}
         for lock, install in (('pnpm-lock.yaml','pnpm install --frozen-lockfile'),
-                              ('yarn.lock','yarn install'), ('package-lock.json','npm ci')):
+                              ('yarn.lock','yarn install --frozen-lockfile'), ('package-lock.json','npm ci')):
             with self.subTest(lock=lock):
                 (root/lock).touch()
                 err=io.StringIO()
@@ -493,11 +494,12 @@ class HintAndPullTests(Isolated):
                     runs.new_checkout_hint(row, root)
                 self.assertIn(f'node_modules missing on new box B; prefix your command with {install} &&',err.getvalue())
                 (root/lock).unlink()
-        (root / 'package.json').write_text('{"devDependencies":{"vite-plus":"1.0.0"}}')
+        (root / 'package.json').write_text('{"packageManager":"pnpm@11.10.0","devDependencies":{"vite-plus":"1.0.0"}}')
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             runs.new_checkout_hint(row, root)
-        self.assertIn('with vp i &&', err.getvalue())
+        self.assertIn('with pnpm install --frozen-lockfile &&', err.getvalue())
+        self.assertNotIn('vp i &&', err.getvalue())
         (root / 'package.json').write_text('{}')
         (root / 'vite.config.ts').touch()
         err = io.StringIO()
@@ -522,7 +524,7 @@ class HintAndPullTests(Isolated):
         args.cmd = ['pnpm', 'test']
         runner = runs.Runner(args, me)
         err = io.StringIO()
-        def start(*a):
+        def start(*a, **_kw):
             self.assertIn('prefix your command with pnpm install --frozen-lockfile &&', err.getvalue())
             return {'processId': 7}
         with patch.object(lease, '_reuse', side_effect=lambda c,r,s,**kw: dict(r)), \

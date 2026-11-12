@@ -86,7 +86,7 @@ class PrepareTtlTests(Isolated):
     def test_push_refreshes_ttl_and_keeper_stops_before_remote_start(self):
         self.push.side_effect = self.block_until_refresh({})
 
-        def start(*args):
+        def start(*args, **_kw):
             self.assert_stopped()
             return {'processId': 7}
 

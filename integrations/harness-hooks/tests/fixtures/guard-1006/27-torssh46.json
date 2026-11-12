@@ -1,0 +1,30 @@
+{
+  "case_number": 27,
+  "reporter_id": "torssh46",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:e4bf7b43-71ce-4af6-a532-5b4c798ffc73",
+  "provenance": {
+    "recovery": "verbatim",
+    "harness": "codex",
+    "tool_name": "exec",
+    "nested_tool": "exec_command",
+    "card_comment_event_id": 134382,
+    "sources": [
+      {
+        "denial_index": 289,
+        "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T10-17-50-01a1ce67-c828-7490-8ec8-ac0f234c0fbe.jsonl",
+        "timestamp": "2026-11-12T06:20:56.429Z",
+        "call_id": "call_738a8644a0134db08b23dbcf3c0ec1db",
+        "command_index": 0
+      }
+    ]
+  },
+  "commands": [
+    {
+      "cmd": "mkdir -p docs/release tmp/rel-prep && cat > tmp/rel-prep/refactor_elf.py <<'PY'\nfrom pathlib import Path\np=Path('scripts/audit-elf.py')\ns=p.read_text(); start=s.index('                needed ='); end=s.index('                print(f\\'ELF PASS',start)\nblock=s[start:end]\nhelper='''\"\"\"Shared ELF checks for the build gate and single-APK release audit.\"\"\"\nimport re\n\nNATIVE_LIBRARIES = {\n    'libtorssh_jni.so', 'libtorssh_probe.so', 'libtorcore_tor.so',\n    'libtorcore_lyrebird.so', 'libtorcore_jni.so', 'libtorssh_ssh.so',\n    'libtorssh_keygen.so', 'libtorssh_proxy.so', 'libtorssh_askpass.so',\n}\n\n\ndef audit_elf(output, name, abi):\n'''+''.join(line[12:]+'\\n' for line in block.splitlines())\nPath('scripts/elf_audit.py').write_text(helper)\ns=s[:start]+'                audit_elf(output, name, abi)\\n'+s[end:]\ns=s.replace('import zipfile\\n','import zipfile\\nfrom elf_audit import audit_elf, NATIVE_LIBRARIES\\n')\na=s.index(' == {\\n',s.index('assert {n.rsplit'));b=s.index(', native',a)\ns=s[:a]+' == NATIVE_LIBRARIES'+s[b:]\np.write_text(s)\nPY\npython3 tmp/rel-prep/refactor_elf.py",
+      "workdir": "/Users/ardud/checkouts/torssh-rel-prep",
+      "sha256": "3f8357a6f953594868e5aad8faabde6ad0c3c130d4b745dbf47228dda2089df0"
+    }
+  ],
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "original_refusal": "statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.."
+}

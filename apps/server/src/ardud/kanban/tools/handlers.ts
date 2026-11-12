@@ -846,9 +846,36 @@ const handlers = {
   wiki_read: McpToolAccess.readsAsCaller((input) =>
     withCaller((service, caller) =>
       Effect.gen(function* () {
+        if (input.slug !== undefined && input.slugs !== undefined) {
+          return yield* invalid("Pass slug or slugs, not both.");
+        }
         const board = yield* boardFor(service, caller, input.boardId, true);
         const pages = yield* service.wiki(board.id);
-        return { pages: input.slug ? pages.filter((page) => page.slug === input.slug) : pages };
+        if (input.slug !== undefined) {
+          return { pages: pages.filter((page) => page.slug === input.slug) };
+        }
+        if (input.slugs !== undefined) {
+          const bySlug = new Map(pages.map((page) => [page.slug, page]));
+          return {
+            pages: input.slugs.flatMap((slug) => {
+              const page = bySlug.get(slug);
+              return page === undefined ? [] : [page];
+            }),
+            missing: input.slugs.filter((slug) => !bySlug.has(slug)),
+          };
+        }
+        return {
+          pages: [],
+          index: pages
+            .toSorted((a, b) => a.slug.localeCompare(b.slug))
+            .map((page) => ({
+              slug: page.slug,
+              title: page.title,
+              updatedAt: page.updatedAt,
+              bytes: Buffer.byteLength(page.body, "utf8"),
+            })),
+          hint: "Pass slug to read a page.",
+        };
       }),
     ),
   ),

@@ -18,6 +18,7 @@ const variantDescriptor = (values: ReadonlyArray<string>): ProviderOptionDescrip
 export const opencodeTestProvider = (): ServerProvider => {
   const models = [
     { slug: "opus/claude-opus-5-5", variants: ALL_VARIANTS },
+    { slug: "opus/claude-sonnet-5-5", variants: ALL_VARIANTS },
     { slug: "opus/cc/claude-haiku-5-5", variants: ALL_VARIANTS },
     { slug: "opus/cx/gpt-6.1-sol", variants: ["xhigh"] },
     { slug: "opus/gpt-6-astra", variants: ["xhigh"] },

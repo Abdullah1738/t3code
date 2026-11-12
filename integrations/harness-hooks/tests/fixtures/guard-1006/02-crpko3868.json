@@ -1,0 +1,38 @@
+{
+  "case_number": 2,
+  "reporter_id": "crpko3868",
+  "thread_id": "thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Fcrpko-devops:8c9c6a1b-4f85-46df-bbcb-afc23783dc61",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/11/rollout-2026-11-11T19-52-40-01a1cb4f-b484-78b0-8031-1c1a7a75915b.jsonl",
+    "source_call_line_0": 240,
+    "timestamp": "2026-11-11T16:03:04.694Z",
+    "call_id": "call_354b8d94ee544d0a84aa7b1e346ef935",
+    "command_index_0": 0,
+    "cell_command_count": 2,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 36,
+    "setup_files_provenance": {
+      "kind": "synthetic_representative_only",
+      "original_invocation_source_recovered": false,
+      "detail": "Minimal harmless source supplied for an existing invoked script. These bytes are authored for guard scanning, not recovered original contents. Never execute reporter commands."
+    }
+  },
+  "session_cwd": "/Volumes/ExternalSSD/crpko-devops",
+  "commands": [
+    {
+      "cmd": "mkdir -p tmp && git show HEAD:src/components/features/auth/prototype/screens.tsx > src/components/features/auth/prototype/screens.before.tsx && mkdir -p 'src/app/[locale]/auth/signup/qa-grace' && cat > 'src/app/[locale]/auth/signup/qa-grace/page.tsx' <<'EOF'\n'use client';\nimport { useSearchParams } from 'next/navigation';\nimport * as After from '@/components/features/auth/prototype/screens';\nimport * as Before from '@/components/features/auth/prototype/screens.before';\nimport { PrototypeAuthShell } from '@/components/features/auth/prototype';\nimport { SecurityStepupModal } from '@/components/modals/security/security-stepup-modal';\nimport { useTranslations } from 'next-intl';\n\nexport default function Evidence() {\n  const params = useSearchParams();\n  const before = params.get('version') === 'before';\n  const state = params.get('state') ?? 'select-ending';\n  const Screens = before ? Before : After;\n  const t = useTranslations('auth.prototypeAuth');\n  const expiry = Date.now() + (state.endsWith('ending') ? 42_000 : 600_000);\n  const noop = () => {};\n  const factor = state.includes('totp') ? 'totp' : 'passkey';\n  let card;\n  if (state.startsWith('select')) card = <Screens.SecuritySetup testId=\"select\" onPick={noop} onSkip={noop} {...(!before ? {graceExpiresAt: expiry} : {})} />;\n  else if (state.startsWith('passkey')) card = <Screens.PasskeySetup onCreate={noop} onSkip={noop} onBack={noop} {...(!before ? {graceExpiresAt: expiry} : {})} />;\n  else if (state === 'totp') card = <Screens.TotpSetup secret=\"JBSWY3DPEHPK3PXP\" otpauthUrl=\"otpauth://totp/Crpko:test?secret=JBSWY3DPEHPK3PXP&issuer=Crpko\" code=\"\" onCodeChange={noop} onBack={noop} />;\n  else if (state === 'auto-ready') card = <Screens.AuthStatus variant=\"complete\" title={t('complete.title')} subtitle={!before ? <span role=\"status\">{t('quickSetup.ended')}</span> : t('complete.subtitle')} primaryLabel={t('complete.startTrading')} onPrimary={noop} testId=\"complete\" />;\n  else if (state.startsWith('expired') && !before) card = <After.SetupExpired factor={factor} onContinue={noop} onSkip={noop} onBack={noop} />;\n  else card = <Screens.SecuritySetup testId=\"select\" onPick={noop} onSkip={noop} />;\n  const modal = state.startsWith('no-window') || (before && state.startsWith('expired')) || state === 'stepup';\n  return <PrototypeAuthShell>{card}<SecurityStepupModal isOpen={modal} onClose={noop} submit={async()=> 'done'} {...(!before ? {title:t('quickSetup.checkTitle'), purposeLabel:t(factor === 'totp' ? 'quickSetup.totpBody' : 'quickSetup.passkeyBody')} : {})} /></PrototypeAuthShell>;\n}\nEOF\nnode node_modules/prettier/bin/prettier.cjs --write 'src/app/[locale]/auth/signup/qa-grace/page.tsx' >/dev/null\nprintf '\\nsrc/components/features/auth/prototype/screens.before.tsx\\nsrc/app/\\n' > tmp/evidence-excludes-note\ncat .git/info/exclude | tail -5\n",
+      "workdir": "/Users/ardud/checkouts/web-crp-14722-grace",
+      "sha256": "5c11d6dd8c970b4c4e11091921f4caab082c04be0fdcf888dff1ea178d73b56f"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard.",
+  "setup_files": {
+    "/Users/ardud/checkouts/web-crp-14722-grace/node_modules/prettier/bin/prettier.cjs": "module.exports = {};\n"
+  }
+}

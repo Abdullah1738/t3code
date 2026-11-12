@@ -1,0 +1,35 @@
+{
+  "case_number": 10,
+  "reporter_id": "torssh34",
+  "thread_id": "thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:899c5503-7939-4c44-8113-df179519086a",
+  "provenance": {
+    "recovery": "verbatim",
+    "source_kind": "retained_codex_custom_tool_call",
+    "session_file": "/Users/ardud/.robob/harness-homes/codex/sessions/2026/11/12/rollout-2026-11-12T01-28-10-01a1cc82-dc62-7eb2-a478-19dc707a4794.jsonl",
+    "source_call_line_0": 421,
+    "timestamp": "2026-11-11T21:54:43.522Z",
+    "call_id": "call_7110570312794d2c9001a876539e97ca",
+    "command_index_0": 0,
+    "cell_command_count": 1,
+    "decoder": "integrations/harness-hooks/tests/code_mode_fixture.py:commands (static decoding; no execution)",
+    "explicit_workdir_present": true,
+    "sha256_scope": "UTF-8 bytes of cmd only; workdir preserved separately",
+    "thread_mapping": "Robob #1006 reporter link and reporter activity title confirmed",
+    "raw_denials_file": "/tmp/guard1006-denials.json",
+    "raw_denial_index_0": 281,
+    "intentionally_absent_from_setup_files": [
+      "tmp/lifecycle-core/gate.sh",
+      "scripts/check.sh",
+      "scripts/gradle-tasks.sh"
+    ]
+  },
+  "session_cwd": "/Users/ardud/.robob/projects/torssh",
+  "commands": [
+    {
+      "cmd": "head -35 specs/torcore.totality.json\ncat scripts/gradle-tasks.sh\nhead -55 scripts/check-build.sh\ncat > tmp/lifecycle-core/gate.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")/../..\"\nexpected=$1\nactual=$(git rev-parse HEAD)\n[[ \"$actual\" == \"$expected\" ]] || { echo 'Wrong gate head'; exit 1; }\n[[ -z $(git status --porcelain) ]] || { echo 'Dirty gate inputs'; exit 1; }\necho \"GATE_HEAD=$actual\"\nsource scripts/env.sh\nbash scripts/bootstrap-offbox.sh --tools-only\n# Clear outputs relocated from the skeleton checkout, preserving downloaded caches.\nrm -rf build/native app/build torcore/build .gradle\nsource scripts/gradle-tasks.sh\n./gradlew --dependency-verification strict \"${TORS_GRADLE_TASKS[@]}\"\n./scripts/check.sh\n[[ $(git rev-parse HEAD) == \"$expected\" && -z $(git status --porcelain) ]] || { echo 'Gate input changed'; exit 1; }\nEOF",
+      "workdir": "/Users/ardud/checkouts/torssh-lifecycle-core",
+      "sha256": "79c0f26bdacd77bf32155d7dd4b4d124de49ba5a3cdb07151480ffba5d56fcd0"
+    }
+  ],
+  "original_refusal": "Command blocked by PreToolUse hook: statev2 guard: this command was NOT run. The effective directory or path of an explicit script invocation could not be established, so its live-database access cannot be checked. Use a literal absolute script path and an explicit workdir; do not bypass the guard."
+}

@@ -93,6 +93,7 @@ export const makeFake = Effect.gen(function* () {
       latestRun: () => Effect.succeed(null),
       compactRun: () => Effect.succeed(null),
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,

@@ -129,12 +129,17 @@ exit 0
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     ".local/bin/robob-read-watchdog",
-                    "Library/LaunchAgents/com.ardud.robob-read-watchdog.plist"):
+                    "Library/LaunchAgents/com.ardud.robob-read-watchdog.plist",
+                    ".local/bin/mirage-beacon-keepalive", ".local/libexec/mirage/clients.py",
+                    ".local/libexec/mirage/restart.sh",
+                    "Library/LaunchAgents/com.ardud.mirage-beacon-keepalive.plist"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 12, self.calls_log())
+        self.assertEqual(len(loads), 13, self.calls_log())
+        self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
+        self.assertFalse(os.path.exists(self.live(".local/state/mirage-beacon-keepalive")))
         self.assertTrue(os.access(self.live(".local/bin/robob-read-watchdog"), os.X_OK))
         self.assertTrue(os.path.isdir(self.live(".local/state/robob-read-watchdog")))
         for rel in (".local/share/juno-proxy/juno_proxy.py", ".local/bin/power-unplug-telegram.sh",

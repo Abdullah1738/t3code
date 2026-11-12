@@ -1,3 +1,4 @@
+import { emptyDelegatedRecoveryCounts } from "./ardud/observability/StartupPhaseLog.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import { DEFAULT_SERVER_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -116,7 +117,9 @@ it.effect("parks automatic pull until activation without delaying command readin
           prepareForShutdown: Effect.void,
           reconcile: () => Effect.succeed(recovery),
         }),
-        Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          recoverDelegatedTasks: Effect.succeed(emptyDelegatedRecoveryCounts),
+        }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
         Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
         Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: Effect.never }),

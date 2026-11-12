@@ -588,7 +588,7 @@ class FallbackTests(Isolated):
             self.assertFalse(fallback.allowed(argv,e,'/repo'),argv)
         self.assertFalse(fallback.allowed(['echo','ok'],common.OffboxError('uncertain',started=True),'/repo'))
         self.assertFalse(fallback.allowed(['./scripts/full-suite.sh'],e,'/repo'))
-        # Go checks reach the Mac only through local-first's sandbox, never through the plain fallback.
+        # Go checks never reach the Mac through the plain fallback.
         self.assertFalse(fallback.allowed(['go','test','-run','TestOne','./pkg'],e,'/repo'))
 
     def test_cli_returns_90_for_full_suite(self):

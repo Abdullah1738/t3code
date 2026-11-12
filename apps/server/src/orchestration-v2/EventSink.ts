@@ -13,6 +13,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -218,6 +219,19 @@ export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>(
   "t3/orchestration-v2/EventSink/EventSinkV2",
 ) {}
 
+type WritePhase = "normalize" | "append" | "project" | "outbox" | "lane_wait";
+
+interface WriteTiming {
+  readonly measure: <A, E, R>(
+    phase: WritePhase,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
+  readonly projectEvent: <A, E, R>(
+    type: string,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
+}
+
 const layerBase: Layer.Layer<
   EventSinkV2,
   never,
@@ -262,43 +276,116 @@ const layerBase: Layer.Layer<
     // subscribers first, and clients drop any event at or below the newest
     // sequence they have applied.
     const publishLane = yield* Semaphore.make(1);
-    const commitThenPublish = <A, E, R>(
-      transaction: Effect.Effect<A, E, R>,
+    // The caller owns the write span; phase timers must not create child spans.
+    const commitThenPublish = Effect.fnUntraced(function* <A, E, R>(
+      events: ReadonlyArray<{ readonly type: string }>,
+      transaction: (timing: WriteTiming) => Effect.Effect<A, E, R>,
       publish: (committed: A) => Effect.Effect<void>,
-    ) =>
-      Effect.suspend(() => {
-        let holdsLane = false;
-        const takeLane = publishLane.take(1).pipe(
+    ) {
+      const clock = yield* Clock.Clock;
+      const now = () => clock.monotonicTimeNanosUnsafe();
+      const elapsed = (start: bigint) => Number(now() - start) / 1_000_000;
+      const phases = { normalize: 0, append: 0, project: 0, outbox: 0, lane_wait: 0 };
+      let slowestProjectType = "";
+      let slowestProjectMs = 0;
+      // These timers run with tracing disabled; only the enclosing write span is annotated.
+      const measure: WriteTiming["measure"] = (phase, effect) =>
+        Effect.suspend(() => {
+          const start = now();
+          return effect.pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                phases[phase] += elapsed(start);
+              }),
+            ),
+          );
+        });
+      const timing: WriteTiming = {
+        measure,
+        projectEvent: (type, effect) =>
+          Effect.suspend(() => {
+            const start = now();
+            return effect.pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  const ms = elapsed(start);
+                  if (slowestProjectType === "" || ms > slowestProjectMs) {
+                    slowestProjectType = type;
+                    slowestProjectMs = ms;
+                  }
+                }),
+              ),
+            );
+          }),
+      };
+      let holdsLane = false;
+      let txStart: bigint | undefined;
+      let txMs = 0;
+      const takeLane = measure(
+        "lane_wait",
+        publishLane.take(1).pipe(
           Effect.andThen(
             Effect.sync(() => {
               holdsLane = true;
             }),
           ),
           Effect.uninterruptible,
+        ),
+      );
+      const report = Effect.suspend(() => {
+        const eventTypes = new Set<string>();
+        for (const event of events) {
+          eventTypes.add(event.type);
+          if (eventTypes.size === 10) break;
+        }
+        const fields = {
+          "orchestration_v2.phase.normalize_ms": phases.normalize,
+          "orchestration_v2.phase.append_ms": phases.append,
+          "orchestration_v2.phase.project_ms": phases.project,
+          "orchestration_v2.phase.outbox_ms": phases.outbox,
+          "orchestration_v2.phase.lane_wait_ms": phases.lane_wait,
+          "orchestration_v2.phase.tx_ms": txMs,
+          "orchestration_v2.event_types": [...eventTypes].join(","),
+          "orchestration_v2.phase.slowest_project_type": slowestProjectType,
+          "orchestration_v2.phase.slowest_project_ms": slowestProjectMs,
+        };
+        return Effect.annotateCurrentSpan(fields).pipe(
+          Effect.andThen(
+            txMs > 5_000 ? Effect.logWarning("Slow EventSink transaction", fields) : Effect.void,
+          ),
         );
-        const started = performance.now();
-        return sql
-          .withTransaction(Effect.tap(transaction, () => takeLane))
-          .pipe(
-            // ardud: the writer is a synchronous connection, yet single-event writes
-            // held it for 99-267 s on 11 Nov 2026 with no SQL running and no event-loop
-            // stall over 6 s. The body yields to Effect's scheduler every 2,048 ops, and
-            // each yield waited a full round of a saturated run queue while every other
-            // write queued behind it. Run the transaction body without cooperative yields;
-            // a real wait (the publish lane) still suspends.
-            Effect.provideService(Scheduler.PreventSchedulerYield, true),
-            Effect.tap(() =>
-              Effect.annotateCurrentSpan(
-                "orchestration_v2.transaction_ms",
-                Math.round(performance.now() - started),
-              ),
-            ),
-            Effect.tap(publish),
-            Effect.ensuring(
-              Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void)),
-            ),
-          );
       });
+      const started = performance.now();
+      return yield* sql
+        .withTransaction(
+          Effect.suspend(() => {
+            txStart = now();
+            return Effect.tap(transaction(timing), () => takeLane);
+          }),
+        )
+        .pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              // Capture before restoring scheduler yields, so a descheduled reporter cannot
+              // inflate the writer hold. db.lock_wait_ms already records acquisition.
+              txMs = txStart === undefined ? 0 : elapsed(txStart);
+            }),
+          ),
+          // Keep synchronous writer work from yielding behind the saturated run queue.
+          // A real wait (including the publish lane) still suspends.
+          Effect.provideService(Scheduler.PreventSchedulerYield, true),
+          Effect.tap(() =>
+            Effect.annotateCurrentSpan(
+              "orchestration_v2.transaction_ms",
+              Math.round(performance.now() - started),
+            ),
+          ),
+          // Diagnostics must not suppress publication after a successful commit.
+          Effect.ensuring(report.pipe(Effect.ignoreCause)),
+          Effect.tap(publish),
+          Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+        );
+    });
 
     // A user can answer after terminal normalization reads the pending request.
     // Recheck inside the write transaction so stale cleanup cannot erase answers.
@@ -371,10 +458,17 @@ const layerBase: Layer.Layer<
 
     const applyStoredEvents =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
-      Effect.fnUntraced(function* (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) {
-        yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
-          concurrency: 1,
-        });
+      Effect.fnUntraced(function* (
+        storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>,
+        timing: WriteTiming,
+      ) {
+        yield* Effect.forEach(
+          storedEvents,
+          (stored) => timing.projectEvent(stored.event.type, projectionStore.apply(stored.event)),
+          {
+            concurrency: 1,
+          },
+        );
         const sequence = storedEvents.at(-1)?.sequence;
         if (sequence !== undefined) {
           const now = DateTime.formatIso(yield* DateTime.now);
@@ -414,84 +508,86 @@ const layerBase: Layer.Layer<
       });
 
       return yield* commitThenPublish(
-        Effect.gen(function* () {
-          let sourceEvents = input.events;
-          if (input.refreshBoundProviderSessions === true) {
-            const requests = input.events.filter(
-              (
-                event,
-              ): event is Extract<
-                OrchestrationV2DomainEvent,
-                { type: "provider-session.attached" | "provider-session.updated" }
-              > => event.type === "provider-session.updated",
-            );
-            if (
-              requests.length !== input.events.length ||
-              input.effects.length > 0 ||
-              input.unlessNativeThreadOwned !== undefined ||
-              input.guardPendingUserInputCancellations !== undefined ||
-              input.updateDelegatedCompletionOnly !== undefined
-            ) {
-              return yield* new EventSinkWriteError({
-                eventCount: input.events.length,
-                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-                cause: "Session refresh cannot include other events, effects or write guards.",
-              });
-            }
-            // The preflight payload only identifies a binding. A read outside this
-            // transaction could overwrite a newer status or resurrect a detached session.
-            const recordsByThread = new Map(
-              yield* Effect.forEach(
-                new Set(requests.map((event) => event.threadId)),
-                (threadId) =>
-                  projectionStore.getThreadRecords(threadId, ["providerSessions"]).pipe(
-                    Effect.catchIf(
-                      Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError),
-                      () => Effect.succeed(undefined),
-                    ),
-                    Effect.map((records) => [threadId, records] as const),
-                  ),
-                { concurrency: 1 },
-              ),
-            );
-            const seenByThread = new Map<ThreadId, Set<ProviderSessionId>>();
-            const refreshed: Array<OrchestrationV2DomainEvent> = [];
-            const occurredAt = yield* DateTime.now;
-            for (const event of requests) {
-              const seen = seenByThread.get(event.threadId) ?? new Set<ProviderSessionId>();
-              if (seen.has(event.payload.id)) continue;
-              seen.add(event.payload.id);
-              seenByThread.set(event.threadId, seen);
-              const records = recordsByThread.get(event.threadId);
-              if (
-                records === undefined ||
-                records.thread.deletedAt !== null ||
-                records.thread.archivedAt !== null
-              )
-                continue;
-              const session = records.providerSessions.find(
-                (session) => session.id === event.payload.id,
+        input.events,
+        (timing) =>
+          Effect.gen(function* () {
+            let sourceEvents = input.events;
+            if (input.refreshBoundProviderSessions === true) {
+              const requests = input.events.filter(
+                (
+                  event,
+                ): event is Extract<
+                  OrchestrationV2DomainEvent,
+                  { type: "provider-session.attached" | "provider-session.updated" }
+                > => event.type === "provider-session.updated",
               );
               if (
-                session?.driver !== "opencode" ||
-                !session.capabilities.sessions.supportsMultipleProviderThreadsPerSession
-              )
-                continue;
-              refreshed.push({
-                ...event,
-                payload: session,
-                driver: session.driver,
-                providerInstanceId: session.providerInstanceId,
-                occurredAt,
-              });
+                requests.length !== input.events.length ||
+                input.effects.length > 0 ||
+                input.unlessNativeThreadOwned !== undefined ||
+                input.guardPendingUserInputCancellations !== undefined ||
+                input.updateDelegatedCompletionOnly !== undefined
+              ) {
+                return yield* new EventSinkWriteError({
+                  eventCount: input.events.length,
+                  ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                  cause: "Session refresh cannot include other events, effects or write guards.",
+                });
+              }
+              // The preflight payload only identifies a binding. A read outside this
+              // transaction could overwrite a newer status or resurrect a detached session.
+              const recordsByThread = new Map(
+                yield* Effect.forEach(
+                  new Set(requests.map((event) => event.threadId)),
+                  (threadId) =>
+                    projectionStore.getThreadRecords(threadId, ["providerSessions"]).pipe(
+                      Effect.catchIf(
+                        Schema.is(ProjectionStore.ProjectionStoreThreadNotFoundError),
+                        () => Effect.succeed(undefined),
+                      ),
+                      Effect.map((records) => [threadId, records] as const),
+                    ),
+                  { concurrency: 1 },
+                ),
+              );
+              const seenByThread = new Map<ThreadId, Set<ProviderSessionId>>();
+              const refreshed: Array<OrchestrationV2DomainEvent> = [];
+              const occurredAt = yield* DateTime.now;
+              for (const event of requests) {
+                const seen = seenByThread.get(event.threadId) ?? new Set<ProviderSessionId>();
+                if (seen.has(event.payload.id)) continue;
+                seen.add(event.payload.id);
+                seenByThread.set(event.threadId, seen);
+                const records = recordsByThread.get(event.threadId);
+                if (
+                  records === undefined ||
+                  records.thread.deletedAt !== null ||
+                  records.thread.archivedAt !== null
+                )
+                  continue;
+                const session = records.providerSessions.find(
+                  (session) => session.id === event.payload.id,
+                );
+                if (
+                  session?.driver !== "opencode" ||
+                  !session.capabilities.sessions.supportsMultipleProviderThreadsPerSession
+                )
+                  continue;
+                refreshed.push({
+                  ...event,
+                  payload: session,
+                  driver: session.driver,
+                  providerInstanceId: session.providerInstanceId,
+                  occurredAt,
+                });
+              }
+              sourceEvents = refreshed;
+              if (sourceEvents.length === 0) return [];
             }
-            sourceEvents = refreshed;
-            if (sourceEvents.length === 0) return [];
-          }
-          // Check ownership in the same transaction that claims the native session.
-          const imported = input.unlessNativeThreadOwned;
-          if (imported?.nativeThreadRef != null) {
-            const owners = yield* sql`
+            // Check ownership in the same transaction that claims the native session.
+            const imported = input.unlessNativeThreadOwned;
+            if (imported?.nativeThreadRef != null) {
+              const owners = yield* sql`
               SELECT provider_thread_id
               FROM orchestration_v2_projection_provider_threads
               WHERE driver = ${imported.driver}
@@ -500,45 +596,51 @@ const layerBase: Layer.Layer<
                 AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${imported.nativeThreadRef.nativeId}
               LIMIT 1
             `;
-            if (owners.length > 0) return [];
-          }
-          // Checkpoint capture can finish after a cohort writer reads its parent run.
-          // Merge in this transaction so the event log and projection keep that completion.
-          const events = input.updateDelegatedCompletionOnly
-            ? yield* Effect.forEach(sourceEvents, (event) =>
-                Effect.gen(function* () {
-                  if (event.type !== "run.updated") return event;
-                  const { runs } = yield* projectionStore.getThreadRecords(
-                    event.threadId,
-                    ["runs"],
-                    { runIds: [event.payload.id] },
-                  );
-                  const current = runs[0];
-                  return current === undefined
-                    ? event
-                    : {
-                        ...event,
-                        payload: {
-                          ...current,
-                          delegatedCompletion: event.payload.delegatedCompletion,
-                        },
-                      };
-                }),
-              )
-            : sourceEvents;
-          const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(events)
-              : events,
-          );
-          const committed = yield* eventStore.append({
-            ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
-          });
-          yield* applyStoredEvents(committed);
-          yield* effectOutbox.enqueue(input.effects);
-          return committed;
-        }).pipe(Effect.withTracerEnabled(false)),
+              if (owners.length > 0) return [];
+            }
+            // Checkpoint capture can finish after a cohort writer reads its parent run.
+            // Merge in this transaction so the event log and projection keep that completion.
+            const events = input.updateDelegatedCompletionOnly
+              ? yield* Effect.forEach(sourceEvents, (event) =>
+                  Effect.gen(function* () {
+                    if (event.type !== "run.updated") return event;
+                    const { runs } = yield* projectionStore.getThreadRecords(
+                      event.threadId,
+                      ["runs"],
+                      { runIds: [event.payload.id] },
+                    );
+                    const current = runs[0];
+                    return current === undefined
+                      ? event
+                      : {
+                          ...event,
+                          payload: {
+                            ...current,
+                            delegatedCompletion: event.payload.delegatedCompletion,
+                          },
+                        };
+                  }),
+                )
+              : sourceEvents;
+            const normalized = yield* timing.measure(
+              "normalize",
+              normalizeEvents(
+                input.guardPendingUserInputCancellations === true
+                  ? yield* guardUserInputCancellations(events)
+                  : events,
+              ),
+            );
+            const committed = yield* timing.measure(
+              "append",
+              eventStore.append({
+                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                events: normalized,
+              }),
+            );
+            yield* timing.measure("project", applyStoredEvents(committed, timing));
+            yield* timing.measure("outbox", effectOutbox.enqueue(input.effects));
+            return committed;
+          }).pipe(Effect.withTracerEnabled(false)),
         (storedEvents) =>
           Effect.gen(function* () {
             if (input.effects.length > 0) {
@@ -559,11 +661,13 @@ const layerBase: Layer.Layer<
         });
 
         return yield* commitThenPublish(
-          Effect.gen(function* () {
-            const rows = yield* sql<{
-              readonly status: string;
-              readonly active_attempt_id: string | null;
-            }>`
+          input.events,
+          (timing) =>
+            Effect.gen(function* () {
+              const rows = yield* sql<{
+                readonly status: string;
+                readonly active_attempt_id: string | null;
+              }>`
             SELECT
               status,
               json_extract(payload_json, '$.activeAttemptId') AS active_attempt_id
@@ -572,31 +676,37 @@ const layerBase: Layer.Layer<
               AND thread_id = ${input.threadId}
             LIMIT 1
           `;
-            const current = rows[0];
-            if (
-              current === undefined ||
-              current.status !== input.expectedStatus ||
-              current.active_attempt_id !== input.activeAttemptId
-            ) {
-              return {
-                committed: false as const,
-                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
-              };
-            }
+              const current = rows[0];
+              if (
+                current === undefined ||
+                current.status !== input.expectedStatus ||
+                current.active_attempt_id !== input.activeAttemptId
+              ) {
+                return {
+                  committed: false as const,
+                  storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+                };
+              }
 
-            const normalized = yield* normalizeEvents(
-              input.guardPendingUserInputCancellations === true
-                ? yield* guardUserInputCancellations(input.events)
-                : input.events,
-            );
-            const storedEvents = yield* eventStore.append({
-              ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-              events: normalized,
-            });
-            yield* applyStoredEvents(storedEvents);
-            yield* effectOutbox.enqueue(input.effects ?? []);
-            return { committed: true as const, storedEvents };
-          }),
+              const normalized = yield* timing.measure(
+                "normalize",
+                normalizeEvents(
+                  input.guardPendingUserInputCancellations === true
+                    ? yield* guardUserInputCancellations(input.events)
+                    : input.events,
+                ),
+              );
+              const storedEvents = yield* timing.measure(
+                "append",
+                eventStore.append({
+                  ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                  events: normalized,
+                }),
+              );
+              yield* timing.measure("project", applyStoredEvents(storedEvents, timing));
+              yield* timing.measure("outbox", effectOutbox.enqueue(input.effects ?? []));
+              return { committed: true as const, storedEvents };
+            }),
           (result) =>
             Effect.gen(function* () {
               if (!result.committed) return;
@@ -622,11 +732,13 @@ const layerBase: Layer.Layer<
       });
 
       return yield* commitThenPublish(
-        Effect.gen(function* () {
-          const rows = yield* sql<{
-            readonly active_attempt_id: string | null;
-            readonly last_run_ordinal: number | null;
-          }>`
+        input.events,
+        (timing) =>
+          Effect.gen(function* () {
+            const rows = yield* sql<{
+              readonly active_attempt_id: string | null;
+              readonly last_run_ordinal: number | null;
+            }>`
             SELECT
               json_extract(r.payload_json, '$.activeAttemptId') AS active_attempt_id,
               p.last_run_ordinal
@@ -637,30 +749,36 @@ const layerBase: Layer.Layer<
             WHERE p.provider_thread_id = ${input.providerThreadId}
             LIMIT 1
           `;
-          const current = rows[0];
-          if (
-            current === undefined ||
-            current.active_attempt_id !== input.activeAttemptId ||
-            current.last_run_ordinal !== input.expectedLastRunOrdinal
-          ) {
-            return {
-              committed: false as const,
-              storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
-            };
-          }
+            const current = rows[0];
+            if (
+              current === undefined ||
+              current.active_attempt_id !== input.activeAttemptId ||
+              current.last_run_ordinal !== input.expectedLastRunOrdinal
+            ) {
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
 
-          const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(input.events)
-              : input.events,
-          );
-          const storedEvents = yield* eventStore.append({
-            ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
-          });
-          yield* applyStoredEvents(storedEvents);
-          return { committed: true as const, storedEvents };
-        }),
+            const normalized = yield* timing.measure(
+              "normalize",
+              normalizeEvents(
+                input.guardPendingUserInputCancellations === true
+                  ? yield* guardUserInputCancellations(input.events)
+                  : input.events,
+              ),
+            );
+            const storedEvents = yield* timing.measure(
+              "append",
+              eventStore.append({
+                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+                events: normalized,
+              }),
+            );
+            yield* timing.measure("project", applyStoredEvents(storedEvents, timing));
+            return { committed: true as const, storedEvents };
+          }),
         (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
       );
     });
@@ -675,25 +793,30 @@ const layerBase: Layer.Layer<
       const expectedJson = yield* ProjectionStore.encodeProviderThreadPayload(input.expected);
 
       return yield* commitThenPublish(
-        Effect.gen(function* () {
-          const rows = yield* sql<{ readonly payload_json: string }>`
+        input.events,
+        (timing) =>
+          Effect.gen(function* () {
+            const rows = yield* sql<{ readonly payload_json: string }>`
             SELECT payload_json
             FROM orchestration_v2_projection_provider_threads
             WHERE provider_thread_id = ${input.expected.id}
             LIMIT 1
           `;
-          if (rows[0]?.payload_json !== expectedJson) {
-            return {
-              committed: false as const,
-              storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
-            };
-          }
+            if (rows[0]?.payload_json !== expectedJson) {
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
 
-          const normalized = yield* normalizeEvents(input.events);
-          const storedEvents = yield* eventStore.append({ events: normalized });
-          yield* applyStoredEvents(storedEvents);
-          return { committed: true as const, storedEvents };
-        }),
+            const normalized = yield* timing.measure("normalize", normalizeEvents(input.events));
+            const storedEvents = yield* timing.measure(
+              "append",
+              eventStore.append({ events: normalized }),
+            );
+            yield* timing.measure("project", applyStoredEvents(storedEvents, timing));
+            return { committed: true as const, storedEvents };
+          }),
         (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
       );
     });
@@ -718,54 +841,62 @@ const layerBase: Layer.Layer<
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
       const result = yield* commitThenPublish(
-        Effect.gen(function* () {
-          const reserved = yield* commandReceipts.insertIfAbsent({
-            commandId: input.commandId,
-            threadId: input.threadId,
-            commandType: input.commandType,
-            acceptedAt: input.acceptedAt,
-            resultSequence: 0,
-            status: "accepted",
-            error: null,
-          });
-          if (!reserved) {
-            const existing = yield* existingCommandResult(input.commandId);
-            return { ...existing, committed: false as const, cancelledEffectIds: [] };
-          }
-          if (input.recheck !== undefined) yield* input.recheck;
+        input.events,
+        (timing) =>
+          Effect.gen(function* () {
+            const reserved = yield* commandReceipts.insertIfAbsent({
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.acceptedAt,
+              resultSequence: 0,
+              status: "accepted",
+              error: null,
+            });
+            if (!reserved) {
+              const existing = yield* existingCommandResult(input.commandId);
+              return { ...existing, committed: false as const, cancelledEffectIds: [] };
+            }
+            if (input.recheck !== undefined) yield* input.recheck;
 
-          const normalized = yield* normalizeEvents(input.events);
-          const storedEvents = yield* eventStore.append({
-            commandId: input.commandId,
-            events: normalized,
-          });
-          const sequence = storedEvents.at(-1)?.sequence;
-          if (sequence === undefined) {
-            return yield* Effect.die(
-              new Error(`Command ${input.commandId} produced no orchestration events.`),
+            const normalized = yield* timing.measure("normalize", normalizeEvents(input.events));
+            const storedEvents = yield* timing.measure(
+              "append",
+              eventStore.append({
+                commandId: input.commandId,
+                events: normalized,
+              }),
             );
-          }
-          yield* applyStoredEvents(storedEvents);
-          yield* effectOutbox.enqueue(input.effects);
-          const receipt: CommandReceiptStore.CommandReceiptV2 = {
-            commandId: input.commandId,
-            threadId: input.threadId,
-            commandType: input.commandType,
-            acceptedAt: input.acceptedAt,
-            resultSequence: sequence,
-            status: "accepted",
-            error: null,
-          };
-          yield* commandReceipts.upsert(receipt);
-          const cancelledEffectIds =
-            input.cancelUnsettledEffects === undefined
-              ? []
-              : yield* effectOutbox.cancelUnsettled({
-                  threadId: input.threadId,
-                  ...input.cancelUnsettledEffects,
-                });
-          return { receipt, storedEvents, committed: true as const, cancelledEffectIds };
-        }),
+            const sequence = storedEvents.at(-1)?.sequence;
+            if (sequence === undefined) {
+              return yield* Effect.die(
+                new Error(`Command ${input.commandId} produced no orchestration events.`),
+              );
+            }
+            yield* timing.measure("project", applyStoredEvents(storedEvents, timing));
+            yield* timing.measure("outbox", effectOutbox.enqueue(input.effects));
+            const receipt: CommandReceiptStore.CommandReceiptV2 = {
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.acceptedAt,
+              resultSequence: sequence,
+              status: "accepted",
+              error: null,
+            };
+            yield* commandReceipts.upsert(receipt);
+            const cancelledEffectIds =
+              input.cancelUnsettledEffects === undefined
+                ? []
+                : yield* timing.measure(
+                    "outbox",
+                    effectOutbox.cancelUnsettled({
+                      threadId: input.threadId,
+                      ...input.cancelUnsettledEffects,
+                    }),
+                  );
+            return { receipt, storedEvents, committed: true as const, cancelledEffectIds };
+          }),
         (result) =>
           Effect.gen(function* () {
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
@@ -822,25 +953,36 @@ const layerBase: Layer.Layer<
     const commitProjectCommandEffect = Effect.fn("orchestrationV2.EventSink.commitProjectCommand")(
       function* (input: Parameters<EventSinkV2Shape["commitProjectCommand"]>[0]) {
         const result = yield* commitThenPublish(
-          Effect.gen(function* () {
-            const reserved: CommandReceiptStore.ProjectCommandReceiptV2 = {
-              commandId: input.commandId,
-              projectId: input.projectId,
-              commandType: input.commandType,
-              acceptedAt: input.acceptedAt,
-              resultSequence: 0,
-              status: "accepted",
-              error: null,
-            };
-            if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
-              return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
-            }
-            const event = yield* eventStore.appendProjectEvent(input.event);
-            yield* projectStore.apply(event);
-            const receipt = { ...reserved, resultSequence: event.sequence };
-            yield* commandReceipts.upsert(receipt);
-            return { receipt, event };
-          }),
+          [input.event],
+          (timing) =>
+            Effect.gen(function* () {
+              const reserved: CommandReceiptStore.ProjectCommandReceiptV2 = {
+                commandId: input.commandId,
+                projectId: input.projectId,
+                commandType: input.commandType,
+                acceptedAt: input.acceptedAt,
+                resultSequence: 0,
+                status: "accepted",
+                error: null,
+              };
+              if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
+                return {
+                  receipt: yield* existingProjectReceipt(input.commandId),
+                  event: undefined,
+                };
+              }
+              const event = yield* timing.measure(
+                "append",
+                eventStore.appendProjectEvent(input.event),
+              );
+              yield* timing.measure(
+                "project",
+                timing.projectEvent(event.type, projectStore.apply(event)),
+              );
+              const receipt = { ...reserved, resultSequence: event.sequence };
+              yield* commandReceipts.upsert(receipt);
+              return { receipt, event };
+            }),
           (result) =>
             result.event === undefined ? Effect.void : eventStore.publishCommitted([result.event]),
         );

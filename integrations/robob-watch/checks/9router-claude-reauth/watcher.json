@@ -1,0 +1,18 @@
+{
+  "id": "9router-claude-reauth",
+  "title": "9router Claude reauth supervisor",
+  "check": "./check.sh",
+  "interval_s": 60,
+  "mode": "wake",
+  "context": "The 9router Claude recovery supervisor check has failed. Treat the router/control state as unknown. Inspect its journal and lease; do not start another recovery or remove a lease until the prior worker is conclusively terminal. Do not repeat credentials, codes or auth URLs.",
+  "expires_at": null,
+  "max_fires": 0,
+  "serial": false,
+  "paused": false,
+  "depends": [
+    "ssd"
+  ],
+  "relays": [],
+  "created_at": "2026-11-01T12:25:21.069Z",
+  "created_by_session": null
+}

@@ -1,0 +1,10 @@
+#!/bin/sh
+# offbox-rtcwake SECONDS: (re)arm an RTC wake alarm SECONDS from now. A timer keeps one armed while the
+# machine runs and the shutdown hook arms a short one, so a real power-off (thermal trip, `poweroff -ff`)
+# is followed by a wake-up. Whether the board honours it from S5 is checked by acceptance.sh.
+secs=${1:-900}
+rtc=/sys/class/rtc/rtc0/wakealarm
+[ -w "$rtc" ] || exit 0
+echo 0 > "$rtc" 2>/dev/null
+echo "+$secs" > "$rtc" 2>/dev/null
+exit 0

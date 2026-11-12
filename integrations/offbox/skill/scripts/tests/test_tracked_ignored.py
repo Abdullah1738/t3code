@@ -191,7 +191,10 @@ class TrackedIgnoredTests(unittest.TestCase):
             if cmd[0] == ssh_sync.RSYNC and "--files-from=-" in cmd:
                 return subprocess.CompletedProcess(cmd, 12, "", "rsync: connection unexpectedly closed")
             return self.run_local(cmd, **kw)
-        with patch.object(ssh_sync.subprocess, "run", side_effect=fail_second):
+        with patch.object(ssh_sync.subprocess, "run", side_effect=fail_second), \
+                patch.object(ssh_sync, "RETRY_PAUSES", (0, 0, 0)), \
+                patch.object(ssh_sync, "close_master"), patch.object(ssh_sync, "setup"), \
+                patch.object(ssh_sync.api, "get", return_value={"state": "ready"}):
             with self.assertRaises(OffboxError) as cm:
                 self.push()
         self.assertEqual(cm.exception.code, 90)

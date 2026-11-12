@@ -4287,6 +4287,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         return rows.map((row) => ThreadId.make(row.thread_id));
       },
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+      // These lifetime-table scans run after readiness; a synchronous writer
+      // scan would still freeze requests even from a background Effect fiber.
+      (effect, kind) =>
+        kind === "subagent-results" || kind === "delegated-completions"
+          ? effect.pipe(NodeSqliteClient.readOnly, NodeSqliteClient.backgroundReads)
+          : effect,
     );
 
     const getUnreadableThreadIds = Effect.fn("ProjectionStore.getUnreadableThreadIds")(

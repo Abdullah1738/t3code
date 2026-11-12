@@ -1,13 +1,34 @@
 #!/usr/bin/env node
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
+
+// Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
+export function ignoreMacosTypeOfServiceEinval(
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI; no Effect runtime.
+  platform = process.platform,
+  socketPrototype = NodeNet.Socket.prototype,
+) {
+  if (platform !== "darwin") return;
+  const setTypeOfService = socketPrototype.setTypeOfService;
+  if (typeof setTypeOfService !== "function") return;
+  socketPrototype.setTypeOfService = function (...args) {
+    try {
+      return setTypeOfService.apply(this, args);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "EINVAL") return this;
+      throw error;
+    }
+  };
+}
+ignoreMacosTypeOfServiceEinval();
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
 const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
@@ -494,7 +515,7 @@ async function main() {
       const text = need(args.slice(1).join(" "), "TEXT");
       const requestId =
         flags["request-id"] === undefined
-          ? randomUUID()
+          ? NodeCrypto.randomUUID()
           : need(flags["request-id"], "--request-id");
       const controller = new AbortController();
       const abort = () => controller.abort();

@@ -1,3 +1,4 @@
+import * as McpDeadline from "./McpDeadline.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
   CommandId,
@@ -136,6 +137,7 @@ const DEFAULT_THREAD_ITEM_MAX_CHARS = 20_000;
 
 interface ResolvedTarget {
   readonly modelSelection: ModelSelection;
+  readonly selectionRouting?: NonNullable<OrchestratorMcpDelegateTaskResult["selectionRouting"]>;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
 }
 
@@ -282,6 +284,8 @@ function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): Orchestrato
     schedule: task.schedule,
     nextRunAt: task.nextRunAt,
     lastRunStatus: task.lastRunStatus,
+    lastRunError: task.lastRunError,
+    missedRuns: task.missedRuns,
     ...(task.webhook?.url == null || !mayRun ? {} : { webhookUrl: task.webhook.url }),
     ...(task.webhook === undefined
       ? {}
@@ -1677,9 +1681,44 @@ const make = Effect.gen(function* () {
         );
       }
     }
+    const requestedProviderInstanceId = requestedWasMapped
+      ? ("opencode" as ProviderInstanceId)
+      : (input.target?.providerInstanceId ??
+        (input.target?.driverKind === undefined || input.target.driverKind === "opencode"
+          ? originalSelection.instanceId
+          : instanceId));
+    const sourceModel = input.target?.model ?? originalSelection.model;
+    const sourceOptions =
+      requestedOptions ??
+      (requestedProviderInstanceId === originalSelection.instanceId &&
+      sourceModel === originalSelection.model
+        ? originalSelection.options
+        : undefined);
+    const requested = {
+      providerInstanceId: requestedProviderInstanceId,
+      model: sourceModel,
+      ...(sourceOptions === undefined ? {} : { options: sourceOptions }),
+    };
+    const describeOptions = (selections: ModelSelection["options"]) =>
+      selections?.length
+        ? ` (${selections.map(({ id, value }) => `${id} ${value}`).join(", ")})`
+        : "";
+    const selectionRouting =
+      mappedDestination &&
+      resolveSelection({
+        instanceId: requestedProviderInstanceId,
+        model: sourceModel,
+      }).kind === "mapped"
+        ? {
+            requested,
+            reason: "harness-migration" as const,
+            message: `Routed ${requestedProviderInstanceId}/${sourceModel}${describeOptions(sourceOptions)} → ${instanceId}/${model}${describeOptions(options)} by harness migration; this is the same route as ${instanceId}/${model}, not a separate fallback.`,
+          }
+        : undefined;
     return {
       modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
       supportedRuntimeModes: provider.supportedRuntimeModes,
+      ...(selectionRouting === undefined ? {} : { selectionRouting }),
     };
   });
 
@@ -1927,6 +1966,7 @@ const make = Effect.gen(function* () {
       providerInstanceId: modelSelection.instanceId,
       model: modelSelection.model,
       options: modelSelection.options ?? [],
+      ...(task.selectionRouting === undefined ? {} : { selectionRouting: task.selectionRouting }),
       ...(Option.isSome(progressGuard)
         ? progressGuard.value.status(task.childThreadId)
         : { lastProgressAt: null, lastProgressKind: null, thinkingSince: null }),
@@ -2051,7 +2091,11 @@ const make = Effect.gen(function* () {
       );
     },
     (effect, _scope, _taskId, timeoutMs) =>
-      effect.pipe(Effect.timeoutOption(Duration.millis(timeoutMs)), Effect.map(Option.flatten)),
+      effect.pipe(
+        McpDeadline.awaitInterruptibly,
+        Effect.timeoutOption(Duration.millis(timeoutMs)),
+        Effect.map(Option.flatten),
+      ),
   );
 
   const scheduledTaskRunModes = Effect.fn("OrchestratorMcpService.scheduledTaskRunModes")(
@@ -2476,7 +2520,19 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
-      const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+      let retryKey = input.clientRequestId;
+      const bounded = <A, E, R>(stage: string, effect: Effect.Effect<A, E, R>, taskId?: string) =>
+        McpDeadline.withDeadline(effect, {
+          code: stage === "caller" ? "caller_unresolved" : "delegation_timeout",
+          threadId: callerScope.thread?.threadId,
+          stage,
+          ...(retryKey === undefined ? {} : { requestKey: retryKey }),
+          ...(taskId === undefined ? {} : { taskId }),
+        });
+      const { scope, parent } = yield* bounded(
+        "caller",
+        loadThreadCaller(callerScope, "delegate_task"),
+      );
       const parentRun = parent.runs
         .filter(ThreadManagementService.isActiveRun)
         .toSorted((left, right) => right.ordinal - left.ordinal)[0];
@@ -2490,25 +2546,35 @@ const make = Effect.gen(function* () {
           "Delegated tasks require an active run owned by this MCP provider session.",
         );
       }
-      const providers = yield* loadProviders;
-      const key = yield* requestKey(input.clientRequestId);
+      const providers = yield* bounded("catalog", loadProviders);
+      const key = yield* bounded("request_key", requestKey(input.clientRequestId));
+      retryKey = key;
       const commandId = stableCommandId({
         scope,
         requestKey: key,
         operation: "delegate-task",
       });
-      const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
-      const settings = yield* serverSettings.getSettings.pipe(
-        Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+      const isRetryOfAcceptedDelegation = yield* bounded(
+        "receipt",
+        threadManagement.hasReceipt(commandId),
       );
-      const target = yield* resolveTargetRechecking({
-        parent,
-        target: input.target,
-        providers,
-        delegateSelection: true,
-        migrateSelection: settings.ardudHarnessMigration?.selections === "apply",
-        skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
-      });
+      const settings = yield* bounded(
+        "settings",
+        serverSettings.getSettings.pipe(
+          Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+        ),
+      );
+      const target = yield* bounded(
+        "selection",
+        resolveTargetRechecking({
+          parent,
+          target: input.target,
+          providers,
+          delegateSelection: true,
+          migrateSelection: settings.ardudHarnessMigration?.selections === "apply",
+          skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
+        }),
+      );
       const runtimeMode = yield* resolveRuntimeMode(
         parent.thread.runtimeMode,
         input.runtimeMode,
@@ -2520,7 +2586,7 @@ const make = Effect.gen(function* () {
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
-        const project = yield* requireProject(parent.thread.projectId);
+        const project = yield* bounded("workspace", requireProject(parent.thread.projectId));
         const base = yield* gitDriver
           .resolveCommit({
             cwd: parent.thread.worktreePath ?? project.workspaceRoot,
@@ -2530,6 +2596,7 @@ const make = Effect.gen(function* () {
             Effect.mapError(() =>
               failure("invalid_request", "Unable to resolve the parent checkout commit."),
             ),
+            (effect) => bounded("workspace", effect),
           );
         // Launch preparation creates the worktree from the project root, so a
         // parent checkout in another repository (such as a Git folder inside
@@ -2544,6 +2611,7 @@ const make = Effect.gen(function* () {
                   `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`,
                 ),
               ),
+              (effect) => bounded("workspace", effect),
             );
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
@@ -2564,6 +2632,9 @@ const make = Effect.gen(function* () {
           ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
+          ...(target.selectionRouting === undefined
+            ? {}
+            : { selectionRouting: target.selectionRouting }),
           runtimeMode,
           interactionMode,
           ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
@@ -2581,6 +2652,7 @@ const make = Effect.gen(function* () {
                   `Unable to create delegated task: ${errorMessage(error)}`,
                 ),
           ),
+          (effect) => bounded("dispatch", effect),
         );
       const taskEvent = result.storedEvents.find(
         (stored) =>
@@ -2602,15 +2674,19 @@ const make = Effect.gen(function* () {
         childRunEvent?.event.type === "run.created" &&
         childRunEvent.event.payload.workspacePreparation !== undefined
       ) {
-        yield* threadLaunch.prepareRun({
-          commandId,
-          threadId: childThreadId,
-          runId: childRunEvent.event.payload.id,
-        });
+        yield* bounded(
+          "workspace_preparation",
+          threadLaunch.prepareRun({
+            commandId,
+            threadId: childThreadId,
+            runId: childRunEvent.event.payload.id,
+          }),
+          taskId,
+        );
       }
 
       if (input.mode !== "wait") {
-        return yield* readTask(scope, taskId, false, true);
+        return yield* bounded("result", readTask(scope, taskId, false, true), taskId);
       }
       const timeoutMs = Math.min(
         MAX_WAIT_TIMEOUT_MS,
@@ -2635,6 +2711,7 @@ const make = Effect.gen(function* () {
           completionWake: "always",
         })
         .pipe(
+          (effect) => bounded("wake_policy", effect, taskId),
           Effect.catch((error) =>
             Effect.logWarning("orchestrator-mcp.delegate-task.wake-policy-failed", {
               taskId,
@@ -2653,7 +2730,7 @@ const make = Effect.gen(function* () {
             }),
           ),
         );
-      return yield* readTask(scope, taskId, Option.isNone(waited), true);
+      return yield* bounded("result", readTask(scope, taskId, Option.isNone(waited), true), taskId);
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");

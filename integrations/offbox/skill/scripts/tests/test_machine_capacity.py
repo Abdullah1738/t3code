@@ -581,7 +581,6 @@ class IntegratedCapacityTests(Isolated):
         self.stack.enter_context(patch.object(cli, "time", self.clock.time))
         self.stack.enter_context(patch.object(outage, "time", self.clock.time))
         self.stack.enter_context(patch.object(outage, "now", lambda: self.clock.t))
-        self.stack.enter_context(patch("offbox_lib.localfirst.decide", return_value="test"))
         self.stack.enter_context(patch.object(fallback, "note_infra_failure"))
         self.stack.enter_context(patch.object(lease, "cap_check"))
 

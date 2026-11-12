@@ -381,7 +381,7 @@ class SavedCard:
                 and bool(re.fullmatch(r'[0-9xX*• .-]*' + order_card.LAST4, self.mask))
                 and len(re.sub(r'\D', '', self.mask)) <= 12
                 and bool(re.search(r'[xX*•]', self.mask)), 'CARD_MISMATCH')
-        require(isinstance(self.network, str) and self.network.lower() == 'mastercard', 'CARD_MISMATCH')
+        require(isinstance(self.network, str) and self.network.lower() == order_card.NETWORK, 'CARD_MISMATCH')
 
 
 def project_cards(data):
@@ -406,7 +406,7 @@ def saved_order_card(data):
     """Select the unique live nondeleted Mastercard, never another default card."""
     projected = project_cards(data)
     matches = [row for row, p in zip(data['data'], projected)
-               if p['last4'] == order_card.LAST4 and p['network'] == 'mastercard' and p['is_deleted'] is False]
+               if p['last4'] == order_card.LAST4 and p['network'] == order_card.NETWORK and p['is_deleted'] is False]
     require(len(matches) == 1, 'SAVED_CARD_NOT_UNIQUE')
     row = matches[0]
     card = SavedCard(row.get('id'), row.get('ccMasked'), row.get('ccType'))
@@ -560,7 +560,7 @@ def review_snapshot(snapshot, *, expected_skus, expected_total_minor, required_p
                 'MERCHANT_QTY_MAX_EXCEEDED')
     payment = p['payment']
     require(payment['method'] == 'cc_noonpay' and payment['last4'] == order_card.LAST4
-            and str(payment['network']).lower() == 'mastercard' and payment['token_ref'] == fingerprint(card.token)
+            and str(payment['network']).lower() == order_card.NETWORK and payment['token_ref'] == fingerprint(card.token)
             and payment['wallet_minor'] == 0 and payment['charge_minor'] == expected_total_minor
             and not payment['emi_selected'], 'PAYMENT_MISMATCH')
     # noon asks for CVV on some carts; complete(cvv=...) encrypts it, so allow_cvv

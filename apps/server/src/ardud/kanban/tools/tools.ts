@@ -212,7 +212,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -227,7 +227,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -435,7 +435,7 @@ const CardAsk = tool(
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may drop asks in todo and block or drop asks in needs_owner.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -514,7 +514,7 @@ const CardFlag = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only." +
+  "Park a card that has no running thread on the one thing it waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only, once they are not running (e.g. a card in review waiting on a push). A worker in Working waiting on a PR's CI calls watch_pull_request and ends its turn instead; for any other wait it asks its board evaluator to set it and ends its turn." +
     (WAITS_ENGINE_WIRED
       ? ""
       : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
@@ -594,7 +594,7 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
@@ -640,12 +640,20 @@ const DiscussionRead = tool(
 const WikiRead = tool(
   "wiki_read",
   "Read the board wiki",
-  "The board's shared lessons. Without slug: every page.",
+  "The board's shared lessons. Without slug: a list of pages (slug, title, size); pass slug or slugs to read them.",
   {
     slug: Schema.optional(TrimmedNonEmptyString),
+    slugs: Schema.optional(
+      Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1), Schema.isMaxLength(20)),
+    ),
     boardId: BoardRef,
   },
-  { pages: Records },
+  {
+    pages: Records,
+    index: Schema.optional(Records),
+    missing: Schema.optional(Schema.Array(Schema.String)),
+    hint: Schema.optional(Schema.String),
+  },
   { readonly: true },
 );
 

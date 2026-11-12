@@ -95,6 +95,12 @@ export const ThreadPullRequestWatch = Schema.Struct({
   /** Remarks created exactly at `remarksThrough` that were reported, so a late one still counts. */
   remarkIds: Schema.Array(TrimmedNonEmptyString),
   conflicting: Schema.Boolean,
+  /** Head SHA a conflicting read was last seen on, waiting for a second matching read before the wake. */
+  conflictHead: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  /** head:base key the last conflict wake was sent for; no second conflict wake for the same key. */
+  conflictWokeFor: Schema.NullOr(Schema.String).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   /** Comment-only wakes in a row. Watching stops at a limit, so bots cannot loop it. */
   wakes: NonNegativeInt,
 });

@@ -54,6 +54,7 @@ const coreResponse = (pullRequest: Readonly<Record<string, unknown>> = {}) => ({
         autoMergeRequest: null,
         headRefName: "feature",
         baseRefName: "main",
+        baseRefOid: "base123",
         headRefOid: "abc123",
         state: "OPEN",
         createdAt: "2026-07-01T00:00:00Z",
@@ -530,6 +531,7 @@ const checkContextsPage = (
   nodes: ReadonlyArray<Record<string, unknown>>,
   endCursor: string | null,
   headRefOid = "abc123",
+  checksHeadSha = headRefOid,
 ) =>
   encodeJson({
     data: {
@@ -540,6 +542,7 @@ const checkContextsPage = (
             nodes: [
               {
                 commit: {
+                  oid: checksHeadSha,
                   statusCheckRollup: {
                     contexts: { nodes, pageInfo: { hasNextPage: endCursor !== null, endCursor } },
                   },
@@ -718,6 +721,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
               nodes: [
                 {
                   commit: {
+                    oid: "abc123",
                     statusCheckRollup: {
                       contexts: {
                         nodes: [
@@ -912,6 +916,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
                 nodes: [
                   {
                     commit: {
+                      oid: "abc123",
                       statusCheckRollup: {
                         contexts: {
                           nodes: paginated ? [] : [node],
@@ -1081,6 +1086,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
             nodes: [
               {
                 commit: {
+                  oid: "abc123",
                   statusCheckRollup: {
                     contexts: { nodes: checks, pageInfo: { hasNextPage: false, endCursor: null } },
                   },
@@ -1196,6 +1202,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
             nodes: [
               {
                 commit: {
+                  oid: "abc123",
                   statusCheckRollup: {
                     contexts: {
                       nodes: [
@@ -3018,7 +3025,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
       description: "base-only write",
       basePermission: "WRITE",
       sourcePermission: "READ",
-      headRef: { id: "REF" },
+      headRef: { id: "REF", target: { __typename: "Commit", oid: "abc123" } },
       expected: false,
       actionAllowed: false,
     },
@@ -3026,7 +3033,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
       description: "source-only write",
       basePermission: "READ",
       sourcePermission: "WRITE",
-      headRef: { id: "REF" },
+      headRef: { id: "REF", target: { __typename: "Commit", oid: "abc123" } },
       expected: true,
       actionAllowed: true,
     },
@@ -3042,7 +3049,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
       description: "an unavailable source repository",
       basePermission: "WRITE",
       sourcePermission: null,
-      headRef: { id: "REF" },
+      headRef: { id: "REF", target: { __typename: "Commit", oid: "abc123" } },
       expected: false,
       actionAllowed: false,
     },
@@ -3076,7 +3083,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
         state: "MERGED",
         isCrossRepository: true,
         headRepository: { nameWithOwner: "contributor/web-fork", viewerPermission: "WRITE" },
-        headRef: { id: "REF" },
+        headRef: { id: "REF", target: { __typename: "Commit", oid: "abc123" } },
       });
       mockedExecute.mockReturnValue(Effect.succeed(output(encodeJson(answer))));
       const provider = yield* GitHubPullRequestProvider.make;
@@ -4714,6 +4721,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
                   nodes: [
                     {
                       commit: {
+                        oid: "abc123",
                         statusCheckRollup: {
                           contexts: {
                             nodes: [
@@ -4766,6 +4774,42 @@ layer("GitHubPullRequestApi.layer", (it) => {
     }),
   );
 
+  it.effect("rejects paginated checks whose commit differs from the PR head", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            encodeJson(
+              coreResponse({
+                commits: {
+                  nodes: [
+                    {
+                      commit: {
+                        oid: "abc123",
+                        statusCheckRollup: {
+                          contexts: { nodes: [], pageInfo: { hasNextPage: true } },
+                        },
+                      },
+                    },
+                  ],
+                },
+              }),
+            ),
+          ),
+        ),
+      );
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(output(checkContextsPage([], null, "abc123", "old-rollup"))),
+      );
+      const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      const result = yield* cli
+        .getPullRequestDetail({ cwd: "/w", repository: "acme/web", host: "github.com", number: 7 })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(result));
+      expect(mockedExecute).toHaveBeenCalledTimes(2);
+    }),
+  );
+
   it.effect("reads every check when the combined response has another page", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValueOnce(
@@ -4777,6 +4821,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
                   nodes: [
                     {
                       commit: {
+                        oid: "abc123",
                         statusCheckRollup: {
                           contexts: {
                             nodes: [
@@ -4835,6 +4880,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
           nodes: [
             {
               commit: {
+                oid: "abc123",
                 statusCheckRollup: {
                   contexts: {
                     nodes: [],

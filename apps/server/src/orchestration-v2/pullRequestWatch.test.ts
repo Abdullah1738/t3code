@@ -23,6 +23,8 @@ const watch = (overrides: Partial<ThreadPullRequestWatch> = {}): ThreadPullReque
   remarksThrough: STARTED,
   remarkIds: [],
   conflicting: false,
+  conflictHead: null,
+  conflictWokeFor: null,
   wakes: 0,
   ...overrides,
 });
@@ -61,8 +63,50 @@ const remark = (
 });
 
 const noRemarks: ReadonlyArray<PullRequestComment> = [];
+const frontendRequired = [
+  "Lockfile Validation",
+  "Code Quality",
+  "Build Check",
+  "Security Audit",
+].map((name) => ({ ...check(name, "success"), required: true }));
 
 describe("evaluatePullRequestWatch", () => {
+  it("holds PR 1571's required green while its test shards are pending, then wakes once", () => {
+    const pending = detail({
+      headSha: "d1f7fff87a6c38e3235f45d2a16ccafbe3cf0aab",
+      checks: [
+        ...frontendRequired,
+        ...[1, 2, 3, 4].map((i) => ({ ...check(`Test shard ${i}/4`, "pending"), required: false })),
+      ],
+    });
+    const held = evaluatePullRequestWatch(watch(), pending, noRemarks);
+    assert.deepEqual(held.changes, []);
+    assert.isFalse(held.next.passed);
+    assert.deepEqual(held.next.passedChecks, []);
+    assert.deepEqual(held.next.passedPending, []);
+    const green = {
+      ...pending,
+      checks: pending.checks.map((c) => ({ ...c, status: "success" as const })),
+    };
+    const settled = evaluatePullRequestWatch(held.next, green, noRemarks);
+    assert.deepEqual(settled.changes, [{ kind: "checks-passed", count: 4, required: true }]);
+    const message = pullRequestWatchMessage({
+      number: 1571,
+      url: "https://github.com/o/r/pull/1571",
+      baseBranch: "main",
+      headSha: green.headSha ?? null,
+      report: settled,
+    });
+    assert.include(message.text, "All 4 required checks passed on d1f7fff.");
+    assert.equal(message.notification.summary, "#1571: checks passed");
+    assert.deepEqual(evaluatePullRequestWatch(settled.next, green, noRemarks).changes, []);
+  });
+  it("never reports a zero-status Forgejo head as checks passed", () => {
+    const result = evaluatePullRequestWatch(watch(), detail({ checks: [] }), noRemarks);
+    assert.isFalse(result.next.passed);
+    assert.deepEqual(result.changes, []);
+  });
+
   it("reports each failure at once, even while another check never finishes", () => {
     const bot = check("CodeRabbit", "pending");
     const first = detail({ checks: [check("lint", "failure"), check("test", "pending"), bot] });
@@ -81,7 +125,7 @@ describe("evaluatePullRequestWatch", () => {
     assert.equal(evaluatePullRequestWatch(test.next, pushed, noRemarks).changes.length, 1);
   });
 
-  it("reports passed once the required checks pass, whatever the others do", () => {
+  it("waits for optional checks even when the required checks have passed", () => {
     const required = (name: string, status: PullRequestCheck["status"]) => ({
       ...check(name, status),
       required: true,
@@ -89,9 +133,15 @@ describe("evaluatePullRequestWatch", () => {
     const green = detail({
       checks: [required("test", "success"), required("lint", "success"), check("bot", "pending")],
     });
-    const passed = evaluatePullRequestWatch(watch(), green, noRemarks);
+    const held = evaluatePullRequestWatch(watch(), green, noRemarks);
+    assert.deepEqual(held.changes, []);
+    const settled = {
+      ...green,
+      checks: green.checks.map((c) => ({ ...c, status: "success" as const })),
+    };
+    const passed = evaluatePullRequestWatch(held.next, settled, noRemarks);
     assert.deepEqual(passed.changes, [{ kind: "checks-passed", count: 2, required: true }]);
-    assert.deepEqual(evaluatePullRequestWatch(passed.next, green, noRemarks).changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(passed.next, settled, noRemarks).changes, []);
 
     const plain = detail({ checks: [check("test", "success"), check("bot", "pending")] });
     assert.deepEqual(evaluatePullRequestWatch(watch(), plain, noRemarks).changes, []);
@@ -103,7 +153,7 @@ describe("evaluatePullRequestWatch", () => {
       required: true,
     });
     const tests = detail({
-      checks: [required("Tests", "success"), check("Smoke Tests", "pending")],
+      checks: [required("Tests", "success"), check("Smoke Tests", "success")],
     });
     const first = evaluatePullRequestWatch(watch(), tests, noRemarks);
     assert.deepEqual(first.changes, [{ kind: "checks-passed", count: 1, required: true }]);
@@ -127,6 +177,110 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(waiting.next, gated, noRemarks).changes, [
       { kind: "checks-passed", count: 2, required: true },
     ]);
+  });
+
+  it("holds required green for an active workflow placeholder without recording a pass", () => {
+    const pending = detail({
+      checks: [...frontendRequired, check("CI workflow run 43042659234", "pending")],
+    });
+    const held = evaluatePullRequestWatch(watch(), pending, noRemarks);
+    assert.deepEqual(held.changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(held.next, pending, noRemarks).changes, []);
+    const settled = evaluatePullRequestWatch(
+      held.next,
+      detail({ checks: frontendRequired }),
+      noRemarks,
+    );
+    assert.deepEqual(settled.changes, [{ kind: "checks-passed", count: 4, required: true }]);
+  });
+
+  it("reports a required failure immediately while optional checks are pending", () => {
+    const failed = { ...frontendRequired[0]!, status: "failure" as const };
+    const report = evaluatePullRequestWatch(
+      watch(),
+      detail({
+        checks: [failed, ...frontendRequired.slice(1), check("Test shard 1/4", "pending")],
+      }),
+      noRemarks,
+    );
+    assert.deepEqual(report.changes, [{ kind: "checks-failed", failed: [failed] }]);
+  });
+
+  it.each(["failure", "cancelled", "action-required"] as const)(
+    "reports optional %s immediately while other checks are pending",
+    (status) => {
+      const failed = { ...check("Advisory", status), required: false };
+      const report = evaluatePullRequestWatch(
+        watch(),
+        detail({ checks: [...frontendRequired, failed, check("Tests", "pending")] }),
+        noRemarks,
+      );
+      assert.deepEqual(report.changes, [{ kind: "checks-failed", failed: [failed] }]);
+      const message = pullRequestWatchMessage({
+        number: 12,
+        url: "https://github.com/o/r/pull/12",
+        baseBranch: "main",
+        headSha: report.next.headSha,
+        report,
+      });
+      assert.include(message.text, `Advisory (${status}, not required)`);
+      assert.equal(message.notification.outcome, "failed");
+    },
+  );
+
+  it("fails PR 1573 immediately and names the non-required failed and cancelled shards", () => {
+    const failed = { ...check("Test shard 3/4", "failure"), required: false };
+    const cancelled = { ...check("Test shard 2/4", "cancelled"), required: false };
+    const report = evaluatePullRequestWatch(
+      watch(),
+      detail({
+        headSha: "26c6f35abcd",
+        checks: [...frontendRequired, failed, cancelled, check("Tests", "pending")],
+      }),
+      noRemarks,
+    );
+    assert.deepEqual(report.changes, [{ kind: "checks-failed", failed: [failed, cancelled] }]);
+    assert.isFalse(report.next.passed);
+    const message = pullRequestWatchMessage({
+      number: 1573,
+      url: "https://github.com/o/r/pull/1573",
+      baseBranch: "main",
+      headSha: report.next.headSha,
+      report,
+    });
+    assert.include(message.text, "Test shard 3/4 (failure, not required)");
+    assert.include(message.text, "Test shard 2/4 (cancelled, not required)");
+    assert.equal(message.notification.summary, "#1573: checks failed");
+    assert.equal(message.notification.outcome, "failed");
+    const settled = detail({ checks: [...frontendRequired, failed, cancelled] });
+    assert.deepEqual(evaluatePullRequestWatch(watch(), settled, noRemarks).changes, [
+      { kind: "checks-failed", failed: [failed, cancelled] },
+    ]);
+  });
+
+  it("resets a required pass when the head moves to pending optional checks", () => {
+    const green = detail({ checks: frontendRequired });
+    const passed = evaluatePullRequestWatch(watch(), green, noRemarks);
+    const pushed = detail({
+      headSha: "bbbbbbbbbb",
+      checks: [...frontendRequired, check("Tests", "pending")],
+    });
+    const held = evaluatePullRequestWatch(passed.next, pushed, noRemarks);
+    assert.deepEqual(held.changes, []);
+    assert.isFalse(held.next.passed);
+    assert.deepEqual(held.next.passedChecks, []);
+    assert.deepEqual(held.next.passedPending, []);
+    const settled = evaluatePullRequestWatch(
+      held.next,
+      { ...pushed, checks: frontendRequired },
+      noRemarks,
+    );
+    assert.deepEqual(settled.changes, [{ kind: "checks-passed", count: 4, required: true }]);
+    assert.deepEqual(
+      evaluatePullRequestWatch(settled.next, { ...pushed, checks: frontendRequired }, noRemarks)
+        .changes,
+      [],
+    );
   });
 
   it("does not report passed again for a new passed check where none is required", () => {
@@ -315,23 +469,125 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(report.next, detail(), comments).changes, []);
   });
 
-  it("reports a conflict once, until the branch is clean again", () => {
-    const conflicting = detail({ mergeability: "conflicting" });
-    const first = evaluatePullRequestWatch(watch(), conflicting, noRemarks);
-    assert.deepEqual(first.changes, [{ kind: "conflicting" }]);
-    const recomputing = evaluatePullRequestWatch(
+  it("ignores a single conflicting read followed by a clean one (PR 1110)", () => {
+    const first = evaluatePullRequestWatch(
+      watch(),
+      detail({ mergeability: "conflicting" }),
+      noRemarks,
+    );
+    assert.deepEqual(first.changes, []);
+    assert.equal(first.next.conflictHead, "aaaaaaaaaa");
+    assert.isFalse(first.next.conflicting);
+    const clean = evaluatePullRequestWatch(first.next, detail(), noRemarks);
+    assert.deepEqual(clean.changes, []);
+    assert.isNull(clean.next.conflictHead);
+  });
+
+  it("confirms a conflict on the second matching head read, then stays quiet", () => {
+    const conflict = detail({ mergeability: "conflicting", baseSha: "base111111" });
+    const first = evaluatePullRequestWatch(watch(), conflict, noRemarks);
+    const second = evaluatePullRequestWatch(first.next, conflict, noRemarks);
+    assert.deepEqual(second.changes, [
+      { kind: "conflicting", headSha: "aaaaaaaaaa", baseSha: "base111111" },
+    ]);
+    assert.isTrue(second.next.conflicting);
+    assert.equal(second.next.conflictWokeFor, "aaaaaaaaaa:base111111");
+    assert.deepEqual(evaluatePullRequestWatch(second.next, conflict, noRemarks).changes, []);
+  });
+
+  it("does not repeat a conflict after a flap or reset on the same head/base (PR 1205)", () => {
+    for (const baseSha of [undefined, "base111111"]) {
+      const conflict = detail({ mergeability: "conflicting", ...(baseSha ? { baseSha } : {}) });
+      let state = watch();
+      const changes = [];
+      for (const mergeability of [
+        "conflicting",
+        "conflicting",
+        "mergeable",
+        "conflicting",
+        "conflicting",
+      ] as const) {
+        const report = evaluatePullRequestWatch(state, { ...conflict, mergeability }, noRemarks);
+        changes.push(...report.changes);
+        state = report.next;
+      }
+      assert.equal(changes.length, 1);
+      assert.equal(state.conflictWokeFor, baseSha ? `aaaaaaaaaa:${baseSha}` : "aaaaaaaaaa");
+      const reset = { ...state, conflicting: false, conflictHead: null };
+      const first = evaluatePullRequestWatch(reset, conflict, noRemarks);
+      assert.deepEqual(evaluatePullRequestWatch(first.next, conflict, noRemarks).changes, []);
+      if (baseSha) {
+        const clean = evaluatePullRequestWatch(state, detail(), noRemarks);
+        const movedBase = { ...conflict, baseSha: "base222222" };
+        const pending = evaluatePullRequestWatch(clean.next, movedBase, noRemarks);
+        assert.equal(
+          evaluatePullRequestWatch(pending.next, movedBase, noRemarks).changes.length,
+          1,
+        );
+      }
+    }
+  });
+
+  it("restarts conflict confirmation when the head moves", () => {
+    const conflict = detail({ mergeability: "conflicting" });
+    const first = evaluatePullRequestWatch(watch(), conflict, noRemarks);
+    const moved = { ...conflict, headSha: "bbbbbbbbbb" };
+    const pending = evaluatePullRequestWatch(first.next, moved, noRemarks);
+    assert.deepEqual(pending.changes, []);
+    assert.equal(pending.next.conflictHead, "bbbbbbbbbb");
+    const confirmed = evaluatePullRequestWatch(pending.next, moved, noRemarks);
+    assert.deepEqual(confirmed.changes, [{ kind: "conflicting", headSha: "bbbbbbbbbb" }]);
+    const clean = evaluatePullRequestWatch(
+      confirmed.next,
+      detail({ headSha: "cccccccccc" }),
+      noRemarks,
+    );
+    assert.deepEqual(clean.changes, []);
+    assert.isFalse(clean.next.conflicting);
+    assert.isNull(clean.next.conflictHead);
+    const unknown = evaluatePullRequestWatch(
+      confirmed.next,
+      detail({ headSha: "cccccccccc", mergeability: "unknown" }),
+      noRemarks,
+    );
+    assert.isFalse(unknown.next.conflicting);
+    assert.isNull(unknown.next.conflictHead);
+  });
+
+  it("keeps confirmation through unknown but never confirms without a head", () => {
+    const conflict = detail({ mergeability: "conflicting" });
+    const first = evaluatePullRequestWatch(watch(), conflict, noRemarks);
+    const unknown = evaluatePullRequestWatch(
       first.next,
       detail({ mergeability: "unknown" }),
       noRemarks,
     );
-    assert.deepEqual(
-      evaluatePullRequestWatch(recomputing.next, conflicting, noRemarks).changes,
-      [],
-    );
-    const clean = evaluatePullRequestWatch(first.next, detail(), noRemarks);
-    assert.deepEqual(evaluatePullRequestWatch(clean.next, conflicting, noRemarks).changes, [
-      { kind: "conflicting" },
+    assert.deepEqual(unknown.changes, []);
+    assert.deepEqual(evaluatePullRequestWatch(unknown.next, conflict, noRemarks).changes, [
+      { kind: "conflicting", headSha: "aaaaaaaaaa" },
     ]);
+    const missing = { ...conflict, headSha: undefined };
+    const noHead = evaluatePullRequestWatch(watch(), missing, noRemarks);
+    assert.deepEqual(evaluatePullRequestWatch(noHead.next, missing, noRemarks).changes, []);
+  });
+
+  it("names the conflict head and the base GitHub reported in its message", () => {
+    for (const baseSha of [undefined, "f77c1992e5e9"]) {
+      const conflict = detail({ mergeability: "conflicting", ...(baseSha ? { baseSha } : {}) });
+      const pending = evaluatePullRequestWatch(watch(), conflict, noRemarks);
+      const report = evaluatePullRequestWatch(pending.next, conflict, noRemarks);
+      const message = pullRequestWatchMessage({
+        number: 1110,
+        url: "https://github.com/o/r/pull/1110",
+        baseBranch: "native-v1",
+        headSha: "aaaaaaaaaa",
+        report,
+      });
+      assert.include(
+        message.text,
+        `- The branch now conflicts with native-v1 (head aaaaaaa${baseSha ? ", GitHub base f77c199" : ""}).`,
+      );
+    }
   });
 
   it("does not spend the comment wake limit on check results", () => {
@@ -369,7 +625,10 @@ describe("pullRequestWatchMessage", () => {
       headSha: report.next.headSha,
       report,
     });
-    assert.include(message.text, "- Checks failed on aaaaaaa:\n  - lint https://ci.example/lint");
+    assert.include(
+      message.text,
+      "- Checks failed on aaaaaaa:\n  - lint (failure, not required) https://ci.example/lint",
+    );
     assert.include(message.text, '  - reviewer on src/index.ts: "Needs a test."');
     assert.include(message.text, "unwatch_pull_request");
     assert.deepEqual(message.notification, {

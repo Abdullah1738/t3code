@@ -1375,7 +1375,9 @@ export const make = Effect.gen(function* () {
           return {
             ...page,
             // Past the first page a different head is a push mid-walk.
-            changed: page.headSha !== headSha,
+            changed:
+              page.headSha !== headSha ||
+              (page.checksHeadSha !== null && page.checksHeadSha !== page.headSha),
             pageInfo: { hasNextPage: page.nextCursor !== null, endCursor: page.nextCursor },
           };
         },

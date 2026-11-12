@@ -99,6 +99,7 @@ const makeFake = () => {
         Effect.sync(() => {
           threads.get(input.threadId)?.messages.push(input.text);
         }),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,

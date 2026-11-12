@@ -213,3 +213,31 @@ describe("CDP relay downloads", () => {
     ]);
   });
 });
+
+it("returns the host viewport acknowledgment with metrics while guest commands remain responsive", async () => {
+  const viewport = Promise.withResolvers<unknown>();
+  const written: Array<Record<string, unknown>> = [];
+  const relay = createCdpRelayConnection(
+    {
+      ...makeTarget(async () => ({ cssVisualViewport: { zoom: 1 } })),
+      viewport: () => viewport.promise,
+    },
+    (raw) => written.push(JSON.parse(raw)),
+  );
+  relay.receive(
+    JSON.stringify({ id: 1, method: "Page.getLayoutMetrics", sessionId: "t3-preview-page" }),
+  );
+  relay.receive(
+    JSON.stringify({ id: 2, method: "Runtime.evaluate", sessionId: "t3-preview-page" }),
+  );
+  await settle();
+  expect(written.map((message) => message["id"])).toEqual([2]);
+  viewport.resolve({ mode: "fill", width: 390, height: 844 });
+  await settle();
+  expect(written.find((message) => message["id"] === 1)).toMatchObject({
+    result: {
+      cssVisualViewport: { zoom: 1 },
+      t3Viewport: { mode: "fill", width: 390, height: 844 },
+    },
+  });
+});

@@ -112,6 +112,7 @@ export function checkMove(role: MoveRole, card: KanbanCard, to: KanbanStage): Mo
       return no(`dispatcher cannot move ${from} -> ${to}`);
     case "cardThread":
       if (from === "working" && (to === "needs_review" || to === "needs_owner")) return ok;
+      if (from === "todo" && card.activeThreadId === null && to === "needs_review") return ok;
       return no(
         `a card thread can move working -> needs_review or needs_owner, not ${from} -> ${to}`,
       );

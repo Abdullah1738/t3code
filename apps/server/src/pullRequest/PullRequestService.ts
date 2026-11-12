@@ -1604,6 +1604,13 @@ export const make = Effect.gen(function* () {
               ? {}
               : { headRepositoryNameWithOwner: changeRequest.headRepositoryNameWithOwner }),
             ...(changeRequest.headSha ? { headSha: changeRequest.headSha } : {}),
+            ...(changeRequest.headBranchSha === undefined
+              ? {}
+              : { headBranchSha: changeRequest.headBranchSha }),
+            ...(changeRequest.checksHeadSha === undefined
+              ? {}
+              : { checksHeadSha: changeRequest.checksHeadSha }),
+            ...(changeRequest.baseSha ? { baseSha: changeRequest.baseSha } : {}),
             baseBranch: changeRequest.baseBranch,
             createdAt: changeRequest.createdAt,
             updatedAt: changeRequest.updatedAt,

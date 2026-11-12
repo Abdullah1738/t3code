@@ -18,7 +18,7 @@ void ${JSON.stringify(failOn)};`);
 };
 const db = join(sandbox, "bridge.sqlite");
 Bun.spawnSync(["/usr/bin/sqlite3", db, `create table kv (key text primary key, value text); create table inbound (id text primary key, payload text, state text); insert into kv values ('route', '{"id":"ses_live123","generation":1}');`]);
-const env = { ...process.env, ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
+const env = { ...process.env, ROBOB_WATCH_LOAD_OVERRIDE: "0.1", ROBOB_WATCH_ROOT: join(sandbox, "root"), ROBOB_WATCH_SPECTRUM_CLI: stub("spectrum", ""),
   ROBOB_WATCH_TELEGRAM_CLI: stub("telegram", ""), ROBOB_WATCH_BRIDGE_DB: db,
   ROBOB_WATCH_HEADSUP_MS: "1000", WACLI_STORE_DIR: join(sandbox, "wacli") };
 // Checks put the sandbox helpers first on PATH: a logging-only wa there keeps any check that drafts away from the real one.
