@@ -15,7 +15,7 @@
 # mullvad.net, api.mullvad.net and repository.mullvad.net are blocked on UAE lines (TLS reset), so the
 # package comes from GitHub and the daemon reaches the API through its own bridges ("api-access").
 #
-# Four things here are not Mullvad defaults, each for a reason found on install day (home/FAILURE-MODES.md 3.29-3.33):
+# Four things here are not Mullvad defaults, each for a reason found on install day (home/FAILURE-MODES.md 3.29-3.35):
 #  - table inet offbox_vpn gives tailnet flows Mullvad's split-tunnel conntrack mark, so its kill switch lets them through.
 #  - mullvad-early-boot-blocking.service is masked. Its table blocks everything, tailnet and LAN included, until
 #    the daemon replaces it; if the daemon does not start, or anything runs "systemctl start mullvad-daemon" on a

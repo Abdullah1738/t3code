@@ -115,7 +115,9 @@ Owner, 12 Nov 2026: Mullvad on the box, permanently on. `mullvad.sh` (copied to 
 - Set up or rebuild: `scp mullvad.sh root@<server>:/root/ && ssh root@<server> 'bash /root/mullvad.sh install'`,
   then `security find-generic-password -s mullvad-account -a ardud -w | ssh root@<server> offbox-mullvad login`.
   The account number lives in the Mac's Keychain (`mullvad-account`) and in the daemon's own state on the server.
-- Check: `offbox-mullvad check` (also part of `acceptance.sh`). Failures: FAILURE-MODES 3.29-3.34.
+- Some Mullvad exit addresses are refused by Google's download server (Go, Android SDK): a timer runs
+  `offbox-mullvad exit-check` every 10 minutes and takes another relay when that happens.
+- Check: `offbox-mullvad check` (also part of `acceptance.sh`). Failures: FAILURE-MODES 3.29-3.35.
 
 ## With the KVM
 
