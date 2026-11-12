@@ -1,0 +1,223 @@
+#!/bin/sh
+# Mirage Beacon keepalive + hang watchdog.
+# Owner rule 3 Nov 2026: Mirage Beacon must always be running on this Mac.
+# Upgraded 11 Nov 2026: Mirage was alive and LISTENing but unreachable; restart fixed it.
+#
+# Run every 60 s by LaunchAgent com.ardud.mirage-beacon-keepalive.
+#  - process absent            -> open it now (unless Mirage's own self-heal shell is about to)
+#  - health probe fails 3x row -> graceful quit (15 s) -> SIGTERM/SIGKILL -> open -g
+#  - never restarts while a remote client flow is passing data; max 1 restart / 5 min
+#
+# Probes (all on this Mac):
+#  1. ps state not Z (zombie) / T (stopped)
+#  2. TCP 9852 accepts on 127.0.0.1
+#  3. TCP 9853 on 127.0.0.1 returns Mirage's {"supportedFeatures":...} hello (app-level,
+#     needs the app's network code to be alive, not just the kernel backlog)
+#  4. same hello on the LAN IP (en0/en1) when there is one
+#  Info only: Tailscale backend state and IP. Connecting to our own 100.x IP from this
+#  Mac never reaches Mirage (Network.framework user-space stack), even while the iPad is
+#  connected over Tailscale, so it cannot be used as a pass/fail probe.
+#
+# Test mode: MIRAGE_KEEPALIVE_FORCE_FAIL=1 or touch $STATE/force-fail (file removed after
+# a restart) makes the health probe fail. MIRAGE_KEEPALIVE_THRESHOLD overrides 3.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+APP='/Applications/Mirage Beacon.app'
+BUNDLE=com.ethanlipnik.Mirage-Host
+PROC='Mirage Beacon'
+LOG="$HOME/Library/Logs/mirage-beacon-keepalive.log"
+STATE="$HOME/.local/state/mirage-beacon-keepalive"
+THRESHOLD=${MIRAGE_KEEPALIVE_THRESHOLD:-3}
+COOLDOWN=300
+LOG_MAX_BYTES=524288
+LOG_KEEP_LINES=2000
+TAILSCALE=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+[ -x "$TAILSCALE" ] || TAILSCALE=$(command -v tailscale 2>/dev/null || echo /opt/homebrew/bin/tailscale)
+
+mkdir -p "$STATE"
+now=$(date +%s)
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# Cap log size in place (launchd keeps its fd open).
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt "$LOG_MAX_BYTES" ]; then
+  tail -n "$LOG_KEEP_LINES" "$LOG" >"$STATE/log.tmp" && cat "$STATE/log.tmp" >"$LOG"
+  rm -f "$STATE/log.tmp"
+fi
+
+# Single instance (manual runs vs launchd).
+if ! mkdir "$STATE/lock" 2>/dev/null; then
+  lockpid=$(cat "$STATE/lock/pid" 2>/dev/null)
+  if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then exit 0; fi
+  rm -rf "$STATE/lock"; mkdir "$STATE/lock" 2>/dev/null || exit 0
+fi
+echo $$ >"$STATE/lock/pid"
+trap 'rm -rf "$STATE/lock"' EXIT INT TERM
+
+readn() { v=$(cat "$STATE/$1" 2>/dev/null); case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+
+# run_to SECS cmd... : run with a hard timeout, rc 124 on timeout.
+run_to() {
+  _t=$1; shift
+  "$@" & _cp=$!
+  ( sleep "$_t"; kill -9 "$_cp" 2>/dev/null ) >/dev/null 2>&1 & _wp=$!
+  wait "$_cp"; _rc=$?
+  if kill -0 "$_wp" 2>/dev/null; then kill "$_wp" 2>/dev/null; else _rc=124; fi
+  return $_rc
+}
+
+mirage_pid() { pgrep -x "$PROC" 2>/dev/null | head -n 1; }
+
+hello_ok() { # host -> 0 if 9853 sends Mirage's hello within ~3 s
+  nc -d -G 5 -w 3 "$1" 9853 2>/dev/null | LC_ALL=C grep -a -q supportedFeatures
+}
+
+selfheal_pending() { # Mirage's own relaunch shell is still waiting
+  pgrep -f 'com.mirage.host.processExitIntent' >/dev/null 2>&1
+}
+
+open_mirage() {
+  if [ -n "$(mirage_pid)" ]; then log "open skipped: already running pid $(mirage_pid)"; return 0; fi
+  open -g -a "$APP"
+}
+
+wait_listening() { # up to $1 s for the 9853 hello on loopback
+  _i=0
+  while [ "$_i" -lt "$1" ]; do
+    hello_ok 127.0.0.1 && return 0
+    sleep 2; _i=$((_i + 5))
+  done
+  return 1
+}
+
+# Remote flows (peer not loopback/self) and their total bytes; prints "count bytes peers".
+flow_snapshot() {
+  run_to 15 nettop -L 1 -n -x -p "$1" -J bytes_in,bytes_out >"$STATE/nettop.out" 2>/dev/null
+  awk -F, -v self="$2" -v lan="$3" '
+    /<->/ {
+      split($1, a, "<->"); peer = a[2]
+      if (peer ~ /^\*/ || peer ~ /^127\./ || peer ~ /^::1/ ) next
+      ip = peer; sub(/[:.][0-9]+$/, "", ip)
+      if (ip == self || ip == lan) next
+      # bytes_out only (host->client video): a wedged host stops sending even if the client
+      # keeps sending input. nettop can print a flow more than once: keep one value per flow.
+      v = $3; if (!($1 in seen) || v > seen[$1]) seen[$1] = v
+    }
+    END {
+      for (f in seen) { n++; b += seen[f]; split(f, a, "<->"); peers = peers " " a[2] }
+      printf "%d %d%s\n", n + 0, b + 0, peers
+    }' "$STATE/nettop.out"
+}
+
+restart_mirage() {
+  pid=$1
+  echo "$now" >"$STATE/last_restart"
+  log "restart: graceful quit pid $pid"
+  run_to 12 osascript -e "with timeout of 10 seconds" -e "tell application id \"$BUNDLE\" to quit" -e "end timeout" >/dev/null 2>"$STATE/osa.err"
+  rc=$?
+  [ $rc -ne 0 ] && log "restart: osascript quit rc=$rc $(head -c 160 "$STATE/osa.err" | tr '\n' ' ')"
+  i=0
+  while [ $i -lt 15 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    log "restart: still alive after 15 s, SIGTERM"
+    kill -TERM "$pid" 2>/dev/null; sleep 3
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    log "restart: SIGKILL"
+    kill -KILL "$pid" 2>/dev/null; sleep 2
+  fi
+  if kill -0 "$pid" 2>/dev/null; then log "restart: pid $pid would not die"; return 1; fi
+  sleep 2
+  open_mirage
+  if wait_listening 45; then
+    log "restart: OK, pid $(mirage_pid) answering on 9852/9853"
+  else
+    log "restart: pid $(mirage_pid) not answering yet after 45 s (will keep checking)"
+  fi
+  rm -f "$STATE/force-fail" "$STATE/last_hold_log"
+  echo 0 >"$STATE/fails"
+}
+
+# ---------- 1. absent ----------
+pid=$(mirage_pid)
+if [ -z "$pid" ]; then
+  # Mirage's own shell relaunches ~35 s after update-type exits; give it up to 120 s.
+  [ -f "$STATE/absent_since" ] || echo "$now" >"$STATE/absent_since"
+  if selfheal_pending && [ $((now - $(readn absent_since))) -lt 120 ]; then
+    log "absent: Mirage self-heal relaunch pending, leaving it"
+    exit 0
+  fi
+  rm -f "$STATE/absent_since"
+  log "absent: relaunching Mirage Beacon"
+  open_mirage
+  echo 0 >"$STATE/fails"
+  if wait_listening 45; then log "absent: relaunched pid $(mirage_pid), answering"; else log "absent: relaunched pid $(mirage_pid), not answering yet"; fi
+  exit 0
+fi
+rm -f "$STATE/absent_since"
+npids=$(pgrep -x "$PROC" | wc -l | tr -d ' ')
+[ "$npids" -gt 1 ] && log "warn: $npids Mirage processes: $(pgrep -x "$PROC" | tr '\n' ' ')"
+
+# ---------- 2. health ----------
+reasons=""
+st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+case "$st" in
+  Z*|T*) reasons="$reasons state=$st" ;;
+esac
+nc -z -G 5 127.0.0.1 9852 >/dev/null 2>&1 || reasons="$reasons lo:9852-refused"
+hello_ok 127.0.0.1 || reasons="$reasons lo:9853-no-hello"
+lan=""
+for ifc in en0 en1; do lan=$(ipconfig getifaddr "$ifc" 2>/dev/null) && [ -n "$lan" ] && break; done
+if [ -n "$lan" ]; then hello_ok "$lan" || reasons="$reasons lan($lan):9853-no-hello"; fi
+if [ "${MIRAGE_KEEPALIVE_FORCE_FAIL:-0}" = 1 ] || [ -f "$STATE/force-fail" ]; then reasons="$reasons forced-test-failure"; fi
+
+# Tailscale IPv4 from the utun interface (the CLI can stall >10 s under load in launchd).
+ts_ip=$(ifconfig 2>/dev/null | awk '/^utun/ {u=1; next} /^[a-z]/ {u=0} u && $1=="inet" && $2 ~ /^100\./ {print $2; exit}')
+[ -n "$ts_ip" ] || ts_ip=$(run_to 15 "$TAILSCALE" ip -4 2>/dev/null | head -n 1)
+ts_prev=$(cat "$STATE/ts_ip" 2>/dev/null)
+if [ -z "$ts_ip" ]; then
+  [ "$ts_prev" != none ] && log "info: no Tailscale IPv4 on this Mac (Tailscale down or logged out); a Mirage restart would not fix that"
+  echo none >"$STATE/ts_ip"
+elif [ "$ts_ip" != "$ts_prev" ]; then
+  log "info: Tailscale IPv4 $ts_ip"; echo "$ts_ip" >"$STATE/ts_ip"
+fi
+
+fails=$(readn fails)
+if [ -z "$reasons" ]; then
+  [ "$fails" -gt 0 ] && log "healthy again after $fails failed check(s), pid $pid"
+  echo 0 >"$STATE/fails"; rm -f "$STATE/last_hold_log"
+  last_ok=$(readn last_ok_log)
+  if [ $((now - last_ok)) -ge 3600 ]; then
+    log "ok: pid $pid stat=$st 9852/9853 answering (lo${lan:+, lan $lan})${ts_ip:+, tailscale $ts_ip}"
+    echo "$now" >"$STATE/last_ok_log"
+  fi
+  exit 0
+fi
+
+fails=$((fails + 1)); echo "$fails" >"$STATE/fails"
+# While a restart is held back (streaming), repeat lines at most every 10 min.
+noisy=1
+if [ "$fails" -gt "$THRESHOLD" ] && [ $((now - $(readn last_hold_log))) -lt 600 ]; then noisy=0; fi
+[ $noisy = 1 ] && log "check failed ($fails/$THRESHOLD) pid $pid:$reasons"
+[ "$fails" -lt "$THRESHOLD" ] && exit 0
+
+# ---------- 3. restart gates ----------
+set -- $(flow_snapshot "$pid" "$ts_ip" "$lan"); n1=${1:-0}; b1=${2:-0}
+if [ "$n1" -gt 0 ]; then
+  sleep 3
+  set -- $(flow_snapshot "$pid" "$ts_ip" "$lan"); n2=${1:-0}; b2=${2:-0}; shift 2; peers="$*"
+  # Only an exactly unchanged byte count with the same flow count counts as idle;
+  # any change, or a failed/odd sample, is treated as an active client (no restart).
+  if [ "$n2" -ne "$n1" ] || [ "$b2" -ne "$b1" ]; then
+    [ $noisy = 1 ] && log "skip restart: client connected and active (flows $n1->$n2, bytes $b1->$b2 in 3 s; $peers)" && echo "$now" >"$STATE/last_hold_log"
+    exit 0
+  fi
+  log "remote flow(s) present but idle (${b1}->${b2} B): $peers"
+fi
+last=$(readn last_restart)
+if [ $((now - last)) -lt "$COOLDOWN" ]; then
+  log "skip restart: cooldown ($((now - last)) s since last, min $COOLDOWN)"
+  exit 0
+fi
+
+restart_mirage "$pid"
