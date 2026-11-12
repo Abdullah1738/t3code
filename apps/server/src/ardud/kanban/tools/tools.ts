@@ -227,7 +227,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -435,7 +435,7 @@ const CardAsk = tool(
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may drop asks in todo and block or drop asks in needs_owner.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
