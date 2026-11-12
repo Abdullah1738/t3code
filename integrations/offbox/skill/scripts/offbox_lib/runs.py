@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import api, capacity, identity, lease, node_version, pool, ssh_sync
+from . import api, capacity, identity, lease, node_tools, node_version, pool, ssh_sync
 from . import prune, prepare
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, event, log, new_id, now,
@@ -668,15 +668,7 @@ NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 
 
 def missing_deps_hint(root_files: set[str], package_manager: str | None) -> str:
-    manager = package_manager.split("@", 1)[0] if package_manager else ""
-    if manager not in {"pnpm", "bun", "yarn", "npm"}:
-        manager = next((pm for files, pm in (({"pnpm-lock.yaml"}, "pnpm"),
-                                            ({"bun.lock", "bun.lockb"}, "bun"),
-                                            ({"yarn.lock"}, "yarn"),
-                                            ({"package-lock.json"}, "npm")) if files & root_files), "npm")
-    install = {"pnpm": "pnpm install --frozen-lockfile", "bun": "bun install",
-               "yarn": "yarn install --frozen-lockfile",
-               "npm": "npm ci" if "package-lock.json" in root_files else "npm install"}[manager]
+    install = node_tools.install_command(root_files, package_manager)
     return ("no node_modules on this box yet (fresh or pruned box). Install deps and run the command in the same call: "
             f"offbox run -- '{install} && <command>'; offbox save --default afterwards keeps them.")
 
@@ -1104,13 +1096,14 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
 
 def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, run_id: str,
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
-                  image_wait: int = 180, repo_key: str = "") -> str:
+                  image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None) -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     cd = f"$HOME/{rdir}" + (f"/{rel}" if rel and rel != "." else "")
     root = '"$HOME"/' + shlex.quote(rdir)
     deps_check = (f'__offbox_exit=$?; if [ "$__offbox_exit" -ne 0 ] && [ -f {root}/package.json ] '
-                  f'&& [ ! -e {root}/node_modules ]; then printf "\\n%s\\n" {NO_NODE_MODULES_MARKER} >&2; fi; exit "$__offbox_exit"')
+                  f'&& [ ! -e {root}/node_modules ]; then printf "\\n%s\\n" {NO_NODE_MODULES_MARKER} >&2; fi; '
+                  'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
               'trap ' + shlex.quote(deps_check) + ' EXIT',
@@ -1123,6 +1116,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               repo_setup_block(repo_key, rdir),
               GO_REPAIR,
               node,
+              node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
@@ -1251,7 +1245,7 @@ class Runner:
         new_checkout_hint(row, self.root)
         script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
-                               repo_key=me["repo_key"])
+                               repo_key=me["repo_key"], repo_root=self.root)
         from . import start_check
         # From this point a lost response may mean the command executed. Never run it locally again.
         self.started = True
@@ -1923,17 +1917,7 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
 def new_checkout_hint(row: dict, root: Path) -> None:
     if not row.get("_new_checkout") or not (root / "package.json").exists():
         return
-    try:
-        manifest = json.loads((root / "package.json").read_text())
-    except (OSError, ValueError):
-        manifest = {}
-    uses_vp = isinstance(manifest, dict) and any(
-        isinstance(manifest.get(key), dict) and "vite-plus" in manifest[key]
-        for key in ("dependencies", "devDependencies"))
-    install = ("vp i" if uses_vp
-               else "pnpm install --frozen-lockfile" if (root / "pnpm-lock.yaml").exists()
-               else "yarn install" if (root / "yarn.lock").exists()
-               else "npm ci" if (root / "package-lock.json").exists() else "npm install")
+    install = node_tools.repo_install(root)
     say(f"node_modules missing on new box {row['box_id']}; prefix your command with {install} &&")
 
 
