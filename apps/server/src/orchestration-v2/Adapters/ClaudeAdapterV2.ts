@@ -352,7 +352,8 @@ export const ClaudeProviderCapabilitiesV2 = {
     emitsTurnCompleted: true,
     supportsInterrupt: true,
     supportsActiveSteering: true,
-    activeSteeringInterruptsTools: true,
+    // Steers wait for a fresh SDK turn; running tools finish normally.
+    activeSteeringInterruptsTools: false,
     supportsSteeringByInterruptRestart: false,
     supportsQueuedMessages: true,
     terminalStatusQuality: "strong",
@@ -3498,9 +3499,11 @@ interface ActiveClaudeTurnContext {
   // Set while this turn's latest compaction status reports a failure, with
   // Claude's error text when it sent one.
   compactionFailure: { readonly message: string | undefined } | null;
-  // Usage of the results that steers ended, oldest first. The final result's
+  // Usage of the SDK segments before the final steer, oldest first. The final result's
   // usage covers only its own segment, so the turn bills these as well.
   readonly steeredSegmentUsage: Array<SDKResultMessage["usage"]>;
+  readonly pendingSteers: Array<SDKUserMessage>;
+  acceptingSteers: boolean;
   readonly subagentsByTaskId: Map<string, ActiveClaudeSubagent>;
   readonly subagentsByToolUseId: Map<string, ActiveClaudeSubagent>;
   readonly subagentNodesByTaskId: Map<string, OrchestrationV2ExecutionNode["id"]>;
@@ -6568,6 +6571,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
         }) {
+          input.context.acceptingSteers = false;
           yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
           if (input.context.compaction?.status === "running") {
             yield* emitProviderEvent({
@@ -8620,31 +8624,46 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             });
           }
 
-          const resultText =
-            message.type === "result" &&
-            ((message.subtype === "success" && message.is_error) ||
-              terminalStatusFromResult(message) === "failed")
-              ? null
-              : resultTextFromSdkMessage(message);
-          if (
-            context.assistant.emittedNativeItemIds.size === 0 &&
-            context.assistant.fallbackText.length === 0 &&
-            resultText !== null &&
-            resultText.text.length > 0 &&
-            !context.assistant.noticeTexts.has(resultText.text)
-          ) {
-            context.assistant.fallbackText = resultText.text;
-            context.assistant.fallbackNativeItemId = resultText.nativeItemId;
-          }
-
           if (message.type === "result") {
             const completedAt = yield* DateTime.now;
             const interrupted = (yield* Ref.get(interruptedTurns)).has(context.providerTurnId);
             const wasSteered = (yield* Ref.get(steeredTurns)).has(context.providerTurnId);
-            if (!interrupted && wasSteered && isClaudeActiveSteeringAbortResult(message)) {
+            if (
+              !interrupted &&
+              !message.is_error &&
+              terminalStatusFromResult(message) === "completed" &&
+              context.pendingSteers.length > 0
+            ) {
+              // `next` folds into tool/Skill output. Sending only after the
+              // result gives each steer its own SDK user turn, without aborting
+              // tools or completing the enclosing T3 turn between segments.
               context.steeredSegmentUsage.push(message.usage);
+              yield* liveQuery.query.offer(context.pendingSteers.shift()!);
               return;
             }
+            if (!interrupted && wasSteered && isClaudeActiveSteeringAbortResult(message)) {
+              context.steeredSegmentUsage.push(message.usage);
+              const pending = context.pendingSteers.shift();
+              if (pending !== undefined) yield* liveQuery.query.offer(pending);
+              return;
+            }
+            const resultText =
+              (message.subtype === "success" && message.is_error) ||
+              terminalStatusFromResult(message) === "failed"
+                ? null
+                : resultTextFromSdkMessage(message);
+            if (
+              context.assistant.emittedNativeItemIds.size === 0 &&
+              context.assistant.fallbackText.length === 0 &&
+              resultText !== null &&
+              resultText.text.length > 0 &&
+              !context.assistant.noticeTexts.has(resultText.text)
+            ) {
+              context.assistant.fallbackText = resultText.text;
+              context.assistant.fallbackNativeItemId = resultText.nativeItemId;
+            }
+
+            context.acceptingSteers = false;
             yield* Ref.update(steeredTurns, (current) => {
               const next = new Set(current);
               next.delete(context.providerTurnId);
@@ -9750,6 +9769,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               latestAssistantRateLimit: null,
               compactionFailure: null,
               steeredSegmentUsage: [],
+              pendingSteers: [],
+              acceptingSteers: true,
               subagentsByTaskId: new Map(),
               subagentsByToolUseId: new Map(),
               subagentNodesByTaskId: new Map(),
@@ -10024,10 +10045,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
         );
 
-        // A steer is sent with priority "now", which cancels the root turn's
-        // running tool calls. A subagent the root launched in the foreground is
-        // one of them, so it moves to the background first and keeps running;
-        // its result arrives as a task notification like any background agent.
+        // A foreground subagent can hold the SDK turn open indefinitely. Move
+        // it to the background so the root can finish and accept the steer as
+        // a fresh user turn; its result still arrives as a task notification.
         const backgroundForegroundSubagents = Effect.fnUntraced(function* (
           live: ClaudeLiveQueryContext,
         ) {
@@ -10110,7 +10130,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 compileClaudeModelSelection(currentTurn.input.modelSelection).promptEffort,
               ),
               attachments: turnInput.message.attachments,
-              priority: "now",
+              priority: "later",
               attachmentsDir,
               fileSystem,
               skills: yield* userInvocableSkills(currentTurn.input.runtimePolicy.cwd),
@@ -10121,19 +10141,22 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             // the steer fails and the orchestrator starts the follow-up turn.
             if (
               (yield* Ref.get(activeTurn))?.providerTurnId !== turnInput.providerTurnId ||
-              (yield* Ref.get(queryContext)) !== existing
+              (yield* Ref.get(queryContext)) !== existing ||
+              !currentTurn.acceptingSteers
             ) {
               return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                 driver: CLAUDE_PROVIDER,
                 detail: `Claude provider turn ${turnInput.providerTurnId} ended before the steer was sent.`,
               });
             }
+            // No yield between the final check and admission: the SDK result
+            // must either see this message or have already closed steering.
+            currentTurn.pendingSteers.push(userMessage);
             yield* Ref.update(steeredTurns, (current) => {
               const next = new Set(current);
               next.add(turnInput.providerTurnId);
               return next;
             });
-            yield* existing.query.offer(userMessage);
           },
           (effect, turnInput) =>
             effect.pipe(
