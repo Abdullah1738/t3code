@@ -29,7 +29,7 @@ VERTICALS = {'noon': {'nownow', 'main', 'minutes', 'supermall', 'food'},
 OUTCOMES = frozenset({'RESPONSE_RECEIVED', 'UNKNOWN', 'CHALLENGE_REQUIRED', 'PAYMENT_FAILED',
                        'ORDER_ID_RECEIVED', 'PAYMENT_REPORTED_SUCCESS',
                        'EXACT_ORDER_CONFIRMED', 'TRACKER_REGISTERED',
-                       'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED',
+                       'PREORDER_INTENT_RECEIVED','PREORDER_PAYMENT_CONFIRMED','PREORDER_ZERO_AMOUNTS',
                        'FLOW_RELEASED_NO_PAYMENT_SENT', 'STABLE_CART_ADOPTED',
                         'FENCED_PAYMENT_RECONCILED', 'PREPARATION_FAILED', 'CART_READBACK'})
 KINDS = frozenset({'cart', 'quote', 'instructions', 'selection', 'place', 'payment',
@@ -103,7 +103,75 @@ class PaymentError(JournalError):
 
     def __init__(self, code, details):
         super().__init__(code)
+        self.code = code
         self.details = details
+
+
+def _nownow_prepare_gate(db, flow, review_hash=None):
+    now = time.time()
+    prepared = db.execute("SELECT * FROM observations WHERE flow_id=? AND outcome='NOWNOW_PREPARED' "
+                          "ORDER BY sequence DESC LIMIT 1", (flow['id'],)).fetchone()
+    if (not 0 <= now - flow['created_at'] <= 12 * 3600 or prepared is None
+            or not 0 <= now - prepared['observed_at'] <= 3600
+            or (review_hash is not None and prepared['evidence_hash'] != review_hash)):
+        raise PaymentError('NOWNOW_FRESH_PREPARE_REQUIRED', {
+            'flow_id': flow['id'], 'next_action': 're-run --prepare-only for the same basket; use a new flow if older than 12 h',
+            'financial_send': False, 'financial_retry': False})
+
+
+def require_nownow_prepared(flow_id, review_hash=None):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        if flow['app'] != 'noon' or flow['vertical'] != 'nownow':
+            fail('NOWNOW_FLOW_REQUIRED')
+        _nownow_prepare_gate(db, flow, review_hash)
+
+
+def bind_nownow_session(flow_id, session_hash):
+    """Persist creation provenance separately from reviews of an adopted cart."""
+    if not _hash(session_hash):
+        fail('NOWNOW_SESSION_BINDING_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        _active(flow)
+        op = db.execute("SELECT * FROM operations WHERE flow_id=? AND name='cart_create' AND kind='cart'",
+                        (flow_id,)).fetchone()
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or not op or op['state'] != 'OBSERVED'
+                or flow['order_id'] or flow['reserved_minor']):
+            fail('NOWNOW_SESSION_BINDING_INVALID')
+        if db.execute("SELECT 1 FROM observations WHERE flow_id=? AND outcome='NOWNOW_SESSION_OWNED'", (flow_id,)).fetchone():
+            fail('NOWNOW_SESSION_ALREADY_BOUND')
+        if (not db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_create' AND outcome='RESPONSE_RECEIVED'", (flow_id,)).fetchone()
+                or db.execute("SELECT 1 FROM observations WHERE flow_id=? AND operation='cart_create' AND outcome='UNKNOWN'", (flow_id,)).fetchone()):
+            fail('NOWNOW_SESSION_CREATION_UNPROVEN')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'cart_create', 'NOWNOW_SESSION_OWNED', session_hash, time.time()))
+
+
+def require_nownow_session(flow_id, session_hash):
+    with _db() as db:
+        flow = _get(db, flow_id)
+        rows = db.execute("SELECT evidence_hash FROM observations WHERE flow_id=? AND operation='cart_create' "
+                          "AND outcome='NOWNOW_SESSION_OWNED'", (flow_id,)).fetchall()
+        if (flow['app'] != 'noon' or flow['vertical'] != 'nownow' or len(rows) != 1
+                or rows[0]['evidence_hash'] != session_hash):
+            fail('NOWNOW_SESSION_OWNERSHIP_UNPROVEN')
+
+
+def record_nownow_prepared(flow_id, review_hash):
+    """Only explicit nonfinancial preparation can grant the live-send window."""
+    if not _hash(review_hash):
+        fail('NOWNOW_PREPARE_REVIEW_INVALID')
+    with _db() as db:
+        flow = _get(db, flow_id)
+        _active(flow)
+        if (flow['vertical'] != 'nownow' or flow['app'] != 'noon' or flow['order_id']
+                or db.execute("SELECT 1 FROM operations WHERE flow_id=? AND state!='OBSERVED'", (flow_id,)).fetchone()):
+            fail('NOWNOW_PREPARE_STATE_INVALID')
+        db.execute('INSERT INTO observations(flow_id,operation,outcome,evidence_hash,observed_at) VALUES (?,?,?,?,?)',
+                   (flow_id, 'flow', 'NOWNOW_PREPARED', review_hash, time.time()))
+    return {'flow_age_seconds': round(time.time() - flow['created_at'], 1),
+            'prepare_valid_seconds': 3600, 'live_flow_max_age_seconds': 12 * 3600}
 
 
 def payment_details(*, flow_id, order, amount_minor, outcome):
@@ -340,6 +408,8 @@ def consume(flow_id, operation, *, kind, request_hash, cart_hash=None,
         flow = _get(db, flow_id)
         _active(flow)
         policy = db.execute('SELECT * FROM campaigns WHERE name=?', (flow['campaign'],)).fetchone()
+        if flow['app'] == 'noon' and flow['vertical'] == 'nownow' and kind in ('place', 'payment', 'preauthorize', 'prepay'):
+            _nownow_prepare_gate(db, flow, review_hash)
         if policy is None:
             fail('JOURNAL_CAMPAIGN_METADATA_INVALID')
         if db.execute('SELECT 1 FROM operations WHERE flow_id=? AND state=?',
@@ -1272,6 +1342,17 @@ def open_payments(*, since_seconds=1800, now=None):
             fail('JOURNAL_SCHEMA_UNSUPPORTED')
         rows = db.execute(
             "SELECT f.id, f.app, f.vertical, f.state, f.order_id, f.reserved_minor, "
+            "EXISTS(SELECT 1 FROM observations s WHERE s.flow_id=f.id AND "
+            "NOT EXISTS(SELECT 1 FROM observations correction WHERE correction.flow_id=f.id "
+            "AND correction.sequence>s.sequence AND correction.outcome IN ('UNKNOWN','CHALLENGE_REQUIRED','PAYMENT_FAILED')) AND "
+            "(s.outcome='PAYMENT_REPORTED_SUCCESS' OR (s.outcome='PREORDER_PAYMENT_CONFIRMED' AND "
+            "NOT EXISTS(SELECT 1 FROM operations placed WHERE placed.flow_id=f.id AND placed.kind='place')))) AS settled, "
+            "(SELECT MAX(c.observed_at) FROM observations c WHERE c.flow_id=f.id AND c.outcome='UNKNOWN' "
+            "AND EXISTS(SELECT 1 FROM observations prior WHERE prior.flow_id=f.id "
+            "AND prior.outcome='PAYMENT_REPORTED_SUCCESS' AND prior.sequence<c.sequence)) AS reopened_at, "
+            "(SELECT s.outcome FROM observations s JOIN operations p ON p.flow_id=s.flow_id AND p.name=s.operation "
+            "WHERE s.flow_id=f.id AND p.kind='prepay' ORDER BY s.sequence DESC LIMIT 1) AS intent_outcome, "
+            "MAX(CASE WHEN o.kind='place' THEN 1 ELSE 0 END) AS has_place, "
             "MAX(CASE WHEN o.kind IN ('place','payment','preauthorize','prepay') THEN o.created_at END) AS sent_at "
             "FROM flows f LEFT JOIN operations o ON o.flow_id=f.id "
             "WHERE f.state NOT IN ('COMPLETE','RELEASED','OWNER_ATTESTED_UNCHARGED','REJECTED_DUPLICATE') "
@@ -1280,10 +1361,24 @@ def open_payments(*, since_seconds=1800, now=None):
         fail('JOURNAL_BUSY_OR_UNAVAILABLE')
     finally:
         db.close()
-    return [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
+    result = [{'flow_id': r['id'], 'app': r['app'], 'vertical': r['vertical'], 'state': r['state'],
              'order_id': r['order_id'], 'amount_minor': r['reserved_minor'],
+             'settlement_epoch': r['reopened_at'] or 0,
+             'in_flight': bool(r['sent_at'] is not None and not r['settled']
+                 and not (r['state'] == 'FENCED' and (r['reserved_minor'] == 0
+                     or (not r['has_place'] and r['intent_outcome'] == 'PREORDER_ZERO_AMOUNTS')))),
              'financial_send': r['sent_at'] is not None,
              'sent_seconds_ago': round(now - r['sent_at']) if r['sent_at'] is not None else None} for r in rows]
+    for row in result:
+        if row['vertical'] == 'nownow':
+            try:
+                retained = json.loads((ROOT / 'nownow' / (row['flow_id'] + '.json')).read_text())
+                card = retained['card_last4']
+                if re.fullmatch(r'[0-9]{4}', card):
+                    row['card_last4'] = card
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+    return result
 
 
 def flow_created_at(flow_id):

@@ -14,6 +14,7 @@ def require(ok, code):
 
 
 def retain(flow):
+    j.require_nownow_session(flow.flow_id, j.digest({'session': flow.review['projection']['session']}))
     root = j.ROOT / 'nownow'
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     state = {'binding': j.binding(flow.flow_id), 'review': flow.review,

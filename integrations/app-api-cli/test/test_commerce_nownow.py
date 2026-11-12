@@ -70,6 +70,7 @@ class NowNowFlowTests(unittest.TestCase):
         flow.receipt_store=c.receipts.create(flow_id=flow.flow_id,app='noon',vertical='nownow',
             account_hash=flow.account_hash,scope_hash=flow.scope_hash)
         flow.opened=True
+        c.journal.record_nownow_prepared(flow.flow_id, flow.review.digest)
         controller={'observed_at':time.time(),'review_digest':flow.review.digest,'status':'idle',
             'orderPaymentAmount':25,'selection':{'kind':'card','cardId':'synthetic-token'},
             'wallet':{'enabled':False},'requiresCardSubscription':False,'isCvvRequired':False}

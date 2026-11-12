@@ -29,6 +29,17 @@ def _require_source(condition, code):
         j.fail(code)
 
 
+def stop_retained_preparation(flow_id):
+    state = j.inspect(flow_id)
+    _require_source(state['app'] == 'noon' and state['vertical'] == 'nownow', 'NOWNOW_FLOW_REQUIRED')
+    if (state['state'] != 'ACTIVE' or state['reserved_minor'] or state['order_id']
+            or any(o['state'] != 'OBSERVED' or o['kind'] in ('place', 'payment', 'preauthorize', 'prepay')
+                   for o in state['operations'])):
+        return {'cart_checked': False, 'reason': 'NOWNOW_STOP_RECONCILIATION_REQUIRED'}
+    j.abandon(flow_id)
+    return clear_cart(flow_id)
+
+
 def source(flow_id, cleanup_id=None):
     with j._db() as db:
         flow = j._get(db, flow_id)
@@ -50,7 +61,7 @@ def source(flow_id, cleanup_id=None):
                 continue  # The terminal release and fresh failed intent cover these only.
             evidence = [o for o in observations if o['operation'] == op['name']]
             _require_source(any(o['outcome'] == 'RESPONSE_RECEIVED' for o in evidence)
-                and all(o['outcome'] in ('RESPONSE_RECEIVED', 'CART_READBACK') for o in evidence),
+                and all(o['outcome'] in ('RESPONSE_RECEIVED', 'CART_READBACK', 'NOWNOW_SESSION_OWNED') for o in evidence),
                 'NOWNOW_CLEAR_UNRESOLVED_CART_HISTORY')
         _require_source(not db.execute("SELECT 1 FROM operations p JOIN flows f ON p.flow_id=f.id "
             "WHERE f.app='noon' AND f.account_hash=? AND p.rowid>? AND f.id!=? AND f.id!=?",
@@ -72,6 +83,7 @@ def clear_cart(flow_id, *, auth=None, request=native.native_request, vault=None)
         state = recover_legacy_review(flow_id, auth=auth)
     cleanup_id = str(uuid.uuid4())
     p = state['review']['projection']
+    j.require_nownow_session(flow_id, j.digest({'session': p['session']}))
     body = {'sessionCode': p['session']}
     digest = j.digest(body)
     current = None

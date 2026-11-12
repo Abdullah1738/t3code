@@ -23,6 +23,7 @@ class ReleaseTests(unittest.TestCase):
         self.account = fingerprint('customer')
         j.open_flow(flow_id=self.flow, app='noon', vertical='nownow', account_hash=self.account, scope_hash='2'*64)
         args = dict(request_hash='3'*64, cart_hash='4'*64, review_hash='5'*64, payable_minor=2670)
+        j.record_nownow_prepared(self.flow, args['review_hash'])
         j.consume(self.flow, 'subscription', kind='preauthorize', **args)
         self.vault = IntentVault(Store())
         self.intent = self.vault.retain(self.flow, secret='synthetic', review_hash='5'*64,
