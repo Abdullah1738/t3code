@@ -517,15 +517,20 @@ def _new_box(con, me: dict, size: str | None, template: str | None, base: str | 
 RECIPE_TIMEOUT_S = 15 * 60
 
 
+def quarantine(box_id: str, why: str) -> None:
+    con = db()
+    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
+    event(con, box_id, "lease_quarantined", why[:300])
+    con.commit()
+
+
 def _retire_recipe_box(box_id: str, pid, why: str) -> bool:
     """A box whose recipe did not finish cleanly is never handed out or reused: it may be half built, or its recipe
     may still be changing it. Quarantine it (pools and reuse only take running/stopped leases), stop the recipe, and
     delete the box: deletion is the one proof the recipe can no longer touch it. A failed delete leaves the lease
     quarantined and the reaper deletes it on a later pass. True once deleted."""
+    quarantine(box_id, why)
     con = db()
-    con.execute("UPDATE leases SET state='quarantined' WHERE box_id=?", (box_id,))
-    con.commit()
-    event(con, box_id, "lease_quarantined", why[:300])
     if pid is not None:
         try:
             api.cmd_kill(box_id, pid)
@@ -1102,8 +1107,8 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
-    current = con.execute('SELECT note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
-    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+    current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
+    if current and (current['state'] == 'quarantined' or (current['note'] or '').startswith(BOX_WEDGED_NOTE)):
         return None
     box_id = row["box_id"]
     from . import allocation

@@ -45,6 +45,9 @@ class TrackedIgnoredTests(unittest.TestCase):
         self.rsyncs = []
         self.real_run = subprocess.run
         stack.enter_context(patch.object(ssh_sync, "log"))
+        stack.enter_context(patch.object(ssh_sync, "_watch_rsync", side_effect=self.watch_local))
+        stack.enter_context(patch.object(ssh_sync, "_progress_args", return_value=()))
+
         stack.enter_context(patch.object(ssh_sync.subprocess, "run", side_effect=self.run_local))
         stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no ssh expected")))
 
@@ -55,6 +58,10 @@ class TrackedIgnoredTests(unittest.TestCase):
 
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.src), *args], check=True, capture_output=True)
+
+    def watch_local(self, cmd, timeout, input=None, **kwargs):
+        return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                              timeout=timeout, input=input)
 
     def run_local(self, cmd, **kwargs):
         if cmd[0] == ssh_sync.RSYNC:

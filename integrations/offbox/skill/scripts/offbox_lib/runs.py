@@ -1393,7 +1393,7 @@ class Runner:
                 with prepare.phase("push (source read stalled if no transfer progress)", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
-                                       seed_candidates=candidates)
+                                       seed_candidates=candidates, run_id=self.run_id)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
