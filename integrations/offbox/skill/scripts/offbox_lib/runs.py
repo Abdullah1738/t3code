@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 from . import api, capacity, identity, lease, node_version, pool, ssh_sync
-from . import prune
-from .common import (EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
+from . import prune, prepare
+from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S, RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError,
                      atomic_write_json, db, event, new_id, now, offsets_path, read_json, say, silence)
 
 BG_TTL_S = ORPHAN_RUN_MAX_S
@@ -1102,6 +1102,8 @@ class Runner:
                      cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
                      json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid()))
         con.commit()
+        say(f"pending run {self.run_id}; wait: offbox wait {self.run_id}; kill: offbox kill {self.run_id}")
+        event(con, None, "run_pending", self.run_id)
         t0 = now()
         size, why = lease.auto_size(con, cmd_text, me, a.size)
         if why:
@@ -1115,32 +1117,52 @@ class Runner:
             options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
             row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
                                               run_id=self.run_id, **options)
+            replacement = None
             self.lease_row = row
             self.box = row["box_id"]
             rdir = row["remote_dir"]
             self.record(box_id=self.box, size=row["size"], remote_dir=rdir, setup_s=round(now() - t0, 2),
                         docker=int(lease.uses_docker(cmd_text, me["repo_root"])))
+            keeper_scope = None
+            if row.get('_prepare_end') is None:
+                row['_prepare_end'] = prepare.Budget(self.box).end
             try:
-                with _keep_ttl(self.box):
+                with _keep_ttl(self.box, row['_prepare_end']) as keeper_scope:
                     replacement = self._prepare_box(con, a, rdir, env_file, body)
                 if replacement is not None:
                     pool.release_guard(row)
                     self.lease_row, self.box = replacement, replacement['box_id']
                     continue
                 break
+            except (prepare.Stalled, TtlUnconfirmed) as e:
+                self.record(box_id=None)
+                self.cold_boxes.add(self.box)
+                pool.release_guard(row)
+                self.lease_row = self.box = None
+                if replacement is None:
+                    prepare.move_once(e)
+                say(f"{e}; trying another box")
             except lease.DeadMount as e:
                 replacement = None
                 dead_attempts += 1
                 dead = self.box
                 self.record(box_id=None)  # our run row must not point at the box we stop
-                lease.set_aside_dead_mount(con, dead, e.reason)
+                ttl_confirmed = keeper_scope is None or keeper_scope.settled.is_set()
+                if ttl_confirmed:
+                    lease.set_aside_dead_mount(con, dead, e.reason)
                 pool.release_guard(row)
                 self.lease_row = self.box = None
                 if dead_attempts == 2:
                     raise OffboxError(f"{dead} has a dead filesystem ({e.reason}), and so did the box before it; "
                                       "both are set aside. Nothing ran: retry", code=EXIT_INFRA) from e
-                say(f"{dead} has a dead filesystem ({e.reason}): stopped and set aside (offbox list --all shows it). "
+                prepare.move_once(e)
+                action = 'stopped and set aside' if ttl_confirmed else 'set aside'
+                say(f"{dead} has a dead filesystem ({e.reason}): {action} (offbox list --all shows it). "
                     "Trying another box")
+            except BaseException:
+                if keeper_scope is not None and not keeper_scope.settled.is_set():
+                    self.record(box_id=None)  # finish must not assign an idle TTL to a fenced box
+                raise
         try:
             w = node_version.want(self.root, self.cwd)
             node_block = node_version.block(w) if w else ""
@@ -1184,6 +1206,16 @@ class Runner:
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
+        with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
+            replacement = self._check_box(con, a, rdir)
+        if replacement is not None:
+            return replacement
+        # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
+        with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
+            self._sync_box(con, a, rdir, env_file, body)
+        return None
+
+    def _check_box(self, con, a, rdir) -> dict | None:
         # The probe goes before prune: prune's ssh hangs on a dead filesystem.
         forced_cold = self.lease_row.get('_cold_resume')
         reason, home_s = ssh_sync.probe_home(self.box, measure_write=not forced_cold)
@@ -1212,26 +1244,34 @@ class Runner:
                     missing = exists.returncode == 1
                 except (subprocess.TimeoutExpired, OSError):
                     pass
-            if missing:
+            if missing and prepare.can_move():
                 replacement = pool.try_warm(self.me, self.lease_row['size'], self.lease_row.get('source'),
                                             self.cold_boxes, self.run_id)
                 if replacement is not None:
+                    prepare.move_once(OffboxError(f'{self.box} has a cold disk; using a warm box'))
                     self.cold_moved = True
                     say(f'{self.box} was just resumed and its disk is still loading; '
                         f'using running box {replacement["box_id"]} instead')
                     return replacement
             say(f'{self.box} was just resumed and its disk is still loading; the first sync, installs and Docker '
                 'databases on it can be slow for 5-25 min. For long runs use --bg + offbox wait.')
+        return None
+
+    def _sync_box(self, con, a, rdir, env_file, body):
         # Env values go through a 0600 file (never the command text, which boat keeps 90 days in history).
         err: list = []
-        tw = threading.Thread(target=lambda: _safe(err, ssh_sync.put_file, self.box, env_file, body))
+        left = api.left()
+        upload_timeout = 120 if left is None else max(.001, min(120, left))
+        tw = threading.Thread(target=_safe,
+                              args=(err, ssh_sync.put_file, self.box, env_file, body, '600', upload_timeout), daemon=True)
         tw.start()
         push_exc = None
         try:
             if not a.no_sync:
-                candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
-                st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
-                                   seed_candidates=candidates)
+                with prepare.phase("push (source read stalled if no transfer progress)", self.box):
+                    candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
+                    st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
+                                       seed_candidates=candidates)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s)")
@@ -1245,7 +1285,8 @@ class Runner:
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
             push_exc = e
         finally:
-            tw.join()
+            left = api.left()
+            tw.join(timeout=max(0, left) if left is not None else None)
         # A dead mount may have failed either transfer; prefer that over an ordinary error from the other.
         for e in (push_exc, err[0] if err else None):
             reason = ssh_sync.dead_mount(str(e)) if e is not None else None
@@ -1326,17 +1367,45 @@ def _ttl_keeper(box_id: str, stop_evt: threading.Event):
             return
 
 
+class TtlUnconfirmed(OffboxError):
+    def __init__(self, box_id):
+        super().__init__(f'{box_id} has an unconfirmed auto-stop update; set aside; nothing ran')
+
+
 @contextlib.contextmanager
-def _keep_ttl(box_id: str):
+def _keep_ttl(box_id: str, prepare_end=None):
     stop_evt = threading.Event()
-    keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
+    requests = api.RequestScope(5)
+    end = prepare_end if prepare_end is not None else prepare.Budget(box_id).end
+
+    def refresh():
+        with requests.active():
+            _ttl_keeper(box_id, stop_evt)
+
+    keeper = threading.Thread(target=refresh, daemon=True)
     keeper.start()
+    failed = False
     try:
-        yield
+        yield requests
+    except BaseException:
+        failed = True
+        raise
     finally:
         stop_evt.set()
-        # GET/PATCH retries can outlive the follower's join bound. Drain them before handing off the TTL.
-        keeper.join()
+        requests.cancel(preserve_mutations=True)
+        requests.settled.wait(max(0, min(1, end - time.monotonic())))
+        requests.cancel()
+        # Socket reads wake on cancel. A stuck DNS/Keychain lookup may remain, but cannot send a late PATCH.
+        keeper.join(1)
+        if not requests.settled.is_set():
+            # Reuse the existing persistent selection fence; keep the disk and let normal idle stopping handle it.
+            with contextlib.closing(db()) as con:
+                con.execute('UPDATE leases SET note=? WHERE box_id=?',
+                            (BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH', box_id))
+                con.commit()
+                event(con, box_id, 'ttl_unconfirmed', 'keeper PATCH sent without acknowledgement; box set aside')
+            if not failed:
+                raise TtlUnconfirmed(box_id)
 
 
 def _echo(stream, b: bytes) -> bool:
@@ -1729,6 +1798,11 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
 
 
 def run_remote(a, me: dict) -> int:
+    with prepare.attempts():
+        return _run_prepared(a, me)
+
+
+def _run_prepared(a, me: dict) -> int:
     """Foreground or --bg remote run. Raises OffboxError(code 90/91/92) before the command starts."""
     # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
     if not a.no_sync and getattr(a, "include", None):
@@ -1742,6 +1816,7 @@ def run_remote(a, me: dict) -> int:
             if attempt == 2:
                 raise OffboxError(f"{wedged[0]} and {wedged[1]} were both wedged before the command; "
                                   "both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+            prepare.move_once(e)
             say(wedged_message(e.box, e.evidence, e.stopped, retry=True))
 
 

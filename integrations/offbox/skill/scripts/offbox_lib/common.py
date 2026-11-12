@@ -259,15 +259,20 @@ def file_lock(name: str, timeout: float = 600):
     path = LOCKS_DIR / (name.replace("/", "_")[:180] + ".lock")
     f = open(path, "a+")
     deadline = now() + timeout
-    while True:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if now() > deadline:
-                f.close()
-                raise OffboxError(f"timed out waiting for lock {name}")
-            time.sleep(0.3)
+    from . import prepare
+    try:
+        with prepare.phase("lock_wait", detail=f"lock={name}"):
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if now() > deadline:
+                        raise OffboxError(f"timed out waiting for lock {name}")
+                    time.sleep(0.3)
+    except BaseException:
+        f.close()
+        raise
     try:
         yield
     finally:

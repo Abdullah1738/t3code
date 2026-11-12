@@ -262,13 +262,14 @@ class PoolQueueTests(Isolated):
             with self.assertRaises(pool.PoolBusyError) as caught:
                 pool.acquire(self.me, run_id='mine')
         lines = err.getvalue().splitlines()
-        self.assertIn('queued for a repo pool box: 2/2 busy, 1 other caller(s) waiting; will wait up to 130s', lines[0])
+        self.assertIn('queued for a repo pool box: 2/2 busy, 0 held by checkout cleanup, '
+                      '1 other caller(s) waiting; will wait up to 130s', lines[0])
         self.assertIn('tool timeout above 130s', lines[0])
         self.assertIn('background', lines[0])
         progress = [ln for ln in lines if 'still queued' in ln]
         self.assertEqual(len(progress), 2)
         self.assertIn('waited 60s of 130s', progress[0])
-        self.assertIn('stayed busy for 130s', str(caught.exception))
+        self.assertIn('2/2 busy, 0 held by checkout cleanup for 130s', str(caught.exception))
 
     def test_box_freed_while_queued_is_taken(self):
         self.full_pool()
