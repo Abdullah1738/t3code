@@ -44,11 +44,37 @@ def snapshot_members(repo,snapshot):
     return members
 
 
-def inspect_dump(repo, snapshot, path, needle):
+def inspect_dump(repo, snapshot, path, needle, size=None):
+    from redact_inspect import MAX_IMAGE_BYTES,sqlite_scan
+    if size is not None and size>MAX_IMAGE_BYTES:
+        from redact_reader import BlobImage,sqlite_connection
+        with contextlib.closing(BlobImage(repo,snapshot,path)) as image:
+            if image[:16]==b'SQLite format 3\0':
+                with sqlite_connection(image) as con:
+                    return sqlite_scan(con,image,needle),True
     proc = subprocess.Popen(['restic','--no-cache','-r',str(repo),'dump',snapshot,path],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=restic_env())
     try:
-        result = inspect_stream(proc.stdout,needle)
+        header=proc.stdout.read(16)
+        if header==b'SQLite format 3\0':
+            # A snapshot is already an encrypted seekable source. Avoid a
+            # plaintext restore and the former whole-image RAM allocation.
+            from redact_inspect import MAX_IMAGE_BYTES,sqlite_hits,sqlite_scan
+            data=header+proc.stdout.read(MAX_IMAGE_BYTES+1-len(header))
+            if len(data)<=MAX_IMAGE_BYTES:
+                result=(sqlite_hits(data,needle),True)
+            else:
+                from redact_reader import BlobImage,sqlite_connection
+                del data
+                while proc.stdout.read(1<<20):pass
+                if proc.wait():raise RedactionError('restic dump failed')
+                with contextlib.closing(BlobImage(repo,snapshot,path)) as image:
+                    with sqlite_connection(image) as con:
+                        result=(sqlite_scan(con,image,needle),True)
+        else:
+            from redact_inspect import Prefix
+            import io
+            result = inspect_stream(io.BufferedReader(Prefix(header,proc.stdout)),needle)
         if proc.wait():
             raise RedactionError('restic dump failed')
         return result
@@ -123,7 +149,7 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
             path = node['path']
             if contains(path,needle):
                 raise RedactionError('snapshot path intersects redaction selector')
-            n, _ = inspect_dump(repo,sid,path,needle)
+            n, _ = inspect_dump(repo,sid,path,needle,size=node.get('size'))
             if n:
                 exclusions.add(path)
         if exclusions:
@@ -147,7 +173,7 @@ def rewrite_repo(repo, stage, needle, paths, *, dry_run):
             path = node['path']
             if contains(path,needle):
                 raise RedactionError('snapshot path intersects redaction selector')
-            n, _ = inspect_dump(repo,snap['id'],path,needle)
+            n, _ = inspect_dump(repo,snap['id'],path,needle,size=node.get('size'))
             remaining += int(n>0)
     after_packs = {str(p.relative_to(repo)) for p in (Path(repo)/'data').rglob('*') if p.is_file()}
     return {'matchedBefore':len(affected),'replaced':0 if dry_run else len(affected),

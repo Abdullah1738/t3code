@@ -110,7 +110,7 @@ Safe post-deploy push acceptance is prepared with
 checkout and bare push target per harness, replaces both origin URLs with the
 local path, and prints fresh-session prompts. After the three sessions,
 `python3 scripts/acceptance_push.py verify --root PRINTED_ROOT` requires cited
-main-dev denials in the decision log and no `main` refs in any bare target.
+main-dev denials in the decision log and no `main ` refs in any bare target.
 
 Corpus-derived denial currently recognizes explicit branch constraints and literal
 git push destinations. Other standing rules are supplied as context; ambiguous
@@ -315,19 +315,25 @@ needle sweep; source cleanup must precede resumed capture and backups.
 rewrites affected file paths with `--forget`, prunes with `--max-unused 0`, and
 rebuilds the transcript manifests and backs up the sanitized stage. Historical SQLite and compressed transcript
 containers are inspected semantically: SQLite rows (including zlib payloads and
-FTS), recoverable deleted payloads, decoded zstd/gzip streams, ZIP members,
+FTS5's physical prefix-compressed terms, including deleted postings), recoverable deleted payloads, decoded zstd/gzip streams, ZIP members,
 and archive metadata. Only files with matches are
 excluded; clean historical files remain byte-for-byte intact. Path hints never
 count as evidence of a match. Removal still affects whole matched historical
 files, followed by a sanitized stage backup.
 
 Inspection stays diskless. Concatenated compression frames, trailing data and
-unclassified SQLite pages are rejected rather than skipped. Seekable SQLite/ZIP images have a 128 MiB RAM budget;
-exceeding it, finding uncertain SQLite free/reserved space or unsupported virtual tables, or encountering a nonempty
+unclassified SQLite pages are rejected rather than skipped. SQLite snapshots
+larger than 128 MiB are read through a read-only APSW VFS backed by the existing
+encrypted restic blobs. The reader loads the repository index once, verifies
+blobs with restic's reader, and keeps a 32 MiB plaintext blob cache in RAM; it
+never restores a plaintext file. SQLite uses an 8 MiB page cache, and free-page
+accounting takes one byte per database page (about 26 MiB for 100 GiB with 4 KiB pages).
+Whole SQLite snapshot size is not capped; individual SQLite values and nested
+seekable ZIP/SQLite containers retain a 128 MiB limit. Finding uncertain SQLite free/reserved space, unsupported virtual tables/custom tokenizers,
+or a deleted multi-token FTS phrase whose adjacency cannot be established, or encountering a nonempty
 transactional WAL/journal (including inside an archive) stops before any
 snapshot rewrite or prune in that repository. It does not delete an uninspected container or report
-a successful purge. Large production SQLite snapshots therefore require a
-separately approved inspection strategy. The replica stage or earlier repositories may already have
+a successful purge. The replica stage or earlier repositories may already have
 been sanitized when historical inspection fails. Dirty gzip/ZIP stage copies
 must be cleaned at their source; zstd transcript rewriting is supported.
 The cold archive is also a restic repo. If its local copy was finalized away,
@@ -336,6 +342,16 @@ storage, rewrites/prunes it, then mirrors both repos with remote deletion.
 Old cold files have no replacement when their original source no longer exists.
 Restic passwords use the existing `RESTIC_PASSWORD_COMMAND`/`RESTIC_PASSWORD`
 configuration (production Keychain service `restic-memory-backup`).
+
+The large-snapshot path requires the pinned Go helper in `bin/recall-restic-reader`
+and APSW 3.54.1.0 in the integration's `venv/redact-reader` for the CLI's Python version.
+Build `restic-reader/` offbox (cross-compile with `GOOS=darwin GOARCH=arm64`
+for this Mac) and download the matching APSW wheel there. During the separately
+approved deployment, install those prebuilt artifacts with
+`python3 scripts/install_redact_reader.py --root <integration-root> --binary <helper> --wheel <apsw-wheel>`,
+then read back with the same script and `--root <integration-root> --check`.
+Both runtime directories are already excluded by `deploy.zsh`; missing dependencies
+fail closed. Reader fixtures require`RECALL_RESTIC_READER=<helper>` and APSW.
 
 Dropbox's mirror uses `files/delete_batch`, not permanent deletion. Its personal
 OAuth client cannot use the team-only `files/permanently_delete` endpoint.

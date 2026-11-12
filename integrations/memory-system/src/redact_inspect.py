@@ -11,6 +11,7 @@ import zipfile
 from redact import RedactionError, contains, decode_cell, qi, tables, patterns
 from redact_sqlite_space import regions
 from redact_zip_layout import validate as validate_zip_layout
+from redact_fts import physical_hits
 
 MAX_IMAGE_BYTES = 128 * 1024 * 1024
 MAX_DEPTH = 8
@@ -61,36 +62,43 @@ def bounded_image(stream):
 def sqlite_hits(data, needle):
     # Serialized WAL-mode images otherwise try to open an external WAL. Snapshot
     # sidecars are fenced separately; inspect the complete checkpointed image.
+    image=bytearray(data)
+    image[18:20]=b'\x01\x01'
+    with contextlib.closing(sqlite3.connect(':memory:')) as con:
+        con.deserialize(image)
+        return sqlite_scan(con,data,needle)
+
+
+def sqlite_scan(con,data,needle):
     page_size=int.from_bytes(data[16:18],'big')
     if page_size==1:page_size=65536
     if not page_size or len(data)!=int.from_bytes(data[28:32],'big')*page_size:
         raise RedactionError('SQLite image contains unclassified trailing bytes')
-    image = bytearray(data)
-    image[18:20] = b'\x01\x01'
-    roots = []
-    with contextlib.closing(sqlite3.connect(':memory:')) as con:
-        con.deserialize(image)
-        con.execute('PRAGMA temp_store=MEMORY')
-        con.execute('PRAGMA query_only=ON')
-        if con.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
-            raise RedactionError('SQLite image failed integrity inspection')
-        hits = 0
-        kinds = tables(con)
-        roots=[1]+[r[0] for r in con.execute('SELECT rootpage FROM sqlite_schema WHERE rootpage>0')]
-        for table, kind in kinds.items():
-            if kind != 'table':
-                continue
-            columns = [r[1] for r in con.execute(f'PRAGMA table_info({qi(table)})')]
-            for row in con.execute(f'SELECT * FROM {qi(table)}'):
-                hits += int(any(contains(decode_cell(k,v),needle) for k,v in zip(columns,row)))
-        query = '"' + needle.decode().replace('"','""') + '"'
-        for name,kind in kinds.items():
-            if kind!='virtual':continue
-            sql=con.execute('SELECT sql FROM sqlite_schema WHERE name=?',(name,)).fetchone()[0]
-            if not re.search(r'\busing\s+fts[345]\b',sql,re.I):
-                raise RedactionError('unsupported SQLite virtual table')
-            table=qi(name)
-            hits+=con.execute(f'SELECT count(*) FROM {table} WHERE {table} MATCH ?',(query,)).fetchone()[0]
+    con.execute('PRAGMA cache_size=-8192')
+    con.execute('PRAGMA mmap_size=0')
+    con.execute('PRAGMA temp_store=MEMORY')
+    con.execute('PRAGMA query_only=ON')
+    if con.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+        raise RedactionError('SQLite image failed integrity inspection')
+    hits = 0
+    kinds = tables(con)
+    roots=[1]+[r[0] for r in con.execute('SELECT rootpage FROM sqlite_schema WHERE rootpage>0')]
+    for table, kind in kinds.items():
+        if kind != 'table':
+            continue
+        columns = [r[1] for r in con.execute(f'PRAGMA table_info({qi(table)})')]
+        for row in con.execute(f'SELECT * FROM {qi(table)}'):
+            if any(contains(decode_cell(k,v),needle) for k,v in zip(columns,row)):return 1
+    query = '"' + needle.decode().replace('"','""') + '"'
+    for name,kind in kinds.items():
+        if kind!='virtual':continue
+        sql=con.execute('SELECT sql FROM sqlite_schema WHERE name=?',(name,)).fetchone()[0]
+        if not re.search(r'\busing\s+fts[345]\b',sql,re.I):
+            raise RedactionError('unsupported SQLite virtual table')
+        table=qi(name)
+        hits+=con.execute(f'SELECT count(*) FROM {table} WHERE {table} MATCH ?',(query,)).fetchone()[0]
+        if hits:return hits
+        hits+=physical_hits(con,name,sql,needle)
     hits += int(needle in data)
     if hits:
         return hits

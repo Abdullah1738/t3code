@@ -466,9 +466,9 @@ class BackupTest(unittest.TestCase):
 
     def test_inspection_budget_failure_preserves_snapshots_and_releases_lock(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
-            root=Path(tmp);repo=root/'repo';db=root/'large.db'
-            with connect(db) as con:
-                con.execute('CREATE TABLE sample(value TEXT)');con.execute('INSERT INTO sample VALUES(?)',('clean',))
+            root=Path(tmp);repo=root/'repo';db=root/'large.zip'
+            with zipfile.ZipFile(db,'w',compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr('clean.txt','clean'*1000)
             redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',str(db))
             before=redact_backups.restic(repo,'snapshots','--json',json_output=True)
             with patch.object(redact_inspect,'MAX_IMAGE_BYTES',1024),self.assertRaises(redact.RedactionError):
@@ -517,6 +517,66 @@ class BackupTest(unittest.TestCase):
             image=con.serialize()
         self.assertNotIn(TOKEN.encode(),image)
         self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(image),TOKEN.encode())[0],0)
+
+    def test_deleted_prefix_compressed_fts_terms_remain_visible(self):
+        forms={
+            'contentless-delete':("content='',contentless_delete=1",'DELETE FROM episodic_text_fts WHERE rowid=2'),
+            'contentless-command':("content=''","INSERT INTO episodic_text_fts(episodic_text_fts,rowid,value) VALUES('delete',2,?)"),
+            'ordinary':('', 'DELETE FROM episodic_text_fts WHERE rowid=2'),
+            'external':("content='source_rows'","INSERT INTO episodic_text_fts(episodic_text_fts,rowid,value) VALUES('delete',2,?)"),
+        }
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RESTIC_PASSWORD':'fixture-password'}):
+            root=Path(tmp);repo=root/'repo';dirty=[]
+            for form,(options,deletion) in forms.items():
+                path=root/(form+'.db');dirty.append(str(path))
+                with connect(path) as con:
+                    con.execute('CREATE TABLE source_rows(value TEXT)')
+                    con.execute('CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value'+(','+options if options else '')+')')
+                    rows=[(1,TOKEN[:-1]+'4'),(2,TOKEN)]
+                    con.executemany('INSERT INTO source_rows(rowid,value) VALUES(?,?)',rows)
+                    con.executemany('INSERT INTO episodic_text_fts(rowid,value) VALUES(?,?)',rows)
+                    con.execute("INSERT INTO episodic_text_fts(episodic_text_fts) VALUES('optimize')")
+                    segments=list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10'))
+                    con.execute(deletion,(TOKEN,) if '?' in deletion else ())
+                    con.execute('DELETE FROM source_rows WHERE rowid=2');con.commit();con.execute('VACUUM')
+                    self.assertEqual(con.execute('SELECT count(*) FROM episodic_text_fts WHERE episodic_text_fts MATCH ?',(TOKEN,)).fetchone()[0],0)
+                    self.assertTrue(any(row in list(con.execute('SELECT id,block FROM episodic_text_fts_data WHERE id>10')) for row in segments))
+                image=path.read_bytes()
+                with self.subTest(form=form):
+                    if form=='contentless-delete':self.assertFalse(TOKEN.encode() in image)
+                    self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(image),TOKEN.encode())[0],0)
+            clean=root/'clean.db'
+            with connect(clean) as con:
+                con.execute("CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value,content='',contentless_delete=1)")
+                con.executemany('INSERT INTO episodic_text_fts(rowid,value) VALUES(?,?)',[(1,'unrelatedprefix123'),(2,'unrelatedprefix456')])
+                con.execute("INSERT INTO episodic_text_fts(episodic_text_fts) VALUES('optimize')")
+                con.execute('DELETE FROM episodic_text_fts WHERE rowid=2');con.commit();con.execute('VACUUM')
+            original=clean.read_bytes()
+            self.assertEqual(redact_inspect.inspect_stream(io.BytesIO(original),TOKEN.encode()),(0,True))
+            redact_backups.restic(repo,'init');redact_backups.restic(repo,'backup',*dirty,str(clean))
+            result=redact_backups.rewrite_repo(repo,None,TOKEN.encode(),set(),dry_run=False)
+            self.assertGreater(result['matchedBefore'],0);self.assertEqual(result['remainingAfter'],0)
+            for snap in redact_backups.restic(repo,'snapshots','--json',json_output=True):
+                self.assertEqual([n['path'] for n in redact_backups.nodes(repo,snap['id'])],[str(clean)])
+                self.assertEqual(redact_backups.restic(repo,'dump',snap['id'],str(clean)),original)
+
+    def test_physical_fts_substrings_and_repeated_words(self):
+        with connect(':memory:') as con:
+            con.execute("CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value,content='',contentless_delete=1)")
+            con.executemany('INSERT INTO episodic_text_fts(rowid,value) VALUES(?,?)',[(1,'xx'+TOKEN[:-1]+'4'),(2,'xx'+TOKEN)])
+            con.execute("INSERT INTO episodic_text_fts(episodic_text_fts) VALUES('optimize')")
+            con.execute('DELETE FROM episodic_text_fts WHERE rowid=2');con.commit();con.execute('VACUUM')
+            self.assertEqual(con.execute('SELECT count(*) FROM episodic_text_fts WHERE episodic_text_fts MATCH ?',(TOKEN,)).fetchone()[0],0)
+            image=con.serialize()
+        self.assertFalse(TOKEN.encode() in image)
+        self.assertGreater(redact_inspect.inspect_stream(io.BytesIO(image),TOKEN.encode())[0],0)
+        for selector in (b'fixtureword fixtureword',b'fixtureword fixtureword fixtureword'):
+            with connect(':memory:') as con:
+                con.execute("CREATE VIRTUAL TABLE episodic_text_fts USING fts5(value,content='',contentless_delete=1)")
+                con.execute("INSERT INTO episodic_text_fts(value) VALUES('fixtureword')")
+                con.commit();con.execute('VACUUM');image=con.serialize()
+            with self.subTest(occurrences=len(selector.split())),self.assertRaises(redact.RedactionError):
+                redact_inspect.inspect_stream(io.BytesIO(image),selector)
 
     def test_nested_sidecars_and_unknown_free_bytes_fail_closed(self):
         for form in ('zip-name','zip-gzip-header','zip-zstd-header'):

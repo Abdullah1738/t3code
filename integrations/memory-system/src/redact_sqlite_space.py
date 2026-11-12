@@ -24,12 +24,18 @@ def regions(data, roots):
             if b<128 or i==8:
                 return value,i+1
         raise RedactionError('invalid SQLite varint')
-    pending,seen,owned=list(roots),set(),set()
+    # One byte per page keeps accounting near26MiB for a100GiB/4KiB image.
+    flags=bytearray(len(data)//page_size)
+    def mark(number,bits):
+        if not 1<=number<=len(flags):raise RedactionError('invalid SQLite page reference')
+        flags[number-1]|=bits
+    pending=list(roots)
     while pending:
         number=pending.pop()
-        if number in seen:
+        if not 1<=number<=len(flags):raise RedactionError('invalid SQLite page reference')
+        if flags[number-1]&2:
             continue
-        seen.add(number);owned.add(number)
+        mark(number,3)
         p=page(number);h=100 if number==1 else 0;kind=p[h]
         if kind not in (2,5,10,13):
             raise RedactionError('unsupported SQLite btree page')
@@ -73,22 +79,23 @@ def regions(data, roots):
             while remaining:
                 if overflow in chain:
                     raise RedactionError('cyclic SQLite overflow')
-                chain.add(overflow);owned.add(overflow);op=page(overflow);used=min(remaining,usable-4)
+                chain.add(overflow);mark(overflow,1);op=page(overflow);used=min(remaining,usable-4)
                 if remaining<=usable-4:
                     yield op[4+used:usable]
                 remaining-=used;overflow=u32(op,0)
-    trunk=int.from_bytes(data[32:36],'big');free_seen=set()
+    trunk=int.from_bytes(data[32:36],'big')
     while trunk:
-        if trunk in free_seen:
+        if not 1<=trunk<=len(flags):raise RedactionError('invalid SQLite freelist page')
+        if flags[trunk-1]&4:
             raise RedactionError('cyclic SQLite freelist')
-        free_seen.add(trunk);owned.add(trunk);p=page(trunk);count=u32(p,4)
+        mark(trunk,5);p=page(trunk);count=u32(p,4)
         if 8+count*4>usable:
             raise RedactionError('invalid SQLite freelist')
         for i in range(count):
-            leaf=u32(p,8+i*4);owned.add(leaf)
+            leaf=u32(p,8+i*4);mark(leaf,1)
             yield page(leaf)
         yield p[8+count*4:usable]
         trunk=u32(p,0)
 
-    if len(owned)!=len(data)//page_size:
+    if 0 in flags:
         raise RedactionError('unclassified SQLite pages remain')
