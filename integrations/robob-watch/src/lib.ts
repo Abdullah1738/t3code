@@ -76,6 +76,7 @@ export type Watcher = {
   title: string;
   check: string;
   interval_s: number;
+  timeout_s?: number;
   mode: Mode;
   context: string;
   expires_at: string | null;
@@ -118,6 +119,8 @@ export type State = {
   next_at?: number;
   consecutive_failures: number;
   failure_alerted: boolean;
+  load_timeouts?: number;
+  load_timeout_since?: string;
   failure_paused_at?: string;
   last_error?: string;
   /** When the current run of consecutive failures started. */
@@ -224,6 +227,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (typeof input.check !== "string" || !input.check.trim()) errors.push("check command is required");
   const interval = input.interval_s === undefined ? DEFAULT_INTERVAL : Number(input.interval_s);
   if (!Number.isInteger(interval) || interval < MIN_INTERVAL) errors.push(`interval_s must be an integer >= ${MIN_INTERVAL}`);
+  const timeout = input.timeout_s;
+  if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 1 || timeout > 600)) errors.push("timeout_s must be an integer from 1 to 600");
   const mode = input.mode ?? "wake";
   if (mode !== "wake" && mode !== "notify") errors.push("mode must be wake or notify");
   let triggers = input.triggers === undefined ? [] : input.triggers;
@@ -264,6 +269,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     // Only checks that drive the old whatscli TUI need the shared lock; whatsapp-new-message reads a DB now.
     max_fires: maxFires, serial: input.serial === true || /(^|[\s;|&(`$])wa\s+(tui|screen)\b/.test(input.check!),
     paused: input.paused === true,
+    ...(timeout !== undefined ? { timeout_s: timeout } : {}),
     ...(maxFailures !== undefined ? { max_consecutive_failures: maxFailures } : {}),
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
@@ -321,7 +327,7 @@ export type CheckResult = { code: number | null; stdout: string; stderr: string;
  * than KILL_GRACE_MS past the timeout: a SIGKILLed process that the scheduler has not reaped yet must not keep
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
-export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = CHECK_TIMEOUT_MS): Promise<CheckResult> {
+export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   const started = now();
   return new Promise(resolve => {
@@ -348,7 +354,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already gone */ }
       grace = setTimeout(() => {
         try { child.stdout!.destroy(); child.stderr!.destroy(); child.unref(); } catch { /* ignore */ }
-        finish(null, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
+        finish(child.exitCode, `\n[robob-watch] process group ${child.pid} not reaped ${KILL_GRACE_MS / 1000}s after SIGKILL`);
       }, KILL_GRACE_MS);
     }, timeoutMs);
     child.on("close", code => finish(code));
