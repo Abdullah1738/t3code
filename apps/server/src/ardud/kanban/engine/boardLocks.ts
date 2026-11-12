@@ -34,6 +34,10 @@ interface Operation {
   readonly dependencies: Map<string, Map<string, number>>;
   readonly parent: Operation | undefined;
   readonly abandoned: Map<string, Effect.Effect<void>>;
+  readonly scopes: Map<
+    string,
+    { readonly resources: ReadonlyArray<string>; readonly valid: Effect.Effect<boolean> }
+  >;
   /** Reads this operation made outside the gate, shared by its stale reruns (see `outsideRead`). */
   readonly replay: Map<string, Array<ReplayEntry>>;
   /** How many reads of each key this attempt has made so far. */
@@ -52,6 +56,9 @@ const current = Context.Reference<Operation | undefined>("KanbanBoardOperation",
 });
 const ancestor = Context.Reference<Operation | undefined>("KanbanParentOperation", {
   defaultValue: () => undefined,
+});
+const dispatchMetadata = Context.Reference<boolean>("KanbanDispatchMetadata", {
+  defaultValue: () => false,
 });
 
 export class BoardStateChanged {
@@ -80,6 +87,7 @@ export const REPLAY_MAX_MS = 30_000;
 /** State locks are never held across another service's I/O. A stale continuation cannot write. */
 export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const boards = new Map<string, BoardLock>();
+  const dispatches = new Set<Operation>();
   let migrationGeneration = 0;
   // Only selection migration takes every permit; ordinary boards never exclude each other here.
   const migration = yield* Semaphore.make(BOARD_PERMITS);
@@ -151,7 +159,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
   const acquire = (op: Operation, boardId: string, reconcile = false) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
-        if (reconcile) op.stale = false;
+        if (reconcile && !op.scopes.has(boardId)) op.stale = false;
         yield* check(op);
         if (op.held?.boardId === boardId) return;
         yield* release(op);
@@ -178,8 +186,9 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         op.held = held;
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
-        if (!reconcile) {
-          if (expected !== undefined && expected !== version(held)) op.stale = true;
+        const scoped = op.scopes.get(boardId);
+        if (scoped || !reconcile) {
+          if (!scoped && expected !== undefined && expected !== version(held)) op.stale = true;
           for (const [key, value] of op.dependencies.get(boardId) ?? []) {
             if ((board.resources.get(key) ?? 0) !== value) op.stale = true;
           }
@@ -187,7 +196,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           // The explicit continuation validates its inputs under this new snapshot.
           op.dependencies.delete(boardId);
         }
-        if (expected !== undefined || !op.dependencies.has(boardId))
+        if (scoped && !(yield* scoped.valid)) op.stale = true;
+        if (!scoped && (expected !== undefined || !op.dependencies.has(boardId)))
           seen.set(boardId, version(held));
         yield* check(op);
       }),
@@ -217,6 +227,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           dependencies: new Map(),
           parent: yield* ancestor,
           abandoned: new Map(),
+          scopes: new Map(),
           replay,
           reads: new Map(),
           replayed: 0,
@@ -235,6 +246,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           Effect.provideService(current, op),
           Effect.ensuring(
             release(op).pipe(
+              Effect.andThen(Effect.sync(() => dispatches.delete(op))),
               Effect.andThen(
                 Effect.suspend(() =>
                   Effect.forEach(op.abandoned.values(), (cleanup) => cleanup, { discard: true }),
@@ -274,12 +286,13 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const previous = versions.get(op)!;
         const broad = previous.has(boardId);
         yield* acquire(op, boardId);
-        if (resource === undefined) previous.set(boardId, version(op.held!));
+        const scoped = op.scopes.get(boardId);
+        if (resource === undefined && !scoped) previous.set(boardId, version(op.held!));
         else if (!broad) previous.delete(boardId);
-        if (resource !== undefined) {
+        if (resource !== undefined && (!scoped || scoped.resources.includes(resource))) {
           let dependencies = op.dependencies.get(boardId);
           if (!dependencies) op.dependencies.set(boardId, (dependencies = new Map()));
-          if (!dependencies.has("epoch"))
+          if (!scoped && !dependencies.has("epoch"))
             dependencies.set("epoch", boardOf(boardId).resources.get("epoch") ?? 0);
           if (!boardOf(boardId).resources.has(resource))
             boardOf(boardId).resources.set(resource, 0);
@@ -314,13 +327,23 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           if (resource !== undefined) {
             const value = (held.board.resources.get(resource) ?? 0) + 1;
             held.board.resources.set(resource, value);
-            op.dependencies.get(boardId)!.set(resource, value);
+            // A link-state refresh must not forgive an earlier content write or migration.
+            if (yield* dispatchMetadata) {
+              for (const dispatch of dispatches) {
+                if (!dispatch.scopes.get(boardId)?.resources.includes(resource)) continue;
+                const dependencies = dispatch.dependencies.get(boardId);
+                if (dependencies?.get(resource) === value - 1) dependencies.set(resource, value);
+              }
+            }
+            if (!scoped || scoped.resources.includes(resource))
+              op.dependencies.get(boardId)!.set(resource, value);
             for (let parent = op.parent; parent; parent = parent.parent) {
               const dependencies = parent.dependencies.get(boardId);
               if (dependencies?.get(resource) === value - 1) dependencies.set(resource, value);
             }
           }
-          if (resource === undefined || broad) versions.get(op)!.set(boardId, version(held));
+          if (!scoped && (resource === undefined || broad))
+            versions.get(op)!.set(boardId, version(held));
           // Nested routing owns its commits, not concurrent writers' commits. Let its
           // caller continue only when those are the sole changes since it released.
           for (const [parent, unchanged] of parents) {
@@ -447,6 +470,44 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
 
   return {
     run,
+    // Dispatch alone replaces its planning snapshot with the card and slot it will take.
+    // Collection reads inside that dispatch must not silently restore a board-wide dependency.
+    scopeDispatch: Effect.fn("KanbanBoardLocks.scopeDispatch")(function* (
+      boardId: string,
+      resources: ReadonlyArray<string>,
+      valid: Effect.Effect<boolean>,
+    ) {
+      const op = yield* operation;
+      if (!op) return;
+      yield* acquire(op, boardId);
+      const board = boardOf(boardId);
+      op.scopes.set(boardId, { resources, valid });
+      dispatches.add(op);
+      versions.get(op)!.delete(boardId);
+      op.dependencies.set(
+        boardId,
+        new Map(
+          resources.map((key) => {
+            if (!board.resources.has(key)) board.resources.set(key, 0);
+            return [key, board.resources.get(key)!];
+          }),
+        ),
+      );
+      if (!(yield* valid)) {
+        op.stale = true;
+        yield* check(op);
+      }
+    }),
+    resourceVersion: (boardId: string, resource: string) =>
+      access(
+        boardId,
+        Effect.sync(() => boardOf(boardId).resources.get(resource) ?? 0),
+        false,
+        resource,
+      ),
+    // Only the metadata persistence is marked; publication and its follow-ups keep normal conflicts.
+    dispatchMetadata: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(Effect.provideService(dispatchMetadata, true)),
     step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string) =>
       run(effect, cardId).pipe(Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 })),
     access,

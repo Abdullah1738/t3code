@@ -199,6 +199,7 @@ const makeWorld = (options: { readonly reader?: boolean } = {}) => {
       send: (input) =>
         Effect.sync(() => void threads.get(input.threadId)?.messages.push(input.text)),
       model: () => Effect.succeed(null),
+      withdraw: () => Effect.void,
       setModel: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,

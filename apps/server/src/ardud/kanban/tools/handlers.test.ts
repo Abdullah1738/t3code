@@ -160,6 +160,7 @@ const fakeThreads = (
             : Effect.void),
       model: () => Effect.succeed(null),
       setModel: () => Effect.void,
+      withdraw: () => Effect.void,
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),

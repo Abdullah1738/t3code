@@ -10132,6 +10132,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     );
     const run = projection.runs.find((candidate) => candidate.id === command.runId);
+    // Native steering preserves the attempt; compare its accepted input while owning the command lock.
+    if (command.expectedLastInputMessageId !== undefined && run !== undefined) {
+      const inputs = yield* loadProjectionForCommand(command, ["turnItems"], {
+        turnItemTypes: ["user_message"],
+        turnItemRunId: run.id,
+      });
+      const latest = inputs.turnItems.findLast((item) => item.type === "user_message");
+      if (latest?.messageId !== command.expectedLastInputMessageId) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${run.id} accepted another input before interruption.`,
+        });
+      }
+    }
     if (command.fenced === true && run !== undefined) {
       const cause =
         run.status === "completed" ||

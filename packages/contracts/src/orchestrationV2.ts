@@ -3021,6 +3021,7 @@ export const OrchestrationV2Command = Schema.Union([
     reason: Schema.optional(Schema.String),
     holdQueue: Schema.optional(Schema.Boolean),
     expectedAttemptId: Schema.optional(RunAttemptId),
+    expectedLastInputMessageId: Schema.optional(MessageId),
     fenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({

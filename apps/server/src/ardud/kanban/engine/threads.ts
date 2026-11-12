@@ -15,6 +15,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import type {
@@ -139,6 +140,11 @@ export interface KanbanThreadsShape {
   >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
+  readonly withdraw: (input: {
+    readonly threadId: ThreadId;
+    readonly key: string;
+    readonly text: string;
+  }) => Effect.Effect<void>;
   /** Switches an open thread to this model now; does nothing when it already runs it. */
   readonly setModel: (
     threadId: ThreadId,
@@ -360,49 +366,145 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  const discardWithdrawal = Effect.fn("KanbanThreads.discardWithdrawal")(
+    function* (
+      projectId: ProjectId,
+      threadId: ThreadId,
+      id: string,
+      reason = "Board withdrawal could not steer its original run",
+    ) {
+      const messageId = MessageId.make(`kanban:${id}`);
+      // A queued withdrawal can start while cancellation is committing; reconcile that race once.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const records = yield* threads.getProjectThreadRecords(
+          { projectId, threadId },
+          ["messages", "runs", "turnItems"],
+          { messageIds: [messageId], turnItemTypes: ["user_message"] },
+        );
+        const message = records.messages.find((entry) => entry.id === messageId);
+        const run = records.runs.find((entry) => entry.id === message?.runId);
+        const item = records.turnItems.find(
+          (entry) => entry.type === "user_message" && entry.messageId === messageId,
+        );
+        // Steering restarts can replace userMessageId on the worker's existing run.
+        if (
+          !run ||
+          run.userMessageId !== messageId ||
+          (item?.type === "user_message" &&
+            ["steer", "promoted_queued_to_steer"].includes(item.inputIntent))
+        )
+          return false;
+        // Native steering keeps the root message and attempt while adding another card's work.
+        if (
+          records.turnItems.some(
+            (entry) =>
+              entry.type === "user_message" &&
+              entry.runId === run.id &&
+              entry.messageId !== messageId &&
+              ["steer", "promoted_queued_to_steer"].includes(entry.inputIntent),
+          )
+        )
+          return false;
+        const command =
+          run.status === "queued"
+            ? {
+                type: "queued-run.cancel" as const,
+                commandId: CommandId.make(`kanban:send:${id}:cancel`),
+                threadId,
+                runId: run.id,
+              }
+            : ["preparing", "starting", "running", "waiting"].includes(run.status)
+              ? {
+                  type: "run.interrupt" as const,
+                  commandId: CommandId.make(`kanban:send:${id}:interrupt`),
+                  threadId,
+                  runId: run.id,
+                  holdQueue: false,
+                  fenced: true,
+                  expectedLastInputMessageId: messageId,
+                  ...(run.activeAttemptId === null
+                    ? {}
+                    : { expectedAttemptId: run.activeAttemptId }),
+                  reason,
+                }
+              : null;
+        if (command === null) return true;
+        const stopped = yield* Effect.result(threads.dispatch(command));
+        if (Result.isSuccess(stopped)) return true;
+        if (attempt === 1) return yield* stopped.failure;
+      }
+    },
+    Effect.catchCause((cause) =>
+      Effect.logWarning("kanban withdrawal cleanup failed", { cause }).pipe(Effect.as(true)),
+    ),
+  );
+
+  const sendId = Effect.fn("KanbanThreads.sendId")(function* (
+    input: Pick<KanbanSendInput, "threadId" | "key">,
+  ) {
+    let id: string = input.key ?? NodeCrypto.randomUUID();
+    if (input.key !== undefined) {
+      // A rejected receipt is final, but proves that attempt did not send. Walk
+      // only those receipts: an accepted or unknown attempt must retain its id.
+      for (let attempt = 0; ; attempt += 1) {
+        id = attempt === 0 ? input.key : `${input.key}:retry:${attempt}`;
+        const receipt = yield* receipts.getByCommandId({
+          commandId: CommandId.make(`kanban:send:${id}`),
+        });
+        if (Option.isNone(receipt)) break;
+        if (
+          receipt.value.aggregateKind !== "thread" ||
+          receipt.value.aggregateId !== input.threadId ||
+          receipt.value.commandType !== "message.dispatch"
+        ) {
+          return yield* new KanbanThreadError({
+            operation: "send",
+            detail: "keyed send receipt belongs to another command",
+          });
+        }
+        if (receipt.value.status !== "rejected") break;
+      }
+    }
+    return id;
+  });
+
   const send: KanbanThreadsShape["send"] = Effect.fn("KanbanThreads.send")(
     function* (input) {
       const shell = yield* threads.getThreadShell(input.threadId);
       if (shell === null || shell.deletedAt !== null) {
         return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
       }
-      let id: string = input.key ?? NodeCrypto.randomUUID();
-      if (input.key !== undefined) {
-        // A rejected receipt is final, but proves that attempt did not send. Walk
-        // only those receipts: an accepted or unknown attempt must retain its id.
-        for (let attempt = 0; ; attempt += 1) {
-          id = attempt === 0 ? input.key : `${input.key}:retry:${attempt}`;
-          const receipt = yield* receipts.getByCommandId({
-            commandId: CommandId.make(`kanban:send:${id}`),
+      const id = yield* sendId(input);
+      const deliver = Effect.gen(function* () {
+        const sent = yield* threads.sendToThread({
+          projectId: shell.projectId,
+          commandId: CommandId.make(`kanban:send:${id}`),
+          messageId: MessageId.make(`kanban:${id}`),
+          threadId: input.threadId,
+          text: input.text,
+          attachments: [],
+          ...(input.model ? { modelSelection: input.model } : {}),
+          mode: input.mode ?? "auto",
+          ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
+          createdBy: "system",
+          creationSource: "server",
+        });
+        if (input.mode === "steer" && sent.delivery !== "steered") {
+          return yield* new KanbanThreadError({
+            operation: "send",
+            detail: "withdrawal did not steer a live run",
+            rejected: true,
           });
-          if (Option.isNone(receipt)) break;
-          if (
-            receipt.value.aggregateKind !== "thread" ||
-            receipt.value.aggregateId !== input.threadId ||
-            receipt.value.commandType !== "message.dispatch"
-          ) {
-            return yield* new KanbanThreadError({
-              operation: "send",
-              detail: "keyed send receipt belongs to another command",
-            });
-          }
-          if (receipt.value.status !== "rejected") break;
         }
-      }
-      const sent = yield* threads.sendToThread({
-        projectId: shell.projectId,
-        commandId: CommandId.make(`kanban:send:${id}`),
-        messageId: MessageId.make(`kanban:${id}`),
-        threadId: input.threadId,
-        text: input.text,
-        attachments: [],
-        ...(input.model ? { modelSelection: input.model } : {}),
-        mode: input.mode ?? "auto",
-        ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
-        createdBy: "system",
-        creationSource: "server",
+        return sent.run.id;
       });
-      return sent.run.id;
+      return yield* input.mode === "steer"
+        ? deliver.pipe(
+            Effect.onError(() =>
+              discardWithdrawal(shell.projectId, input.threadId, id).pipe(Effect.asVoid),
+            ),
+          )
+        : deliver;
     },
     Effect.mapError((error) =>
       isKanbanThreadError(error)
@@ -412,6 +514,24 @@ const make = Effect.gen(function* () {
             detail: detailOf(error),
             rejected: Schema.is(Orchestrator.OrchestratorCommandPreviouslyRejectedError)(error),
           }),
+    ),
+  );
+
+  const withdraw: KanbanThreadsShape["withdraw"] = Effect.fn("KanbanThreads.withdraw")(
+    function* (input) {
+      const shell = yield* threads.getThreadShell(input.threadId);
+      if (!shell || shell.deletedAt !== null) return;
+      const id = yield* sendId(input);
+      const receipt = yield* receipts.getByCommandId({
+        commandId: CommandId.make(`kanban:send:${id}`),
+      });
+      if (Option.isNone(receipt) || receipt.value.status !== "accepted") return;
+      const stopped = yield* discardWithdrawal(shell.projectId, input.threadId, id, input.text);
+      if (!stopped) yield* send({ ...input, key: `${input.key}:state-changed`, mode: "steer" });
+    },
+    Effect.asVoid,
+    Effect.catchCause((cause) =>
+      Effect.logWarning("kanban assignment withdrawal failed", { cause }),
     ),
   );
 
@@ -508,6 +628,7 @@ const make = Effect.gen(function* () {
     compactRun,
     launch,
     send,
+    withdraw,
     setModel,
     cancelQueued,
     interrupt,
