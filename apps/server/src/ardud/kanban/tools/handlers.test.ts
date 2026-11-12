@@ -781,6 +781,7 @@ it.effect(
       });
       assert.isTrue(theirs.isError);
       assert.include(theirs.text, `can't change card #${other.number}`);
+      assert.include(theirs.text, "card_create");
     }).pipe(Effect.provide(layer));
   },
 );

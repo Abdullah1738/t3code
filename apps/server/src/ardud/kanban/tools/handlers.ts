@@ -254,7 +254,9 @@ const ownCard = (caller: Caller, card: KanbanCard) =>
     ? card.workThreadId === caller.threadId
     : caller.link?.cardId === card.id)
     ? Effect.void
-    : refuse(`This thread works on other cards; it can't change card #${card.number}.`);
+    : refuse(
+        `This thread works on other cards; it can't change card #${card.number}. A card you created without assignToSelf belongs to the thread that will work it; put details in card_create, or hand them to the board's evaluator.`,
+      );
 
 /** The card a work thread's new cards follow on from: one it carries, else the one it started with. */
 const workOrigin = Effect.fn("KanbanTools.workOrigin")(function* (
